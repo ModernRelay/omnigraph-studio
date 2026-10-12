@@ -77,7 +77,7 @@ pub(crate) fn opener(cx: &App, kind: &str) -> Option<OpenSavedItem> {
 }
 
 /// `OMNIGRAPH_STUDIO_NO_RESTORE=1` starts with no remembered tabs (the snapshot tool sets it).
-pub(crate) fn restore_enabled() -> bool {
+pub fn restore_enabled() -> bool {
     std::env::var("OMNIGRAPH_STUDIO_NO_RESTORE").map_or(true, |v| v.is_empty() || v == "0")
 }
 
@@ -120,6 +120,44 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     file.write_all(text.as_bytes())
+}
+
+/// The graphs a window had open, in the order they were opened, and which one it showed: what
+/// Studio reopens at its next start.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SavedSession {
+    pub graphs: Vec<SavedGraph>,
+    #[serde(default)]
+    pub shown: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedGraph {
+    pub server_url: String,
+    pub graph: String,
+    pub branch: String,
+}
+
+fn session_path() -> PathBuf {
+    studio_settings::data_dir().join("session.json")
+}
+
+/// The graphs to reopen, if a session was saved and restoring is on.
+pub fn load_session() -> Option<SavedSession> {
+    if !restore_enabled() {
+        return None;
+    }
+    let text = std::fs::read_to_string(session_path()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+pub(crate) fn save_session(saved: &SavedSession) {
+    if std::fs::create_dir_all(studio_settings::data_dir()).is_err() {
+        return;
+    }
+    if let Ok(text) = serde_json::to_string_pretty(saved) {
+        write_private(&session_path(), &text).ok();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -185,6 +223,22 @@ mod tests {
         assert_eq!(mode, 0o600);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"active": 1}"#);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_saved_session_reads_back_and_an_older_one_shows_the_first_graph() {
+        let saved = SavedSession {
+            graphs: vec![SavedGraph {
+                server_url: "https://example.test".into(),
+                graph: "crm".into(),
+                branch: "main".into(),
+            }],
+            shown: 0,
+        };
+        let text = serde_json::to_string(&saved).unwrap();
+        assert_eq!(serde_json::from_str::<SavedSession>(&text).unwrap(), saved);
+        let without_shown: SavedSession = serde_json::from_str(r#"{"graphs": []}"#).unwrap();
+        assert_eq!(without_shown.shown, 0);
     }
 
     #[test]

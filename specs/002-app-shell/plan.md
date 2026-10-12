@@ -67,8 +67,10 @@ window", the shown graph checked, Open Another Graph…, Close Graph) and reads 
 more are open; ⌃⌘] and ⌃⌘[ step through them. Closing a graph saves its tabs (opening it
 again brings them back) and shows the one opened before; a graph with a write still running
 stays open, so the write's outcome is never dropped. Toasts follow the shown graph; a parked
-graph's writes still land in its activity log. Which graphs a window had open is not restored
-across launches (see Deferred).
+graph's writes still land in its activity log. Which graphs the window had open (server URL,
+graph, branch, and the one shown) is written to the owner-only `session.json` as it changes,
+and the next start reopens them, on servers still known, showing the one shown; with none to
+reopen it shows "Open a graph". Only the last window's graphs come back (see Deferred).
 
 ### Window chrome
 

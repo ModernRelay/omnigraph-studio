@@ -119,8 +119,43 @@ pub fn build_workspace(window: &mut Window, cx: &mut App) -> Entity<Workspace> {
     workspace
 }
 
-/// Opens `OMNIGRAPH_STUDIO_GRAPH` on the environment server when both are set, else shows the
-/// "Open a graph" modal.
+/// Reopens the graphs the last window had open, on servers still known, showing the one it
+/// showed. Returns whether any graph was reopened.
+fn reopen_last_session(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) -> bool {
+    let Some(saved) = studio_workspace::load_session() else {
+        return false;
+    };
+    let registry = ConnectionRegistry::global(cx);
+    let connections = registry.read(cx).connections.clone();
+    let mut shown = None;
+    for (index, graph) in saved.graphs.iter().enumerate() {
+        let Some(connection) = connections
+            .iter()
+            .find(|c| c.read(cx).server.url == graph.server_url)
+            .cloned()
+        else {
+            continue;
+        };
+        if connection.read(cx).state == ConnectionState::Idle {
+            connection.update(cx, |connection, cx| connection.connect(cx));
+        }
+        let session = open_session(connection, graph.graph.clone(), graph.branch.clone(), cx);
+        if index == saved.shown {
+            shown = Some(session.entity_id());
+        }
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_session(session, window, cx)
+        });
+    }
+    let opened = !workspace.read(cx).open_graphs().is_empty();
+    if let Some(id) = shown {
+        workspace.update(cx, |workspace, cx| workspace.show_graph(id, window, cx));
+    }
+    opened
+}
+
+/// Opens `OMNIGRAPH_STUDIO_GRAPH` on the environment server when both are set, else the graphs
+/// open at the last quit, else shows the "Open a graph" modal.
 fn open_initial_graph(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
     let registry = ConnectionRegistry::global(cx);
     let graph = std::env::var("OMNIGRAPH_STUDIO_GRAPH").ok();
@@ -134,6 +169,7 @@ fn open_initial_graph(workspace: &Entity<Workspace>, window: &mut Window, cx: &m
                 workspace.set_session(session, window, cx)
             });
         }
+        _ if reopen_last_session(workspace, window, cx) => {}
         _ => {
             for connection in registry.read(cx).connections.clone() {
                 if connection.read(cx).state == ConnectionState::Idle {

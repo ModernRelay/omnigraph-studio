@@ -39,7 +39,8 @@ pub use item::{Item, ItemEvent, ItemFooter, ItemHandle};
 pub use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};
 pub use panels::{Dock, PanelEntry, PanelPosition};
 pub use persistence::{
-    SavedItem, SavedPane, SavedWorkspace, register_item_kind, saved_window_bounds,
+    SavedGraph, SavedItem, SavedPane, SavedSession, SavedWorkspace, load_session,
+    register_item_kind, restore_enabled, saved_window_bounds,
 };
 
 /// A modal: dismissing it emits [`DismissEvent`].
@@ -101,6 +102,8 @@ pub struct Workspace {
     /// were opened (the switcher's order).
     parked: Vec<ParkedGraph>,
     graph_order: Vec<EntityId>,
+    /// The open graphs as last written for the next start.
+    saved_session: Option<SavedSession>,
     /// The document area: panes of tabs in a tree of splits (spec 002, "Frame").
     panes: Vec<Pane<Box<dyn ItemHandle>>>,
     center: Member,
@@ -182,6 +185,7 @@ impl Workspace {
             session: None,
             parked: Vec::new(),
             graph_order: Vec::new(),
+            saved_session: None,
             panes: vec![Pane::new(0)],
             center: Member::Pane(0),
             active_pane: 0,
@@ -261,8 +265,35 @@ impl Workspace {
         }
     }
 
+    /// The open graphs as Studio reopens them at its next start.
+    fn session_snapshot(&self, cx: &App) -> SavedSession {
+        let open = self.open_graphs();
+        let shown = open.iter().position(|(_, shown)| *shown).unwrap_or(0);
+        SavedSession {
+            graphs: open
+                .iter()
+                .map(|(session, _)| {
+                    let session = session.read(cx);
+                    SavedGraph {
+                        server_url: session.connection.read(cx).server.url.clone(),
+                        graph: session.graph_id.clone(),
+                        branch: session.branch.clone(),
+                    }
+                })
+                .collect(),
+            shown,
+        }
+    }
+
     /// Writes the workspace's state shortly after it stops changing.
     fn save_if_changed(&mut self, cx: &mut Context<Self>) {
+        if persistence::restore_enabled() {
+            let open = self.session_snapshot(cx);
+            if self.saved_session.as_ref() != Some(&open) {
+                persistence::save_session(&open);
+                self.saved_session = Some(open);
+            }
+        }
         let Some((url, graph)) = self.graph_key(cx) else {
             return;
         };
