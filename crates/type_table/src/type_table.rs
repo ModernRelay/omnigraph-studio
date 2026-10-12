@@ -9,12 +9,8 @@ mod peek;
 mod table;
 mod types_list;
 
-use gpui::{App, AppContext as _, Context, KeyBinding, Window};
+use gpui::{App, AppContext as _, Context, Window};
 use studio_actions::graph::{OpenNode, OpenType};
-use studio_actions::table::{
-    AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyCell, DeleteRow, EditCell, FilterBySelection,
-    InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp, PeekRow, RefreshTable,
-};
 use studio_workspace::{ToastKind, Workspace};
 
 pub use dialogs::{DeleteRowModal, InsertRowModal};
@@ -22,32 +18,9 @@ pub use peek::{NodePeek, PeekSubject};
 pub use table::{Cursor, TypeTable};
 pub use types_list::TypesList;
 
-/// Navigation keys work while no text field in the table has focus.
-const NAVIGATING: &str = "TypeTable && !editing";
-const EDITING: &str = "TypeTable && editing";
-
 /// Registers this surface with every new workspace: the sidebar's Types section, `OpenType`,
-/// `OpenNode`, and the table's key bindings.
+/// and `OpenNode`. Its keys are in `assets/keymaps/` (`TypeTable`, `TypeTable && editing`).
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("j", MoveDown, Some(NAVIGATING)),
-        KeyBinding::new("down", MoveDown, Some(NAVIGATING)),
-        KeyBinding::new("k", MoveUp, Some(NAVIGATING)),
-        KeyBinding::new("up", MoveUp, Some(NAVIGATING)),
-        KeyBinding::new("left", MoveLeft, Some(NAVIGATING)),
-        KeyBinding::new("right", MoveRight, Some(NAVIGATING)),
-        KeyBinding::new("enter", EditCell, Some(NAVIGATING)),
-        KeyBinding::new("enter", ConfirmEdit, Some(EDITING)),
-        KeyBinding::new("space", PeekRow, Some(NAVIGATING)),
-        KeyBinding::new("escape", Cancel, Some("TypeTable")),
-        KeyBinding::new("secondary-r", RefreshTable, Some("TypeTable")),
-        KeyBinding::new("secondary-c", CopyCell, Some(NAVIGATING)),
-        KeyBinding::new("secondary-n", InsertRow, Some("TypeTable")),
-        KeyBinding::new("secondary-backspace", DeleteRow, Some(NAVIGATING)),
-        KeyBinding::new("secondary-f", AddFilter, Some("TypeTable")),
-        KeyBinding::new("secondary-alt-f", FilterBySelection, Some(NAVIGATING)),
-        KeyBinding::new("secondary-alt-backspace", ClearFilters, Some("TypeTable")),
-    ]);
 
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };

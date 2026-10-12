@@ -61,6 +61,10 @@ gpui_platform = { workspace = true }
 name = "settings_apply"
 harness = false
 
+[[test]]
+name = "keymaps"
+harness = false
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 gpui_platform = { workspace = true, features = ["test-support", "font-kit", "runtime_shaders"] }

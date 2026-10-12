@@ -34,15 +34,179 @@
   {
     "context": "Workspace",
     "bindings": {
-      "cmd-1": ["studio::ActivateItem", { "index": 0 }],
-      "cmd-2": ["studio::ActivateItem", { "index": 1 }],
-      "cmd-3": ["studio::ActivateItem", { "index": 2 }],
-      "cmd-4": ["studio::ActivateItem", { "index": 3 }],
-      "cmd-5": ["studio::ActivateItem", { "index": 4 }],
-      "cmd-6": ["studio::ActivateItem", { "index": 5 }],
-      "cmd-7": ["studio::ActivateItem", { "index": 6 }],
-      "cmd-8": ["studio::ActivateItem", { "index": 7 }],
+      "cmd-1": [
+        "studio::ActivateItem",
+        {
+          "index": 0
+        }
+      ],
+      "cmd-2": [
+        "studio::ActivateItem",
+        {
+          "index": 1
+        }
+      ],
+      "cmd-3": [
+        "studio::ActivateItem",
+        {
+          "index": 2
+        }
+      ],
+      "cmd-4": [
+        "studio::ActivateItem",
+        {
+          "index": 3
+        }
+      ],
+      "cmd-5": [
+        "studio::ActivateItem",
+        {
+          "index": 4
+        }
+      ],
+      "cmd-6": [
+        "studio::ActivateItem",
+        {
+          "index": 5
+        }
+      ],
+      "cmd-7": [
+        "studio::ActivateItem",
+        {
+          "index": 6
+        }
+      ],
+      "cmd-8": [
+        "studio::ActivateItem",
+        {
+          "index": 7
+        }
+      ],
       "cmd-9": "studio::ActivateLastItem"
+    }
+  },
+  {
+    "bindings": {
+      "cmd-n": "studio_graph::NewQuery"
+    }
+  },
+  {
+    "context": "TypeTable && !editing",
+    "bindings": {
+      "j": "studio_table::MoveDown",
+      "down": "studio_table::MoveDown",
+      "k": "studio_table::MoveUp",
+      "up": "studio_table::MoveUp",
+      "left": "studio_table::MoveLeft",
+      "right": "studio_table::MoveRight",
+      "enter": "studio_table::EditCell",
+      "space": "studio_table::PeekRow",
+      "cmd-c": "studio_table::CopyCell",
+      "cmd-backspace": "studio_table::DeleteRow",
+      "cmd-alt-f": "studio_table::FilterBySelection"
+    }
+  },
+  {
+    "context": "TypeTable && editing",
+    "bindings": {
+      "enter": "studio_table::ConfirmEdit"
+    }
+  },
+  {
+    "context": "TypeTable",
+    "bindings": {
+      "escape": "studio_table::Cancel",
+      "cmd-r": "studio_table::RefreshTable",
+      "cmd-n": "studio_table::InsertRow",
+      "cmd-f": "studio_table::AddFilter",
+      "cmd-alt-backspace": "studio_table::ClearFilters"
+    }
+  },
+  {
+    "context": "Tree",
+    "bindings": {
+      "up": "studio_tree::SelectPrevious",
+      "down": "studio_tree::SelectNext",
+      "right": "studio_tree::Expand",
+      "left": "studio_tree::Collapse",
+      "enter": "studio_tree::OpenSelected",
+      "alt-right": "studio_tree::ExpandAll",
+      "alt-left": "studio_tree::CollapseAll"
+    }
+  },
+  {
+    "context": "Tree && !filtering",
+    "bindings": {
+      "f": "studio_tree::RerootHere",
+      "g": "studio_tree::ShowOnCanvas"
+    }
+  },
+  {
+    "context": "Tree && filtering",
+    "bindings": {
+      "escape": "studio_tree::ClearFilter"
+    }
+  },
+  {
+    "context": "Canvas",
+    "bindings": {
+      "0": "studio_canvas::FitToWindow",
+      "=": "studio_canvas::ZoomIn",
+      "+": "studio_canvas::ZoomIn",
+      "-": "studio_canvas::ZoomOut",
+      "enter": "studio_canvas::ExpandNode",
+      "backspace": "studio_canvas::CollapseNode",
+      "left": "studio_canvas::MoveLeft",
+      "right": "studio_canvas::MoveRight",
+      "up": "studio_canvas::MoveUp",
+      "down": "studio_canvas::MoveDown"
+    }
+  },
+  {
+    "context": "QueryEditor > Editor",
+    "bindings": {
+      "cmd-enter": "studio_query::Run",
+      "cmd-shift-enter": "studio_query::Explain"
+    }
+  },
+  {
+    "context": "QueryEditor",
+    "bindings": {
+      "cmd-enter": "studio_query::Run",
+      "cmd-shift-enter": "studio_query::Explain"
+    }
+  },
+  {
+    "context": "QueryConfirm",
+    "bindings": {
+      "enter": "menu::Confirm",
+      "escape": "menu::Cancel"
+    }
+  },
+  {
+    "context": "QueryResults",
+    "bindings": {
+      "cmd-c": "studio_query::CopyCell",
+      "cmd-shift-c": "studio_query::CopyRow"
+    }
+  },
+  {
+    "context": "Review",
+    "bindings": {
+      "j": "studio_review::NextChange",
+      "down": "studio_review::NextChange",
+      "k": "studio_review::PreviousChange",
+      "up": "studio_review::PreviousChange",
+      "cmd-y": "studio_review::AcceptAndNext",
+      "alt-cmd-z": "studio_review::RevertAndNext",
+      "cmd-shift-enter": "studio_review::Merge"
+    }
+  },
+  {
+    "context": "History",
+    "bindings": {
+      "j": "menu::SelectNext",
+      "k": "menu::SelectPrevious"
     }
   }
 ]

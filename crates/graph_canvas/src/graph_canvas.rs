@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use gpui::{
     App, AppContext as _, BorderStyle, Bounds, ContentMask, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, Hsla, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
+    FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathBuilder, PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString,
     Subscription, Task, TextAlign, TextRun, Window, canvas, point, px, quad, size,
 };
@@ -47,18 +47,6 @@ const LABEL_SIZE: f32 = 12.;
 
 /// Registers the canvas's keys and the actions that open it.
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("0", FitToWindow, Some("Canvas")),
-        KeyBinding::new("=", ZoomIn, Some("Canvas")),
-        KeyBinding::new("+", ZoomIn, Some("Canvas")),
-        KeyBinding::new("-", ZoomOut, Some("Canvas")),
-        KeyBinding::new("enter", ExpandNode, Some("Canvas")),
-        KeyBinding::new("backspace", CollapseNode, Some("Canvas")),
-        KeyBinding::new("left", MoveLeft, Some("Canvas")),
-        KeyBinding::new("right", MoveRight, Some("Canvas")),
-        KeyBinding::new("up", MoveUp, Some("Canvas")),
-        KeyBinding::new("down", MoveDown, Some("Canvas")),
-    ]);
     cx.observe_new(|workspace: &mut Workspace, window, _cx| {
         if window.is_none() {
             return;

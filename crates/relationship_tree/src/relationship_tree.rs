@@ -17,8 +17,7 @@ mod rows;
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    KeyBinding, KeyContext, KeyDownEvent, ListSizingBehavior, Render, ScrollStrategy, Subscription,
+    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable, KeyContext, KeyDownEvent, ListSizingBehavior, Render, ScrollStrategy, Subscription,
     UniformListScrollHandle, Window, uniform_list,
 };
 use graph_store::{
@@ -44,18 +43,6 @@ const DISCLOSURE: f32 = 12.;
 
 /// Registers the tree's keys and adds the "Explore" section to every workspace.
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("up", SelectPrevious, Some("Tree")),
-        KeyBinding::new("down", SelectNext, Some("Tree")),
-        KeyBinding::new("right", Expand, Some("Tree")),
-        KeyBinding::new("left", Collapse, Some("Tree")),
-        KeyBinding::new("enter", OpenSelected, Some("Tree")),
-        KeyBinding::new("alt-right", ExpandAll, Some("Tree")),
-        KeyBinding::new("alt-left", CollapseAll, Some("Tree")),
-        KeyBinding::new("f", RerootHere, Some("Tree && !filtering")),
-        KeyBinding::new("g", ShowOnCanvas, Some("Tree && !filtering")),
-        KeyBinding::new("escape", ClearFilter, Some("Tree && filtering")),
-    ]);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
             return;

@@ -7,7 +7,7 @@ mod lanes;
 mod merged;
 mod view;
 
-use gpui::{App, KeyBinding};
+use gpui::App;
 use studio_actions::graph::{OpenCommit, OpenHistory};
 use studio_workspace::Workspace;
 
@@ -18,12 +18,6 @@ pub use view::{HistoryView, LONG_HISTORY, history_key};
 
 /// Registers this surface with every new workspace.
 pub fn init(cx: &mut App) {
-    // Up, down and enter come from Zed's `menu` bindings; j and k belong in
-    // `assets/keymaps/` and are bound here, in the `History` context only, until they move.
-    cx.bind_keys([
-        KeyBinding::new("j", menu::SelectNext, Some("History")),
-        KeyBinding::new("k", menu::SelectPrevious, Some("History")),
-    ]);
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &OpenHistory, window, cx| {
             let Some(session) = workspace.session().cloned() else {

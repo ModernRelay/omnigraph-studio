@@ -7,36 +7,15 @@ mod branches;
 mod conflicts;
 mod view;
 
-use gpui::{App, AppContext as _, Focusable as _, KeyBinding};
-use studio_actions::review::{AcceptAndNext, Merge, NextChange, PreviousChange, RevertAndNext};
+use gpui::{App, AppContext as _, Focusable as _};
 use studio_workspace::Workspace;
 
 pub use branches::{BranchList, CreateBranchModal, DeleteBranchModal, TARGET};
 pub use conflicts::conflict_wording;
 pub use view::{ReviewView, open_review, review_key};
 
-/// The review's default keys. They belong in `assets/keymaps/`; until they move there they are
-/// bound here, in the `Review` key context only.
-fn bind_keys(cx: &mut App) {
-    #[cfg(target_os = "macos")]
-    let (accept, revert, merge) = ("cmd-y", "alt-cmd-z", "cmd-shift-enter");
-    #[cfg(not(target_os = "macos"))]
-    let (accept, revert, merge) = ("ctrl-y", "alt-ctrl-z", "ctrl-shift-enter");
-    let context = Some("Review");
-    cx.bind_keys([
-        KeyBinding::new("j", NextChange, context),
-        KeyBinding::new("down", NextChange, context),
-        KeyBinding::new("k", PreviousChange, context),
-        KeyBinding::new("up", PreviousChange, context),
-        KeyBinding::new(accept, AcceptAndNext, context),
-        KeyBinding::new(revert, RevertAndNext, context),
-        KeyBinding::new(merge, Merge, context),
-    ]);
-}
-
 /// Registers this surface with every new workspace.
 pub fn init(cx: &mut App) {
-    bind_keys(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };
         // Window-level actions reach the workspace only through a focused element, and a fresh
