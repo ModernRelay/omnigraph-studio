@@ -1,0 +1,37 @@
+// Studio's development graph: people, companies and projects.
+
+node Person {
+  slug: String @key
+  name: String
+  title: String?
+  email: String?
+  born: Date?
+  tags: [String]?
+}
+
+node Company {
+  slug: String @key
+  name: String
+  founded: I32?
+  city: String?
+}
+
+node Project {
+  slug: String @key
+  name: String
+  status: enum(active, paused, done)
+  started: Date?
+}
+
+edge WorksAt: Person -> Company @card(0..) {
+  role: String?
+  since: Date?
+}
+
+edge Knows: Person -> Person @card(0..)
+
+edge Contributes: Person -> Project @card(0..) {
+  hours: I32?
+}
+
+edge Owns: Company -> Project @card(0..)

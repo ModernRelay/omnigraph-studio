@@ -1,0 +1,8 @@
+version: 1
+groups:
+  developers: [act-dev]
+rules:
+  - id: developers-list-graphs
+    allow:
+      actors: { group: developers }
+      actions: [graph_list]

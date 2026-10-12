@@ -1,0 +1,1231 @@
+{"type":"Company","data":{"slug":"company-00000","name":"Sammet Systems","founded":1956,"city":"London"}}
+{"type":"Company","data":{"slug":"company-00001","name":"Goldwasser Labs","founded":1957,"city":"Lisbon"}}
+{"type":"Company","data":{"slug":"company-00002","name":"Allen Labs","city":"Tokyo"}}
+{"type":"Company","data":{"slug":"company-00003","name":"Liskov Systems","city":"Tokyo"}}
+{"type":"Company","data":{"slug":"company-00004","name":"Turing AI","founded":1978,"city":"Toronto"}}
+{"type":"Company","data":{"slug":"company-00005","name":"Berners-Lee Labs","founded":2000,"city":"London"}}
+{"type":"Company","data":{"slug":"company-00006","name":"Hopper Labs","founded":1967,"city":"San Francisco"}}
+{"type":"Company","data":{"slug":"company-00007","name":"Hamilton Systems","founded":2023,"city":"San Francisco"}}
+{"type":"Company","data":{"slug":"company-00008","name":"Goldwasser Systems","founded":2023,"city":"Toronto"}}
+{"type":"Company","data":{"slug":"company-00009","name":"Allen Works","city":"Toronto"}}
+{"type":"Company","data":{"slug":"company-00010","name":"Liskov AI","city":"Berlin"}}
+{"type":"Company","data":{"slug":"company-00011","name":"Dahl AI","founded":1990,"city":"Tokyo"}}
+{"type":"Company","data":{"slug":"company-00012","name":"Berners-Lee Group","founded":1981}}
+{"type":"Company","data":{"slug":"company-00013","name":"Dijkstra Systems","city":"San Francisco"}}
+{"type":"Company","data":{"slug":"company-00014","name":"Perlman Group","founded":2007,"city":"San Francisco"}}
+{"type":"Company","data":{"slug":"company-00015","name":"Matsumoto Labs","founded":2003,"city":"Berlin"}}
+{"type":"Company","data":{"slug":"company-00016","name":"Sammet Systems","founded":2003,"city":"London"}}
+{"type":"Company","data":{"slug":"company-00017","name":"Liskov AI","founded":1990,"city":"San Francisco"}}
+{"type":"Company","data":{"slug":"company-00018","name":"Thompson AI","founded":2008,"city":"London"}}
+{"type":"Company","data":{"slug":"company-00019","name":"Liskov Works","founded":1958,"city":"London"}}
+{"type":"Company","data":{"slug":"company-00020","name":"Sutherland AI","founded":2007,"city":"San Francisco"}}
+{"type":"Company","data":{"slug":"company-00021","name":"Lamport Works","city":"Tokyo"}}
+{"type":"Company","data":{"slug":"company-00022","name":"Thompson Systems","founded":2013,"city":"London"}}
+{"type":"Company","data":{"slug":"company-00023","name":"Allen Works","founded":1981,"city":"Tokyo"}}
+{"type":"Company","data":{"slug":"company-00024","name":"Lamport Group","city":"Tokyo"}}
+{"type":"Project","data":{"slug":"project-00000","name":"Project Delta 0","status":"done","started":"2017-07-28"}}
+{"type":"Project","data":{"slug":"project-00001","name":"Project Ember 1","status":"paused","started":"2020-11-13"}}
+{"type":"Project","data":{"slug":"project-00002","name":"Project Beacon 2","status":"active"}}
+{"type":"Project","data":{"slug":"project-00003","name":"Project Beacon 3","status":"active","started":"2015-08-27"}}
+{"type":"Project","data":{"slug":"project-00004","name":"Project Ember 4","status":"active","started":"2015-03-14"}}
+{"type":"Project","data":{"slug":"project-00005","name":"Project Ember 5","status":"paused","started":"2020-03-23"}}
+{"type":"Project","data":{"slug":"project-00006","name":"Project Ember 6","status":"done","started":"2026-01-15"}}
+{"type":"Project","data":{"slug":"project-00007","name":"Project Fable 7","status":"done","started":"2021-07-04"}}
+{"type":"Project","data":{"slug":"project-00008","name":"Project Delta 8","status":"done","started":"2018-02-07"}}
+{"type":"Project","data":{"slug":"project-00009","name":"Project Delta 9","status":"active"}}
+{"type":"Project","data":{"slug":"project-00010","name":"Project Ember 10","status":"active"}}
+{"type":"Project","data":{"slug":"project-00011","name":"Project Ember 11","status":"active","started":"2020-10-01"}}
+{"type":"Project","data":{"slug":"project-00012","name":"Project Atlas 12","status":"active","started":"2017-11-09"}}
+{"type":"Project","data":{"slug":"project-00013","name":"Project Comet 13","status":"done","started":"2016-02-28"}}
+{"type":"Project","data":{"slug":"project-00014","name":"Project Delta 14","status":"paused","started":"2019-02-05"}}
+{"type":"Project","data":{"slug":"project-00015","name":"Project Atlas 15","status":"done","started":"2019-08-27"}}
+{"type":"Project","data":{"slug":"project-00016","name":"Project Fable 16","status":"active","started":"2018-09-12"}}
+{"type":"Project","data":{"slug":"project-00017","name":"Project Beacon 17","status":"done","started":"2015-09-10"}}
+{"type":"Project","data":{"slug":"project-00018","name":"Project Fable 18","status":"active","started":"2019-09-12"}}
+{"type":"Project","data":{"slug":"project-00019","name":"Project Beacon 19","status":"paused","started":"2023-09-25"}}
+{"type":"Project","data":{"slug":"project-00020","name":"Project Ember 20","status":"paused","started":"2024-04-26"}}
+{"type":"Project","data":{"slug":"project-00021","name":"Project Beacon 21","status":"paused","started":"2018-04-17"}}
+{"type":"Project","data":{"slug":"project-00022","name":"Project Delta 22","status":"paused","started":"2015-05-16"}}
+{"type":"Project","data":{"slug":"project-00023","name":"Project Comet 23","status":"active","started":"2020-08-26"}}
+{"type":"Project","data":{"slug":"project-00024","name":"Project Fable 24","status":"paused","started":"2020-02-08"}}
+{"type":"Project","data":{"slug":"project-00025","name":"Project Atlas 25","status":"active","started":"2020-04-16"}}
+{"type":"Project","data":{"slug":"project-00026","name":"Project Ember 26","status":"done","started":"2022-11-12"}}
+{"type":"Project","data":{"slug":"project-00027","name":"Project Fable 27","status":"active","started":"2016-07-26"}}
+{"type":"Project","data":{"slug":"project-00028","name":"Project Fable 28","status":"active","started":"2017-07-26"}}
+{"type":"Project","data":{"slug":"project-00029","name":"Project Fable 29","status":"paused"}}
+{"type":"Project","data":{"slug":"project-00030","name":"Project Fable 30","status":"paused","started":"2026-02-24"}}
+{"type":"Project","data":{"slug":"project-00031","name":"Project Beacon 31","status":"active","started":"2015-03-19"}}
+{"type":"Project","data":{"slug":"project-00032","name":"Project Delta 32","status":"done"}}
+{"type":"Project","data":{"slug":"project-00033","name":"Project Ember 33","status":"paused","started":"2020-03-18"}}
+{"type":"Project","data":{"slug":"project-00034","name":"Project Ember 34","status":"active"}}
+{"type":"Project","data":{"slug":"project-00035","name":"Project Fable 35","status":"done"}}
+{"type":"Project","data":{"slug":"project-00036","name":"Project Fable 36","status":"active","started":"2018-04-01"}}
+{"type":"Project","data":{"slug":"project-00037","name":"Project Comet 37","status":"active","started":"2018-10-11"}}
+{"type":"Project","data":{"slug":"project-00038","name":"Project Comet 38","status":"done","started":"2017-01-24"}}
+{"type":"Project","data":{"slug":"project-00039","name":"Project Comet 39","status":"paused","started":"2023-07-27"}}
+{"type":"Person","data":{"slug":"person-000000","name":"Radia Knuth","title":"Founder","born":"1978-03-20"}}
+{"type":"Person","data":{"slug":"person-000001","name":"Donald Dijkstra","title":"Researcher","email":"donald.dijkstra1@example.com","born":"1985-01-11","tags":["databases","security","graphs"]}}
+{"type":"Person","data":{"slug":"person-000002","name":"Grace Allen","title":"Designer","tags":["graphs","systems","web"]}}
+{"type":"Person","data":{"slug":"person-000003","name":"Niklaus Sammet","title":"Founder","email":"niklaus.sammet3@example.com","born":"1962-12-09","tags":["web","security","databases"]}}
+{"type":"Person","data":{"slug":"person-000004","name":"Radia Lamarr","title":"Founder","email":"radia.lamarr4@example.com","tags":["compilers","ui","graphs"]}}
+{"type":"Person","data":{"slug":"person-000005","name":"Leslie Wirth","title":"Designer"}}
+{"type":"Person","data":{"slug":"person-000006","name":"Frances Sutherland","born":"1995-11-22","tags":["compilers","web"]}}
+{"type":"Person","data":{"slug":"person-000007","name":"Donald Wirth","title":"Researcher","email":"donald.wirth7@example.com","tags":["compilers","ml","databases"]}}
+{"type":"Person","data":{"slug":"person-000008","name":"Edsger Hamilton","title":"Founder","email":"edsger.hamilton8@example.com","born":"1972-06-03","tags":["graphs","compilers"]}}
+{"type":"Person","data":{"slug":"person-000009","name":"Shafi Wirth","title":"Manager","email":"shafi.wirth9@example.com","tags":["databases","graphs"]}}
+{"type":"Person","data":{"slug":"person-000010","name":"Grace Shannon","title":"Engineer","tags":["security"]}}
+{"type":"Person","data":{"slug":"person-000011","name":"Donald Hamilton","email":"donald.hamilton11@example.com","born":"1966-07-05","tags":["ml","graphs","compilers"]}}
+{"type":"Person","data":{"slug":"person-000012","name":"Alan Dijkstra","title":"Manager","email":"alan.dijkstra12@example.com"}}
+{"type":"Person","data":{"slug":"person-000013","name":"Barbara Lamarr","title":"Engineer","email":"barbara.lamarr13@example.com","tags":["databases","ui"]}}
+{"type":"Person","data":{"slug":"person-000014","name":"Ada Sammet","title":"Founder","email":"ada.sammet14@example.com","born":"1989-03-02","tags":["databases"]}}
+{"type":"Person","data":{"slug":"person-000015","name":"Edsger Lamarr","title":"Engineer","born":"1990-05-17","tags":["security"]}}
+{"type":"Person","data":{"slug":"person-000016","name":"Niklaus Perlman","title":"Analyst"}}
+{"type":"Person","data":{"slug":"person-000017","name":"Hedy Turing","title":"Engineer","born":"1962-09-16","tags":["web"]}}
+{"type":"Person","data":{"slug":"person-000018","name":"Claude Hamilton","title":"Analyst","email":"claude.hamilton18@example.com","born":"1975-09-10","tags":["ui"]}}
+{"type":"Person","data":{"slug":"person-000019","name":"Jean Allen","email":"jean.allen19@example.com","born":"1958-07-12"}}
+{"type":"Person","data":{"slug":"person-000020","name":"Donald Lovelace","title":"Engineer","email":"donald.lovelace20@example.com","born":"1977-03-02"}}
+{"type":"Person","data":{"slug":"person-000021","name":"Leslie Perlman","title":"Analyst","email":"leslie.perlman21@example.com","born":"1994-05-02","tags":["compilers","databases","web"]}}
+{"type":"Person","data":{"slug":"person-000022","name":"Niklaus Lovelace","title":"Designer","email":"niklaus.lovelace22@example.com","tags":["ui","graphs"]}}
+{"type":"Person","data":{"slug":"person-000023","name":"Ivan Allen","title":"Designer"}}
+{"type":"Person","data":{"slug":"person-000024","name":"Ole Lamarr","title":"Founder","email":"ole.lamarr24@example.com"}}
+{"type":"Person","data":{"slug":"person-000025","name":"Barbara Lamarr"}}
+{"type":"Person","data":{"slug":"person-000026","name":"Leslie Lovelace","title":"Designer","email":"leslie.lovelace26@example.com","tags":["systems"]}}
+{"type":"Person","data":{"slug":"person-000027","name":"Jean Dahl","title":"Researcher","born":"1959-01-27","tags":["compilers","security","systems"]}}
+{"type":"Person","data":{"slug":"person-000028","name":"Tim Lovelace","email":"tim.lovelace28@example.com","born":"1995-11-23","tags":["databases"]}}
+{"type":"Person","data":{"slug":"person-000029","name":"Ada Turing","title":"Researcher","email":"ada.turing29@example.com","born":"1974-08-18"}}
+{"type":"Person","data":{"slug":"person-000030","name":"Ada Goldwasser","title":"Analyst","tags":["databases","ml","security"]}}
+{"type":"Person","data":{"slug":"person-000031","name":"Shafi Liskov","title":"Analyst","email":"shafi.liskov31@example.com","born":"1980-05-26"}}
+{"type":"Person","data":{"slug":"person-000032","name":"Hedy Hopper","title":"Analyst","email":"hedy.hopper32@example.com","tags":["web","systems","ui"]}}
+{"type":"Person","data":{"slug":"person-000033","name":"Barbara Dahl","title":"Analyst","tags":["databases"]}}
+{"type":"Person","data":{"slug":"person-000034","name":"Yukihiro Knuth","title":"Designer","born":"1969-10-19","tags":["graphs"]}}
+{"type":"Person","data":{"slug":"person-000035","name":"Ole Turing","title":"Manager","born":"1994-04-22","tags":["security","ml","web"]}}
+{"type":"Person","data":{"slug":"person-000036","name":"Ivan Wirth","title":"Manager","email":"ivan.wirth36@example.com","tags":["security"]}}
+{"type":"Person","data":{"slug":"person-000037","name":"Barbara Dahl","title":"Engineer","tags":["security","ui","databases"]}}
+{"type":"Person","data":{"slug":"person-000038","name":"Frances Liskov","title":"Founder","born":"1966-06-05","tags":["databases","ml"]}}
+{"type":"Person","data":{"slug":"person-000039","name":"Ken Hopper","title":"Manager","email":"ken.hopper39@example.com","born":"1951-03-01","tags":["web","ui","compilers"]}}
+{"type":"Person","data":{"slug":"person-000040","name":"Donald Hamilton","title":"Designer","email":"donald.hamilton40@example.com","tags":["graphs","compilers"]}}
+{"type":"Person","data":{"slug":"person-000041","name":"Jean Lamport","title":"Engineer","email":"jean.lamport41@example.com"}}
+{"type":"Person","data":{"slug":"person-000042","name":"Ivan Lamarr","title":"Designer"}}
+{"type":"Person","data":{"slug":"person-000043","name":"Ken Hamilton"}}
+{"type":"Person","data":{"slug":"person-000044","name":"Alan Sutherland","title":"Analyst","email":"alan.sutherland44@example.com","tags":["systems","security"]}}
+{"type":"Person","data":{"slug":"person-000045","name":"Jean Allen","email":"jean.allen45@example.com","born":"1951-11-13","tags":["databases"]}}
+{"type":"Person","data":{"slug":"person-000046","name":"Alan Hamilton","title":"Manager","email":"alan.hamilton46@example.com","tags":["web","graphs"]}}
+{"type":"Person","data":{"slug":"person-000047","name":"Shafi Knuth","title":"Researcher","email":"shafi.knuth47@example.com","tags":["security","ml"]}}
+{"type":"Person","data":{"slug":"person-000048","name":"Hedy Lamport","title":"Analyst","born":"1992-07-04","tags":["compilers"]}}
+{"type":"Person","data":{"slug":"person-000049","name":"Barbara Allen","title":"Founder","email":"barbara.allen49@example.com","born":"1964-08-11","tags":["systems","databases","security"]}}
+{"type":"Person","data":{"slug":"person-000050","name":"Frances Hopper","title":"Engineer","born":"1970-04-12","tags":["ui","graphs"]}}
+{"type":"Person","data":{"slug":"person-000051","name":"Margaret Lamport","title":"Manager","email":"margaret.lamport51@example.com","tags":["ml","systems"]}}
+{"type":"Person","data":{"slug":"person-000052","name":"Alan Dahl","title":"Designer","email":"alan.dahl52@example.com","tags":["databases"]}}
+{"type":"Person","data":{"slug":"person-000053","name":"Hedy Hopper","title":"Manager","email":"hedy.hopper53@example.com","born":"1969-01-05"}}
+{"type":"Person","data":{"slug":"person-000054","name":"Margaret Dahl","title":"Founder","email":"margaret.dahl54@example.com","tags":["web","databases","graphs"]}}
+{"type":"Person","data":{"slug":"person-000055","name":"Grace Knuth","title":"Researcher","email":"grace.knuth55@example.com","born":"2002-12-23","tags":["databases","security","graphs"]}}
+{"type":"Person","data":{"slug":"person-000056","name":"Ada Knuth","title":"Researcher","email":"ada.knuth56@example.com","tags":["compilers","ml"]}}
+{"type":"Person","data":{"slug":"person-000057","name":"Hedy Perlman","title":"Analyst","email":"hedy.perlman57@example.com","born":"1956-02-10","tags":["systems"]}}
+{"type":"Person","data":{"slug":"person-000058","name":"Hedy Hopper","email":"hedy.hopper58@example.com","tags":["web","compilers"]}}
+{"type":"Person","data":{"slug":"person-000059","name":"Jean Hopper","title":"Manager","email":"jean.hopper59@example.com","born":"1951-07-23","tags":["graphs","web"]}}
+{"type":"Person","data":{"slug":"person-000060","name":"Frances Dahl","title":"Analyst","email":"frances.dahl60@example.com","tags":["systems"]}}
+{"type":"Person","data":{"slug":"person-000061","name":"Ken Hopper","title":"Manager","tags":["ml","web","ui"]}}
+{"type":"Person","data":{"slug":"person-000062","name":"Frances Lovelace","born":"1954-04-16","tags":["security"]}}
+{"type":"Person","data":{"slug":"person-000063","name":"Frances Hopper","title":"Manager","born":"1968-02-20","tags":["compilers","databases","ui"]}}
+{"type":"Person","data":{"slug":"person-000064","name":"Margaret Turing","title":"Founder","tags":["graphs"]}}
+{"type":"Person","data":{"slug":"person-000065","name":"Yukihiro Knuth","title":"Manager","tags":["web","ml","compilers"]}}
+{"type":"Person","data":{"slug":"person-000066","name":"Claude Liskov","title":"Researcher","email":"claude.liskov66@example.com","tags":["graphs","compilers","ml"]}}
+{"type":"Person","data":{"slug":"person-000067","name":"Leslie Thompson","title":"Designer","email":"leslie.thompson67@example.com"}}
+{"type":"Person","data":{"slug":"person-000068","name":"Hedy Liskov","title":"Designer","email":"hedy.liskov68@example.com","born":"1985-04-13","tags":["security","systems"]}}
+{"type":"Person","data":{"slug":"person-000069","name":"Margaret Liskov","title":"Engineer","email":"margaret.liskov69@example.com","tags":["ui","compilers","systems"]}}
+{"type":"Person","data":{"slug":"person-000070","name":"Ole Lovelace","title":"Analyst","email":"ole.lovelace70@example.com","born":"1999-07-02","tags":["graphs","ui","web"]}}
+{"type":"Person","data":{"slug":"person-000071","name":"Alan Lamarr","title":"Researcher","email":"alan.lamarr71@example.com","born":"1971-06-09","tags":["graphs","compilers"]}}
+{"type":"Person","data":{"slug":"person-000072","name":"Jean Lamarr","title":"Designer","born":"2001-11-03"}}
+{"type":"Person","data":{"slug":"person-000073","name":"Grace Shannon","title":"Manager","email":"grace.shannon73@example.com","born":"1999-07-26","tags":["systems","web"]}}
+{"type":"Person","data":{"slug":"person-000074","name":"Ole Knuth","title":"Manager","born":"1997-05-27","tags":["ui"]}}
+{"type":"Person","data":{"slug":"person-000075","name":"Jean Sammet","title":"Manager","email":"jean.sammet75@example.com","born":"1955-09-07","tags":["compilers","databases","ui"]}}
+{"type":"Person","data":{"slug":"person-000076","name":"Barbara Turing","title":"Manager","email":"barbara.turing76@example.com","tags":["databases","graphs","compilers"]}}
+{"type":"Person","data":{"slug":"person-000077","name":"Yukihiro Liskov","title":"Researcher","born":"1995-08-06","tags":["compilers"]}}
+{"type":"Person","data":{"slug":"person-000078","name":"Margaret Wirth","title":"Founder","email":"margaret.wirth78@example.com"}}
+{"type":"Person","data":{"slug":"person-000079","name":"Ivan Sutherland","title":"Designer","email":"ivan.sutherland79@example.com","tags":["ui","web"]}}
+{"type":"Person","data":{"slug":"person-000080","name":"Grace Dijkstra","title":"Researcher","tags":["ml"]}}
+{"type":"Person","data":{"slug":"person-000081","name":"Barbara Lamport","title":"Designer","email":"barbara.lamport81@example.com","born":"1964-11-26"}}
+{"type":"Person","data":{"slug":"person-000082","name":"Niklaus Turing","title":"Engineer","born":"1964-08-12"}}
+{"type":"Person","data":{"slug":"person-000083","name":"Ivan Hopper","title":"Engineer","born":"2002-10-07"}}
+{"type":"Person","data":{"slug":"person-000084","name":"Ken Perlman","born":"1999-11-01"}}
+{"type":"Person","data":{"slug":"person-000085","name":"Yukihiro Matsumoto","title":"Designer","tags":["graphs"]}}
+{"type":"Person","data":{"slug":"person-000086","name":"Frances Lamarr","title":"Engineer","email":"frances.lamarr86@example.com","born":"1963-01-27","tags":["systems","ml"]}}
+{"type":"Person","data":{"slug":"person-000087","name":"Ken Dijkstra","title":"Founder","email":"ken.dijkstra87@example.com","tags":["web","graphs","ui"]}}
+{"type":"Person","data":{"slug":"person-000088","name":"Claude Lamport","title":"Analyst","email":"claude.lamport88@example.com","born":"1955-11-06","tags":["security","ui","compilers"]}}
+{"type":"Person","data":{"slug":"person-000089","name":"Ivan Hamilton","title":"Engineer","email":"ivan.hamilton89@example.com","born":"1972-07-14"}}
+{"type":"Person","data":{"slug":"person-000090","name":"Ken Allen","title":"Manager","email":"ken.allen90@example.com"}}
+{"type":"Person","data":{"slug":"person-000091","name":"Margaret Dijkstra","title":"Manager","tags":["web","systems"]}}
+{"type":"Person","data":{"slug":"person-000092","name":"Edsger Knuth","title":"Engineer","tags":["databases","security","systems"]}}
+{"type":"Person","data":{"slug":"person-000093","name":"Ken Perlman","title":"Researcher","tags":["databases"]}}
+{"type":"Person","data":{"slug":"person-000094","name":"Claude Lamport","title":"Manager","email":"claude.lamport94@example.com","born":"2001-04-10","tags":["graphs"]}}
+{"type":"Person","data":{"slug":"person-000095","name":"Ole Sammet","title":"Engineer","email":"ole.sammet95@example.com","born":"1955-12-20","tags":["ui"]}}
+{"type":"Person","data":{"slug":"person-000096","name":"Yukihiro Lamport","title":"Founder","email":"yukihiro.lamport96@example.com","born":"1961-10-07"}}
+{"type":"Person","data":{"slug":"person-000097","name":"Leslie Perlman","title":"Researcher","email":"leslie.perlman97@example.com","tags":["ui"]}}
+{"type":"Person","data":{"slug":"person-000098","name":"Alan Goldwasser","email":"alan.goldwasser98@example.com","tags":["databases","ui"]}}
+{"type":"Person","data":{"slug":"person-000099","name":"Yukihiro Wirth","title":"Founder","email":"yukihiro.wirth99@example.com","born":"1991-07-10","tags":["systems"]}}
+{"type":"Person","data":{"slug":"person-000100","name":"Leslie Thompson","title":"Manager","email":"leslie.thompson100@example.com"}}
+{"type":"Person","data":{"slug":"person-000101","name":"Yukihiro Dahl","title":"Manager","born":"1999-08-27","tags":["web"]}}
+{"type":"Person","data":{"slug":"person-000102","name":"Leslie Shannon","title":"Engineer","born":"1955-08-17"}}
+{"type":"Person","data":{"slug":"person-000103","name":"Alan Knuth","title":"Engineer","email":"alan.knuth103@example.com"}}
+{"type":"Person","data":{"slug":"person-000104","name":"Alan Perlman","title":"Manager","email":"alan.perlman104@example.com","born":"1951-02-20"}}
+{"type":"Person","data":{"slug":"person-000105","name":"Frances Knuth","title":"Manager","born":"2000-03-22","tags":["databases"]}}
+{"type":"Person","data":{"slug":"person-000106","name":"Ken Matsumoto","tags":["web","databases"]}}
+{"type":"Person","data":{"slug":"person-000107","name":"Hedy Perlman","title":"Manager","tags":["ml"]}}
+{"type":"Person","data":{"slug":"person-000108","name":"Ken Turing","title":"Researcher","tags":["ml","ui"]}}
+{"type":"Person","data":{"slug":"person-000109","name":"Edsger Lamarr","title":"Engineer","email":"edsger.lamarr109@example.com","tags":["web","security"]}}
+{"type":"Person","data":{"slug":"person-000110","name":"Radia Berners-Lee","title":"Analyst","email":"radia.berners-lee110@example.com","tags":["ml","compilers","ui"]}}
+{"type":"Person","data":{"slug":"person-000111","name":"Ken Berners-Lee","title":"Researcher","email":"ken.berners-lee111@example.com","born":"1978-04-06"}}
+{"type":"Person","data":{"slug":"person-000112","name":"Ivan Perlman","title":"Designer","email":"ivan.perlman112@example.com","born":"1987-11-11"}}
+{"type":"Person","data":{"slug":"person-000113","name":"Alan Hopper","title":"Researcher","born":"1976-09-12"}}
+{"type":"Person","data":{"slug":"person-000114","name":"Donald Dahl","title":"Researcher","email":"donald.dahl114@example.com"}}
+{"type":"Person","data":{"slug":"person-000115","name":"Ada Berners-Lee","title":"Designer","email":"ada.berners-lee115@example.com","born":"1984-04-14","tags":["compilers","databases"]}}
+{"type":"Person","data":{"slug":"person-000116","name":"Ken Matsumoto","email":"ken.matsumoto116@example.com","tags":["compilers"]}}
+{"type":"Person","data":{"slug":"person-000117","name":"Niklaus Shannon","title":"Engineer","email":"niklaus.shannon117@example.com","born":"2000-05-13","tags":["graphs","web"]}}
+{"type":"Person","data":{"slug":"person-000118","name":"Shafi Thompson","title":"Founder","email":"shafi.thompson118@example.com","born":"1983-12-16","tags":["compilers"]}}
+{"type":"Person","data":{"slug":"person-000119","name":"Ada Turing","title":"Engineer","email":"ada.turing119@example.com","born":"1965-03-02"}}
+{"type":"Person","data":{"slug":"person-000120","name":"Ada Matsumoto","title":"Founder","email":"ada.matsumoto120@example.com","tags":["ui","security","systems"]}}
+{"type":"Person","data":{"slug":"person-000121","name":"Radia Hamilton","email":"radia.hamilton121@example.com","born":"1954-05-21"}}
+{"type":"Person","data":{"slug":"person-000122","name":"Ole Goldwasser","title":"Engineer","email":"ole.goldwasser122@example.com","born":"1979-02-24","tags":["compilers","databases","graphs"]}}
+{"type":"Person","data":{"slug":"person-000123","name":"Hedy Hopper","title":"Analyst","tags":["graphs","compilers"]}}
+{"type":"Person","data":{"slug":"person-000124","name":"Shafi Hamilton","title":"Analyst","email":"shafi.hamilton124@example.com","born":"1966-05-21","tags":["databases"]}}
+{"type":"Person","data":{"slug":"person-000125","name":"Radia Lovelace","title":"Researcher","tags":["compilers"]}}
+{"type":"Person","data":{"slug":"person-000126","name":"Jean Allen","title":"Manager","email":"jean.allen126@example.com","tags":["web","systems","security"]}}
+{"type":"Person","data":{"slug":"person-000127","name":"Ada Lovelace","title":"Manager","email":"ada.lovelace127@example.com","tags":["ui","web"]}}
+{"type":"Person","data":{"slug":"person-000128","name":"Yukihiro Berners-Lee","title":"Engineer","email":"yukihiro.berners-lee128@example.com"}}
+{"type":"Person","data":{"slug":"person-000129","name":"Ada Shannon","title":"Engineer","email":"ada.shannon129@example.com","tags":["graphs"]}}
+{"type":"Person","data":{"slug":"person-000130","name":"Ada Turing","title":"Researcher","email":"ada.turing130@example.com","born":"1994-02-24"}}
+{"type":"Person","data":{"slug":"person-000131","name":"Barbara Berners-Lee","email":"barbara.berners-lee131@example.com","born":"2002-09-22"}}
+{"type":"Person","data":{"slug":"person-000132","name":"Leslie Shannon","title":"Researcher"}}
+{"type":"Person","data":{"slug":"person-000133","name":"Barbara Sutherland","title":"Manager","tags":["security"]}}
+{"type":"Person","data":{"slug":"person-000134","name":"Jean Sammet","title":"Manager","tags":["graphs","ml"]}}
+{"type":"Person","data":{"slug":"person-000135","name":"Ken Sammet","email":"ken.sammet135@example.com","born":"1968-10-24"}}
+{"type":"Person","data":{"slug":"person-000136","name":"Margaret Lovelace","title":"Manager","email":"margaret.lovelace136@example.com","tags":["graphs","security","systems"]}}
+{"type":"Person","data":{"slug":"person-000137","name":"Frances Liskov","title":"Founder","email":"frances.liskov137@example.com"}}
+{"type":"Person","data":{"slug":"person-000138","name":"Radia Allen","title":"Designer","email":"radia.allen138@example.com","born":"1950-06-16"}}
+{"type":"Person","data":{"slug":"person-000139","name":"Ole Dijkstra","title":"Manager","email":"ole.dijkstra139@example.com","born":"1982-05-19","tags":["security"]}}
+{"type":"Person","data":{"slug":"person-000140","name":"Frances Hopper","title":"Manager","born":"1999-02-16"}}
+{"type":"Person","data":{"slug":"person-000141","name":"Jean Thompson","title":"Engineer","email":"jean.thompson141@example.com"}}
+{"type":"Person","data":{"slug":"person-000142","name":"Margaret Lovelace","title":"Designer","tags":["systems"]}}
+{"type":"Person","data":{"slug":"person-000143","name":"Grace Wirth","title":"Researcher","email":"grace.wirth143@example.com","born":"1998-10-21"}}
+{"type":"Person","data":{"slug":"person-000144","name":"Ken Berners-Lee","title":"Designer","email":"ken.berners-lee144@example.com","born":"1978-11-18","tags":["compilers","ui"]}}
+{"type":"Person","data":{"slug":"person-000145","name":"Niklaus Lamarr","title":"Founder","tags":["ui"]}}
+{"type":"Person","data":{"slug":"person-000146","name":"Hedy Sutherland","email":"hedy.sutherland146@example.com","born":"1959-12-05","tags":["ml"]}}
+{"type":"Person","data":{"slug":"person-000147","name":"Yukihiro Perlman","title":"Designer","tags":["security"]}}
+{"type":"Person","data":{"slug":"person-000148","name":"Claude Dijkstra","title":"Analyst","tags":["security"]}}
+{"type":"Person","data":{"slug":"person-000149","name":"Ivan Hamilton","title":"Designer","born":"1956-05-07","tags":["web","graphs","systems"]}}
+{"type":"Person","data":{"slug":"person-000150","name":"Leslie Hamilton","title":"Analyst","born":"1968-08-01","tags":["security"]}}
+{"type":"Person","data":{"slug":"person-000151","name":"Yukihiro Lamport","title":"Engineer","email":"yukihiro.lamport151@example.com","born":"1977-12-19","tags":["ui","ml","systems"]}}
+{"type":"Person","data":{"slug":"person-000152","name":"Tim Hopper","title":"Analyst","tags":["ml","compilers","web"]}}
+{"type":"Person","data":{"slug":"person-000153","name":"Claude Hamilton","title":"Researcher","email":"claude.hamilton153@example.com","born":"1990-03-09","tags":["web","ui","graphs"]}}
+{"type":"Person","data":{"slug":"person-000154","name":"Yukihiro Hamilton","title":"Founder","email":"yukihiro.hamilton154@example.com","born":"1961-11-11"}}
+{"type":"Person","data":{"slug":"person-000155","name":"Leslie Dahl","title":"Engineer","born":"1960-12-26","tags":["ml"]}}
+{"type":"Person","data":{"slug":"person-000156","name":"Claude Berners-Lee","title":"Manager","email":"claude.berners-lee156@example.com","born":"1982-01-21","tags":["ml","ui"]}}
+{"type":"Person","data":{"slug":"person-000157","name":"Niklaus Allen","title":"Analyst","born":"1957-12-20","tags":["graphs","compilers"]}}
+{"type":"Person","data":{"slug":"person-000158","name":"Hedy Lamport","title":"Manager","tags":["ml","security","compilers"]}}
+{"type":"Person","data":{"slug":"person-000159","name":"Claude Hopper","title":"Designer","email":"claude.hopper159@example.com","born":"1983-04-26","tags":["web","databases","systems"]}}
+{"type":"Person","data":{"slug":"person-000160","name":"Donald Liskov","email":"donald.liskov160@example.com","tags":["compilers"]}}
+{"type":"Person","data":{"slug":"person-000161","name":"Ken Hamilton","title":"Manager","email":"ken.hamilton161@example.com","born":"1991-03-25","tags":["ml","systems","databases"]}}
+{"type":"Person","data":{"slug":"person-000162","name":"Hedy Lamport","title":"Analyst","born":"1961-08-01","tags":["ml","databases"]}}
+{"type":"Person","data":{"slug":"person-000163","name":"Ivan Sammet","title":"Manager","email":"ivan.sammet163@example.com","born":"1955-11-12","tags":["security"]}}
+{"type":"Person","data":{"slug":"person-000164","name":"Leslie Turing","title":"Engineer","email":"leslie.turing164@example.com","born":"2000-03-17","tags":["graphs","ml"]}}
+{"type":"Person","data":{"slug":"person-000165","name":"Ada Allen","title":"Engineer","email":"ada.allen165@example.com"}}
+{"type":"Person","data":{"slug":"person-000166","name":"Tim Knuth","born":"1972-03-07","tags":["compilers","security","ml"]}}
+{"type":"Person","data":{"slug":"person-000167","name":"Yukihiro Liskov","title":"Analyst","email":"yukihiro.liskov167@example.com","born":"1990-05-07","tags":["ui","security","graphs"]}}
+{"type":"Person","data":{"slug":"person-000168","name":"Niklaus Shannon","title":"Founder","born":"2002-03-16","tags":["graphs","ui","systems"]}}
+{"type":"Person","data":{"slug":"person-000169","name":"Donald Dahl","title":"Researcher","email":"donald.dahl169@example.com","born":"1997-01-06","tags":["web","ml"]}}
+{"type":"Person","data":{"slug":"person-000170","name":"Tim Dahl","title":"Analyst","born":"1977-07-22"}}
+{"type":"Person","data":{"slug":"person-000171","name":"Edsger Thompson","title":"Analyst","email":"edsger.thompson171@example.com"}}
+{"type":"Person","data":{"slug":"person-000172","name":"Jean Shannon","title":"Founder","email":"jean.shannon172@example.com","born":"1959-01-07","tags":["compilers","web","graphs"]}}
+{"type":"Person","data":{"slug":"person-000173","name":"Ken Sammet","title":"Manager","email":"ken.sammet173@example.com","born":"1963-05-14","tags":["systems","compilers"]}}
+{"type":"Person","data":{"slug":"person-000174","name":"Shafi Turing","tags":["systems","compilers","security"]}}
+{"type":"Person","data":{"slug":"person-000175","name":"Hedy Perlman","title":"Designer","email":"hedy.perlman175@example.com","born":"2000-02-11","tags":["ml"]}}
+{"type":"Person","data":{"slug":"person-000176","name":"Ivan Knuth","title":"Founder","email":"ivan.knuth176@example.com"}}
+{"type":"Person","data":{"slug":"person-000177","name":"Leslie Goldwasser","title":"Manager","email":"leslie.goldwasser177@example.com","tags":["databases","graphs"]}}
+{"type":"Person","data":{"slug":"person-000178","name":"Alan Allen","email":"alan.allen178@example.com","born":"1992-01-26","tags":["compilers","ml","systems"]}}
+{"type":"Person","data":{"slug":"person-000179","name":"Yukihiro Liskov","title":"Researcher","born":"1990-03-04","tags":["graphs"]}}
+{"type":"Person","data":{"slug":"person-000180","name":"Margaret Shannon","title":"Analyst","born":"1958-05-18","tags":["security","databases"]}}
+{"type":"Person","data":{"slug":"person-000181","name":"Margaret Turing","title":"Designer","born":"1987-01-16"}}
+{"type":"Person","data":{"slug":"person-000182","name":"Claude Hamilton","title":"Founder","email":"claude.hamilton182@example.com","born":"1954-01-22","tags":["compilers","ui","systems"]}}
+{"type":"Person","data":{"slug":"person-000183","name":"Shafi Shannon","title":"Engineer","email":"shafi.shannon183@example.com","tags":["graphs"]}}
+{"type":"Person","data":{"slug":"person-000184","name":"Margaret Lovelace","title":"Engineer","email":"margaret.lovelace184@example.com"}}
+{"type":"Person","data":{"slug":"person-000185","name":"Frances Shannon","title":"Researcher","email":"frances.shannon185@example.com","tags":["web"]}}
+{"type":"Person","data":{"slug":"person-000186","name":"Edsger Turing","title":"Designer","email":"edsger.turing186@example.com","born":"1959-12-25"}}
+{"type":"Person","data":{"slug":"person-000187","name":"Ivan Goldwasser","title":"Analyst","email":"ivan.goldwasser187@example.com","born":"1966-01-23"}}
+{"type":"Person","data":{"slug":"person-000188","name":"Ada Turing","title":"Engineer","email":"ada.turing188@example.com","born":"1989-02-13","tags":["security","ml"]}}
+{"type":"Person","data":{"slug":"person-000189","name":"Yukihiro Dijkstra","email":"yukihiro.dijkstra189@example.com","born":"1970-06-19","tags":["web","ml","databases"]}}
+{"type":"Person","data":{"slug":"person-000190","name":"Donald Shannon","title":"Designer","email":"donald.shannon190@example.com","tags":["web","ui","systems"]}}
+{"type":"Person","data":{"slug":"person-000191","name":"Hedy Berners-Lee","title":"Designer","tags":["graphs","systems"]}}
+{"type":"Person","data":{"slug":"person-000192","name":"Donald Matsumoto","email":"donald.matsumoto192@example.com","born":"1965-07-13","tags":["ui","systems","web"]}}
+{"type":"Person","data":{"slug":"person-000193","name":"Ivan Lovelace","title":"Designer","born":"1987-01-10","tags":["compilers"]}}
+{"type":"Person","data":{"slug":"person-000194","name":"Hedy Goldwasser","title":"Analyst","email":"hedy.goldwasser194@example.com","born":"1984-02-18","tags":["systems","databases","ml"]}}
+{"type":"Person","data":{"slug":"person-000195","name":"Grace Sutherland","title":"Founder","tags":["security"]}}
+{"type":"Person","data":{"slug":"person-000196","name":"Tim Lovelace","email":"tim.lovelace196@example.com","born":"1984-06-25"}}
+{"type":"Person","data":{"slug":"person-000197","name":"Grace Lamport","title":"Founder","email":"grace.lamport197@example.com","tags":["web","security"]}}
+{"type":"Person","data":{"slug":"person-000198","name":"Tim Allen","title":"Researcher","tags":["ml","security"]}}
+{"type":"Person","data":{"slug":"person-000199","name":"Tim Thompson","title":"Manager","email":"tim.thompson199@example.com","born":"1965-01-16","tags":["databases","compilers"]}}
+{"edge":"WorksAt","from":"person-000000","to":"company-00002","data":{"role":"lead","since":"2000-06-09"}}
+{"edge":"Knows","from":"person-000000","to":"person-000155"}
+{"edge":"Knows","from":"person-000000","to":"person-000005"}
+{"edge":"Knows","from":"person-000000","to":"person-000024"}
+{"edge":"Knows","from":"person-000000","to":"person-000008"}
+{"edge":"Contributes","from":"person-000000","to":"project-00036","data":{"hours":291}}
+{"edge":"WorksAt","from":"person-000001","to":"company-00008","data":{"role":"advisor","since":"2014-10-27"}}
+{"edge":"Knows","from":"person-000001","to":"person-000033"}
+{"edge":"Knows","from":"person-000001","to":"person-000065"}
+{"edge":"Knows","from":"person-000001","to":"person-000009"}
+{"edge":"Knows","from":"person-000001","to":"person-000086"}
+{"edge":"Contributes","from":"person-000001","to":"project-00011","data":{"hours":15}}
+{"edge":"Contributes","from":"person-000002","to":"project-00029","data":{"hours":33}}
+{"edge":"Contributes","from":"person-000002","to":"project-00031","data":{"hours":328}}
+{"edge":"WorksAt","from":"person-000003","to":"company-00003","data":{"role":"staff"}}
+{"edge":"Knows","from":"person-000003","to":"person-000059"}
+{"edge":"Knows","from":"person-000003","to":"person-000164"}
+{"edge":"Knows","from":"person-000003","to":"person-000022"}
+{"edge":"Knows","from":"person-000003","to":"person-000171"}
+{"edge":"Contributes","from":"person-000003","to":"project-00011","data":{"hours":121}}
+{"edge":"Contributes","from":"person-000003","to":"project-00028","data":{"hours":114}}
+{"edge":"Contributes","from":"person-000003","to":"project-00010","data":{}}
+{"edge":"WorksAt","from":"person-000004","to":"company-00011","data":{"role":"staff","since":"2000-01-09"}}
+{"edge":"Knows","from":"person-000004","to":"person-000181"}
+{"edge":"Knows","from":"person-000004","to":"person-000189"}
+{"edge":"Knows","from":"person-000004","to":"person-000165"}
+{"edge":"Knows","from":"person-000004","to":"person-000194"}
+{"edge":"Contributes","from":"person-000004","to":"project-00003","data":{"hours":3}}
+{"edge":"Contributes","from":"person-000004","to":"project-00006","data":{"hours":347}}
+{"edge":"Contributes","from":"person-000004","to":"project-00009","data":{"hours":302}}
+{"edge":"WorksAt","from":"person-000005","to":"company-00014","data":{"role":"staff","since":"2011-05-13"}}
+{"edge":"WorksAt","from":"person-000005","to":"company-00024","data":{"role":"staff","since":"2012-03-15"}}
+{"edge":"Knows","from":"person-000005","to":"person-000036"}
+{"edge":"WorksAt","from":"person-000006","to":"company-00022","data":{"role":"lead","since":"2005-04-03"}}
+{"edge":"Knows","from":"person-000006","to":"person-000095"}
+{"edge":"Knows","from":"person-000006","to":"person-000191"}
+{"edge":"Knows","from":"person-000006","to":"person-000035"}
+{"edge":"Knows","from":"person-000006","to":"person-000199"}
+{"edge":"Contributes","from":"person-000006","to":"project-00006","data":{"hours":232}}
+{"edge":"Contributes","from":"person-000006","to":"project-00024","data":{"hours":166}}
+{"edge":"Contributes","from":"person-000006","to":"project-00001","data":{"hours":245}}
+{"edge":"Knows","from":"person-000007","to":"person-000036"}
+{"edge":"Knows","from":"person-000007","to":"person-000084"}
+{"edge":"Contributes","from":"person-000007","to":"project-00003","data":{}}
+{"edge":"WorksAt","from":"person-000008","to":"company-00017","data":{"role":"lead","since":"2004-05-14"}}
+{"edge":"Knows","from":"person-000008","to":"person-000063"}
+{"edge":"Knows","from":"person-000008","to":"person-000039"}
+{"edge":"Knows","from":"person-000008","to":"person-000006"}
+{"edge":"Contributes","from":"person-000008","to":"project-00036","data":{"hours":86}}
+{"edge":"Contributes","from":"person-000008","to":"project-00018","data":{"hours":56}}
+{"edge":"WorksAt","from":"person-000009","to":"company-00014","data":{"role":"contractor"}}
+{"edge":"Knows","from":"person-000009","to":"person-000014"}
+{"edge":"Knows","from":"person-000009","to":"person-000161"}
+{"edge":"Knows","from":"person-000009","to":"person-000171"}
+{"edge":"Knows","from":"person-000009","to":"person-000054"}
+{"edge":"Contributes","from":"person-000009","to":"project-00018","data":{"hours":187}}
+{"edge":"Contributes","from":"person-000009","to":"project-00007","data":{"hours":134}}
+{"edge":"Contributes","from":"person-000009","to":"project-00016","data":{"hours":122}}
+{"edge":"Knows","from":"person-000010","to":"person-000074"}
+{"edge":"Knows","from":"person-000010","to":"person-000106"}
+{"edge":"Knows","from":"person-000010","to":"person-000041"}
+{"edge":"WorksAt","from":"person-000011","to":"company-00004","data":{"role":"staff","since":"2016-06-17"}}
+{"edge":"Knows","from":"person-000011","to":"person-000113"}
+{"edge":"WorksAt","from":"person-000012","to":"company-00009","data":{"role":"advisor","since":"2013-04-09"}}
+{"edge":"WorksAt","from":"person-000012","to":"company-00005","data":{}}
+{"edge":"Knows","from":"person-000012","to":"person-000133"}
+{"edge":"Contributes","from":"person-000012","to":"project-00011","data":{}}
+{"edge":"Contributes","from":"person-000013","to":"project-00017","data":{}}
+{"edge":"Contributes","from":"person-000013","to":"project-00011","data":{"hours":322}}
+{"edge":"Contributes","from":"person-000013","to":"project-00013","data":{"hours":299}}
+{"edge":"WorksAt","from":"person-000014","to":"company-00006","data":{"role":"staff"}}
+{"edge":"Knows","from":"person-000014","to":"person-000104"}
+{"edge":"Knows","from":"person-000014","to":"person-000184"}
+{"edge":"Knows","from":"person-000014","to":"person-000132"}
+{"edge":"Contributes","from":"person-000014","to":"project-00021","data":{"hours":253}}
+{"edge":"Contributes","from":"person-000014","to":"project-00018","data":{}}
+{"edge":"WorksAt","from":"person-000015","to":"company-00024","data":{"role":"contractor"}}
+{"edge":"Knows","from":"person-000015","to":"person-000063"}
+{"edge":"Knows","from":"person-000015","to":"person-000047"}
+{"edge":"Contributes","from":"person-000015","to":"project-00002","data":{"hours":295}}
+{"edge":"Contributes","from":"person-000015","to":"project-00010","data":{"hours":3}}
+{"edge":"WorksAt","from":"person-000016","to":"company-00016","data":{"role":"contractor","since":"2002-02-12"}}
+{"edge":"Knows","from":"person-000016","to":"person-000082"}
+{"edge":"Contributes","from":"person-000016","to":"project-00036","data":{"hours":375}}
+{"edge":"Contributes","from":"person-000016","to":"project-00003","data":{"hours":263}}
+{"edge":"Contributes","from":"person-000016","to":"project-00018","data":{}}
+{"edge":"WorksAt","from":"person-000017","to":"company-00004","data":{"role":"lead","since":"2007-10-06"}}
+{"edge":"WorksAt","from":"person-000017","to":"company-00000","data":{"role":"lead"}}
+{"edge":"Knows","from":"person-000017","to":"person-000142"}
+{"edge":"Knows","from":"person-000017","to":"person-000007"}
+{"edge":"Knows","from":"person-000018","to":"person-000066"}
+{"edge":"WorksAt","from":"person-000019","to":"company-00020","data":{"role":"contractor","since":"2022-08-04"}}
+{"edge":"WorksAt","from":"person-000019","to":"company-00018","data":{"role":"advisor","since":"2022-03-02"}}
+{"edge":"Knows","from":"person-000019","to":"person-000031"}
+{"edge":"Knows","from":"person-000019","to":"person-000119"}
+{"edge":"Contributes","from":"person-000019","to":"project-00037","data":{}}
+{"edge":"Contributes","from":"person-000019","to":"project-00032","data":{}}
+{"edge":"Contributes","from":"person-000019","to":"project-00017","data":{"hours":278}}
+{"edge":"WorksAt","from":"person-000020","to":"company-00007","data":{"since":"2012-03-27"}}
+{"edge":"WorksAt","from":"person-000020","to":"company-00004","data":{"role":"staff","since":"2012-12-14"}}
+{"edge":"Knows","from":"person-000020","to":"person-000154"}
+{"edge":"Knows","from":"person-000020","to":"person-000134"}
+{"edge":"Knows","from":"person-000020","to":"person-000009"}
+{"edge":"Knows","from":"person-000020","to":"person-000101"}
+{"edge":"WorksAt","from":"person-000021","to":"company-00010","data":{"role":"contractor"}}
+{"edge":"Knows","from":"person-000021","to":"person-000183"}
+{"edge":"Knows","from":"person-000021","to":"person-000111"}
+{"edge":"Contributes","from":"person-000021","to":"project-00025","data":{}}
+{"edge":"Contributes","from":"person-000021","to":"project-00035","data":{"hours":349}}
+{"edge":"WorksAt","from":"person-000022","to":"company-00007","data":{"role":"contractor","since":"2000-06-04"}}
+{"edge":"Knows","from":"person-000022","to":"person-000047"}
+{"edge":"Knows","from":"person-000022","to":"person-000017"}
+{"edge":"Knows","from":"person-000022","to":"person-000083"}
+{"edge":"Knows","from":"person-000022","to":"person-000110"}
+{"edge":"Contributes","from":"person-000022","to":"project-00032","data":{"hours":116}}
+{"edge":"WorksAt","from":"person-000023","to":"company-00013","data":{"role":"contractor","since":"2014-11-02"}}
+{"edge":"WorksAt","from":"person-000024","to":"company-00008","data":{}}
+{"edge":"WorksAt","from":"person-000024","to":"company-00021","data":{"since":"2001-10-04"}}
+{"edge":"Knows","from":"person-000024","to":"person-000031"}
+{"edge":"Knows","from":"person-000024","to":"person-000133"}
+{"edge":"WorksAt","from":"person-000025","to":"company-00007","data":{"role":"staff"}}
+{"edge":"Knows","from":"person-000025","to":"person-000088"}
+{"edge":"Knows","from":"person-000025","to":"person-000165"}
+{"edge":"Contributes","from":"person-000025","to":"project-00007","data":{}}
+{"edge":"WorksAt","from":"person-000026","to":"company-00008","data":{"role":"contractor","since":"2004-08-04"}}
+{"edge":"WorksAt","from":"person-000026","to":"company-00002","data":{}}
+{"edge":"Knows","from":"person-000026","to":"person-000104"}
+{"edge":"Knows","from":"person-000026","to":"person-000147"}
+{"edge":"Contributes","from":"person-000026","to":"project-00017","data":{"hours":380}}
+{"edge":"Contributes","from":"person-000026","to":"project-00015","data":{"hours":233}}
+{"edge":"WorksAt","from":"person-000027","to":"company-00022","data":{"role":"lead","since":"2006-09-23"}}
+{"edge":"WorksAt","from":"person-000027","to":"company-00018","data":{"role":"advisor","since":"2017-05-20"}}
+{"edge":"Knows","from":"person-000027","to":"person-000120"}
+{"edge":"Knows","from":"person-000027","to":"person-000079"}
+{"edge":"Knows","from":"person-000027","to":"person-000007"}
+{"edge":"Contributes","from":"person-000027","to":"project-00021","data":{"hours":263}}
+{"edge":"WorksAt","from":"person-000028","to":"company-00012","data":{"role":"contractor"}}
+{"edge":"WorksAt","from":"person-000028","to":"company-00018","data":{"role":"advisor"}}
+{"edge":"Knows","from":"person-000028","to":"person-000082"}
+{"edge":"Contributes","from":"person-000028","to":"project-00031","data":{"hours":111}}
+{"edge":"Contributes","from":"person-000028","to":"project-00017","data":{"hours":396}}
+{"edge":"Knows","from":"person-000029","to":"person-000141"}
+{"edge":"WorksAt","from":"person-000030","to":"company-00011","data":{"role":"staff","since":"2026-08-12"}}
+{"edge":"WorksAt","from":"person-000030","to":"company-00014","data":{"role":"staff","since":"2021-12-05"}}
+{"edge":"Knows","from":"person-000030","to":"person-000086"}
+{"edge":"Knows","from":"person-000030","to":"person-000171"}
+{"edge":"Knows","from":"person-000030","to":"person-000090"}
+{"edge":"Contributes","from":"person-000030","to":"project-00012","data":{"hours":142}}
+{"edge":"WorksAt","from":"person-000031","to":"company-00003","data":{"role":"contractor"}}
+{"edge":"WorksAt","from":"person-000031","to":"company-00023","data":{"role":"lead","since":"2003-01-14"}}
+{"edge":"Knows","from":"person-000031","to":"person-000149"}
+{"edge":"Knows","from":"person-000031","to":"person-000030"}
+{"edge":"Knows","from":"person-000031","to":"person-000127"}
+{"edge":"Knows","from":"person-000031","to":"person-000101"}
+{"edge":"Contributes","from":"person-000031","to":"project-00026","data":{"hours":144}}
+{"edge":"WorksAt","from":"person-000032","to":"company-00019","data":{"role":"contractor","since":"2022-08-10"}}
+{"edge":"WorksAt","from":"person-000032","to":"company-00003","data":{"role":"advisor"}}
+{"edge":"Knows","from":"person-000032","to":"person-000134"}
+{"edge":"Knows","from":"person-000032","to":"person-000142"}
+{"edge":"Knows","from":"person-000032","to":"person-000152"}
+{"edge":"Contributes","from":"person-000032","to":"project-00020","data":{"hours":154}}
+{"edge":"Contributes","from":"person-000032","to":"project-00000","data":{}}
+{"edge":"Contributes","from":"person-000032","to":"project-00031","data":{"hours":75}}
+{"edge":"WorksAt","from":"person-000033","to":"company-00018","data":{"role":"contractor","since":"2002-06-11"}}
+{"edge":"Knows","from":"person-000033","to":"person-000062"}
+{"edge":"Knows","from":"person-000033","to":"person-000083"}
+{"edge":"Knows","from":"person-000033","to":"person-000052"}
+{"edge":"Knows","from":"person-000033","to":"person-000109"}
+{"edge":"Contributes","from":"person-000034","to":"project-00036","data":{"hours":275}}
+{"edge":"Contributes","from":"person-000034","to":"project-00031","data":{"hours":276}}
+{"edge":"WorksAt","from":"person-000035","to":"company-00013","data":{"since":"2013-07-15"}}
+{"edge":"WorksAt","from":"person-000035","to":"company-00016","data":{"role":"advisor"}}
+{"edge":"Knows","from":"person-000035","to":"person-000115"}
+{"edge":"Knows","from":"person-000035","to":"person-000002"}
+{"edge":"WorksAt","from":"person-000036","to":"company-00007","data":{"role":"contractor","since":"2012-11-18"}}
+{"edge":"WorksAt","from":"person-000036","to":"company-00003","data":{}}
+{"edge":"Knows","from":"person-000036","to":"person-000107"}
+{"edge":"Contributes","from":"person-000036","to":"project-00025","data":{"hours":301}}
+{"edge":"Contributes","from":"person-000036","to":"project-00028","data":{"hours":272}}
+{"edge":"Contributes","from":"person-000036","to":"project-00039","data":{"hours":48}}
+{"edge":"WorksAt","from":"person-000037","to":"company-00011","data":{"role":"advisor","since":"2002-05-17"}}
+{"edge":"Knows","from":"person-000037","to":"person-000028"}
+{"edge":"Contributes","from":"person-000037","to":"project-00021","data":{"hours":216}}
+{"edge":"Contributes","from":"person-000037","to":"project-00032","data":{"hours":269}}
+{"edge":"WorksAt","from":"person-000038","to":"company-00016","data":{"role":"lead","since":"2006-07-06"}}
+{"edge":"WorksAt","from":"person-000039","to":"company-00018","data":{"role":"staff","since":"2000-01-10"}}
+{"edge":"Knows","from":"person-000039","to":"person-000001"}
+{"edge":"Knows","from":"person-000039","to":"person-000077"}
+{"edge":"Knows","from":"person-000039","to":"person-000101"}
+{"edge":"Knows","from":"person-000039","to":"person-000025"}
+{"edge":"Knows","from":"person-000040","to":"person-000044"}
+{"edge":"Contributes","from":"person-000040","to":"project-00035","data":{"hours":273}}
+{"edge":"Contributes","from":"person-000040","to":"project-00036","data":{"hours":74}}
+{"edge":"Contributes","from":"person-000040","to":"project-00017","data":{"hours":211}}
+{"edge":"WorksAt","from":"person-000041","to":"company-00003","data":{"role":"lead","since":"2016-02-01"}}
+{"edge":"WorksAt","from":"person-000041","to":"company-00004","data":{"role":"staff"}}
+{"edge":"Knows","from":"person-000041","to":"person-000125"}
+{"edge":"Knows","from":"person-000041","to":"person-000119"}
+{"edge":"Knows","from":"person-000041","to":"person-000156"}
+{"edge":"Knows","from":"person-000041","to":"person-000110"}
+{"edge":"Knows","from":"person-000042","to":"person-000082"}
+{"edge":"Knows","from":"person-000042","to":"person-000036"}
+{"edge":"Knows","from":"person-000042","to":"person-000183"}
+{"edge":"Knows","from":"person-000042","to":"person-000060"}
+{"edge":"Contributes","from":"person-000042","to":"project-00017","data":{}}
+{"edge":"Contributes","from":"person-000042","to":"project-00010","data":{"hours":299}}
+{"edge":"Knows","from":"person-000043","to":"person-000049"}
+{"edge":"Knows","from":"person-000043","to":"person-000115"}
+{"edge":"Contributes","from":"person-000043","to":"project-00001","data":{"hours":299}}
+{"edge":"Contributes","from":"person-000043","to":"project-00003","data":{"hours":23}}
+{"edge":"Contributes","from":"person-000043","to":"project-00014","data":{"hours":318}}
+{"edge":"WorksAt","from":"person-000044","to":"company-00007","data":{"role":"lead"}}
+{"edge":"Knows","from":"person-000044","to":"person-000080"}
+{"edge":"Knows","from":"person-000044","to":"person-000001"}
+{"edge":"Knows","from":"person-000044","to":"person-000116"}
+{"edge":"Contributes","from":"person-000044","to":"project-00026","data":{"hours":254}}
+{"edge":"Contributes","from":"person-000044","to":"project-00038","data":{"hours":35}}
+{"edge":"WorksAt","from":"person-000045","to":"company-00021","data":{"role":"contractor","since":"2018-04-14"}}
+{"edge":"Knows","from":"person-000045","to":"person-000102"}
+{"edge":"Knows","from":"person-000045","to":"person-000182"}
+{"edge":"Contributes","from":"person-000045","to":"project-00001","data":{}}
+{"edge":"Contributes","from":"person-000045","to":"project-00015","data":{"hours":96}}
+{"edge":"Contributes","from":"person-000045","to":"project-00005","data":{}}
+{"edge":"WorksAt","from":"person-000046","to":"company-00012","data":{"since":"2010-09-28"}}
+{"edge":"Knows","from":"person-000046","to":"person-000085"}
+{"edge":"Knows","from":"person-000046","to":"person-000103"}
+{"edge":"Knows","from":"person-000046","to":"person-000166"}
+{"edge":"Knows","from":"person-000047","to":"person-000089"}
+{"edge":"Knows","from":"person-000047","to":"person-000141"}
+{"edge":"Knows","from":"person-000047","to":"person-000062"}
+{"edge":"Contributes","from":"person-000047","to":"project-00012","data":{"hours":224}}
+{"edge":"Contributes","from":"person-000047","to":"project-00029","data":{}}
+{"edge":"Contributes","from":"person-000047","to":"project-00018","data":{"hours":175}}
+{"edge":"WorksAt","from":"person-000048","to":"company-00007","data":{"role":"lead"}}
+{"edge":"Knows","from":"person-000048","to":"person-000139"}
+{"edge":"Knows","from":"person-000048","to":"person-000032"}
+{"edge":"Contributes","from":"person-000048","to":"project-00029","data":{"hours":111}}
+{"edge":"Contributes","from":"person-000048","to":"project-00015","data":{"hours":193}}
+{"edge":"Contributes","from":"person-000048","to":"project-00010","data":{"hours":298}}
+{"edge":"WorksAt","from":"person-000049","to":"company-00009","data":{"role":"contractor","since":"2007-08-22"}}
+{"edge":"Knows","from":"person-000049","to":"person-000180"}
+{"edge":"Contributes","from":"person-000049","to":"project-00038","data":{"hours":189}}
+{"edge":"Contributes","from":"person-000049","to":"project-00028","data":{"hours":207}}
+{"edge":"WorksAt","from":"person-000050","to":"company-00016","data":{"role":"lead","since":"2003-11-17"}}
+{"edge":"WorksAt","from":"person-000050","to":"company-00006","data":{"role":"staff","since":"2008-12-25"}}
+{"edge":"Knows","from":"person-000050","to":"person-000007"}
+{"edge":"Knows","from":"person-000050","to":"person-000168"}
+{"edge":"Knows","from":"person-000050","to":"person-000183"}
+{"edge":"Contributes","from":"person-000050","to":"project-00019","data":{}}
+{"edge":"Knows","from":"person-000051","to":"person-000198"}
+{"edge":"Contributes","from":"person-000051","to":"project-00020","data":{}}
+{"edge":"Contributes","from":"person-000052","to":"project-00032","data":{}}
+{"edge":"Contributes","from":"person-000052","to":"project-00019","data":{"hours":46}}
+{"edge":"WorksAt","from":"person-000053","to":"company-00009","data":{"role":"lead","since":"2012-05-12"}}
+{"edge":"Knows","from":"person-000053","to":"person-000118"}
+{"edge":"Knows","from":"person-000053","to":"person-000198"}
+{"edge":"Knows","from":"person-000053","to":"person-000160"}
+{"edge":"Contributes","from":"person-000053","to":"project-00017","data":{}}
+{"edge":"WorksAt","from":"person-000054","to":"company-00021","data":{"role":"advisor","since":"2000-11-23"}}
+{"edge":"Knows","from":"person-000054","to":"person-000063"}
+{"edge":"Knows","from":"person-000054","to":"person-000102"}
+{"edge":"Knows","from":"person-000054","to":"person-000090"}
+{"edge":"WorksAt","from":"person-000055","to":"company-00009","data":{"role":"staff"}}
+{"edge":"Knows","from":"person-000055","to":"person-000187"}
+{"edge":"Knows","from":"person-000055","to":"person-000056"}
+{"edge":"Knows","from":"person-000055","to":"person-000182"}
+{"edge":"Knows","from":"person-000055","to":"person-000173"}
+{"edge":"WorksAt","from":"person-000056","to":"company-00001","data":{}}
+{"edge":"Knows","from":"person-000056","to":"person-000193"}
+{"edge":"Contributes","from":"person-000056","to":"project-00009","data":{"hours":283}}
+{"edge":"Contributes","from":"person-000056","to":"project-00024","data":{"hours":327}}
+{"edge":"WorksAt","from":"person-000057","to":"company-00018","data":{"role":"lead","since":"2022-09-09"}}
+{"edge":"Knows","from":"person-000057","to":"person-000171"}
+{"edge":"Knows","from":"person-000057","to":"person-000175"}
+{"edge":"Knows","from":"person-000057","to":"person-000147"}
+{"edge":"Contributes","from":"person-000057","to":"project-00000","data":{"hours":398}}
+{"edge":"Contributes","from":"person-000057","to":"project-00007","data":{"hours":22}}
+{"edge":"WorksAt","from":"person-000058","to":"company-00019","data":{"role":"staff","since":"2021-02-02"}}
+{"edge":"WorksAt","from":"person-000058","to":"company-00022","data":{"role":"advisor"}}
+{"edge":"Knows","from":"person-000058","to":"person-000191"}
+{"edge":"Knows","from":"person-000058","to":"person-000022"}
+{"edge":"Contributes","from":"person-000058","to":"project-00025","data":{"hours":47}}
+{"edge":"Contributes","from":"person-000058","to":"project-00039","data":{"hours":218}}
+{"edge":"Contributes","from":"person-000058","to":"project-00014","data":{"hours":175}}
+{"edge":"WorksAt","from":"person-000059","to":"company-00023","data":{"role":"contractor","since":"2021-12-07"}}
+{"edge":"WorksAt","from":"person-000059","to":"company-00022","data":{"role":"contractor","since":"2024-03-16"}}
+{"edge":"Knows","from":"person-000059","to":"person-000011"}
+{"edge":"Contributes","from":"person-000059","to":"project-00011","data":{}}
+{"edge":"Contributes","from":"person-000059","to":"project-00034","data":{"hours":121}}
+{"edge":"WorksAt","from":"person-000060","to":"company-00008","data":{"role":"staff"}}
+{"edge":"WorksAt","from":"person-000060","to":"company-00007","data":{"role":"advisor","since":"2006-11-10"}}
+{"edge":"Knows","from":"person-000060","to":"person-000034"}
+{"edge":"Contributes","from":"person-000060","to":"project-00030","data":{"hours":228}}
+{"edge":"Contributes","from":"person-000060","to":"project-00015","data":{}}
+{"edge":"Contributes","from":"person-000060","to":"project-00000","data":{"hours":358}}
+{"edge":"WorksAt","from":"person-000061","to":"company-00004","data":{"role":"lead","since":"2007-06-21"}}
+{"edge":"Contributes","from":"person-000061","to":"project-00010","data":{"hours":393}}
+{"edge":"Contributes","from":"person-000061","to":"project-00009","data":{"hours":106}}
+{"edge":"Contributes","from":"person-000061","to":"project-00038","data":{}}
+{"edge":"WorksAt","from":"person-000062","to":"company-00000","data":{"role":"advisor","since":"2001-01-09"}}
+{"edge":"Knows","from":"person-000062","to":"person-000050"}
+{"edge":"Knows","from":"person-000062","to":"person-000028"}
+{"edge":"Contributes","from":"person-000062","to":"project-00028","data":{}}
+{"edge":"Contributes","from":"person-000062","to":"project-00007","data":{"hours":292}}
+{"edge":"WorksAt","from":"person-000063","to":"company-00009","data":{"role":"lead","since":"2001-01-15"}}
+{"edge":"Knows","from":"person-000063","to":"person-000021"}
+{"edge":"Knows","from":"person-000063","to":"person-000191"}
+{"edge":"Knows","from":"person-000063","to":"person-000183"}
+{"edge":"Contributes","from":"person-000063","to":"project-00036","data":{}}
+{"edge":"Contributes","from":"person-000063","to":"project-00016","data":{"hours":223}}
+{"edge":"WorksAt","from":"person-000064","to":"company-00006","data":{"since":"2011-02-21"}}
+{"edge":"Knows","from":"person-000064","to":"person-000160"}
+{"edge":"Knows","from":"person-000064","to":"person-000157"}
+{"edge":"Contributes","from":"person-000064","to":"project-00015","data":{}}
+{"edge":"Contributes","from":"person-000064","to":"project-00005","data":{}}
+{"edge":"WorksAt","from":"person-000065","to":"company-00004","data":{"role":"advisor","since":"2020-09-28"}}
+{"edge":"Knows","from":"person-000065","to":"person-000026"}
+{"edge":"Contributes","from":"person-000065","to":"project-00039","data":{"hours":332}}
+{"edge":"Contributes","from":"person-000065","to":"project-00020","data":{"hours":164}}
+{"edge":"WorksAt","from":"person-000066","to":"company-00011","data":{"role":"lead","since":"2011-05-08"}}
+{"edge":"Knows","from":"person-000067","to":"person-000160"}
+{"edge":"Knows","from":"person-000067","to":"person-000180"}
+{"edge":"Knows","from":"person-000067","to":"person-000103"}
+{"edge":"Knows","from":"person-000067","to":"person-000012"}
+{"edge":"Contributes","from":"person-000067","to":"project-00031","data":{"hours":375}}
+{"edge":"WorksAt","from":"person-000068","to":"company-00009","data":{"since":"2002-03-23"}}
+{"edge":"Knows","from":"person-000068","to":"person-000041"}
+{"edge":"Contributes","from":"person-000068","to":"project-00028","data":{"hours":206}}
+{"edge":"Contributes","from":"person-000069","to":"project-00030","data":{"hours":2}}
+{"edge":"Contributes","from":"person-000069","to":"project-00012","data":{}}
+{"edge":"Contributes","from":"person-000069","to":"project-00013","data":{"hours":262}}
+{"edge":"WorksAt","from":"person-000070","to":"company-00004","data":{"role":"advisor"}}
+{"edge":"Contributes","from":"person-000070","to":"project-00021","data":{}}
+{"edge":"Contributes","from":"person-000070","to":"project-00004","data":{"hours":91}}
+{"edge":"Contributes","from":"person-000070","to":"project-00028","data":{"hours":85}}
+{"edge":"WorksAt","from":"person-000071","to":"company-00009","data":{"role":"staff","since":"2018-11-12"}}
+{"edge":"Knows","from":"person-000071","to":"person-000050"}
+{"edge":"Knows","from":"person-000071","to":"person-000120"}
+{"edge":"Knows","from":"person-000071","to":"person-000021"}
+{"edge":"Knows","from":"person-000071","to":"person-000138"}
+{"edge":"Contributes","from":"person-000071","to":"project-00033","data":{"hours":274}}
+{"edge":"Contributes","from":"person-000071","to":"project-00029","data":{"hours":80}}
+{"edge":"WorksAt","from":"person-000072","to":"company-00019","data":{}}
+{"edge":"Contributes","from":"person-000072","to":"project-00038","data":{"hours":216}}
+{"edge":"Contributes","from":"person-000072","to":"project-00019","data":{"hours":247}}
+{"edge":"WorksAt","from":"person-000073","to":"company-00009","data":{"role":"advisor","since":"2020-01-28"}}
+{"edge":"Knows","from":"person-000073","to":"person-000056"}
+{"edge":"Contributes","from":"person-000073","to":"project-00005","data":{"hours":298}}
+{"edge":"Contributes","from":"person-000073","to":"project-00009","data":{"hours":185}}
+{"edge":"Contributes","from":"person-000073","to":"project-00037","data":{"hours":290}}
+{"edge":"WorksAt","from":"person-000074","to":"company-00012","data":{"role":"advisor"}}
+{"edge":"Knows","from":"person-000074","to":"person-000051"}
+{"edge":"WorksAt","from":"person-000075","to":"company-00008","data":{"role":"staff"}}
+{"edge":"Knows","from":"person-000075","to":"person-000181"}
+{"edge":"Knows","from":"person-000075","to":"person-000125"}
+{"edge":"Contributes","from":"person-000075","to":"project-00035","data":{"hours":278}}
+{"edge":"WorksAt","from":"person-000076","to":"company-00022","data":{"since":"2018-02-28"}}
+{"edge":"WorksAt","from":"person-000076","to":"company-00003","data":{"role":"contractor","since":"2025-08-05"}}
+{"edge":"Knows","from":"person-000076","to":"person-000140"}
+{"edge":"Knows","from":"person-000076","to":"person-000129"}
+{"edge":"Knows","from":"person-000076","to":"person-000182"}
+{"edge":"Knows","from":"person-000076","to":"person-000193"}
+{"edge":"WorksAt","from":"person-000077","to":"company-00003","data":{"role":"contractor","since":"2006-10-16"}}
+{"edge":"WorksAt","from":"person-000077","to":"company-00014","data":{"role":"staff"}}
+{"edge":"Knows","from":"person-000077","to":"person-000014"}
+{"edge":"Knows","from":"person-000077","to":"person-000103"}
+{"edge":"Knows","from":"person-000077","to":"person-000060"}
+{"edge":"Knows","from":"person-000077","to":"person-000012"}
+{"edge":"Contributes","from":"person-000077","to":"project-00002","data":{"hours":110}}
+{"edge":"Contributes","from":"person-000077","to":"project-00000","data":{"hours":62}}
+{"edge":"WorksAt","from":"person-000078","to":"company-00013","data":{"role":"staff","since":"2006-10-04"}}
+{"edge":"Knows","from":"person-000078","to":"person-000043"}
+{"edge":"Knows","from":"person-000078","to":"person-000093"}
+{"edge":"Contributes","from":"person-000078","to":"project-00000","data":{}}
+{"edge":"Contributes","from":"person-000078","to":"project-00016","data":{"hours":378}}
+{"edge":"WorksAt","from":"person-000079","to":"company-00011","data":{"role":"contractor"}}
+{"edge":"WorksAt","from":"person-000079","to":"company-00023","data":{"since":"2011-09-11"}}
+{"edge":"Knows","from":"person-000079","to":"person-000028"}
+{"edge":"Knows","from":"person-000079","to":"person-000008"}
+{"edge":"Knows","from":"person-000079","to":"person-000172"}
+{"edge":"Knows","from":"person-000079","to":"person-000062"}
+{"edge":"Contributes","from":"person-000079","to":"project-00022","data":{"hours":11}}
+{"edge":"Contributes","from":"person-000079","to":"project-00012","data":{"hours":298}}
+{"edge":"WorksAt","from":"person-000080","to":"company-00003","data":{"role":"staff","since":"2002-05-06"}}
+{"edge":"Knows","from":"person-000080","to":"person-000141"}
+{"edge":"Contributes","from":"person-000080","to":"project-00024","data":{"hours":129}}
+{"edge":"Contributes","from":"person-000080","to":"project-00009","data":{"hours":354}}
+{"edge":"WorksAt","from":"person-000081","to":"company-00014","data":{"role":"staff"}}
+{"edge":"Knows","from":"person-000081","to":"person-000124"}
+{"edge":"Contributes","from":"person-000081","to":"project-00002","data":{"hours":331}}
+{"edge":"Contributes","from":"person-000081","to":"project-00004","data":{"hours":201}}
+{"edge":"Contributes","from":"person-000081","to":"project-00011","data":{"hours":82}}
+{"edge":"WorksAt","from":"person-000082","to":"company-00012","data":{"role":"lead","since":"2019-09-03"}}
+{"edge":"Knows","from":"person-000082","to":"person-000084"}
+{"edge":"Knows","from":"person-000082","to":"person-000135"}
+{"edge":"Contributes","from":"person-000082","to":"project-00019","data":{"hours":302}}
+{"edge":"WorksAt","from":"person-000083","to":"company-00001","data":{"role":"lead","since":"2023-08-11"}}
+{"edge":"WorksAt","from":"person-000083","to":"company-00006","data":{"since":"2011-06-01"}}
+{"edge":"Knows","from":"person-000083","to":"person-000148"}
+{"edge":"Knows","from":"person-000083","to":"person-000123"}
+{"edge":"Contributes","from":"person-000083","to":"project-00014","data":{"hours":312}}
+{"edge":"Contributes","from":"person-000083","to":"project-00001","data":{}}
+{"edge":"WorksAt","from":"person-000084","to":"company-00023","data":{"role":"lead"}}
+{"edge":"Knows","from":"person-000084","to":"person-000016"}
+{"edge":"Knows","from":"person-000084","to":"person-000128"}
+{"edge":"Contributes","from":"person-000084","to":"project-00022","data":{"hours":300}}
+{"edge":"Contributes","from":"person-000084","to":"project-00036","data":{"hours":358}}
+{"edge":"Knows","from":"person-000085","to":"person-000197"}
+{"edge":"Knows","from":"person-000085","to":"person-000024"}
+{"edge":"Knows","from":"person-000085","to":"person-000051"}
+{"edge":"Knows","from":"person-000085","to":"person-000198"}
+{"edge":"Contributes","from":"person-000085","to":"project-00036","data":{"hours":122}}
+{"edge":"Contributes","from":"person-000085","to":"project-00006","data":{"hours":73}}
+{"edge":"Contributes","from":"person-000085","to":"project-00023","data":{"hours":156}}
+{"edge":"WorksAt","from":"person-000086","to":"company-00023","data":{"role":"advisor","since":"2020-04-12"}}
+{"edge":"Knows","from":"person-000086","to":"person-000183"}
+{"edge":"Knows","from":"person-000086","to":"person-000103"}
+{"edge":"Knows","from":"person-000086","to":"person-000085"}
+{"edge":"Knows","from":"person-000086","to":"person-000015"}
+{"edge":"Contributes","from":"person-000086","to":"project-00020","data":{"hours":125}}
+{"edge":"Contributes","from":"person-000086","to":"project-00030","data":{"hours":179}}
+{"edge":"WorksAt","from":"person-000087","to":"company-00004","data":{"role":"lead"}}
+{"edge":"Knows","from":"person-000087","to":"person-000103"}
+{"edge":"Knows","from":"person-000087","to":"person-000114"}
+{"edge":"Knows","from":"person-000087","to":"person-000101"}
+{"edge":"Contributes","from":"person-000087","to":"project-00010","data":{}}
+{"edge":"Contributes","from":"person-000087","to":"project-00037","data":{"hours":158}}
+{"edge":"WorksAt","from":"person-000088","to":"company-00023","data":{"since":"2010-02-07"}}
+{"edge":"Knows","from":"person-000088","to":"person-000020"}
+{"edge":"Knows","from":"person-000088","to":"person-000149"}
+{"edge":"Knows","from":"person-000088","to":"person-000045"}
+{"edge":"Knows","from":"person-000088","to":"person-000077"}
+{"edge":"Contributes","from":"person-000088","to":"project-00029","data":{"hours":354}}
+{"edge":"Contributes","from":"person-000088","to":"project-00022","data":{"hours":35}}
+{"edge":"WorksAt","from":"person-000089","to":"company-00010","data":{"role":"lead"}}
+{"edge":"Knows","from":"person-000089","to":"person-000139"}
+{"edge":"Knows","from":"person-000089","to":"person-000005"}
+{"edge":"Contributes","from":"person-000089","to":"project-00017","data":{"hours":11}}
+{"edge":"WorksAt","from":"person-000090","to":"company-00001","data":{"role":"contractor","since":"2019-05-28"}}
+{"edge":"Knows","from":"person-000090","to":"person-000165"}
+{"edge":"Knows","from":"person-000090","to":"person-000025"}
+{"edge":"Knows","from":"person-000090","to":"person-000050"}
+{"edge":"Knows","from":"person-000090","to":"person-000061"}
+{"edge":"WorksAt","from":"person-000091","to":"company-00019","data":{"role":"staff"}}
+{"edge":"Knows","from":"person-000091","to":"person-000087"}
+{"edge":"Knows","from":"person-000091","to":"person-000184"}
+{"edge":"Knows","from":"person-000091","to":"person-000034"}
+{"edge":"Knows","from":"person-000091","to":"person-000001"}
+{"edge":"Contributes","from":"person-000091","to":"project-00017","data":{"hours":8}}
+{"edge":"WorksAt","from":"person-000092","to":"company-00000","data":{"role":"lead","since":"2023-01-21"}}
+{"edge":"Knows","from":"person-000092","to":"person-000103"}
+{"edge":"Knows","from":"person-000092","to":"person-000156"}
+{"edge":"Knows","from":"person-000092","to":"person-000173"}
+{"edge":"Contributes","from":"person-000092","to":"project-00011","data":{"hours":24}}
+{"edge":"Contributes","from":"person-000092","to":"project-00003","data":{}}
+{"edge":"WorksAt","from":"person-000093","to":"company-00010","data":{"role":"contractor","since":"2012-05-15"}}
+{"edge":"WorksAt","from":"person-000093","to":"company-00024","data":{"role":"staff"}}
+{"edge":"Knows","from":"person-000093","to":"person-000144"}
+{"edge":"Knows","from":"person-000093","to":"person-000167"}
+{"edge":"Contributes","from":"person-000093","to":"project-00003","data":{"hours":371}}
+{"edge":"Contributes","from":"person-000093","to":"project-00026","data":{"hours":81}}
+{"edge":"Contributes","from":"person-000094","to":"project-00013","data":{}}
+{"edge":"Knows","from":"person-000095","to":"person-000092"}
+{"edge":"Knows","from":"person-000095","to":"person-000108"}
+{"edge":"Contributes","from":"person-000095","to":"project-00034","data":{"hours":79}}
+{"edge":"Contributes","from":"person-000095","to":"project-00037","data":{"hours":309}}
+{"edge":"WorksAt","from":"person-000096","to":"company-00010","data":{}}
+{"edge":"WorksAt","from":"person-000096","to":"company-00007","data":{"role":"contractor","since":"2024-11-10"}}
+{"edge":"Knows","from":"person-000096","to":"person-000180"}
+{"edge":"Knows","from":"person-000096","to":"person-000116"}
+{"edge":"Knows","from":"person-000096","to":"person-000143"}
+{"edge":"Knows","from":"person-000096","to":"person-000071"}
+{"edge":"Contributes","from":"person-000096","to":"project-00033","data":{}}
+{"edge":"Contributes","from":"person-000096","to":"project-00017","data":{}}
+{"edge":"WorksAt","from":"person-000097","to":"company-00003","data":{"role":"advisor"}}
+{"edge":"Knows","from":"person-000097","to":"person-000102"}
+{"edge":"Knows","from":"person-000098","to":"person-000034"}
+{"edge":"Knows","from":"person-000098","to":"person-000031"}
+{"edge":"Knows","from":"person-000098","to":"person-000015"}
+{"edge":"Knows","from":"person-000098","to":"person-000139"}
+{"edge":"Contributes","from":"person-000098","to":"project-00035","data":{"hours":133}}
+{"edge":"WorksAt","from":"person-000099","to":"company-00011","data":{"role":"lead","since":"2023-03-17"}}
+{"edge":"WorksAt","from":"person-000099","to":"company-00023","data":{"role":"staff","since":"2022-04-15"}}
+{"edge":"Knows","from":"person-000099","to":"person-000054"}
+{"edge":"Knows","from":"person-000099","to":"person-000162"}
+{"edge":"Knows","from":"person-000099","to":"person-000088"}
+{"edge":"Contributes","from":"person-000099","to":"project-00029","data":{"hours":14}}
+{"edge":"Contributes","from":"person-000099","to":"project-00013","data":{}}
+{"edge":"Contributes","from":"person-000099","to":"project-00020","data":{"hours":34}}
+{"edge":"WorksAt","from":"person-000100","to":"company-00021","data":{"role":"advisor"}}
+{"edge":"Knows","from":"person-000100","to":"person-000096"}
+{"edge":"Knows","from":"person-000100","to":"person-000104"}
+{"edge":"Knows","from":"person-000100","to":"person-000168"}
+{"edge":"Knows","from":"person-000100","to":"person-000160"}
+{"edge":"Contributes","from":"person-000100","to":"project-00001","data":{"hours":135}}
+{"edge":"WorksAt","from":"person-000101","to":"company-00007","data":{"role":"lead","since":"2010-07-21"}}
+{"edge":"Knows","from":"person-000101","to":"person-000076"}
+{"edge":"Knows","from":"person-000101","to":"person-000127"}
+{"edge":"Contributes","from":"person-000101","to":"project-00036","data":{"hours":245}}
+{"edge":"WorksAt","from":"person-000102","to":"company-00024","data":{"role":"lead","since":"2009-02-11"}}
+{"edge":"Contributes","from":"person-000102","to":"project-00015","data":{"hours":306}}
+{"edge":"Contributes","from":"person-000102","to":"project-00010","data":{"hours":109}}
+{"edge":"Contributes","from":"person-000102","to":"project-00020","data":{"hours":108}}
+{"edge":"WorksAt","from":"person-000103","to":"company-00001","data":{"role":"contractor"}}
+{"edge":"Knows","from":"person-000103","to":"person-000076"}
+{"edge":"Knows","from":"person-000104","to":"person-000002"}
+{"edge":"Contributes","from":"person-000104","to":"project-00019","data":{}}
+{"edge":"WorksAt","from":"person-000105","to":"company-00003","data":{"role":"lead","since":"2012-02-14"}}
+{"edge":"Knows","from":"person-000105","to":"person-000164"}
+{"edge":"Knows","from":"person-000105","to":"person-000170"}
+{"edge":"Contributes","from":"person-000105","to":"project-00021","data":{"hours":322}}
+{"edge":"Contributes","from":"person-000105","to":"project-00002","data":{"hours":20}}
+{"edge":"Contributes","from":"person-000105","to":"project-00037","data":{}}
+{"edge":"WorksAt","from":"person-000106","to":"company-00007","data":{"role":"contractor","since":"2023-01-02"}}
+{"edge":"WorksAt","from":"person-000106","to":"company-00018","data":{"role":"advisor"}}
+{"edge":"WorksAt","from":"person-000107","to":"company-00004","data":{"since":"2005-04-22"}}
+{"edge":"Knows","from":"person-000107","to":"person-000037"}
+{"edge":"Knows","from":"person-000107","to":"person-000162"}
+{"edge":"Knows","from":"person-000107","to":"person-000188"}
+{"edge":"Knows","from":"person-000107","to":"person-000139"}
+{"edge":"WorksAt","from":"person-000108","to":"company-00011","data":{"role":"staff","since":"2006-04-24"}}
+{"edge":"WorksAt","from":"person-000108","to":"company-00015","data":{"role":"staff"}}
+{"edge":"Knows","from":"person-000108","to":"person-000003"}
+{"edge":"Contributes","from":"person-000108","to":"project-00017","data":{"hours":101}}
+{"edge":"Contributes","from":"person-000108","to":"project-00004","data":{"hours":209}}
+{"edge":"WorksAt","from":"person-000109","to":"company-00011","data":{"role":"staff","since":"2001-11-15"}}
+{"edge":"WorksAt","from":"person-000109","to":"company-00008","data":{}}
+{"edge":"Knows","from":"person-000109","to":"person-000176"}
+{"edge":"Knows","from":"person-000109","to":"person-000105"}
+{"edge":"Contributes","from":"person-000109","to":"project-00025","data":{"hours":215}}
+{"edge":"Contributes","from":"person-000109","to":"project-00027","data":{"hours":78}}
+{"edge":"WorksAt","from":"person-000110","to":"company-00024","data":{"role":"contractor","since":"2025-03-21"}}
+{"edge":"Contributes","from":"person-000110","to":"project-00038","data":{"hours":131}}
+{"edge":"WorksAt","from":"person-000111","to":"company-00023","data":{"role":"lead","since":"2021-02-03"}}
+{"edge":"WorksAt","from":"person-000111","to":"company-00012","data":{"since":"2022-01-13"}}
+{"edge":"Knows","from":"person-000111","to":"person-000083"}
+{"edge":"Knows","from":"person-000111","to":"person-000175"}
+{"edge":"Knows","from":"person-000111","to":"person-000165"}
+{"edge":"Knows","from":"person-000111","to":"person-000113"}
+{"edge":"Contributes","from":"person-000111","to":"project-00029","data":{}}
+{"edge":"Contributes","from":"person-000111","to":"project-00036","data":{"hours":241}}
+{"edge":"WorksAt","from":"person-000112","to":"company-00010","data":{"since":"2007-11-26"}}
+{"edge":"WorksAt","from":"person-000112","to":"company-00018","data":{"role":"contractor","since":"2002-07-17"}}
+{"edge":"Knows","from":"person-000112","to":"person-000156"}
+{"edge":"Knows","from":"person-000112","to":"person-000168"}
+{"edge":"Contributes","from":"person-000112","to":"project-00004","data":{"hours":314}}
+{"edge":"Contributes","from":"person-000112","to":"project-00034","data":{"hours":135}}
+{"edge":"WorksAt","from":"person-000113","to":"company-00023","data":{"role":"advisor","since":"2015-10-08"}}
+{"edge":"Knows","from":"person-000113","to":"person-000016"}
+{"edge":"Contributes","from":"person-000113","to":"project-00033","data":{"hours":188}}
+{"edge":"Contributes","from":"person-000113","to":"project-00013","data":{"hours":89}}
+{"edge":"WorksAt","from":"person-000114","to":"company-00021","data":{"role":"contractor"}}
+{"edge":"Contributes","from":"person-000114","to":"project-00024","data":{"hours":220}}
+{"edge":"Contributes","from":"person-000114","to":"project-00023","data":{}}
+{"edge":"WorksAt","from":"person-000115","to":"company-00022","data":{"role":"advisor","since":"2011-06-22"}}
+{"edge":"Knows","from":"person-000115","to":"person-000133"}
+{"edge":"Knows","from":"person-000115","to":"person-000077"}
+{"edge":"Knows","from":"person-000115","to":"person-000169"}
+{"edge":"WorksAt","from":"person-000116","to":"company-00012","data":{"role":"advisor","since":"2022-02-15"}}
+{"edge":"Knows","from":"person-000116","to":"person-000187"}
+{"edge":"Knows","from":"person-000116","to":"person-000044"}
+{"edge":"Knows","from":"person-000116","to":"person-000194"}
+{"edge":"Contributes","from":"person-000116","to":"project-00000","data":{"hours":188}}
+{"edge":"WorksAt","from":"person-000117","to":"company-00016","data":{"role":"lead","since":"2016-06-26"}}
+{"edge":"Knows","from":"person-000117","to":"person-000064"}
+{"edge":"Knows","from":"person-000117","to":"person-000004"}
+{"edge":"Knows","from":"person-000117","to":"person-000142"}
+{"edge":"Contributes","from":"person-000117","to":"project-00000","data":{"hours":30}}
+{"edge":"WorksAt","from":"person-000118","to":"company-00005","data":{}}
+{"edge":"WorksAt","from":"person-000118","to":"company-00009","data":{"role":"advisor"}}
+{"edge":"Knows","from":"person-000118","to":"person-000112"}
+{"edge":"Knows","from":"person-000118","to":"person-000023"}
+{"edge":"Contributes","from":"person-000118","to":"project-00005","data":{"hours":149}}
+{"edge":"Contributes","from":"person-000118","to":"project-00012","data":{"hours":191}}
+{"edge":"Contributes","from":"person-000118","to":"project-00008","data":{"hours":368}}
+{"edge":"WorksAt","from":"person-000119","to":"company-00012","data":{"role":"advisor"}}
+{"edge":"Knows","from":"person-000119","to":"person-000104"}
+{"edge":"Knows","from":"person-000119","to":"person-000110"}
+{"edge":"Contributes","from":"person-000119","to":"project-00022","data":{"hours":297}}
+{"edge":"Contributes","from":"person-000119","to":"project-00015","data":{}}
+{"edge":"WorksAt","from":"person-000120","to":"company-00006","data":{"since":"2021-04-11"}}
+{"edge":"WorksAt","from":"person-000120","to":"company-00022","data":{"role":"staff"}}
+{"edge":"Knows","from":"person-000120","to":"person-000097"}
+{"edge":"Knows","from":"person-000120","to":"person-000100"}
+{"edge":"Knows","from":"person-000120","to":"person-000134"}
+{"edge":"Contributes","from":"person-000120","to":"project-00031","data":{"hours":237}}
+{"edge":"Contributes","from":"person-000120","to":"project-00001","data":{"hours":359}}
+{"edge":"Contributes","from":"person-000120","to":"project-00006","data":{"hours":213}}
+{"edge":"WorksAt","from":"person-000121","to":"company-00005","data":{"role":"staff","since":"2015-03-17"}}
+{"edge":"Contributes","from":"person-000121","to":"project-00012","data":{"hours":21}}
+{"edge":"WorksAt","from":"person-000122","to":"company-00017","data":{"role":"advisor","since":"2024-08-04"}}
+{"edge":"Contributes","from":"person-000122","to":"project-00004","data":{"hours":8}}
+{"edge":"Knows","from":"person-000123","to":"person-000022"}
+{"edge":"Knows","from":"person-000123","to":"person-000192"}
+{"edge":"Knows","from":"person-000123","to":"person-000055"}
+{"edge":"Contributes","from":"person-000123","to":"project-00003","data":{"hours":29}}
+{"edge":"Contributes","from":"person-000123","to":"project-00012","data":{"hours":383}}
+{"edge":"Contributes","from":"person-000123","to":"project-00021","data":{"hours":299}}
+{"edge":"WorksAt","from":"person-000124","to":"company-00013","data":{"role":"staff","since":"2004-06-11"}}
+{"edge":"Knows","from":"person-000124","to":"person-000132"}
+{"edge":"WorksAt","from":"person-000125","to":"company-00017","data":{"role":"advisor","since":"2002-06-13"}}
+{"edge":"Knows","from":"person-000125","to":"person-000169"}
+{"edge":"Knows","from":"person-000125","to":"person-000076"}
+{"edge":"Contributes","from":"person-000125","to":"project-00032","data":{"hours":128}}
+{"edge":"Contributes","from":"person-000125","to":"project-00026","data":{"hours":224}}
+{"edge":"Contributes","from":"person-000125","to":"project-00003","data":{"hours":132}}
+{"edge":"WorksAt","from":"person-000126","to":"company-00006","data":{"role":"lead"}}
+{"edge":"Knows","from":"person-000126","to":"person-000166"}
+{"edge":"Knows","from":"person-000126","to":"person-000095"}
+{"edge":"Knows","from":"person-000126","to":"person-000118"}
+{"edge":"Knows","from":"person-000126","to":"person-000168"}
+{"edge":"Contributes","from":"person-000126","to":"project-00037","data":{"hours":175}}
+{"edge":"Contributes","from":"person-000126","to":"project-00009","data":{"hours":362}}
+{"edge":"Contributes","from":"person-000126","to":"project-00023","data":{"hours":27}}
+{"edge":"WorksAt","from":"person-000127","to":"company-00000","data":{}}
+{"edge":"Knows","from":"person-000127","to":"person-000082"}
+{"edge":"Knows","from":"person-000127","to":"person-000009"}
+{"edge":"Knows","from":"person-000127","to":"person-000070"}
+{"edge":"Knows","from":"person-000127","to":"person-000056"}
+{"edge":"Contributes","from":"person-000127","to":"project-00018","data":{"hours":304}}
+{"edge":"Contributes","from":"person-000127","to":"project-00012","data":{"hours":208}}
+{"edge":"Contributes","from":"person-000127","to":"project-00013","data":{"hours":228}}
+{"edge":"WorksAt","from":"person-000128","to":"company-00006","data":{"role":"staff"}}
+{"edge":"WorksAt","from":"person-000129","to":"company-00002","data":{"since":"2000-12-18"}}
+{"edge":"Knows","from":"person-000129","to":"person-000127"}
+{"edge":"Contributes","from":"person-000129","to":"project-00018","data":{"hours":274}}
+{"edge":"WorksAt","from":"person-000130","to":"company-00004","data":{"role":"lead","since":"2014-02-07"}}
+{"edge":"WorksAt","from":"person-000131","to":"company-00007","data":{"role":"advisor","since":"2014-11-14"}}
+{"edge":"Knows","from":"person-000131","to":"person-000014"}
+{"edge":"Contributes","from":"person-000131","to":"project-00002","data":{}}
+{"edge":"WorksAt","from":"person-000132","to":"company-00009","data":{"role":"lead","since":"2025-06-23"}}
+{"edge":"Knows","from":"person-000132","to":"person-000184"}
+{"edge":"Knows","from":"person-000132","to":"person-000039"}
+{"edge":"Knows","from":"person-000132","to":"person-000079"}
+{"edge":"Knows","from":"person-000132","to":"person-000066"}
+{"edge":"Contributes","from":"person-000132","to":"project-00035","data":{}}
+{"edge":"Contributes","from":"person-000132","to":"project-00013","data":{"hours":119}}
+{"edge":"WorksAt","from":"person-000133","to":"company-00001","data":{"role":"advisor","since":"2020-05-08"}}
+{"edge":"Knows","from":"person-000133","to":"person-000177"}
+{"edge":"Knows","from":"person-000133","to":"person-000023"}
+{"edge":"Knows","from":"person-000133","to":"person-000050"}
+{"edge":"Knows","from":"person-000133","to":"person-000118"}
+{"edge":"Contributes","from":"person-000133","to":"project-00011","data":{"hours":348}}
+{"edge":"WorksAt","from":"person-000134","to":"company-00003","data":{"role":"staff","since":"2003-11-07"}}
+{"edge":"Knows","from":"person-000134","to":"person-000018"}
+{"edge":"Knows","from":"person-000134","to":"person-000074"}
+{"edge":"Knows","from":"person-000134","to":"person-000125"}
+{"edge":"Contributes","from":"person-000134","to":"project-00001","data":{"hours":48}}
+{"edge":"Contributes","from":"person-000134","to":"project-00031","data":{"hours":144}}
+{"edge":"WorksAt","from":"person-000135","to":"company-00019","data":{"since":"2002-04-05"}}
+{"edge":"Knows","from":"person-000135","to":"person-000069"}
+{"edge":"Knows","from":"person-000135","to":"person-000196"}
+{"edge":"Knows","from":"person-000135","to":"person-000195"}
+{"edge":"Contributes","from":"person-000135","to":"project-00037","data":{"hours":17}}
+{"edge":"WorksAt","from":"person-000136","to":"company-00019","data":{"role":"staff","since":"2004-11-10"}}
+{"edge":"WorksAt","from":"person-000136","to":"company-00003","data":{"role":"staff"}}
+{"edge":"Knows","from":"person-000136","to":"person-000115"}
+{"edge":"Knows","from":"person-000136","to":"person-000123"}
+{"edge":"Contributes","from":"person-000136","to":"project-00021","data":{"hours":92}}
+{"edge":"Knows","from":"person-000137","to":"person-000017"}
+{"edge":"Knows","from":"person-000137","to":"person-000185"}
+{"edge":"Contributes","from":"person-000137","to":"project-00006","data":{"hours":305}}
+{"edge":"Contributes","from":"person-000137","to":"project-00035","data":{"hours":19}}
+{"edge":"Contributes","from":"person-000137","to":"project-00007","data":{}}
+{"edge":"WorksAt","from":"person-000138","to":"company-00018","data":{"role":"contractor","since":"2004-07-19"}}
+{"edge":"WorksAt","from":"person-000138","to":"company-00003","data":{"role":"advisor"}}
+{"edge":"Knows","from":"person-000138","to":"person-000092"}
+{"edge":"Contributes","from":"person-000138","to":"project-00005","data":{"hours":331}}
+{"edge":"WorksAt","from":"person-000139","to":"company-00009","data":{"role":"lead"}}
+{"edge":"Contributes","from":"person-000139","to":"project-00007","data":{}}
+{"edge":"WorksAt","from":"person-000140","to":"company-00017","data":{}}
+{"edge":"Knows","from":"person-000140","to":"person-000062"}
+{"edge":"Knows","from":"person-000140","to":"person-000041"}
+{"edge":"Knows","from":"person-000140","to":"person-000145"}
+{"edge":"WorksAt","from":"person-000141","to":"company-00008","data":{"role":"lead"}}
+{"edge":"WorksAt","from":"person-000141","to":"company-00011","data":{}}
+{"edge":"Knows","from":"person-000141","to":"person-000061"}
+{"edge":"Contributes","from":"person-000141","to":"project-00006","data":{}}
+{"edge":"Knows","from":"person-000142","to":"person-000179"}
+{"edge":"Knows","from":"person-000142","to":"person-000146"}
+{"edge":"Knows","from":"person-000142","to":"person-000053"}
+{"edge":"Contributes","from":"person-000142","to":"project-00005","data":{"hours":79}}
+{"edge":"WorksAt","from":"person-000143","to":"company-00000","data":{"role":"contractor","since":"2016-02-10"}}
+{"edge":"Knows","from":"person-000143","to":"person-000030"}
+{"edge":"Knows","from":"person-000143","to":"person-000021"}
+{"edge":"Knows","from":"person-000143","to":"person-000169"}
+{"edge":"Knows","from":"person-000143","to":"person-000148"}
+{"edge":"Contributes","from":"person-000143","to":"project-00014","data":{"hours":397}}
+{"edge":"WorksAt","from":"person-000144","to":"company-00022","data":{"role":"lead"}}
+{"edge":"WorksAt","from":"person-000144","to":"company-00001","data":{"role":"advisor","since":"2001-04-20"}}
+{"edge":"Knows","from":"person-000144","to":"person-000077"}
+{"edge":"Contributes","from":"person-000144","to":"project-00005","data":{"hours":94}}
+{"edge":"Contributes","from":"person-000144","to":"project-00029","data":{}}
+{"edge":"WorksAt","from":"person-000145","to":"company-00013","data":{"role":"staff"}}
+{"edge":"Knows","from":"person-000145","to":"person-000037"}
+{"edge":"Contributes","from":"person-000145","to":"project-00009","data":{"hours":395}}
+{"edge":"WorksAt","from":"person-000146","to":"company-00006","data":{"role":"lead","since":"2021-06-23"}}
+{"edge":"WorksAt","from":"person-000147","to":"company-00001","data":{"role":"contractor","since":"2010-02-25"}}
+{"edge":"Knows","from":"person-000147","to":"person-000162"}
+{"edge":"Knows","from":"person-000147","to":"person-000016"}
+{"edge":"Knows","from":"person-000147","to":"person-000050"}
+{"edge":"Knows","from":"person-000147","to":"person-000160"}
+{"edge":"WorksAt","from":"person-000148","to":"company-00013","data":{"role":"staff","since":"2011-10-06"}}
+{"edge":"Knows","from":"person-000148","to":"person-000172"}
+{"edge":"Knows","from":"person-000148","to":"person-000197"}
+{"edge":"Knows","from":"person-000148","to":"person-000190"}
+{"edge":"Contributes","from":"person-000148","to":"project-00008","data":{"hours":382}}
+{"edge":"Contributes","from":"person-000148","to":"project-00016","data":{"hours":349}}
+{"edge":"Contributes","from":"person-000148","to":"project-00019","data":{"hours":223}}
+{"edge":"WorksAt","from":"person-000149","to":"company-00020","data":{}}
+{"edge":"Knows","from":"person-000149","to":"person-000136"}
+{"edge":"Knows","from":"person-000149","to":"person-000167"}
+{"edge":"Knows","from":"person-000149","to":"person-000161"}
+{"edge":"Knows","from":"person-000149","to":"person-000029"}
+{"edge":"WorksAt","from":"person-000150","to":"company-00024","data":{"role":"lead"}}
+{"edge":"Knows","from":"person-000150","to":"person-000117"}
+{"edge":"Knows","from":"person-000150","to":"person-000143"}
+{"edge":"Knows","from":"person-000150","to":"person-000060"}
+{"edge":"Knows","from":"person-000150","to":"person-000126"}
+{"edge":"WorksAt","from":"person-000151","to":"company-00021","data":{"role":"contractor","since":"2021-06-27"}}
+{"edge":"Knows","from":"person-000151","to":"person-000103"}
+{"edge":"Knows","from":"person-000151","to":"person-000022"}
+{"edge":"Knows","from":"person-000151","to":"person-000058"}
+{"edge":"Contributes","from":"person-000151","to":"project-00038","data":{"hours":3}}
+{"edge":"Contributes","from":"person-000151","to":"project-00027","data":{"hours":310}}
+{"edge":"Contributes","from":"person-000152","to":"project-00026","data":{"hours":172}}
+{"edge":"Contributes","from":"person-000152","to":"project-00038","data":{"hours":43}}
+{"edge":"Contributes","from":"person-000152","to":"project-00019","data":{"hours":239}}
+{"edge":"WorksAt","from":"person-000153","to":"company-00001","data":{"role":"advisor"}}
+{"edge":"WorksAt","from":"person-000153","to":"company-00009","data":{"role":"advisor"}}
+{"edge":"Knows","from":"person-000153","to":"person-000104"}
+{"edge":"Knows","from":"person-000153","to":"person-000169"}
+{"edge":"Knows","from":"person-000153","to":"person-000137"}
+{"edge":"Contributes","from":"person-000153","to":"project-00007","data":{"hours":322}}
+{"edge":"Knows","from":"person-000154","to":"person-000047"}
+{"edge":"Knows","from":"person-000154","to":"person-000099"}
+{"edge":"Knows","from":"person-000154","to":"person-000069"}
+{"edge":"Contributes","from":"person-000154","to":"project-00009","data":{}}
+{"edge":"Contributes","from":"person-000154","to":"project-00023","data":{"hours":313}}
+{"edge":"WorksAt","from":"person-000155","to":"company-00009","data":{"role":"contractor","since":"2016-10-07"}}
+{"edge":"Knows","from":"person-000155","to":"person-000100"}
+{"edge":"Knows","from":"person-000156","to":"person-000026"}
+{"edge":"Contributes","from":"person-000156","to":"project-00029","data":{"hours":337}}
+{"edge":"WorksAt","from":"person-000157","to":"company-00023","data":{"role":"advisor","since":"2017-12-28"}}
+{"edge":"Knows","from":"person-000157","to":"person-000170"}
+{"edge":"Knows","from":"person-000157","to":"person-000096"}
+{"edge":"Knows","from":"person-000157","to":"person-000034"}
+{"edge":"Knows","from":"person-000157","to":"person-000192"}
+{"edge":"Contributes","from":"person-000157","to":"project-00026","data":{"hours":170}}
+{"edge":"Contributes","from":"person-000157","to":"project-00004","data":{"hours":152}}
+{"edge":"WorksAt","from":"person-000158","to":"company-00009","data":{"role":"contractor","since":"2025-11-02"}}
+{"edge":"Knows","from":"person-000158","to":"person-000126"}
+{"edge":"Knows","from":"person-000158","to":"person-000093"}
+{"edge":"Knows","from":"person-000158","to":"person-000177"}
+{"edge":"Contributes","from":"person-000159","to":"project-00028","data":{"hours":374}}
+{"edge":"Contributes","from":"person-000159","to":"project-00019","data":{"hours":235}}
+{"edge":"Contributes","from":"person-000159","to":"project-00032","data":{}}
+{"edge":"WorksAt","from":"person-000160","to":"company-00015","data":{"role":"lead"}}
+{"edge":"Knows","from":"person-000160","to":"person-000036"}
+{"edge":"Knows","from":"person-000160","to":"person-000048"}
+{"edge":"WorksAt","from":"person-000161","to":"company-00005","data":{"since":"2008-11-25"}}
+{"edge":"Knows","from":"person-000161","to":"person-000074"}
+{"edge":"WorksAt","from":"person-000162","to":"company-00017","data":{"role":"contractor","since":"2025-11-21"}}
+{"edge":"Knows","from":"person-000162","to":"person-000126"}
+{"edge":"Knows","from":"person-000162","to":"person-000181"}
+{"edge":"Knows","from":"person-000162","to":"person-000092"}
+{"edge":"Contributes","from":"person-000162","to":"project-00020","data":{"hours":254}}
+{"edge":"Contributes","from":"person-000162","to":"project-00010","data":{"hours":273}}
+{"edge":"WorksAt","from":"person-000163","to":"company-00004","data":{"role":"lead","since":"2001-03-10"}}
+{"edge":"Knows","from":"person-000163","to":"person-000043"}
+{"edge":"Knows","from":"person-000163","to":"person-000174"}
+{"edge":"Knows","from":"person-000163","to":"person-000079"}
+{"edge":"Knows","from":"person-000163","to":"person-000013"}
+{"edge":"Contributes","from":"person-000163","to":"project-00024","data":{"hours":96}}
+{"edge":"Contributes","from":"person-000163","to":"project-00023","data":{"hours":244}}
+{"edge":"WorksAt","from":"person-000164","to":"company-00019","data":{"role":"advisor","since":"2012-02-22"}}
+{"edge":"Knows","from":"person-000164","to":"person-000092"}
+{"edge":"Knows","from":"person-000164","to":"person-000100"}
+{"edge":"Contributes","from":"person-000164","to":"project-00024","data":{"hours":105}}
+{"edge":"Contributes","from":"person-000164","to":"project-00030","data":{"hours":319}}
+{"edge":"WorksAt","from":"person-000165","to":"company-00016","data":{"role":"contractor","since":"2024-06-02"}}
+{"edge":"Knows","from":"person-000165","to":"person-000071"}
+{"edge":"Contributes","from":"person-000165","to":"project-00035","data":{"hours":186}}
+{"edge":"Contributes","from":"person-000165","to":"project-00026","data":{"hours":203}}
+{"edge":"Contributes","from":"person-000165","to":"project-00004","data":{"hours":148}}
+{"edge":"Knows","from":"person-000166","to":"person-000115"}
+{"edge":"Knows","from":"person-000166","to":"person-000197"}
+{"edge":"Knows","from":"person-000167","to":"person-000178"}
+{"edge":"Knows","from":"person-000167","to":"person-000145"}
+{"edge":"Knows","from":"person-000167","to":"person-000078"}
+{"edge":"Knows","from":"person-000167","to":"person-000090"}
+{"edge":"Contributes","from":"person-000167","to":"project-00016","data":{"hours":281}}
+{"edge":"Contributes","from":"person-000167","to":"project-00015","data":{}}
+{"edge":"WorksAt","from":"person-000168","to":"company-00021","data":{"role":"staff","since":"2005-11-06"}}
+{"edge":"WorksAt","from":"person-000168","to":"company-00013","data":{"role":"staff","since":"2012-12-27"}}
+{"edge":"Knows","from":"person-000168","to":"person-000102"}
+{"edge":"Knows","from":"person-000168","to":"person-000100"}
+{"edge":"Contributes","from":"person-000168","to":"project-00021","data":{"hours":74}}
+{"edge":"Contributes","from":"person-000168","to":"project-00022","data":{"hours":267}}
+{"edge":"Contributes","from":"person-000168","to":"project-00011","data":{"hours":148}}
+{"edge":"WorksAt","from":"person-000169","to":"company-00006","data":{"role":"advisor","since":"2013-02-17"}}
+{"edge":"Contributes","from":"person-000169","to":"project-00036","data":{"hours":110}}
+{"edge":"WorksAt","from":"person-000170","to":"company-00023","data":{"role":"lead"}}
+{"edge":"WorksAt","from":"person-000170","to":"company-00008","data":{"role":"lead","since":"2009-01-24"}}
+{"edge":"Knows","from":"person-000170","to":"person-000073"}
+{"edge":"Knows","from":"person-000170","to":"person-000033"}
+{"edge":"Knows","from":"person-000170","to":"person-000165"}
+{"edge":"Contributes","from":"person-000170","to":"project-00039","data":{"hours":310}}
+{"edge":"Contributes","from":"person-000170","to":"project-00017","data":{"hours":140}}
+{"edge":"Contributes","from":"person-000170","to":"project-00004","data":{"hours":115}}
+{"edge":"WorksAt","from":"person-000171","to":"company-00003","data":{"role":"advisor","since":"2025-02-12"}}
+{"edge":"Knows","from":"person-000172","to":"person-000055"}
+{"edge":"Knows","from":"person-000172","to":"person-000000"}
+{"edge":"Contributes","from":"person-000172","to":"project-00008","data":{"hours":229}}
+{"edge":"Contributes","from":"person-000172","to":"project-00028","data":{"hours":305}}
+{"edge":"Contributes","from":"person-000172","to":"project-00017","data":{"hours":21}}
+{"edge":"WorksAt","from":"person-000173","to":"company-00014","data":{"role":"contractor"}}
+{"edge":"WorksAt","from":"person-000173","to":"company-00003","data":{"role":"advisor","since":"2016-10-08"}}
+{"edge":"Knows","from":"person-000173","to":"person-000142"}
+{"edge":"Contributes","from":"person-000173","to":"project-00018","data":{"hours":296}}
+{"edge":"WorksAt","from":"person-000174","to":"company-00022","data":{"role":"lead","since":"2000-09-09"}}
+{"edge":"WorksAt","from":"person-000174","to":"company-00000","data":{"role":"contractor","since":"2020-05-24"}}
+{"edge":"WorksAt","from":"person-000175","to":"company-00012","data":{"since":"2013-04-22"}}
+{"edge":"Contributes","from":"person-000175","to":"project-00034","data":{"hours":129}}
+{"edge":"Contributes","from":"person-000175","to":"project-00021","data":{}}
+{"edge":"WorksAt","from":"person-000176","to":"company-00018","data":{"role":"lead","since":"2021-12-20"}}
+{"edge":"Knows","from":"person-000176","to":"person-000048"}
+{"edge":"Knows","from":"person-000176","to":"person-000087"}
+{"edge":"Knows","from":"person-000176","to":"person-000157"}
+{"edge":"Contributes","from":"person-000176","to":"project-00007","data":{"hours":145}}
+{"edge":"WorksAt","from":"person-000177","to":"company-00002","data":{}}
+{"edge":"Knows","from":"person-000177","to":"person-000180"}
+{"edge":"Contributes","from":"person-000177","to":"project-00016","data":{"hours":387}}
+{"edge":"WorksAt","from":"person-000178","to":"company-00023","data":{"role":"staff","since":"2023-10-24"}}
+{"edge":"WorksAt","from":"person-000179","to":"company-00006","data":{"role":"contractor"}}
+{"edge":"Knows","from":"person-000179","to":"person-000067"}
+{"edge":"Knows","from":"person-000179","to":"person-000142"}
+{"edge":"Knows","from":"person-000179","to":"person-000090"}
+{"edge":"Knows","from":"person-000179","to":"person-000160"}
+{"edge":"Contributes","from":"person-000179","to":"project-00036","data":{"hours":182}}
+{"edge":"WorksAt","from":"person-000180","to":"company-00003","data":{"role":"staff","since":"2022-06-14"}}
+{"edge":"Contributes","from":"person-000180","to":"project-00006","data":{"hours":242}}
+{"edge":"Contributes","from":"person-000180","to":"project-00021","data":{"hours":43}}
+{"edge":"Contributes","from":"person-000180","to":"project-00009","data":{"hours":164}}
+{"edge":"WorksAt","from":"person-000181","to":"company-00004","data":{"role":"staff","since":"2008-09-13"}}
+{"edge":"Knows","from":"person-000181","to":"person-000090"}
+{"edge":"Contributes","from":"person-000181","to":"project-00001","data":{"hours":266}}
+{"edge":"Contributes","from":"person-000181","to":"project-00012","data":{"hours":375}}
+{"edge":"WorksAt","from":"person-000182","to":"company-00005","data":{"role":"contractor"}}
+{"edge":"WorksAt","from":"person-000183","to":"company-00023","data":{"since":"2000-01-27"}}
+{"edge":"Contributes","from":"person-000183","to":"project-00002","data":{"hours":37}}
+{"edge":"Contributes","from":"person-000183","to":"project-00013","data":{"hours":174}}
+{"edge":"Contributes","from":"person-000183","to":"project-00036","data":{"hours":237}}
+{"edge":"WorksAt","from":"person-000184","to":"company-00024","data":{"role":"lead"}}
+{"edge":"Knows","from":"person-000184","to":"person-000090"}
+{"edge":"Contributes","from":"person-000184","to":"project-00006","data":{"hours":226}}
+{"edge":"Contributes","from":"person-000184","to":"project-00037","data":{"hours":300}}
+{"edge":"Contributes","from":"person-000184","to":"project-00008","data":{"hours":351}}
+{"edge":"WorksAt","from":"person-000185","to":"company-00024","data":{"role":"staff","since":"2023-01-28"}}
+{"edge":"Knows","from":"person-000185","to":"person-000043"}
+{"edge":"Knows","from":"person-000185","to":"person-000102"}
+{"edge":"Knows","from":"person-000185","to":"person-000166"}
+{"edge":"Contributes","from":"person-000185","to":"project-00030","data":{"hours":242}}
+{"edge":"WorksAt","from":"person-000186","to":"company-00004","data":{"role":"contractor","since":"2002-12-08"}}
+{"edge":"WorksAt","from":"person-000186","to":"company-00003","data":{"role":"lead"}}
+{"edge":"Knows","from":"person-000186","to":"person-000190"}
+{"edge":"Knows","from":"person-000186","to":"person-000057"}
+{"edge":"Knows","from":"person-000186","to":"person-000162"}
+{"edge":"Knows","from":"person-000186","to":"person-000189"}
+{"edge":"WorksAt","from":"person-000187","to":"company-00003","data":{"role":"lead","since":"2001-08-02"}}
+{"edge":"Knows","from":"person-000187","to":"person-000061"}
+{"edge":"Knows","from":"person-000187","to":"person-000056"}
+{"edge":"Knows","from":"person-000187","to":"person-000198"}
+{"edge":"WorksAt","from":"person-000188","to":"company-00020","data":{"role":"contractor"}}
+{"edge":"WorksAt","from":"person-000188","to":"company-00018","data":{"role":"lead","since":"2015-02-25"}}
+{"edge":"Contributes","from":"person-000188","to":"project-00009","data":{"hours":84}}
+{"edge":"WorksAt","from":"person-000189","to":"company-00016","data":{"role":"staff","since":"2012-01-03"}}
+{"edge":"WorksAt","from":"person-000189","to":"company-00010","data":{"role":"staff","since":"2026-02-17"}}
+{"edge":"Knows","from":"person-000189","to":"person-000158"}
+{"edge":"Knows","from":"person-000189","to":"person-000156"}
+{"edge":"Knows","from":"person-000189","to":"person-000152"}
+{"edge":"Knows","from":"person-000189","to":"person-000137"}
+{"edge":"Knows","from":"person-000190","to":"person-000157"}
+{"edge":"Knows","from":"person-000190","to":"person-000074"}
+{"edge":"Knows","from":"person-000190","to":"person-000117"}
+{"edge":"Knows","from":"person-000190","to":"person-000101"}
+{"edge":"WorksAt","from":"person-000191","to":"company-00023","data":{"role":"staff"}}
+{"edge":"WorksAt","from":"person-000191","to":"company-00006","data":{"since":"2014-04-04"}}
+{"edge":"Knows","from":"person-000191","to":"person-000171"}
+{"edge":"Contributes","from":"person-000191","to":"project-00007","data":{"hours":181}}
+{"edge":"Contributes","from":"person-000191","to":"project-00039","data":{"hours":45}}
+{"edge":"Contributes","from":"person-000191","to":"project-00005","data":{"hours":52}}
+{"edge":"Knows","from":"person-000192","to":"person-000070"}
+{"edge":"Knows","from":"person-000192","to":"person-000077"}
+{"edge":"Contributes","from":"person-000192","to":"project-00018","data":{"hours":296}}
+{"edge":"Contributes","from":"person-000192","to":"project-00009","data":{"hours":394}}
+{"edge":"WorksAt","from":"person-000193","to":"company-00000","data":{"role":"staff"}}
+{"edge":"Contributes","from":"person-000193","to":"project-00033","data":{"hours":209}}
+{"edge":"WorksAt","from":"person-000194","to":"company-00018","data":{"role":"lead","since":"2023-02-01"}}
+{"edge":"WorksAt","from":"person-000194","to":"company-00020","data":{"role":"staff","since":"2000-11-22"}}
+{"edge":"Knows","from":"person-000194","to":"person-000110"}
+{"edge":"WorksAt","from":"person-000195","to":"company-00019","data":{"role":"advisor","since":"2022-03-09"}}
+{"edge":"Knows","from":"person-000195","to":"person-000089"}
+{"edge":"Knows","from":"person-000195","to":"person-000007"}
+{"edge":"Contributes","from":"person-000195","to":"project-00024","data":{}}
+{"edge":"Contributes","from":"person-000195","to":"project-00006","data":{}}
+{"edge":"WorksAt","from":"person-000196","to":"company-00024","data":{"since":"2024-06-09"}}
+{"edge":"Knows","from":"person-000196","to":"person-000003"}
+{"edge":"Contributes","from":"person-000196","to":"project-00034","data":{"hours":183}}
+{"edge":"Contributes","from":"person-000196","to":"project-00001","data":{"hours":169}}
+{"edge":"Contributes","from":"person-000196","to":"project-00021","data":{}}
+{"edge":"WorksAt","from":"person-000197","to":"company-00010","data":{"role":"staff","since":"2003-01-27"}}
+{"edge":"Knows","from":"person-000197","to":"person-000108"}
+{"edge":"Knows","from":"person-000197","to":"person-000160"}
+{"edge":"Contributes","from":"person-000197","to":"project-00023","data":{"hours":235}}
+{"edge":"Contributes","from":"person-000197","to":"project-00004","data":{}}
+{"edge":"WorksAt","from":"person-000198","to":"company-00001","data":{}}
+{"edge":"WorksAt","from":"person-000198","to":"company-00020","data":{"role":"contractor","since":"2016-12-25"}}
+{"edge":"Contributes","from":"person-000198","to":"project-00013","data":{"hours":7}}
+{"edge":"WorksAt","from":"person-000199","to":"company-00013","data":{"role":"staff","since":"2005-10-15"}}
+{"edge":"Knows","from":"person-000199","to":"person-000175"}
+{"edge":"Knows","from":"person-000199","to":"person-000042"}
+{"edge":"Knows","from":"person-000199","to":"person-000176"}
+{"edge":"Knows","from":"person-000199","to":"person-000190"}
+{"edge":"Contributes","from":"person-000199","to":"project-00025","data":{"hours":15}}
+{"edge":"Contributes","from":"person-000199","to":"project-00015","data":{}}
+{"edge":"Owns","from":"company-00006","to":"project-00000"}
+{"edge":"Owns","from":"company-00020","to":"project-00001"}
+{"edge":"Owns","from":"company-00008","to":"project-00002"}
+{"edge":"Owns","from":"company-00019","to":"project-00003"}
+{"edge":"Owns","from":"company-00020","to":"project-00004"}
+{"edge":"Owns","from":"company-00020","to":"project-00005"}
+{"edge":"Owns","from":"company-00023","to":"project-00006"}
+{"edge":"Owns","from":"company-00018","to":"project-00007"}
+{"edge":"Owns","from":"company-00004","to":"project-00008"}
+{"edge":"Owns","from":"company-00020","to":"project-00009"}
+{"edge":"Owns","from":"company-00002","to":"project-00010"}
+{"edge":"Owns","from":"company-00019","to":"project-00011"}
+{"edge":"Owns","from":"company-00002","to":"project-00012"}
+{"edge":"Owns","from":"company-00022","to":"project-00013"}
+{"edge":"Owns","from":"company-00012","to":"project-00014"}
+{"edge":"Owns","from":"company-00009","to":"project-00015"}
+{"edge":"Owns","from":"company-00002","to":"project-00016"}
+{"edge":"Owns","from":"company-00002","to":"project-00017"}
+{"edge":"Owns","from":"company-00023","to":"project-00018"}
+{"edge":"Owns","from":"company-00002","to":"project-00019"}
+{"edge":"Owns","from":"company-00017","to":"project-00020"}
+{"edge":"Owns","from":"company-00000","to":"project-00021"}
+{"edge":"Owns","from":"company-00002","to":"project-00022"}
+{"edge":"Owns","from":"company-00011","to":"project-00023"}
+{"edge":"Owns","from":"company-00002","to":"project-00024"}
+{"edge":"Owns","from":"company-00004","to":"project-00025"}
+{"edge":"Owns","from":"company-00017","to":"project-00026"}
+{"edge":"Owns","from":"company-00003","to":"project-00027"}
+{"edge":"Owns","from":"company-00023","to":"project-00028"}
+{"edge":"Owns","from":"company-00015","to":"project-00029"}
+{"edge":"Owns","from":"company-00020","to":"project-00030"}
+{"edge":"Owns","from":"company-00016","to":"project-00031"}
+{"edge":"Owns","from":"company-00022","to":"project-00032"}
+{"edge":"Owns","from":"company-00008","to":"project-00033"}
+{"edge":"Owns","from":"company-00024","to":"project-00034"}
+{"edge":"Owns","from":"company-00014","to":"project-00035"}
+{"edge":"Owns","from":"company-00005","to":"project-00036"}
+{"edge":"Owns","from":"company-00003","to":"project-00037"}
+{"edge":"Owns","from":"company-00008","to":"project-00038"}
+{"edge":"Owns","from":"company-00009","to":"project-00039"}

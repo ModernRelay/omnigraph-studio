@@ -1,65 +1,51 @@
-//! Theme setup on Zed's `theme` crate, the `ThemeSettingsProvider` Zed's `ui` reads, and graph
-//! tokens (node-type palette, edge and diff colors).
+//! Zed's settings, themes and assets, set up for Studio, plus graph tokens (node-type palette,
+//! edge and diff colors).
 //!
 //! Layer 1 (`docs/architecture.md`). Plan: `specs/002-app-shell/plan.md`.
 //!
-//! Zed's `theme::init(LoadThemes::JustBase, cx)` sets up the registry and the default theme
-//! without Zed's settings crates. Zed's `ui` components then read fonts, sizes and density
-//! through the provider registered here (`theme/src/theme_settings_provider.rs` at Zed
-//! v1.23.2).
+//! Studio uses Zed's `editor` for every text input (spike S4), and the editor reads Zed's
+//! settings store and `theme_settings`. So Studio runs Zed's own bootstrap here: the release
+//! channel, the settings store with Zed's defaults, the bundled themes and fonts.
 
-use gpui::{App, Font, Pixels, font, px};
-use theme::{LoadThemes, ThemeSettingsProvider, UiDensity};
+use gpui::{App, Hsla, hsla};
 
-/// Sets up Zed's theme system with Studio's font and density settings.
-///
-/// Must run before any window opens: Zed's `ui` components panic without a registered
-/// provider.
+pub use assets::Assets;
+
+/// Sets up Zed's settings store, themes and fonts. Must run before any window opens.
 pub fn init(cx: &mut App) {
-    theme::init(LoadThemes::JustBase, cx);
-    theme::set_theme_settings_provider(Box::new(StudioThemeSettings::default()), cx);
-}
-
-/// Fonts, sizes and density for Zed's `ui`. Fixed values until `studio_settings` supplies them
-/// (spec 002).
-struct StudioThemeSettings {
-    ui_font: Font,
-    buffer_font: Font,
-    ui_font_size: Pixels,
-    buffer_font_size: Pixels,
-    density: UiDensity,
-}
-
-impl Default for StudioThemeSettings {
-    fn default() -> Self {
-        Self {
-            ui_font: font(".SystemUIFont"),
-            buffer_font: font("Menlo"),
-            ui_font_size: px(14.),
-            buffer_font_size: px(13.),
-            density: UiDensity::Default,
-        }
+    release_channel::init_test(
+        semver::Version::new(0, 1, 0),
+        release_channel::ReleaseChannel::Dev,
+        cx,
+    );
+    settings::init(cx);
+    theme_settings::init(theme::LoadThemes::All(Box::new(Assets)), cx);
+    if let Err(error) = Assets.load_fonts(cx) {
+        log_font_error(&error);
     }
 }
 
-impl ThemeSettingsProvider for StudioThemeSettings {
-    fn ui_font<'a>(&'a self, _cx: &'a App) -> &'a Font {
-        &self.ui_font
-    }
+fn log_font_error(error: &dyn std::fmt::Display) {
+    eprintln!("Studio could not load its bundled fonts: {error}");
+}
 
-    fn buffer_font<'a>(&'a self, _cx: &'a App) -> &'a Font {
-        &self.buffer_font
-    }
+/// A stable color for a node or edge type, derived from its name so the same type has the same
+/// color in tables, the tree and the canvas.
+pub fn type_color(type_name: &str) -> Hsla {
+    let hash = type_name.bytes().fold(0x811c_9dc5_u32, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    });
+    let hue = (hash % 360) as f32 / 360.;
+    hsla(hue, 0.55, 0.55, 1.)
+}
 
-    fn ui_font_size(&self, _cx: &App) -> Pixels {
-        self.ui_font_size
-    }
+#[cfg(test)]
+mod tests {
+    use super::type_color;
 
-    fn buffer_font_size(&self, _cx: &App) -> Pixels {
-        self.buffer_font_size
-    }
-
-    fn ui_density(&self, _cx: &App) -> UiDensity {
-        self.density
+    #[test]
+    fn type_colors_are_stable_and_distinct() {
+        assert_eq!(type_color("Person"), type_color("Person"));
+        assert_ne!(type_color("Person"), type_color("Company"));
     }
 }

@@ -1,0 +1,8 @@
+version: 1
+groups:
+  developers: [act-dev]
+rules:
+  - id: developers-do-everything
+    allow:
+      actors: { group: developers }
+      actions: [read, export, change, branch_create, branch_delete, branch_merge, invoke_query, admin]

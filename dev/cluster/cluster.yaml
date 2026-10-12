@@ -1,0 +1,13 @@
+version: 1
+metadata:
+  name: studio-dev
+graphs:
+  knowledge:
+    schema: knowledge.pg
+policies:
+  graph-access:
+    file: graph.policy.yaml
+    applies_to: [knowledge]
+  server-access:
+    file: server.policy.yaml
+    applies_to: [cluster]

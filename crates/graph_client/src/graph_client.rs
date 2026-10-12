@@ -8,8 +8,10 @@
 //! OmniGraph `v0.13.0` (MIT).
 
 pub mod api;
+mod client;
 
 pub use api::ErrorOutput;
+pub use client::{ApiErrorSummary, CommitChanges, GraphClient, ReadError, ServerHealth};
 
 /// Header every protected request sends and every response echoes
 /// (`omnigraph-api-types` `HTTP_API_CONTRACT_HEADER` at OmniGraph v0.13.0).

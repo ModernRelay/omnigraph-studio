@@ -11,6 +11,11 @@ path = "src/studio_theme.rs"
 [dependencies]
 gpui = { workspace = true }
 theme = { workspace = true }
+theme_settings = { workspace = true }
+settings = { workspace = true }
+assets = { workspace = true }
+release_channel = { workspace = true }
+semver = { workspace = true }
 
 [lints]
 workspace = true

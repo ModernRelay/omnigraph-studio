@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Serve Studio's development graph on http://127.0.0.1:8787 (graph `knowledge`).
+# Token `dev-token` resolves to actor `act-dev`, which the dev policy allows to do everything.
+#
+#   script/dev-server            # first run applies the cluster and loads dev/seed.jsonl
+#   script/dev-server --reset    # start again from an empty graph
+#
+# Needs OmniGraph 0.13 (`omnigraph` and `omnigraph-server`). Data lives in dev/.data.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+DATA=${STUDIO_DEV_DATA:-$ROOT/dev/.data}
+BIND=${STUDIO_DEV_BIND:-127.0.0.1:8787}
+CLI=${OMNIGRAPH_BIN:-omnigraph}
+SERVER=${OMNIGRAPH_SERVER_BIN:-omnigraph-server}
+TOKEN=dev-token
+
+if [[ "${1:-}" == "--reset" ]]; then
+  rm -rf "$DATA"
+fi
+
+version=$("$CLI" version | head -1)
+if [[ "$version" != "omnigraph 0.13."* ]]; then
+  echo "dev-server needs OmniGraph 0.13; found: $version (set OMNIGRAPH_BIN)" >&2
+  exit 1
+fi
+
+fresh=0
+if [[ ! -d "$DATA/__cluster" ]]; then
+  fresh=1
+  mkdir -p "$DATA"
+  cp "$ROOT"/dev/cluster/*.yaml "$ROOT"/dev/cluster/*.pg "$DATA"/
+  (cd "$DATA" && "$CLI" cluster apply --config . > /dev/null)
+  # A direct apply keeps the cluster lock; nothing else uses this directory, so release it.
+  lock=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["lock_id"])' "$DATA/__cluster/lock.json")
+  (cd "$DATA" && "$CLI" cluster force-unlock "$lock" --config . > /dev/null)
+fi
+
+OMNIGRAPH_SERVER_BEARER_TOKENS_JSON="{\"act-dev\":\"$TOKEN\"}" \
+  "$SERVER" --cluster "$DATA" --bind "$BIND" &
+server=$!
+trap 'kill $server 2>/dev/null' EXIT INT TERM
+
+for _ in $(seq 1 60); do
+  if curl -fsS "http://$BIND/readyz" > /dev/null 2>&1; then break; fi
+  sleep 0.5
+done
+
+if [[ $fresh == 1 ]]; then
+  [[ -f "$ROOT/dev/seed.jsonl" ]] || python3 "$ROOT/script/dev-seed.py" > "$ROOT/dev/seed.jsonl"
+  OMNIGRAPH_BEARER_TOKEN=$TOKEN "$CLI" load --server "http://$BIND" --graph knowledge \
+    --data "$ROOT/dev/seed.jsonl" --mode overwrite --yes --quiet > /dev/null
+  echo "Loaded dev/seed.jsonl into knowledge."
+fi
+
+echo "Serving http://$BIND · graph knowledge · token $TOKEN (actor act-dev)"
+wait $server

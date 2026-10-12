@@ -17,5 +17,8 @@ thiserror = { workspace = true }
 url = { workspace = true }
 futures = { workspace = true }
 
+[dev-dependencies]
+http_client = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true
