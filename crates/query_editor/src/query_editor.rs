@@ -9,7 +9,7 @@ mod results;
 mod view;
 
 use gpui::App;
-use studio_actions::graph::NewQuery;
+use studio_actions::graph::{NewQuery, OpenQueryAt};
 use studio_workspace::{ToastKind, Workspace};
 
 pub use view::QueryEditor;
@@ -25,14 +25,33 @@ pub fn init(cx: &mut App) {
             .and_then(|text| text.as_str())
             .unwrap_or_default()
             .to_owned();
+        let at_commit = data
+            .get("at_commit")
+            .and_then(|commit| commit.as_str())
+            .map(str::to_owned);
         let number = view::next_number();
         workspace.open_item(format!("query:{number}"), window, cx, |window, cx| {
             let mut editor = QueryEditor::new(number, session, window, cx);
             editor.set_text(&text, window, cx);
+            if let Some(commit) = at_commit {
+                editor.pin_to(commit, cx);
+            }
             editor
         });
     });
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
+        workspace.register_action(|workspace, action: &OpenQueryAt, window, cx| {
+            let Some(session) = workspace.session().cloned() else {
+                return;
+            };
+            let number = view::next_number();
+            let commit = action.commit_id.clone();
+            workspace.open_item(format!("query:{number}"), window, cx, |window, cx| {
+                let mut editor = QueryEditor::new(number, session, window, cx);
+                editor.pin_to(commit, cx);
+                editor
+            });
+        });
         workspace.register_action(|workspace, _: &NewQuery, window, cx| {
             let Some(session) = workspace.session().cloned() else {
                 workspace.show_toast(

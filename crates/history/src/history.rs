@@ -5,11 +5,13 @@
 mod commit_view;
 mod lanes;
 mod merged;
+mod panel;
 mod view;
 
-use gpui::App;
+use gpui::{App, AppContext as _};
 use studio_actions::graph::{OpenCommit, OpenHistory};
-use studio_workspace::Workspace;
+use studio_workspace::{PanelPosition, Workspace};
+use ui::IconName;
 
 pub use commit_view::{CommitCounts, CommitView, commit_key};
 pub use lanes::{Graph, GraphCommit, GraphRow, LaneLine, assign_lanes};
@@ -26,8 +28,8 @@ pub fn init(cx: &mut App) {
             return;
         };
         let branch = branch.to_owned();
-        workspace.open_item::<HistoryView>(history_key(&branch), window, cx, |_, cx| {
-            HistoryView::new(session, branch, cx)
+        workspace.open_item::<HistoryView>(history_key(&branch), window, cx, |window, cx| {
+            HistoryView::new(session, branch, window, cx)
         });
     });
     studio_workspace::register_item_kind(cx, "commit", |data, workspace, window, cx| {
@@ -42,14 +44,27 @@ pub fn init(cx: &mut App) {
             CommitView::new(session, id, None, cx)
         });
     });
-    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
+    cx.observe_new(|workspace: &mut Workspace, window, cx| {
+        if let Some(window) = window {
+            let handle = cx.entity().downgrade();
+            let session = workspace.session().cloned();
+            let panel = cx.new(|cx| panel::HistoryPanel::new(handle, session, window, cx));
+            workspace.add_panel(
+                PanelPosition::Bottom,
+                "history",
+                "History",
+                IconName::GitGraph,
+                panel.into(),
+                cx,
+            );
+        }
         workspace.register_action(|workspace, _: &OpenHistory, window, cx| {
             let Some(session) = workspace.session().cloned() else {
                 return;
             };
             let branch = session.read(cx).branch.clone();
-            workspace.open_item::<HistoryView>(history_key(&branch), window, cx, |_, cx| {
-                HistoryView::new(session, branch, cx)
+            workspace.open_item::<HistoryView>(history_key(&branch), window, cx, |window, cx| {
+                HistoryView::new(session, branch, window, cx)
             });
         });
         workspace.register_action(|workspace, action: &OpenCommit, window, cx| {

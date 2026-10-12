@@ -87,6 +87,8 @@ pub struct TypeTable {
     session: Entity<GraphSession>,
     type_name: String,
     branch: String,
+    /// The commit this table reads, read-only; `None` follows the branch head.
+    at_commit: Option<String>,
     kind: TableKind,
     schema: Option<Arc<SchemaModel>>,
     missing: bool,
@@ -129,7 +131,10 @@ impl Focusable for TypeTable {
 
 impl Item for TypeTable {
     fn tab_title(&self, _cx: &App) -> SharedString {
-        self.type_name.clone().into()
+        match &self.at_commit {
+            Some(commit) => format!("{} @ {}", self.type_name, short_commit(commit)).into(),
+            None => self.type_name.clone().into(),
+        }
     }
 
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
@@ -137,13 +142,13 @@ impl Item for TypeTable {
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
-        Some(format!("type:{}", self.type_name).into())
+        Some(crate::table_key(&self.type_name, self.at_commit.as_deref()).into())
     }
 
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
         Some(SavedItem {
             kind: "type_table".into(),
-            data: serde_json::json!({ "type_name": self.type_name }),
+            data: serde_json::json!({ "type_name": self.type_name, "at_commit": self.at_commit }),
         })
     }
 
@@ -169,6 +174,7 @@ impl TypeTable {
         workspace: WeakEntity<Workspace>,
         session: Entity<GraphSession>,
         type_name: String,
+        at_commit: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -249,6 +255,7 @@ impl TypeTable {
             session,
             type_name,
             branch,
+            at_commit,
             kind: TableKind::Node,
             schema: None,
             missing: false,
@@ -309,6 +316,9 @@ impl TypeTable {
     ) {
         match event {
             SessionEvent::SchemaChanged => self.load_schema(cx),
+            // A table pinned to a commit reads that commit whatever the branch does.
+            SessionEvent::BranchChanged | SessionEvent::Committed { .. }
+                if self.at_commit.is_some() => {}
             SessionEvent::BranchChanged => {
                 self.branch = self.session.read(cx).branch.clone();
                 self.cells.clear();
@@ -468,6 +478,8 @@ impl TypeTable {
             self.paging.restart();
         } else {
             self.paging.reset();
+            // A table opened at a commit stays pinned to it (constitution II).
+            self.paging.pinned = self.at_commit.clone();
             self.newer = false;
             cx.emit(ItemEvent::UpdateTab);
         }
@@ -626,7 +638,12 @@ impl TypeTable {
     /// Asks the branch head for its commit with the cheapest read there is (one row), and offers
     /// Refresh when it moved past the pin.
     fn check_head(&mut self, cx: &mut Context<Self>) {
-        if self.newer || self.paging.pinned.is_none() || self.schema.is_none() || self.missing {
+        if self.newer
+            || self.at_commit.is_some()
+            || self.paging.pinned.is_none()
+            || self.schema.is_none()
+            || self.missing
+        {
             return;
         }
         let saved_filters = std::mem::take(&mut self.filters);
@@ -912,7 +929,7 @@ impl TypeTable {
         let Some(column) = self.columns.get(cursor.col) else {
             return;
         };
-        if !column.editable(self.kind) {
+        if !column.editable(self.kind) || self.at_commit.is_some() {
             self.show_peek(cursor.row, false, cx);
             return;
         }
@@ -1276,6 +1293,10 @@ impl TypeTable {
     }
 
     fn on_insert(&mut self, _: &InsertRow, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(reason) = self.pinned_reason() {
+            self.toast(ToastKind::Info, &reason, cx);
+            return;
+        }
         if self.kind != TableKind::Node {
             self.toast(ToastKind::Info, "Edges are added with a query for now.", cx);
             return;
@@ -1295,6 +1316,10 @@ impl TypeTable {
     }
 
     fn on_delete(&mut self, _: &DeleteRow, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(reason) = self.pinned_reason() {
+            self.toast(ToastKind::Info, &reason, cx);
+            return;
+        }
         if self.kind != TableKind::Node {
             self.toast(
                 ToastKind::Info,
@@ -1331,6 +1356,16 @@ impl TypeTable {
     }
 
     // ---- filters ----
+
+    /// Why nothing can be written here, when the table reads a past commit.
+    fn pinned_reason(&self) -> Option<String> {
+        self.at_commit.as_ref().map(|commit| {
+            format!(
+                "Read-only: pinned to commit {}. Open the table at the branch head to edit.",
+                short_commit(commit)
+            )
+        })
+    }
 
     fn filterable(&self) -> Vec<Property> {
         self.columns
@@ -1554,8 +1589,10 @@ impl TypeTable {
             Loadable::Failed(error) => Some(error.clone()),
             _ => None,
         };
-        let read_only = self.kind == TableKind::Edge;
-        let target_tooltip = if read_only {
+        let read_only = self.kind == TableKind::Edge || self.at_commit.is_some();
+        let target_tooltip = if let Some(reason) = self.pinned_reason() {
+            reason
+        } else if read_only {
             "Edges cannot be changed in a cell: the engine has no edge update (T16).".to_owned()
         } else {
             format!("Edits, inserts and deletes here commit to {}", self.branch)
@@ -1579,11 +1616,18 @@ impl TypeTable {
                     div()
                         .id("write-target")
                         .tooltip(Tooltip::text(target_tooltip))
-                        .child(
-                            Label::new("Read only")
+                        .child(match &self.at_commit {
+                            Some(commit) => studio_ui::ds::meta_code(
+                                IconName::GitCommit,
+                                format!("Read only · {}", short_commit(commit)),
+                                cx,
+                            )
+                            .into_any_element(),
+                            None => Label::new("Read only")
                                 .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        ),
+                                .color(Color::Muted)
+                                .into_any_element(),
+                        }),
                 )
             })
             .when(self.newer, |d| {
@@ -2217,6 +2261,10 @@ impl TypeTable {
         let focus = self.focus_handle.clone();
         let mut hints = h_flex().gap_4().items_center();
         hints = match (self.editing.is_some(), self.kind) {
+            // A table pinned to a commit only reads.
+            (false, _) if self.at_commit.is_some() => {
+                hints.child(studio_ui::ds::key_hint(&PeekRow, "Peek", &focus, cx))
+            }
             (true, _) => hints
                 .child(studio_ui::ds::key_hint(&ConfirmEdit, "Save", &focus, cx))
                 .child(studio_ui::ds::key_hint(&Cancel, "Cancel", &focus, cx)),

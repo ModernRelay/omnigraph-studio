@@ -11,13 +11,14 @@ use graph_client::api::{ChangeCauseOutput, CommitOutput};
 use graph_store::{
     ChangeFold, FoldedChange, FoldedChanges, GraphSession, NetChange, TypeCounts, summary_sentence,
 };
-use studio_actions::graph::OpenCommit;
+use studio_actions::graph::{OpenCommit, OpenQueryAt, OpenType};
 use studio_ui::{
     ChangeCard, ChangeKind, CopyableValue, PropertyRow, change_counts, change_group_header,
     empty_state, now_micros, relative_time, short_commit_id, type_swatch, utc_date_time,
 };
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
+use ui::{ContextMenu, PopoverMenu, Tooltip};
 
 /// Changes asked for per page.
 const PAGE: u32 = 500;
@@ -293,7 +294,9 @@ impl CommitView {
                     .child(
                         Headline::new(format!("Commit {}", short_commit_id(&self.commit_id)))
                             .size(HeadlineSize::XSmall),
-                    ),
+                    )
+                    .child(div().flex_1())
+                    .child(self.render_open_at(cx)),
             )
             .child(meta(
                 "Id",
@@ -355,6 +358,72 @@ impl CommitView {
                     })),
             )
             .into_any_element()
+    }
+
+    /// Opens the graph as it was at this commit, read-only: a type's table, or a query (spec
+    /// 009).
+    fn render_open_at(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let commit = self.commit_id.clone();
+        // The types changed in this commit first, then the rest of the schema.
+        let mut types: Vec<String> = self.counts.iter().map(|c| c.type_name.clone()).collect();
+        if let Some(schema) = self.session.read(cx).schema_model() {
+            for name in schema
+                .nodes
+                .iter()
+                .map(|n| &n.name)
+                .chain(schema.edges.iter().map(|e| &e.name))
+            {
+                if !types.contains(name) {
+                    types.push(name.clone());
+                }
+            }
+        }
+        let table_commit = commit.clone();
+        h_flex()
+            .gap_1()
+            .child(
+                PopoverMenu::new("open-table-at")
+                    .trigger(
+                        Button::new("open-table-at-button", "Table")
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::Small)
+                            .start_icon(Icon::new(IconName::Table).size(IconSize::XSmall))
+                            .tooltip(Tooltip::text(
+                                "Open a type's table as it was at this commit",
+                            )),
+                    )
+                    .menu(move |window, cx| {
+                        let types = types.clone();
+                        let commit = table_commit.clone();
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            for name in types {
+                                menu = menu.action(
+                                    name.clone(),
+                                    Box::new(OpenType {
+                                        type_name: name,
+                                        at_commit: Some(commit.clone()),
+                                    }),
+                                );
+                            }
+                            menu
+                        }))
+                    }),
+            )
+            .child(
+                Button::new("query-at", "Query")
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::Small)
+                    .start_icon(Icon::new(IconName::FileCode).size(IconSize::XSmall))
+                    .tooltip(Tooltip::text("Open a query that reads this commit"))
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(
+                            Box::new(OpenQueryAt {
+                                commit_id: commit.clone(),
+                            }),
+                            cx,
+                        )
+                    }),
+            )
     }
 
     fn render_row(

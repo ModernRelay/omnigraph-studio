@@ -626,6 +626,7 @@ fn add_type_rows(
     for (name, kind) in types {
         let action = OpenType {
             type_name: name.clone(),
+            at_commit: None,
         };
         if !window.is_action_available(&action, cx) {
             return;

@@ -4,14 +4,16 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use editor::{Editor, EditorEvent};
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    Hsla, PathBuilder, Pixels, Render, ScrollStrategy, SharedString, Subscription, Task,
-    UniformListScrollHandle, Window, canvas, point, px, uniform_list,
+    Hsla, KeyContext, PathBuilder, Pixels, Render, ScrollStrategy, SharedString, Subscription,
+    Task, UniformListScrollHandle, Window, canvas, point, px, uniform_list,
 };
 use graph_client::api::CommitOutput;
-use graph_store::GraphSession;
+use graph_store::{GraphSession, SessionEvent};
 use studio_actions::graph::OpenCommit;
+use studio_actions::history::{NextMatch, PreviousMatch};
 use studio_ui::{change_counts, empty_state, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
@@ -40,6 +42,13 @@ enum State {
 pub struct HistoryView {
     session: Entity<GraphSession>,
     branch: String,
+    /// The bottom-dock panel: rows only, following the window's branch; a commit opens in its
+    /// own tab.
+    compact: bool,
+    /// Finds commits by id prefix or actor.
+    search: Entity<Editor>,
+    matches: Vec<usize>,
+    match_at: Option<usize>,
     focus_handle: FocusHandle,
     state: State,
     commits: Vec<CommitOutput>,
@@ -54,6 +63,8 @@ pub struct HistoryView {
     scroll: UniformListScrollHandle,
     _task: Option<Task<()>>,
     _detail_subscription: Option<Subscription>,
+    _search_subscription: Subscription,
+    _session_subscription: Option<Subscription>,
 }
 
 impl EventEmitter<ItemEvent> for HistoryView {}
@@ -90,10 +101,63 @@ pub fn history_key(branch: &str) -> String {
 }
 
 impl HistoryView {
-    pub fn new(session: Entity<GraphSession>, branch: String, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        session: Entity<GraphSession>,
+        branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(session, branch, false, window, cx)
+    }
+
+    /// The bottom-dock panel: the window's branch, rows only.
+    pub fn panel(
+        session: Entity<GraphSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let branch = session.read(cx).branch.clone();
+        let mut view = Self::build(session.clone(), branch, true, window, cx);
+        view._session_subscription =
+            Some(
+                cx.subscribe(&session, |this, session, event, cx| match event {
+                    SessionEvent::BranchChanged => {
+                        this.branch = session.read(cx).branch.clone();
+                        this.reload(cx);
+                    }
+                    SessionEvent::Committed { branch } if *branch == this.branch => this.reload(cx),
+                    _ => {}
+                }),
+            );
+        view
+    }
+
+    fn build(
+        session: Entity<GraphSession>,
+        branch: String,
+        compact: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let search = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Find a commit by id or actor", window, cx);
+            editor
+        });
+        let search_subscription = cx.subscribe(&search, |this, _, event: &EditorEvent, cx| {
+            if let EditorEvent::BufferEdited = event {
+                this.find(cx);
+            }
+        });
         let mut view = Self {
             session,
             branch,
+            compact,
+            search,
+            matches: Vec::new(),
+            match_at: None,
+            _search_subscription: search_subscription,
+            _session_subscription: None,
             focus_handle: cx.focus_handle(),
             state: State::Loading,
             commits: Vec::new(),
@@ -197,13 +261,51 @@ impl HistoryView {
         cx.notify();
     }
 
-    /// Selects a commit and shows its changes in the detail split.
+    /// The commits whose id starts with, or whose actor contains, the search text.
+    fn find(&mut self, cx: &mut Context<Self>) {
+        let query = self.search.read(cx).text(cx).trim().to_lowercase();
+        self.matches = if query.is_empty() {
+            Vec::new()
+        } else {
+            self.commits
+                .iter()
+                .enumerate()
+                .filter(|(_, commit)| commit_matches(commit, &query))
+                .map(|(ix, _)| ix)
+                .collect()
+        };
+        self.match_at = (!self.matches.is_empty()).then_some(0);
+        if let Some(&ix) = self.matches.first() {
+            self.select(ix, cx);
+        }
+        cx.notify();
+    }
+
+    fn step_match(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let count = self.matches.len();
+        let Some(at) = self.match_at.filter(|_| count > 0) else {
+            return;
+        };
+        let at = if forward {
+            (at + 1) % count
+        } else {
+            (at + count - 1) % count
+        };
+        self.match_at = Some(at);
+        self.select(self.matches[at], cx);
+    }
+
+    /// Selects a commit and, in the tab, shows its changes in the detail split.
     pub fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(commit) = self.commits.get(ix).cloned() else {
             return;
         };
         self.selected = Some(ix);
         self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
+        if self.compact {
+            cx.notify();
+            return;
+        }
         let same = self
             .detail
             .as_ref()
@@ -402,7 +504,8 @@ impl HistoryView {
                     .on_click(
                         cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                             this.select(ix, cx);
-                            if event.click_count() == 2 {
+                            // The panel has no detail split: a click opens the commit's tab.
+                            if this.compact || event.click_count() == 2 {
                                 window.dispatch_action(
                                     Box::new(OpenCommit {
                                         commit_id: open_id.clone(),
@@ -483,6 +586,15 @@ impl HistoryView {
             )
             .into_any_element()
     }
+}
+
+/// Whether a commit's id starts with, or its actor contains, `query` (lowercase).
+fn commit_matches(commit: &CommitOutput, query: &str) -> bool {
+    commit.graph_commit_id.to_lowercase().starts_with(query)
+        || commit
+            .actor_id
+            .as_ref()
+            .is_some_and(|actor| actor.to_lowercase().contains(query))
 }
 
 /// A small rounded label.
@@ -586,9 +698,32 @@ impl RowPaint {
 }
 
 impl Render for HistoryView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let border = cx.theme().colors().border_variant;
         let count = self.commits.len();
+        let searched = !self.search.read(cx).text(cx).trim().is_empty();
+        let counter = match (searched, self.match_at) {
+            (false, _) => None,
+            (true, Some(at)) => Some(format!("{}/{}", at + 1, self.matches.len())),
+            (true, None) => Some("No match".to_owned()),
+        };
+        let search = h_flex()
+            .w(px(if self.compact { 220. } else { 260. }))
+            .h(px(26.))
+            .px_2()
+            .gap_1p5()
+            .items_center()
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .bg(cx.theme().colors().editor_background)
+            .child(
+                Icon::new(IconName::MagnifyingGlass)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(div().flex_1().child(self.search.clone()))
+            .children(counter.map(studio_ui::ds::text::meta));
         let header = h_flex()
             .flex_none()
             .px_4()
@@ -596,8 +731,20 @@ impl Render for HistoryView {
             .gap_2()
             .border_b_1()
             .border_color(border)
-            .child(Icon::new(IconName::GitGraph).color(Color::Muted))
-            .child(Headline::new(format!("History of {}", self.branch)).size(HeadlineSize::XSmall))
+            .when(!self.compact, |header| {
+                header
+                    .child(Icon::new(IconName::GitGraph).color(Color::Muted))
+                    .child(
+                        Headline::new(format!("History of {}", self.branch))
+                            .size(HeadlineSize::XSmall),
+                    )
+            })
+            .when(self.compact, |header| {
+                header.child(studio_ui::ds::meta(
+                    IconName::GitBranch,
+                    self.branch.clone(),
+                ))
+            })
             .child(
                 Label::new(match self.state {
                     State::Ready if count > self.own_count => format!(
@@ -612,6 +759,7 @@ impl Render for HistoryView {
                 .color(Color::Muted),
             )
             .child(div().flex_1())
+            .child(search)
             .child(
                 Button::new("refresh-history", "Refresh")
                     .style(ButtonStyle::Subtle)
@@ -638,6 +786,7 @@ impl Render for HistoryView {
             State::Loading if self.commits.is_empty() => {
                 empty_state("Reading commits…", None).into_any_element()
             }
+            _ if self.compact => self.render_list(cx),
             _ => {
                 let list = self.render_list(cx);
                 let detail = match &self.detail {
@@ -663,15 +812,48 @@ impl Render for HistoryView {
                     .into_any_element()
             }
         };
+        // Typing in the search box must not move the selection.
+        let mut context = KeyContext::new_with_defaults();
+        context.add("History");
+        if self.search.focus_handle(cx).is_focused(window) {
+            context.add("searching");
+        }
         v_flex()
-            .key_context("History")
+            .key_context(context)
             .track_focus(&self.focus_handle)
             .size_full()
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(|this, _: &NextMatch, _, cx| this.step_match(true, cx)))
+            .on_action(cx.listener(|this, _: &PreviousMatch, _, cx| this.step_match(false, cx)))
             .child(header)
             .children(warning)
             .child(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_finds_commits_by_id_prefix_or_actor() {
+        let commit = CommitOutput {
+            graph_commit_id: "hb1.01M4R84Z6GANJ0B8MJ4S3Y6CKK.2.01M4R865CRM266GRK5EP12CTBE".into(),
+            graph_manifest_version: 3,
+            created_at: 0,
+            graph_branch: None,
+            parent_commit_id: None,
+            merged_parent_commit_id: None,
+            actor_id: Some("act-Dev".into()),
+        };
+        assert!(commit_matches(&commit, "hb1.01m4r"));
+        assert!(commit_matches(&commit, "dev"));
+        assert!(
+            !commit_matches(&commit, "ep12ctbe"),
+            "an id matches by prefix only"
+        );
+        assert!(!commit_matches(&commit, "alice"));
     }
 }

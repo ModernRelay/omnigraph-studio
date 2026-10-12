@@ -24,7 +24,11 @@ pub use types_list::TypesList;
 pub fn init(cx: &mut App) {
     studio_workspace::register_item_kind(cx, "type_table", |data, workspace, window, cx| {
         if let Some(type_name) = data.get("type_name").and_then(|name| name.as_str()) {
-            open_type(workspace, type_name, window, cx);
+            let at_commit = data
+                .get("at_commit")
+                .and_then(|commit| commit.as_str())
+                .map(str::to_owned);
+            open_type(workspace, type_name, at_commit, window, cx);
         }
     });
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
@@ -41,7 +45,13 @@ pub fn init(cx: &mut App) {
             cx,
         );
         workspace.register_action(|workspace, action: &OpenType, window, cx| {
-            open_type(workspace, &action.type_name, window, cx)
+            open_type(
+                workspace,
+                &action.type_name,
+                action.at_commit.clone(),
+                window,
+                cx,
+            )
         });
         workspace.register_action(|workspace, action: &OpenNode, _window, cx| {
             open_node(workspace, action, cx)
@@ -51,9 +61,11 @@ pub fn init(cx: &mut App) {
 }
 
 /// Opens a type's table, or activates it when it is open.
+/// Opens a type's table, at the branch head or read-only at a commit.
 fn open_type(
     workspace: &mut Workspace,
     type_name: &str,
+    at_commit: Option<String>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -74,11 +86,19 @@ fn open_type(
     let handle = cx.entity().downgrade();
     let name = type_name.to_owned();
     workspace.open_item::<TypeTable>(
-        format!("type:{type_name}"),
+        table_key(type_name, at_commit.as_deref()),
         window,
         cx,
-        move |window, cx| TypeTable::new(handle, session, name, window, cx),
+        move |window, cx| TypeTable::new(handle, session, name, at_commit, window, cx),
     );
+}
+
+/// One tab per type at the head, and one per type and commit.
+pub(crate) fn table_key(type_name: &str, at_commit: Option<&str>) -> String {
+    match at_commit {
+        Some(commit) => format!("type:{type_name}@{commit}"),
+        None => format!("type:{type_name}"),
+    }
 }
 
 /// Shows one node in the inspector, read at the branch head.

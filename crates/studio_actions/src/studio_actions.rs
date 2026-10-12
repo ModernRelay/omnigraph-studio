@@ -99,6 +99,9 @@ pub mod graph {
     #[action(namespace = studio_graph)]
     pub struct OpenType {
         pub type_name: String,
+        /// Read the table at this commit, read-only (spec 009); `None` reads the branch head.
+        #[serde(default)]
+        pub at_commit: Option<String>,
     }
 
     /// Open one node in the inspector and the relationship tree.
@@ -107,6 +110,13 @@ pub mod graph {
     pub struct OpenNode {
         pub type_name: String,
         pub id: String,
+    }
+
+    /// Open a query editor that reads one commit, read-only (spec 009).
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct OpenQueryAt {
+        pub commit_id: String,
     }
 
     /// Show one node on the graph canvas.
@@ -209,6 +219,20 @@ pub mod query {
             CopyCell,
             /// Copy the selected result row as JSON.
             CopyRow,
+        ]
+    );
+}
+
+pub mod history {
+    use gpui::actions;
+
+    actions!(
+        studio_history,
+        [
+            /// Go to the next commit matching the search.
+            NextMatch,
+            /// Go to the previous commit matching the search.
+            PreviousMatch,
         ]
     );
 }

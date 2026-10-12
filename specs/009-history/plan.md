@@ -1,8 +1,8 @@
 # 009: History
 
 Status: built on 0.13 · 2026-10-12 (`crates/history`): a History tab with the lane graph and a
-commit detail split, and `OpenCommit` as its own tab. Not built: the bottom-dock panel, search
-by id prefix or actor, and opening a type table or query editor pinned to a commit.
+commit detail split, `OpenCommit` as its own tab, a History panel in the bottom dock, search by
+id prefix or actor, and type tables and query editors pinned to a commit.
 
 ## Problem
 
@@ -30,8 +30,15 @@ XI (lane logic forked from Zed with notices).
 - Bottom dock panel and a full tab: a lane graph left, then message-free rows (commits have no
   messages): short id, actor, relative time, branch chips, change counts.
 - Selecting a commit opens its changes (spec 008's entity cards) in a detail split.
-- Search by id prefix or actor with an i/N counter.
-- Any commit can open a type table or query editor pinned to it (read-only chip).
+- Search by id prefix or actor with an i/N counter; ↵ and ⇧↵ step through the matches, and
+  typing in the field never moves the selection.
+- Any commit can open a type table or query editor pinned to it (read-only chip): the commit
+  detail's Table menu (the commit's types first) dispatches `OpenType { at_commit }`, its Query
+  button `OpenQueryAt`. A pinned table reads that snapshot for every page and count, ignores the
+  branch and its head, and refuses edits, inserts and deletes with the reason; a pinned query
+  reads the snapshot and refuses writes. Both come back after a restart.
+- The bottom-dock panel follows the window's branch and graph; rows only, and a click opens the
+  commit in its own tab.
 - More than 5,000 commits: a warning that the list loads in full until paging exists.
 
 ## Decisions
@@ -55,6 +62,8 @@ XI (lane logic forked from Zed with notices).
 | 2026-10-12 | Lanes connect and never collide | `history::lanes` property test over 2,000 seeded random commit graphs (up to 60 commits, merges, missing parents): every edge is one line, rows join edge to edge, no two lines share a lane, width bounded | Passes; a mutation that leaves ending lanes busy fails at seed 0 |
 | 2026-10-12 | Merges draw against a live server | offscreen snapshot of main after merging `feature-y` and fast-forwarding `feature-z` | Both merged lanes join main; heads shown as branch chips |
 | 2026-10-12 | Parentless commit | live server: `GET /commits/{genesis}/changes` | 409 "has no first parent"; the detail says the commit cannot be compared |
+| 2026-10-12 | Pinned tables and queries read their commit | offscreen snapshot restoring `Person @ 4S3Y6CKK`, `Person @ EP12CTBE` and a query at `4S3Y6CKK`, with the History panel open | Tabs named with the commit, a "Read only · 4S3Y6CKK" chip, footer hints reduced to Peek; the query's result reads "people on commit 4S3Y6CKK" |
+| 2026-10-12 | Search matches by id prefix or actor | `history` test `search_finds_commits_by_id_prefix_or_actor` | An id matches only by prefix; actors match anywhere, case-blind |
 
 ## Corrections
 

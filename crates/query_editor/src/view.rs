@@ -22,7 +22,9 @@ use graph_client::{ReadError, WriteOutcome};
 use graph_store::{GraphSession, SessionEvent};
 use serde_json::{Map, Value};
 use studio_actions::query::{CopyCell, CopyRow, Explain, Run};
-use studio_ui::{GridColumn, ROW_HEIGHT, format_value, grid_cell, grid_header, is_numeric};
+use studio_ui::{
+    GridColumn, ROW_HEIGHT, format_value, grid_cell, grid_header, is_numeric, short_commit_id,
+};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 use ui::{KeyBinding, Tooltip};
@@ -193,6 +195,8 @@ pub fn next_number() -> usize {
 pub struct QueryEditor {
     number: usize,
     session: Entity<GraphSession>,
+    /// Reads run at this commit and writes are refused (spec 009); `None` uses the branch.
+    at_commit: Option<String>,
     editor: Entity<Editor>,
     /// The latest check; it lags the text by `CHECK_DELAY`.
     analysis: Option<Arc<Analysis>>,
@@ -221,7 +225,10 @@ impl Focusable for QueryEditor {
 
 impl Item for QueryEditor {
     fn tab_title(&self, _cx: &App) -> SharedString {
-        format!("Query {}", self.number).into()
+        match &self.at_commit {
+            Some(commit) => format!("Query {} @ {}", self.number, short_commit_id(commit)).into(),
+            None => format!("Query {}", self.number).into(),
+        }
     }
 
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
@@ -237,7 +244,10 @@ impl Item for QueryEditor {
     fn serialize(&self, cx: &App) -> Option<SavedItem> {
         Some(SavedItem {
             kind: "query".into(),
-            data: serde_json::json!({ "text": self.editor.read(cx).text(cx) }),
+            data: serde_json::json!({
+                "text": self.editor.read(cx).text(cx),
+                "at_commit": self.at_commit,
+            }),
         })
     }
 }
@@ -287,6 +297,7 @@ impl QueryEditor {
         let mut this = Self {
             number,
             session,
+            at_commit: None,
             editor,
             analysis: None,
             cursor: 0,
@@ -305,6 +316,13 @@ impl QueryEditor {
         };
         this.set_example(window, cx);
         this
+    }
+
+    /// Pins reads to a commit and refuses writes, for a query opened from History.
+    pub fn pin_to(&mut self, commit: String, cx: &mut Context<Self>) {
+        self.at_commit = Some(commit);
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
     }
 
     /// Replaces the draft, as when a remembered tab comes back.
@@ -600,6 +618,16 @@ impl QueryEditor {
         }
         match self.prepare(false, cx) {
             Err(message) => self.output = Output::Failed(Failure::new(message)),
+            Ok(prepared) if prepared.write && self.at_commit.is_some() => {
+                let commit = self
+                    .at_commit
+                    .as_deref()
+                    .map(short_commit_id)
+                    .unwrap_or_default();
+                self.output = Output::Failed(Failure::new(format!(
+                    "Read-only: this query reads commit {commit}. Open a new query to write to a branch."
+                )));
+            }
             Ok(prepared) if prepared.write => {
                 // Never on ⌘↵ alone: the person confirms the branch first.
                 let branch = self.branch(cx);
@@ -628,9 +656,14 @@ impl QueryEditor {
             query: prepared.text.clone(),
             name: prepared.name.clone(),
             params: prepared.params.clone(),
-            // A statement names its own branches; the server refuses a target with it.
-            branch: (!prepared.statement).then(|| branch.clone()),
-            snapshot: None,
+            // A statement names its own branches; the server refuses a target with it. A query
+            // pinned to a commit reads that snapshot instead of the branch.
+            branch: (!prepared.statement && self.at_commit.is_none()).then(|| branch.clone()),
+            snapshot: self.at_commit.clone().filter(|_| !prepared.statement),
+        };
+        let branch = match &self.at_commit {
+            Some(commit) => format!("commit {}", short_commit_id(commit)),
+            None => branch,
         };
         let started = Instant::now();
         let task = self
@@ -692,7 +725,10 @@ impl QueryEditor {
                     target: output
                         .target
                         .branch
-                        .or(output.target.snapshot)
+                        .or(output
+                            .target
+                            .snapshot
+                            .map(|commit| format!("commit {}", short_commit_id(&commit))))
                         .unwrap_or(branch),
                     commit: output.graph_commit_id,
                 })
@@ -824,8 +860,23 @@ impl QueryEditor {
             _ => (String::new(), false),
         };
         let busy = self.writing;
+        let pinned = self.at_commit.clone();
         studio_ui::ds::toolbar(cx)
             .px_2()
+            .when_some(pinned, |toolbar, commit| {
+                toolbar.child(
+                    div()
+                        .id("read-only-commit")
+                        .tooltip(Tooltip::text(format!(
+                            "Reads run at commit {commit}; writes are refused"
+                        )))
+                        .child(studio_ui::ds::meta_code(
+                            IconName::GitCommit,
+                            format!("Read only · {}", short_commit_id(&commit)),
+                            cx,
+                        )),
+                )
+            })
             .child(
                 Button::new("run", "Run")
                     .style(ButtonStyle::Filled)

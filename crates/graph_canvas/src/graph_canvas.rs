@@ -433,6 +433,7 @@ impl GraphCanvas {
                 window.dispatch_action(
                     Box::new(OpenType {
                         type_name: node.label.clone(),
+                        at_commit: None,
                     }),
                     cx,
                 );
@@ -834,6 +835,7 @@ impl GraphCanvas {
                                     window.dispatch_action(
                                         Box::new(OpenType {
                                             type_name: type_name.clone(),
+                                            at_commit: None,
                                         }),
                                         cx,
                                     )

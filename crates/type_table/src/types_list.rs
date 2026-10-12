@@ -136,6 +136,7 @@ impl Render for TypesList {
             let selected = active.as_deref() == Some(format!("type:{name}").as_str());
             let action = OpenType {
                 type_name: name.clone(),
+                at_commit: None,
             };
             let tooltip = match &counts_error {
                 Some(error) => format!("Counts could not be read: {error}"),

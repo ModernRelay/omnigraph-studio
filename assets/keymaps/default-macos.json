@@ -211,10 +211,17 @@
     }
   },
   {
-    "context": "History",
+    "context": "History && !searching",
     "bindings": {
       "j": "menu::SelectNext",
       "k": "menu::SelectPrevious"
+    }
+  },
+  {
+    "context": "History && searching",
+    "bindings": {
+      "enter": "studio_history::NextMatch",
+      "shift-enter": "studio_history::PreviousMatch"
     }
   }
 ]
