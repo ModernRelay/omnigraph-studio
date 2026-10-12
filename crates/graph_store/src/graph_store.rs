@@ -5,6 +5,7 @@
 
 pub mod cli_config;
 mod connection;
+mod exploration;
 mod registry;
 mod session;
 
@@ -15,6 +16,7 @@ use gpui::App;
 pub use connection::{
     Connection, ConnectionEvent, ConnectionState, GraphListing, ServerEntry, ServerSource,
 };
+pub use exploration::*;
 pub use registry::{ConnectionRegistry, RegistryEvent, data_dir};
 pub use session::{GraphSession, Loadable, OutcomeEntry, OutcomeKind, SessionEvent, open_session};
 
