@@ -9,7 +9,7 @@ pub mod workspace {
     use gpui::actions;
 
     actions!(
-        workspace,
+        studio,
         [
             /// Open the command palette.
             ToggleCommandPalette,
@@ -27,6 +27,196 @@ pub mod workspace {
             GoForward,
             /// Quit Studio.
             Quit,
+            /// Close the active tab.
+            CloseActiveItem,
+            /// Activate the next tab.
+            ActivateNextItem,
+            /// Activate the previous tab.
+            ActivatePreviousItem,
+            /// Show or hide the sidebar.
+            ToggleSidebar,
+            /// Show or hide the inspector.
+            ToggleInspector,
+            /// Show or hide the activity log.
+            ToggleActivity,
+            /// Connect to a server or open a graph.
+            OpenGraph,
+            /// Reload the schema, branches and counts of the open graph.
+            Refresh,
+        ]
+    );
+}
+
+pub mod graph {
+    use gpui::{Action, actions};
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    actions!(
+        studio_graph,
+        [
+            /// Open the query editor.
+            NewQuery,
+            /// Open the branch review against main.
+            ReviewBranch,
+            /// Open the commit history.
+            OpenHistory,
+            /// Open the graph canvas on the schema.
+            OpenCanvas,
+            /// Open the inspector for the graph's storage.
+            OpenInspector,
+            /// Create a branch from the current branch.
+            CreateBranch,
+            /// Delete the current branch.
+            DeleteBranch,
+            /// Merge the current branch into main.
+            MergeBranch,
+        ]
+    );
+
+    /// Open a node or edge type's table.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct OpenType {
+        pub type_name: String,
+    }
+
+    /// Open one node in the inspector and the relationship tree.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct OpenNode {
+        pub type_name: String,
+        pub id: String,
+    }
+
+    /// Show one node on the graph canvas.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct ShowNodeOnCanvas {
+        pub type_name: String,
+        pub id: String,
+    }
+
+    /// Open one commit's changes.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct OpenCommit {
+        pub commit_id: String,
+    }
+}
+
+pub mod table {
+    use gpui::actions;
+
+    actions!(
+        studio_table,
+        [
+            /// Move the cell cursor up.
+            MoveUp,
+            /// Move the cell cursor down.
+            MoveDown,
+            /// Move the cell cursor left.
+            MoveLeft,
+            /// Move the cell cursor right.
+            MoveRight,
+            /// Edit the selected cell.
+            EditCell,
+            /// Save the cell being edited.
+            ConfirmEdit,
+            /// Cancel the edit, or step back one level.
+            Cancel,
+            /// Show the selected row in the inspector.
+            PeekRow,
+            /// Reload the table from the branch head.
+            RefreshTable,
+            /// Add a row.
+            InsertRow,
+            /// Delete the selected row.
+            DeleteRow,
+            /// Copy the selected cell's value.
+            CopyCell,
+        ]
+    );
+}
+
+pub mod tree {
+    use gpui::actions;
+
+    actions!(
+        studio_tree,
+        [
+            /// Select the next row.
+            SelectNext,
+            /// Select the previous row.
+            SelectPrevious,
+            /// Expand the selected row, or step into its first child.
+            Expand,
+            /// Collapse the selected row, or go to its parent.
+            Collapse,
+            /// Expand every relationship of the selected node.
+            ExpandAll,
+            /// Collapse the selected row's subtree.
+            CollapseAll,
+            /// Open the selected node in the inspector.
+            OpenSelected,
+            /// Make the selected node the tree's root.
+            RerootHere,
+            /// Show the selected node on the canvas.
+            ShowOnCanvas,
+        ]
+    );
+}
+
+pub mod query {
+    use gpui::actions;
+
+    actions!(
+        studio_query,
+        [
+            /// Run the query under the cursor.
+            Run,
+            /// Show the plan of the query under the cursor.
+            Explain,
+        ]
+    );
+}
+
+pub mod review {
+    use gpui::actions;
+
+    actions!(
+        studio_review,
+        [
+            /// Go to the next change.
+            NextChange,
+            /// Go to the previous change.
+            PreviousChange,
+            /// Mark the current change reviewed and go to the next.
+            AcceptAndNext,
+            /// Revert the current change and go to the next.
+            RevertAndNext,
+            /// Merge the reviewed branch.
+            Merge,
+        ]
+    );
+}
+
+pub mod canvas {
+    use gpui::actions;
+
+    actions!(
+        studio_canvas,
+        [
+            /// Fit the graph to the window.
+            FitToWindow,
+            /// Zoom in.
+            ZoomIn,
+            /// Zoom out.
+            ZoomOut,
+            /// Expand the selected node.
+            ExpandNode,
+            /// Collapse the selected node.
+            CollapseNode,
         ]
     );
 }

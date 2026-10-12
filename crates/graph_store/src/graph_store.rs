@@ -1,3 +1,32 @@
-//! GPUI entities over `graph_client`: connections, graph sessions with snapshot pins, the compiled schema model, the shared exploration state, drafts, and the outcome log.
+//! GPUI entities over `graph_client`: the server registry, connections, graph sessions with
+//! schema and counts, and the outcome log of every write.
 //!
-//! Layer 3 (`docs/architecture.md`). Plan: `specs/003-*/plan.md`.
+//! Layer 3 (`docs/architecture.md`). Plan: `specs/003-connections/plan.md`.
+
+pub mod cli_config;
+mod connection;
+mod registry;
+mod session;
+
+use std::sync::Arc;
+
+use gpui::App;
+
+pub use connection::{
+    Connection, ConnectionEvent, ConnectionState, GraphListing, ServerEntry, ServerSource,
+};
+pub use registry::{ConnectionRegistry, RegistryEvent, data_dir};
+pub use session::{GraphSession, Loadable, OutcomeEntry, OutcomeKind, SessionEvent, open_session};
+
+/// Sets up the HTTP client and loads every known server. Call once at startup.
+pub fn init(cx: &mut App) {
+    let http: Arc<dyn http_client::HttpClient> = Arc::new(
+        reqwest_client::ReqwestClient::user_agent(concat!(
+            "OmniGraph-Studio/",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .expect("the HTTP client starts"),
+    );
+    cx.set_http_client(http.clone());
+    ConnectionRegistry::init(http, cx);
+}

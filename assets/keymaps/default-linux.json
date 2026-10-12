@@ -1,19 +1,19 @@
 [
   {
     "bindings": {
-      "ctrl-k": "workspace::ToggleCommandPalette",
-      "ctrl-,": "workspace::OpenSettings",
-      "ctrl-shift-b": "workspace::SwitchBranch",
-      "ctrl-shift-n": "workspace::NewWindow",
-      "alt-left": "workspace::GoBack",
-      "alt-right": "workspace::GoForward",
-      "ctrl-q": "workspace::Quit"
+      "ctrl-k": "studio::ToggleCommandPalette",
+      "ctrl-,": "studio::OpenSettings",
+      "ctrl-shift-b": "studio::SwitchBranch",
+      "ctrl-shift-n": "studio::NewWindow",
+      "alt-left": "studio::GoBack",
+      "alt-right": "studio::GoForward",
+      "ctrl-q": "studio::Quit"
     }
   },
   {
     "context": "Workspace && !TextInput",
     "bindings": {
-      "?": "workspace::ShowKeyBindings"
+      "?": "studio::ShowKeyBindings"
     }
   }
 ]

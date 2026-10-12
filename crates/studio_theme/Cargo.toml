@@ -16,6 +16,9 @@ settings = { workspace = true }
 assets = { workspace = true }
 release_channel = { workspace = true }
 semver = { workspace = true }
+# Zed's dev builds read assets from the nearest git checkout at run time, which for Studio is
+# Studio's own repository. Embed Zed's assets at compile time in every profile instead.
+util = { workspace = true, features = ["debug-embed"] }
 
 [lints]
 workspace = true

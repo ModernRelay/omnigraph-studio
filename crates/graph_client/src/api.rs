@@ -42,7 +42,7 @@ pub struct GraphListResponse {
     pub graphs: Vec<GraphInfo>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GraphInfo {
     pub graph_id: String,
     pub uri: String,

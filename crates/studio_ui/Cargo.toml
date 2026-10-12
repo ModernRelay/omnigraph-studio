@@ -14,6 +14,7 @@ ui = { workspace = true }
 theme = { workspace = true }
 studio_theme = { workspace = true }
 studio_actions = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
