@@ -11,10 +11,20 @@ path = "src/query_editor.rs"
 [dependencies]
 gpui = { workspace = true }
 ui = { workspace = true }
+editor = { workspace = true }
+language = { workspace = true }
+menu = { workspace = true }
+# Zed's completion types (`Completion`, `CompletionResponse`) live in `project`; `editor`
+# already builds it, so this adds no crate to the graph.
+project = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 studio_ui = { workspace = true }
 studio_actions = { workspace = true }
 studio_workspace = { workspace = true }
+graph_client = { workspace = true }
 graph_store = { workspace = true }
+gq_language = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

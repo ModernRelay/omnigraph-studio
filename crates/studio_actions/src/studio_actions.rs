@@ -194,6 +194,10 @@ pub mod query {
             Run,
             /// Show the plan of the query under the cursor.
             Explain,
+            /// Copy the selected result cell's value.
+            CopyCell,
+            /// Copy the selected result row as JSON.
+            CopyRow,
         ]
     );
 }

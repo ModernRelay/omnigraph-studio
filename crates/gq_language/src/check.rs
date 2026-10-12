@@ -25,7 +25,8 @@ pub struct Diagnostic {
 impl Diagnostic {
     fn from_compiler(diagnostic: &QueryDiagnostic, query: Option<&str>) -> Self {
         Self {
-            code: format!("{:?}", diagnostic.code),
+            // `T12`, not the code's `Debug` form.
+            code: diagnostic.code.as_str().to_owned(),
             message: diagnostic.message.clone(),
             fix: diagnostic.fix.clone(),
             line: diagnostic.position.as_ref().map(|p| p.line),
@@ -157,6 +158,7 @@ mod tests {
         let result = check(&dev(), "query q() { match { $p: Person } return { $p.name ");
         assert_eq!(result.diagnostics.len(), 1);
         assert!(result.diagnostics[0].line.is_some());
+        assert_eq!(result.diagnostics[0].code, "Q001");
     }
 
     #[test]
@@ -173,5 +175,20 @@ mod tests {
     fn statements_are_recognised() {
         let result = check(&dev(), "branch list");
         assert!(result.statement);
+    }
+
+    #[test]
+    fn mutations_and_parameter_types_are_reported() {
+        let result = check(
+            &dev(),
+            "query add($slug: String, $founded: I32?, $tags: [String]?) {\n  insert Company { slug: $slug, name: $slug, founded: $founded }\n}",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let query = &result.queries[0];
+        assert!(query.is_mutation);
+        assert!(query.columns.is_empty());
+        assert_eq!(query.params[0], ("slug".into(), "String".into(), false));
+        assert_eq!(query.params[1], ("founded".into(), "I32".into(), true));
+        assert_eq!(query.params[2].1, "[String]");
     }
 }

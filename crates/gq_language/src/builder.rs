@@ -426,6 +426,72 @@ pub fn delete_node(
     })
 }
 
+/// The text a new query editor starts with (spec 007): a read over the first node type, with
+/// its key and a few properties, ordered by its label. `None` when the schema has no node type.
+pub fn example_read(schema: &SchemaModel) -> Option<String> {
+    let node = schema.nodes.first()?;
+    let var = node
+        .name
+        .chars()
+        .next()
+        .map(|c| c.to_ascii_lowercase())
+        .filter(char::is_ascii_lowercase)
+        .unwrap_or('n');
+    let mut columns: Vec<&str> = Vec::new();
+    for name in node
+        .key
+        .iter()
+        .map(String::as_str)
+        .chain(node.label_property())
+    {
+        if !columns.contains(&name) {
+            columns.push(name);
+        }
+    }
+    for property in &node.properties {
+        if columns.len() >= 4 {
+            break;
+        }
+        if property.projectable() && !columns.contains(&property.name.as_str()) {
+            columns.push(&property.name);
+        }
+    }
+    let returns = if columns.is_empty() {
+        format!("${var}")
+    } else {
+        columns
+            .iter()
+            .map(|c| format!("${var}.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let order = node
+        .label_property()
+        .map(|label| format!("  order {{ ${var}.{label} asc }}\n"))
+        .unwrap_or_default();
+    let name = snake_case(&node.name);
+    Some(format!(
+        "query list_{name}() {{\n  match {{ ${var}: {ty} }}\n  return {{ {returns} }}\n{order}  limit 50\n}}\n",
+        ty = node.name,
+    ))
+}
+
+/// `WorksAt` → `works_at`.
+fn snake_case(name: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -443,6 +509,34 @@ mod tests {
             query.text,
             result.diagnostics
         );
+    }
+
+    #[test]
+    fn the_example_read_compiles_and_names_its_columns() {
+        let schema = dev();
+        let text = example_read(&schema).unwrap();
+        let result = check(&schema, &text);
+        assert!(
+            result.diagnostics.is_empty(),
+            "{text}\n{:?}",
+            result.diagnostics
+        );
+        let query = &result.queries[0];
+        // The first node type in the compiled schema; the dev schema's is `Company`.
+        assert_eq!(schema.nodes[0].name, "Company");
+        assert_eq!(query.name, "list_company");
+        assert!(!query.is_mutation);
+        // The compiler names a projected property by the property alone (`slug`, not
+        // `c.slug` as the server does), in projection order.
+        let names: Vec<&str> = query.columns.iter().map(|c| c.name.as_str()).collect();
+        let returned = text.split("return { ").nth(1).unwrap();
+        let returned: Vec<&str> = returned[..returned.find(" }").unwrap()]
+            .split(", ")
+            .map(|c| c.trim_start_matches("$c."))
+            .collect();
+        assert_eq!(names, returned);
+        assert_eq!(names[..2], ["slug", "name"]);
+        assert_eq!(snake_case("WorksAt"), "works_at");
     }
 
     #[test]
