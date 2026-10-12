@@ -11,14 +11,25 @@ use gpui::{App, Hsla, hsla};
 
 pub use assets::Assets;
 
-/// Sets up Zed's settings store, themes and fonts. Must run before any window opens.
-pub fn init(cx: &mut App) {
+/// Sets up the release channel and Zed's settings store with Zed's defaults. Put the user's
+/// settings into the store next, then call [`init_themes`].
+pub fn init_settings_store(cx: &mut App) {
     release_channel::init_test(
         semver::Version::new(0, 1, 0),
         release_channel::ReleaseChannel::Dev,
         cx,
     );
     settings::init(cx);
+}
+
+/// Loads the bundled themes and fonts and selects the theme the settings store names. Must run
+/// before any window opens.
+///
+/// The first theme is read from the store here, not from a later store notification: GPUI's
+/// launch callback runs without flushing effects, so a notification sent during launch reaches
+/// `theme_settings`' observer only if it arrives after the observer is active, and it does not.
+/// Zed's own `main` orders its bootstrap the same way.
+pub fn init_themes(cx: &mut App) {
     theme_settings::init(theme::LoadThemes::All(Box::new(Assets)), cx);
     if let Err(error) = Assets.load_fonts(cx) {
         log_font_error(&error);

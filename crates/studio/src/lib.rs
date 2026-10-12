@@ -4,17 +4,20 @@
 mod activity;
 mod keymaps;
 mod open_graph;
+mod settings_view;
 
-use gpui::{App, AppContext as _, Entity, Window, WindowBounds, WindowOptions, point, px, size};
+use gpui::{App, AppContext as _, Entity, Focusable as _, Window, WindowBounds, WindowOptions, point, px, size};
 use graph_store::{ConnectionRegistry, ConnectionState, open_session};
-use studio_actions::workspace::{OpenGraph, Quit};
+use studio_actions::workspace::{OpenGraph, OpenSettings, Quit};
 use studio_workspace::Workspace;
 
 pub use open_graph::OpenGraphModal;
 
 /// Sets up settings, themes, the editor, keymaps, the server registry and every feature.
 pub fn init(cx: &mut App) {
-    studio_theme::init(cx);
+    studio_theme::init_settings_store(cx);
+    studio_settings::init(cx);
+    studio_theme::init_themes(cx);
     editor::init(cx);
     graph_store::init(cx);
     keymaps::load(cx);
@@ -34,6 +37,9 @@ pub fn init(cx: &mut App) {
         let handle = cx.entity().downgrade();
         let activity = cx.new(|cx| activity::ActivityLog::new(handle, window, cx));
         workspace.set_activity_view(activity.into(), cx);
+        workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
+            workspace.open_item("settings", window, cx, settings_view::SettingsView::new);
+        });
         workspace.register_action(|workspace, _: &OpenGraph, window, cx| {
             let handle = cx.entity().downgrade();
             workspace.toggle_modal(window, cx, |window, cx| {
@@ -61,6 +67,10 @@ pub fn window_options(cx: &App) -> WindowOptions {
 /// Builds the root view of a window.
 pub fn build_workspace(window: &mut Window, cx: &mut App) -> Entity<Workspace> {
     let workspace = cx.new(|cx| Workspace::new(window, cx));
+    // Actions dispatch along the focus path; until something inside the workspace has focus they
+    // stop at the window root and never reach the workspace's handlers.
+    let focus = workspace.read(cx).focus_handle(cx);
+    window.focus(&focus, cx);
     open_initial_graph(&workspace, window, cx);
     workspace
 }

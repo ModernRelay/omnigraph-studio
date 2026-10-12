@@ -13,8 +13,8 @@ purpose.
 |---|---|---|
 | Depend | `gpui`, `gpui_platform`, `gpui_tokio`, `refineable`, `sum_tree`, `collections`, `util`, `http_client`, `reqwest_client` | Apache-2.0 |
 | Depend | `ui`, `theme`, `component`, `icons`, `menu` | GPL-3.0-or-later |
-| Depend if spike S4 passes | `editor`, `multi_buffer`, `buffer_diff`, `language` | GPL-3.0-or-later |
-| Fork and trim into Studio crates | `workspace`, `picker`, `command_palette`, `settings`, `settings_ui`, `tabular_data_preview`, `git_ui` (commit graph), `markdown` | GPL-3.0-or-later |
+| Depend (spike S4 passed) | `editor`, `multi_buffer`, `language`, `settings`, `theme_settings`, `release_channel`, `assets` | GPL-3.0-or-later |
+| Fork and trim into Studio crates | `workspace`, `picker`, `command_palette`, `settings_ui`, `tabular_data_preview`, `git_ui` (commit graph), `markdown` | GPL-3.0-or-later |
 
 `ui` depends only on `gpui`, `component`, `theme`, `icons`, `menu` and small helper crates.
 `picker`, `workspace`, `command_palette` and `markdown` depend on Zed's project, client,
@@ -22,12 +22,25 @@ database or language crates, which is why they are forked rather than depended o
 own second app, makes the same cut: it links `gpui`, `ui`, `theme` and `component` and ships
 its own editor, picker, panes and settings.
 
-## Starting Zed's theme without Zed's settings
+## Starting Zed's settings and theme
 
-`theme::init(LoadThemes::JustBase, cx)` sets up the registry and the default theme without
-touching settings. Zed's `ui` components then read fonts, font sizes and density through a
-`theme::ThemeSettingsProvider` registered with `theme::set_theme_settings_provider`, which
-`studio_theme` implements. Studio never links Zed's `settings` or `theme_settings`.
+Zed's `editor` reads Zed's settings store and `theme_settings`, so Studio runs Zed's own
+bootstrap in `studio::init`, in this order:
+
+1. `studio_theme::init_settings_store`: the release channel and the settings store with Zed's
+   defaults.
+2. `studio_settings::init`: Studio's `settings.json`, whose theme and font keys go into the
+   store as Zed user settings.
+3. `studio_theme::init_themes`: the bundled themes and fonts; `theme_settings::init` selects
+   the first theme from the store.
+
+The order matters. GPUI's launch callback (`Application::run`) and
+`HeadlessAppContext::update` run without flushing effects, and `theme_settings` reacts to later
+store changes through a global observer that becomes active only when effects flush. A store
+change made during launch is therefore never seen, and the first theme must already be in the
+store when `theme_settings::init` runs, as in Zed's `main`. Changes after launch arrive in
+flushed updates (input handlers, `AsyncApp::update`) and reach the observer.
+`crates/studio/tests/settings_apply.rs` guards both paths.
 
 ## Bumping the pin
 

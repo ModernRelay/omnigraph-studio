@@ -10,10 +10,9 @@ path = "src/studio_settings.rs"
 
 [dependencies]
 gpui = { workspace = true }
+settings = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-schemars = { workspace = true }
-anyhow = { workspace = true }
 
 [lints]
 workspace = true

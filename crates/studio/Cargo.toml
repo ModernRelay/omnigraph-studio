@@ -55,6 +55,10 @@ gpui_platform = { workspace = true, features = ["wayland", "x11"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 gpui_platform = { workspace = true }
 
+[[test]]
+name = "settings_apply"
+harness = false
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 gpui_platform = { workspace = true, features = ["test-support", "font-kit", "runtime_shaders"] }
