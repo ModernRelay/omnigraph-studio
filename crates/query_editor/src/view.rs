@@ -385,7 +385,7 @@ impl QueryEditor {
                 .into_iter()
                 .map(|c| (c.graph_commit_id, c.created_at, c.actor_id))
                 .collect();
-            commits.sort_by(|a, b| b.1.cmp(&a.1));
+            commits.sort_by_key(|commit| std::cmp::Reverse(commit.1));
             commits.truncate(PICKER_COMMITS);
             this.update(cx, |this, cx| {
                 this.commits = commits;
