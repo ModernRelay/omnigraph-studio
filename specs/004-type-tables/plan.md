@@ -3,8 +3,8 @@
 Status: in progress · 2026-10-12. `crates/type_table` ships the Types sidebar, node and edge
 tables (keyset pages pinned to one commit, filtered counts, filters, a cell cursor, value-bound
 cell edits with all three outcomes, peek, insert and typed-key delete), sorting by a column,
-Blob cells and previews, and preview tabs (spec 002). Not yet: relationship columns, saved
-views, bulk edits, relative dates (see Deferred).
+Blob cells and previews, relative dates, and preview tabs (spec 002). Not yet: relationship
+columns, saved views, bulk edits (see Deferred).
 
 ## Problem
 
@@ -136,8 +136,7 @@ opens the branch's recent commits.
   - R2 unpublished commits: staged edits as a reviewable proposal only when the server
     advertises `cluster_publishCommit`.
 - Group-by (Tower 084) until filters and editing ship.
-- Relationship columns, relative dates, saved views and bulk edits are designed above but not
-  built yet. The preview tab is built (spec 002).
+- Relationship columns, saved views and bulk edits are designed above but not built yet. The preview tab is built (spec 002).
 - Saving a Blob value to a file: the peek previews the first bytes only.
 - Per-row history beyond the commits that the change feed can cheaply return.
 
@@ -167,6 +166,12 @@ opens the branch's recent commits.
 | pending | Merge-mode NDJSON leaves unspecified properties untouched | run against a 0.13 server | Bulk edit not built yet |
 
 ## Corrections
+
+- 2026-10-12 · "Dates relative": a `DateTime` reads relative for two weeks either way ("3 h
+  ago", "in 2 days"), then as its date; a `Date` reads Today, Yesterday or Tomorrow, else as
+  itself (a birthday as "48 years ago" helps no one). The exact value is the cell's tooltip;
+  the peek and copy keep exact values. 0.13 returns `DateTime` as `2024-01-01T12:34:56.789`
+  in UTC.
 
 - 2026-10-12 · Blob cells: the page query cannot project a Blob, so each drawn cell is read on
   its own with `HEAD` at the page's commit, at most once per row and property until the table

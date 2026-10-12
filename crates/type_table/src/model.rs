@@ -356,6 +356,61 @@ pub fn display_value(property: Option<&Property>, value: &Value) -> String {
     studio_ui::format_value(value)
 }
 
+/// What a date or time cell shows, and the exact value for its tooltip (spec 004: "dates
+/// relative with exact value on hover"). A `DateTime` reads relative to `now` for two weeks
+/// either way, then as its date; a `Date` reads Today, Yesterday or Tomorrow, else as itself.
+/// `None` for other values.
+pub fn relative_value(
+    property: Option<&Property>,
+    value: &Value,
+    now: chrono::DateTime<chrono::Local>,
+) -> Option<(String, String)> {
+    let property = property.filter(|p| !p.list)?;
+    let text = value.as_str()?;
+    match property.kind {
+        ScalarKind::DateTime => {
+            let at = chrono::NaiveDateTime::parse_from_str(
+                text.trim_end_matches('Z'),
+                "%Y-%m-%dT%H:%M:%S%.f",
+            )
+            .ok()?
+            .and_utc();
+            let seconds = (now.with_timezone(&chrono::Utc) - at).num_seconds();
+            let (span, future) = (seconds.abs(), seconds < 0);
+            let ago = |amount: i64, unit: &str| {
+                if future {
+                    format!("in {amount} {unit}")
+                } else {
+                    format!("{amount} {unit} ago")
+                }
+            };
+            let shown = match span {
+                s if s < 45 => "just now".to_owned(),
+                s if s < 3_600 => ago((s + 30) / 60, "min"),
+                s if s < 86_400 => ago(s / 3_600, "h"),
+                s if s < 86_400 * 14 => {
+                    let days = s / 86_400;
+                    ago(days, if days == 1 { "day" } else { "days" })
+                }
+                _ => at.format("%Y-%m-%d").to_string(),
+            };
+            Some((shown, at.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string()))
+        }
+        ScalarKind::Date => {
+            let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
+            let days = (date - now.date_naive()).num_days();
+            let shown = match days {
+                0 => "Today",
+                -1 => "Yesterday",
+                1 => "Tomorrow",
+                _ => return None,
+            };
+            Some((shown.to_owned(), text.to_owned()))
+        }
+        _ => None,
+    }
+}
+
 /// The text copied for a cell: the raw string, or JSON for anything else.
 pub fn copy_text(value: &Value) -> String {
     match value {
@@ -1085,5 +1140,54 @@ mod tests {
             filter_label(&filter("in:Knows", FilterOp::HasAny, Value::Null)),
             "has ← knows"
         );
+    }
+
+    #[test]
+    fn dates_read_relative_with_the_exact_value_kept() {
+        use chrono::TimeZone as _;
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 12, 12, 0, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        let at = |kind: ScalarKind, text: &str| {
+            let property = Property {
+                name: "at".into(),
+                kind,
+                base_type: String::new(),
+                nullable: true,
+                list: false,
+                enum_values: None,
+                is_key: false,
+            };
+            relative_value(Some(&property), &Value::String(text.into()), now)
+        };
+        assert_eq!(
+            at(ScalarKind::DateTime, "2026-10-12T09:00:00.000"),
+            Some(("3 h ago".into(), "2026-10-12 09:00:00.000 UTC".into()))
+        );
+        assert_eq!(
+            at(ScalarKind::DateTime, "2026-10-14T12:00:00Z").map(|(t, _)| t),
+            Some("in 2 days".into())
+        );
+        assert_eq!(
+            at(ScalarKind::DateTime, "2026-10-12T11:59:40").map(|(t, _)| t),
+            Some("just now".into())
+        );
+        assert_eq!(
+            at(ScalarKind::DateTime, "2024-01-01T12:34:56.789").map(|(t, _)| t),
+            Some("2024-01-01".into()),
+            "older than two weeks: the date"
+        );
+        let today = now.date_naive();
+        assert_eq!(
+            at(ScalarKind::Date, &today.format("%Y-%m-%d").to_string()).map(|(t, _)| t),
+            Some("Today".into())
+        );
+        assert_eq!(
+            at(ScalarKind::Date, "1978-03-20"),
+            None,
+            "a far date reads as itself"
+        );
+        assert_eq!(at(ScalarKind::Text, "2026-10-12"), None);
     }
 }

@@ -2295,7 +2295,12 @@ impl TypeTable {
                 .child(self.render_edit_callout(editing.notice.clone(), hint, window, cx))
                 .into_any_element();
         }
-        let shown = display_value(column.property(), value);
+        // Dates read relative; the exact value is the cell's tooltip.
+        let relative = crate::model::relative_value(column.property(), value, chrono::Local::now());
+        let shown = match &relative {
+            Some((shown, _)) => shown.clone(),
+            None => display_value(column.property(), value),
+        };
         let text_color = if value.is_null() {
             Color::Disabled
         } else {
@@ -2346,7 +2351,7 @@ impl TypeTable {
                     )),
                 )
             }
-            None => (None, None),
+            None => (None, relative.map(|(_, exact)| exact)),
         };
         if is_cursor {
             cell = cell.child(ring());
