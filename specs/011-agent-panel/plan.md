@@ -98,7 +98,8 @@ can fix its query.
 
 A proposal shows a card: the summary, the query text, the parameters, and the target branch,
 with "creates `agent/<stamp>` from `<base>`" before the first write. Buttons: **Allow**
-(⌘↩), **Always for this branch**, **Reject** (⎋). On Allow, Studio creates the branch if
+(⌘Y), **Always for this branch** (⌘⌥Y), **Reject** (⌘⌥N), each showing its binding; see
+Actions for why ⌘↩ (Send) and ⎋ are not used. On Allow, Studio creates the branch if
 needed, then sends the mutation to it. The card and the tool result show the outcome:
 
 - Committed: the commit id and the affected counts.
@@ -192,3 +193,5 @@ Query text, parameters, rows, tokens and prompt text. Agent stderr is shown only
   in the per-user runtime directory described above, with a length check that fails with a
   clear message.
 - Stop was planned as ⌘.; Zed's editor binding takes it inside the composer, so it is ⌘⇧.
+- 2026-10-12 · Approval said Allow was ⌘↩ and Reject ⎋. ⌘↩ is Send in the composer and ⎋
+  belongs to the editor, so the card uses the bound ⌘Y, ⌘⌥Y and ⌘⌥N, as in Actions.
