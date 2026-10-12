@@ -7,7 +7,9 @@ use std::cmp::Ordering;
 use gq_language::builder::edge_property_column;
 use gq_language::input::parse_scalar;
 pub use gq_language::input::{edit_text, parse_input};
-use gq_language::{EdgeType, Filter, FilterOp, NodeType, PageStart, Property, ScalarKind};
+use gq_language::{
+    EdgeType, Filter, FilterOp, NodeType, PageStart, Property, RelationshipGroup, ScalarKind,
+};
 use graph_client::WriteOutcome;
 use graph_client::api::ChangeOutput;
 use serde_json::{Map, Value};
@@ -32,6 +34,8 @@ pub enum ColumnRole {
     Endpoint { node_type: String },
     /// A declared property.
     Property(Property),
+    /// A node's neighbours through one relationship group: chips, then "+N".
+    Relationship(RelationshipGroup),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -50,6 +54,13 @@ impl ColumnSpec {
     pub fn property(&self) -> Option<&Property> {
         match &self.role {
             ColumnRole::Property(property) => Some(property),
+            _ => None,
+        }
+    }
+
+    pub fn relationship(&self) -> Option<&RelationshipGroup> {
+        match &self.role {
+            ColumnRole::Relationship(group) => Some(group),
             _ => None,
         }
     }
@@ -96,7 +107,9 @@ fn property_column(property: &Property, key: String) -> ColumnSpec {
 
 /// A node table's columns: the pinned key (or `@id`), then properties in schema order. Vector
 /// properties are hidden; Blob properties show as "Blob".
-pub fn node_columns(node: &NodeType) -> Vec<ColumnSpec> {
+/// A node table's columns: the key, the properties in schema order, then one column per
+/// relationship group in `groups`.
+pub fn node_columns(node: &NodeType, groups: &[RelationshipGroup]) -> Vec<ColumnSpec> {
     let mut columns = Vec::new();
     match node.key.as_deref().and_then(|key| node.property(key)) {
         Some(key) => columns.push(ColumnSpec {
@@ -124,6 +137,17 @@ pub fn node_columns(node: &NodeType) -> Vec<ColumnSpec> {
             continue;
         }
         columns.push(property_column(property, property.name.clone()));
+    }
+    for group in groups {
+        let key = gq_language::builder::relationship_key(group);
+        columns.push(ColumnSpec {
+            title: gq_language::builder::relationship_label(&key).unwrap_or_else(|| key.clone()),
+            key,
+            detail: group.other_type.clone(),
+            role: ColumnRole::Relationship(group.clone()),
+            width: 260.,
+            align_right: false,
+        });
     }
     columns
 }
@@ -708,15 +732,23 @@ mod tests {
     #[test]
     fn node_columns_pin_the_key_and_follow_schema_order() {
         let schema = schema();
-        let columns = node_columns(schema.node("Person").unwrap());
+        let groups = schema.relationships_of("Person");
+        let columns = node_columns(schema.node("Person").unwrap(), &groups);
         let keys: Vec<_> = columns.iter().map(|c| c.key.as_str()).collect();
-        assert_eq!(keys, ["slug", "name", "title", "email", "born", "tags"]);
+        assert_eq!(
+            keys[..6],
+            ["slug", "name", "title", "email", "born", "tags"]
+        );
+        let relationships: Vec<_> = columns[6..].iter().map(|c| c.title.as_str()).collect();
+        assert_eq!(relationships.len(), groups.len());
+        assert!(relationships.contains(&"worksAt →"), "{relationships:?}");
+        assert!(columns[6..].iter().all(|c| !c.editable(TableKind::Node)));
         assert_eq!(columns[0].role, ColumnRole::Key);
         assert_eq!(columns[4].detail, "Date?");
         assert!(!columns[0].editable(TableKind::Node));
         assert!(columns[1].editable(TableKind::Node));
         assert!(!columns[1].editable(TableKind::Edge));
-        let company = node_columns(schema.node("Company").unwrap());
+        let company = node_columns(schema.node("Company").unwrap(), &[]);
         assert!(
             company
                 .iter()

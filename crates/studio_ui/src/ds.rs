@@ -540,6 +540,28 @@ pub fn meta_code(icon: IconName, value: impl Into<SharedString>, cx: &App) -> Di
         .child(text::code(value, cx).color(Color::Muted).single_line())
 }
 
+/// A tag: a name in a quiet pill, as a table shows a row's neighbours. The UI font, unlike
+/// `ui::Chip`, which is for code-like values such as enum members.
+pub fn tag(label: impl Into<SharedString>, cx: &App) -> Div {
+    div()
+        .flex_none()
+        .max_w(px(160.))
+        .h(px(20.))
+        .px(px(space::SM))
+        .flex()
+        .items_center()
+        .rounded(px(radius::XS))
+        .border_1()
+        .border_color(surface::raised_border(cx))
+        .bg(surface::sunken(cx))
+        .child(
+            Label::new(label.into())
+                .size(LabelSize::XSmall)
+                .single_line()
+                .truncate(),
+        )
+}
+
 /// A segmented control: a sunken track holding [`segment`]s, for a choice of two to four.
 /// Concentric: the track's radius is a segment's plus its padding.
 pub fn segmented(cx: &App) -> Div {

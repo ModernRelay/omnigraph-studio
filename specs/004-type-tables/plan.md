@@ -3,8 +3,8 @@
 Status: in progress · 2026-10-12. `crates/type_table` ships the Types sidebar, node and edge
 tables (keyset pages pinned to one commit, filtered counts, filters, a cell cursor, value-bound
 cell edits with all three outcomes, peek, insert and typed-key delete), sorting by a column,
-Blob cells and previews, relative dates, and preview tabs (spec 002). Not yet: relationship
-columns, saved views, bulk edits (see Deferred).
+Blob cells and previews, relative dates, relationship columns, and preview tabs (spec 002).
+Not yet: saved views, bulk edits (see Deferred).
 
 ## Problem
 
@@ -75,7 +75,11 @@ stay put), IX (paged, virtualized).
 - The next page is fetched when the viewport passes 80% of loaded rows. No row cap: the grid is
   virtualized.
 - Relationship columns: one query per page and relationship, with the page's ids as an `in`
-  list parameter; the first three neighbours as chips, then "+N".
+  list parameter; the first three neighbours as chips, then "+N". Built as two reads per page
+  and relationship at the page's commit: a grouped count (`return { $n.@id as id, count($m)
+  as n }`) and the first neighbours with labels, capped at three a row on average (30 to
+  1,000 rows), so a row past the cap shows its count alone. A click opens the other type
+  filtered to this row's neighbours through the same relationship.
 - Filtered counts: `return { count($n) as n }` with the same filters, pinned to the snapshot.
 
 ### Filters and views
@@ -136,7 +140,7 @@ opens the branch's recent commits.
   - R2 unpublished commits: staged edits as a reviewable proposal only when the server
     advertises `cluster_publishCommit`.
 - Group-by (Tower 084) until filters and editing ship.
-- Relationship columns, saved views and bulk edits are designed above but not built yet. The preview tab is built (spec 002).
+- Saved views and bulk edits are designed above but not built yet. The preview tab is built (spec 002).
 - Saving a Blob value to a file: the peek previews the first bytes only.
 - Per-row history beyond the commits that the change feed can cheaply return.
 
@@ -163,6 +167,7 @@ opens the branch's recent commits.
 | 2026-10-12 | Actions reach the workspace with nothing focused | `crates/gpui/src/window.rs` `dispatch_action` / `focus_node_id_in_rendered_frame` | With no focus, an action goes to the root view's node only, which is outside the workspace element that holds its handlers. The workspace now focuses itself when a session opens and nothing else has focus |
 | 2026-10-12 | Blob cells and previews | `HEAD`/`GET /graphs/notes/blob` on the 0.13 dev server (`notes.attachment`: a PNG, a query text, 1 KiB of bytes, an empty value, nulls); `graph_client` blob tests; `type_table::blob` tests; offscreen snapshots of the Note table and three peeks | A managed cell answers 200 with `content-length` and an ETag (`0` for empty); a null cell and a missing row both answer 404 `not_found`, so a 404 on a row the table read is null; `Range` answers 206. Cells read "Blob · 690 B · Preview", "Blob · 0 B" and "—", for drawn rows only, at the page's commit; the peek drew the PNG, the query text and a hex dump |
 | 2026-10-12 | Null order and sorted keyset pages on 0.13 | `order { $n.title asc, $n.@id asc }` and `desc` on the dev server; `is not null`; the keyset clause with `or`; `gq_language` `sorted_pages_read_values_then_nulls_and_compile` (text, Date, I32, an edge property); `type_table` paging test; offscreen snapshots of Person by title both ways and Company by city with 25-row pages | Nulls come first ascending and last descending, so the `is null` split is needed; Company by city ran Berlin to Toronto, then the company without a city, across the switch from values to nulls ("25 of 25") |
+| 2026-10-12 | Relationship columns | `gq_language` `page_relationship_reads_compile_for_every_group`; the grouped count and sample on the dev server (`person-000002` with no `knows` has no row); an offscreen snapshot of Person with its five relationship columns | Counts per id, tags in the UI font with "+N" kept in view, "—" for none |
 | pending | Merge-mode NDJSON leaves unspecified properties untouched | run against a 0.13 server | Bulk edit not built yet |
 
 ## Corrections

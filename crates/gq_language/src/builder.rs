@@ -678,6 +678,83 @@ pub fn degree(
     })
 }
 
+/// How many neighbours each node of a page has through a relationship group (spec 004,
+/// relationship columns). Columns: `id`, `n`; a node with none has no row.
+pub fn page_degrees(
+    schema: &SchemaModel,
+    node_type: &str,
+    group: &RelationshipGroup,
+    ids: &[String],
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, node_type)?;
+    schema
+        .edge(&group.edge)
+        .ok_or_else(|| BuildError::UnknownEdge(group.edge.clone()))?;
+    let mut params = Params::new();
+    let ids = params.add("ids", "[String]", Value::from(ids.to_vec()));
+    let text = format!(
+        "query studio_page_degrees({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id in {ids}\n    {traversal}\n  }}\n  return {{ $n.@id as id, count($m) as n }}\n}}\n",
+        sig = params.signature(),
+        ty = node.name,
+        traversal = traversal_clause(group, None),
+    );
+    Ok(BuiltQuery {
+        name: "studio_page_degrees".into(),
+        text,
+        params: params.values,
+    })
+}
+
+/// The first neighbours of a page's nodes through a relationship group, for the column's
+/// chips: `id`, `other`, then `label` when the other type has one. At most `limit` rows in all,
+/// by node then neighbour; a node past the limit shows its count alone.
+pub fn page_neighbours(
+    schema: &SchemaModel,
+    node_type: &str,
+    group: &RelationshipGroup,
+    ids: &[String],
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, node_type)?;
+    schema
+        .edge(&group.edge)
+        .ok_or_else(|| BuildError::UnknownEdge(group.edge.clone()))?;
+    let other = self::node(schema, &group.other_type)?;
+    let mut params = Params::new();
+    let ids = params.add("ids", "[String]", Value::from(ids.to_vec()));
+    let mut columns = vec!["$n.@id as id".to_owned(), "$m.@id as other".to_owned()];
+    if let Some(label) = other.label_property()
+        && Some(label) != other.key.as_deref()
+    {
+        columns.push(format!("$m.{label} as label"));
+    }
+    let text = format!(
+        "query studio_page_neighbours({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id in {ids}\n    {traversal}\n  }}\n  return {{ {columns} }}\n  order {{ $n.@id asc, $m.@id asc }}\n  limit {limit}\n}}\n",
+        sig = params.signature(),
+        ty = node.name,
+        traversal = traversal_clause(group, None),
+        columns = columns.join(", "),
+    );
+    Ok(BuiltQuery {
+        name: "studio_page_neighbours".into(),
+        text,
+        params: params.values,
+    })
+}
+
+/// The same relationship seen from the other end: from a `node_type` row to its neighbours,
+/// back from a neighbour to `node_type` rows.
+pub fn reversed(group: &RelationshipGroup, node_type: &str) -> RelationshipGroup {
+    RelationshipGroup {
+        edge: group.edge.clone(),
+        direction: match group.direction {
+            Direction::Outgoing => Direction::Incoming,
+            Direction::Incoming => Direction::Outgoing,
+        },
+        other_type: node_type.to_owned(),
+    }
+}
+
 /// One page of a node's neighbours through a relationship group, with the neighbour's label
 /// and the edge's properties (spec 005). Columns: `id`, `label` (when the other type has one),
 /// then `e_<property>` for each projectable edge property.
@@ -1046,6 +1123,26 @@ mod tests {
             query.text,
             result.diagnostics
         );
+    }
+
+    #[test]
+    fn page_relationship_reads_compile_for_every_group() {
+        let schema = dev();
+        let ids = vec!["person-000000".to_owned(), "person-000001".to_owned()];
+        for node in &schema.nodes {
+            for group in schema.relationships_of(&node.name) {
+                let degrees = page_degrees(&schema, &node.name, &group, &ids).unwrap();
+                assert!(degrees.text.contains("$n.@id in $ids"), "{}", degrees.text);
+                assert_compiles(&degrees);
+                let sample = page_neighbours(&schema, &node.name, &group, &ids, 300).unwrap();
+                assert!(sample.text.contains("limit 300"));
+                assert_compiles(&sample);
+            }
+        }
+        let group = &schema.relationships_of("Person")[0];
+        let back = reversed(group, "Person");
+        assert_eq!(back.other_type, "Person");
+        assert_ne!(back.direction, group.direction);
     }
 
     #[test]

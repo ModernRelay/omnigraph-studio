@@ -17,8 +17,8 @@ use gpui::{
     anchored, deferred, point,
 };
 use gq_language::{
-    BuildError, BuiltQuery, Filter, FilterOp, PageStart, Property, ScalarKind, SchemaModel, Sort,
-    builder,
+    BuildError, BuiltQuery, Filter, FilterOp, PageStart, Property, RelationshipGroup, ScalarKind,
+    SchemaModel, Sort, builder,
 };
 use graph_client::api::ReadOutput;
 use graph_client::{BlobCell, BlobMeta, ReadError};
@@ -84,6 +84,39 @@ struct FilterDraft {
     error: Option<String>,
 }
 
+/// How many neighbours a relationship cell shows as chips.
+const RELATION_CHIPS: usize = 3;
+
+/// One row's neighbours through one relationship: how many, and the first few.
+struct Relation {
+    count: Result<i64, String>,
+    neighbours: Vec<(String, Option<String>)>,
+}
+
+/// `id → n` from a `page_degrees` result.
+fn relation_counts(rows: &Value) -> HashMap<String, i64> {
+    rows.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| Some((row.get("id")?.as_str()?.to_owned(), row.get("n")?.as_i64()?)))
+        .collect()
+}
+
+/// `(id, other, label)` from a `page_neighbours` result.
+fn relation_samples(rows: &Value) -> Vec<(String, String, Option<String>)> {
+    rows.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            Some((
+                row.get("id")?.as_str()?.to_owned(),
+                row.get("other")?.as_str()?.to_owned(),
+                row.get("label").and_then(Value::as_str).map(str::to_owned),
+            ))
+        })
+        .collect()
+}
+
 pub struct TypeTable {
     workspace: WeakEntity<Workspace>,
     session: Entity<GraphSession>,
@@ -115,6 +148,10 @@ pub struct TypeTable {
     /// commit; and the reads under way.
     blobs: HashMap<(String, String), Loadable<BlobMeta>>,
     blob_tasks: HashMap<(String, String), Task<()>>,
+    /// Each row's neighbours in the relationship columns, by row id and relationship key;
+    /// read for each page at the page's commit.
+    relations: HashMap<(String, String), Relation>,
+    relation_tasks: Vec<Task<()>>,
     peek: Option<(String, Entity<NodePeek>)>,
     newer: bool,
     saves_in_flight: usize,
@@ -292,6 +329,8 @@ impl TypeTable {
             cells: HashMap::new(),
             blobs: HashMap::new(),
             blob_tasks: HashMap::new(),
+            relations: HashMap::new(),
+            relation_tasks: Vec::new(),
             peek: None,
             newer: false,
             saves_in_flight: 0,
@@ -391,7 +430,7 @@ impl TypeTable {
         }
         let columns = if let Some(node) = schema.node(&self.type_name) {
             self.kind = TableKind::Node;
-            node_columns(node)
+            node_columns(node, &schema.relationships_of(&self.type_name))
         } else if let Some(edge) = schema.edge(&self.type_name) {
             self.kind = TableKind::Edge;
             edge_columns(edge)
@@ -540,6 +579,8 @@ impl TypeTable {
         self.rows.clear();
         self.blobs.clear();
         self.blob_tasks.clear();
+        self.relations.clear();
+        self.relation_tasks.clear();
         self.cursor = None;
         self.editing = None;
         self.loading_more = false;
@@ -631,7 +672,9 @@ impl TypeTable {
                 let sort_column = self.sort.as_ref().map(|sort| sort.property.as_str());
                 self.paging
                     .accept(output.graph_commit_id.as_deref(), &page, size, sort_column);
+                let ids: Vec<String> = page.iter().map(|row| row.id.clone()).collect();
                 self.rows.extend(page);
+                self.load_relations(ids, cx);
                 if first {
                     self.first_page = Loadable::Loaded(());
                     self.load_counts(cx);
@@ -650,6 +693,74 @@ impl TypeTable {
             }
         }
         cx.notify();
+    }
+
+    /// Reads the relationship columns for one page's rows: per relationship, how many
+    /// neighbours each row has, and the first few for the chips. Pinned to the page's commit.
+    fn load_relations(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        if ids.is_empty() || self.kind != TableKind::Node {
+            return;
+        }
+        let groups: Vec<_> = self
+            .columns
+            .iter()
+            .filter_map(ColumnSpec::relationship)
+            .cloned()
+            .collect();
+        let snapshot = self.paging.pinned.clone();
+        // Enough for three chips a row on most pages; a row past it shows its count alone.
+        let sample = (ids.len() as u32 * 3).clamp(30, 1000);
+        for group in groups {
+            let key = builder::relationship_key(&group);
+            let queries = (
+                builder::page_degrees(&schema, &self.type_name, &group, &ids),
+                builder::page_neighbours(&schema, &self.type_name, &group, &ids, sample),
+            );
+            let (Ok(degrees), Ok(neighbours)) = queries else {
+                continue;
+            };
+            let degrees = self.session.update(cx, |session, cx| {
+                session.read(&degrees, snapshot.clone(), cx)
+            });
+            let neighbours = self.session.update(cx, |session, cx| {
+                session.read(&neighbours, snapshot.clone(), cx)
+            });
+            let ids = ids.clone();
+            self.relation_tasks.push(cx.spawn(async move |this, cx| {
+                let (degrees, neighbours) = (degrees.await, neighbours.await);
+                this.update(cx, |this, cx| {
+                    let counts: HashMap<String, i64> = match &degrees {
+                        Ok(output) => relation_counts(&output.rows),
+                        Err(_) => HashMap::new(),
+                    };
+                    let mut shown: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+                    if let Ok(output) = &neighbours {
+                        for (id, other, label) in relation_samples(&output.rows) {
+                            let list = shown.entry(id).or_default();
+                            if list.len() < RELATION_CHIPS {
+                                list.push((other, label));
+                            }
+                        }
+                    }
+                    let failed = degrees.err().map(|error| error.to_string());
+                    for id in ids {
+                        let relation = Relation {
+                            count: match &failed {
+                                Some(error) => Err(error.clone()),
+                                None => Ok(counts.get(&id).copied().unwrap_or(0)),
+                            },
+                            neighbours: shown.remove(&id).unwrap_or_default(),
+                        };
+                        this.relations.insert((id, key.clone()), relation);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
     }
 
     fn load_counts(&mut self, cx: &mut Context<Self>) {
@@ -943,6 +1054,25 @@ impl TypeTable {
     fn click_cell(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
         let cursor = Cursor { row, col };
         self.set_cursor(cursor, window, cx);
+        // A relationship cell opens the related rows: the other type, filtered to those related
+        // to this row through the same relationship seen from the other end.
+        if let (Some(group), Some(id)) = (
+            self.columns[col].relationship(),
+            self.rows.get(row).map(|r| r.id.clone()),
+        ) {
+            let back = builder::reversed(group, &self.type_name);
+            window.dispatch_action(
+                Box::new(studio_actions::graph::OpenType {
+                    type_name: group.other_type.clone(),
+                    at_commit: self.at_commit.clone(),
+                    filter_id: Some(id),
+                    via: Some(builder::relationship_key(&back)),
+                    preview: false,
+                }),
+                cx,
+            );
+            return;
+        }
         if self.columns[col].editable(self.kind) {
             self.start_edit(cursor, window, cx);
         } else {
@@ -2166,6 +2296,70 @@ impl TypeTable {
         }
     }
 
+    /// A relationship cell: the first neighbours as chips, then "+N"; "—" for none.
+    fn render_relation_cell(
+        &self,
+        row: &Row,
+        key: &str,
+        group: &RelationshipGroup,
+        cx: &App,
+    ) -> AnyElement {
+        let Some(relation) = self.relations.get(&(row.id.clone(), key.to_owned())) else {
+            return Label::new("…")
+                .size(LabelSize::Small)
+                .color(Color::Disabled)
+                .into_any_element();
+        };
+        let count = match &relation.count {
+            Ok(count) => *count,
+            Err(error) => {
+                return div()
+                    .id(SharedString::from(format!("relation-{}-{key}", row.id)))
+                    .tooltip(Tooltip::text(error.clone()))
+                    .child(Label::new("?").size(LabelSize::Small).color(Color::Warning))
+                    .into_any_element();
+            }
+        };
+        if count == 0 {
+            return Label::new("—")
+                .size(LabelSize::Small)
+                .color(Color::Disabled)
+                .into_any_element();
+        }
+        let more = count - relation.neighbours.len() as i64;
+        // The count stays in view; the tags give way.
+        h_flex()
+            .id(SharedString::from(format!("relation-{}-{key}", row.id)))
+            .w_full()
+            .min_w_0()
+            .gap_1()
+            .tooltip(Tooltip::text(format!(
+                "{} {} · click to open them",
+                format_count(count),
+                group.other_type
+            )))
+            .child(h_flex().min_w_0().gap_1().overflow_hidden().children(
+                relation.neighbours.iter().map(|(id, label)| {
+                    studio_ui::ds::tag(label.clone().unwrap_or_else(|| id.clone()), cx)
+                }),
+            ))
+            .when(more > 0, |cell| {
+                cell.child(
+                    div().flex_none().child(
+                        Label::new(if relation.neighbours.is_empty() {
+                            format_count(count)
+                        } else {
+                            format!("+{}", format_count(more))
+                        })
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .single_line(),
+                    ),
+                )
+            })
+            .into_any_element()
+    }
+
     /// A Blob cell: "Blob" while it is read, then its size and "Preview" (a click opens the
     /// peek, which shows it), "—" for null, or the host of an external reference.
     fn render_blob_cell(&self, row: &Row, property: &Property) -> AnyElement {
@@ -2307,6 +2501,15 @@ impl TypeTable {
             Color::Default
         };
         let numeric = column.align_right;
+        if let Some(group) = column.relationship() {
+            return cell
+                .child(self.render_relation_cell(row, &column.key, group, cx))
+                .when(is_cursor, |cell| cell.child(ring()))
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.click_cell(ix, col, window, cx)),
+                )
+                .into_any_element();
+        }
         let content: AnyElement = match column.property() {
             Some(property) if property.kind == ScalarKind::Blob => {
                 self.render_blob_cell(row, property)
