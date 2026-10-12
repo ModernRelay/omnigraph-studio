@@ -23,6 +23,8 @@ pub struct OpenGraphModal {
     new_name: Entity<Editor>,
     new_url: Entity<Editor>,
     new_token: Entity<Editor>,
+    /// A replacement for a token the selected server refused.
+    replacement_token: Entity<Editor>,
     error: Option<SharedString>,
     _subscriptions: Vec<Subscription>,
 }
@@ -73,6 +75,8 @@ impl OpenGraphModal {
         ));
         let new_token = input("Token (stored in the keychain)", window, cx);
         new_token.update(cx, |editor, cx| editor.set_masked(true, cx));
+        let replacement_token = input("New token", window, cx);
+        replacement_token.update(cx, |editor, cx| editor.set_masked(true, cx));
         let selected = connections
             .iter()
             .find(|c| c.read(cx).state == ConnectionState::Ready)
@@ -87,6 +91,7 @@ impl OpenGraphModal {
             new_name: input("Name, for example dev", window, cx),
             new_url: input("http://127.0.0.1:8787", window, cx),
             new_token,
+            replacement_token,
             error: None,
             _subscriptions: subscriptions,
         }
@@ -153,6 +158,30 @@ impl OpenGraphModal {
         }
     }
 
+    fn update_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(connection) = self.selected.clone() else {
+            return;
+        };
+        let token = self.replacement_token.read(cx).text(cx);
+        if token.trim().is_empty() {
+            self.error = Some("Enter the new token.".into());
+            cx.notify();
+            return;
+        }
+        let registry = ConnectionRegistry::global(cx);
+        match registry.update(cx, |registry, cx| {
+            registry.update_token(&connection, token, cx)
+        }) {
+            Ok(()) => {
+                self.error = None;
+                self.replacement_token
+                    .update(cx, |editor, cx| editor.set_text("", window, cx));
+            }
+            Err(error) => self.error = Some(error.to_string().into()),
+        }
+        cx.notify();
+    }
+
     fn render_servers(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let connections = ConnectionRegistry::global(cx).read(cx).connections.clone();
         v_flex()
@@ -217,11 +246,12 @@ impl OpenGraphModal {
         let c = connection.read(cx);
         let status = match &c.state {
             ConnectionState::Unreachable(error) => format!("Could not reach the server: {error}"),
-            ConnectionState::Unauthorized => {
-                "The server refused the token. For a CLI server, check `omnigraph login`; for one added here, add it again with a new token.".into()
-            }
+            ConnectionState::Unauthorized => "The server refused the token.".into(),
             state => state.label(),
         };
+        let state = c.state.clone();
+        let cli = c.server.source == ServerSource::Cli;
+        let selected = connection.clone();
         let listing_note = match &c.graphs {
             GraphListing::NotAllowed => Some("This token may not list graphs. Enter a graph id."),
             GraphListing::Failed(_) => Some("The graph list could not be read. Enter a graph id."),
@@ -242,13 +272,65 @@ impl OpenGraphModal {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(Indicator::dot().color(state_color(&c.state)))
+                    .child(Indicator::dot().color(state_color(&state)))
                     .child(
                         Label::new(status)
                             .size(LabelSize::Small)
                             .color(Color::Muted),
-                    ),
+                    )
+                    .child(div().flex_1())
+                    .map(|row| match &state {
+                        ConnectionState::Connecting => row.child(
+                            Button::new("cancel-connect", "Cancel")
+                                .style(ButtonStyle::Subtle)
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    selected.update(cx, |c, cx| c.cancel(cx));
+                                })),
+                        ),
+                        ConnectionState::Unreachable(_) | ConnectionState::Idle => row.child(
+                            Button::new("retry-connect", "Retry")
+                                .style(ButtonStyle::Subtle)
+                                .label_size(LabelSize::Small)
+                                .start_icon(Icon::new(IconName::RotateCw).size(IconSize::XSmall))
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    selected.update(cx, |c, cx| c.connect(cx));
+                                })),
+                        ),
+                        _ => row,
+                    }),
             )
+            .when(state == ConnectionState::Unauthorized, |pane| {
+                pane.child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(colors.border)
+                                .child(self.replacement_token.clone()),
+                        )
+                        .child(
+                            Button::new("update-token", "Update token")
+                                .style(ButtonStyle::Filled)
+                                .tooltip(ui::Tooltip::text(if cli {
+                                    "Used until Studio quits. Run `omnigraph login` to keep it \
+                                     for the CLI and Studio."
+                                } else {
+                                    "Stored in the keychain and used from now on."
+                                }))
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.update_token(window, cx)
+                                    }),
+                                ),
+                        ),
+                )
+            })
             .child(
                 Label::new("Graphs")
                     .size(LabelSize::XSmall)

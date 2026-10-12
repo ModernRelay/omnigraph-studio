@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{Context, EventEmitter, Task};
-use studio_settings::StudioSettings;
 use graph_client::api::{GraphInfo, HealthOutput};
 use graph_client::{GraphClient, ReadError};
 use http_client::HttpClient;
+use studio_settings::StudioSettings;
 
 /// Where Studio learned about a server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +76,7 @@ pub enum ConnectionEvent {
 pub struct Connection {
     pub server: ServerEntry,
     client: GraphClient,
+    http: Arc<dyn HttpClient>,
     pub state: ConnectionState,
     pub health: Option<HealthOutput>,
     pub operations: BTreeSet<String>,
@@ -100,10 +101,11 @@ impl Connection {
         http: Arc<dyn HttpClient>,
     ) -> anyhow::Result<Self> {
         let has_token = token.is_some();
-        let client = GraphClient::new(&server.url, token, http)?;
+        let client = GraphClient::new(&server.url, token, http.clone())?;
         Ok(Self {
             server,
             client,
+            http,
             state: ConnectionState::Idle,
             health: None,
             operations: BTreeSet::new(),
@@ -151,6 +153,29 @@ impl Connection {
     pub fn remember_graph(&mut self, graph_id: &str) {
         if !self.server.known_graphs.iter().any(|g| g == graph_id) {
             self.server.known_graphs.push(graph_id.to_owned());
+        }
+    }
+
+    /// Replaces the token after the server refused the old one (spec 003); requests made after
+    /// this use it, and the connection checks again.
+    pub fn set_token(
+        &mut self,
+        token: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        self.client = GraphClient::new(&self.server.url, token.clone(), self.http.clone())?;
+        self.has_token = token.is_some();
+        self.connect(cx);
+        Ok(())
+    }
+
+    /// Stops a connection attempt that is taking too long.
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        if self.state == ConnectionState::Connecting {
+            self._task = None;
+            self.state = ConnectionState::Idle;
+            cx.emit(ConnectionEvent::StateChanged);
+            cx.notify();
         }
     }
 

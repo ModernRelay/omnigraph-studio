@@ -209,6 +209,29 @@ impl ConnectionRegistry {
         Ok(connection)
     }
 
+    /// Replaces a server's token and reconnects. A server Studio added keeps it in the keychain;
+    /// for a CLI server it lasts this run, since Studio never writes the CLI's files.
+    pub fn update_token(
+        &mut self,
+        connection: &Entity<Connection>,
+        token: String,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let token = token.trim().to_owned();
+        let (url, source) = {
+            let server = &connection.read(cx).server;
+            (server.url.clone(), server.source)
+        };
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some(token.clone()), cx)
+        })?;
+        if source == ServerSource::Studio {
+            cx.write_credentials(&url, KEYCHAIN_USER, token.as_bytes())
+                .detach();
+        }
+        Ok(())
+    }
+
     /// Removes a server Studio added, with its keychain token.
     pub fn remove_server(&mut self, connection: &Entity<Connection>, cx: &mut Context<Self>) {
         let url = connection.read(cx).server.url.clone();
@@ -244,9 +267,10 @@ impl ConnectionRegistry {
         let saved = SavedServers { servers };
         let dir = data_dir();
         if std::fs::create_dir_all(&dir).is_ok()
-            && let Ok(text) = serde_json::to_string_pretty(&saved) {
-                let _ = std::fs::write(saved_path(), text);
-            }
+            && let Ok(text) = serde_json::to_string_pretty(&saved)
+        {
+            let _ = std::fs::write(saved_path(), text);
+        }
     }
 
     pub fn find(&self, name: &str, cx: &App) -> Option<Entity<Connection>> {

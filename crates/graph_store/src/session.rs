@@ -2,7 +2,7 @@
 //! write Studio sends for it (spec 003, 004, 008).
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task};
 use gq_language::{BuiltQuery, SchemaModel};
@@ -63,7 +63,13 @@ pub enum SessionEvent {
         branch: String,
     },
     ActivityChanged,
+    /// The graph became unavailable (503) or answered again.
+    AvailabilityChanged,
 }
+
+/// The first wait before a graph that answered 503 is asked again; it doubles up to the cap.
+const RECHECK_FIRST: Duration = Duration::from_secs(5);
+const RECHECK_CAP: Duration = Duration::from_secs(60);
 
 pub struct GraphSession {
     pub connection: Entity<Connection>,
@@ -75,6 +81,11 @@ pub struct GraphSession {
     pub outcomes: Vec<OutcomeEntry>,
     pub reads_in_flight: usize,
     pub writes_in_flight: usize,
+    /// Why the graph is unavailable, when it answered 503 (spec 003); reads resume, and this
+    /// clears, when it answers again.
+    pub unavailable: Option<String>,
+    recheck_after: Duration,
+    _recheck: Option<Task<()>>,
     _schema_task: Option<Task<()>>,
     _branches_task: Option<Task<()>>,
     _datasets_task: Option<Task<()>>,
@@ -99,6 +110,9 @@ impl GraphSession {
             outcomes: Vec::new(),
             reads_in_flight: 0,
             writes_in_flight: 0,
+            unavailable: None,
+            recheck_after: RECHECK_FIRST,
+            _recheck: None,
             _schema_task: None,
             _branches_task: None,
             _datasets_task: None,
@@ -123,6 +137,40 @@ impl GraphSession {
         self.schema.loaded().cloned()
     }
 
+    /// Notes what a read says about the graph's availability: a 503 marks it unavailable and
+    /// asks again later, with a growing wait; any answer clears the mark.
+    fn note_read<T>(&mut self, result: &Result<T, ReadError>, cx: &mut Context<Self>) {
+        match result {
+            Err(ReadError::Refused(error)) if error.status == 503 => {
+                let first = self.unavailable.is_none();
+                self.unavailable = Some(error.message.clone());
+                if first || self._recheck.is_none() {
+                    let wait = self.recheck_after;
+                    self.recheck_after = (wait * 2).min(RECHECK_CAP);
+                    self._recheck = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(wait).await;
+                        this.update(cx, |this, cx| {
+                            this._recheck = None;
+                            this.reload(cx);
+                        })
+                        .ok();
+                    }));
+                }
+                if first {
+                    cx.emit(SessionEvent::AvailabilityChanged);
+                }
+            }
+            Err(ReadError::Transport(_)) => {}
+            _ => {
+                if self.unavailable.take().is_some() {
+                    self.recheck_after = RECHECK_FIRST;
+                    self._recheck = None;
+                    cx.emit(SessionEvent::AvailabilityChanged);
+                }
+            }
+        }
+    }
+
     /// Reloads the schema, the branch list and the type counts.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.reload_schema(cx);
@@ -135,7 +183,9 @@ impl GraphSession {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         self._schema_task = Some(cx.spawn(async move |this, cx| {
-            let result = match client.schema(&graph).await {
+            let read = client.schema(&graph).await;
+            this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
+            let result = match read {
                 Ok(output) => match SchemaModel::parse(&output.schema_source) {
                     Ok(model) => Loadable::Loaded(Arc::new(model)),
                     Err(error) => {
@@ -158,7 +208,9 @@ impl GraphSession {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         self._branches_task = Some(cx.spawn(async move |this, cx| {
-            let result = match client.branches(&graph).await {
+            let read = client.branches(&graph).await;
+            this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
+            let result = match read {
                 Ok(output) => {
                     let mut branches = output.branches;
                     branches.sort_by(|a, b| (a != "main").cmp(&(b != "main")).then(a.cmp(b)));
@@ -181,7 +233,9 @@ impl GraphSession {
         let graph = self.graph_id.clone();
         let branch = self.branch.clone();
         self._datasets_task = Some(cx.spawn(async move |this, cx| {
-            let result = match client.snapshot(&graph, &branch).await {
+            let read = client.snapshot(&graph, &branch).await;
+            this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
+            let result = match read {
                 Ok(output) => Loadable::Loaded(output.datasets),
                 Err(error) => Loadable::Failed(error.to_string()),
             };
@@ -242,6 +296,7 @@ impl GraphSession {
         cx.spawn(async move |this, cx| {
             let result = client.query(&graph, &request).await;
             this.update(cx, |this, cx| {
+                this.note_read(&result, cx);
                 this.reads_in_flight = this.reads_in_flight.saturating_sub(1);
                 cx.emit(SessionEvent::ActivityChanged);
                 cx.notify();
@@ -432,4 +487,70 @@ pub fn open_session(
 ) -> Entity<GraphSession> {
     connection.update(cx, |connection, _| connection.remember_graph(&graph_id));
     cx.new(|cx| GraphSession::new(connection, graph_id, branch, cx))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use gpui::{AppContext as _, TestAppContext};
+    use http_client::http::Response;
+    use http_client::{AsyncBody, FakeHttpClient};
+
+    use super::*;
+    use crate::connection::{ServerEntry, ServerSource};
+
+    #[gpui::test]
+    async fn a_graph_that_answers_503_is_unavailable_until_it_answers_again(
+        cx: &mut TestAppContext,
+    ) {
+        let ready = Arc::new(AtomicBool::new(false));
+        let flag = ready.clone();
+        let http = FakeHttpClient::create(move |_request| {
+            let ready = flag.load(Ordering::SeqCst);
+            async move {
+                let (status, body) = if ready {
+                    (200, r#"{"branches":["main"]}"#)
+                } else {
+                    (503, r#"{"error":"graph knowledge is loading"}"#)
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert_eq!(
+                session.unavailable.as_deref(),
+                Some("graph knowledge is loading")
+            )
+        });
+
+        // Nothing is asked again before the wait; after it, the answer clears the mark.
+        ready.store(true, Ordering::SeqCst);
+        cx.executor().advance_clock(RECHECK_FIRST / 2);
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| assert!(session.unavailable.is_some()));
+        cx.executor().advance_clock(RECHECK_FIRST);
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.unavailable, None);
+            assert_eq!(
+                session.branches.loaded().cloned(),
+                Some(vec!["main".to_owned()])
+            );
+        });
+    }
 }

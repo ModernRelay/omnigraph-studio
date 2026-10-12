@@ -1128,6 +1128,7 @@ impl Workspace {
         let s = session.read(cx);
         let graph = s.graph_id.clone();
         let branch = s.branch.clone();
+        let unavailable = s.unavailable.clone();
         let branches = s.branches.loaded().cloned().unwrap_or_default();
         let running = match (s.reads_in_flight, s.writes_in_flight) {
             (0, 0) => None,
@@ -1154,18 +1155,26 @@ impl Workspace {
                     .rounded(px(studio_ui::ds::radius::SM))
                     .cursor_pointer()
                     .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                    .tooltip(|_, cx| {
-                        Tooltip::for_action(
-                            "Open another graph",
-                            &studio_actions::workspace::OpenGraph,
-                            cx,
-                        )
+                    .map(|button| match unavailable.clone() {
+                        Some(reason) => button.tooltip(Tooltip::text(format!(
+                            "This graph is unavailable: {reason}. Reads resume when it is ready."
+                        ))),
+                        None => button.tooltip(|_, cx| {
+                            Tooltip::for_action(
+                                "Open another graph",
+                                &studio_actions::workspace::OpenGraph,
+                                cx,
+                            )
+                        }),
                     })
                     .child(
                         Icon::new(IconName::DatabaseZap)
                             .size(IconSize::XSmall)
                             .color(Color::Muted),
                     )
+                    .when(unavailable.is_some(), |button| {
+                        button.child(Indicator::dot().color(Color::Warning))
+                    })
                     .child(Label::new(graph).size(LabelSize::Small).single_line())
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(studio_actions::workspace::OpenGraph), cx)

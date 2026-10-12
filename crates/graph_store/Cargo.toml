@@ -21,5 +21,8 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 url = { workspace = true }
 
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true

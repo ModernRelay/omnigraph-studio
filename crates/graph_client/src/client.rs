@@ -26,6 +26,12 @@ use crate::{ApiError, CONTRACT_HEADER, IF_GRAPH_COMMIT_HEADER, SUPPORTED_CONTRAC
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(300);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many times a read refused with 429 is tried again (spec 003). Writes never are.
+const READ_RETRIES: usize = 2;
+/// The longest `Retry-After` a read waits; a longer one is shown as the refusal.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// The wait when a 429 names none.
+const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
 
 /// Why a read failed.
 #[derive(Debug, Clone)]
@@ -89,6 +95,8 @@ impl ServerHealth {
 struct RawResponse {
     status: StatusCode,
     contract: Option<String>,
+    /// `Retry-After` in seconds; the HTTP-date form is not used by OmniGraph.
+    retry_after: Option<Duration>,
     body: Vec<u8>,
 }
 
@@ -186,6 +194,12 @@ impl GraphClient {
             .get(CONTRACT_HEADER)
             .and_then(|value: &HeaderValue| value.to_str().ok())
             .map(str::to_owned);
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value: &HeaderValue| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
         let mut bytes = Vec::new();
         response
             .into_body()
@@ -195,6 +209,7 @@ impl GraphClient {
         Ok(RawResponse {
             status,
             contract,
+            retry_after,
             body: bytes,
         })
     }
@@ -207,10 +222,23 @@ impl GraphClient {
         body: Option<Vec<u8>>,
     ) -> Result<T, ReadError> {
         let url = self.url(segments, query);
-        let raw = self
-            .send(method, url, body, &[], READ_TIMEOUT)
-            .await
-            .map_err(ReadError::Transport)?;
+        let mut retries = 0;
+        let raw = loop {
+            let raw = self
+                .send(method.clone(), url.clone(), body.clone(), &[], READ_TIMEOUT)
+                .await
+                .map_err(ReadError::Transport)?;
+            // A read changes nothing, so a rate-limited one waits as asked and goes again.
+            if raw.status == StatusCode::TOO_MANY_REQUESTS && retries < READ_RETRIES {
+                let wait = raw.retry_after.unwrap_or(DEFAULT_RETRY_AFTER);
+                if wait <= MAX_RETRY_AFTER {
+                    retries += 1;
+                    smol::Timer::after(wait).await;
+                    continue;
+                }
+            }
+            break raw;
+        };
         if raw.status.is_success() {
             match raw.contract.as_deref() {
                 Some(served) if SUPPORTED_CONTRACTS.contains(&served) => {}
@@ -627,6 +655,55 @@ mod tests {
         let result =
             block_on(client(respond(200, Some("0.13"), r#"{"branches":["main"]}"#)).branches("g"));
         assert_eq!(result.unwrap().branches, vec!["main"]);
+    }
+
+    /// Answers 429 (`Retry-After: 0`) `limited` times, then 200; counts the requests.
+    fn rate_limited(
+        limited: usize,
+        body: &'static str,
+    ) -> (Arc<dyn HttpClient>, Arc<std::sync::atomic::AtomicUsize>) {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = count.clone();
+        let http = FakeHttpClient::create(move |_request| {
+            let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                let builder = Response::builder().header(CONTRACT_HEADER, "0.13");
+                let response = if n < limited {
+                    builder
+                        .status(429)
+                        .header("retry-after", "0")
+                        .body(AsyncBody::from(r#"{"error":"slow down"}"#))
+                } else {
+                    builder.status(200).body(AsyncBody::from(body))
+                };
+                Ok(response.unwrap())
+            }
+        });
+        (http, count)
+    }
+
+    #[test]
+    fn a_rate_limited_read_waits_and_goes_again_a_bounded_number_of_times() {
+        let (http, count) = rate_limited(2, r#"{"branches":["main"]}"#);
+        let result = block_on(client(http).branches("g"));
+        assert_eq!(result.unwrap().branches, vec!["main"]);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        let (http, count) = rate_limited(10, r#"{"branches":["main"]}"#);
+        let result = block_on(client(http).branches("g"));
+        assert!(matches!(result, Err(ReadError::Refused(e)) if e.status == 429));
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1 + READ_RETRIES
+        );
+    }
+
+    #[test]
+    fn a_rate_limited_write_is_never_sent_again() {
+        let (http, count) = rate_limited(1, CHANGE);
+        let outcome = block_on(client(http).mutate("g", &ChangeRequest::default(), None));
+        assert!(!matches!(outcome, WriteOutcome::Committed(_)));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
