@@ -1,7 +1,7 @@
 # 010: Inspectors
 
-Status: built on 0.13 · 2026-10-12 (`crates/inspectors`): a "Storage" tab. Not built: index facts
-from `explain` (E13).
+Status: built on 0.13 · 2026-10-12 (`crates/inspectors`): a "Storage" tab. Index facts wait on
+E13: 0.13's `explain` names none for a scan (see the validation log).
 
 ## Problem
 
@@ -33,14 +33,16 @@ I (read through HTTP only), VI (missing data labelled, never blank).
 
 ## Deferred
 
-- Engine change E13 (index status), [spec 012](../012-omnigraph-engine-changes/plan.md). Index facts come from `explain` statistics until
-  then.
+- Engine change E13 (index status), [spec 012](../012-omnigraph-engine-changes/plan.md). The
+  interim plan, index facts from `explain` statistics, has nothing to read at 0.13: a scan's
+  plan names its table version, projection, filter and row estimate, not the indexes behind it.
 
 ## Validation log
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-10-11 | Snapshot fields in 0.13.0 | parsed `openapi.json` at `v0.13.0` | `datasets`, `graph_branch`, `graph_manifest_version`, `internal_schema_version` |
+| 2026-10-12 | `explain` as a source of index facts | `explain` of a key-equality scan on `knowledge` and a `search` scan on `notes` against the 0.13 dev server | The physical `Scan` carries `table`, `version`, `projection`, `filter` and one statistic, `scan_row_estimate` with its origin ("manifest row count, at most one row under a key equality"); `plan` rows add passes, route, hashes, `assumptions` (dataset path and version, gate policy, memory limit). Nothing names an index or its coverage |
 | 2026-10-12 | Every field renders from a live server | offscreen snapshot against `omnigraph-server` 0.13.0 | `/healthz`, `/readyz`, `/graphs` and `/snapshot` values shown and copyable; `source_version` absent and labelled "Not reported by this server" |
 
 ## Corrections
