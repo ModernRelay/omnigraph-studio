@@ -61,6 +61,15 @@ without preview, or work in it keeps it. Tabs that hold unsaved work stay open o
 closes. The workspace file saves each pane's tabs, active tab and pinned count, the split tree
 and the active pane; a file from before splits restores as one pane.
 
+Built (several graphs in one window): opening another graph parks the shown one with its panes,
+tabs and back/forward trail, saved first; the sidebar footer is the switcher ("Open in this
+window", the shown graph checked, Open Another Graph…, Close Graph) and reads "+N graphs" when
+more are open; ⌃⌘] and ⌃⌘[ step through them. Closing a graph saves its tabs (opening it
+again brings them back) and shows the one opened before; a graph with a write still running
+stays open, so the write's outcome is never dropped. Toasts follow the shown graph; a parked
+graph's writes still land in its activity log. Which graphs a window had open is not restored
+across launches (see Deferred).
+
 ### Window chrome
 
 - Transparent title bar with traffic lights; the title area shows
@@ -226,10 +235,14 @@ Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks ente
 | 2026-10-12 | Settings rows are generated in declaration order | `studio_settings` field tests (row order, sections, kinds, path writes and resets); `serde_json`'s `preserve_order` is on in the workspace graph; offscreen snapshots of the Appearance section and of searches for "page" and "agent" | Fourteen rows in four sections; `agent.env` hidden; changed rows show Reset and the nav counts them |
 | 2026-10-12 | A graph's own value reaches its views | offscreen snapshots with the new `click:x,y` step: the scope switch, then + on Table page size in the graph scope; `settings.json` after; the Person table after | `graphs."environment/knowledge".type_table_page_size` 125, `studio.type_table_page_size` still 100; the table footer reads "125 of 200" |
 | 2026-10-12 | Panes, pins and previews | `studio_workspace` pane tests (preview replaced in place and kept, pin order, close others, removal, split nesting and collapse, JSON round trip); offscreen snapshots: preview Person then Company, pin a query, split right and down, restart with restore, drag the boundary with the new `drag:` step | Company replaced Person in its place in italics; the query stayed first with a pin; both splits showed a copy of the Project table; the layout, pins and shares came back after the restart |
+| 2026-10-12 | Two graphs in one window | a second dev graph `notes` (`dev/cluster/notes.pg`, `dev/notes-seed.jsonl`); offscreen snapshots: Person and a query on `knowledge`, Open Graph, `click:` on `notes`, a Note table split in two, the switcher; then ⌃⌘] | The switcher listed both with `notes` checked and "+1 graph" in the footer; stepping back showed `knowledge` with its Person tab and the query draft |
 | 2026-10-12 | Every tab kind comes back after a restart | offscreen snapshots: one run opened a type table, a query with a draft, history, canvas and storage; a second run with `OMNIGRAPH_STUDIO_NO_RESTORE=0` | All five tabs restored in order, the draft intact; the workspace file is `-rw-------` |
 
 ## Corrections
 
+- 2026-10-12 · After a graph switch the next action went nowhere: the Open Graph modal handed
+  the focus back to a tab of the graph just parked, which is no longer drawn. Parking clears the
+  modal's saved focus; a modal with none focuses the shown graph's active tab.
 - 2026-10-12 · ⌘W, the dock toggles (⌘B, ⌘⌥B, ⌘J) and next and previous tab had no key:
   Zed's bindings for them name Zed's actions, which Studio's keymap loader drops. Studio binds
   its own in the `Workspace` context.

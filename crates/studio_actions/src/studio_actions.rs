@@ -84,6 +84,13 @@ pub mod workspace {
             CloseOtherItems,
             /// Close every unpinned tab of the pane.
             CloseAllItems,
+            /// Show the next graph open in this window.
+            ActivateNextGraph,
+            /// Show the previous graph open in this window.
+            ActivatePreviousGraph,
+            /// Close the shown graph's tabs in this window; they come back when it is opened
+            /// again.
+            CloseGraph,
             /// Open the design system gallery: every token and component in the current window
             /// style.
             OpenDesignSystem,

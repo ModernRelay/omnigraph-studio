@@ -23,14 +23,17 @@ use gpui::{
 use graph_store::{ConnectionState, GraphSession, OutcomeKind, SessionEvent};
 use studio_actions::graph::{OpenCommit, OpenHistory};
 use studio_actions::workspace::{
-    ActivateItem, ActivateLastItem, ActivateNextItem, ActivateNextPane, ActivatePreviousItem,
-    ActivatePreviousPane, CloseActiveItem, CloseAllItems, CloseOtherItems, GoBack, GoForward,
-    KeepPreviewTab, Refresh, SplitDown, SplitRight, ToggleActivity, ToggleInspector, TogglePinTab,
-    ToggleSidebar,
+    ActivateItem, ActivateLastItem, ActivateNextGraph, ActivateNextItem, ActivateNextPane,
+    ActivatePreviousGraph, ActivatePreviousItem, ActivatePreviousPane, CloseActiveItem,
+    CloseAllItems, CloseGraph, CloseOtherItems, GoBack, GoForward, KeepPreviewTab, Refresh,
+    SplitDown, SplitRight, ToggleActivity, ToggleInspector, TogglePinTab, ToggleSidebar,
 };
 use studio_settings::StudioSettings;
 use ui::prelude::*;
-use ui::{CommonAnimationExt as _, ContextMenu, Indicator, PopoverMenu, Tooltip, right_click_menu};
+use ui::{
+    ButtonLike, CommonAnimationExt as _, ContextMenu, Indicator, PopoverMenu, Tooltip,
+    right_click_menu,
+};
 
 pub use item::{Item, ItemEvent, ItemFooter, ItemHandle};
 pub use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};
@@ -79,8 +82,25 @@ pub enum WorkspaceEvent {
 
 type ActionRegistration = Rc<dyn Fn(Div, &mut Window, &mut Context<Workspace>) -> Div>;
 
+/// A graph open in this window but not shown (spec 002: several graph sessions as tabs): its
+/// tabs, splits and back/forward trail wait here until it is shown again.
+struct ParkedGraph {
+    session: Entity<GraphSession>,
+    panes: Vec<Pane<Box<dyn ItemHandle>>>,
+    center: Member,
+    active_pane: PaneId,
+    next_pane: PaneId,
+    back: Vec<EntityId>,
+    forward: Vec<EntityId>,
+    saved: Option<SavedWorkspace>,
+}
+
 pub struct Workspace {
     session: Option<Entity<GraphSession>>,
+    /// The other graphs open in this window, and every open graph's session in the order they
+    /// were opened (the switcher's order).
+    parked: Vec<ParkedGraph>,
+    graph_order: Vec<EntityId>,
     /// The document area: panes of tabs in a tree of splits (spec 002, "Frame").
     panes: Vec<Pane<Box<dyn ItemHandle>>>,
     center: Member,
@@ -160,6 +180,8 @@ impl Workspace {
         });
         Self {
             session: None,
+            parked: Vec::new(),
+            graph_order: Vec::new(),
             panes: vec![Pane::new(0)],
             center: Member::Pane(0),
             active_pane: 0,
@@ -345,26 +367,56 @@ impl Workspace {
         self.session.as_ref()
     }
 
-    /// Opens a graph session in this window. Tabs from another graph are closed.
+    /// Opens a graph session in this window. Another graph's tabs are kept: that graph is
+    /// parked and comes back from the graph switcher.
     pub fn set_session(
         &mut self,
         session: Entity<GraphSession>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let same_graph = self.session.as_ref().is_some_and(|current| {
-            let current = current.read(cx);
-            let next = session.read(cx);
-            current.graph_id == next.graph_id && current.connection == next.connection
-        });
-        if !same_graph {
-            self.panes = vec![Pane::new(0)];
-            self.center = Member::Pane(0);
-            self.active_pane = 0;
-            self.next_pane = 1;
-            self._item_subscriptions.clear();
-            self.right.remove(INSPECTOR_PANEL);
+        let shown = self
+            .session
+            .as_ref()
+            .is_some_and(|current| same_graph(current, &session, cx));
+        if shown {
+            self.subscribe_session(session, window, cx);
+            cx.emit(WorkspaceEvent::SessionChanged);
+            cx.notify();
+            return;
         }
+        let parked = self
+            .parked
+            .iter()
+            .position(|parked| same_graph(&parked.session, &session, cx))
+            .map(|index| self.parked.remove(index));
+        if let Some(current) = self.park(cx) {
+            self.parked.push(current);
+        }
+        if let Some(parked) = parked {
+            self.show_parked(parked, window, cx);
+            return;
+        }
+        self.graph_order.push(session.entity_id());
+        self.subscribe_session(session, window, cx);
+        if persistence::restore_enabled() {
+            self.saved = None;
+            self.restore(window, cx);
+        }
+        // Focus the graph's active tab, else the workspace: a parked graph's tab may still hold
+        // the focus, and actions dispatched from an element that is not drawn reach nothing.
+        let index = self.pane(self.active_pane).map_or(0, |p| p.active);
+        self.activate_in(self.active_pane, index, false, window, cx);
+        cx.emit(WorkspaceEvent::SessionChanged);
+        cx.notify();
+    }
+
+    fn subscribe_session(
+        &mut self,
+        session: Entity<GraphSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self._session_subscription = Some(cx.subscribe_in(
             &session,
             window,
@@ -376,17 +428,147 @@ impl Workspace {
             },
         ));
         self.session = Some(session);
-        if !same_graph && persistence::restore_enabled() {
-            self.saved = None;
-            self.restore(window, cx);
+    }
+
+    /// Writes the shown graph's state now, rather than after the save delay.
+    fn save_now(&mut self, cx: &mut Context<Self>) {
+        let Some((url, graph)) = self.graph_key(cx) else {
+            return;
+        };
+        let snapshot = self.snapshot(cx);
+        self._save = None;
+        persistence::save(&url, &graph, &snapshot);
+        self.saved = Some(snapshot);
+    }
+
+    /// Takes the shown graph out of the window, saved, leaving no graph shown.
+    fn park(&mut self, cx: &mut Context<Self>) -> Option<ParkedGraph> {
+        self.save_now(cx);
+        let session = self.session.take()?;
+        self._session_subscription = None;
+        self.right.remove(INSPECTOR_PANEL);
+        // A modal open now must not hand the focus back to a tab of this graph.
+        if let Some(modal) = &mut self.modal {
+            modal.previous_focus = None;
         }
-        // With nothing focused, GPUI dispatches actions to the window's root view, which is
-        // outside the element that carries the workspace's action handlers.
-        if window.focused(cx).is_none() {
-            window.focus(&self.focus_handle, cx);
-        }
+        Some(ParkedGraph {
+            session,
+            panes: std::mem::replace(&mut self.panes, vec![Pane::new(0)]),
+            center: std::mem::replace(&mut self.center, Member::Pane(0)),
+            active_pane: std::mem::replace(&mut self.active_pane, 0),
+            next_pane: std::mem::replace(&mut self.next_pane, 1),
+            back: std::mem::take(&mut self.back),
+            forward: std::mem::take(&mut self.forward),
+            saved: self.saved.take(),
+        })
+    }
+
+    fn show_parked(&mut self, parked: ParkedGraph, window: &mut Window, cx: &mut Context<Self>) {
+        self.panes = parked.panes;
+        self.center = parked.center;
+        self.active_pane = parked.active_pane;
+        self.next_pane = parked.next_pane;
+        self.back = parked.back;
+        self.forward = parked.forward;
+        self.saved = parked.saved;
+        self.subscribe_session(parked.session, window, cx);
+        let index = self.pane(self.active_pane).map_or(0, |p| p.active);
+        self.activate_in(self.active_pane, index, false, window, cx);
         cx.emit(WorkspaceEvent::SessionChanged);
         cx.notify();
+    }
+
+    /// The graphs open in this window, in the order they were opened, and which is shown.
+    pub fn open_graphs(&self) -> Vec<(Entity<GraphSession>, bool)> {
+        self.graph_order
+            .iter()
+            .filter_map(|id| {
+                if let Some(session) = self.session.as_ref().filter(|s| s.entity_id() == *id) {
+                    return Some((session.clone(), true));
+                }
+                self.parked
+                    .iter()
+                    .find(|parked| parked.session.entity_id() == *id)
+                    .map(|parked| (parked.session.clone(), false))
+            })
+            .collect()
+    }
+
+    /// Shows the open graph whose session is `id`.
+    pub fn show_graph(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.as_ref().map(Entity::entity_id) == Some(id) {
+            return;
+        }
+        let Some(index) = self.parked.iter().position(|p| p.session.entity_id() == id) else {
+            return;
+        };
+        let target = self.parked.remove(index);
+        if let Some(current) = self.park(cx) {
+            self.parked.push(current);
+        }
+        self.show_parked(target, window, cx);
+    }
+
+    /// Shows the next (or previous) open graph.
+    fn show_graph_step(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let order: Vec<EntityId> = self
+            .open_graphs()
+            .iter()
+            .map(|(session, _)| session.entity_id())
+            .collect();
+        let Some(current) = self.session.as_ref().map(Entity::entity_id) else {
+            return;
+        };
+        let Some(position) = order.iter().position(|id| *id == current) else {
+            return;
+        };
+        let next = if forward {
+            order[(position + 1) % order.len()]
+        } else {
+            order[(position + order.len() - 1) % order.len()]
+        };
+        self.show_graph(next, window, cx);
+    }
+
+    /// Closes the shown graph's tabs in this window and shows the graph opened before it. Its
+    /// tabs are saved first, so opening it again brings them back. A graph with a write still
+    /// running stays open: closing it could drop the write's outcome.
+    pub fn close_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        if session.read(cx).writes_in_flight > 0 {
+            let graph = session.read(cx).graph_id.clone();
+            self.show_toast(
+                ToastKind::Error,
+                format!("A write to {graph} is still running. Close the graph when it finishes."),
+                cx,
+            );
+            return;
+        }
+        let id = session.entity_id();
+        if let Some(closed) = self.park(cx) {
+            for item in closed.panes.iter().flat_map(|pane| pane.items.iter()) {
+                let item = item.item_id();
+                self._item_subscriptions.retain(|(id, _)| *id != item);
+            }
+        }
+        self.graph_order.retain(|open| *open != id);
+        let next = self.graph_order.last().copied().and_then(|next| {
+            let index = self
+                .parked
+                .iter()
+                .position(|p| p.session.entity_id() == next)?;
+            Some(self.parked.remove(index))
+        });
+        match next {
+            Some(next) => self.show_parked(next, window, cx),
+            None => {
+                window.focus(&self.focus_handle, cx);
+                cx.emit(WorkspaceEvent::SessionChanged);
+                cx.notify();
+            }
+        }
     }
 
     fn toast_for_latest_outcome(&mut self, cx: &mut Context<Self>) {
@@ -906,8 +1088,13 @@ impl Workspace {
 
     pub fn hide_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(modal) = self.modal.take() {
-            if let Some(focus) = modal.previous_focus {
-                window.focus(&focus, cx);
+            match modal.previous_focus {
+                Some(focus) => window.focus(&focus, cx),
+                // What had the focus left with its graph: focus the shown graph's tab.
+                None => {
+                    let index = self.pane(self.active_pane).map_or(0, |p| p.active);
+                    self.activate_in(self.active_pane, index, false, window, cx);
+                }
             }
             cx.notify();
         }
@@ -1205,22 +1392,30 @@ impl Workspace {
                 "Not connected".to_owned(),
             ),
         };
-        self.strip("sidebar-footer", cx)
-            .px(px(studio_ui::ds::space::XS))
-            .border_t_1()
-            .border_color(hairline)
+        let open = self.open_graphs();
+        let others = open.len().saturating_sub(1);
+        let workspace = cx.entity().downgrade();
+        let entries: Vec<(EntityId, String, bool)> = open
+            .iter()
+            .map(|(session, shown)| {
+                let s = session.read(cx);
+                let server = s.connection.read(cx).server.name.clone();
+                (
+                    session.entity_id(),
+                    format!("{server} / {}", s.graph_id),
+                    *shown,
+                )
+            })
+            .collect();
+        let trigger = ButtonLike::new("graph-switcher")
+            .full_width()
+            .tooltip(Tooltip::text(format!("{url} · {state} · Switch graph")))
             .child(
                 h_flex()
-                    .id("graph-switcher")
                     .w_full()
-                    .h(px(24.))
-                    .px(px(studio_ui::ds::space::SM))
+                    .px(px(studio_ui::ds::space::XS))
                     .gap(px(studio_ui::ds::space::SM))
                     .items_center()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                    .tooltip(Tooltip::text(format!("{url} · {state}")))
                     .child(Indicator::dot().color(color))
                     .child(
                         Label::new(server)
@@ -1236,13 +1431,55 @@ impl Workspace {
                             .truncate(),
                     )
                     .child(div().flex_1())
+                    .when(others > 0, |row| {
+                        row.child(studio_ui::ds::sidebar_count(format!(
+                            "+{others} graph{}",
+                            if others == 1 { "" } else { "s" }
+                        )))
+                    })
                     .child(
                         Icon::new(IconName::ChevronUpDown)
                             .size(IconSize::XSmall)
                             .color(Color::Muted),
-                    )
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(studio_actions::workspace::OpenGraph), cx)
+                    ),
+            );
+        self.strip("sidebar-footer", cx)
+            .px(px(studio_ui::ds::space::XS))
+            .border_t_1()
+            .border_color(hairline)
+            .child(
+                PopoverMenu::new("graph-switcher-menu")
+                    .full_width(true)
+                    .anchor(gpui::Anchor::BottomLeft)
+                    .trigger(trigger)
+                    .menu(move |window, cx| {
+                        let entries = entries.clone();
+                        let workspace = workspace.clone();
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            if !entries.is_empty() {
+                                menu = menu.header("Open in this window");
+                            }
+                            for (id, label, shown) in entries {
+                                let workspace = workspace.clone();
+                                menu = menu.toggleable_entry(
+                                    label,
+                                    shown,
+                                    IconPosition::Start,
+                                    None,
+                                    move |window, cx| {
+                                        workspace
+                                            .update(cx, |w, cx| w.show_graph(id, window, cx))
+                                            .ok();
+                                    },
+                                );
+                            }
+                            menu.separator()
+                                .action(
+                                    "Open Another Graph…",
+                                    Box::new(studio_actions::workspace::OpenGraph),
+                                )
+                                .action("Close Graph", Box::new(CloseGraph))
+                        }))
                     }),
             )
     }
@@ -1990,6 +2227,12 @@ impl Workspace {
     }
 }
 
+/// Whether two sessions are the same graph on the same server.
+fn same_graph(a: &Entity<GraphSession>, b: &Entity<GraphSession>, cx: &App) -> bool {
+    let (a, b) = (a.read(cx), b.read(cx));
+    a.graph_id == b.graph_id && a.connection == b.connection
+}
+
 fn toast_text(entry: &graph_store::OutcomeEntry) -> String {
     match &entry.outcome {
         // A mutation that matched nothing answers without a commit: nothing was published.
@@ -2066,6 +2309,13 @@ impl Render for Workspace {
                     this.activate_item(last, window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &ActivateNextGraph, window, cx| {
+                this.show_graph_step(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivatePreviousGraph, window, cx| {
+                this.show_graph_step(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CloseGraph, window, cx| this.close_graph(window, cx)))
             .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
                 this.split(SplitDirection::Right, window, cx)
             }))

@@ -4,10 +4,12 @@ metadata:
 graphs:
   knowledge:
     schema: knowledge.pg
+  notes:
+    schema: notes.pg
 policies:
   graph-access:
     file: graph.policy.yaml
-    applies_to: [knowledge]
+    applies_to: [knowledge, notes]
   server-access:
     file: server.policy.yaml
     applies_to: [cluster]

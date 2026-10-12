@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Serve Studio's development graph on http://127.0.0.1:8787 (graph `knowledge`).
+# Serve Studio's development graphs on http://127.0.0.1:8787 (`knowledge`, and a small `notes`
+# graph for trying more than one graph in a window).
 # Token `dev-token` resolves to actor `act-dev`, which the dev policy allows to do everything.
 #
 #   script/dev-server            # first run applies the cluster and loads dev/seed.jsonl
@@ -50,8 +51,10 @@ if [[ $fresh == 1 ]]; then
   [[ -f "$ROOT/dev/seed.jsonl" ]] || python3 "$ROOT/script/dev-seed.py" > "$ROOT/dev/seed.jsonl"
   OMNIGRAPH_BEARER_TOKEN=$TOKEN "$CLI" load --server "http://$BIND" --graph knowledge \
     --data "$ROOT/dev/seed.jsonl" --mode overwrite --yes --quiet > /dev/null
-  echo "Loaded dev/seed.jsonl into knowledge."
+  OMNIGRAPH_BEARER_TOKEN=$TOKEN "$CLI" load --server "http://$BIND" --graph notes \
+    --data "$ROOT/dev/notes-seed.jsonl" --mode overwrite --yes --quiet > /dev/null
+  echo "Loaded dev/seed.jsonl into knowledge and dev/notes-seed.jsonl into notes."
 fi
 
-echo "Serving http://$BIND · graph knowledge · token $TOKEN (actor act-dev)"
+echo "Serving http://$BIND · graphs knowledge, notes · token $TOKEN (actor act-dev)"
 wait $server

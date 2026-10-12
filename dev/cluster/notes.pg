@@ -1,0 +1,16 @@
+// A second development graph, so switching between graphs in one window can be tried: notes
+// and the topics they are filed under.
+
+node Note {
+  slug: String @key
+  title: String
+  body: String?
+  written: Date?
+}
+
+node Topic {
+  slug: String @key
+  name: String
+}
+
+edge FiledUnder: Note -> Topic @card(0..)

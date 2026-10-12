@@ -32,7 +32,9 @@
       "ctrl-\\": "studio::SplitRight",
       "ctrl-shift-\\": "studio::SplitDown",
       "ctrl-alt-right": "studio::ActivateNextPane",
-      "ctrl-alt-left": "studio::ActivatePreviousPane"
+      "ctrl-alt-left": "studio::ActivatePreviousPane",
+      "ctrl-alt-]": "studio::ActivateNextGraph",
+      "ctrl-alt-[": "studio::ActivatePreviousGraph"
     }
   },
   {

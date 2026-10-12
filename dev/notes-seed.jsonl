@@ -1,0 +1,19 @@
+{"type":"Topic","data":{"slug":"graphs","name":"Graphs"}}
+{"type":"Topic","data":{"slug":"rust","name":"Rust"}}
+{"type":"Topic","data":{"slug":"design","name":"Design"}}
+{"type":"Topic","data":{"slug":"storage","name":"Storage"}}
+{"type":"Note","data":{"slug":"lance-versions","title":"Lance keeps every version","body":"Detached commits never move HEAD.","written":"2026-09-02"}}
+{"type":"Note","data":{"slug":"gpui-panes","title":"Panes in GPUI","body":"A split is a tree of panes with shares.","written":"2026-10-12"}}
+{"type":"Note","data":{"slug":"tower-chips","title":"Tower's type chips","body":"Letter marks, hairlines, faded unrelated types.","written":"2026-10-11"}}
+{"type":"Note","data":{"slug":"keyset-paging","title":"Keyset paging","body":"Order by @id and pass the last id.","written":"2026-10-10"}}
+{"type":"Note","data":{"slug":"schema-rows","title":"Settings rows from a schema","body":"Doc comments become descriptions.","written":"2026-10-12"}}
+{"type":"Note","data":{"slug":"merge-preview","title":"Merge preview","body":"A three-way merge is checked before it lands.","written":"2026-10-09"}}
+{"edge":"FiledUnder","from":"lance-versions","to":"storage"}
+{"edge":"FiledUnder","from":"gpui-panes","to":"rust"}
+{"edge":"FiledUnder","from":"gpui-panes","to":"design"}
+{"edge":"FiledUnder","from":"tower-chips","to":"design"}
+{"edge":"FiledUnder","from":"tower-chips","to":"graphs"}
+{"edge":"FiledUnder","from":"keyset-paging","to":"graphs"}
+{"edge":"FiledUnder","from":"keyset-paging","to":"storage"}
+{"edge":"FiledUnder","from":"schema-rows","to":"rust"}
+{"edge":"FiledUnder","from":"merge-preview","to":"graphs"}
