@@ -178,6 +178,8 @@ pub mod tree {
             RerootHere,
             /// Show the selected node on the canvas.
             ShowOnCanvas,
+            /// Clear the text typed to filter the tree.
+            ClearFilter,
         ]
     );
 }
@@ -232,6 +234,14 @@ pub mod canvas {
             ExpandNode,
             /// Collapse the selected node.
             CollapseNode,
+            /// Select the nearest node to the left.
+            MoveLeft,
+            /// Select the nearest node to the right.
+            MoveRight,
+            /// Select the nearest node above.
+            MoveUp,
+            /// Select the nearest node below.
+            MoveDown,
         ]
     );
 }

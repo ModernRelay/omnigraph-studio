@@ -6,6 +6,7 @@
 pub mod changes;
 pub mod cli_config;
 mod connection;
+mod exploration;
 pub mod fixes;
 mod registry;
 mod session;
@@ -21,6 +22,7 @@ pub use changes::{
 pub use connection::{
     Connection, ConnectionEvent, ConnectionState, GraphListing, ServerEntry, ServerSource,
 };
+pub use exploration::*;
 pub use fixes::{RevertUnavailable, revert_query};
 pub use registry::{ConnectionRegistry, RegistryEvent, data_dir};
 pub use session::{GraphSession, Loadable, OutcomeEntry, OutcomeKind, SessionEvent, open_session};

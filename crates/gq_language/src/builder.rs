@@ -281,10 +281,10 @@ pub fn neighbours(
         Value::String(after.unwrap_or("").to_owned()),
     );
     let mut columns = vec!["$m.@id as id".to_owned()];
-    if let Some(label) = other.label_property() {
-        if Some(label) != other.key.as_deref() {
-            columns.push(format!("$m.{label} as label"));
-        }
+    if let Some(label) = other.label_property()
+        && Some(label) != other.key.as_deref()
+    {
+        columns.push(format!("$m.{label} as label"));
     }
     for property in edge.properties.iter().filter(|p| p.projectable()) {
         columns.push(format!("$e.{0} as e_{0}", property.name));
@@ -298,6 +298,36 @@ pub fn neighbours(
     );
     Ok(BuiltQuery {
         name: "studio_neighbours".into(),
+        text,
+        params: params.values,
+    })
+}
+
+/// One node's key and label, to root the relationship tree and the canvas at it (spec 005,
+/// 006). Columns: `id`, then `label` when the type's label property is not its key. No row
+/// means the node does not exist at the commit read.
+pub fn node_label(
+    schema: &SchemaModel,
+    type_name: &str,
+    id: &str,
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, type_name)?;
+    let mut params = Params::new();
+    let id = params.add("id", "String", Value::String(id.to_owned()));
+    let mut columns = vec!["$n.@id as id".to_owned()];
+    if let Some(label) = node.label_property()
+        && Some(label) != node.key.as_deref()
+    {
+        columns.push(format!("$n.{label} as label"));
+    }
+    let text = format!(
+        "query studio_node({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n  }}\n  return {{ {columns} }}\n  limit 1\n}}\n",
+        sig = params.signature(),
+        ty = node.name,
+        columns = columns.join(", "),
+    );
+    Ok(BuiltQuery {
+        name: "studio_node".into(),
         text,
         params: params.values,
     })
@@ -456,6 +486,29 @@ mod tests {
                 &neighbours(&schema, "Company", &group, "company-00000", None, 50).unwrap(),
             );
         }
+    }
+
+    #[test]
+    fn node_label_compiles_for_every_type() {
+        let schema = dev();
+        for node in &schema.nodes {
+            let query = node_label(&schema, &node.name, "x").unwrap();
+            assert_compiles(&query);
+            assert!(query.text.contains("$n.name as label"), "{}", query.text);
+        }
+        assert!(matches!(
+            node_label(&schema, "Nope", "x"),
+            Err(BuildError::UnknownType(_))
+        ));
+    }
+
+    #[test]
+    fn node_label_without_a_label_property_returns_only_the_key() {
+        let schema = SchemaModel::parse("node Tag {\n  slug: String @key\n}\n").unwrap();
+        let query = node_label(&schema, "Tag", "t").unwrap();
+        assert!(!query.text.contains("as label"), "{}", query.text);
+        let result = check(&schema, &query.text);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
     }
 
     #[test]
