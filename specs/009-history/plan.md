@@ -28,8 +28,16 @@ XI (lane logic forked from Zed with notices).
 ## Design
 
 - Bottom dock panel and a full tab: a lane graph left, then message-free rows (commits have no
-  messages): short id, actor, relative time, branch chips, change counts.
-- Selecting a commit opens its changes (spec 008's entity cards) in a detail split.
+  messages), built from `studio_ui::ds` like every list: the short id (code text), the change
+  counts in a fixed column, branch heads as tags with a merge mark, then the actor and the
+  relative time, muted and right-aligned. No column header; rows are inset pills at the data
+  row height. The graph draws the branch's own lane in the accent and merged lanes in grey.
+  The tab's toolbar is the shared one: title, then branch and commit count as meta, search and
+  a refresh icon.
+- Selecting a commit opens its changes (spec 008's entity cards) in a detail split, headed like
+  the inspector: a small "Commit" label, the short id as the title (click copies the full id),
+  then one meta row (actor, time, branch, parent and merged parent as links, change count).
+  The per-type breakdown is the group headers over the cards, not a second summary.
 - Search by id prefix or actor with an i/N counter; ↵ and ⇧↵ step through the matches, and
   typing in the field never moves the selection.
 - Any commit can open a type table or query editor pinned to it (read-only chip): the commit

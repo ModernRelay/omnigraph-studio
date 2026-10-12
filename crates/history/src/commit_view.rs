@@ -8,13 +8,11 @@ use gpui::{
 use gq_language::SchemaModel;
 use graph_client::ReadError;
 use graph_client::api::{ChangeCauseOutput, CommitOutput};
-use graph_store::{
-    ChangeFold, FoldedChange, FoldedChanges, GraphSession, NetChange, TypeCounts, summary_sentence,
-};
+use graph_store::{ChangeFold, FoldedChange, FoldedChanges, GraphSession, NetChange, TypeCounts};
 use studio_actions::graph::{OpenCommit, OpenQueryAt, OpenType};
 use studio_ui::{
-    ChangeCard, ChangeKind, CopyableValue, PropertyRow, change_counts, change_group_header,
-    empty_state, now_micros, relative_time, short_commit_id, utc_date_time,
+    ChangeCard, ChangeKind, PropertyRow, change_group_header, empty_state, now_micros,
+    relative_time, short_commit_id, utc_date_time,
 };
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
@@ -196,7 +194,6 @@ impl CommitView {
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
-        let border = cx.theme().colors().border_variant;
         let actor = self
             .commit
             .as_ref()
@@ -231,132 +228,115 @@ impl CommitView {
                     .as_ref()
                     .and_then(|c| c.merged_parent_commit_id.clone())
             });
-        let sentence = match &self.state {
+        let changes = match &self.state {
             State::Ready => {
-                let actors: Vec<String> = actor.iter().cloned().collect();
-                let mut sentence = summary_sentence(
-                    self.folded.entity_count(),
-                    self.folded.relationship_count(),
-                    1,
-                    &actors,
+                let total = self.folded.entity_count() + self.folded.relationship_count();
+                let mut text = format!(
+                    "{} change{}",
+                    studio_ui::group_digits(total),
+                    if total == 1 { "" } else { "s" }
                 );
                 if self.next_page_token.is_some() {
-                    sentence.push_str(&format!(" (first {} changes)", self.fold.raw_changes()));
+                    text.push_str(" so far");
                 }
-                sentence
+                Some(text)
             }
-            State::Loading => "Reading changes…".into(),
-            State::Failed(_) => String::new(),
+            State::Loading => Some("Reading changes…".into()),
+            State::Failed(_) => None,
         };
-        let meta = |label: &'static str, value: AnyElement| {
-            h_flex()
-                .gap_2()
-                .child(
-                    div().w(px(64.)).flex_none().child(
-                        Label::new(label)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-                )
-                .child(value)
+        // A parent is a link to its own commit.
+        let parent_link = |id: String, icon: IconName, name: &'static str, tooltip: String| {
+            let short = short_commit_id(&id);
+            div()
+                .id(name)
+                .cursor_pointer()
+                .tooltip(Tooltip::text(tooltip))
+                .on_click(move |_, window, cx| {
+                    window.dispatch_action(
+                        Box::new(OpenCommit {
+                            commit_id: id.clone(),
+                        }),
+                        cx,
+                    )
+                })
+                .child(studio_ui::ds::meta_code(icon, short, cx))
+                .into_any_element()
         };
-        let parent_link = |id: Option<String>, name: &'static str| -> AnyElement {
-            match id {
-                Some(id) => Button::new(name, short_commit_id(&id))
-                    .label_size(LabelSize::Small)
-                    .style(ButtonStyle::Subtle)
-                    .on_click(move |_, window, cx| {
-                        window.dispatch_action(
-                            Box::new(OpenCommit {
-                                commit_id: id.clone(),
-                            }),
-                            cx,
-                        )
-                    })
+        let mut facts: Vec<AnyElement> = vec![
+            studio_ui::ds::meta(IconName::Person, actor.unwrap_or_else(|| "—".into()))
+                .into_any_element(),
+        ];
+        if let Some(at) = at {
+            facts.push(
+                div()
+                    .id("commit-when")
+                    .tooltip(Tooltip::text(utc_date_time(at)))
+                    .child(studio_ui::ds::meta(
+                        IconName::Clock,
+                        relative_time(at, now_micros()),
+                    ))
                     .into_any_element(),
-                None => Label::new("none")
-                    .size(LabelSize::Small)
-                    .color(Color::Disabled)
-                    .into_any_element(),
-            }
-        };
+            );
+        }
+        if let Some(branch) = branch {
+            facts.push(studio_ui::ds::meta(IconName::GitBranch, branch).into_any_element());
+        }
+        if let Some(parent) = parent {
+            facts.push(parent_link(
+                parent,
+                IconName::GitCommit,
+                "commit-parent",
+                "Open the parent commit".into(),
+            ));
+        }
+        if let Some(merged) = merged {
+            facts.push(parent_link(
+                merged,
+                IconName::PullRequest,
+                "commit-merged-parent",
+                "Open the merged branch's commit".into(),
+            ));
+        }
+        if let Some(changes) = changes {
+            facts.push(studio_ui::ds::text::meta(changes).into_any_element());
+        }
+        let full_id = self.commit_id.clone();
         v_flex()
             .flex_none()
-            .px_4()
-            .py_3()
-            .gap_1()
+            .px(px(studio_ui::ds::space::EDGE))
+            .pt(px(studio_ui::ds::space::LG))
+            .pb(px(studio_ui::ds::space::LG))
+            .gap(px(studio_ui::ds::space::SM))
             .border_b_1()
-            .border_color(border)
+            .border_color(studio_ui::ds::surface::rule(cx))
             .child(
                 h_flex()
-                    .gap_2()
-                    .child(Icon::new(IconName::GitCommit).color(Color::Muted))
+                    .gap(px(studio_ui::ds::space::INLINE))
                     .child(
-                        Headline::new(format!("Commit {}", short_commit_id(&self.commit_id)))
-                            .size(HeadlineSize::XSmall),
+                        Icon::new(IconName::GitCommit)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
                     )
+                    .child(studio_ui::ds::text::meta("Commit"))
                     .child(div().flex_1())
                     .child(self.render_open_at(cx)),
             )
-            .child(meta(
-                "Id",
-                CopyableValue::new("commit-id", Some(self.commit_id.clone())).into_any_element(),
-            ))
-            .child(meta(
-                "Actor",
-                CopyableValue::new("actor", actor)
-                    .plain()
-                    .into_any_element(),
-            ))
-            .child(meta(
-                "When",
-                Label::new(match at {
-                    Some(at) => format!(
-                        "{} · {}",
-                        relative_time(at, now_micros()),
-                        utc_date_time(at)
-                    ),
-                    None => "—".into(),
-                })
-                .size(LabelSize::Small)
-                .into_any_element(),
-            ))
-            .child(meta(
-                "Branch",
-                Label::new(branch.unwrap_or_else(|| "—".into()))
-                    .size(LabelSize::Small)
-                    .into_any_element(),
-            ))
-            .child(meta(
-                "Parents",
-                h_flex()
-                    .gap_1()
-                    .child(parent_link(parent, "parent"))
-                    .when(merged.is_some(), |d| {
-                        d.child(
-                            Label::new("merged")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(parent_link(merged, "merged-parent"))
-                    })
-                    .into_any_element(),
-            ))
-            .when(!sentence.is_empty(), |d| {
-                d.child(div().pt_1().child(Label::new(sentence)))
-            })
             .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap_x_4()
-                    .children(self.counts.iter().map(|count| {
-                        h_flex()
-                            .gap_1p5()
-                            .child(studio_ui::kind_swatch(&count.type_name, count.is_edge))
-                            .child(Label::new(count.type_name.clone()).size(LabelSize::Small))
-                            .child(change_counts(count.added, count.changed, count.removed))
-                    })),
+                div()
+                    .id("commit-title")
+                    .cursor_pointer()
+                    .tooltip(Tooltip::text(format!("{full_id}\nClick to copy")))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(full_id.clone()))
+                    })
+                    .child(
+                        Label::new(short_commit_id(&self.commit_id))
+                            .size(LabelSize::Large)
+                            .weight(gpui::FontWeight::MEDIUM)
+                            .buffer_font(cx),
+                    ),
             )
+            .child(studio_ui::ds::meta_row(facts).flex_wrap())
             .into_any_element()
     }
 
@@ -440,7 +420,7 @@ impl CommitView {
             Some(Row::Group(ix)) => {
                 let count = &self.counts[ix];
                 div()
-                    .px_4()
+                    .px(px(studio_ui::ds::space::EDGE))
                     .child(change_group_header(
                         &count.type_name,
                         count.is_edge,
@@ -454,8 +434,8 @@ impl CommitView {
                 let schema = self.session.read(cx).schema_model();
                 let change = &self.folded.changes[ix];
                 div()
-                    .px_4()
-                    .py_1()
+                    .px(px(studio_ui::ds::space::EDGE))
+                    .py(px(studio_ui::ds::space::XS))
                     .child(change_card(
                         change,
                         schema.as_deref(),

@@ -17,7 +17,7 @@ use studio_actions::history::{NextMatch, PreviousMatch};
 use studio_ui::{change_counts, empty_state, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
-use ui::{Banner, ContextMenu, Severity, right_click_menu};
+use ui::{Banner, ContextMenu, Severity, Tooltip, right_click_menu};
 
 use crate::commit_view::{CommitCounts, CommitView};
 use crate::lanes::{Graph, GraphCommit, assign_lanes};
@@ -30,6 +30,11 @@ pub const LONG_HISTORY: usize = 5_000;
 const OTHER_BRANCHES: usize = 20;
 
 const ROW_HEIGHT: f32 = studio_ui::ds::size::ROW;
+/// The short commit id's column, and the time's, so ids and times line up down the list.
+const COMMIT_ID_WIDTH: f32 = 84.;
+const WHEN_WIDTH: f32 = 64.;
+/// The change counts' column, so `+3 ~2 −1` line up down the list whatever tags follow.
+const CHANGES_WIDTH: f32 = 112.;
 const LANE_WIDTH: f32 = 14.;
 const GRAPH_PADDING: f32 = 8.;
 
@@ -448,17 +453,19 @@ impl HistoryView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let colors = cx.theme().colors();
-        let selected_bg = colors.element_selected;
-        let hover_bg = colors.element_hover;
-        let accents = cx.theme().accents().clone();
+        let selected_bg = studio_ui::ds::surface::selected_document(cx);
+        let hover_bg = studio_ui::ds::surface::hover(cx);
+        // One accent for the branch's own lane; merged branches' lanes in a quiet grey, so the
+        // graph reads as structure, not a palette.
+        let accent = cx.theme().colors().text_accent;
+        let quiet = cx.theme().colors().text_muted.opacity(0.55);
         let graph_width = self.graph_width();
         let now = now_micros();
         range
             .filter_map(|ix| {
                 let commit = self.commits.get(ix)?;
                 let row = self.graph.rows.get(ix)?.clone();
-                let color = |index: usize| accents.color_for_index(index as u32);
+                let color = |index: usize| if index == 0 { accent } else { quiet };
                 let lines = RowPaint {
                     commit: (row.lane, color(row.color)),
                     through: row
@@ -493,13 +500,17 @@ impl HistoryView {
                 let actor = commit.actor_id.clone();
                 let open_id = id.clone();
                 let copy_id = id.clone();
+                let merge = commit.merged_parent_commit_id.is_some();
+                // A row reads: lane, id, where it heads, what it changed, then who and when.
                 let row_element = h_flex()
                     .id(("commit-row", ix))
                     .h(px(ROW_HEIGHT))
-                    .w_full()
-                    .pr_2()
+                    .mx(px(studio_ui::ds::space::SM))
+                    .pr(px(studio_ui::ds::space::MD))
+                    .gap(px(studio_ui::ds::space::LG))
+                    .rounded(px(studio_ui::ds::radius::SM))
                     .when(selected, |d| d.bg(selected_bg))
-                    .hover(|d| d.bg(hover_bg))
+                    .when(!selected, |d| d.hover(|d| d.bg(hover_bg)))
                     .cursor_pointer()
                     .child(
                         div().w(px(graph_width)).h_full().flex_none().child(
@@ -510,75 +521,69 @@ impl HistoryView {
                             .size_full(),
                         ),
                     )
+                    .child(div().w(px(COMMIT_ID_WIDTH)).flex_none().child(
+                        studio_ui::ds::text::code(short_commit_id(&id), cx).color(if selected {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        }),
+                    ))
                     .child(
-                        div().w(px(86.)).flex_none().child(
-                            Label::new(short_commit_id(&id))
-                                .size(LabelSize::Small)
-                                .buffer_font(cx)
-                                .color(if selected {
-                                    Color::Default
+                        div()
+                            .w(px(CHANGES_WIDTH))
+                            .flex_none()
+                            .overflow_hidden()
+                            .children(counts.map(|(added, changed, removed)| {
+                                if added + changed + removed == 0 {
+                                    studio_ui::ds::text::meta("no changes").into_any_element()
                                 } else {
-                                    Color::Muted
-                                }),
-                        ),
+                                    h_flex()
+                                        .gap_1()
+                                        .child(change_counts(added, changed, removed))
+                                        .when(partial, |d| {
+                                            d.child(studio_ui::ds::text::meta("+ more"))
+                                        })
+                                        .into_any_element()
+                                }
+                            })),
                     )
                     .child(
-                        div().w(px(120.)).flex_none().child(
-                            Label::new(actor.unwrap_or_else(|| "—".into()))
-                                .size(LabelSize::Small)
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(px(studio_ui::ds::space::SM))
+                            .overflow_hidden()
+                            .children(
+                                heads
+                                    .iter()
+                                    .map(|name| studio_ui::ds::tag(name.clone(), cx)),
+                            )
+                            .when(merge, |d| {
+                                d.child(
+                                    div()
+                                        .id(("merge", ix))
+                                        .tooltip(Tooltip::text(format!("Merged into {branch}")))
+                                        .child(
+                                            Icon::new(IconName::PullRequest)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                            }),
+                    )
+                    .child(
+                        div().max_w(px(140.)).flex_none().child(
+                            studio_ui::ds::text::meta(actor.unwrap_or_else(|| "—".into()))
                                 .single_line()
                                 .truncate(),
                         ),
                     )
                     .child(
-                        div().w(px(96.)).flex_none().child(
-                            Label::new(relative_time(commit.created_at, now))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
+                        h_flex().w(px(WHEN_WIDTH)).flex_none().justify_end().child(
+                            studio_ui::ds::text::meta(relative_time(commit.created_at, now))
+                                .single_line(),
                         ),
                     )
-                    .child(
-                        h_flex()
-                            .w(px(170.))
-                            .flex_none()
-                            .gap_1()
-                            .when(heads.is_empty(), |d| {
-                                d.child(chip(branch, Color::Muted, cx))
-                            })
-                            .children(heads.iter().map(|name| {
-                                let color = if *name == self.branch {
-                                    Color::Accent
-                                } else {
-                                    Color::Default
-                                };
-                                chip(format!("{name} ▸"), color, cx)
-                            }))
-                            .when(commit.merged_parent_commit_id.is_some(), |d| {
-                                d.child(chip("merge".into(), Color::Info, cx))
-                            }),
-                    )
-                    .child(div().flex_1().min_w_0().children(counts.map(
-                        |(added, changed, removed)| {
-                            if added + changed + removed == 0 {
-                                Label::new("no changes")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Disabled)
-                                    .into_any_element()
-                            } else {
-                                h_flex()
-                                    .gap_1()
-                                    .child(change_counts(added, changed, removed))
-                                    .when(partial, |d| {
-                                        d.child(
-                                            Label::new("+ more")
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Muted),
-                                        )
-                                    })
-                                    .into_any_element()
-                            }
-                        },
-                    )))
                     .on_click(
                         cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                             this.select(ix, cx);
@@ -627,31 +632,10 @@ impl HistoryView {
     }
 
     fn render_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        let border = studio_ui::ds::surface::rule(cx);
-        let graph_width = self.graph_width();
-        let column = |title: &'static str, width: Option<f32>| {
-            let label = Label::new(title).size(LabelSize::Small).color(Color::Muted);
-            match width {
-                Some(width) => div().w(px(width)).flex_none().child(label),
-                None => div().flex_1().child(label),
-            }
-        };
+        // No column header: an id, tags, counts, an actor and a time say what they are.
         v_flex()
             .size_full()
-            .child(
-                h_flex()
-                    .h(px(studio_ui::HEADER_HEIGHT))
-                    .flex_none()
-                    .pr_2()
-                    .border_b_1()
-                    .border_color(border)
-                    .child(column("Graph", Some(graph_width)).pl_2())
-                    .child(column("Commit", Some(86.)))
-                    .child(column("Actor", Some(120.)))
-                    .child(column("When", Some(96.)))
-                    .child(column("Branch", Some(170.)))
-                    .child(column("Changes", None)),
-            )
+            .pt(px(studio_ui::ds::space::SM))
             .child(
                 uniform_list(
                     "history-rows",
@@ -677,23 +661,6 @@ fn commit_matches(commit: &CommitOutput, query: &str) -> bool {
             .actor_id
             .as_ref()
             .is_some_and(|actor| actor.to_lowercase().contains(query))
-}
-
-/// A small rounded label.
-fn chip(text: String, color: Color, cx: &App) -> AnyElement {
-    let fill = cx.theme().colors().element_background;
-    div()
-        .px_1p5()
-        .rounded_sm()
-        .bg(fill)
-        .child(
-            Label::new(text)
-                .size(LabelSize::XSmall)
-                .color(color)
-                .single_line()
-                .truncate(),
-        )
-        .into_any_element()
 }
 
 /// One row's lines, resolved to colors, painted into the row's graph cell.
@@ -781,7 +748,6 @@ impl RowPaint {
 
 impl Render for HistoryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().colors().border_variant;
         let count = self.commits.len();
         let searched = !self.search.read(cx).text(cx).trim().is_empty();
         let counter = match (searched, self.match_at) {
@@ -790,15 +756,13 @@ impl Render for HistoryView {
             (true, None) => Some("No match".to_owned()),
         };
         let search = h_flex()
-            .w(px(if self.compact { 220. } else { 260. }))
+            .w(px(if self.compact { 200. } else { 240. }))
             .h(px(26.))
             .px_2()
             .gap_1p5()
             .items_center()
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .bg(cx.theme().colors().editor_background)
+            .rounded(px(studio_ui::ds::radius::SM))
+            .bg(studio_ui::ds::surface::sunken(cx))
             .child(
                 Icon::new(IconName::MagnifyingGlass)
                     .size(IconSize::XSmall)
@@ -806,47 +770,39 @@ impl Render for HistoryView {
             )
             .child(div().flex_1().child(self.search.clone()))
             .children(counter.map(studio_ui::ds::text::meta));
-        let header = h_flex()
-            .flex_none()
-            .px_4()
-            .py_2()
-            .gap_2()
-            .border_b_1()
-            .border_color(border)
+        let summary = match self.state {
+            State::Ready if count > self.own_count => {
+                format!("{count} commits · {} merged in", count - self.own_count)
+            }
+            State::Ready => format!("{count} commit{}", if count == 1 { "" } else { "s" }),
+            State::Loading => "Reading…".into(),
+            State::Failed(_) => String::new(),
+        };
+        let header = studio_ui::ds::toolbar(cx)
             .when(!self.compact, |header| {
                 header
-                    .child(Icon::new(IconName::GitGraph).color(Color::Muted))
                     .child(
-                        Headline::new(format!("History of {}", self.branch))
-                            .size(HeadlineSize::XSmall),
+                        Icon::new(IconName::GitGraph)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("History")
+                            .size(LabelSize::Default)
+                            .weight(gpui::FontWeight::MEDIUM),
                     )
             })
-            .when(self.compact, |header| {
-                header.child(studio_ui::ds::meta(
-                    IconName::GitBranch,
-                    self.branch.clone(),
-                ))
-            })
-            .child(
-                Label::new(match self.state {
-                    State::Ready if count > self.own_count => format!(
-                        "{count} commits · {} from merged branches",
-                        count - self.own_count
-                    ),
-                    State::Ready => format!("{count} commit{}", if count == 1 { "" } else { "s" }),
-                    State::Loading => "Reading commits…".into(),
-                    State::Failed(_) => String::new(),
-                })
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-            )
+            .child(studio_ui::ds::meta_row([
+                studio_ui::ds::meta(IconName::GitBranch, self.branch.clone()).into_any_element(),
+                studio_ui::ds::text::meta(summary).into_any_element(),
+            ]))
             .child(div().flex_1())
             .child(search)
             .child(
-                Button::new("refresh-history", "Refresh")
-                    .style(ButtonStyle::Subtle)
-                    .label_size(LabelSize::Small)
-                    .start_icon(Icon::new(IconName::RotateCw).size(IconSize::Small))
+                IconButton::new("refresh-history", IconName::RotateCw)
+                    .icon_size(IconSize::Small)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Read the history again"))
                     .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
             );
         let warning = (count > LONG_HISTORY).then(|| {
@@ -888,7 +844,7 @@ impl Render for HistoryView {
                             .flex_none()
                             .h_full()
                             .border_l_1()
-                            .border_color(border)
+                            .border_color(studio_ui::ds::surface::rule(cx))
                             .child(detail),
                     )
                     .into_any_element()
