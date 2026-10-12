@@ -7,7 +7,9 @@
 //! tests pass Zed's fake client. The contract is `openapi/omnigraph-0.13.0.json`, copied from
 //! OmniGraph `v0.13.0` (MIT).
 
-use serde::Deserialize;
+pub mod api;
+
+pub use api::ErrorOutput;
 
 /// Header every protected request sends and every response echoes
 /// (`omnigraph-api-types` `HTTP_API_CONTRACT_HEADER` at OmniGraph v0.13.0).
@@ -36,13 +38,4 @@ pub enum WriteOutcome<T> {
 pub struct ApiError {
     pub status: u16,
     pub body: ErrorOutput,
-}
-
-/// The common part of OmniGraph's `ErrorOutput`. Typed details (merge conflicts, precondition
-/// failures, diagnostics, resource limits) are added as surfaces need them.
-#[derive(Debug, Deserialize)]
-pub struct ErrorOutput {
-    pub error: String,
-    #[serde(default)]
-    pub code: Option<String>,
 }

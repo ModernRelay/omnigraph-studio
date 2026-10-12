@@ -78,14 +78,12 @@ url = "2"
 
 # Zed patches crates.io crates in its own workspace. Patches do not carry over to a crate that
 # depends on Zed, so Studio repeats the ones its graph reaches. Copied from Zed v1.23.2
-# Cargo.toml; recheck on every bump (docs/zed-pin.md).
+# Cargo.toml; recheck on every bump (docs/zed-pin.md). Zed's tree-sitter-language and notify
+# patches return with the editor (spike S4); the graph does not reach them yet.
 [patch.crates-io]
-tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }
 async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
 async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
 calloop = { git = "https://github.com/zed-industries/calloop" }
-notify = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
-notify-types = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
 
 [profile.dev]
 split-debuginfo = "unpacked"
