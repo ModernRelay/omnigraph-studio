@@ -67,12 +67,36 @@ pub fn row_text(entry: &Entry, state: &ExploreState) -> String {
     }
 }
 
+/// Whether an entry is a relationship group known to have no relationships, or lies under one.
+fn under_empty_group(entries: &[Entry], index: usize) -> bool {
+    let mut current = Some(index);
+    while let Some(ix) = current {
+        if let EntryKind::Group {
+            count: graph_store::Loadable::Loaded(0),
+            ..
+        } = entries[ix].kind
+        {
+            return true;
+        }
+        current = entries[ix].parent;
+    }
+    false
+}
+
 /// The entries to show for `query`: every match with its ancestors, in tree order. An empty
-/// query shows everything. Paging, loading and error rows hide while filtering.
-pub fn filter(entries: &[Entry], state: &ExploreState, query: &str) -> Vec<usize> {
+/// query shows everything. Loading and error rows hide while filtering; a "Show more" row
+/// stays under a group that shows, so a group not read in full can be searched on the server.
+/// `hide_empty` leaves out groups with no relationships.
+pub fn filter(
+    entries: &[Entry],
+    state: &ExploreState,
+    query: &str,
+    hide_empty: bool,
+) -> Vec<usize> {
+    let shown = |ix: &usize| !hide_empty || !under_empty_group(entries, *ix);
     let query = query.trim().to_lowercase();
     if query.is_empty() {
-        return (0..entries.len()).collect();
+        return (0..entries.len()).filter(shown).collect();
     }
     let mut keep = vec![false; entries.len()];
     for (index, entry) in entries.iter().enumerate() {
@@ -87,7 +111,17 @@ pub fn filter(entries: &[Entry], state: &ExploreState, query: &str) -> Vec<usize
             }
         }
     }
-    (0..entries.len()).filter(|ix| keep[*ix]).collect()
+    for (index, entry) in entries.iter().enumerate() {
+        if matches!(entry.kind, EntryKind::More { .. })
+            && entry.parent.is_some_and(|parent| keep[parent])
+        {
+            keep[index] = true;
+        }
+    }
+    (0..entries.len())
+        .filter(|ix| keep[*ix])
+        .filter(shown)
+        .collect()
 }
 
 /// The visible row with this identity.
@@ -256,7 +290,7 @@ mod tests {
     #[test]
     fn the_tree_flattens_with_cycles_and_paging_rows() {
         let (_, state, entries) = fixture();
-        let all = filter(&entries, &state, "");
+        let all = filter(&entries, &state, "", false);
         let shown = texts(&entries, &state, &all);
         assert_eq!(shown[0], "Ada Lovelace ada");
         assert!(
@@ -272,19 +306,46 @@ mod tests {
     #[test]
     fn filtering_keeps_matches_and_their_ancestors() {
         let (_, state, entries) = fixture();
-        let visible = filter(&entries, &state, "young");
+        let visible = filter(&entries, &state, "young", false);
+        // The group's "Show more" row stays, to search the rest of the group on the server.
         assert_eq!(
             texts(&entries, &state, &visible),
-            ["Ada Lovelace ada", "  Knows Person", "    Cy Young cy"]
+            [
+                "Ada Lovelace ada",
+                "  Knows Person",
+                "    Cy Young cy",
+                "    Show 50 more of 58"
+            ]
         );
         // The root always stays, so the filter never empties the tree.
-        assert_eq!(filter(&entries, &state, "zzz"), vec![0]);
+        assert_eq!(filter(&entries, &state, "zzz", false), vec![0]);
+    }
+
+    #[test]
+    fn empty_groups_hide_with_their_rows_when_asked() {
+        let (schema, mut state, _) = fixture();
+        let bob_knows = GroupKey {
+            node: person("bob"),
+            group: knows(),
+        };
+        state.counts.insert(bob_knows, Loadable::Loaded(0));
+        let entries = state.entries(&schema);
+        let all = filter(&entries, &state, "", false);
+        let without = filter(&entries, &state, "", true);
+        assert!(without.len() < all.len());
+        assert!(without.iter().all(|ix| !matches!(
+            &entries[*ix].kind,
+            EntryKind::Group {
+                count: Loadable::Loaded(0),
+                ..
+            }
+        )));
     }
 
     #[test]
     fn moves_follow_parents_and_children() {
         let (_, state, entries) = fixture();
-        let visible = filter(&entries, &state, "");
+        let visible = filter(&entries, &state, "", false);
         let group_row = visible
             .iter()
             .position(|ix| matches!(&entries[*ix].kind, EntryKind::Group { key, .. } if key.node.id == "ada" && key.group.edge == "Knows"))

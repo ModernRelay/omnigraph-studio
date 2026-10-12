@@ -391,7 +391,7 @@ impl TypeTable {
         self.filters
             .retain(|f| match builder::parse_relationship_key(&f.property) {
                 Some((_, edge)) => schema.edge(edge).is_some(),
-                None => names.contains(f.property.as_str()),
+                None => f.property == builder::ID_FILTER || names.contains(f.property.as_str()),
             });
         self.set_columns(columns, cx);
         self.schema = Some(schema);
@@ -1374,6 +1374,17 @@ impl TypeTable {
             .filter(|p| !FilterOp::for_property(p).is_empty())
             .cloned()
             .collect()
+    }
+
+    /// Shows only the rows one filter keeps, replacing the others (a table opened from the
+    /// relationship tree).
+    pub fn show_only(&mut self, filter: Filter, cx: &mut Context<Self>) {
+        self.filter_draft = None;
+        self.filters = vec![filter];
+        if self.schema.is_some() {
+            self.reload(true, cx);
+        }
+        cx.notify();
     }
 
     /// What a filter can test: each filterable property, then (in a node table) each

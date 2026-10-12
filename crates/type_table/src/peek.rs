@@ -243,6 +243,7 @@ impl NodePeek {
             &group.group,
             &id,
             None,
+            None,
             NEIGHBOUR_LIMIT,
         ) {
             Ok(query) => query,

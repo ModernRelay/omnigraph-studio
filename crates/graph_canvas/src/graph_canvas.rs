@@ -434,6 +434,8 @@ impl GraphCanvas {
                     Box::new(OpenType {
                         type_name: node.label.clone(),
                         at_commit: None,
+                        filter_id: None,
+                        via: None,
                     }),
                     cx,
                 );
@@ -836,6 +838,8 @@ impl GraphCanvas {
                                         Box::new(OpenType {
                                             type_name: type_name.clone(),
                                             at_commit: None,
+                                            filter_id: None,
+                                            via: None,
                                         }),
                                         cx,
                                     )

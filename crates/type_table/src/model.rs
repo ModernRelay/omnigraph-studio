@@ -413,6 +413,7 @@ pub fn row_matches(filters: &[Filter], values: &Map<String, Value>) -> bool {
     filters.iter().all(|filter| {
         let value = values.get(&filter.property).unwrap_or(&Value::Null);
         match filter.op {
+            _ if filter.property == gq_language::builder::ID_FILTER => true,
             FilterOp::HasAny | FilterOp::HasNone | FilterOp::RelatedTo => true,
             FilterOp::IsEmpty => value.is_null(),
             FilterOp::IsNotEmpty => !value.is_null(),

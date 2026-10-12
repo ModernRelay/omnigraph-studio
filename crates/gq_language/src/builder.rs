@@ -157,6 +157,9 @@ impl FilterOp {
     }
 }
 
+/// The filter key that matches a node by its `@id`.
+pub const ID_FILTER: &str = "@id";
+
 /// The filter key of a relationship group: `out:WorksAt`, `in:Knows`.
 pub fn relationship_key(group: &RelationshipGroup) -> String {
     let direction = match group.direction {
@@ -268,6 +271,12 @@ fn filter_clauses(
     for (i, filter) in filters.iter().enumerate() {
         if filter.op.is_relationship() {
             clauses.push(relationship_clause(schema, var, i, filter, params)?);
+            continue;
+        }
+        // The node's own id, as a filter to one row (spec 005: a table opened from the tree).
+        if filter.property == ID_FILTER {
+            let id = params.add(&format!("f{i}"), "String", filter.value.clone());
+            clauses.push(format!("${var}.@id = {id}"));
             continue;
         }
         let property = properties
@@ -596,6 +605,7 @@ pub fn neighbours(
     group: &RelationshipGroup,
     id: &str,
     after: Option<&str>,
+    search: Option<&str>,
     limit: u32,
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, node_type)?;
@@ -619,8 +629,24 @@ pub fn neighbours(
     for property in edge.properties.iter().filter(|p| p.projectable()) {
         columns.push(format!("$e.{0} as e_{0}", property.name));
     }
+    // A search narrows the neighbours to ids starting with, or labels containing, the text.
+    let search = match search.filter(|text| !text.is_empty()) {
+        Some(text) => {
+            let q = params.add("q", "String", Value::String(text.to_owned()));
+            match other
+                .label_property()
+                .filter(|label| Some(*label) != other.key.as_deref())
+            {
+                Some(label) => {
+                    format!("\n    ($m.@id starts_with {q} or $m.{label} contains {q})")
+                }
+                None => format!("\n    $m.@id starts_with {q}"),
+            }
+        }
+        None => String::new(),
+    };
     let text = format!(
-        "query studio_neighbours({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n    {traversal}\n    $m.@id > {after}\n  }}\n  return {{ {columns} }}\n  order {{ $m.@id asc }}\n  limit {limit}\n}}\n",
+        "query studio_neighbours({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n    {traversal}\n    $m.@id > {after}{search}\n  }}\n  return {{ {columns} }}\n  order {{ $m.@id asc }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         ty = node.name,
         traversal = traversal_clause(group, Some("e")),
@@ -1083,12 +1109,21 @@ mod tests {
         for group in schema.relationships_of("Person") {
             assert_compiles(&degree(&schema, "Person", &group, "person-000000").unwrap());
             assert_compiles(
-                &neighbours(&schema, "Person", &group, "person-000000", None, 50).unwrap(),
+                &neighbours(&schema, "Person", &group, "person-000000", None, None, 50).unwrap(),
             );
         }
         for group in schema.relationships_of("Company") {
             assert_compiles(
-                &neighbours(&schema, "Company", &group, "company-00000", None, 50).unwrap(),
+                &neighbours(
+                    &schema,
+                    "Company",
+                    &group,
+                    "company-00000",
+                    None,
+                    Some("ada"),
+                    50,
+                )
+                .unwrap(),
             );
         }
     }

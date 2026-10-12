@@ -27,9 +27,10 @@ use graph_store::{
 };
 use smallvec::SmallVec;
 use studio_actions::graph::{OpenNode, ShowNodeOnCanvas};
+use studio_actions::graph::{OpenType, PeekNode};
 use studio_actions::tree::{
-    ClearFilter, Collapse, CollapseAll, Expand, ExpandAll, OpenSelected, RerootHere, SelectNext,
-    SelectPrevious, ShowOnCanvas,
+    ClearFilter, Collapse, CollapseAll, Expand, ExpandAll, OpenSelected, OpenTable, PeekSelected,
+    RerootHere, SelectNext, SelectPrevious, ShowOnCanvas, ToggleEmptyGroups,
 };
 use studio_ui::type_swatch;
 use studio_workspace::{PanelPosition, Workspace, WorkspaceEvent};
@@ -117,6 +118,8 @@ pub struct RelationshipTree {
     /// it was on is replaced.
     selected_row_index_hint: Option<usize>,
     filter: String,
+    /// Leave out relationship groups with no relationships.
+    hide_empty: bool,
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
     exploration_subscriptions: Vec<Subscription>,
@@ -157,6 +160,7 @@ impl RelationshipTree {
             selected: None,
             selected_row_index_hint: None,
             filter: String::new(),
+            hide_empty: false,
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
             exploration_subscriptions: Vec::new(),
@@ -217,9 +221,12 @@ impl RelationshipTree {
     fn refilter(&mut self, cx: &mut Context<Self>) {
         let previous_row = self.selected_row_index_hint;
         self.visible = match &self.exploration {
-            Some(exploration) => {
-                rows::filter(&self.entries, exploration.read(cx).state(), &self.filter)
-            }
+            Some(exploration) => rows::filter(
+                &self.entries,
+                exploration.read(cx).state(),
+                &self.filter,
+                self.hide_empty,
+            ),
             None => Vec::new(),
         };
         if let Some(selected) = &self.selected
@@ -402,7 +409,14 @@ impl RelationshipTree {
                 self.with_exploration(cx, |e, cx| e.toggle(&entry.path, cx));
             }
             EntryKind::More { key, .. } => {
-                self.with_exploration(cx, |e, cx| e.load_more(&key, cx));
+                // With text typed, a group not read in full is searched on the server.
+                let filter = self.filter.trim().to_owned();
+                let searching = self.group_search(&key, cx);
+                if !filter.is_empty() && searching.as_deref() != Some(filter.as_str()) {
+                    self.with_exploration(cx, |e, cx| e.search_group(&key, &filter, cx));
+                } else {
+                    self.with_exploration(cx, |e, cx| e.load_more(&key, cx));
+                }
             }
             EntryKind::Cycle { ancestor, .. } => {
                 if let Some(ancestor_row) = self.visible.iter().position(|ix| *ix == ancestor) {
@@ -445,6 +459,79 @@ impl RelationshipTree {
 
     fn clear_filter(&mut self, _: &ClearFilter, _: &mut Window, cx: &mut Context<Self>) {
         self.filter.clear();
+        self.with_exploration(cx, |e, cx| e.clear_searches(cx));
+        self.refilter(cx);
+    }
+
+    /// The text a group's neighbours are narrowed to on the server, if any.
+    fn group_search(&self, key: &graph_store::GroupKey, cx: &App) -> Option<String> {
+        self.exploration
+            .as_ref()?
+            .read(cx)
+            .state()
+            .searches
+            .get(key)
+            .cloned()
+    }
+
+    /// Space: the selected node in the inspector, focus staying in the tree.
+    fn peek_selected(&mut self, _: &PeekSelected, window: &mut Window, cx: &mut Context<Self>) {
+        let node = match self.selected_entry().map(|entry| &entry.kind) {
+            Some(EntryKind::Node { node, .. } | EntryKind::Cycle { node, .. }) => node.clone(),
+            Some(EntryKind::Field {
+                target: Some(target),
+                ..
+            }) => target.node.clone(),
+            _ => return,
+        };
+        window.dispatch_action(
+            Box::new(PeekNode {
+                type_name: node.type_name,
+                id: node.id,
+            }),
+            cx,
+        );
+    }
+
+    /// ⌘↵: a node's own type table filtered to it; on a relationship group, the other type's
+    /// table filtered to the nodes related to this one.
+    fn open_table(&mut self, _: &OpenTable, window: &mut Window, cx: &mut Context<Self>) {
+        let action = match self.selected_entry().map(|entry| &entry.kind) {
+            Some(EntryKind::Node { node, .. } | EntryKind::Cycle { node, .. }) => OpenType {
+                type_name: node.type_name.clone(),
+                at_commit: None,
+                filter_id: Some(node.id.clone()),
+                via: None,
+            },
+            Some(EntryKind::Group { key, .. }) => {
+                // Seen from the other type, the relationship runs the other way.
+                let back = gq_language::RelationshipGroup {
+                    edge: key.group.edge.clone(),
+                    direction: match key.group.direction {
+                        gq_language::Direction::Outgoing => gq_language::Direction::Incoming,
+                        gq_language::Direction::Incoming => gq_language::Direction::Outgoing,
+                    },
+                    other_type: key.node.type_name.clone(),
+                };
+                OpenType {
+                    type_name: key.group.other_type.clone(),
+                    at_commit: None,
+                    filter_id: Some(key.node.id.clone()),
+                    via: Some(gq_language::builder::relationship_key(&back)),
+                }
+            }
+            _ => return,
+        };
+        window.dispatch_action(Box::new(action), cx);
+    }
+
+    fn toggle_empty_groups(
+        &mut self,
+        _: &ToggleEmptyGroups,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.hide_empty = !self.hide_empty;
         self.refilter(cx);
     }
 
@@ -678,11 +765,25 @@ impl RelationshipTree {
                     )
                     .into_any_element()
             }
-            EntryKind::More { shown, total, .. } => Label::new(rows::more_label(*shown, *total))
-                .size(LabelSize::XSmall)
-                .color(Color::Accent)
-                .single_line()
-                .into_any_element(),
+            EntryKind::More { shown, total, key } => {
+                let filter = self.filter.trim();
+                let searching = self.group_search(key, cx);
+                let text = if !filter.is_empty() && searching.as_deref() != Some(filter) {
+                    match total {
+                        Some(total) => format!("Find “{filter}” among {total}"),
+                        None => format!("Find “{filter}” in this group"),
+                    }
+                } else if let Some(search) = searching {
+                    format!("Show more matching “{search}”")
+                } else {
+                    rows::more_label(*shown, *total)
+                };
+                Label::new(text)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Accent)
+                    .single_line()
+                    .into_any_element()
+            }
             EntryKind::Loading { .. } => Label::new("Loading…")
                 .size(LabelSize::XSmall)
                 .color(Color::Muted)
@@ -778,18 +879,56 @@ impl RelationshipTree {
             .enumerate()
             .map(|(index, node)| (index, rows::node_text(state, node)))
             .collect();
-        if breadcrumb.is_empty() && !newer && self.filter.is_empty() {
+        state.root.as_ref()?;
+        let filter = self.filter.clone();
+        let hide_empty = self.hide_empty;
+        // The toggle shows only when it changes something: an empty group, or hiding on.
+        let any_empty = self.entries.iter().any(|entry| {
+            matches!(
+                entry.kind,
+                EntryKind::Group {
+                    count: Loadable::Loaded(0),
+                    ..
+                }
+            )
+        });
+        if breadcrumb.is_empty() && !newer && filter.is_empty() && !hide_empty && !any_empty {
             return None;
         }
-        let filter = self.filter.clone();
+        let toggle = IconButton::new(
+            "toggle-empty-groups",
+            if hide_empty {
+                IconName::EyeOff
+            } else {
+                IconName::Eye
+            },
+        )
+        .icon_size(IconSize::XSmall)
+        .toggle_state(hide_empty)
+        .tooltip(move |_, cx| {
+            Tooltip::for_action(
+                if hide_empty {
+                    "Show relationships with none"
+                } else {
+                    "Hide relationships with none"
+                },
+                &ToggleEmptyGroups,
+                cx,
+            )
+        })
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.toggle_empty_groups(&ToggleEmptyGroups, window, cx)
+        }));
         Some(
             v_flex()
                 .px_2()
                 .pb_1()
                 .gap_1()
-                .when(!breadcrumb.is_empty(), |d| {
-                    d.child(
-                        h_flex().flex_wrap().gap_0p5().children(
+                .child(
+                    h_flex()
+                        .gap_0p5()
+                        .child(
+                            h_flex().flex_1().min_w_0().flex_wrap().gap_0p5().children(
                             breadcrumb.into_iter().map(|(index, text)| {
                                 Button::new(("crumb", index), format!("{text} ›"))
                                     .label_size(LabelSize::XSmall)
@@ -799,9 +938,9 @@ impl RelationshipTree {
                                         this.with_exploration(cx, |e, cx| e.back_to(index, cx));
                                     }))
                             }),
-                        ),
-                    )
-                })
+                        ))
+                        .when(hide_empty || any_empty, |row| row.child(toggle)),
+                )
                 .when(newer, |d| {
                     d.child(
                         Button::new("newer", "Newer data · Refresh")
@@ -934,6 +1073,9 @@ impl Render for RelationshipTree {
             .on_action(cx.listener(Self::reroot_here))
             .on_action(cx.listener(Self::show_on_canvas))
             .on_action(cx.listener(Self::clear_filter))
+            .on_action(cx.listener(Self::peek_selected))
+            .on_action(cx.listener(Self::open_table))
+            .on_action(cx.listener(Self::toggle_empty_groups))
             .on_key_down(cx.listener(Self::key_down));
 
         let has_root = self

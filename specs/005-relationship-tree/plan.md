@@ -66,7 +66,6 @@ on the canvas. Typing filters the visible rows.
 - Visible rows are flattened into one list and rendered with `uniform_list`, indent guides, and
   sticky ancestor rows so the path stays visible however deep the walk.
 - Each expansion loads lazily: an inline spinner row, or an error row with Retry.
-- Wide windows can show the same model as columns (node | relationships | nodes | …).
 
 ## Decisions
 
@@ -81,6 +80,8 @@ on the canvas. Typing filters the visible rows.
 - Engine change E16 (neighbourhood counts per node), [spec 012](../012-omnigraph-engine-changes/plan.md). Until then, one count query per
   edge type, run concurrently and cached for the pinned commit.
 - Grouping neighbours by a property ("by company").
+- Showing the same model as columns in wide windows (node | relationships | nodes | …): the
+  tree lives in a fixed-width dock panel, and the canvas covers the wide view.
 
 ## Validation log
 
@@ -96,6 +97,8 @@ on the canvas. Typing filters the visible rows.
 | 2026-10-12 | F re-roots and keeps expansions below; the old root becomes the breadcrumb; ⌥→ expands every group | snapshot Person → Contributes → Project Fable 36, `RerootHere`, `ExpandAll` | breadcrumb "Radia Knuth ›"; Contributes 13 and Owns 1 open |
 | 2026-10-12 | A missing root is an error row with Retry, never an empty tree | snapshot `OpenNode` Person `nobody` | "No Person with key nobody at this commit." · Retry |
 | 2026-10-12 | Flattening, cycle detection, filtering with ancestors, paging state | `cargo test -p graph_store -p relationship_tree` | 9 + 4 unit tests pass |
+| 2026-10-12 | ⌘↵ on a group opens the related table | offscreen snapshot: `OpenNode` person-000000, ↓, ⌘↵ | The left dock switched to Explore; Project opened with "← contributes person-000000", 1 of 40 (project-00036, as the tree shows) |
+| 2026-10-12 | Group search reads the server | `gq_language` `relationship_queries_compile_in_both_directions` with a search; `rows` tests keep the "Show more" row under a kept group and hide empty groups | Pass |
 
 ## Corrections
 
@@ -118,7 +121,14 @@ on the canvas. Typing filters the visible rows.
   The frame (spec 002) should own this.
 - **Key bindings** are registered in `relationship_tree::init` with `cx.bind_keys`; they still
   need entries in `assets/keymaps/`.
-- **Not built yet:** Space peek, ⌘↵ table filtered to the node, the zero-count toggle, the
-  filter box above 50 rows, hover cards with every edge property (a tooltip shows them), the
+- **Built since:** Space peeks (`studio_graph::PeekNode`: the inspector only, focus stays in
+  the tree); ⌘↵ opens the node's table filtered to its id, or on a relationship group the other
+  type's table filtered to "related to" this node (spec 004's relationship filter); the eye
+  toggle (or `h`) hides groups with none, shown when a group is empty; with text typed, a
+  group not read in full offers "Find “text” among N", which reads that group again on the
+  server narrowed to ids starting with or labels containing the text (Esc clears both).
+  `OpenNode` from the table, palette or canvas now reaches the tree: the table's handler
+  propagates, so Explore shows and the tree reveals the node.
+- **Not built yet:** hover cards with every edge property (a tooltip shows them), the
   "Newer data · Refresh" chip is wired to `SessionEvent::Committed` but not seen in a snapshot,
   and fields (at-most-one edges) are covered by unit tests only: the dev schema has none.

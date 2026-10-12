@@ -402,6 +402,8 @@ impl CommitView {
                                     Box::new(OpenType {
                                         type_name: name,
                                         at_commit: Some(commit.clone()),
+                                        filter_id: None,
+                                        via: None,
                                     }),
                                 );
                             }

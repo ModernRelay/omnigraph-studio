@@ -133,14 +133,17 @@
       "left": "studio_tree::Collapse",
       "enter": "studio_tree::OpenSelected",
       "alt-right": "studio_tree::ExpandAll",
-      "alt-left": "studio_tree::CollapseAll"
+      "alt-left": "studio_tree::CollapseAll",
+      "cmd-enter": "studio_tree::OpenTable"
     }
   },
   {
     "context": "Tree && !filtering",
     "bindings": {
       "f": "studio_tree::RerootHere",
-      "g": "studio_tree::ShowOnCanvas"
+      "g": "studio_tree::ShowOnCanvas",
+      "space": "studio_tree::PeekSelected",
+      "h": "studio_tree::ToggleEmptyGroups"
     }
   },
   {

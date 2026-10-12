@@ -9,8 +9,10 @@ mod peek;
 mod table;
 mod types_list;
 
-use gpui::{App, AppContext as _, Context, Window};
-use studio_actions::graph::{OpenNode, OpenType};
+use gpui::{App, AppContext as _, Context, Entity, Window};
+use gq_language::{Filter, FilterOp};
+use serde_json::Value;
+use studio_actions::graph::{OpenNode, OpenType, PeekNode};
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
 
@@ -45,16 +47,43 @@ pub fn init(cx: &mut App) {
             cx,
         );
         workspace.register_action(|workspace, action: &OpenType, window, cx| {
-            open_type(
+            let table = open_type(
                 workspace,
                 &action.type_name,
                 action.at_commit.clone(),
                 window,
                 cx,
+            );
+            if let (Some(table), Some(id)) = (table, action.filter_id.clone()) {
+                let filter = match &action.via {
+                    Some(via) => Filter {
+                        property: via.clone(),
+                        op: FilterOp::RelatedTo,
+                        value: Value::String(id),
+                    },
+                    None => Filter {
+                        property: gq_language::builder::ID_FILTER.into(),
+                        op: FilterOp::Eq,
+                        value: Value::String(id),
+                    },
+                };
+                table.update(cx, |table, cx| table.show_only(filter, cx));
+            }
+        });
+        workspace.register_action(|workspace, action: &PeekNode, _window, cx| {
+            open_node(
+                workspace,
+                &OpenNode {
+                    type_name: action.type_name.clone(),
+                    id: action.id.clone(),
+                },
+                cx,
             )
         });
         workspace.register_action(|workspace, action: &OpenNode, _window, cx| {
-            open_node(workspace, action, cx)
+            open_node(workspace, action, cx);
+            // The relationship tree reveals the node too (spec 005).
+            cx.propagate();
         });
     })
     .detach();
@@ -68,10 +97,8 @@ fn open_type(
     at_commit: Option<String>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) {
-    let Some(session) = workspace.session().cloned() else {
-        return;
-    };
+) -> Option<Entity<TypeTable>> {
+    let session = workspace.session().cloned()?;
     if let Some(schema) = session.read(cx).schema_model()
         && schema.node(type_name).is_none()
         && schema.edge(type_name).is_none()
@@ -81,7 +108,7 @@ fn open_type(
             format!("The schema has no type {type_name}."),
             cx,
         );
-        return;
+        return None;
     }
     let handle = cx.entity().downgrade();
     let name = type_name.to_owned();
@@ -90,7 +117,7 @@ fn open_type(
         window,
         cx,
         move |window, cx| TypeTable::new(handle, session, name, at_commit, window, cx),
-    );
+    )
 }
 
 /// One tab per type at the head, and one per type and commit.

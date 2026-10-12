@@ -253,6 +253,8 @@ pub struct ExploreState {
     pub expanded: HashSet<ExplorePath>,
     pub counts: HashMap<GroupKey, Loadable<u64>>,
     pub neighbours: HashMap<GroupKey, NeighbourList>,
+    /// Groups whose neighbours are narrowed on the server to ids or labels matching a text.
+    pub searches: HashMap<GroupKey, String>,
     pub selection: Option<ExplorePath>,
 }
 
@@ -266,6 +268,7 @@ impl Default for ExploreState {
             expanded: HashSet::new(),
             counts: HashMap::new(),
             neighbours: HashMap::new(),
+            searches: HashMap::new(),
             selection: None,
         }
     }
@@ -921,6 +924,37 @@ impl Exploration {
     }
 
     /// Reads the next page of a group's neighbours.
+    /// Reads a group's neighbours again, narrowed to ids starting with or labels containing
+    /// `text` (spec 005: the filter for groups over one page); empty text reads them all.
+    pub fn search_group(&mut self, key: &GroupKey, text: &str, cx: &mut Context<Self>) {
+        let text = text.trim();
+        let current = self
+            .state
+            .searches
+            .get(key)
+            .map(String::as_str)
+            .unwrap_or("");
+        if current == text {
+            return;
+        }
+        if text.is_empty() {
+            self.state.searches.remove(key);
+        } else {
+            self.state.searches.insert(key.clone(), text.to_owned());
+        }
+        self.state.neighbours.remove(key);
+        self.start(LoadTarget::Page(key.clone()), cx);
+        self.changed(cx);
+    }
+
+    /// Ends every group search, reading those groups' first pages again.
+    pub fn clear_searches(&mut self, cx: &mut Context<Self>) {
+        let keys: Vec<GroupKey> = self.state.searches.keys().cloned().collect();
+        for key in keys {
+            self.search_group(&key, "", cx);
+        }
+    }
+
     pub fn load_more(&mut self, key: &GroupKey, cx: &mut Context<Self>) {
         let ready = self
             .state
@@ -1014,6 +1048,7 @@ impl Exploration {
                     &key.group,
                     &key.node.id,
                     list.next_after(),
+                    self.state.searches.get(key).map(String::as_str),
                     NEIGHBOUR_PAGE,
                 )
             }

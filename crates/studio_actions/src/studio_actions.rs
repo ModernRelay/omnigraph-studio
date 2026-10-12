@@ -102,6 +102,20 @@ pub mod graph {
         /// Read the table at this commit, read-only (spec 009); `None` reads the branch head.
         #[serde(default)]
         pub at_commit: Option<String>,
+        /// Filter the table to this node id: the node itself, or with `via`, the nodes related
+        /// to it through that relationship key (`in:WorksAt`) (spec 005).
+        #[serde(default)]
+        pub filter_id: Option<String>,
+        #[serde(default)]
+        pub via: Option<String>,
+    }
+
+    /// Show one node in the inspector without revealing it in the tree.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct PeekNode {
+        pub type_name: String,
+        pub id: String,
     }
 
     /// Open one node in the inspector and the relationship tree.
@@ -201,6 +215,12 @@ pub mod tree {
             ShowOnCanvas,
             /// Clear the text typed to filter the tree.
             ClearFilter,
+            /// Show the selected node in the inspector, keeping focus in the tree.
+            PeekSelected,
+            /// Open a table filtered to the selected node, or to its neighbours in a group.
+            OpenTable,
+            /// Show or hide relationship groups with no relationships.
+            ToggleEmptyGroups,
         ]
     );
 }
