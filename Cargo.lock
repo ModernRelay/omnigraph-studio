@@ -9827,6 +9827,7 @@ dependencies = [
  "studio_actions",
  "studio_settings",
  "studio_ui",
+ "theme_settings",
  "ui",
 ]
 
