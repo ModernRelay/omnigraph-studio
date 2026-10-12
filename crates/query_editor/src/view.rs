@@ -141,7 +141,8 @@ impl Failure {
         }
     }
 
-    fn from_read(error: &ReadError) -> Self {
+    /// A failed read; a refusal's diagnostic is placed in the editor through `map`.
+    fn from_read(error: &ReadError, map: SourceMap) -> Self {
         let (title, hint) = match error {
             ReadError::Refused(summary) => {
                 let hint = match summary.code {
@@ -177,10 +178,17 @@ impl Failure {
                 "This server speaks a different OmniGraph contract than Studio.",
             ),
         };
+        let diagnostic = match error {
+            ReadError::Refused(summary) => summary
+                .diagnostic
+                .as_ref()
+                .map(|d| server_diagnostic(d, &summary.message, map)),
+            _ => None,
+        };
         Self {
             title,
             hint: Some(hint.into()),
-            diagnostic: None,
+            diagnostic,
         }
     }
 }
@@ -866,7 +874,7 @@ impl QueryEditor {
                     commit: output.graph_commit_id,
                 })
             }
-            Err(error) => Output::Failed(Failure::from_read(&error)),
+            Err(error) => Output::Failed(Failure::from_read(&error, prepared.map)),
         };
         self.results_scroll.scroll_to_item(0, ScrollStrategy::Top);
     }

@@ -53,6 +53,8 @@ pub struct ApiErrorSummary {
     pub status: u16,
     pub message: String,
     pub code: Option<crate::api::ErrorCode>,
+    /// The server's diagnostic for a refused query: where in the text, and what (spec 007).
+    pub diagnostic: Option<Value>,
 }
 
 impl std::fmt::Display for ReadError {
@@ -397,6 +399,7 @@ impl GraphClient {
                           not fetch it."
                     .into(),
                 code: None,
+                diagnostic: None,
             })),
             _ => Err(ReadError::Refused(summary(raw.status, &raw.body))),
         }
@@ -660,6 +663,7 @@ fn summary(status: StatusCode, body: &[u8]) -> ApiErrorSummary {
             status: status.as_u16(),
             message: error.error,
             code: error.code,
+            diagnostic: error.diagnostic,
         },
         Err(_) => ApiErrorSummary {
             status: status.as_u16(),
@@ -668,6 +672,7 @@ fn summary(status: StatusCode, body: &[u8]) -> ApiErrorSummary {
                 .unwrap_or("Request failed")
                 .to_owned(),
             code: None,
+            diagnostic: None,
         },
     }
 }
