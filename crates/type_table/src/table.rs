@@ -42,7 +42,7 @@ use crate::dialogs::{DeleteRowModal, InsertRowModal, SaveViewModal};
 use crate::model::{
     ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN, Row, SaveResult, TableKind, Tone,
     changed_elsewhere, chips_that_fit, copy_text, count_of, display_value, edge_columns, edge_rows,
-    edit_text, filter_label, format_count, insert_position, node_columns, node_rows,
+    edit_text, filter_parts, format_count, insert_position, node_columns, node_rows,
     parse_filter_list, parse_filter_value, parse_input, preset_start, relation_sample, row_matches,
     same_value, save_result, short_commit,
 };
@@ -91,6 +91,21 @@ struct BulkDraft {
     property: Option<String>,
     notice: Option<Notice>,
     saving: bool,
+}
+
+/// A property's icon, by what it holds: text, a number, a time, a choice, a file.
+fn property_icon(property: &Property) -> IconName {
+    if property.enum_values.is_some() {
+        return IconName::ListTodo;
+    }
+    match property.kind {
+        ScalarKind::Text => IconName::CaseSensitive,
+        ScalarKind::Bool => IconName::Check,
+        ScalarKind::Integer | ScalarKind::Float => IconName::Hash,
+        ScalarKind::Date | ScalarKind::DateTime => IconName::Clock,
+        ScalarKind::Vector => IconName::Sparkle,
+        ScalarKind::Blob => IconName::File,
+    }
 }
 
 /// One row's neighbours through one relationship: how many, and the first few.
@@ -245,11 +260,13 @@ impl TypeTable {
         let filter_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Value", window, cx);
+            editor.set_text_style_refinement(studio_ui::ds::field_text(cx));
             editor
         });
         let bulk_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("New value", window, cx);
+            editor.set_text_style_refinement(studio_ui::ds::field_text(cx));
             editor
         });
         let mut subscriptions = vec![
@@ -2117,6 +2134,20 @@ impl TypeTable {
 
     /// What a filter can test: each filterable property, then (in a node table) each
     /// relationship group, as `(key, label)`.
+    /// The icon of a filter key: the property's kind, or the relationship's direction.
+    fn key_icon(&self, key: &str) -> IconName {
+        if let Some((direction, _)) = builder::parse_relationship_key(key) {
+            return match direction {
+                gq_language::Direction::Outgoing => IconName::ArrowRight,
+                gq_language::Direction::Incoming => IconName::ArrowLeft,
+            };
+        }
+        self.filterable()
+            .iter()
+            .find(|p| p.name == key)
+            .map_or(IconName::CaseSensitive, property_icon)
+    }
+
     fn filter_choices(&self) -> Vec<(String, String)> {
         let mut choices: Vec<(String, String)> = self
             .filterable()
@@ -2425,66 +2456,85 @@ impl TypeTable {
         if self.filters.is_empty() && self.filter_draft.is_none() {
             return None;
         }
-        let colors = cx.theme().colors();
-        let (border, chip_bg, editor_bg) = (
-            colors.border_variant,
-            colors.element_background,
-            colors.editor_background,
-        );
+        let editor_bg = cx.theme().colors().editor_background;
         let mut bar = h_flex()
             .flex_none()
             .flex_wrap()
-            .px_3()
-            .py_1p5()
-            .gap_1p5()
+            .px(px(studio_ui::ds::space::EDGE))
+            .py(px(studio_ui::ds::space::SM))
+            .gap(px(studio_ui::ds::space::SM))
             .items_center()
             .border_b_1()
-            .border_color(border);
+            .border_color(studio_ui::ds::surface::rule(cx));
         for (index, filter) in self.filters.iter().enumerate() {
-            bar = bar.child(
-                h_flex()
-                    .gap_0p5()
-                    .pl_2()
-                    .pr_0p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border)
-                    .bg(chip_bg)
-                    .child(Label::new(filter_label(filter)).size(LabelSize::Small))
-                    .child(
-                        IconButton::new(("remove-filter", index), IconName::Close)
-                            .icon_size(IconSize::XSmall)
-                            .tooltip(Tooltip::text("Remove this filter"))
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.remove_filter(index, cx)),
-                            ),
-                    ),
-            );
+            let (field, test, value) = filter_parts(filter);
+            bar = bar.child(studio_ui::ds::filter_pill(
+                ("filter", index),
+                self.key_icon(&filter.property),
+                field,
+                test,
+                value.map(Into::into),
+                cx.listener(move |this, _, _, cx| this.remove_filter(index, cx)),
+                cx,
+            ));
         }
         if let Some(draft) = &self.filter_draft {
             let table = cx.entity().downgrade();
-            let choices = self.filter_choices();
+            let choices: Vec<(String, String, IconName)> = self
+                .filter_choices()
+                .into_iter()
+                .map(|(key, label)| {
+                    let icon = self.key_icon(&key);
+                    (key, label, icon)
+                })
+                .collect();
             let chosen = choices
                 .iter()
-                .find(|(key, _)| *key == draft.property)
-                .map(|(_, label)| label.clone())
+                .find(|(key, _, _)| *key == draft.property)
+                .map(|(_, label, _)| label.clone())
                 .unwrap_or_else(|| draft.property.clone());
             let ops = self.ops_for(&draft.property);
             let property_table = table.clone();
-            bar = bar
+            let chosen_icon = self.key_icon(&draft.property);
+            let rule = studio_ui::ds::surface::rule(cx);
+            let divider = move || div().w(px(1.)).h_full().flex_none().bg(rule);
+            let chevron = || {
+                Icon::new(IconName::ChevronDown)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted)
+            };
+            // The filter being written is the pill it will become, outlined while it is open.
+            let pill = h_flex()
+                .h(px(26.))
+                .flex_none()
+                .rounded_full()
+                .border_1()
+                .border_color(if draft.error.is_some() {
+                    cx.theme().status().error_border
+                } else {
+                    cx.theme().colors().border_focused
+                })
+                .bg(editor_bg)
+                .overflow_hidden()
                 .child(
                     PopoverMenu::new("filter-property")
                         .trigger(
-                            Button::new("filter-property-button", format!("{chosen} ▾"))
-                                .style(ButtonStyle::Outlined)
-                                .label_size(LabelSize::Small),
+                            Button::new("filter-property-button", chosen)
+                                .style(ButtonStyle::Subtle)
+                                .label_size(LabelSize::Small)
+                                .start_icon(
+                                    Icon::new(chosen_icon)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .end_icon(chevron()),
                         )
                         .menu(move |window, cx| {
                             let table = property_table.clone();
                             let choices = choices.clone();
                             Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                                 let mut relationships = false;
-                                for (key, label) in choices {
+                                for (key, label, icon) in choices {
                                     if !relationships
                                         && builder::parse_relationship_key(&key).is_some()
                                     {
@@ -2493,24 +2543,36 @@ impl TypeTable {
                                     }
                                     let table = table.clone();
                                     let name = key.clone();
-                                    menu = menu.entry(label, None, move |window, cx| {
-                                        table
-                                            .update(cx, |this, cx| {
-                                                this.set_draft_property(name.clone(), window, cx)
-                                            })
-                                            .ok();
-                                    });
+                                    menu = menu.item(
+                                        ContextMenuEntry::new(label)
+                                            .icon(icon)
+                                            .icon_color(Color::Muted)
+                                            .handler(move |window, cx| {
+                                                table
+                                                    .update(cx, |this, cx| {
+                                                        this.set_draft_property(
+                                                            name.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    })
+                                                    .ok();
+                                            }),
+                                    );
                                 }
                                 menu
                             }))
                         }),
                 )
+                .child(divider())
                 .child(
                     PopoverMenu::new("filter-op")
                         .trigger(
-                            Button::new("filter-op-button", format!("{} ▾", draft.op.label()))
-                                .style(ButtonStyle::Outlined)
-                                .label_size(LabelSize::Small),
+                            Button::new("filter-op-button", draft.op.label())
+                                .style(ButtonStyle::Subtle)
+                                .label_size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .end_icon(chevron()),
                         )
                         .menu(move |window, cx| {
                             let table = table.clone();
@@ -2530,47 +2592,48 @@ impl TypeTable {
                             }))
                         }),
                 )
-                .when(draft.op.takes_value(), |bar| {
-                    bar.child(
+                .when(draft.op.takes_value(), |pill| {
+                    pill.child(divider()).child(
                         div()
-                            .w(px(200.))
-                            .px_2()
-                            .py_0p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(if draft.error.is_some() {
-                                cx.theme().status().error_border
-                            } else {
-                                border
-                            })
-                            .bg(editor_bg)
+                            .w(px(180.))
+                            .px(px(studio_ui::ds::space::MD))
                             .child(self.filter_editor.clone()),
                     )
                 })
+                .child(divider())
                 .child(
-                    Button::new("apply-filter", "Add")
-                        .style(ButtonStyle::Filled)
-                        .label_size(LabelSize::Small)
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.apply_filter_draft(window, cx)),
+                    h_flex()
+                        .h_full()
+                        .px(px(studio_ui::ds::space::XS))
+                        .gap(px(studio_ui::ds::space::XXS))
+                        .items_center()
+                        .child(
+                            IconButton::new("apply-filter", IconName::Check)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Accent)
+                                .tooltip(Tooltip::text("Add this filter (↵)"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.apply_filter_draft(window, cx)
+                                })),
+                        )
+                        .child(
+                            IconButton::new("cancel-filter", IconName::Close)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Discard this filter (Esc)"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.filter_draft = None;
+                                    window.focus(&this.focus_handle, cx);
+                                    cx.notify();
+                                })),
                         ),
-                )
-                .child(
-                    IconButton::new("cancel-filter", IconName::Close)
-                        .icon_size(IconSize::Small)
-                        .tooltip(Tooltip::text("Discard this filter"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.filter_draft = None;
-                            window.focus(&this.focus_handle, cx);
-                            cx.notify();
-                        })),
-                )
-                .children(
-                    draft
-                        .error
-                        .clone()
-                        .map(|error| Label::new(error).size(LabelSize::Small).color(Color::Error)),
                 );
+            bar = bar.child(pill).children(
+                draft
+                    .error
+                    .clone()
+                    .map(|error| Label::new(error).size(LabelSize::Small).color(Color::Error)),
+            );
         }
         if !self.filters.is_empty() {
             bar = bar.child(div().flex_1()).child(

@@ -154,6 +154,7 @@ impl HistoryView {
         let search = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Find a commit by id or actor", window, cx);
+            editor.set_text_style_refinement(studio_ui::ds::field_text(cx));
             editor
         });
         let search_subscription = cx.subscribe(&search, |this, _, event: &EditorEvent, cx| {

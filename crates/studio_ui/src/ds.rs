@@ -546,6 +546,81 @@ pub fn meta_code(icon: IconName, value: impl Into<SharedString>, cx: &App) -> Di
         .child(text::code(value, cx).color(Color::Muted).single_line())
 }
 
+/// The text of a single-line field that sits among `Small` labels (a filter value, a search
+/// box): an editor's text at the label's size rather than the body size.
+pub fn field_text(cx: &App) -> gpui::TextStyleRefinement {
+    gpui::TextStyleRefinement {
+        font_size: Some(ui::TextSize::Small.rems(cx).into()),
+        ..Default::default()
+    }
+}
+
+/// An applied filter as a segmented pill: the field with its icon, the test, the value, and a
+/// remove button, split by hairlines, as Tower's filter chips read.
+pub fn filter_pill(
+    id: impl Into<ElementId>,
+    icon: IconName,
+    field: impl Into<SharedString>,
+    test: impl Into<SharedString>,
+    value: Option<SharedString>,
+    on_remove: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> Stateful<Div> {
+    let id: ElementId = id.into();
+    let rule = surface::rule(cx);
+    let divider = move || div().w(px(1.)).h_full().flex_none().bg(rule);
+    let segment = || {
+        h_flex()
+            .h_full()
+            .px(px(space::MD))
+            .gap(px(space::XS))
+            .items_center()
+            .flex_none()
+    };
+    h_flex()
+        .id(id.clone())
+        .h(px(26.))
+        .flex_none()
+        .rounded_full()
+        .border_1()
+        .border_color(surface::raised_border(cx))
+        .bg(cx.theme().colors().editor_background)
+        .shadow(elevation::raised())
+        .overflow_hidden()
+        .child(
+            segment()
+                .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+                .child(Label::new(field.into()).size(LabelSize::Small)),
+        )
+        .child(divider())
+        .child(segment().child(text::muted(test).size(LabelSize::Small)))
+        .when_some(value, |pill, value| {
+            pill.child(divider()).child(
+                segment().max_w(px(220.)).child(
+                    Label::new(value)
+                        .size(LabelSize::Small)
+                        .single_line()
+                        .truncate(),
+                ),
+            )
+        })
+        .child(divider())
+        .child(
+            div()
+                .h_full()
+                .px(px(space::XS))
+                .flex()
+                .items_center()
+                .child(
+                    IconButton::new("remove", IconName::Close)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Remove this filter"))
+                        .on_click(on_remove),
+                ),
+        )
+}
+
 /// The widest a [`tag`] grows before its label truncates.
 pub const TAG_MAX_WIDTH: f32 = 160.;
 

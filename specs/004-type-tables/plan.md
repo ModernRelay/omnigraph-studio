@@ -83,6 +83,11 @@ stay put), IX (paged, virtualized).
   the rows it sizes, in page order, up to 2,000 rows; a row with more than 200 neighbours, or
   past the budget, shows its count alone, so a hub never leaves the rows after it bare. A
   click opens the other type filtered to this row's neighbours through the same relationship.
+- Filters read as segmented pills (`ds::filter_pill`): the field with its kind's icon (text,
+  number, time, choice, file, or the relationship's direction), the test, the value and a
+  remove button, split by hairlines. A filter being written is the same pill outlined in the
+  accent, its field and test as menus (the field menu shows each property's icon) and its value
+  as a field at the label size.
 - Filtered counts: `return { count($n) as n }` with the same filters, pinned to the snapshot.
 
 ### Filters and views

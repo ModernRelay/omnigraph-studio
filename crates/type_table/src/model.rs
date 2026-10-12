@@ -567,24 +567,19 @@ pub fn row_matches(filters: &[Filter], values: &Map<String, Value>) -> bool {
 }
 
 /// A filter as a chip reads: `title is Engineer`, `email is empty`, `has worksAt →`.
-pub fn filter_label(filter: &Filter) -> String {
-    if let Some(relationship) = gq_language::builder::relationship_label(&filter.property) {
+/// A filter as its pill's parts: the field, the test and the value it compares with, if any.
+pub fn filter_parts(filter: &Filter) -> (String, String, Option<String>) {
+    // A relationship is named by its traversal; the pill's icon shows its direction.
+    if let Some((_, edge)) = gq_language::builder::parse_relationship_key(&filter.property) {
+        let relationship = gq_language::traversal_name(edge);
         return match filter.op {
-            FilterOp::HasAny => format!("has {relationship}"),
-            FilterOp::HasNone => format!("no {relationship}"),
-            _ => format!("{relationship} {}", edit_text(&filter.value)),
+            FilterOp::HasAny => (relationship, "has any".into(), None),
+            FilterOp::HasNone => (relationship, "has none".into(), None),
+            _ => (relationship, "is".into(), Some(edit_text(&filter.value))),
         };
     }
-    if filter.op.takes_value() {
-        format!(
-            "{} {} {}",
-            filter.property,
-            filter.op.label(),
-            edit_text(&filter.value)
-        )
-    } else {
-        format!("{} {}", filter.property, filter.op.label())
-    }
+    let value = filter.op.takes_value().then(|| edit_text(&filter.value));
+    (filter.property.clone(), filter.op.label().to_owned(), value)
 }
 
 // ---- write outcomes ----
@@ -1076,12 +1071,12 @@ mod tests {
             &values
         ));
         assert_eq!(
-            filter_label(&filter("title", FilterOp::Eq, json!("CEO"))),
-            "title is CEO"
+            filter_parts(&filter("title", FilterOp::Eq, json!("CEO"))),
+            ("title".into(), "is".into(), Some("CEO".into()))
         );
         assert_eq!(
-            filter_label(&filter("email", FilterOp::IsEmpty, Value::Null)),
-            "email is empty"
+            filter_parts(&filter("email", FilterOp::IsEmpty, Value::Null)),
+            ("email".into(), "is empty".into(), None)
         );
     }
 
@@ -1255,8 +1250,8 @@ mod tests {
             &row
         ));
         assert_eq!(
-            filter_label(&filter("in:Knows", FilterOp::HasAny, Value::Null)),
-            "has ← knows"
+            filter_parts(&filter("in:Knows", FilterOp::HasAny, Value::Null)),
+            ("knows".into(), "has any".into(), None)
         );
     }
 
