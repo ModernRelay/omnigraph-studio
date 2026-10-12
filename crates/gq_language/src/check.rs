@@ -100,18 +100,18 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
         match typecheck_query_decl(&schema.catalog, decl) {
             Ok(_) => {
                 let mut info = info;
-                if !info.is_mutation {
-                    if let Ok(operation) = describe_query_operation(&schema.catalog, decl) {
-                        info.columns = operation
-                            .result
-                            .iter()
-                            .map(|field| ResultColumn {
-                                name: field.name.clone(),
-                                kind: format!("{:?}", field.kind),
-                                nullable: field.nullable,
-                            })
-                            .collect();
-                    }
+                if !info.is_mutation
+                    && let Ok(operation) = describe_query_operation(&schema.catalog, decl)
+                {
+                    info.columns = operation
+                        .result
+                        .iter()
+                        .map(|field| ResultColumn {
+                            name: field.name.clone(),
+                            kind: format!("{:?}", field.kind),
+                            nullable: field.nullable,
+                        })
+                        .collect();
                 }
                 result.queries.push(info);
             }

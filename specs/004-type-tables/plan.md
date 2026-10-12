@@ -1,6 +1,9 @@
 # 004: Type tables
 
-Status: draft · 2026-10-11
+Status: in progress · 2026-10-12. `crates/type_table` ships the Types sidebar, node and edge
+tables (keyset pages pinned to one commit, filtered counts, filters, a cell cursor, value-bound
+cell edits with all three outcomes, peek, insert and typed-key delete). Not yet: sorting,
+relationship columns, saved views, bulk edits, preview tabs, relative dates (see Deferred).
 
 ## Problem
 
@@ -128,6 +131,8 @@ opens the branch's recent commits.
   - R2 unpublished commits: staged edits as a reviewable proposal only when the server
     advertises `cluster_publishCommit`.
 - Group-by (Tower 084) until filters and editing ship.
+- Sorting by a property (keyset pairs), relationship columns, relative dates, saved views,
+  bulk edits and the preview tab are designed above but not built yet.
 - Per-row history beyond the commits that the change feed can cheaply return.
 
 ## Validation log
@@ -137,10 +142,42 @@ opens the branch's recent commits.
 | 2026-10-11 | Grammar features used above exist in 0.13.0 | `git show v0.13.0:crates/omnigraph-compiler/src/query/query.pest` | `or`, `in`, null tests, `exists`, `@id` metadata, `update … set { } where` present |
 | 2026-10-11 | Compiler describes result columns | `git show v0.13.0:crates/omnigraph-compiler/src/lib.rs` | `describe_query_operation`, `QueryResultFieldDescriptor` exported |
 | 2026-10-11 | Zed table sources exist | `git ls-tree -r v1.23.2 crates/ui/src/components crates/tabular_data_preview/src` | `data_table.rs`, `table_view.rs`, `table_data_engine.rs`, `types/coordinates.rs` |
-| pending | `affected_nodes = 0` when the bound old value no longer matches | run against a 0.13 server | |
-| pending | Keyset pages stay consistent when pinned to `snapshot` | run against a 0.13 server | |
-| pending | Merge-mode NDJSON leaves unspecified properties untouched | run against a 0.13 server | |
+| 2026-10-12 | `affected_nodes = 0` when the bound old value no longer matches | `update Person set { title: $new } where @id = $id and title = $old` with a stale `$old` against `script/dev-server` (0.13.0, port 8801) | `affected_nodes: 0`, `commit: null`. In Studio: the title changed to "CTO" by another client while the editor was open; Enter showed "Changed elsewhere to “CTO” while you were editing" with the draft kept |
+| 2026-10-12 | An update that sets the value it already has is still a commit | same update with `$new = $old` | `affected_nodes: 1` and a new commit, so Studio sends nothing when the edited text parses to the shown value |
+| 2026-10-12 | Keyset pages stay consistent when pinned to `snapshot` | read the head commit C, insert `person-000150a`, read the page after `person-000149` at `snapshot = C` and at the head | At C: `000150, 000151, 000152`; at the head: `000150, 000150a, 000151` |
+| 2026-10-12 | Edge rows can be keyed and paged by `$e.@id` | `match { $a: Person  $a $e:worksAt $b  $e.@id > $after } return { $e.@id … } order { $e.@id asc }` | Works; ids are ULIDs. Without the typed `$a: Person` binding the engine refuses (T5); `count($e)` is refused (T23), `count($e.@id)` works |
+| 2026-10-12 | Edges cannot be updated | `update WorksAt set { role: $new } where @id = $id` | Refused at type check: T16 "update mutation for edge type is not supported". Edge tables are read-only |
+| 2026-10-12 | List filters take membership, not equality | compiler tests at v0.13.0 (`test_list_equality_match_is_rejected`, `test_contains_filter_accepts_list_membership`); `$n.tags contains $f0` with `$f0: String` on the server | Lists offer `contains` with an element-typed parameter; `contains` on text is a substring test |
+| 2026-10-12 | Deleting a node deletes its edges | insert a person with one `Knows` edge, `delete Person where @id = $id` | `affected_nodes: 1, affected_edges: 1`; the delete dialog says so |
+| 2026-10-12 | A delete bound to an old commit is refused | `/mutate/if-graph-commit` with a pin older than the head | 412 with `precondition_failure {expected, actual}`; Studio shows "Nothing was written. main moved since this table was read; refresh it, then try again." and offers Refresh |
+| 2026-10-12 | Unknown outcome | stopped the 8801 server between the table read and a cell save | The save came back unknown; the cell reopened with "Check History before trying again; your changes are still here"; the head still had the old value |
+| 2026-10-12 | `compile_schema_shape` keeps declaration order | `omnigraph-compiler` v0.13.0 `catalog/schema_shape.rs` | It sorts properties (and enum values) by name. `SchemaModel` now restores the `.pg` declaration order from the AST; enum values stay sorted |
+| 2026-10-12 | Zed's `ui::Table` can carry the grid | `crates/ui/src/components/data_table.rs` and `crates/tabular_data_preview/src/renderer/render_table.rs` at v1.23.2 | Resizable columns + `pin_cols(1)` + `uniform_list` + `disable_base_style`, as the CSV preview uses it |
+| 2026-10-12 | Actions reach the workspace with nothing focused | `crates/gpui/src/window.rs` `dispatch_action` / `focus_node_id_in_rendered_frame` | With no focus, an action goes to the root view's node only, which is outside the workspace element that holds its handlers. The workspace now focuses itself when a session opens and nothing else has focus |
+| pending | Merge-mode NDJSON leaves unspecified properties untouched | run against a 0.13 server | Bulk edit not built yet |
 
 ## Corrections
 
-None yet.
+- 2026-10-12 · Edges are read-only in tables: the engine has no edge update (T16). An edge table
+  pins its source column, then the target and the edge's properties; a click peeks the edge,
+  whose endpoints open in the inspector. Edge insert and delete wait for a later step.
+- 2026-10-12 · "Properties in schema order" needed a fix in `gq_language`: the compiled shape
+  lists them by name. Enum values still read in the compiler's sorted order.
+- 2026-10-12 · A delete is bound to the table's pin, so any commit after the table's read refuses
+  it (412). A table's own committed write moves the pin when that write's parent is the pin; a
+  write on top of someone else's commit leaves the table behind and shows "Newer data · Refresh".
+- 2026-10-12 · Clicking away from a changed cell keeps the text as a draft on the cell (a dot;
+  Enter reopens it) instead of discarding or saving it. Tab saves and moves to the next cell.
+- 2026-10-12 · The peek reads relationship counts with `builder::degree` per group and expands
+  groups of up to 8 neighbours by itself. Moving the cursor with a peek open re-peeks the new
+  row after a 120 ms pause.
+- 2026-10-12 · Key bindings for the table are registered by `type_table::init`
+  (`TypeTable && !editing`: j/k/↑/↓/←/→, ↵ edit, space peek, ⌘C copy, ⌘⌫ delete, ⌘⌥F filter by
+  selection; `TypeTable && editing`: ↵ save; `TypeTable`: esc, ⌘R refresh, ⌘N row, ⌘F filter,
+  ⌘⌥⌫ clear filters). They move to `assets/keymaps/` when the keymap files take feature
+  bindings. New actions: `studio_table::AddFilter`, `FilterBySelection`, `ClearFilters`.
+- 2026-10-12 · A mutation that matched nothing used to toast "committed"; the workspace now
+  shows no toast for it and the status line says nothing was written (constitution VII).
+- 2026-10-12 · The branch-head check is a one-row read at the head every 30 s while the table is
+  the active tab, and after any Studio write to the same branch. Offscreen snapshots do not run
+  GPUI timers, so the poll and the peek debounce are not visible there.

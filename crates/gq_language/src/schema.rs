@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use omnigraph_compiler::catalog::Catalog;
-use omnigraph_compiler::schema::ast::Constraint;
+use omnigraph_compiler::schema::ast::{Constraint, SchemaDecl, SchemaFile};
 use omnigraph_compiler::schema::parser::parse_schema;
 use omnigraph_compiler::types::{PropType, ScalarType};
 use omnigraph_compiler::{
@@ -87,10 +87,11 @@ impl NodeType {
     /// else the key.
     pub fn label_property(&self) -> Option<&str> {
         for candidate in ["name", "title", "display_name", "label"] {
-            if let Some(property) = self.property(candidate) {
-                if matches!(property.kind, ScalarKind::Text) && !property.list {
-                    return Some(&property.name);
-                }
+            if let Some(property) = self.property(candidate)
+                && matches!(property.kind, ScalarKind::Text)
+                && !property.list
+            {
+                return Some(&property.name);
             }
         }
         self.key.as_deref()
@@ -167,8 +168,9 @@ impl SchemaModel {
                         _ => None,
                     })
                     .collect();
-                let properties: Vec<Property> =
+                let mut properties: Vec<Property> =
                     node.properties.iter().map(|p| property(p, &keys)).collect();
+                in_declared_order(&file, &node.name, &mut properties);
                 let key = properties.iter().find(|p| p.is_key).map(|p| p.name.clone());
                 NodeType {
                     name: node.name.clone(),
@@ -180,12 +182,17 @@ impl SchemaModel {
         let edges = shape
             .edges
             .iter()
-            .map(|edge| EdgeType {
-                name: edge.name.clone(),
-                from: edge.from_type.clone(),
-                to: edge.to_type.clone(),
-                at_most_one: edge.cardinality.max == Some(1),
-                properties: edge.properties.iter().map(|p| property(p, &[])).collect(),
+            .map(|edge| {
+                let mut properties: Vec<Property> =
+                    edge.properties.iter().map(|p| property(p, &[])).collect();
+                in_declared_order(&file, &edge.name, &mut properties);
+                EdgeType {
+                    name: edge.name.clone(),
+                    from: edge.from_type.clone(),
+                    to: edge.to_type.clone(),
+                    at_most_one: edge.cardinality.max == Some(1),
+                    properties,
+                }
             })
             .collect();
         Ok(Self {
@@ -227,6 +234,39 @@ impl SchemaModel {
         }
         groups
     }
+}
+
+/// The compiled shape lists properties by name; tables and forms show them as the `.pg` file
+/// declares them. Properties a type inherits from an interface follow its own, in the
+/// interface's order.
+fn in_declared_order(file: &SchemaFile, type_name: &str, properties: &mut [Property]) {
+    let mut declared: Vec<&str> = Vec::new();
+    let mut interfaces: Vec<&str> = Vec::new();
+    for decl in &file.declarations {
+        match decl {
+            SchemaDecl::Node(node) if node.name == type_name => {
+                declared.extend(node.properties.iter().map(|p| p.name.as_str()));
+                interfaces.extend(node.implements.iter().map(String::as_str));
+            }
+            SchemaDecl::Edge(edge) if edge.name == type_name => {
+                declared.extend(edge.properties.iter().map(|p| p.name.as_str()));
+            }
+            _ => {}
+        }
+    }
+    for decl in &file.declarations {
+        if let SchemaDecl::Interface(interface) = decl
+            && interfaces.contains(&interface.name.as_str())
+        {
+            declared.extend(interface.properties.iter().map(|p| p.name.as_str()));
+        }
+    }
+    properties.sort_by_key(|p| {
+        declared
+            .iter()
+            .position(|name| *name == p.name)
+            .unwrap_or(usize::MAX)
+    });
 }
 
 /// `WorksAt` → `worksAt`.
@@ -297,6 +337,27 @@ pub(crate) mod tests {
         let status = schema.node("Project").unwrap().property("status").unwrap();
         assert_eq!(status.enum_values.as_deref().unwrap().len(), 3);
         assert_eq!(status.param_type(false), "String");
+    }
+
+    #[test]
+    fn properties_keep_their_declared_order() {
+        let schema = dev();
+        let names: Vec<_> = schema
+            .node("Person")
+            .unwrap()
+            .properties
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, ["slug", "name", "title", "email", "born", "tags"]);
+        let edge: Vec<_> = schema
+            .edge("WorksAt")
+            .unwrap()
+            .properties
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(edge, ["role", "since"]);
     }
 
     #[test]

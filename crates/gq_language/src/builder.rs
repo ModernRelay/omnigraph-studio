@@ -7,7 +7,8 @@
 use serde_json::{Map, Value};
 
 use crate::schema::{
-    Direction, NodeType, Property, RelationshipGroup, SchemaModel, traversal_name,
+    Direction, EdgeType, NodeType, Property, RelationshipGroup, ScalarKind, SchemaModel,
+    traversal_name,
 };
 
 /// A generated query: GQ source and the parameters to send with it.
@@ -59,6 +60,39 @@ impl FilterOp {
 
     pub fn takes_value(self) -> bool {
         !matches!(self, FilterOp::IsEmpty | FilterOp::IsNotEmpty)
+    }
+
+    /// The comparisons a property supports, in menu order. Lists take membership only (the
+    /// engine refuses list equality); `is empty` needs a nullable property.
+    pub fn for_property(property: &Property) -> Vec<FilterOp> {
+        let mut ops = if property.list {
+            vec![FilterOp::Contains]
+        } else {
+            match property.kind {
+                ScalarKind::Text if property.enum_values.is_none() => {
+                    vec![FilterOp::Eq, FilterOp::Ne, FilterOp::Contains]
+                }
+                ScalarKind::Text | ScalarKind::Bool => vec![FilterOp::Eq, FilterOp::Ne],
+                ScalarKind::Integer
+                | ScalarKind::Float
+                | ScalarKind::Date
+                | ScalarKind::DateTime => {
+                    vec![
+                        FilterOp::Eq,
+                        FilterOp::Ne,
+                        FilterOp::Lt,
+                        FilterOp::Le,
+                        FilterOp::Gt,
+                        FilterOp::Ge,
+                    ]
+                }
+                ScalarKind::Vector | ScalarKind::Blob => Vec::new(),
+            }
+        };
+        if property.nullable && property.projectable() {
+            ops.extend([FilterOp::IsEmpty, FilterOp::IsNotEmpty]);
+        }
+        ops
     }
 }
 
@@ -132,24 +166,37 @@ impl Params {
 }
 
 fn filter_clauses(
-    node: &NodeType,
+    type_name: &str,
+    properties: &[Property],
     var: &str,
     filters: &[Filter],
     params: &mut Params,
 ) -> Result<Vec<String>, BuildError> {
     let mut clauses = Vec::new();
     for (i, filter) in filters.iter().enumerate() {
-        let property = property(node, &filter.property)?;
+        let property = properties
+            .iter()
+            .find(|p| p.name == filter.property)
+            .ok_or_else(|| BuildError::UnknownProperty {
+                type_name: type_name.to_owned(),
+                property: filter.property.clone(),
+            })?;
         let target = format!("${var}.{}", property.name);
         let clause = match filter.op {
             FilterOp::IsEmpty => format!("{target} is null"),
             FilterOp::IsNotEmpty => format!("{target} is not null"),
             op => {
-                let param = params.add(
-                    &format!("f{i}"),
-                    &property.param_type(false),
-                    filter.value.clone(),
-                );
+                // A list is filtered by membership, so its value is one element.
+                let ty = if property.list {
+                    Property {
+                        list: false,
+                        ..property.clone()
+                    }
+                    .param_type(false)
+                } else {
+                    property.param_type(false)
+                };
+                let param = params.add(&format!("f{i}"), &ty, filter.value.clone());
                 let operator = match op {
                     FilterOp::Eq => "=",
                     FilterOp::Ne => "!=",
@@ -185,7 +232,13 @@ pub fn node_page(
         Value::String(after.unwrap_or("").to_owned()),
     );
     let mut clauses = vec![format!("$n: {}", node.name), format!("$n.@id > {after}")];
-    clauses.extend(filter_clauses(node, "n", filters, &mut params)?);
+    clauses.extend(filter_clauses(
+        &node.name,
+        &node.properties,
+        "n",
+        filters,
+        &mut params,
+    )?);
     let text = format!(
         "query studio_page({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ $n }}\n  order {{ $n.@id asc }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
@@ -207,7 +260,13 @@ pub fn node_count(
     let node = node(schema, type_name)?;
     let mut params = Params::new();
     let mut clauses = vec![format!("$n: {}", node.name)];
-    clauses.extend(filter_clauses(node, "n", filters, &mut params)?);
+    clauses.extend(filter_clauses(
+        &node.name,
+        &node.properties,
+        "n",
+        filters,
+        &mut params,
+    )?);
     let text = format!(
         "query studio_count({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ count($n) as n }}\n}}\n",
         sig = params.signature(),
@@ -215,6 +274,125 @@ pub fn node_count(
     );
     Ok(BuiltQuery {
         name: "studio_count".into(),
+        text,
+        params: params.values,
+    })
+}
+
+/// One node by `@id`, at most one row (spec 004: re-reading a row after a conflicting edit, and
+/// the peek of a node opened by id).
+pub fn node_by_id(
+    schema: &SchemaModel,
+    type_name: &str,
+    id: &str,
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, type_name)?;
+    let mut params = Params::new();
+    let id = params.add("id", "String", Value::String(id.to_owned()));
+    let text = format!(
+        "query studio_node({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n  }}\n  return {{ $n }}\n  limit 1\n}}\n",
+        sig = params.signature(),
+        ty = node.name,
+    );
+    Ok(BuiltQuery {
+        name: "studio_node".into(),
+        text,
+        params: params.values,
+    })
+}
+
+fn edge<'a>(schema: &'a SchemaModel, name: &str) -> Result<&'a EdgeType, BuildError> {
+    schema
+        .edge(name)
+        .ok_or_else(|| BuildError::UnknownEdge(name.to_owned()))
+}
+
+/// The column an edge property is returned under by [`edge_page`].
+pub fn edge_property_column(property: &str) -> String {
+    format!("e_{property}")
+}
+
+/// One page of an edge type, keyset-paged by the edge's `@id` (spec 004). Columns: `edge_id`,
+/// `from_id`, `to_id`, then `e_<property>` for each projectable edge property. The engine needs
+/// a typed source binding to traverse, so the source is bound to the edge's `from` type.
+pub fn edge_page(
+    schema: &SchemaModel,
+    edge_name: &str,
+    filters: &[Filter],
+    after: Option<&str>,
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
+    let edge = edge(schema, edge_name)?;
+    let mut params = Params::new();
+    let after = params.add(
+        "after",
+        "String",
+        Value::String(after.unwrap_or("").to_owned()),
+    );
+    let mut clauses = vec![
+        format!("$a: {}", edge.from),
+        format!("$a $e:{} $b", edge.traversal()),
+        format!("$e.@id > {after}"),
+    ];
+    clauses.extend(filter_clauses(
+        &edge.name,
+        &edge.properties,
+        "e",
+        filters,
+        &mut params,
+    )?);
+    let mut columns = vec![
+        "$e.@id as edge_id".to_owned(),
+        "$a.@id as from_id".to_owned(),
+        "$b.@id as to_id".to_owned(),
+    ];
+    for property in edge.properties.iter().filter(|p| p.projectable()) {
+        columns.push(format!(
+            "$e.{} as {}",
+            property.name,
+            edge_property_column(&property.name)
+        ));
+    }
+    let text = format!(
+        "query studio_edge_page({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ {columns} }}\n  order {{ $e.@id asc }}\n  limit {limit}\n}}\n",
+        sig = params.signature(),
+        clauses = clauses.join("\n    "),
+        columns = columns.join(", "),
+    );
+    Ok(BuiltQuery {
+        name: "studio_edge_page".into(),
+        text,
+        params: params.values,
+    })
+}
+
+/// How many edges of a type match the filters. An edge binding cannot be counted bare, so this
+/// counts its `@id`.
+pub fn edge_count(
+    schema: &SchemaModel,
+    edge_name: &str,
+    filters: &[Filter],
+) -> Result<BuiltQuery, BuildError> {
+    let edge = edge(schema, edge_name)?;
+    let mut params = Params::new();
+    let mut clauses = vec![
+        format!("$a: {}", edge.from),
+        format!("$a $e:{} $b", edge.traversal()),
+    ];
+    clauses.extend(filter_clauses(
+        &edge.name,
+        &edge.properties,
+        "e",
+        filters,
+        &mut params,
+    )?);
+    let text = format!(
+        "query studio_edge_count({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ count($e.@id) as n }}\n}}\n",
+        sig = params.signature(),
+        clauses = clauses.join("\n    "),
+    );
+    Ok(BuiltQuery {
+        name: "studio_edge_count".into(),
         text,
         params: params.values,
     })
@@ -564,6 +742,88 @@ mod tests {
         assert_compiles(&page);
         assert_eq!(page.params["after"], json!("person-000010"));
         assert_compiles(&node_count(&schema, "Person", &filters).unwrap());
+    }
+
+    #[test]
+    fn list_filters_take_one_element() {
+        let schema = dev();
+        let tags = schema.node("Person").unwrap().property("tags").unwrap();
+        assert_eq!(
+            FilterOp::for_property(tags),
+            vec![FilterOp::Contains, FilterOp::IsEmpty, FilterOp::IsNotEmpty]
+        );
+        let filters = [Filter {
+            property: "tags".into(),
+            op: FilterOp::Contains,
+            value: json!("graphs"),
+        }];
+        let page = node_page(&schema, "Person", &filters, None, 100).unwrap();
+        assert!(page.text.contains("$f0: String"), "{}", page.text);
+        assert_compiles(&page);
+        assert_compiles(&node_count(&schema, "Person", &filters).unwrap());
+    }
+
+    #[test]
+    fn every_offered_filter_op_compiles() {
+        let schema = dev();
+        for node in &schema.nodes {
+            for property in node.properties.iter().filter(|p| p.projectable()) {
+                for op in FilterOp::for_property(property) {
+                    let value = match property.kind {
+                        crate::ScalarKind::Integer => json!(1),
+                        crate::ScalarKind::Float => json!(1.5),
+                        crate::ScalarKind::Bool => json!(true),
+                        crate::ScalarKind::Date => json!("2020-01-01"),
+                        _ => json!("x"),
+                    };
+                    let filters = [Filter {
+                        property: property.name.clone(),
+                        op,
+                        value,
+                    }];
+                    assert_compiles(&node_page(&schema, &node.name, &filters, None, 10).unwrap());
+                }
+            }
+        }
+        let name = schema.node("Person").unwrap().property("name").unwrap();
+        assert!(!FilterOp::for_property(name).contains(&FilterOp::IsEmpty));
+    }
+
+    #[test]
+    fn node_by_id_compiles() {
+        let schema = dev();
+        let query = node_by_id(&schema, "Person", "person-000000").unwrap();
+        assert_compiles(&query);
+        assert_eq!(query.params["id"], json!("person-000000"));
+    }
+
+    #[test]
+    fn edge_pages_and_counts_compile() {
+        let schema = dev();
+        for edge in &schema.edges {
+            assert_compiles(&edge_page(&schema, &edge.name, &[], None, 100).unwrap());
+            assert_compiles(&edge_count(&schema, &edge.name, &[]).unwrap());
+        }
+        let filters = [
+            Filter {
+                property: "role".into(),
+                op: FilterOp::Eq,
+                value: json!("lead"),
+            },
+            Filter {
+                property: "since".into(),
+                op: FilterOp::IsNotEmpty,
+                value: Value::Null,
+            },
+        ];
+        let page = edge_page(&schema, "WorksAt", &filters, Some("01J"), 50).unwrap();
+        assert_compiles(&page);
+        assert!(page.text.contains("$e.role as e_role"), "{}", page.text);
+        assert_compiles(&edge_count(&schema, "WorksAt", &filters).unwrap());
+        assert!(matches!(
+            edge_page(&schema, "Nope", &[], None, 1),
+            Err(BuildError::UnknownEdge(_))
+        ));
     }
 
     #[test]
