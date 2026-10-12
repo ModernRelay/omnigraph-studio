@@ -74,6 +74,10 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   listed under the editor (code, message, fix, line:column; a click moves the cursor there).
   A type error the compiler reports without a position is placed on the last name its message
   quotes.
+- The toolbar's snapshot picker reads "Head of <branch>" or "Read only · <commit>": the head,
+  or one of the branch's 15 latest commits (short id, age, actor), read when the tab opens and
+  when the branch changes. A commit pins reads (`QueryRequest.snapshot`) and refuses writes;
+  the head unpins.
 - Hover goes through Zed's `SemanticsProvider` (`query_editor::hover`), the rest of which
   answers that it has nothing, with `gq_language::hover`: `$p: Person · node`, `$name: String
   · parameter`, `Person.born: Date?`, `node Person · 6 properties`, `worksAt: Person →
@@ -103,8 +107,6 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 - Run buttons in the gutter and inline short results; hovering a plan operator to
   highlight its part of the query.
-- The snapshot picker (run a read at a past commit). `QueryRequest.snapshot` is there; the editor
-  sends the branch today.
 - Tree-sitter highlighting, folding and outline (`grammars/tree-sitter-gq`).
 - A row cap: the result shows every row the server returns, so the query's own `limit` is the
   cap today (constitution IX). The example query carries `limit 50`.
@@ -131,6 +133,7 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 | 2026-10-12 | A refused read shows the server's diagnostic | `ApiErrorSummary.diagnostic` from `ErrorOutput.diagnostic`; an offscreen snapshot running `return { $p.nope }` | "T6 · type `Person` has no property `nope`" under the refusal, as writes show it; it jumps to the text when the diagnostic has a position |
 | 2026-10-12 | Quick fixes | `gq_language` `a_missing_parameter_list_comes_with_its_edit`; offscreen snapshot of `query people {` with the problems list's Fix clicked | Q002 carries its `()` edit; Fix applied it, the problem cleared and the columns showed. At 0.13 this is the one suggestion the compiler makes; any other `Suggestion` gets the same button, applied only while the text is the one checked |
 | 2026-10-12 | Hover types | `gq_language` `hovers_name_types`; an offscreen snapshot with the new `hover:` step resting on `$p` | "$p: Person · node" in Zed's hover popover, the token highlighted |
+| 2026-10-12 | Snapshot picker | offscreen snapshots: the picker on a new query, the older of main's two commits chosen, Run | The tab and picker named the commit; the read ran "on commit EPD69MJ0" and returned no rows, that commit being before the seed load |
 | 2026-10-12 | Run loop end to end | offscreen snapshots against the dev server: example query, run, explain, parameters, confirm bar, committed and refused writes, a parse error underline, completion | As described under What landed |
 
 ## Corrections

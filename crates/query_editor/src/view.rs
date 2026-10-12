@@ -27,7 +27,7 @@ use studio_ui::{
 };
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
-use ui::{KeyBinding, Tooltip};
+use ui::{ContextMenu, KeyBinding, PopoverMenu, Tooltip};
 
 use crate::analysis::Analysis;
 use crate::completion::GqCompletionProvider;
@@ -193,6 +193,9 @@ impl Failure {
     }
 }
 
+/// How many of the branch's latest commits the snapshot picker offers.
+const PICKER_COMMITS: usize = 15;
+
 static NEXT_NUMBER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
 /// The next tab number: "Query 1", "Query 2", ….
@@ -207,6 +210,9 @@ pub struct QueryEditor {
     path: Option<std::path::PathBuf>,
     saved_text: Option<String>,
     file_error: Option<String>,
+    /// The branch's latest commits, for the snapshot picker: id, Unix micros, actor.
+    commits: Vec<(String, i64, Option<String>)>,
+    commits_task: Option<Task<()>>,
     /// Reads run at this commit and writes are refused (spec 009); `None` uses the branch.
     at_commit: Option<String>,
     editor: Entity<Editor>,
@@ -324,7 +330,10 @@ impl QueryEditor {
                         this.set_example(window, cx);
                         this.schedule_check(window, cx);
                     }
-                    SessionEvent::BranchChanged => cx.notify(),
+                    SessionEvent::BranchChanged => {
+                        this.load_commits(cx);
+                        cx.notify()
+                    }
                     _ => {}
                 },
             ),
@@ -335,6 +344,8 @@ impl QueryEditor {
             path: None,
             saved_text: None,
             file_error: None,
+            commits: Vec::new(),
+            commits_task: None,
             at_commit: None,
             editor,
             analysis: None,
@@ -353,7 +364,125 @@ impl QueryEditor {
             _subscriptions: subscriptions,
         };
         this.set_example(window, cx);
+        this.load_commits(cx);
         this
+    }
+
+    /// Reads the branch's latest commits for the snapshot picker.
+    fn load_commits(&mut self, cx: &mut Context<Self>) {
+        let session = self.session.read(cx);
+        let (client, graph, branch) = (
+            session.client(cx),
+            session.graph_id.clone(),
+            session.branch.clone(),
+        );
+        self.commits_task = Some(cx.spawn(async move |this, cx| {
+            let Ok(list) = client.commits(&graph, &branch).await else {
+                return;
+            };
+            let mut commits: Vec<(String, i64, Option<String>)> = list
+                .commits
+                .into_iter()
+                .map(|c| (c.graph_commit_id, c.created_at, c.actor_id))
+                .collect();
+            commits.sort_by(|a, b| b.1.cmp(&a.1));
+            commits.truncate(PICKER_COMMITS);
+            this.update(cx, |this, cx| {
+                this.commits = commits;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Reads at the branch head again, and writes are allowed again.
+    fn unpin(&mut self, cx: &mut Context<Self>) {
+        if self.at_commit.take().is_some() {
+            cx.emit(ItemEvent::UpdateTab);
+            cx.notify();
+        }
+    }
+
+    /// The toolbar's snapshot picker: the branch head, or one of its latest commits, read
+    /// only (spec 007).
+    fn render_snapshot_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let branch = self.branch(cx);
+        let pinned = self.at_commit.clone();
+        let commits = self.commits.clone();
+        let editor = cx.entity().downgrade();
+        let label = match &pinned {
+            Some(commit) => format!("Read only · {}", short_commit_id(commit)),
+            None => format!("Head of {branch}"),
+        };
+        PopoverMenu::new("snapshot-picker")
+            .trigger(
+                Button::new("snapshot-picker-button", label)
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::Small)
+                    .start_icon(
+                        Icon::new(if pinned.is_some() {
+                            IconName::GitCommit
+                        } else {
+                            IconName::GitBranch
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .end_icon(
+                        Icon::new(IconName::ChevronDown)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .tooltip(Tooltip::text(match &pinned {
+                        Some(commit) => {
+                            format!("Reads run at commit {commit}; writes are refused")
+                        }
+                        None => format!("Reads run at the head of {branch}"),
+                    })),
+            )
+            .menu(move |window, cx| {
+                let commits = commits.clone();
+                let pinned = pinned.clone();
+                let editor = editor.clone();
+                let branch = branch.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    let head_editor = editor.clone();
+                    menu = menu.toggleable_entry(
+                        format!("Head of {branch}"),
+                        pinned.is_none(),
+                        IconPosition::Start,
+                        None,
+                        move |_, cx| {
+                            head_editor.update(cx, |editor, cx| editor.unpin(cx)).ok();
+                        },
+                    );
+                    if !commits.is_empty() {
+                        menu = menu.separator().header("Read at a commit");
+                    }
+                    let now = studio_ui::now_micros();
+                    for (id, at, actor) in commits {
+                        let editor = editor.clone();
+                        let label = format!(
+                            "{} · {}{}",
+                            short_commit_id(&id),
+                            studio_ui::relative_time(at, now),
+                            actor.map(|a| format!(" · {a}")).unwrap_or_default()
+                        );
+                        let checked = pinned.as_deref() == Some(id.as_str());
+                        menu = menu.toggleable_entry(
+                            label,
+                            checked,
+                            IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                let id = id.clone();
+                                editor.update(cx, |editor, cx| editor.pin_to(id, cx)).ok();
+                            },
+                        );
+                    }
+                    menu
+                }))
+            })
     }
 
     /// Pins reads to a commit and refuses writes, for a query opened from History.
@@ -1004,26 +1133,11 @@ impl QueryEditor {
             _ => (String::new(), false),
         };
         let busy = self.writing;
-        let pinned = self.at_commit.clone();
         let file_error = self.file_error.clone();
         studio_ui::ds::toolbar(cx)
             .px_2()
             .when_some(file_error, |toolbar, error| {
                 toolbar.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
-            })
-            .when_some(pinned, |toolbar, commit| {
-                toolbar.child(
-                    div()
-                        .id("read-only-commit")
-                        .tooltip(Tooltip::text(format!(
-                            "Reads run at commit {commit}; writes are refused"
-                        )))
-                        .child(studio_ui::ds::meta_code(
-                            IconName::GitCommit,
-                            format!("Read only · {}", short_commit_id(&commit)),
-                            cx,
-                        )),
-                )
             })
             .child(
                 Button::new("run", "Run")
@@ -1069,6 +1183,7 @@ impl QueryEditor {
                         cx.listener(|this, _, window, cx| this.explain(&Explain, window, cx)),
                     ),
             )
+            .child(self.render_snapshot_picker(cx))
             .child(div().flex_1())
             .when(!summary.is_empty(), |d| {
                 d.child(Label::new(summary).size(LabelSize::Small).color(if writes {
