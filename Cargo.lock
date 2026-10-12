@@ -187,6 +187,7 @@ dependencies = [
  "gq_language",
  "graph_client",
  "graph_store",
+ "markdown",
  "serde_json",
  "smol",
  "studio_actions",

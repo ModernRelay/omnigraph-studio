@@ -1,6 +1,7 @@
 //! The agent panel's view and state: the thread, approval cards, the composer, and the tools
 //! run on the person's session.
 
+use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1::{
@@ -146,6 +147,9 @@ struct Host {
 
 pub struct AgentPanel {
     session: Entity<GraphSession>,
+    /// The agent's replies as rendered markdown, by entry index, with how much of the text each
+    /// has taken in; a streaming reply appends its new tail.
+    markdown: std::collections::HashMap<usize, (Entity<Markdown>, usize)>,
     focus_handle: FocusHandle,
     composer: Entity<Editor>,
     custom_command: Entity<Editor>,
@@ -289,6 +293,7 @@ impl AgentPanel {
             scroll: ScrollHandle::new(),
             state: State::Setup,
             entries: Vec::new(),
+            markdown: std::collections::HashMap::new(),
             branch: None,
             always_allow: false,
             host: None,
@@ -1095,7 +1100,10 @@ impl Render for AgentPanel {
         let editor_bg = cx.theme().colors().editor_background;
         let body = match &self.state {
             State::Setup => self.render_setup(cx).into_any_element(),
-            _ => self.render_thread(window, cx).into_any_element(),
+            _ => {
+                self.sync_markdown(cx);
+                self.render_thread(window, cx).into_any_element()
+            }
         };
         let banner = self.render_branch_banner(cx);
         let (graph, branch) = {
@@ -1263,7 +1271,31 @@ impl AgentPanel {
             )
     }
 
-    fn render_thread(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Brings each agent reply's markdown up to its text: new replies get an entity, a growing
+    /// one appends what streamed in since.
+    fn sync_markdown(&mut self, cx: &mut Context<Self>) {
+        self.markdown
+            .retain(|index, _| matches!(self.entries.get(*index), Some(Entry::Agent(_))));
+        for (index, entry) in self.entries.iter().enumerate() {
+            let Entry::Agent(text) = entry else { continue };
+            match self.markdown.get_mut(&index) {
+                Some((markdown, taken)) if text.len() >= *taken => {
+                    if text.len() > *taken {
+                        let tail = text[*taken..].to_owned();
+                        markdown.update(cx, |markdown, cx| markdown.append(&tail, cx));
+                        *taken = text.len();
+                    }
+                }
+                _ => {
+                    let source: SharedString = text.clone().into();
+                    let markdown = cx.new(|cx| Markdown::new(source, None, None, cx));
+                    self.markdown.insert(index, (markdown, text.len()));
+                }
+            }
+        }
+    }
+
+    fn render_thread(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut thread = v_flex()
             .id("agent-thread")
             .track_scroll(&self.scroll)
@@ -1283,7 +1315,7 @@ impl AgentPanel {
                 .into_any_element();
         }
         for (index, entry) in self.entries.iter().enumerate() {
-            thread = thread.child(self.render_entry(index, entry, cx));
+            thread = thread.child(self.render_entry(index, entry, window, cx));
         }
         if let State::Exited { message, stderr } = &self.state {
             let mut callout = Callout::new()
@@ -1298,7 +1330,13 @@ impl AgentPanel {
         thread.into_any_element()
     }
 
-    fn render_entry(&self, index: usize, entry: &Entry, cx: &mut Context<Self>) -> AnyElement {
+    fn render_entry(
+        &self,
+        index: usize,
+        entry: &Entry,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let text_muted = cx.theme().colors().text_muted;
         match entry {
             Entry::User(text) => gutter_row(
@@ -1316,7 +1354,20 @@ impl AgentPanel {
                         .size(IconSize::Small)
                         .color(Color::Muted),
                 ),
-                div().text_sm().child(text.trim().to_owned()),
+                match self.markdown.get(&index) {
+                    // Zed's markdown, as Zed's agent panel renders a reply.
+                    Some((markdown, _)) => div()
+                        .text_sm()
+                        .child(MarkdownElement::new(
+                            markdown.clone(),
+                            MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                        ))
+                        .into_any_element(),
+                    None => div()
+                        .text_sm()
+                        .child(text.trim().to_owned())
+                        .into_any_element(),
+                },
             )
             .into_any_element(),
             Entry::Thought(text) => gutter_row(

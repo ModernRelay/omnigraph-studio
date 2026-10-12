@@ -168,7 +168,6 @@ Query text, parameters, rows, tokens and prompt text. Agent stderr is shown only
 ## Deferred
 
 - Windows: the proxy uses Unix sockets. Windows support waits for a named-pipe transport.
-- Markdown rendering of agent text (Zed's `markdown` crate is a fork candidate, spec 002).
 - Agent-attributed commits: commits are recorded under the person's actor. Recording "on
   behalf of an agent" needs an engine change, E20 in `docs/deferred-engine-changes.md`.
 - Resuming an earlier agent session (`session/load`).
@@ -185,6 +184,7 @@ Query text, parameters, rows, tokens and prompt text. Agent stderr is shown only
 | 2026-10-12 | An approved change lands only on the agent's branch | Same, then `studio_agent::Allow`; `GET /branches`; read `person-000000`'s title on both branches | `agent/20261012-084228` created from `main`; committed there; `main` still reads "Chief Scientist", the agent branch "Retitled by the test agent" |
 | 2026-10-12 | A rejected change creates nothing | Same, then `studio_agent::Reject`; `GET /branches` | Card "Rejected.", the agent got "The person rejected this change.", no new branch |
 | 2026-10-12 | Key bindings reach the panel | Read every ⌘↩, ⌘Y, ⌘⌥Y, ⌘⌥N, ⌘. and ⌘⇧. binding in Zed's `default-macos.json` at `v1.23.2` | As in Actions above; ⌘. collides, ⌘⇧. is free |
+| 2026-10-12 | Agent replies render as markdown | the test agent answering "summarize people as markdown" with bold, a list, inline code and a code block; an offscreen snapshot | Zed's `markdown` crate (`Markdown::new`, not `new_text`, which parses links only) with `MarkdownStyle::themed(Agent)`; a streaming reply appends its new tail to the parsed text |
 
 ## Corrections
 
