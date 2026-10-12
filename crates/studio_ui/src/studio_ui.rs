@@ -148,8 +148,55 @@ pub fn empty_state(title: impl Into<SharedString>, detail: Option<SharedString>)
 
 /// A small colored square for a node or edge type.
 pub fn type_swatch(type_name: &str) -> Div {
+    type_mark(type_name, type_name)
+}
+
+/// A node type's tinted mark, or for a relationship a neutral arrow: in Tower a relationship is
+/// a line, not a thing, so only node types carry a colour.
+pub fn kind_swatch(type_name: &str, is_edge: bool) -> Div {
+    if is_edge {
+        div()
+            .size(px(16.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                Icon::new(IconName::ArrowRight)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+    } else {
+        type_swatch(type_name)
+    }
+}
+
+/// Tower's type mark: the initial of `label` (a node's label, or the type's name) in white on
+/// the type's tint, a 16-pixel rounded square. The tint says what kind of thing it is, the
+/// letter which one.
+pub fn type_mark(type_name: &str, label: &str) -> Div {
     let color: Hsla = type_color(type_name);
-    div().size(px(8.)).flex_none().rounded_sm().bg(color)
+    let initial = label
+        .trim()
+        .chars()
+        .next()
+        .or_else(|| type_name.chars().next())
+        .unwrap_or('?')
+        .to_uppercase()
+        .collect::<String>();
+    div()
+        .size(px(16.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .bg(color)
+        .text_color(gpui::white())
+        .text_size(px(9.))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .line_height(px(9.))
+        .child(initial)
 }
 
 #[cfg(test)]

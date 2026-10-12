@@ -844,7 +844,7 @@ impl ReviewView {
                 .children(data.counts.iter().map(|count| {
                     h_flex()
                         .gap_1p5()
-                        .child(type_swatch(&count.type_name))
+                        .child(studio_ui::kind_swatch(&count.type_name, count.is_edge))
                         .child(Label::new(count.type_name.clone()).size(LabelSize::Small))
                         .child(change_counts(count.added, count.changed, count.removed))
                 }))

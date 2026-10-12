@@ -146,7 +146,7 @@ impl Render for TypesList {
             };
             list = list.child(
                 studio_ui::ds::SidebarRow::new(("type", index), name.clone())
-                    .start(studio_ui::type_swatch(&name))
+                    .start(studio_ui::kind_swatch(&name, is_edge))
                     .end(studio_ui::ds::sidebar_count(count))
                     .muted(is_edge)
                     .selected(selected)

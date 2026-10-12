@@ -310,7 +310,7 @@ pub fn change_group_header(
         .gap_2()
         .pt_3()
         .pb_1()
-        .child(type_swatch(type_name))
+        .child(crate::kind_swatch(type_name, is_edge))
         .child(Label::new(type_name.to_owned()).size(LabelSize::Small))
         .child(
             Label::new(if is_edge { "relationship" } else { "node" })

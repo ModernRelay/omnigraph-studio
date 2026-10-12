@@ -14,7 +14,7 @@ use graph_store::{
 use studio_actions::graph::{OpenCommit, OpenQueryAt, OpenType};
 use studio_ui::{
     ChangeCard, ChangeKind, CopyableValue, PropertyRow, change_counts, change_group_header,
-    empty_state, now_micros, relative_time, short_commit_id, type_swatch, utc_date_time,
+    empty_state, now_micros, relative_time, short_commit_id, utc_date_time,
 };
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
@@ -352,7 +352,7 @@ impl CommitView {
                     .children(self.counts.iter().map(|count| {
                         h_flex()
                             .gap_1p5()
-                            .child(type_swatch(&count.type_name))
+                            .child(studio_ui::kind_swatch(&count.type_name, count.is_edge))
                             .child(Label::new(count.type_name.clone()).size(LabelSize::Small))
                             .child(change_counts(count.added, count.changed, count.removed))
                     })),

@@ -11,7 +11,7 @@ use graph_client::api::{
     EntityKind, GraphInfo, GraphListResponse, ReadinessOutput, SnapshotOutput,
 };
 use graph_store::{GraphSession, Loadable};
-use studio_ui::{CopyableValue, type_swatch};
+use studio_ui::CopyableValue;
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 
@@ -278,7 +278,10 @@ impl StorageInspector {
                                 .w(px(150.))
                                 .flex_none()
                                 .gap_1p5()
-                                .child(type_swatch(&dataset.type_name))
+                                .child(studio_ui::kind_swatch(
+                                    &dataset.type_name,
+                                    dataset.entity_kind == graph_client::api::EntityKind::Edge,
+                                ))
                                 .child(
                                     CopyableValue::new(
                                         ("type", ix),

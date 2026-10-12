@@ -80,6 +80,17 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   of neighbours.
 - **Mode.** "Schema" and "Exploration" toggle in the canvas; the schema view never clears the
   shared exploration.
+- **Look (2026-10-12), after Tower's explore canvas** (`apps/console` `chip-canvas.tsx`,
+  `ontology-graph.tsx`, `subgraph-graph.tsx`): every type, node, hub and "+K more" is a chip,
+  a white pill with a hairline and a soft contact shadow, with Tower's letter mark (the label's
+  initial in white on one of Tower's eight muted tints, chosen by the same hash) and a muted
+  count; lines are 1-pixel greys (schema 15%, a pointed type's 40% and the rest 5%; hub lines
+  20% and dotted while the hub is closed); pointing at a chip fades what it does not reach to
+  30%; the selection carries Tower's warm ring; a faint dot grid lies behind; a schema with up
+  to 16 relationships labels every line. Chips grow with the view to their size at zoom 1 and
+  become marks alone from afar. Overlay: the mode switch, a "Search nodes…" pill (⌘P) and the
+  zoom controls on top, the caption bottom left. Colour is kept to node types: relationships
+  show a neutral arrow wherever a type is listed.
 - **Keys:** ←↑→↓ (`canvas::MoveLeft` …, nearest node in a 45° cone, `along + 2 × across`),
   `0`, `=`/`+`, `-`, ↵ expand, ⌫ collapse. Space peek, F focus and `[`/`]` are not built.
   Bindings are registered in `graph_canvas::init`; they still need entries in

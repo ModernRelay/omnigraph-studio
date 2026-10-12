@@ -468,7 +468,9 @@ impl CommandPalette {
                     }),
                 };
                 let start: Option<gpui::Div> = match row {
-                    Row::Type { .. } => Some(studio_ui::type_swatch(&candidate.label)),
+                    Row::Type { kind, .. } => {
+                        Some(studio_ui::kind_swatch(&candidate.label, *kind == "edge"))
+                    }
                     Row::Node { type_name, .. } => Some(studio_ui::type_swatch(type_name)),
                     Row::Branch { current, .. } => Some(
                         div().child(

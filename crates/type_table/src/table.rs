@@ -1609,7 +1609,10 @@ impl TypeTable {
             format!("Edits, inserts and deletes here commit to {}", self.branch)
         };
         studio_ui::ds::toolbar(cx)
-            .child(studio_ui::type_swatch(&self.type_name))
+            .child(studio_ui::kind_swatch(
+                &self.type_name,
+                self.kind == TableKind::Edge,
+            ))
             .child(
                 Label::new(self.type_name.clone())
                     .size(LabelSize::Default)

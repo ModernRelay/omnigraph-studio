@@ -10,17 +10,17 @@
 
 mod layout;
 mod model;
+mod paint;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext as _, BorderStyle, Bounds, ContentMask, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathBuilder, PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Subscription,
-    Task, TextAlign, TextRun, Window, canvas, point, px, quad, size,
+    App, AppContext as _, Bounds, ContentMask, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels,
+    Point, Render, ScrollWheelEvent, SharedString, Subscription, Task, Window, canvas, point, px,
 };
 use graph_store::{
     Exploration, ExplorationEvent, ExplorePath, GraphSession, GroupKey, Loadable, NodeRef,
@@ -33,7 +33,7 @@ use studio_actions::canvas::{
 use studio_actions::graph::{
     OpenCanvas, OpenNode, OpenType, PeekNode, ShowNodeOnCanvas, ShowResultsOnCanvas,
 };
-use studio_ui::{empty_state, type_color};
+use studio_ui::empty_state;
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::Tooltip;
 use ui::prelude::*;
@@ -42,11 +42,8 @@ use layout::{LayoutKind, LayoutNode, Vec2};
 use model::{HUB_STEP, NODE_CAP, Scene, SceneId, SceneKind};
 
 /// Labels of graph nodes show from this zoom up; hubs from a little further out.
-const NODE_LABEL_ZOOM: f32 = 0.6;
-const HUB_LABEL_ZOOM: f32 = 0.45;
 const MAX_ZOOM: f32 = 2.;
 const ZOOM_STEP: f32 = 1.25;
-const LABEL_SIZE: f32 = 12.;
 
 /// Registers the canvas's keys and the actions that open it.
 pub fn init(cx: &mut App) {
@@ -150,6 +147,8 @@ pub struct GraphCanvas {
     hovered: Option<usize>,
     drag: Option<Drag>,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Each node's chip on screen as last painted, for hit testing.
+    chips: Rc<RefCell<Vec<Bounds<Pixels>>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -237,6 +236,7 @@ impl GraphCanvas {
             hovered: None,
             drag: None,
             bounds: Rc::new(Cell::new(None)),
+            chips: Rc::new(RefCell::new(Vec::new())),
             _subscriptions: subscriptions,
         };
         canvas.rebuild(cx);
@@ -342,7 +342,7 @@ impl GraphCanvas {
                             SceneKind::More { .. } => LayoutKind::More,
                             _ => LayoutKind::Node,
                         },
-                        space: layout_space(&node.kind, node.radius),
+                        space: layout_space(&node.kind, &node.label),
                         previous: self.known.get(&node.id).copied(),
                     })
                     .collect();
@@ -388,7 +388,7 @@ impl GraphCanvas {
             .map(|(i, node)| LayoutNode {
                 parent: node.parent,
                 kind: LayoutKind::Node,
-                space: layout_space(&node.kind, node.radius),
+                space: layout_space(&node.kind, &node.label),
                 previous: fixed[i],
             })
             .collect();
@@ -451,7 +451,7 @@ impl GraphCanvas {
     fn fit(&mut self, viewport: Bounds<Pixels>) {
         let scene = self.scene.clone();
         let Some((min, max)) = layout::extent(&self.positions, |index| {
-            layout_space(&scene.nodes[index].kind, scene.nodes[index].radius)
+            layout_space(&scene.nodes[index].kind, &scene.nodes[index].label)
         }) else {
             return;
         };
@@ -459,7 +459,8 @@ impl GraphCanvas {
         let height = f32::from(viewport.size.height).max(1.);
         let zoom = ((width - 80.) / (max.x - min.x).max(1.))
             .min((height - 120.) / (max.y - min.y).max(1.))
-            .clamp(0.05, 1.5);
+            // Tower's ontology never zooms a fit past 1.1.
+            .clamp(0.05, 1.1);
         self.zoom = zoom;
         self.fit_zoom = zoom;
         self.center = Vec2::new((min.x + max.x) / 2., (min.y + max.y) / 2.);
@@ -481,47 +482,19 @@ impl GraphCanvas {
         self.zoom = new_zoom;
     }
 
-    fn hit(&self, position: Point<Pixels>, window: &Window) -> Option<usize> {
-        let viewport = self.viewport(window);
-        let mut best: Option<(usize, f32)> = None;
-        for (index, node) in self.scene.nodes.iter().enumerate().rev() {
-            let Some(world) = self.positions.get(index) else {
-                continue;
-            };
-            let screen = to_screen(*world, viewport, self.center, self.zoom);
-            let dx = f32::from(position.x - screen.x);
-            let dy = f32::from(position.y - screen.y);
-            let radius = (node.radius * self.zoom).max(6.) + 3.;
-            let distance = (dx * dx + dy * dy).sqrt();
-            let on_label = match node.kind {
-                SceneKind::Hub { .. } | SceneKind::More { .. } if self.zoom >= HUB_LABEL_ZOOM => {
-                    let owner = match node.kind {
-                        SceneKind::Hub { .. } => node.parent.and_then(|parent| {
-                            let world = self.positions.get(parent)?;
-                            Some(to_screen(*world, viewport, self.center, self.zoom))
-                        }),
-                        _ => None,
-                    };
-                    let width = px(node.label.chars().count() as f32 * 7.);
-                    let line_height = px(LABEL_SIZE + 4.);
-                    let origin = Placement::Side {
-                        at: screen,
-                        owner,
-                        radius: (node.radius * self.zoom).max(3.),
-                    }
-                    .origin(width, line_height);
-                    Bounds::new(origin, size(width, line_height)).contains(&position)
-                }
-                _ => false,
-            };
-            if distance <= radius || on_label {
-                let score = if on_label { radius } else { distance };
-                if best.is_none_or(|(_, b)| score < b) {
-                    best = Some((index, score));
-                }
-            }
-        }
-        best.map(|(index, _)| index)
+    /// The node whose chip is under `position`, topmost first, by the chips as last painted.
+    fn hit(&self, position: Point<Pixels>, _window: &Window) -> Option<usize> {
+        let chips = self.chips.borrow();
+        chips
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(index, rect)| {
+                *index < self.scene.nodes.len()
+                    && rect.size.width > px(0.)
+                    && rect.dilate(px(3.)).contains(&position)
+            })
+            .map(|(index, _)| index)
     }
 
     // ---- interaction ----
@@ -806,16 +779,19 @@ impl GraphCanvas {
 
     // ---- painting ----
 
-    fn render_canvas(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_canvas(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let palette = Palette {
+        let palette = paint::Palette {
             text: colors.text,
             muted: colors.text_muted,
-            background: colors.editor_background,
-            selection: colors.border_focused,
-            hover: colors.border,
-            surface: colors.elevated_surface_background,
+            // Tower's chips are white cards in the light theme.
+            card: if cx.theme().appearance.is_light() {
+                gpui::white()
+            } else {
+                colors.elevated_surface_background
+            },
             border: colors.border_variant,
+            font: theme::theme_settings(cx).ui_font(cx).clone(),
         };
         let scene = self.scene.clone();
         let positions = self.positions.clone();
@@ -824,19 +800,72 @@ impl GraphCanvas {
         let selected = self.selected_index();
         let hovered = self.hovered;
         let bounds_cell = self.bounds.clone();
-        let _ = window;
+        let chips = self.chips.clone();
         canvas(
             move |bounds, _window, _cx| bounds_cell.set(Some(bounds)),
             move |bounds, (), window, cx| {
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
-                    paint_scene(
-                        &scene, &positions, bounds, center, zoom, selected, hovered, &palette,
-                        window, cx,
+                    let screen: Vec<Point<Pixels>> = positions
+                        .iter()
+                        .map(|world| to_screen(*world, bounds, center, zoom))
+                        .collect();
+                    paint::paint(
+                        &scene, &screen, bounds, zoom, selected, hovered, &palette, &chips, window,
+                        cx,
                     );
                 });
             },
         )
         .size_full()
+    }
+
+    /// Tower's caption, bottom left: what is drawn, and what a click does.
+    fn render_caption(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let text = match self.mode {
+            Mode::Schema => {
+                let schema = self.session.read(cx).schema_model();
+                let types = schema.as_ref().map_or(0, |s| s.nodes.len());
+                let edges = schema.as_ref().map_or(0, |s| s.edges.len());
+                format!(
+                    "{types} {} · {edges} {} · click a type to browse it",
+                    if types == 1 { "type" } else { "types" },
+                    if edges == 1 {
+                        "relationship"
+                    } else {
+                        "relationships"
+                    }
+                )
+            }
+            Mode::Explore | Mode::Results => {
+                let nodes = self
+                    .scene
+                    .nodes
+                    .iter()
+                    .filter(|n| matches!(n.kind, SceneKind::Node { .. }))
+                    .count();
+                format!(
+                    "{nodes} {} · click a relationship to open it · double-click a node to expand it",
+                    if nodes == 1 { "node" } else { "nodes" }
+                )
+            }
+        };
+        div()
+            .absolute()
+            .bottom_3()
+            .left_3()
+            .px_2p5()
+            .py_1()
+            .rounded_full()
+            .bg(if cx.theme().appearance.is_light() {
+                gpui::white()
+            } else {
+                colors.elevated_surface_background
+            })
+            .border_1()
+            .border_color(colors.border_variant)
+            .shadow(studio_ui::ds::elevation::float())
+            .child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted))
     }
 
     fn render_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -886,18 +915,26 @@ impl GraphCanvas {
             _ => None,
         };
         let capped = self.scene.capped.clone();
-        let surface = cx.theme().colors().elevated_surface_background;
+        // Tower's floating pills are white cards in the light theme, like its chips.
+        let surface = if cx.theme().appearance.is_light() {
+            gpui::white()
+        } else {
+            cx.theme().colors().elevated_surface_background
+        };
         let border = cx.theme().colors().border_variant;
+        // Tower's floating pills: round, a hairline, a soft float shadow.
         let panel = |id: &'static str| {
             h_flex()
                 .id(id)
-                .gap_1()
-                .p_1()
-                .rounded_md()
+                .h(px(32.))
+                .gap_0p5()
+                .px_1()
+                .items_center()
+                .rounded_full()
                 .bg(surface)
                 .border_1()
                 .border_color(border)
-                .shadow_sm()
+                .shadow(studio_ui::ds::elevation::float())
                 .occlude()
         };
         let mode = self.mode;
@@ -940,14 +977,16 @@ impl GraphCanvas {
                                             })),
                                     )
                             })
-                            .child(
-                                div().px_1().child(
-                                    Label::new(summary)
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .single_line(),
-                                ),
-                            ),
+                            .when(mode == Mode::Results, |panel| {
+                                panel.child(
+                                    div().px_2().child(
+                                        Label::new(summary.clone())
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .single_line(),
+                                    ),
+                                )
+                            }),
                     )
                     .when(newer && mode != Mode::Results, |d| {
                         d.child(
@@ -963,6 +1002,31 @@ impl GraphCanvas {
                             ),
                         )
                     })
+                    .child(div().flex_1())
+                    .child(
+                        panel("canvas-search")
+                            .px_3()
+                            .gap_2()
+                            .cursor_pointer()
+                            .child(
+                                Icon::new(IconName::MagnifyingGlass)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new("Search nodes…")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(ui::KeyBinding::for_action(
+                                &studio_actions::workspace::GoTo,
+                                cx,
+                            ))
+                            .on_click(|_, window, cx| {
+                                window
+                                    .dispatch_action(Box::new(studio_actions::workspace::GoTo), cx)
+                            }),
+                    )
                     .child(div().flex_1())
                     .child(
                         panel("canvas-zoom")
@@ -1070,13 +1134,17 @@ impl GraphCanvas {
     }
 }
 
-/// The room a node needs in layout: its shape plus its label.
-fn layout_space(kind: &SceneKind, radius: f32) -> f32 {
+/// The room a node needs in layout: about half its chip's width at zoom 1 (a mark, the label
+/// at about seven pixels a character, a count, and the padding).
+fn layout_space(kind: &SceneKind, label: &str) -> f32 {
+    let chars = label.chars().count().min(32) as f32;
     match kind {
-        SceneKind::Type { .. } => radius + 24.,
-        SceneKind::Node { .. } => radius + 24.,
-        SceneKind::Hub { .. } => 40.,
-        SceneKind::More { .. } => 30.,
+        SceneKind::Type { count } => {
+            let digits = count.map_or(0, |c| c.to_string().len()) as f32;
+            (46. + (chars + digits) * 7.) / 2.
+        }
+        SceneKind::Node { .. } => (46. + chars * 7.) / 2.,
+        SceneKind::Hub { .. } | SceneKind::More { .. } => (24. + chars * 6.6) / 2.,
     }
 }
 
@@ -1104,419 +1172,6 @@ fn to_world(screen: Point<Pixels>, viewport: Bounds<Pixels>, center: Vec2, zoom:
         center.x + f32::from(screen.x - middle.x) / zoom,
         center.y + f32::from(screen.y - middle.y) / zoom,
     )
-}
-
-struct Palette {
-    text: Hsla,
-    muted: Hsla,
-    background: Hsla,
-    selection: Hsla,
-    hover: Hsla,
-    surface: Hsla,
-    border: Hsla,
-}
-
-/// One straight edge on screen.
-type Segment = (Point<Pixels>, Point<Pixels>);
-
-/// Segments per path: GPUI caps one path near 65k vertices; a stroked segment is a few.
-const SEGMENTS_PER_PATH: usize = 2_000;
-
-#[allow(clippy::too_many_arguments)]
-fn paint_scene(
-    scene: &Scene,
-    positions: &[Vec2],
-    bounds: Bounds<Pixels>,
-    center: Vec2,
-    zoom: f32,
-    selected: Option<usize>,
-    hovered: Option<usize>,
-    palette: &Palette,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    if positions.len() != scene.nodes.len() {
-        return;
-    }
-    let screen: Vec<Point<Pixels>> = positions
-        .iter()
-        .map(|world| to_screen(*world, bounds, center, zoom))
-        .collect();
-    let radius: Vec<f32> = scene
-        .nodes
-        .iter()
-        .map(|node| (node.radius * zoom).max(3.))
-        .collect();
-    let visible = |p: Point<Pixels>, margin: f32| {
-        p.x >= bounds.left() - px(margin)
-            && p.x <= bounds.right() + px(margin)
-            && p.y >= bounds.top() - px(margin)
-            && p.y <= bounds.bottom() + px(margin)
-    };
-
-    // Edges, batched by color into a few paths in one layer. Hovering a node (a type, on the
-    // schema landing) brings out its edges and fades the rest (spec 006).
-    let mut lines: HashMap<(&str, bool), Vec<Segment>> = HashMap::new();
-    let mut loops: Vec<(usize, &str, &str)> = Vec::new();
-    let mut arrows: Vec<(Point<Pixels>, Point<Pixels>, &str)> = Vec::new();
-    let mut labels: Vec<(Point<Pixels>, &str)> = Vec::new();
-    // Offsets for parallel labelled edges between the same pair.
-    let mut pair_count: HashMap<(usize, usize), usize> = HashMap::new();
-    for edge in &scene.edges {
-        let (from, to) = (screen[edge.from], screen[edge.to]);
-        if !visible(from, 400.) && !visible(to, 400.) {
-            continue;
-        }
-        if edge.from == edge.to {
-            loops.push((
-                edge.from,
-                &edge.color_key,
-                edge.label.as_deref().unwrap_or(""),
-            ));
-            continue;
-        }
-        let pair = (edge.from.min(edge.to), edge.from.max(edge.to));
-        let nth = pair_count.entry(pair).or_default();
-        let offset = *nth as f32 * 14.;
-        *nth += 1;
-        let (from, to) = if offset > 0. {
-            let normal = perpendicular(from, to);
-            (
-                point(
-                    from.x + px(normal.x * offset),
-                    from.y + px(normal.y * offset),
-                ),
-                point(to.x + px(normal.x * offset), to.y + px(normal.y * offset)),
-            )
-        } else {
-            (from, to)
-        };
-        // From boundary to boundary, so a line never shows through a node.
-        let start = shorten(to, from, radius[edge.from]);
-        let end = shorten(from, to, radius[edge.to] + 1.);
-        let lit = hovered.is_some_and(|h| edge.from == h || edge.to == h);
-        lines
-            .entry((edge.color_key.as_str(), lit))
-            .or_default()
-            .push((start, end));
-        if let Some(label) = &edge.label {
-            arrows.push((start, end, &edge.color_key));
-            labels.push((point((from.x + to.x) / 2., (from.y + to.y) / 2.), label));
-        }
-    }
-    let stroke = px((1.5 * zoom.sqrt()).clamp(1., 2.));
-    window.paint_layer(bounds, |window| {
-        for ((color_key, lit), segments) in &lines {
-            let opacity = match (hovered.is_some(), lit) {
-                (false, _) => 0.55,
-                (true, true) => 0.95,
-                (true, false) => 0.15,
-            };
-            let color = type_color(color_key).opacity(opacity);
-            let width = if *lit { stroke * 1.6 } else { stroke };
-            for chunk in segments.chunks(SEGMENTS_PER_PATH) {
-                let mut builder = PathBuilder::stroke(width);
-                for (from, to) in chunk {
-                    builder.move_to(*from);
-                    builder.line_to(*to);
-                }
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, color);
-                }
-            }
-        }
-        for (node, color_key, _) in &loops {
-            let p = screen[*node];
-            let r = radius[*node];
-            let start = point(p.x - px(r * 0.6), p.y - px(r * 0.8));
-            let end = point(p.x + px(r * 0.6), p.y - px(r * 0.8));
-            let mut builder = PathBuilder::stroke(stroke);
-            builder.move_to(start);
-            builder.cubic_bezier_to(
-                end,
-                point(p.x - px(r * 2.2), p.y - px(r * 3.2)),
-                point(p.x + px(r * 2.2), p.y - px(r * 3.2)),
-            );
-            if let Ok(path) = builder.build() {
-                window.paint_path(path, type_color(color_key).opacity(0.7));
-            }
-            let tip = end;
-            arrows.push((point(tip.x + px(4.), tip.y - px(8.)), tip, color_key));
-        }
-        let mut heads: HashMap<&str, PathBuilder> = HashMap::new();
-        for (from, tip, color_key) in &arrows {
-            let direction = unit(*from, *tip);
-            let size = 7.;
-            let base = point(
-                tip.x - px(direction.x * size),
-                tip.y - px(direction.y * size),
-            );
-            let normal = Vec2::new(-direction.y, direction.x);
-            let left = point(
-                base.x + px(normal.x * size * 0.5),
-                base.y + px(normal.y * size * 0.5),
-            );
-            let right = point(
-                base.x - px(normal.x * size * 0.5),
-                base.y - px(normal.y * size * 0.5),
-            );
-            heads
-                .entry(color_key)
-                .or_insert_with(PathBuilder::fill)
-                .add_polygon(&[*tip, left, right], true);
-        }
-        for (color_key, builder) in heads {
-            if let Ok(path) = builder.build() {
-                window.paint_path(path, type_color(color_key).opacity(0.8));
-            }
-        }
-    });
-
-    // Nodes.
-    for (index, node) in scene.nodes.iter().enumerate() {
-        let p = screen[index];
-        let r = radius[index];
-        if !visible(p, r + 4.) {
-            continue;
-        }
-        let color = type_color(&node.color_key);
-        let is_selected = selected == Some(index);
-        let is_hovered = hovered == Some(index);
-        let (fill, border_width, border_color): (Hsla, f32, Hsla) = match &node.kind {
-            SceneKind::Type { .. } => (color, 2., palette.background),
-            SceneKind::Node { root, .. } => {
-                (color, if *root { 3. } else { 1.5 }, palette.background)
-            }
-            SceneKind::Hub { open, .. } => {
-                (if *open { color } else { palette.background }, 2., color)
-            }
-            SceneKind::More { .. } => (palette.surface, 1., palette.border),
-        };
-        let (border_width, border_color) = if is_selected {
-            (3., palette.selection)
-        } else if is_hovered {
-            (border_width.max(2.), palette.hover)
-        } else {
-            (border_width, border_color)
-        };
-        let circle = Bounds::new(
-            point(p.x - px(r), p.y - px(r)),
-            size(px(2. * r), px(2. * r)),
-        );
-        window.paint_quad(quad(
-            circle,
-            px(r),
-            fill,
-            px(border_width),
-            border_color,
-            BorderStyle::Solid,
-        ));
-    }
-
-    // Labels, above the zoom threshold or for what the person is looking at.
-    let font = theme::theme_settings(cx).ui_font(cx).clone();
-    let line_height = px(LABEL_SIZE + 4.);
-    // Paints one label; with `backdrop`, on a small pill so it reads over edges.
-    let text = |window: &mut Window,
-                cx: &mut App,
-                content: &str,
-                color: Hsla,
-                placement: Placement,
-                backdrop: Option<Hsla>| {
-        let run = TextRun {
-            len: content.len(),
-            font: font.clone(),
-            color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let line = window.text_system().shape_line(
-            SharedString::from(content.to_owned()),
-            px(LABEL_SIZE),
-            &[run],
-            None,
-        );
-        let origin = placement.origin(line.width, line_height);
-        let x = origin.x;
-        if let Some(backdrop) = backdrop {
-            let pill = Bounds::new(
-                point(x - px(3.), origin.y),
-                size(line.width + px(6.), line_height),
-            );
-            window.paint_quad(quad(
-                pill,
-                px(4.),
-                backdrop,
-                px(0.),
-                backdrop,
-                BorderStyle::Solid,
-            ));
-        }
-        line.paint(
-            point(x, origin.y),
-            line_height,
-            TextAlign::Left,
-            None,
-            window,
-            cx,
-        )
-        .ok();
-    };
-    for (index, node) in scene.nodes.iter().enumerate() {
-        let p = screen[index];
-        let r = radius[index];
-        if !visible(p, 200.) {
-            continue;
-        }
-        let focus = selected == Some(index) || hovered == Some(index);
-        match &node.kind {
-            SceneKind::Type { count } => {
-                text(
-                    window,
-                    cx,
-                    &node.label,
-                    palette.text,
-                    Placement::Below(point(p.x, p.y + px(r + 4.))),
-                    None,
-                );
-                if let Some(count) = count {
-                    text(
-                        window,
-                        cx,
-                        &format_count(*count),
-                        palette.muted,
-                        Placement::Below(point(p.x, p.y + px(r + 4.) + line_height)),
-                        None,
-                    );
-                }
-            }
-            SceneKind::Node { root, .. } => {
-                if zoom >= NODE_LABEL_ZOOM || focus || *root {
-                    text(
-                        window,
-                        cx,
-                        &node.label,
-                        palette.text,
-                        Placement::Below(point(p.x, p.y + px(r + 3.))),
-                        Some(palette.background.opacity(0.85)),
-                    );
-                }
-            }
-            SceneKind::Hub { .. } | SceneKind::More { .. } => {
-                if zoom >= HUB_LABEL_ZOOM || focus {
-                    let color = if matches!(node.kind, SceneKind::More { .. }) {
-                        palette.muted
-                    } else {
-                        palette.text
-                    };
-                    let owner = match node.kind {
-                        SceneKind::Hub { .. } => node.parent.map(|parent| screen[parent]),
-                        _ => None,
-                    };
-                    text(
-                        window,
-                        cx,
-                        &node.label,
-                        color,
-                        Placement::Side {
-                            at: p,
-                            owner,
-                            radius: r,
-                        },
-                        Some(palette.background.opacity(0.85)),
-                    );
-                }
-            }
-        }
-    }
-    if zoom >= HUB_LABEL_ZOOM {
-        for (at, label) in labels {
-            if visible(at, 50.) {
-                text(
-                    window,
-                    cx,
-                    label,
-                    palette.muted,
-                    Placement::Below(point(at.x, at.y - line_height / 2.)),
-                    Some(palette.background),
-                );
-            }
-        }
-        for (node, _, label) in loops {
-            let p = screen[node];
-            let r = radius[node];
-            text(
-                window,
-                cx,
-                label,
-                palette.muted,
-                Placement::Below(point(p.x, p.y - px(r * 3.0) - line_height)),
-                Some(palette.background),
-            );
-        }
-    }
-}
-
-/// Where a label goes, given its width once shaped.
-#[derive(Clone, Copy)]
-enum Placement {
-    /// Centered horizontally, with its top at the point.
-    Below(Point<Pixels>),
-    /// Beside a hub or chip at `at`, on the side facing `owner` (the node it hangs off), so it
-    /// never sits in the fan of neighbours; to the right when there is no owner.
-    Side {
-        at: Point<Pixels>,
-        owner: Option<Point<Pixels>>,
-        radius: f32,
-    },
-}
-
-impl Placement {
-    fn origin(self, width: Pixels, line_height: Pixels) -> Point<Pixels> {
-        match self {
-            Placement::Below(top) => point(top.x - width / 2., top.y),
-            Placement::Side { at, owner, radius } => {
-                let gap = px(radius + 5.);
-                let toward = owner.map(|owner| unit(at, owner));
-                match toward {
-                    Some(d) if d.y < -0.6 => point(at.x - width / 2., at.y - gap - line_height),
-                    Some(d) if d.y > 0.6 => point(at.x - width / 2., at.y + gap),
-                    Some(d) if d.x < 0. => point(at.x - gap - width, at.y - line_height / 2.),
-                    _ => point(at.x + gap, at.y - line_height / 2.),
-                }
-            }
-        }
-    }
-}
-
-fn format_count(count: i64) -> String {
-    let digits = count.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
-fn unit(from: Point<Pixels>, to: Point<Pixels>) -> Vec2 {
-    let dx = f32::from(to.x - from.x);
-    let dy = f32::from(to.y - from.y);
-    let length = (dx * dx + dy * dy).sqrt().max(1e-3);
-    Vec2::new(dx / length, dy / length)
-}
-
-fn perpendicular(from: Point<Pixels>, to: Point<Pixels>) -> Vec2 {
-    let direction = unit(from, to);
-    Vec2::new(-direction.y, direction.x)
-}
-
-fn shorten(from: Point<Pixels>, to: Point<Pixels>, by: f32) -> Point<Pixels> {
-    let direction = unit(from, to);
-    point(to.x - px(direction.x * by), to.y - px(direction.y * by))
 }
 
 impl Render for GraphCanvas {
@@ -1592,5 +1247,6 @@ impl Render for GraphCanvas {
             .child(canvas)
             .children(body.map(|body| div().absolute().size_full().top_0().left_0().child(body)))
             .child(overlay)
+            .child(self.render_caption(cx))
     }
 }

@@ -216,7 +216,7 @@ impl Render for DesignGallery {
                     )
                     .child(
                         SidebarRow::new("g-knows", "Knows")
-                            .start(studio_ui::type_swatch("Knows"))
+                            .start(studio_ui::kind_swatch("Knows", true))
                             .end(ds::sidebar_count("412"))
                             .muted(true),
                     )
