@@ -75,7 +75,8 @@ stay put), IX (paged, virtualized).
 - The next page is fetched when the viewport passes 80% of loaded rows. No row cap: the grid is
   virtualized.
 - Relationship columns: one query per page and relationship, with the page's ids as an `in`
-  list parameter; the neighbours that fit the column whole as chips, then "+N" (a chip is
+  list parameter; at most two neighbours as chips, those that fit the column whole, then "+N"
+  (a chip is
   never cut mid-name; its width is estimated from its label, as a cell is laid out before its
   text is measured). Built as two reads per page and relationship at the page's commit, in
   turn: a grouped count (`return { $n.@id as id, count($m) as n }`), then every neighbour of

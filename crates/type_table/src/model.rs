@@ -707,6 +707,10 @@ pub fn short_commit(id: &str) -> String {
     tail[start..].to_owned()
 }
 
+/// The most chips a relationship cell shows: two names say what a row links to; more crowd
+/// the row.
+pub const RELATION_CHIPS_SHOWN: usize = 2;
+
 /// The most neighbour rows one page reads per relationship, and the most one row may bring:
 /// a row with more shows its count alone, rather than starving the rows after it.
 pub const RELATION_SAMPLE_BUDGET: i64 = 2000;
@@ -736,6 +740,7 @@ pub fn relation_sample(
 /// are left out: by an estimate of each label's width at the tag's size, since a cell is laid
 /// out before its text is measured. A chip cut mid-name reads as a glitch.
 pub fn chips_that_fit(labels: &[&str], count: i64, available: f32) -> usize {
+    let labels = &labels[..labels.len().min(RELATION_CHIPS_SHOWN)];
     const CHAR: f32 = 6.8;
     const CHROME: f32 = 2. * studio_ui::ds::space::SM;
     const GAP: f32 = 4.;
@@ -781,8 +786,8 @@ mod tests {
     #[test]
     fn chips_fit_whole_with_room_for_the_rest() {
         let labels = ["Ada Lovelace", "Alan Turing", "Grace Hopper"];
-        // Everything fits on a wide cell.
-        assert_eq!(chips_that_fit(&labels, 3, 1000.), 3);
+        // A wide cell still shows two; the rest is a count.
+        assert_eq!(chips_that_fit(&labels, 3, 1000.), RELATION_CHIPS_SHOWN);
         // A narrow one keeps whole chips and the "+N" after them.
         let one = chips_that_fit(&labels, 9, 160.);
         assert_eq!(one, 1);

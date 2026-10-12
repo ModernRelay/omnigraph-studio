@@ -510,8 +510,7 @@ pub(crate) fn change_card(
             after: diff.after,
         })
         .collect();
-    let mut card =
-        ChangeCard::new(id, kind, change.type_name.clone(), change.id.clone()).rows(rows);
+    let mut card = ChangeCard::new(id, kind, change.id.clone()).rows(rows);
     if let Some((from, to)) = change.endpoints() {
         card = card.endpoints(from, to);
     }

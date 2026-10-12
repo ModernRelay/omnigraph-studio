@@ -51,7 +51,9 @@ place), X (designed on 0.13; the better routes are deferred).
   then per-type counts (+ added, ~ changed, − removed).
 - Body: one scroll of entity cards grouped by type, changes to existing data first. A changed
   entity shows only its changed properties, before and after; a removed one stays as a real,
-  searchable row; edges show endpoint changes.
+  searchable row; edges show endpoint changes. A card's header is the kind's symbol (+ ~ −)
+  and the entity's id; its type is the group header's, never repeated per card. Cards are
+  hairline frames on the document, values in the UI font.
 - Act in place: Revert (restore the before image), Edit, Mark reviewed (card turns hollow but
   stays). Keys: J/K between cards, ↵ edit, ⌘Y accept and next, ⌥⌘Z revert and next.
 - Edit (a node that is added or changed): a form of its editable properties filled with what

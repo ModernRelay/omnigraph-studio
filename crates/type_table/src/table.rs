@@ -40,11 +40,11 @@ use ui::{
 
 use crate::dialogs::{DeleteRowModal, InsertRowModal, SaveViewModal};
 use crate::model::{
-    ColumnRole, ColumnSpec, Notice, Paging, Row, SaveResult, TableKind, Tone, changed_elsewhere,
-    chips_that_fit, copy_text, count_of, display_value, edge_columns, edge_rows, edit_text,
-    filter_label, format_count, insert_position, node_columns, node_rows, parse_filter_list,
-    parse_filter_value, parse_input, preset_start, relation_sample, row_matches, same_value,
-    save_result, short_commit,
+    ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN, Row, SaveResult, TableKind, Tone,
+    changed_elsewhere, chips_that_fit, copy_text, count_of, display_value, edge_columns, edge_rows,
+    edit_text, filter_label, format_count, insert_position, node_columns, node_rows,
+    parse_filter_list, parse_filter_value, parse_input, preset_start, relation_sample, row_matches,
+    same_value, save_result, short_commit,
 };
 use crate::peek::{NodePeek, PeekSubject};
 
@@ -92,9 +92,6 @@ struct BulkDraft {
     notice: Option<Notice>,
     saving: bool,
 }
-
-/// The most neighbours a relationship cell keeps; it shows the ones that fit whole.
-const RELATION_CHIPS: usize = 4;
 
 /// One row's neighbours through one relationship: how many, and the first few.
 struct Relation {
@@ -1241,7 +1238,7 @@ impl TypeTable {
                     if let Some(Ok(output)) = &neighbours {
                         for (id, other, label) in relation_samples(&output.rows) {
                             let list = shown.entry(id).or_default();
-                            if list.len() < RELATION_CHIPS {
+                            if list.len() < RELATION_CHIPS_SHOWN {
                                 list.push((other, label));
                             }
                         }

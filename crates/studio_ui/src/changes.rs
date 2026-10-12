@@ -7,7 +7,7 @@ use gpui::{AnyElement, App, ClickEvent, Div, ElementId, SharedString, Window};
 use serde_json::Value;
 use ui::prelude::*;
 
-use crate::{format_value, type_swatch};
+use crate::format_value;
 
 /// What happened to an entity, as a card shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,13 +53,14 @@ pub struct PropertyRow {
 
 type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
-/// A card for one changed entity. Changed entities show before → after per changed property;
-/// added ones their values; removed ones their last values, struck through, as a real row.
+/// A card for one changed entity, under its type's [`change_group_header`]: the kind's symbol
+/// and the entity's id, then before → after per changed property for a changed entity, the
+/// values of an added one, the last values of a removed one, struck through. The type is the
+/// group's, so a card does not repeat it.
 #[derive(IntoElement)]
 pub struct ChangeCard {
     id: ElementId,
     kind: ChangeKind,
-    type_name: SharedString,
     entity_id: SharedString,
     endpoints: Option<(SharedString, SharedString)>,
     rows: Vec<PropertyRow>,
@@ -74,13 +75,11 @@ impl ChangeCard {
     pub fn new(
         id: impl Into<ElementId>,
         kind: ChangeKind,
-        type_name: impl Into<SharedString>,
         entity_id: impl Into<SharedString>,
     ) -> Self {
         Self {
             id: id.into(),
             kind,
-            type_name: type_name.into(),
             entity_id: entity_id.into(),
             endpoints: None,
             rows: Vec::new(),
@@ -134,14 +133,13 @@ impl ChangeCard {
     }
 }
 
-fn value_label(value: &Option<Value>, color: Color, strike: bool, cx: &App) -> Label {
+fn value_label(value: &Option<Value>, color: Color, strike: bool) -> Label {
     let text = match value {
         Some(value) => format_value(value),
         None => "—".into(),
     };
     let mut label = Label::new(text)
         .size(LabelSize::Small)
-        .buffer_font(cx)
         .color(color)
         .single_line()
         .truncate();
@@ -158,27 +156,18 @@ impl RenderOnce for ChangeCard {
         let border = if self.selected {
             colors.border_focused
         } else {
-            colors.border_variant
-        };
-        let background = if self.hollow {
-            colors.editor_background
-        } else {
-            colors.surface_background
+            crate::ds::surface::rule(cx)
         };
         let kind = self.kind;
         let header = h_flex()
-            .gap_2()
+            .id("change-kind")
+            .gap(px(crate::ds::space::INLINE))
             .min_w_0()
+            .tooltip(ui::Tooltip::text(kind.label()))
             .child(
-                Label::new(format!("{} {}", kind.symbol(), kind.label()))
+                Label::new(kind.symbol())
                     .size(LabelSize::Small)
                     .color(kind.color()),
-            )
-            .child(type_swatch(&self.type_name))
-            .child(
-                Label::new(self.type_name.clone())
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
             )
             .map(|header| match &self.endpoints {
                 Some((from, to)) => header.child(
@@ -218,32 +207,34 @@ impl RenderOnce for ChangeCard {
                         &row.before,
                         Color::Deleted,
                         true,
-                        cx,
                     )))
                     .child(Label::new("→").size(LabelSize::Small).color(Color::Muted))
                     .child(div().flex_1().min_w_0().child(value_label(
                         &row.after,
                         Color::Created,
                         false,
-                        cx,
                     ))),
                 ChangeKind::Added => h_flex().flex_1().min_w_0().child(value_label(
                     &row.after,
                     Color::Default,
                     false,
-                    cx,
                 )),
-                ChangeKind::Removed => h_flex().flex_1().min_w_0().child(value_label(
-                    &row.before,
-                    Color::Muted,
-                    true,
-                    cx,
-                )),
+                ChangeKind::Removed => {
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(value_label(&row.before, Color::Muted, true))
+                }
             };
             h_flex()
                 .gap_3()
                 .min_w_0()
-                .child(div().w(px(150.)).flex_none().child(name))
+                .child(
+                    div()
+                        .w(px(crate::ds::size::FIELD_LABEL))
+                        .flex_none()
+                        .child(name),
+                )
                 .child(body)
         });
         let card = h_flex()
@@ -252,11 +243,10 @@ impl RenderOnce for ChangeCard {
             .rounded_md()
             .border_1()
             .border_color(border)
-            .bg(background)
             .overflow_hidden()
             .child(
                 div()
-                    .w(px(3.))
+                    .w(px(2.))
                     .h_full()
                     .flex_none()
                     .when(!self.hollow, |d| d.bg(accent)),
