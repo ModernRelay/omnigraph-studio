@@ -6,19 +6,23 @@
 //!       'studio_graph::OpenType={"type_name":"Person"}' 'studio::ToggleActivity'
 //!
 //! Each argument after the output path is an action, `name` or `name=<json>`, dispatched after
-//! the previous one settles. `SNAPSHOT_WAIT_MS` (default 1500) is how long to let each step's
-//! network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default 1440x900).
+//! the previous one settles. `type:<text>` types text into the focused editor (`\n` is a new
+//! line); it is `editor::HandleInput` with the text. `SNAPSHOT_WAIT_MS` (default 1500) is how
+//! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
+//! 1440x900).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui::{AnyWindowHandle, HeadlessAppContext, px, size};
+use gpui::{AnyWindowHandle, Focusable as _, HeadlessAppContext, px, size};
 
 fn settle(cx: &mut HeadlessAppContext, wait: Duration) {
     let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
         cx.run_until_parked();
         std::thread::sleep(Duration::from_millis(25));
+        // Timers (debounces, toasts) run on the headless dispatcher's simulated clock.
+        cx.advance_clock(Duration::from_millis(25));
     }
     cx.run_until_parked();
 }
@@ -56,14 +60,28 @@ fn main() {
     settle(&mut cx, wait);
 
     for spec in actions {
-        let (name, data) = match spec.split_once('=') {
-            Some((name, json)) => (
-                name.to_owned(),
-                Some(serde_json::from_str(json).expect("action data is JSON")),
+        let (name, data) = match spec.strip_prefix("type:") {
+            Some(text) => (
+                "editor::HandleInput".to_owned(),
+                Some(serde_json::Value::String(text.replace("\\n", "\n"))),
             ),
-            None => (spec.clone(), None),
+            None => match spec.split_once('=') {
+                Some((name, json)) => (
+                    name.to_owned(),
+                    Some(serde_json::from_str(json).expect("action data is JSON")),
+                ),
+                None => (spec.clone(), None),
+            },
         };
         cx.update_window(handle, |_, window, cx| {
+            // With nothing focused an action reaches only global handlers, so give the
+            // workspace focus first, as a click in the window would.
+            if window.focused(cx).is_none() {
+                if let Some(workspace) = studio_workspace::workspace_for(window) {
+                    let focus = workspace.read(cx).focus_handle(cx);
+                    window.focus(&focus, cx);
+                }
+            }
             let action = cx
                 .build_action(&name, data)
                 .unwrap_or_else(|error| panic!("unknown action {name}: {error:?}"));
