@@ -809,7 +809,7 @@ impl QueryEditor {
             _ => (String::new(), false),
         };
         let busy = self.writing;
-        studio_ui::chrome::toolbar(cx)
+        studio_ui::ds::toolbar(cx)
             .px_2()
             .child(
                 Button::new("run", "Run")
@@ -1288,7 +1288,7 @@ impl QueryEditor {
         let Output::Rows(rows) = &self.output else {
             return Vec::new();
         };
-        let border = studio_ui::chrome::hairline(cx);
+        let border = studio_ui::ds::surface::rule(cx);
         let colors = cx.theme().colors();
         let (selected_bg, row_selected_bg) = (colors.element_selected, colors.ghost_element_hover);
         let selected = self.selected;

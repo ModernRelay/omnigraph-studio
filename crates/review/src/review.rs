@@ -8,7 +8,8 @@ mod conflicts;
 mod view;
 
 use gpui::{App, AppContext as _, Focusable as _};
-use studio_workspace::Workspace;
+use studio_workspace::{PanelPosition, Workspace};
+use ui::IconName;
 
 pub use branches::{BranchList, CreateBranchModal, DeleteBranchModal, TARGET};
 pub use conflicts::conflict_wording;
@@ -27,7 +28,14 @@ pub fn init(cx: &mut App) {
         let handle = cx.entity().downgrade();
         let session = workspace.session().cloned();
         let list = cx.new(|cx| BranchList::new(handle, session, window, cx));
-        workspace.add_sidebar_section("Branches", list.into(), cx);
+        workspace.add_panel(
+            PanelPosition::Left,
+            "branches",
+            "Branches",
+            IconName::GitBranch,
+            list.into(),
+            cx,
+        );
         branches::register(workspace);
     })
     .detach();

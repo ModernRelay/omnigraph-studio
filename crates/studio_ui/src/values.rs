@@ -106,11 +106,12 @@ impl RenderOnce for CopyableValue {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let Some(value) = self.value else {
             return h_flex()
+                .id(self.id)
+                .tooltip(Tooltip::text("Not reported by this server"))
                 .child(
-                    Label::new("Not reported by this server")
+                    Label::new("—")
                         .size(LabelSize::Small)
-                        .color(Color::Disabled)
-                        .italic(),
+                        .color(Color::Disabled),
                 )
                 .into_any_element();
         };

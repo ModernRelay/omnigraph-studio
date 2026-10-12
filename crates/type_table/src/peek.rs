@@ -647,10 +647,7 @@ impl Render for NodePeek {
                 .then(|| values.get(label)?.as_str().map(str::to_owned))
                 .flatten()
         });
-        let at = self
-            .snapshot
-            .as_deref()
-            .map(|commit| format!("read at {}", short_commit(commit)));
+        let at = self.snapshot.clone();
         let has_properties = !self.property_rows().is_empty();
         let properties = self.render_properties(cx);
         let relationships =
@@ -659,8 +656,8 @@ impl Render for NodePeek {
         v_flex()
             .id("node-peek")
             .w_full()
-            .p_3()
-            .gap_1()
+            .p_4()
+            .gap_1p5()
             .child(
                 h_flex()
                     .gap_1p5()
@@ -678,12 +675,17 @@ impl Render for NodePeek {
             )
             .child(
                 h_flex()
-                    .gap_2()
-                    .child(Label::new(id).size(LabelSize::XSmall).color(Color::Muted))
-                    .children(at.map(|at| {
-                        Label::new(at)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Disabled)
+                    .gap_3()
+                    .child(studio_ui::ds::meta_code(IconName::Hash, id, cx))
+                    .children(at.map(|commit| {
+                        div()
+                            .id("peek-commit")
+                            .tooltip(Tooltip::text(format!("Read at commit {commit}")))
+                            .child(studio_ui::ds::meta_code(
+                                IconName::GitCommit,
+                                short_commit(&commit),
+                                cx,
+                            ))
                     })),
             )
             .children(

@@ -114,31 +114,55 @@ second line shows it (`omnigraph branch create feature-x --from main`).
 ### Visual language
 
 Delta's window, measured from the mock on delta.dev (its CSS uses Zed's One Light tokens and
-IBM Plex Sans, as Studio does), with Tower's quiet rules. Implemented as functions in
-`studio_ui::chrome` and in `studio_workspace`'s render:
+IBM Plex Sans, as Studio does), with Tower's quiet rules. Tokens and components live in
+`studio_ui::ds` (spacing, radii, sizes, surfaces, elevation, text roles, and the rows, cards,
+strips and states built from them); the "Design system" tab (`studio::OpenDesignSystem`) renders
+every specimen in the current theme and window style. Features compose `ds` components rather
+than styling one-off elements.
 
-- **Columns, not bars.** No global title bar or status bar. Each column (sidebar, document,
-  inspector) has its own 32 px header strip, and the document and sidebar their own footer
-  strip, so the rules line up across the window. Strips are window drag areas; as in Zed, a
-  move starts on the first mouse move after a press, so clicks on strip buttons land.
-- **Sidebar column** (`panel_background`, 248 px): the header holds room for the traffic
-  lights, the sidebar toggle and search (⌘K); the footer holds the graph, server and a status
-  dot, and opens "Open a graph", as Delta's footer holds the account.
-- **Document column** (`editor_background`): the header is the tab row (text tabs split by
-  hairlines; the active tab joins the content; inactive tabs sit on `tab_bar_background` at
-  35% and show their close button on hover), then the branch menu, running reads, the activity
-  and inspector toggles. Each document draws its own footer strip.
-- **Inspector column** (`editor_background`, 320 px): a header strip with its title.
-- **Hairlines.** `border_variant` at 60%, never a solid rule.
-- **Text sizes.** The window's rem size is `ui_font_size` (15 px by default), as in Zed, so
+- **Columns, not bars.** No global title bar or status bar. Each column has its own 40 px
+  header strip and the sidebar and document their own footer strip, so the rules line up across
+  the window. Strips are window drag areas; as in Zed, a move starts on the first mouse move
+  after a press, so clicks on strip buttons land.
+- **Panels in docks** (`studio_workspace::panels`, after Zed's `Panel`/`Dock` and Obsidian's
+  side docks). A panel is a view with an id, a title and an icon; features add one with
+  `Workspace::add_panel(position, …)` and show it with `activate_panel`. A dock (left, right,
+  bottom) shows one panel at a time, opens and closes as a whole, and draws the same chrome for
+  every panel: a header strip with its tabs, then the active panel. The left dock (264 px)
+  switches panels with icon tabs (Types, Explore, Branches); the right (340 px, the inspector)
+  and bottom (the activity log) docks use title tabs and a close button. Selection fills the
+  inspector without reopening a dock the user closed. Each dock's open state and active panel
+  are remembered per graph. Documents are tabs in the center, not panels.
+- **Footers, after Delta.** The sidebar footer holds the connection: a status dot, the server
+  and its state, opening "Open a graph" (Delta's account). The document footer holds where the
+  open tab reads and writes, graph / branch with the branch menu (Delta's repo / branch), then
+  the tab's own facts; at the end what is running and the tab's controls. A tab supplies its
+  part through `Item::footer` (`ItemFooter { start, end }`): the table its loaded count, read
+  commit and key hints; the agent its restart, agent pill and send. The document header holds
+  only the tabs and the dock toggles.
+- **Window styles.** `studio.window_style`: `flat` splits columns with hairlines; `glass`
+  floats the three columns as sheets over a soft wash, with one gap around and between them,
+  and moves the traffic lights into the sidebar sheet.
+- **Hairlines.** `ds::surface::rule`, never a solid border; dashed between rows on glass.
+- **Text sizes.** The window's rem size is `ui_font_size` (16 px by default), as in Zed, so
   every `ui` size scales with it. Body text is `Small`; labels, counts and metadata `XSmall`.
-- **Sidebar rows.** Section labels are muted, not bold. Rows are inset `ListItem`s; the
-  selected row is a grey pill. Counts are muted and right-aligned. Footnotes become tooltips.
-- **Context once.** The branch appears once, in the document header's branch menu.
-- **Tables.** Like Linear: a 40 px toolbar, a one-line header (name, then the type muted), 30
+- **Sidebar rows.** `ds::SidebarRow`: section labels muted, not bold; the selected row a grey
+  pill; counts muted and right-aligned. Footnotes become tooltips.
+- **Context once.** The branch appears once, in the document footer's branch menu.
+- **Tables.** Like Linear: a 48 px toolbar, a one-line header (name, then the type muted), 36
   px rows split by hairlines, no column rules, the cursor as a ring and the selected row as a
   pill.
-- **Empty states.** One muted sentence.
+- **Layout, not sentences.** Information sits in structure, as in Delta's thread and Zed's
+  panels: metadata as an icon and a short value (`ds::meta`, `meta_code`: a count, a commit, a
+  branch); keys as key caps (`ds::key_hint`, `KeyBinding` on buttons), never "↵ edit · …"
+  strings; activity as one-line rows with a gutter icon and a verb; approvals and outcomes in
+  cards with a header and a footer of icon buttons (✓ allow, ✓✓ always, ✗ reject) or an outcome
+  chip; code and commands in bordered blocks. The agent's prompt sits under its thread as the
+  next message's gutter row. Explanations go in tooltips. Sentences appear only in errors
+  (`Callout`) and in what an agent writes.
+- **Empty states.** An icon, a title of two or three words, and the actions that fill the
+  space as outlined buttons with their key bindings (`ds::empty_state`); an empty panel is one
+  dim row (`ds::sidebar_placeholder`).
 
 ### Motion
 

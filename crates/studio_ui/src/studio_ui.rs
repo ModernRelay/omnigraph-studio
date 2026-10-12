@@ -9,8 +9,8 @@ use ui::prelude::*;
 
 pub use studio_theme::type_color;
 
-pub mod chrome;
 mod changes;
+pub mod ds;
 mod values;
 
 pub use changes::{ChangeCard, ChangeKind, PropertyRow, change_counts, change_group_header};
@@ -56,8 +56,8 @@ impl GridColumn {
     }
 }
 
-pub const ROW_HEIGHT: f32 = 30.;
-pub const HEADER_HEIGHT: f32 = 32.;
+pub const ROW_HEIGHT: f32 = 36.;
+pub const HEADER_HEIGHT: f32 = 36.;
 
 /// The header row of a grid: one line per column, the name then its type, muted, with a
 /// hairline below (spec 002, "Visual language").
@@ -66,13 +66,13 @@ pub fn grid_header(columns: &[GridColumn], leading: Pixels, cx: &App) -> Div {
         .h(px(HEADER_HEIGHT))
         .flex_none()
         .border_b_1()
-        .border_color(chrome::hairline(cx))
+        .border_color(ds::surface::rule(cx))
         .child(div().w(leading).flex_none())
         .children(columns.iter().map(|column| {
             h_flex()
                 .w(column.width)
                 .flex_none()
-                .px_2()
+                .px_3()
                 .gap_1p5()
                 .overflow_hidden()
                 .when(column.align_right, |d| d.justify_end())
@@ -97,7 +97,7 @@ pub fn grid_cell(width: Pixels, align_right: bool) -> Div {
         .w(width)
         .h(px(ROW_HEIGHT))
         .flex_none()
-        .px_2()
+        .px_3()
         .overflow_hidden()
         .when(align_right, |d| d.justify_end())
 }

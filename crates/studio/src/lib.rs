@@ -2,12 +2,16 @@
 //! (`docs/architecture.md`). `main.rs` runs it; the snapshot example renders it offscreen.
 
 mod activity;
+mod design_gallery;
 mod keymaps;
 mod menus;
 mod open_graph;
 mod settings_view;
 
-use gpui::{App, AppContext as _, Entity, Focusable as _, Window, WindowBounds, WindowOptions, point, px, size};
+use gpui::{
+    App, AppContext as _, Entity, Focusable as _, Window, WindowBounds, WindowOptions, point, px,
+    size,
+};
 use graph_store::{ConnectionRegistry, ConnectionState, open_session};
 use studio_actions::workspace::{NewWindow, OpenGraph, OpenSettings, Quit};
 use studio_workspace::Workspace;
@@ -33,6 +37,14 @@ pub fn init(cx: &mut App) {
     inspectors::init(cx);
     agent_panel::init(cx);
 
+    studio_workspace::register_item_kind(cx, "design-system", |_, workspace, window, cx| {
+        workspace.open_item(
+            "design-system",
+            window,
+            cx,
+            design_gallery::DesignGallery::new,
+        );
+    });
     studio_workspace::register_item_kind(cx, "settings", |_, workspace, window, cx| {
         workspace.open_item("settings", window, cx, settings_view::SettingsView::new);
     });
@@ -44,8 +56,19 @@ pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };
         let handle = cx.entity().downgrade();
-        let activity = cx.new(|cx| activity::ActivityLog::new(handle, window, cx));
+        let session = workspace.session().cloned();
+        let activity = cx.new(|cx| activity::ActivityLog::new(handle, session, window, cx));
         workspace.set_activity_view(activity.into(), cx);
+        workspace.register_action(
+            |workspace, _: &studio_actions::workspace::OpenDesignSystem, window, cx| {
+                workspace.open_item(
+                    "design-system",
+                    window,
+                    cx,
+                    design_gallery::DesignGallery::new,
+                );
+            },
+        );
         workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
             workspace.open_item("settings", window, cx, settings_view::SettingsView::new);
         });
@@ -67,7 +90,7 @@ pub fn window_options(cx: &App) -> WindowOptions {
         titlebar: Some(gpui::TitlebarOptions {
             title: Some("OmniGraph Studio".into()),
             appears_transparent: true,
-            traffic_light_position: Some(point(px(12.), px(10.))),
+            traffic_light_position: Some(point(px(12.), px(12.))),
         }),
         app_id: Some("com.modernrelay.omnigraph-studio".into()),
         ..Default::default()

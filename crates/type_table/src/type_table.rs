@@ -11,23 +11,30 @@ mod types_list;
 
 use gpui::{App, AppContext as _, Context, Window};
 use studio_actions::graph::{OpenNode, OpenType};
-use studio_workspace::{ToastKind, Workspace};
+use studio_workspace::{PanelPosition, ToastKind, Workspace};
+use ui::IconName;
 
 pub use dialogs::{DeleteRowModal, InsertRowModal};
 pub use peek::{NodePeek, PeekSubject};
 pub use table::{Cursor, TypeTable};
 pub use types_list::TypesList;
 
-/// Registers this surface with every new workspace: the sidebar's Types section, `OpenType`,
+/// Registers this surface with every new workspace: the left dock's Types panel, `OpenType`,
 /// and `OpenNode`. Its keys are in `assets/keymaps/` (`TypeTable`, `TypeTable && editing`).
 pub fn init(cx: &mut App) {
-
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };
         let handle = cx.entity().downgrade();
         let session = workspace.session().cloned();
         let types = cx.new(|cx| TypesList::new(handle, session, window, cx));
-        workspace.add_sidebar_section("Types", types.into(), cx);
+        workspace.add_panel(
+            PanelPosition::Left,
+            "types",
+            "Types",
+            IconName::Table,
+            types.into(),
+            cx,
+        );
         workspace.register_action(|workspace, action: &OpenType, window, cx| {
             open_type(workspace, &action.type_name, window, cx)
         });

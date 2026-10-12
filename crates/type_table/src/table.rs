@@ -26,7 +26,7 @@ use studio_actions::table::{
     InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp, PeekRow, RefreshTable,
 };
 use studio_ui::ROW_HEIGHT;
-use studio_workspace::{Item, ItemEvent, ToastKind, Workspace, WorkspaceEvent};
+use studio_workspace::{Item, ItemEvent, ItemFooter, ToastKind, Workspace, WorkspaceEvent};
 use ui::prelude::*;
 use ui::{
     ColumnWidthConfig, ContextMenu, Indicator, PopoverMenu, ResizableColumnsState, Table,
@@ -147,6 +147,10 @@ impl Item for TypeTable {
 
     fn is_stale(&self, _cx: &App) -> bool {
         self.newer
+    }
+
+    fn footer(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<ItemFooter> {
+        Some(self.footer_parts(cx))
     }
 }
 
@@ -1465,7 +1469,7 @@ impl TypeTable {
         } else {
             format!("Edits, inserts and deletes here commit to {}", self.branch)
         };
-        studio_ui::chrome::toolbar(cx)
+        studio_ui::ds::toolbar(cx)
             .child(studio_ui::type_swatch(&self.type_name))
             .child(
                 Label::new(self.type_name.clone())
@@ -1760,15 +1764,14 @@ impl TypeTable {
     }
 
     fn render_grid(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors();
-        let selected_bg = colors.element_selected;
+        let selected_bg = studio_ui::ds::surface::selected_document(cx);
         let headers: Vec<AnyElement> = self
             .columns
             .iter()
             .map(|column| {
                 h_flex()
                     .h(px(studio_ui::HEADER_HEIGHT))
-                    .px_3()
+                    .px_4()
                     .gap_1p5()
                     .w_full()
                     .overflow_hidden()
@@ -1797,7 +1800,8 @@ impl TypeTable {
             .filter(|(_, row)| row.dimmed)
             .map(|(ix, _)| ix)
             .collect();
-        let hairline = studio_ui::chrome::hairline(cx);
+        let hairline = studio_ui::ds::surface::rule(cx);
+        let glass = studio_ui::ds::is_glass(cx);
         // Fixed fitted widths: Zed's resizable columns draw a full-height rule between every
         // column, which the visual language leaves out (spec 002).
         let widths: Vec<_> = self.columns.iter().map(|c| px(c.width)).collect();
@@ -1811,6 +1815,7 @@ impl TypeTable {
             .map_row(move |(ix, row), _window, _cx| {
                 row.border_b_1()
                     .border_color(hairline)
+                    .when(glass, |row| row.border_dashed())
                     .when(cursor_row == Some(ix), |row| row.bg(selected_bg))
                     .when(dimmed.contains(&ix), |row| row.opacity(0.45))
                     .into_any_element()
@@ -1876,12 +1881,14 @@ impl TypeTable {
             .relative()
             .h(px(ROW_HEIGHT))
             .w_full()
-            .px_3()
+            .px_4()
             .flex()
             .items_center()
             .gap_1()
             .overflow_hidden()
-            .when(col == 0, |d| d.border_r_1().border_color(divider.opacity(0.6)))
+            .when(col == 0, |d| {
+                d.border_r_1().border_color(divider.opacity(0.6))
+            })
             .when(column.align_right, |d| d.justify_end());
         // The cursor and the editor are drawn as a ring over the cell, so no cell changes size.
         let ring = || {
@@ -2032,85 +2039,95 @@ impl TypeTable {
             .into_any_element()
     }
 
-    fn render_footer(&self, cx: &mut Context<Self>) -> AnyElement {
-        let border = studio_ui::chrome::hairline(cx);
-        let loaded = if self.rows.is_empty() {
-            String::new()
-        } else if self.paging.exhausted {
-            format!("{} loaded, all", format_count(self.rows.len() as i64))
-        } else {
-            format!("{} loaded", format_count(self.rows.len() as i64))
+    /// The table's part of the footer strip: how much is loaded and the commit every page is
+    /// read at, then the keys that act on the cursor, as key caps (spec 002: layout, not
+    /// sentences).
+    fn footer_parts(&self, cx: &mut Context<Self>) -> ItemFooter {
+        let loaded = match (&self.count, self.rows.len()) {
+            (_, 0) => None,
+            (Loadable::Loaded(total), n) if self.filters.is_empty() => Some(format!(
+                "{} of {}",
+                format_count(n as i64),
+                format_count(*total)
+            )),
+            (_, n) => Some(format_count(n as i64)),
         };
-        let pinned = self.paging.pinned.as_deref().map(|commit| {
-            (
-                format!("read at {}", short_commit(commit)),
-                commit.to_owned(),
-            )
-        });
-        let hints = match (self.editing.is_some(), self.kind) {
-            (true, _) => "↵ save · esc cancel",
-            (false, TableKind::Node) => "↵ edit · space peek · esc back · ⌘N row · ⌘⌫ delete",
-            (false, TableKind::Edge) => "↵ peek · space peek · esc back",
-        };
-        h_flex()
-            .h(px(studio_ui::chrome::FOOTER_HEIGHT))
-            .flex_none()
-            .px_3()
-            .gap_3()
-            .items_center()
-            .border_t_1()
-            .border_color(border)
-            .child(
-                Label::new(loaded)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .when(self.loading_more, |d| {
-                d.child(
-                    Label::new("Reading the next page…")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-            })
-            .when_some(self.more_error.clone(), |d, error| {
-                d.child(
-                    div().id("more-error").tooltip(Tooltip::text(error)).child(
-                        Label::new("The next page could not be read.")
-                            .size(LabelSize::XSmall)
+        let mut start = Vec::new();
+        if let Some(loaded) = loaded {
+            start.push(
+                div()
+                    .id("loaded-rows")
+                    .tooltip(Tooltip::text(if self.paging.exhausted {
+                        "Every row is loaded"
+                    } else {
+                        "Rows loaded so far; more load as you scroll"
+                    }))
+                    .child(studio_ui::ds::meta(IconName::Hash, loaded))
+                    .into_any_element(),
+            );
+        }
+        if let Some(commit) = self.paging.pinned.clone() {
+            start.push(
+                div()
+                    .id("pinned-commit")
+                    .tooltip(Tooltip::text(format!(
+                        "Every page of this table is read at commit {commit}"
+                    )))
+                    .child(studio_ui::ds::meta_code(
+                        IconName::GitCommit,
+                        short_commit(&commit),
+                        cx,
+                    ))
+                    .into_any_element(),
+            );
+        }
+        if self.loading_more {
+            start.push(
+                Icon::new(IconName::ArrowCircle)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted)
+                    .into_any_element(),
+            );
+        }
+        if let Some(error) = self.more_error.clone() {
+            start.push(
+                Button::new("retry-more", "Retry")
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::XSmall)
+                    .start_icon(
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::XSmall)
                             .color(Color::Error),
-                    ),
-                )
-                .child(
-                    Button::new("retry-more", "Try again")
-                        .style(ButtonStyle::Subtle)
-                        .label_size(LabelSize::XSmall)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.more_error = None;
-                            this.load_more(cx);
-                        })),
-                )
-            })
-            .when_some(pinned, |d, (label, commit)| {
-                d.child(
-                    div()
-                        .id("pinned-commit")
-                        .tooltip(Tooltip::text(format!(
-                            "Every page of this table is read at commit {commit}"
-                        )))
-                        .child(
-                            Label::new(label)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Disabled),
-                        ),
-                )
-            })
-            .child(div().flex_1())
-            .child(
-                Label::new(hints)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Disabled),
-            )
-            .into_any_element()
+                    )
+                    .tooltip(Tooltip::text(format!(
+                        "The next page could not be read: {error}"
+                    )))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.more_error = None;
+                        this.load_more(cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        let focus = self.focus_handle.clone();
+        let mut hints = h_flex().gap_4().items_center();
+        hints = match (self.editing.is_some(), self.kind) {
+            (true, _) => hints
+                .child(studio_ui::ds::key_hint(&ConfirmEdit, "Save", &focus, cx))
+                .child(studio_ui::ds::key_hint(&Cancel, "Cancel", &focus, cx)),
+            (false, TableKind::Node) => hints
+                .child(studio_ui::ds::key_hint(&EditCell, "Edit", &focus, cx))
+                .child(studio_ui::ds::key_hint(&PeekRow, "Peek", &focus, cx))
+                .child(studio_ui::ds::key_hint(&InsertRow, "Row", &focus, cx))
+                .child(studio_ui::ds::key_hint(&DeleteRow, "Delete", &focus, cx)),
+            (false, TableKind::Edge) => {
+                hints.child(studio_ui::ds::key_hint(&PeekRow, "Peek", &focus, cx))
+            }
+        };
+        ItemFooter {
+            start,
+            end: vec![hints.into_any_element()],
+        }
     }
 }
 
@@ -2135,7 +2152,6 @@ impl Render for TypeTable {
         let toolbar = self.render_toolbar(cx);
         let filter_bar = self.render_filter_bar(cx);
         let body = self.render_body(cx);
-        let footer = self.render_footer(cx);
         v_flex()
             .key_context(context)
             .track_focus(&self.focus_handle)
@@ -2179,6 +2195,5 @@ impl Render for TypeTable {
             .child(toolbar)
             .children(filter_bar)
             .child(div().flex_1().min_h_0().child(body))
-            .child(footer)
     }
 }

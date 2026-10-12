@@ -9811,6 +9811,7 @@ dependencies = [
  "gpui",
  "serde_json",
  "studio_actions",
+ "studio_settings",
  "studio_theme",
  "theme",
  "ui",

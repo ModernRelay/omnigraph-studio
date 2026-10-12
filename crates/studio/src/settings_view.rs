@@ -2,12 +2,15 @@
 //! control and Reset, filtered by a search box. Changes write `settings.json` and apply at once.
 
 use editor::{Editor, EditorEvent};
-use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString, Subscription, Window};
+use gpui::{
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString, Subscription,
+    Window,
+};
 use studio_settings::{StudioSettings, ThemeMode};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use theme::ThemeRegistry;
 use ui::prelude::*;
-use ui::{ContextMenu, PopoverMenu};
+use ui::{Callout, ContextMenu, PopoverMenu, Severity, Tooltip};
 
 pub struct SettingsView {
     focus_handle: FocusHandle,
@@ -88,7 +91,13 @@ fn stepper(
                     studio_settings::update(cx, move |s| down(s, -1));
                 }),
         )
-        .child(div().w(px(56.)).flex().justify_center().child(Label::new(value).size(LabelSize::Small)))
+        .child(
+            div()
+                .w(px(56.))
+                .flex()
+                .justify_center()
+                .child(Label::new(value).size(LabelSize::Small)),
+        )
         .child(
             IconButton::new((id, 1usize), IconName::Plus)
                 .icon_size(IconSize::Small)
@@ -144,19 +153,23 @@ fn agent_control(command: &[String]) -> AnyElement {
                     .truncate(),
             ),
         )
-        .child(h_flex().gap_1().children(agent_panel::PRESETS.iter().enumerate().map(
-            |(index, (name, preset))| {
-                let preset: Vec<String> = preset.iter().map(|s| (*s).to_owned()).collect();
-                Button::new(("agent-preset", index), *name)
-                    .label_size(LabelSize::Small)
-                    .style(ButtonStyle::Subtle)
-                    .toggle_state(preset.as_slice() == command)
-                    .on_click(move |_, _, cx| {
-                        let preset = preset.clone();
-                        studio_settings::update(cx, move |s| s.agent.command = preset);
-                    })
-            },
-        )))
+        .child(
+            h_flex()
+                .gap_1()
+                .children(agent_panel::PRESETS.iter().enumerate().map(
+                    |(index, (name, preset))| {
+                        let preset: Vec<String> = preset.iter().map(|s| (*s).to_owned()).collect();
+                        Button::new(("agent-preset", index), *name)
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Subtle)
+                            .toggle_state(preset.as_slice() == command)
+                            .on_click(move |_, _, cx| {
+                                let preset = preset.clone();
+                                studio_settings::update(cx, move |s| s.agent.command = preset);
+                            })
+                    },
+                )),
+        )
         .into_any_element()
 }
 
@@ -211,30 +224,46 @@ impl SettingsView {
                 title: "Editor font size",
                 description: "Text size in the query editor.",
                 is_default: settings.buffer_font_size == defaults.buffer_font_size,
-                control: stepper("buffer-font", format!("{}", settings.buffer_font_size), |s, d| {
-                    s.buffer_font_size = (s.buffer_font_size + d as f32).clamp(10., 24.)
-                }),
+                control: stepper(
+                    "buffer-font",
+                    format!("{}", settings.buffer_font_size),
+                    |s, d| s.buffer_font_size = (s.buffer_font_size + d as f32).clamp(10., 24.),
+                ),
                 reset: |s| s.buffer_font_size = StudioSettings::default().buffer_font_size,
             },
             Row {
                 title: "Table page size",
                 description: "Rows read per page in type tables.",
-                is_default: settings.studio.type_table_page_size == defaults.studio.type_table_page_size,
-                control: stepper("page-size", settings.studio.type_table_page_size.to_string(), |s, d| {
-                    let next = s.studio.type_table_page_size as i64 + d * 25;
-                    s.studio.type_table_page_size = next.clamp(25, 1000) as u32
-                }),
-                reset: |s| s.studio.type_table_page_size = StudioSettings::default().studio.type_table_page_size,
+                is_default: settings.studio.type_table_page_size
+                    == defaults.studio.type_table_page_size,
+                control: stepper(
+                    "page-size",
+                    settings.studio.type_table_page_size.to_string(),
+                    |s, d| {
+                        let next = s.studio.type_table_page_size as i64 + d * 25;
+                        s.studio.type_table_page_size = next.clamp(25, 1000) as u32
+                    },
+                ),
+                reset: |s| {
+                    s.studio.type_table_page_size =
+                        StudioSettings::default().studio.type_table_page_size
+                },
             },
             Row {
                 title: "Relationship page size",
                 description: "Neighbours shown per page in the relationship tree.",
                 is_default: settings.studio.tree_page_size == defaults.studio.tree_page_size,
-                control: stepper("tree-size", settings.studio.tree_page_size.to_string(), |s, d| {
-                    let next = s.studio.tree_page_size as i64 + d * 10;
-                    s.studio.tree_page_size = next.clamp(10, 500) as u32
-                }),
-                reset: |s| s.studio.tree_page_size = StudioSettings::default().studio.tree_page_size,
+                control: stepper(
+                    "tree-size",
+                    settings.studio.tree_page_size.to_string(),
+                    |s, d| {
+                        let next = s.studio.tree_page_size as i64 + d * 10;
+                        s.studio.tree_page_size = next.clamp(10, 500) as u32
+                    },
+                ),
+                reset: |s| {
+                    s.studio.tree_page_size = StudioSettings::default().studio.tree_page_size
+                },
             },
             Row {
                 title: "Agent",
@@ -247,11 +276,17 @@ impl SettingsView {
                 title: "Canvas node limit",
                 description: "Most nodes the canvas draws before offering a table instead.",
                 is_default: settings.studio.canvas_max_nodes == defaults.studio.canvas_max_nodes,
-                control: stepper("canvas-max", settings.studio.canvas_max_nodes.to_string(), |s, d| {
-                    let next = s.studio.canvas_max_nodes as i64 + d * 500;
-                    s.studio.canvas_max_nodes = next.clamp(500, 20_000) as u32
-                }),
-                reset: |s| s.studio.canvas_max_nodes = StudioSettings::default().studio.canvas_max_nodes,
+                control: stepper(
+                    "canvas-max",
+                    settings.studio.canvas_max_nodes.to_string(),
+                    |s, d| {
+                        let next = s.studio.canvas_max_nodes as i64 + d * 500;
+                        s.studio.canvas_max_nodes = next.clamp(500, 20_000) as u32
+                    },
+                ),
+                reset: |s| {
+                    s.studio.canvas_max_nodes = StudioSettings::default().studio.canvas_max_nodes
+                },
             },
         ]
     }
@@ -280,23 +315,41 @@ impl Render for SettingsView {
             .overflow_y_scroll()
             .p_6()
             .gap_4()
-            .child(Headline::new("Settings"))
             .child(
-                Label::new(format!("Saved to {}", path.display()))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                h_flex()
+                    .max_w(px(760.))
+                    .gap_2()
+                    .child(Headline::new("Settings"))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .w(px(280.))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .child(self.search.clone()),
+                    )
+                    .child(
+                        IconButton::new("reveal-settings", IconName::Folder)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text(format!("{}", path.display())))
+                            .on_click({
+                                let path = path.clone();
+                                move |_, _, cx| cx.reveal_path(&path)
+                            }),
+                    ),
             )
-            .children(error.map(|e| Label::new(e).size(LabelSize::Small).color(Color::Error)))
-            .child(
-                div()
-                    .w(px(360.))
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border)
-                    .child(self.search.clone()),
-            )
+            .children(error.map(|e| {
+                div().max_w(px(760.)).child(
+                    Callout::new()
+                        .severity(Severity::Error)
+                        .icon(IconName::Warning)
+                        .title("settings.json could not be applied")
+                        .description(e),
+                )
+            }))
             .child(
                 v_flex()
                     .max_w(px(760.))
@@ -308,20 +361,19 @@ impl Render for SettingsView {
                             .border_b_1()
                             .border_color(border_variant)
                             .child(
-                                v_flex()
-                                    .flex_1()
-                                    .child(Label::new(row.title))
-                                    .child(Label::new(row.description).size(LabelSize::Small).color(Color::Muted)),
+                                v_flex().flex_1().child(Label::new(row.title)).child(
+                                    Label::new(row.description)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
                             )
                             .child(row.control)
-                            .child(
-                                div().w(px(64.)).children((!row.is_default).then(|| {
-                                    Button::new(("reset", index), "Reset")
-                                        .label_size(LabelSize::Small)
-                                        .style(ButtonStyle::Subtle)
-                                        .on_click(move |_, _, cx| studio_settings::update(cx, reset))
-                                })),
-                            )
+                            .child(div().w(px(64.)).children((!row.is_default).then(|| {
+                                Button::new(("reset", index), "Reset")
+                                    .label_size(LabelSize::Small)
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(move |_, _, cx| studio_settings::update(cx, reset))
+                            })))
                     })),
             )
     }

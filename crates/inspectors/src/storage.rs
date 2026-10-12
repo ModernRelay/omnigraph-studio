@@ -444,7 +444,7 @@ fn section(title: &str, error: Option<String>, rows: Vec<AnyElement>, cx: &App) 
         .gap_1()
         .py_3()
         .border_b_1()
-        .border_color(studio_ui::chrome::hairline(cx))
+        .border_color(studio_ui::ds::surface::rule(cx))
         .child(
             Label::new(title.to_owned())
                 .size(LabelSize::Small)
@@ -502,17 +502,19 @@ impl Render for StorageInspector {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .p_4()
-                    .gap_3()
+                    .px_6()
+                    .py_4()
+                    .gap_4()
                     .child(server)
                     .child(graphs)
                     .child(snapshot)
                     .child(
-                        Label::new(
-                            "Index status is not served by OmniGraph 0.13 (E13); use `explain` in the query editor for a type's index facts.",
-                        )
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                        div()
+                            .id("index-status")
+                            .tooltip(ui::Tooltip::text(
+                                "OmniGraph 0.13 does not serve index status (E13); `explain` in the query editor shows a type's index facts",
+                            ))
+                            .child(studio_ui::ds::meta(IconName::Info, "Index status not served")),
                     ),
             )
     }

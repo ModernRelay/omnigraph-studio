@@ -5,8 +5,7 @@ use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, PermissionOption, PermissionOptionKind, PlanEntryStatus,
-    RequestPermissionOutcome, SelectedPermissionOutcome, SessionUpdate, StopReason,
-    ToolCallStatus,
+    RequestPermissionOutcome, SelectedPermissionOutcome, SessionUpdate, StopReason, ToolCallStatus,
 };
 use editor::Editor;
 use futures::StreamExt as _;
@@ -23,9 +22,10 @@ use serde_json::{Map, Value};
 use studio_actions::agent::{Allow, AllowAlways, Reject, Restart, Send, Stop};
 use studio_actions::graph::ReviewBranch;
 use studio_settings::StudioSettings;
-use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
-use ui::KeyBinding;
+use studio_ui::ds;
+use studio_workspace::{Item, ItemEvent, ItemFooter, SavedItem, Workspace};
 use ui::prelude::*;
+use ui::{Callout, CommonAnimationExt as _, Indicator, KeyBinding, Severity, Tooltip};
 
 use crate::host::{self, HostCommand, HostEvent, Launch};
 use crate::socket::{ToolRequest, ToolSocket};
@@ -64,9 +64,16 @@ enum State {
     /// An agent is chosen but not running.
     Idle,
     Starting,
-    Ready { agent: String },
-    Prompting { agent: String },
-    Exited { message: String, stderr: String },
+    Ready {
+        agent: String,
+    },
+    Prompting {
+        agent: String,
+    },
+    Exited {
+        message: String,
+        stderr: String,
+    },
 }
 
 /// The agent's branch for this agent session.
@@ -86,7 +93,12 @@ enum Decision {
 enum ProposalState {
     Waiting(oneshot::Sender<Decision>),
     Running,
-    Committed(String),
+    /// The commit id, or `None` when the mutation matched nothing, and what changed.
+    Committed {
+        commit: Option<String>,
+        nodes: i64,
+        edges: i64,
+    },
     Refused(String),
     Unknown,
     Rejected,
@@ -120,7 +132,10 @@ enum Entry {
     Plan(Vec<(String, PlanEntryStatus)>),
     Permission(PermissionCard),
     Proposal(Proposal),
-    Notice { text: String, error: bool },
+    Notice {
+        text: String,
+        error: bool,
+    },
 }
 
 struct Host {
@@ -172,14 +187,85 @@ impl Item for AgentPanel {
             data: Value::Null,
         })
     }
+
+    /// Delta's composer footer: the agent at work, the agent, then send or stop.
+    fn footer(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<ItemFooter> {
+        let running = matches!(self.state, State::Prompting { .. });
+        let can_send = matches!(
+            self.state,
+            State::Ready { .. } | State::Idle | State::Exited { .. } | State::Starting
+        );
+        let send_or_stop = if running {
+            ds::round_button("stop", IconName::Stop, false, cx)
+                .tooltip(|_, cx| Tooltip::for_action("Stop", &Stop, cx))
+                .on_click(cx.listener(|this, _, window, cx| this.stop(&Stop, window, cx)))
+        } else {
+            ds::round_button("send", IconName::ArrowUp, can_send, cx)
+                .when(!can_send, |button| button.opacity(0.4))
+                .tooltip(|_, cx| Tooltip::for_action("Send", &Send, cx))
+                .on_click(cx.listener(|this, _, window, cx| this.send(&Send, window, cx)))
+        };
+        let (agent_name, dot, state) = self.status();
+        let command = Self::command(cx).join(" ");
+        let about = if command.is_empty() {
+            format!("{state}. Choose the agent in Settings.")
+        } else {
+            format!("{state} · {command}. Choose the agent in Settings.")
+        };
+        let agent_pill = ds::pill("agent-pill", cx)
+            .tooltip(Tooltip::text(about))
+            .child(Indicator::dot().color(dot))
+            .child(ds::text::body(agent_name))
+            .child(
+                Icon::new(IconName::ChevronDown)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(studio_actions::workspace::OpenSettings), cx)
+            });
+        let mut end = Vec::new();
+        if matches!(self.state, State::Ready { .. } | State::Exited { .. }) {
+            end.push(
+                IconButton::new("restart", IconName::RotateCw)
+                    .icon_size(IconSize::Small)
+                    .tooltip(|_, cx| Tooltip::for_action("New agent session", &Restart, cx))
+                    .on_click(cx.listener(|this, _, window, cx| this.restart(&Restart, window, cx)))
+                    .into_any_element(),
+            );
+        }
+        if running {
+            end.push(
+                h_flex()
+                    .gap(px(ds::space::XS))
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::ArrowCircle)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted)
+                            .with_rotate_animation(2),
+                    )
+                    .child(ds::text::meta("Working"))
+                    .into_any_element(),
+            );
+        }
+        end.push(
+            h_flex()
+                .gap(px(ds::space::SM))
+                .items_center()
+                .child(agent_pill)
+                .child(send_or_stop)
+                .into_any_element(),
+        );
+        Some(ItemFooter {
+            start: Vec::new(),
+            end,
+        })
+    }
 }
 
 impl AgentPanel {
-    pub fn new(
-        session: Entity<GraphSession>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(session: Entity<GraphSession>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| {
             let mut editor = Editor::auto_height(2, 10, window, cx);
             editor.set_placeholder_text("Ask about the graph, or ask for a change…", window, cx);
@@ -236,20 +322,29 @@ impl AgentPanel {
         let data = studio_settings::data_dir().join("agent");
         let cwd = data.join("workspace");
         if let Err(error) = std::fs::create_dir_all(&cwd) {
-            self.fail_start(format!("Studio could not create {}: {error}", cwd.display()), cx);
+            self.fail_start(
+                format!("Studio could not create {}: {error}", cwd.display()),
+                cx,
+            );
             return;
         }
         let mut socket = match ToolSocket::bind(&crate::socket::socket_dir()) {
             Ok(socket) => socket,
             Err(error) => {
-                self.fail_start(format!("Studio could not open the tool socket: {error}"), cx);
+                self.fail_start(
+                    format!("Studio could not open the tool socket: {error}"),
+                    cx,
+                );
                 return;
             }
         };
         let executable = match std::env::current_exe() {
             Ok(path) => path,
             Err(error) => {
-                self.fail_start(format!("Studio could not find its own executable: {error}"), cx);
+                self.fail_start(
+                    format!("Studio could not find its own executable: {error}"),
+                    cx,
+                );
                 return;
             }
         };
@@ -426,15 +521,16 @@ impl AgentPanel {
                         title,
                         status,
                     } = entry
-                        && *existing == id {
-                            if let Some(new_title) = update.fields.title.clone() {
-                                *title = new_title;
-                            }
-                            if let Some(new_status) = update.fields.status {
-                                *status = new_status;
-                            }
-                            break;
+                        && *existing == id
+                    {
+                        if let Some(new_title) = update.fields.title.clone() {
+                            *title = new_title;
                         }
+                        if let Some(new_status) = update.fields.status {
+                            *status = new_status;
+                        }
+                        break;
+                    }
                 }
             }
             SessionUpdate::Plan(plan) => {
@@ -578,16 +674,15 @@ impl AgentPanel {
 
     fn choose_option(&mut self, index: usize, option_index: usize, cx: &mut Context<Self>) {
         if let Some(Entry::Permission(card)) = self.entries.get_mut(index)
-            && let (Some(reply), Some(option)) =
-                (card.reply.take(), card.options.get(option_index))
-            {
-                card.answer = Some(option.name.clone());
-                reply
-                    .send(RequestPermissionOutcome::Selected(
-                        SelectedPermissionOutcome::new(option.option_id.clone()),
-                    ))
-                    .ok();
-            }
+            && let (Some(reply), Some(option)) = (card.reply.take(), card.options.get(option_index))
+        {
+            card.answer = Some(option.name.clone());
+            reply
+                .send(RequestPermissionOutcome::Selected(
+                    SelectedPermissionOutcome::new(option.option_id.clone()),
+                ))
+                .ok();
+        }
         cx.notify();
     }
 
@@ -627,7 +722,10 @@ impl AgentPanel {
         let session = self.session.read(cx);
         let Some(schema) = session.schema_model() else {
             reply
-                .send(("The schema is still loading; try again in a moment.".into(), true))
+                .send((
+                    "The schema is still loading; try again in a moment.".into(),
+                    true,
+                ))
                 .ok();
             return;
         };
@@ -661,12 +759,13 @@ impl AgentPanel {
                     text.push_str(&format!("{branch}{mark}\n"));
                 }
                 if agent_branch.is_none()
-                    && let Some(branch) = &self.branch {
-                        text.push_str(&format!(
-                            "\nYour branch will be {} once you propose a change.\n",
-                            branch.name
-                        ));
-                    }
+                    && let Some(branch) = &self.branch
+                {
+                    text.push_str(&format!(
+                        "\nYour branch will be {} once you propose a change.\n",
+                        branch.name
+                    ));
+                }
                 reply.send((text, false)).ok();
             }
             ToolCall::Query {
@@ -848,19 +947,17 @@ impl AgentPanel {
                 .ok()
                 .flatten();
             let Some(write) = write else {
-                reply
-                    .send(("The agent session ended.".into(), true))
-                    .ok();
+                reply.send(("The agent session ended.".into(), true)).ok();
                 return;
             };
             let outcome = write.await;
             let (state, text, is_error) = describe_outcome(&outcome);
-            let committed = matches!(&outcome, WriteOutcome::Committed(output) if output.commit.is_some());
+            let committed =
+                matches!(&outcome, WriteOutcome::Committed(output) if output.commit.is_some());
             this.update(cx, |this, cx| {
-                if committed
-                    && let Some(branch) = &mut this.branch {
-                        branch.changes += 1;
-                    }
+                if committed && let Some(branch) = &mut this.branch {
+                    branch.changes += 1;
+                }
                 this.set_proposal_state(index, state, cx);
             })
             .ok();
@@ -897,37 +994,33 @@ impl AgentPanel {
 /// name the built `omnigraph-studio` next to them when it exists.
 fn proxy_executable(current: PathBuf) -> PathBuf {
     if let Ok(path) = std::env::var("OMNIGRAPH_STUDIO_PROXY")
-        && !path.is_empty() {
-            return PathBuf::from(path);
-        }
+        && !path.is_empty()
+    {
+        return PathBuf::from(path);
+    }
     current
 }
 
 fn describe_outcome(outcome: &WriteOutcome<ChangeOutput>) -> (ProposalState, String, bool) {
     match outcome {
-        WriteOutcome::Committed(output) => match &output.commit {
-            Some(commit) => {
-                let counts = format!(
-                    "{} nodes and {} edges changed",
-                    output.affected_nodes, output.affected_edges
-                );
-                // The agent gets the full id to refer to; the card shows its short form.
-                let card = format!(
-                    "Committed on {} as {}: {counts}.",
+        WriteOutcome::Committed(output) => {
+            let state = ProposalState::Committed {
+                commit: output.commit.as_ref().map(|c| c.graph_commit_id.clone()),
+                nodes: output.affected_nodes,
+                edges: output.affected_edges,
+            };
+            let text = match &output.commit {
+                Some(commit) => format!(
+                    "Committed on {}: commit {}, {} nodes and {} edges changed.",
                     output.branch,
-                    short_commit(&commit.graph_commit_id)
-                );
-                let text = format!(
-                    "Committed on {}: commit {}, {counts}.",
-                    output.branch, commit.graph_commit_id
-                );
-                (ProposalState::Committed(card), text, false)
-            }
-            None => {
-                let text = "Nothing changed: the mutation matched no rows.".to_owned();
-                (ProposalState::Committed(text.clone()), text, false)
-            }
-        },
+                    commit.graph_commit_id,
+                    output.affected_nodes,
+                    output.affected_edges
+                ),
+                None => "Nothing changed: the mutation matched no rows.".to_owned(),
+            };
+            (state, text, false)
+        }
         WriteOutcome::Refused(error) => {
             let text = format!(
                 "Refused by the server ({}): {}",
@@ -935,9 +1028,7 @@ fn describe_outcome(outcome: &WriteOutcome<ChangeOutput>) -> (ProposalState, Str
             );
             (ProposalState::Refused(text.clone()), text, true)
         }
-        WriteOutcome::Unknown { .. } => {
-            (ProposalState::Unknown, UNKNOWN_OUTCOME.to_owned(), true)
-        }
+        WriteOutcome::Unknown { .. } => (ProposalState::Unknown, UNKNOWN_OUTCOME.to_owned(), true),
     }
 }
 
@@ -957,27 +1048,84 @@ fn content_text(content: &ContentBlock) -> String {
 }
 
 // ---- rendering ----
+//
+// Layout, not sentences (spec 002): Delta's thread, a gutter icon beside each entry and one-line
+// activity rows; Zed's tool cards, a tinted header and a footer of icon buttons with key caps.
+// Explanations go in tooltips.
+
+/// Width of the thread's gutter, where each entry's icon sits.
+const GUTTER: f32 = 24.;
+
+/// A thread row: an icon in the gutter, the content beside it.
+fn gutter_row(icon: Option<Icon>, content: impl IntoElement) -> Div {
+    h_flex()
+        .w_full()
+        .items_start()
+        .gap_1()
+        .child(
+            div()
+                .w(px(GUTTER))
+                .flex_none()
+                // Centers a small icon on the first line of `text_sm` content.
+                .pt(px(4.))
+                .flex()
+                .justify_center()
+                .children(icon),
+        )
+        .child(div().flex_1().min_w_0().child(content))
+}
+
+/// A short verb for one of Studio's tools, as Delta labels activity ("Edit", "Read").
+fn tool_verb(title: &str) -> String {
+    if title.contains("omnigraph_schema") {
+        "Read the schema".into()
+    } else if title.contains("omnigraph_branches") {
+        "List branches".into()
+    } else if title.contains("omnigraph_query") {
+        "Query".into()
+    } else if title.contains("omnigraph_propose_change") {
+        "Propose a change".into()
+    } else {
+        title.to_owned()
+    }
+}
 
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        let (border, field_border, editor_bg) = (
-            studio_ui::chrome::hairline(cx),
-            colors.border_variant,
-            colors.editor_background,
-        );
-        let header = self.render_header(cx).into_any_element();
+        let editor_bg = cx.theme().colors().editor_background;
         let body = match &self.state {
             State::Setup => self.render_setup(cx).into_any_element(),
             _ => self.render_thread(window, cx).into_any_element(),
         };
         let banner = self.render_branch_banner(cx);
-        let composer = self.composer.clone();
-        let focus = self.focus_handle.clone();
-        let can_send = matches!(
-            self.state,
-            State::Ready { .. } | State::Idle | State::Exited { .. } | State::Starting
-        );
+        let (graph, branch) = {
+            let session = self.session.read(cx);
+            (session.graph_id.clone(), session.branch.clone())
+        };
+        // The prompt, inline under the thread as Delta writes it: the next message's gutter and
+        // the editor. The agent and send are in the footer strip.
+        let composer = div()
+            .id("composer")
+            .key_context("AgentComposer")
+            .flex_none()
+            .pl_2()
+            .pr_4()
+            .pt(px(ds::space::MD))
+            .pb(px(ds::space::LG))
+            .border_t_1()
+            .border_color(ds::surface::rule(cx))
+            .when(ds::is_glass(cx), |row| row.border_dashed())
+            .tooltip(Tooltip::text(format!(
+                "The agent reads {graph} at {branch}; its changes go to a branch of its own"
+            )))
+            .child(gutter_row(
+                Some(
+                    Icon::new(IconName::Person)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                ),
+                div().text_sm().child(self.composer.clone()),
+            ));
 
         v_flex()
             .key_context("AgentPanel")
@@ -990,178 +1138,120 @@ impl Render for AgentPanel {
             .on_action(cx.listener(Self::restart))
             .size_full()
             .bg(editor_bg)
-            .child(header)
             .child(body)
             .children(banner)
-            .child(
-                v_flex()
-                    .flex_none()
-                    .p_2()
-                    .gap_1()
-                    .border_t_1()
-                    .border_color(border)
-                    .child(
-                        div()
-                            .key_context("AgentComposer")
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(field_border)
-                            .bg(editor_bg)
-                            .child(composer),
-                    )
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .child(
-                                h_flex()
-                                    .gap_3()
-                                    .when(!matches!(self.state, State::Setup), |hints| hints.children(
-                                        [
-                                            (&Send as &dyn gpui::Action, "send"),
-                                            (&Allow, "allow"),
-                                            (&Reject, "reject"),
-                                            (&Stop, "stop"),
-                                        ]
-                                        .into_iter()
-                                        .map(|(action, label)| {
-                                            h_flex()
-                                                .gap_1()
-                                                .child(KeyBinding::for_action_in(action, &focus, cx))
-                                                .child(
-                                                    Label::new(label)
-                                                        .size(LabelSize::XSmall)
-                                                        .color(Color::Muted),
-                                                )
-                                        }),
-                                    )),
-                            )
-                            .child(
-                                Button::new("send", "Send")
-                                    .label_size(LabelSize::Small)
-                                    .disabled(!can_send)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.send(&Send, window, cx)
-                                    })),
-                            ),
-                    ),
-            )
+            .child(composer)
     }
 }
 
 impl AgentPanel {
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (status, color) = match &self.state {
-            State::Setup => ("No agent chosen".to_owned(), Color::Muted),
-            State::Idle => ("Not started".to_owned(), Color::Muted),
-            State::Starting => ("Starting…".to_owned(), Color::Muted),
-            State::Ready { agent } => (format!("{agent} · ready"), Color::Success),
-            State::Prompting { agent } => (format!("{agent} · working"), Color::Accent),
-            State::Exited { .. } => ("Stopped".to_owned(), Color::Error),
-        };
-        let command = Self::command(cx).join(" ");
-        let running = matches!(self.state, State::Prompting { .. });
-        let restartable = matches!(
-            self.state,
-            State::Ready { .. } | State::Exited { .. }
-        );
-        studio_ui::chrome::toolbar(cx)
-            .child(Icon::new(IconName::ZedAssistant).size(IconSize::Small))
-            .child(Label::new(status).size(LabelSize::Small).color(color))
-            .child(
-                div().flex_1().overflow_hidden().child(
-                    Label::new(command)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .single_line()
-                        .truncate(),
-                ),
-            )
-            .when(running, |row| {
-                row.child(
-                    Button::new("stop", "Stop")
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(|this, _, window, cx| this.stop(&Stop, window, cx))),
-                )
-            })
-            .when(restartable, |row| {
-                row.child(
-                    Button::new("restart", "New session")
-                        .label_size(LabelSize::Small)
-                        .style(ButtonStyle::Subtle)
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.restart(&Restart, window, cx)),
-                        ),
-                )
-            })
+    /// The agent's name, a dot for its state and what the state means.
+    fn status(&self) -> (String, Color, &'static str) {
+        match &self.state {
+            State::Setup => ("Agent".to_owned(), Color::Muted, "No agent chosen"),
+            State::Idle => (
+                "Agent".to_owned(),
+                Color::Muted,
+                "Starts when you send a message",
+            ),
+            State::Starting => ("Agent".to_owned(), Color::Warning, "Starting"),
+            State::Ready { agent } => (agent.clone(), Color::Success, "Ready"),
+            State::Prompting { agent } => (agent.clone(), Color::Accent, "Working"),
+            State::Exited { .. } => ("Agent".to_owned(), Color::Error, "Stopped"),
+        }
     }
 
     fn render_setup(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().colors().border;
+        let border = cx.theme().colors().border_variant;
         v_flex()
             .id("agent-setup")
             .overflow_y_scroll()
             .flex_1()
             .min_h_0()
+            .items_center()
+            .justify_center()
             .p_6()
-            .gap_3()
-            .child(Headline::new("Choose an agent").size(HeadlineSize::Small))
             .child(
-                Label::new(
-                    "Studio runs the agent on this computer over the Agent Client Protocol and \
-                     gives it tools for this graph. The agent never sees your token; every \
-                     change it proposes waits for you and lands on a branch of its own.",
-                )
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-            )
-            .children(PRESETS.iter().enumerate().map(|(index, (name, command))| {
-                let command: Vec<String> = command.iter().map(|s| (*s).to_owned()).collect();
-                let shown = command.join(" ");
-                h_flex()
-                    .gap_3()
+                v_flex()
+                    .w(px(320.))
+                    .gap_1()
                     .child(
+                        h_flex()
+                            .gap_1p5()
+                            .mb_2()
+                            .justify_center()
+                            .child(Label::new("Choose an agent").color(Color::Muted))
+                            .child(
+                                div()
+                                    .id("agent-info")
+                                    .tooltip(Tooltip::text(
+                                        "Studio runs the agent on this computer over the Agent \
+                                         Client Protocol and gives it tools for this graph. It \
+                                         never sees your token; each change it proposes waits \
+                                         for you and lands on a branch of its own.",
+                                    ))
+                                    .child(
+                                        Icon::new(IconName::Info)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    ),
+                            ),
+                    )
+                    .children(PRESETS.iter().enumerate().map(|(index, (name, command))| {
+                        let command: Vec<String> =
+                            command.iter().map(|s| (*s).to_owned()).collect();
+                        let shown = command.join(" ");
                         Button::new(("preset", index), *name)
-                            .style(ButtonStyle::Filled)
+                            .full_width()
+                            .style(ButtonStyle::Outlined)
+                            .label_size(LabelSize::Small)
+                            .start_icon(
+                                Icon::new(IconName::ZedAssistant)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .tooltip(Tooltip::text(format!(
+                                "Runs {shown}; npx downloads it the first time you send a message"
+                            )))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.use_command(command.clone(), cx)
-                            })),
-                    )
-                    .child(Label::new(shown).size(LabelSize::XSmall).color(Color::Muted))
-            }))
-            .child(
-                h_flex()
-                    .gap_2()
+                            }))
+                    }))
                     .child(
-                        div()
-                            .w(px(420.))
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(border)
-                            .child(self.custom_command.clone()),
+                        h_flex()
+                            .my_2()
+                            .gap_2()
+                            .child(ui::Divider::horizontal())
+                            .child(Label::new("or").size(LabelSize::XSmall).color(Color::Muted))
+                            .child(ui::Divider::horizontal()),
                     )
                     .child(
-                        Button::new("custom", "Use this command")
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let text = this.custom_command.read(cx).text(cx);
-                                let command: Vec<String> =
-                                    text.split_whitespace().map(str::to_owned).collect();
-                                if !command.is_empty() {
-                                    this.use_command(command, cx);
-                                }
-                            })),
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(border)
+                                    .child(self.custom_command.clone()),
+                            )
+                            .child(
+                                IconButton::new("use-custom", IconName::ArrowRight)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Use this command"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let text = this.custom_command.read(cx).text(cx);
+                                        let command: Vec<String> =
+                                            text.split_whitespace().map(str::to_owned).collect();
+                                        if !command.is_empty() {
+                                            this.use_command(command, cx);
+                                        }
+                                    })),
+                            ),
                     ),
-            )
-            .child(
-                Label::new(
-                    "Presets run npx, which downloads the agent the first time you send a message.",
-                )
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
             )
     }
 
@@ -1172,111 +1262,146 @@ impl AgentPanel {
             .overflow_y_scroll()
             .flex_1()
             .min_h_0()
-            .p_3()
-            .gap_2();
-        if self.entries.is_empty() {
-            let text = match &self.state {
-                State::Exited { .. } => "",
-                _ => "Ask a question about the graph, or ask for a change.",
-            };
-            thread = thread.child(Label::new(text).color(Color::Muted));
+            .py_4()
+            .pr_4()
+            .pl_2()
+            .gap_5();
+        if self.entries.is_empty() && !matches!(self.state, State::Exited { .. }) {
+            return thread
+                .child(studio_ui::ds::empty_state(
+                    IconName::ZedAssistant,
+                    "Ask about the graph",
+                ))
+                .into_any_element();
         }
         for (index, entry) in self.entries.iter().enumerate() {
             thread = thread.child(self.render_entry(index, entry, cx));
         }
         if let State::Exited { message, stderr } = &self.state {
-            thread = thread.child(
-                v_flex()
-                    .gap_1()
-                    .child(Label::new(message.clone()).color(Color::Error))
-                    .when(!stderr.is_empty(), |col| {
-                        col.child(
-                            div()
-                                .p_2()
-                                .rounded_md()
-                                .bg(cx.theme().colors().surface_background)
-                                .font_buffer(cx)
-                                .text_xs()
-                                .child(stderr.clone()),
-                        )
-                    }),
-            );
+            let mut callout = Callout::new()
+                .severity(Severity::Error)
+                .icon(IconName::XCircle)
+                .title(message.clone());
+            if !stderr.is_empty() {
+                callout = callout.description_slot(studio_ui::ds::code_block(stderr.clone(), cx));
+            }
+            thread = thread.child(gutter_row(None, callout));
         }
-        thread
+        thread.into_any_element()
     }
 
     fn render_entry(&self, index: usize, entry: &Entry, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors();
-        let (surface, border) = (colors.surface_background, colors.border_variant);
+        let text_muted = cx.theme().colors().text_muted;
         match entry {
-            Entry::User(text) => div()
-                .p_2()
-                .rounded_md()
-                .bg(surface)
-                .child(text.clone())
-                .into_any_element(),
-            Entry::Agent(text) => div().text_sm().child(text.clone()).into_any_element(),
-            Entry::Thought(text) => v_flex()
-                .child(
-                    Label::new("Thinking")
-                        .size(LabelSize::XSmall)
+            Entry::User(text) => gutter_row(
+                Some(
+                    Icon::new(IconName::Person)
+                        .size(IconSize::Small)
                         .color(Color::Muted),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(colors.text_muted)
-                        .max_h(px(80.))
-                        .overflow_hidden()
-                        .child(text.clone()),
-                )
-                .into_any_element(),
-            Entry::Tool { title, status, .. } => {
-                let (icon, color, label) = match status {
-                    ToolCallStatus::Pending => (IconName::Circle, Color::Muted, "pending"),
-                    ToolCallStatus::InProgress => (IconName::ArrowCircle, Color::Accent, "running"),
-                    ToolCallStatus::Completed => (IconName::Check, Color::Success, "done"),
-                    ToolCallStatus::Failed => (IconName::XCircle, Color::Error, "failed"),
-                    _ => (IconName::Circle, Color::Muted, ""),
-                };
+                ),
+                div().text_sm().child(text.clone()),
+            )
+            .into_any_element(),
+            Entry::Agent(text) => gutter_row(
+                Some(
+                    Icon::new(IconName::ZedAssistant)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                ),
+                div().text_sm().child(text.trim().to_owned()),
+            )
+            .into_any_element(),
+            Entry::Thought(text) => gutter_row(
+                None,
                 h_flex()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border)
-                    .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+                    .id(("thought", index))
+                    .gap_1()
+                    .tooltip(Tooltip::text(text.clone()))
                     .child(
-                        Label::new(title.clone())
-                            .size(LabelSize::Small)
-                            .single_line()
-                            .truncate(),
+                        Icon::new(IconName::Sparkle)
+                            .size(IconSize::XSmall)
+                            .color(Color::Disabled),
                     )
-                    .child(Label::new(label).size(LabelSize::XSmall).color(Color::Muted))
-                    .into_any_element()
-            }
-            Entry::Plan(items) => v_flex()
-                .gap_0p5()
-                .child(Label::new("Plan").size(LabelSize::XSmall).color(Color::Muted))
-                .children(items.iter().map(|(content, status)| {
-                    let (icon, color) = match status {
-                        PlanEntryStatus::Completed => (IconName::Check, Color::Success),
-                        PlanEntryStatus::InProgress => (IconName::ArrowRight, Color::Accent),
-                        _ => (IconName::Circle, Color::Muted),
-                    };
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(text_muted)
+                            .truncate()
+                            .child(text.lines().next().unwrap_or_default().to_owned()),
+                    ),
+            )
+            .into_any_element(),
+            Entry::Tool { title, status, .. } => {
+                let icon = match status {
+                    ToolCallStatus::Pending => Icon::new(IconName::Circle).color(Color::Disabled),
+                    ToolCallStatus::InProgress => {
+                        Icon::new(IconName::ArrowCircle).color(Color::Accent)
+                    }
+                    ToolCallStatus::Completed => Icon::new(IconName::Check).color(Color::Success),
+                    ToolCallStatus::Failed => Icon::new(IconName::XCircle).color(Color::Error),
+                    _ => Icon::new(IconName::Circle).color(Color::Disabled),
+                };
+                gutter_row(
+                    Some(icon.size(IconSize::XSmall)),
                     h_flex()
-                        .gap_2()
-                        .child(Icon::new(icon).size(IconSize::XSmall).color(color))
-                        .child(Label::new(content.clone()).size(LabelSize::Small))
-                }))
-                .into_any_element(),
-            Entry::Notice { text, error } => Label::new(text.clone())
-                .size(LabelSize::Small)
-                .color(if *error { Color::Error } else { Color::Muted })
-                .into_any_element(),
-            Entry::Permission(card) => self.render_permission(index, card, cx),
-            Entry::Proposal(proposal) => self.render_proposal(index, proposal, cx),
+                        .id(("tool", index))
+                        .tooltip(Tooltip::text(title.clone()))
+                        .child(
+                            Label::new(tool_verb(title))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .single_line()
+                                .truncate(),
+                        ),
+                )
+                .into_any_element()
+            }
+            Entry::Plan(items) => gutter_row(
+                Some(
+                    Icon::new(IconName::ListTodo)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                ),
+                v_flex()
+                    .gap_0p5()
+                    .children(items.iter().map(|(content, status)| {
+                        let icon = match status {
+                            PlanEntryStatus::Completed => {
+                                Icon::new(IconName::Check).color(Color::Success)
+                            }
+                            PlanEntryStatus::InProgress => {
+                                Icon::new(IconName::ArrowRight).color(Color::Accent)
+                            }
+                            _ => Icon::new(IconName::Circle).color(Color::Disabled),
+                        };
+                        h_flex()
+                            .gap_2()
+                            .child(icon.size(IconSize::XSmall))
+                            .child(Label::new(content.clone()).size(LabelSize::Small))
+                    })),
+            )
+            .into_any_element(),
+            Entry::Notice { text, error } => gutter_row(
+                Some(
+                    Icon::new(if *error {
+                        IconName::Warning
+                    } else {
+                        IconName::Info
+                    })
+                    .size(IconSize::XSmall)
+                    .color(if *error { Color::Error } else { Color::Muted }),
+                ),
+                Label::new(text.clone())
+                    .size(LabelSize::Small)
+                    .color(if *error { Color::Error } else { Color::Muted }),
+            )
+            .into_any_element(),
+            Entry::Permission(card) => {
+                gutter_row(None, self.render_permission(index, card, cx)).into_any_element()
+            }
+            Entry::Proposal(proposal) => {
+                gutter_row(None, self.render_proposal(index, proposal, cx)).into_any_element()
+            }
         }
     }
 
@@ -1286,30 +1411,48 @@ impl AgentPanel {
         card: &PermissionCard,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let border = cx.theme().colors().border;
-        v_flex()
-            .p_2()
-            .gap_2()
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .child(Label::new(card.title.clone()).size(LabelSize::Small))
-            .map(|card_el| match &card.answer {
-                Some(answer) => card_el.child(
-                    Label::new(answer.clone())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
-                None => card_el.child(h_flex().gap_1().children(
-                    card.options.iter().enumerate().map(|(option_index, option)| {
-                        Button::new(("permission", index * 16 + option_index), option.name.clone())
-                            .label_size(LabelSize::Small)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.choose_option(index, option_index, cx)
-                            }))
-                    }),
-                )),
-            })
+        let header = studio_ui::ds::card_header(cx)
+            .child(
+                Icon::new(IconName::Warning)
+                    .size(IconSize::XSmall)
+                    .color(Color::Warning),
+            )
+            .child(
+                Label::new(card.title.clone())
+                    .size(LabelSize::Small)
+                    .single_line()
+                    .truncate(),
+            );
+        let footer = match &card.answer {
+            Some(answer) => studio_ui::ds::card_footer(cx).child(
+                Label::new(answer.clone())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            ),
+            None => studio_ui::ds::card_footer(cx).children(card.options.iter().enumerate().map(
+                |(option_index, option)| {
+                    let (icon, color) = match option.kind {
+                        PermissionOptionKind::AllowOnce => (IconName::Check, Color::Success),
+                        PermissionOptionKind::AllowAlways => {
+                            (IconName::CheckDouble, Color::Success)
+                        }
+                        _ => (IconName::Close, Color::Error),
+                    };
+                    Button::new(
+                        ("permission", index * 16 + option_index),
+                        option.name.clone(),
+                    )
+                    .label_size(LabelSize::Small)
+                    .start_icon(Icon::new(icon).size(IconSize::XSmall).color(color))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.choose_option(index, option_index, cx)
+                    }))
+                },
+            )),
+        };
+        studio_ui::ds::card(cx)
+            .child(header)
+            .child(footer)
             .into_any_element()
     }
 
@@ -1319,118 +1462,200 @@ impl AgentPanel {
         proposal: &Proposal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let colors = cx.theme().colors();
-        let (border, surface) = (colors.border, colors.surface_background);
-        let target = match &proposal.creates_from {
-            Some(base) => format!("Creates {} from {base}, then runs there", proposal.branch),
-            None => format!("Runs on {}", proposal.branch),
-        };
-        let params = proposal
-            .params
-            .as_ref()
-            .map(|params| serde_json::to_string_pretty(params).unwrap_or_default());
-        let (status, color): (Option<String>, Color) = match &proposal.state {
-            ProposalState::Waiting(_) => (None, Color::Default),
-            ProposalState::Running => (Some("Running…".into()), Color::Muted),
-            ProposalState::Committed(text) => (Some(text.clone()), Color::Success),
-            ProposalState::Refused(text) => (Some(text.clone()), Color::Error),
-            ProposalState::Unknown => (Some(UNKNOWN_OUTCOME.into()), Color::Warning),
-            ProposalState::Rejected => (Some("Rejected.".into()), Color::Muted),
-        };
-        let waiting = matches!(proposal.state, ProposalState::Waiting(_));
-        v_flex()
-            .p_2()
-            .gap_2()
-            .rounded_md()
-            .border_1()
-            .border_color(border)
+        let focus = self.focus_handle.clone();
+        let header = studio_ui::ds::card_header(cx)
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(Icon::new(IconName::Pencil).size(IconSize::Small))
-                    .child(Label::new(proposal.summary.clone())),
-            )
-            .child(
-                Label::new(target)
-                    .size(LabelSize::XSmall)
+                Icon::new(IconName::Pencil)
+                    .size(IconSize::XSmall)
                     .color(Color::Muted),
             )
             .child(
-                div()
-                    .p_2()
-                    .rounded_sm()
-                    .bg(surface)
-                    .font_buffer(cx)
-                    .text_xs()
-                    .child(proposal.query.clone()),
+                Label::new(proposal.summary.clone())
+                    .size(LabelSize::Small)
+                    .single_line()
+                    .truncate(),
             )
-            .children(params.map(|params| {
+            .child(div().flex_1())
+            .child(
                 div()
-                    .p_2()
-                    .rounded_sm()
-                    .bg(surface)
-                    .font_buffer(cx)
-                    .text_xs()
-                    .child(params)
-            }))
-            .children(
-                status.map(|status| Label::new(status).size(LabelSize::Small).color(color)),
-            )
-            .when(waiting, |card| {
-                card.child(
-                    h_flex()
-                        .gap_1()
-                        .child(
-                            Button::new(("allow", index), "Allow")
-                                .style(ButtonStyle::Filled)
-                                .label_size(LabelSize::Small)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.decide(index, Decision::Allow, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new(("always", index), "Always for this branch")
-                                .label_size(LabelSize::Small)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.decide(index, Decision::AllowAlways, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new(("reject", index), "Reject")
-                                .label_size(LabelSize::Small)
-                                .style(ButtonStyle::Subtle)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.decide(index, Decision::Reject, cx)
-                                })),
+                    .id(("proposal-branch", index))
+                    .tooltip(Tooltip::text(match &proposal.creates_from {
+                        Some(base) => format!(
+                            "Runs on {}, which Studio creates from {base} first",
+                            proposal.branch
                         ),
+                        None => format!("Runs on {}", proposal.branch),
+                    }))
+                    .child(studio_ui::ds::meta(
+                        IconName::GitBranch,
+                        proposal.branch.clone(),
+                    )),
+            )
+            .when(proposal.creates_from.is_some(), |header| {
+                header.child(ui::Chip::new("new").label_size(LabelSize::XSmall))
+            });
+        let params = proposal.params.as_ref().map(|params| {
+            ds::fields().children(params.iter().map(|(key, value)| {
+                ds::field(
+                    format!("${key}"),
+                    ds::text::code(
+                        match value {
+                            Value::String(text) => text.clone(),
+                            other => other.to_string(),
+                        },
+                        cx,
+                    )
+                    .single_line()
+                    .truncate(),
                 )
-            })
+            }))
+        });
+        let body = ds::card_body()
+            .child(ds::code_block(proposal.query.clone(), cx))
+            .children(params);
+        let footer = match &proposal.state {
+            ProposalState::Waiting(_) => studio_ui::ds::card_footer(cx)
+                .child(
+                    Button::new(("allow", index), "Allow")
+                        .label_size(LabelSize::Small)
+                        .start_icon(
+                            Icon::new(IconName::Check)
+                                .size(IconSize::XSmall)
+                                .color(Color::Success),
+                        )
+                        .key_binding(KeyBinding::for_action_in(&Allow, &focus, cx))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.decide(index, Decision::Allow, cx)
+                        })),
+                )
+                .child(
+                    Button::new(("always", index), "Always on this branch")
+                        .label_size(LabelSize::Small)
+                        .start_icon(
+                            Icon::new(IconName::CheckDouble)
+                                .size(IconSize::XSmall)
+                                .color(Color::Success),
+                        )
+                        .key_binding(KeyBinding::for_action_in(&AllowAlways, &focus, cx))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.decide(index, Decision::AllowAlways, cx)
+                        })),
+                )
+                .child(div().flex_1())
+                .child(
+                    Button::new(("reject", index), "Reject")
+                        .label_size(LabelSize::Small)
+                        .start_icon(
+                            Icon::new(IconName::Close)
+                                .size(IconSize::XSmall)
+                                .color(Color::Error),
+                        )
+                        .key_binding(KeyBinding::for_action_in(&Reject, &focus, cx))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.decide(index, Decision::Reject, cx)
+                        })),
+                ),
+            state => {
+                let (icon, color, label, tooltip): (IconName, Color, String, Option<String>) =
+                    match state {
+                        ProposalState::Running => {
+                            (IconName::ArrowCircle, Color::Accent, "Running".into(), None)
+                        }
+                        ProposalState::Committed {
+                            commit: Some(commit),
+                            nodes,
+                            edges,
+                        } => (
+                            IconName::Check,
+                            Color::Success,
+                            "Committed".into(),
+                            Some(format!(
+                                "Commit {commit}: {nodes} nodes and {edges} edges changed"
+                            )),
+                        ),
+                        ProposalState::Committed { commit: None, .. } => (
+                            IconName::Check,
+                            Color::Muted,
+                            "No change".into(),
+                            Some("The mutation matched no rows".into()),
+                        ),
+                        ProposalState::Refused(message) => (
+                            IconName::XCircle,
+                            Color::Error,
+                            "Refused".into(),
+                            Some(message.clone()),
+                        ),
+                        ProposalState::Unknown => (
+                            IconName::Warning,
+                            Color::Warning,
+                            "Outcome unknown".into(),
+                            Some(UNKNOWN_OUTCOME.into()),
+                        ),
+                        _ => (IconName::Close, Color::Muted, "Rejected".into(), None),
+                    };
+                let commit = match state {
+                    ProposalState::Committed {
+                        commit: Some(commit),
+                        nodes,
+                        edges,
+                    } => Some((short_commit(commit), *nodes + *edges)),
+                    _ => None,
+                };
+                studio_ui::ds::card_footer(cx)
+                    .px_2()
+                    .gap_3()
+                    .child(
+                        h_flex()
+                            .id(("outcome", index))
+                            .gap_1()
+                            .when_some(tooltip, |d, tooltip| d.tooltip(Tooltip::text(tooltip)))
+                            .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+                            .child(Label::new(label).size(LabelSize::Small).color(color)),
+                    )
+                    .when_some(commit, |d, (commit, changed)| {
+                        d.child(studio_ui::ds::meta_code(IconName::GitCommit, commit, cx))
+                            .child(studio_ui::ds::meta(IconName::Pencil, changed.to_string()))
+                    })
+            }
+        };
+        studio_ui::ds::card(cx)
+            .child(header)
+            .child(body)
+            .child(footer)
             .into_any_element()
     }
 
     fn render_branch_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let branch = self.branch.as_ref().filter(|b| b.created && b.changes > 0)?;
-        let border = cx.theme().colors().border_variant;
-        let text = format!(
-            "{} · {} change{}",
-            branch.name,
-            branch.changes,
-            if branch.changes == 1 { "" } else { "s" }
-        );
+        let branch = self
+            .branch
+            .as_ref()
+            .filter(|b| b.created && b.changes > 0)?;
         Some(
             h_flex()
                 .flex_none()
+                .h(px(studio_ui::ds::size::STRIP))
                 .px_3()
-                .py_1()
-                .gap_2()
+                .gap_3()
                 .border_t_1()
-                .border_color(border)
-                .child(Icon::new(IconName::GitBranch).size(IconSize::Small))
-                .child(Label::new(text).size(LabelSize::Small))
+                .border_color(studio_ui::ds::surface::rule(cx))
+                .child(studio_ui::ds::meta(
+                    IconName::GitBranch,
+                    branch.name.clone(),
+                ))
+                .child(
+                    div()
+                        .id("agent-changes")
+                        .tooltip(Tooltip::text("Changes committed on the agent's branch"))
+                        .child(studio_ui::ds::meta(
+                            IconName::Pencil,
+                            branch.changes.to_string(),
+                        )),
+                )
                 .child(div().flex_1())
                 .child(
                     Button::new("review", "Review")
                         .label_size(LabelSize::Small)
+                        .start_icon(Icon::new(IconName::Eye).size(IconSize::XSmall))
                         .on_click(cx.listener(|this, _, window, cx| this.review(window, cx))),
                 )
                 .into_any_element(),

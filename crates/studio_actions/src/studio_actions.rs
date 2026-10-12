@@ -58,6 +58,9 @@ pub mod workspace {
         [
             /// Activate the last tab.
             ActivateLastItem,
+            /// Open the design system gallery: every token and component in the current window
+            /// style.
+            OpenDesignSystem,
         ]
     );
 }

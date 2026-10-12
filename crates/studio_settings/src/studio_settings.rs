@@ -38,10 +38,23 @@ impl Default for ThemeChoice {
     }
 }
 
+/// How the window's surfaces are drawn (spec 002, "Visual language").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowStyle {
+    /// Columns on solid panels, split by hairlines.
+    #[default]
+    Flat,
+    /// The document and inspector float as translucent sheets over a faint wash.
+    Glass,
+}
+
 /// Studio's own settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StudioOptions {
+    /// Flat columns, or glass sheets.
+    pub window_style: WindowStyle,
     /// Rows per page in type tables.
     pub type_table_page_size: u32,
     /// Neighbours per page in the relationship tree.
@@ -55,6 +68,7 @@ pub struct StudioOptions {
 impl Default for StudioOptions {
     fn default() -> Self {
         Self {
+            window_style: WindowStyle::default(),
             type_table_page_size: 100,
             tree_page_size: 50,
             canvas_max_nodes: 2000,
@@ -87,7 +101,7 @@ impl Default for StudioSettings {
     fn default() -> Self {
         Self {
             theme: ThemeChoice::default(),
-            ui_font_size: 15.,
+            ui_font_size: 16.,
             buffer_font_size: 14.,
             studio: StudioOptions::default(),
             agent: AgentSettings::default(),
@@ -109,10 +123,13 @@ impl Global for SettingsFileState {}
 /// elsewhere.
 pub fn data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("OMNIGRAPH_STUDIO_DATA")
-        && !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
     if cfg!(target_os = "macos") {
         home.join("Library/Application Support/OmniGraph Studio")
     } else {
@@ -221,8 +238,7 @@ fn watch(cx: &mut App) {
             cx.background_executor().timer(Duration::from_secs(2)).await;
             let path = settings_path();
             let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-            let changed = cx
-                .update(|cx| cx.global::<SettingsFileState>().modified != modified);
+            let changed = cx.update(|cx| cx.global::<SettingsFileState>().modified != modified);
             if changed {
                 let (settings, modified, error) = read_file();
                 cx.update(|cx| {
@@ -241,7 +257,10 @@ mod tests {
 
     #[test]
     fn missing_keys_take_defaults_and_unknown_keys_are_ignored() {
-        let settings = StudioSettings::parse(r#"{"ui_font_size": 13, "extra": 1, "studio": {"tree_page_size": 20}}"#).unwrap();
+        let settings = StudioSettings::parse(
+            r#"{"ui_font_size": 13, "extra": 1, "studio": {"tree_page_size": 20}}"#,
+        )
+        .unwrap();
         assert_eq!(settings.ui_font_size, 13.);
         assert_eq!(settings.studio.tree_page_size, 20);
         assert_eq!(settings.studio.type_table_page_size, 100);

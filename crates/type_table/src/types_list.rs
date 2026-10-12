@@ -6,7 +6,6 @@ use graph_store::{GraphSession, Loadable, SessionEvent};
 use studio_actions::graph::OpenType;
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;
-use ui::Tooltip;
 
 use crate::model::format_count;
 
@@ -100,7 +99,7 @@ impl Render for TypesList {
                     .into_any_element();
             }
             _ => {
-                return studio_ui::chrome::sidebar_note("Reading types…").into_any_element();
+                return studio_ui::ds::sidebar_note("Reading types…").into_any_element();
             }
         };
         let counts_error = match &s.datasets {
@@ -132,7 +131,7 @@ impl Render for TypesList {
         let mut list = v_flex().w_full();
         for (index, (name, count, is_edge)) in entries.into_iter().enumerate() {
             if Some(index) == first_edge {
-                list = list.child(studio_ui::chrome::section_label("Relationships").pt_3());
+                list = list.child(studio_ui::ds::section_label("Relationships").pt_3());
             }
             let selected = active.as_deref() == Some(format!("type:{name}").as_str());
             let action = OpenType {
@@ -143,25 +142,12 @@ impl Render for TypesList {
                 None => format!("Rows at the head of {branch}"),
             };
             list = list.child(
-                studio_ui::chrome::sidebar_item(("type", index), selected)
-                    .start_slot(studio_ui::type_swatch(&name))
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .gap_2()
-                            .child(
-                                Label::new(name.clone())
-                                    .size(LabelSize::Small)
-                                    .when(is_edge, |l| l.color(Color::Muted)),
-                            )
-                            .child(div().flex_1())
-                            .child(
-                                div()
-                                    .id(("type-count", index))
-                                    .tooltip(Tooltip::text(tooltip))
-                                    .child(studio_ui::chrome::sidebar_count(count)),
-                            ),
-                    )
+                studio_ui::ds::SidebarRow::new(("type", index), name.clone())
+                    .start(studio_ui::type_swatch(&name))
+                    .end(studio_ui::ds::sidebar_count(count))
+                    .muted(is_edge)
+                    .selected(selected)
+                    .tooltip(tooltip)
                     .on_click(move |_, window, cx| {
                         window.dispatch_action(Box::new(action.clone()), cx)
                     }),

@@ -1,11 +1,12 @@
 //! The relationship tree (spec 005): a node, its relationship groups with counts, the nodes at
 //! the other end, their groups, and so on, as a path tree over the session's shared
-//! [`Exploration`]. It lives in the sidebar as the "Explore" section.
+//! [`Exploration`]. It is the left dock's "Explore" panel.
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/005-relationship-tree/plan.md`.
 //!
-//! Rooting: the tree registers a workspace handler for `OpenNode` that reveals the node (selects
-//! it where the tree already shows it, else roots the tree there and focuses the tree) and then
+//! Rooting: the tree registers a workspace handler for `OpenNode` that shows the Explore panel,
+//! reveals the node (selects it where the tree already shows it, else roots the tree there and
+//! focuses the tree) and then
 //! calls `cx.propagate()`, so a later handler, such as the inspector's, still runs. GPUI stops
 //! at the first bubble handler that does not propagate, so a feature crate that handles
 //! `OpenNode` before this one and does not propagate should call
@@ -17,7 +18,8 @@ mod rows;
 use std::ops::Range;
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable, KeyContext, KeyDownEvent, ListSizingBehavior, Render, ScrollStrategy, Subscription,
+    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable,
+    KeyContext, KeyDownEvent, ListSizingBehavior, Render, ScrollStrategy, Subscription,
     UniformListScrollHandle, Window, uniform_list,
 };
 use graph_store::{
@@ -30,18 +32,20 @@ use studio_actions::tree::{
     SelectPrevious, ShowOnCanvas,
 };
 use studio_ui::type_swatch;
-use studio_workspace::{Workspace, WorkspaceEvent};
+use studio_workspace::{PanelPosition, Workspace, WorkspaceEvent};
 use ui::prelude::*;
 use ui::{IndentGuideColors, StickyCandidate, Tooltip};
 
 pub use rows::{RowId, RowTag};
 
+/// The tree's panel id in the left dock.
+const EXPLORE_PANEL: &str = "explore";
 const ROW_HEIGHT: f32 = 24.;
 const INDENT: f32 = 12.;
 const LEFT_PAD: f32 = 8.;
 const DISCLOSURE: f32 = 12.;
 
-/// Registers the tree's keys and adds the "Explore" section to every workspace.
+/// Registers the tree's keys and adds the "Explore" panel to every workspace.
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
@@ -50,9 +54,17 @@ pub fn init(cx: &mut App) {
         let handle = cx.entity();
         let session = workspace.session().cloned();
         let tree = cx.new(|cx| RelationshipTree::new(&handle, session, window, cx));
-        workspace.add_sidebar_section("Explore", tree.clone().into(), cx);
+        workspace.add_panel(
+            PanelPosition::Left,
+            EXPLORE_PANEL,
+            "Explore",
+            IconName::ListTree,
+            tree.clone().into(),
+            cx,
+        );
         workspace.register_action(move |workspace, action: &OpenNode, window, cx| {
             if let Some(session) = workspace.session().cloned() {
+                workspace.activate_panel(EXPLORE_PANEL, cx);
                 let node = NodeRef::new(action.type_name.clone(), action.id.clone());
                 reveal(&tree, &session, node, window, cx);
             }
@@ -930,8 +942,11 @@ impl Render for RelationshipTree {
             .is_some_and(|exploration| exploration.read(cx).root().is_some());
         if !has_root || self.entries.is_empty() {
             return root
-                .child(studio_ui::chrome::sidebar_note(
-                    "Press ↵ on a row to walk its relationships.",
+                .child(studio_ui::ds::sidebar_placeholder(
+                    "explore-empty",
+                    IconName::ListTree,
+                    "No node",
+                    "Press ↵ on a table row, or ⌘K and Open Node, to walk its relationships",
                 ))
                 .into_any_element();
         }

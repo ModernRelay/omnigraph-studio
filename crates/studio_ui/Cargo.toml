@@ -9,6 +9,7 @@ publish.workspace = true
 path = "src/studio_ui.rs"
 
 [dependencies]
+studio_settings = { workspace = true }
 gpui = { workspace = true }
 ui = { workspace = true }
 theme = { workspace = true }

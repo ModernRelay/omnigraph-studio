@@ -2,7 +2,8 @@
 //! `workspace::Item`.
 
 use gpui::{
-    AnyView, App, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Render, SharedString,
+    AnyElement, AnyView, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    Render, SharedString, Window,
 };
 use ui::IconName;
 
@@ -14,6 +15,16 @@ pub enum ItemEvent {
     UpdateTab,
     /// The item asks to be closed.
     Close,
+}
+
+/// What a tab shows in the document column's footer strip (spec 002, after Delta's footers):
+/// facts about the open document after the workspace's graph and branch at the start, and the
+/// tab's controls and key hints at the end. The workspace draws the strip, so every tab's footer
+/// sits on the same baseline as the sidebar's.
+#[derive(Default)]
+pub struct ItemFooter {
+    pub start: Vec<AnyElement>,
+    pub end: Vec<AnyElement>,
 }
 
 pub trait Item: Render + Focusable + EventEmitter<ItemEvent> {
@@ -43,6 +54,11 @@ pub trait Item: Render + Focusable + EventEmitter<ItemEvent> {
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
         None
     }
+
+    /// The tab's part of the footer strip; `None` shows only the graph and branch.
+    fn footer(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<ItemFooter> {
+        None
+    }
 }
 
 pub trait ItemHandle: 'static {
@@ -56,6 +72,7 @@ pub trait ItemHandle: 'static {
     fn focus_handle(&self, cx: &App) -> FocusHandle;
     fn boxed_clone(&self) -> Box<dyn ItemHandle>;
     fn serialize(&self, cx: &App) -> Option<SavedItem>;
+    fn footer(&self, window: &mut Window, cx: &mut App) -> Option<ItemFooter>;
 }
 
 impl<T: Item> ItemHandle for Entity<T> {
@@ -97,5 +114,9 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn serialize(&self, cx: &App) -> Option<SavedItem> {
         self.read(cx).serialize(cx)
+    }
+
+    fn footer(&self, window: &mut Window, cx: &mut App) -> Option<ItemFooter> {
+        self.update(cx, |item, cx| item.footer(window, cx))
     }
 }

@@ -27,7 +27,7 @@ pub const LONG_HISTORY: usize = 5_000;
 /// Other branches whose lists History reads for heads and merged-in commits.
 const OTHER_BRANCHES: usize = 20;
 
-const ROW_HEIGHT: f32 = 28.;
+const ROW_HEIGHT: f32 = 34.;
 const LANE_WIDTH: f32 = 14.;
 const GRAPH_PADDING: f32 = 8.;
 
@@ -439,7 +439,7 @@ impl HistoryView {
     }
 
     fn render_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        let border = studio_ui::chrome::hairline(cx);
+        let border = studio_ui::ds::surface::rule(cx);
         let graph_width = self.graph_width();
         let column = |title: &'static str, width: Option<f32>| {
             let label = Label::new(title).size(LabelSize::Small).color(Color::Muted);

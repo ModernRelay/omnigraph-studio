@@ -148,36 +148,29 @@ impl BranchList {
                 let name = name.clone();
                 move |_, _, _| {
                     let (when, tooltip) = detail.clone().unzip();
-                    studio_ui::chrome::sidebar_item(("branch", index), current)
-                        .start_slot(
+                    let row = studio_ui::ds::SidebarRow::new(("branch", index), name.clone())
+                        .start(
                             Icon::new(IconName::GitBranch)
                                 .size(IconSize::Small)
                                 .color(Color::Muted),
                         )
-                        .when_some(tooltip, |item, tooltip| item.tooltip(Tooltip::text(tooltip)))
-                        .child(
-                            h_flex()
-                                .w_full()
-                                .min_w_0()
-                                .gap_2()
-                                .child(
-                                    Label::new(name.clone())
-                                        .size(LabelSize::Small)
-                                        .single_line()
-                                        .truncate(),
-                                )
-                                .child(div().flex_1())
-                                .children(when.map(studio_ui::chrome::sidebar_count)),
-                        )
-                        .on_click({
-                            let session = session.clone();
-                            let name = name.clone();
-                            move |_, _, cx| {
-                                if let Some(session) = &session {
-                                    session.update(cx, |s, cx| s.set_branch(name.clone(), cx));
-                                }
+                        .selected(current)
+                        .when_some(when, |row, when| {
+                            row.end(studio_ui::ds::sidebar_count(when))
+                        });
+                    let row = match tooltip {
+                        Some(tooltip) => row.tooltip(tooltip),
+                        None => row,
+                    };
+                    row.on_click({
+                        let session = session.clone();
+                        let name = name.clone();
+                        move |_, _, cx| {
+                            if let Some(session) = &session {
+                                session.update(cx, |s, cx| s.set_branch(name.clone(), cx));
                             }
-                        })
+                        }
+                    })
                 }
             })
             .menu(move |window, cx| {
@@ -273,18 +266,14 @@ impl Render for BranchList {
             graph_store::Loadable::Failed(error) => Err(Some(error.clone())),
             _ => Err(None),
         };
-        let new_button = studio_ui::chrome::sidebar_item("new-branch", false)
-            .start_slot(
+        let new_button = studio_ui::ds::SidebarRow::new("new-branch", "New branch…")
+            .muted(true)
+            .start(
                 Icon::new(IconName::Plus)
                     .size(IconSize::Small)
                     .color(Color::Muted),
             )
-            .child(
-                Label::new("New branch…")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .tooltip({
+            .tooltip_fn({
                 let current = current.clone();
                 move |_, cx| {
                     Tooltip::with_meta(
@@ -313,9 +302,7 @@ impl Render for BranchList {
                     ),
                 )
             }
-            Err(None) => {
-                list = list.child(studio_ui::chrome::sidebar_note("Reading branches…"))
-            }
+            Err(None) => list = list.child(studio_ui::ds::sidebar_note("Reading branches…")),
         }
         v_flex()
             .w_full()

@@ -12,8 +12,11 @@ pub struct ActivityLog {
 }
 
 impl ActivityLog {
+    /// `session` is the workspace's session now; later changes arrive as `SessionChanged`,
+    /// which may have been emitted before this view existed.
     pub fn new(
         workspace: WeakEntity<Workspace>,
+        session: Option<Entity<GraphSession>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -33,6 +36,7 @@ impl ActivityLog {
                 },
             ));
         }
+        this.watch(session, cx);
         this
     }
 
@@ -55,57 +59,76 @@ impl Render for ActivityLog {
             .as_ref()
             .map(|s| s.read(cx).outcomes.clone())
             .unwrap_or_default();
+        // The feed, after the reference frames: a status dot, what was written (underlined),
+        // where it went, and when; refusals and unknown outcomes keep their reason in a tooltip.
         v_flex()
             .id("activity-log")
             .size_full()
             .overflow_y_scroll()
-            .p_2()
-            .gap_1()
+            .py(px(studio_ui::ds::space::XS))
             .when(entries.is_empty(), |d| {
-                d.child(
-                    Label::new("No writes yet in this window.")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
+                d.child(studio_ui::ds::empty_state(
+                    IconName::ListTree,
+                    "No writes yet",
+                ))
             })
-            .children(entries.iter().rev().map(|entry| {
-                let (color, outcome) = match &entry.outcome {
+            .children(entries.iter().rev().enumerate().map(|(index, entry)| {
+                let (status, verb, tooltip) = match &entry.outcome {
                     OutcomeKind::Committed { commit } => (
-                        Color::Success,
-                        match commit.as_deref() {
-                            Some(id) if !id.is_empty() => format!("committed {}", short_commit(id)),
-                            _ => "committed".into(),
-                        },
+                        studio_ui::ds::Status::Done,
+                        "committed",
+                        commit
+                            .as_deref()
+                            .filter(|id| !id.is_empty())
+                            .map(|id| format!("Commit {id}")),
                     ),
-                    OutcomeKind::Refused { message } => {
-                        (Color::Error, format!("refused: {message}"))
-                    }
-                    OutcomeKind::Unknown { reason } => {
-                        (Color::Warning, format!("unknown: {reason}"))
-                    }
+                    OutcomeKind::Refused { message } => (
+                        studio_ui::ds::Status::Failed,
+                        "was refused",
+                        Some(format!("Nothing was written: {message}")),
+                    ),
+                    OutcomeKind::Unknown { reason } => (
+                        studio_ui::ds::Status::Running,
+                        "has an unknown outcome",
+                        Some(format!("{reason}. Check History before trying again.")),
+                    ),
                 };
-                h_flex()
-                    .gap_2()
-                    .child(ui::Indicator::dot().color(color))
-                    .child(Label::new(entry.description.clone()).size(LabelSize::Small))
-                    .child(
-                        Label::new(format!("on {}", entry.branch))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(Label::new(outcome).size(LabelSize::Small).color(color))
+                let when = entry
+                    .at
+                    .elapsed()
+                    .map(|elapsed| relative(elapsed.as_secs()))
+                    .unwrap_or_else(|_| "now".into());
+                let row = studio_ui::ds::ActivityRow::new(
+                    ("activity", index),
+                    IconName::Pencil,
+                    entry.description.clone(),
+                    verb,
+                    when,
+                )
+                .status(status)
+                .place(
+                    if matches!(entry.outcome, OutcomeKind::Committed { .. }) {
+                        "to"
+                    } else {
+                        "on"
+                    },
+                    IconName::GitBranch,
+                    entry.branch.clone(),
+                );
+                match tooltip {
+                    Some(tooltip) => row.tooltip(tooltip),
+                    None => row,
+                }
             }))
     }
 }
 
-/// The last segment of a graph commit id, for display.
-pub fn short_commit(id: &str) -> String {
-    let tail = id.rsplit('.').next().unwrap_or(id);
-    tail.chars()
-        .rev()
-        .take(8)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
+/// "just now", "3m ago", "2h ago", "4d ago".
+fn relative(seconds: u64) -> String {
+    match seconds {
+        0..=44 => "just now".into(),
+        45..=3599 => format!("{}m ago", (seconds + 30) / 60),
+        3600..=86_399 => format!("{}h ago", seconds / 3600),
+        _ => format!("{}d ago", seconds / 86_400),
+    }
 }

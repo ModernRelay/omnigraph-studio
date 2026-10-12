@@ -30,6 +30,10 @@ pub struct SavedWorkspace {
     pub sidebar_open: bool,
     pub inspector_open: bool,
     pub activity_open: bool,
+    /// Each dock's active panel.
+    pub left_panel: Option<String>,
+    pub right_panel: Option<String>,
+    pub bottom_panel: Option<String>,
 }
 
 /// Opens a remembered tab of one kind.
@@ -153,9 +157,15 @@ mod tests {
             sidebar_open: true,
             inspector_open: false,
             activity_open: true,
+            left_panel: Some("types".into()),
+            right_panel: None,
+            bottom_panel: None,
         };
         let text = serde_json::to_string(&saved).unwrap();
-        assert_eq!(serde_json::from_str::<SavedWorkspace>(&text).unwrap(), saved);
+        assert_eq!(
+            serde_json::from_str::<SavedWorkspace>(&text).unwrap(),
+            saved
+        );
         let partial: SavedWorkspace = serde_json::from_str(r#"{"active": 2}"#).unwrap();
         assert_eq!(partial.active, 2);
         assert!(partial.items.is_empty());
