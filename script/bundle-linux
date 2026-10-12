@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Build a Linux tarball of OmniGraph Studio in target/bundle (spec 001, "Shipping"):
+#
+#   omnigraph-studio-<version>-linux-<arch>/
+#     bin/omnigraph-studio
+#     share/applications/omnigraph-studio.desktop
+#     LICENSE
+#
+#   script/bundle-linux            # release build
+#   script/bundle-linux --debug    # the debug build, to check the layout quickly
+#
+# Unpack anywhere and run bin/omnigraph-studio; copy the .desktop file into
+# ~/.local/share/applications to list it in a launcher. An AppImage is not built yet.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$ROOT"
+
+profile=release
+case "${1:-}" in
+  --debug) profile=debug ;;
+  "") ;;
+  *) echo "usage: script/bundle-linux [--debug]" >&2; exit 2 ;;
+esac
+
+if [[ "$(uname)" != "Linux" ]]; then
+  echo "bundle-linux runs on Linux" >&2
+  exit 1
+fi
+
+version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+arch=$(uname -m)
+name="omnigraph-studio-$version-linux-$arch"
+
+if [[ "$profile" == release ]]; then
+  cargo build --locked --release -p studio --bin omnigraph-studio
+else
+  cargo build --locked -p studio --bin omnigraph-studio
+fi
+
+out="$ROOT/target/bundle"
+staging=$(mktemp -d)
+trap 'rm -rf "$staging"' EXIT
+dir="$staging/$name"
+mkdir -p "$dir/bin" "$dir/share/applications"
+cp "target/$profile/omnigraph-studio" "$dir/bin/omnigraph-studio"
+cp resources/linux/omnigraph-studio.desktop.in "$dir/share/applications/omnigraph-studio.desktop"
+cp LICENSE "$dir/"
+
+mkdir -p "$out"
+tar -czf "$out/$name.tar.gz" -C "$staging" "$name"
+echo "$out/$name.tar.gz"

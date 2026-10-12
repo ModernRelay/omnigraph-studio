@@ -77,10 +77,16 @@ Linux. CI caches `~/.cargo/git` and `target/` keyed on `Cargo.lock`.
 
 ### Shipping (after 002)
 
-- macOS: `script/bundle-mac` builds a `.app` with `cargo bundle`-style metadata, signs with a
-  Developer ID with hardened runtime, notarizes with `notarytool`, staples, wraps in a DMG.
-  Needs a ModernRelay Apple Developer account.
-- Linux: tarball and AppImage. Windows: later.
+- macOS: `script/bundle-mac` builds `OmniGraph Studio.app` (identifier
+  `com.modernrelay.omnigraph-studio`, minimum macOS 11) and a DMG in `target/bundle`. With
+  `STUDIO_SIGN_IDENTITY` it signs the app and DMG with a Developer ID, the hardened runtime and
+  a secure timestamp; with `STUDIO_NOTARY_PROFILE` it notarizes with `notarytool` and staples.
+  Without them the app is signed ad hoc. Entitlements (`resources/macos/studio.entitlements`)
+  are only the JIT pair Zed's wasmtime needs. Signing needs a ModernRelay Apple Developer
+  account. The app has no icon yet.
+- Linux: `script/bundle-linux` builds a tarball (`bin/`, a `.desktop` entry, `LICENSE`).
+  AppImage later. Windows: later.
+- CI bundles the debug build on both systems so the scripts keep working.
 - Homebrew cask in a ModernRelay tap. Updates: a polling updater modelled on Zed's
   `auto_update`, later.
 
@@ -128,6 +134,7 @@ Linux. CI caches `~/.cargo/git` and `target/` keyed on `Cargo.lock`.
 | 2026-10-11 | Workspace manifests are valid | `cargo metadata --no-deps --offline` | 17 members read |
 | 2026-10-11 | Crate layers hold | `python3 script/check-layers.py` | `layers ok: 17 crates` |
 | 2026-10-11 | Assets parse | JSON parse of `assets/**/*.json` | Keymaps and default settings valid |
+| 2026-10-12 | `script/bundle-mac` produces a valid app and DMG | `script/bundle-mac --debug`; `codesign -dv`, `codesign -d --entitlements -`, `hdiutil verify` | App bundle (arm64), ad hoc signature valid and satisfying its designated requirement, two entitlements, DMG checksum valid (113 MB from the debug build). Developer ID signing and notarization not exercised: no identity on this machine |
 | 2026-10-11 | First build | not run | Pending: 5.8 GiB free on the machine; run S0 with ≥ 25 GiB free |
 
 ## Upgrade drills

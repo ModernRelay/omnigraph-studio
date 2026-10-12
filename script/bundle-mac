@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Build "OmniGraph Studio.app" and a DMG in target/bundle (spec 001, "Shipping").
+#
+#   script/bundle-mac            # release build
+#   script/bundle-mac --debug    # the debug build, to check the bundle quickly
+#
+# Signing and notarization run when their variables are set:
+#   STUDIO_SIGN_IDENTITY    a "Developer ID Application: …" identity in the keychain; signs the
+#                           app and the DMG with the hardened runtime and a secure timestamp
+#   STUDIO_NOTARY_PROFILE   a profile saved with `xcrun notarytool store-credentials`; submits
+#                           the DMG, waits, and staples the ticket
+# Without an identity the app is signed ad hoc and opens only on the Mac that built it.
+# STUDIO_BUNDLE_ID overrides the bundle identifier.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$ROOT"
+
+profile=release
+case "${1:-}" in
+  --debug) profile=debug ;;
+  "") ;;
+  *) echo "usage: script/bundle-mac [--debug]" >&2; exit 2 ;;
+esac
+
+if [[ "$(uname)" != "Darwin" ]]; then
+  echo "bundle-mac runs on macOS" >&2
+  exit 1
+fi
+if [[ -n "${STUDIO_NOTARY_PROFILE:-}" && -z "${STUDIO_SIGN_IDENTITY:-}" ]]; then
+  echo "STUDIO_NOTARY_PROFILE needs STUDIO_SIGN_IDENTITY: Apple notarizes only signed apps" >&2
+  exit 1
+fi
+
+version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+bundle_id=${STUDIO_BUNDLE_ID:-com.modernrelay.omnigraph-studio}
+name="OmniGraph Studio"
+arch=$(uname -m)
+
+if [[ "$profile" == release ]]; then
+  cargo build --locked --release -p studio --bin omnigraph-studio
+else
+  cargo build --locked -p studio --bin omnigraph-studio
+fi
+
+out="$ROOT/target/bundle"
+app="$out/$name.app"
+rm -rf "$app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp "target/$profile/omnigraph-studio" "$app/Contents/MacOS/omnigraph-studio"
+
+cat > "$app/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>$name</string>
+	<key>CFBundleExecutable</key>
+	<string>omnigraph-studio</string>
+	<key>CFBundleIdentifier</key>
+	<string>$bundle_id</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$name</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$version</string>
+	<key>CFBundleVersion</key>
+	<string>$version</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>ModernRelay. Licensed under GPL-3.0-or-later.</string>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+</dict>
+</plist>
+PLIST
+plutil -lint "$app/Contents/Info.plist" >/dev/null
+cp LICENSE* "$app/Contents/Resources/" 2>/dev/null || true
+
+entitlements="$ROOT/resources/macos/studio.entitlements"
+if [[ -n "${STUDIO_SIGN_IDENTITY:-}" ]]; then
+  /usr/bin/codesign --force --timestamp --options runtime --entitlements "$entitlements" \
+    --sign "$STUDIO_SIGN_IDENTITY" "$app"
+else
+  /usr/bin/codesign --force --entitlements "$entitlements" --sign - "$app"
+fi
+/usr/bin/codesign --verify --strict --verbose=2 "$app"
+
+dmg="$out/OmniGraph-Studio-$version-$arch.dmg"
+staging=$(mktemp -d)
+trap 'rm -rf "$staging"' EXIT
+cp -R "$app" "$staging/"
+ln -s /Applications "$staging/Applications"
+rm -f "$dmg"
+hdiutil create -volname "$name" -srcfolder "$staging" -ov -format UDZO "$dmg" >/dev/null
+
+if [[ -n "${STUDIO_SIGN_IDENTITY:-}" ]]; then
+  /usr/bin/codesign --force --timestamp --sign "$STUDIO_SIGN_IDENTITY" "$dmg"
+fi
+if [[ -n "${STUDIO_NOTARY_PROFILE:-}" ]]; then
+  xcrun notarytool submit "$dmg" --keychain-profile "$STUDIO_NOTARY_PROFILE" --wait
+  xcrun stapler staple "$dmg"
+  xcrun stapler validate "$dmg"
+fi
+
+echo "$app"
+echo "$dmg"

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=OmniGraph Studio
+GenericName=Graph browser
+Comment=Browse, query and change OmniGraph graphs
+TryExec=omnigraph-studio
+Exec=omnigraph-studio
+Icon=omnigraph-studio
+Categories=Development;Database;
+StartupNotify=true
+StartupWMClass=omnigraph-studio
