@@ -7706,8 +7706,16 @@ dependencies = [
 name = "query_editor"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "editor",
  "gpui",
+ "gq_language",
+ "graph_client",
  "graph_store",
+ "language",
+ "menu",
+ "project",
+ "serde_json",
  "studio_actions",
  "studio_ui",
  "studio_workspace",
