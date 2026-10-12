@@ -30,5 +30,19 @@
       "cmd-alt-y": "studio_agent::AllowAlways",
       "cmd-alt-n": "studio_agent::Reject"
     }
+  },
+  {
+    "context": "Workspace",
+    "bindings": {
+      "cmd-1": ["studio::ActivateItem", { "index": 0 }],
+      "cmd-2": ["studio::ActivateItem", { "index": 1 }],
+      "cmd-3": ["studio::ActivateItem", { "index": 2 }],
+      "cmd-4": ["studio::ActivateItem", { "index": 3 }],
+      "cmd-5": ["studio::ActivateItem", { "index": 4 }],
+      "cmd-6": ["studio::ActivateItem", { "index": 5 }],
+      "cmd-7": ["studio::ActivateItem", { "index": 6 }],
+      "cmd-8": ["studio::ActivateItem", { "index": 7 }],
+      "cmd-9": "studio::ActivateLastItem"
+    }
   }
 ]

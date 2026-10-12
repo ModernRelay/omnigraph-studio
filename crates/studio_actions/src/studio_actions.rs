@@ -45,6 +45,21 @@ pub mod workspace {
             Refresh,
         ]
     );
+
+    /// Activate the tab at a position, counted from zero.
+    #[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+    #[action(namespace = studio)]
+    pub struct ActivateItem {
+        pub index: usize,
+    }
+
+    gpui::actions!(
+        studio,
+        [
+            /// Activate the last tab.
+            ActivateLastItem,
+        ]
+    );
 }
 
 pub mod graph {

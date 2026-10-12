@@ -14,6 +14,7 @@ graph_client = { workspace = true }
 gq_language = { workspace = true }
 http_client = { workspace = true }
 reqwest_client = { workspace = true }
+studio_settings = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

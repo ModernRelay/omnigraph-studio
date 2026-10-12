@@ -104,7 +104,7 @@ struct SettingsFileState {
 
 impl Global for SettingsFileState {}
 
-/// Studio's data directory (same rule as `graph_store::data_dir`): `OMNIGRAPH_STUDIO_DATA`, else
+/// Studio's data directory, for every crate: `OMNIGRAPH_STUDIO_DATA`, else
 /// `~/Library/Application Support/OmniGraph Studio` on macOS, `$XDG_CONFIG_HOME/omnigraph-studio`
 /// elsewhere.
 pub fn data_dir() -> PathBuf {

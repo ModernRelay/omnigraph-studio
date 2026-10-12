@@ -17,8 +17,8 @@ use gpui::{
 };
 use graph_store::{ConnectionState, GraphSession, OutcomeKind, SessionEvent};
 use studio_actions::workspace::{
-    ActivateNextItem, ActivatePreviousItem, CloseActiveItem, Refresh, ToggleActivity,
-    ToggleInspector, ToggleSidebar,
+    ActivateItem, ActivateLastItem, ActivateNextItem, ActivatePreviousItem, CloseActiveItem,
+    Refresh, ToggleActivity, ToggleInspector, ToggleSidebar,
 };
 use ui::prelude::*;
 use ui::{ContextMenu, Indicator, PopoverMenu, Tab, TabBar, Tooltip};
@@ -47,7 +47,14 @@ struct Toast {
     id: usize,
     kind: ToastKind,
     message: SharedString,
+    /// Time left on screen; `None` stays until dismissed (errors, spec 002).
+    remaining: Option<Duration>,
+    hovered: bool,
 }
+
+/// How long a success or info toast stays (spec 002); hovering pauses it.
+const TOAST_DURATION: Duration = Duration::from_secs(10);
+const TOAST_TICK: Duration = Duration::from_millis(250);
 
 struct SidebarSection {
     title: SharedString,
@@ -359,21 +366,52 @@ impl Workspace {
     ) {
         let id = self.next_toast;
         self.next_toast += 1;
+        let remaining = match kind {
+            ToastKind::Error => None,
+            ToastKind::Info | ToastKind::Success => Some(TOAST_DURATION),
+        };
         self.toasts.push(Toast {
             id,
             kind,
             message: message.into(),
+            remaining,
+            hovered: false,
         });
         cx.notify();
+        if remaining.is_none() {
+            return;
+        }
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_secs(8)).await;
-            this.update(cx, |this, cx| {
-                this.toasts.retain(|t| t.id != id);
-                cx.notify();
-            })
-            .ok();
+            loop {
+                cx.background_executor().timer(TOAST_TICK).await;
+                let gone = this
+                    .update(cx, |this, cx| {
+                        let Some(toast) = this.toasts.iter_mut().find(|t| t.id == id) else {
+                            return true;
+                        };
+                        if !toast.hovered {
+                            let left = toast.remaining.unwrap_or_default().saturating_sub(TOAST_TICK);
+                            toast.remaining = Some(left);
+                            if left.is_zero() {
+                                this.toasts.retain(|t| t.id != id);
+                                cx.notify();
+                                return true;
+                            }
+                        }
+                        false
+                    })
+                    .unwrap_or(true);
+                if gone {
+                    break;
+                }
+            }
         })
         .detach();
+    }
+
+    pub fn dismiss_toast(&mut self, id: usize, cx: &mut Context<Self>) {
+        self.toasts.retain(|t| t.id != id);
+        cx.notify();
     }
 
     // ---- actions ----
@@ -740,7 +778,15 @@ impl Workspace {
                     ToastKind::Success => Color::Success,
                     ToastKind::Error => Color::Error,
                 };
+                let id = toast.id;
                 h_flex()
+                    .id(("toast", id))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if let Some(toast) = this.toasts.iter_mut().find(|t| t.id == id) {
+                            toast.hovered = *hovered;
+                        }
+                        cx.notify();
+                    }))
                     .gap_2()
                     .px_3()
                     .py_2()
@@ -757,6 +803,11 @@ impl Workspace {
                             .flex_1()
                             .min_w_0()
                             .child(Label::new(toast.message.clone()).size(LabelSize::Small)),
+                    )
+                    .child(
+                        IconButton::new(("dismiss-toast", id), IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .on_click(cx.listener(move |this, _, _, cx| this.dismiss_toast(id, cx))),
                     )
             }))
     }
@@ -802,6 +853,14 @@ impl Render for Workspace {
                 if !this.items.is_empty() {
                     let previous = (this.active + this.items.len() - 1) % this.items.len();
                     this.activate_item(previous, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, action: &ActivateItem, window, cx| {
+                this.activate_item(action.index, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivateLastItem, window, cx| {
+                if let Some(last) = this.items.len().checked_sub(1) {
+                    this.activate_item(last, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {

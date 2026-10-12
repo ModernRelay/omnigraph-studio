@@ -46,26 +46,8 @@ struct GlobalRegistry(Entity<ConnectionRegistry>);
 
 impl Global for GlobalRegistry {}
 
-/// Studio's data directory: `~/Library/Application Support/OmniGraph Studio` on macOS,
-/// `$XDG_CONFIG_HOME/omnigraph-studio` elsewhere. `OMNIGRAPH_STUDIO_DATA` overrides it.
-pub fn data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("OMNIGRAPH_STUDIO_DATA") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/OmniGraph Studio")
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config"))
-            .join("omnigraph-studio")
-    }
-}
+/// Studio's data directory; one rule for the whole app, kept in `studio_settings`.
+pub use studio_settings::data_dir;
 
 fn saved_path() -> PathBuf {
     data_dir().join("servers.json")

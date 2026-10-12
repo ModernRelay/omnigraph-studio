@@ -1,0 +1,60 @@
+//! The application menus (spec 002). Every item is an action, so the menu shows the action's
+//! binding and the palette offers the same command.
+
+use gpui::{App, Menu, MenuItem, OsAction, SystemMenuType};
+use studio_actions::agent::OpenAgent;
+use studio_actions::graph::{
+    CreateBranch, MergeBranch, NewQuery, OpenCanvas, OpenHistory, ReviewBranch,
+};
+use studio_actions::workspace::{
+    CloseActiveItem, NewWindow, OpenGraph, OpenSettings, Quit, Refresh, ShowKeyBindings,
+    SwitchBranch, ToggleActivity, ToggleCommandPalette, ToggleInspector, ToggleSidebar,
+};
+
+pub fn set(cx: &mut App) {
+    cx.set_menus([
+        Menu::new("OmniGraph Studio").items([
+            MenuItem::action("Settings…", OpenSettings),
+            MenuItem::separator(),
+            MenuItem::os_submenu("Services", SystemMenuType::Services),
+            MenuItem::separator(),
+            MenuItem::action("Quit OmniGraph Studio", Quit),
+        ]),
+        Menu::new("File").items([
+            MenuItem::action("Open Graph…", OpenGraph),
+            MenuItem::action("New Window", NewWindow),
+            MenuItem::separator(),
+            MenuItem::action("Close Tab", CloseActiveItem),
+        ]),
+        Menu::new("Edit").items([
+            MenuItem::os_action("Undo", editor::actions::Undo, OsAction::Undo),
+            MenuItem::os_action("Redo", editor::actions::Redo, OsAction::Redo),
+            MenuItem::separator(),
+            MenuItem::os_action("Cut", editor::actions::Cut, OsAction::Cut),
+            MenuItem::os_action("Copy", editor::actions::Copy, OsAction::Copy),
+            MenuItem::os_action("Paste", editor::actions::Paste, OsAction::Paste),
+            MenuItem::os_action("Select All", editor::actions::SelectAll, OsAction::SelectAll),
+        ]),
+        Menu::new("View").items([
+            MenuItem::action("Command Palette", ToggleCommandPalette),
+            MenuItem::separator(),
+            MenuItem::action("Sidebar", ToggleSidebar),
+            MenuItem::action("Inspector", ToggleInspector),
+            MenuItem::action("Activity", ToggleActivity),
+        ]),
+        Menu::new("Graph").items([
+            MenuItem::action("Refresh", Refresh),
+            MenuItem::action("Switch Branch…", SwitchBranch),
+            MenuItem::separator(),
+            MenuItem::action("New Query", NewQuery),
+            MenuItem::action("History", OpenHistory),
+            MenuItem::action("Canvas", OpenCanvas),
+            MenuItem::action("Agent", OpenAgent),
+            MenuItem::separator(),
+            MenuItem::action("Create Branch…", CreateBranch),
+            MenuItem::action("Review Branch", ReviewBranch),
+            MenuItem::action("Merge Branch…", MergeBranch),
+        ]),
+        Menu::new("Help").items([MenuItem::action("Keyboard Shortcuts", ShowKeyBindings)]),
+    ]);
+}

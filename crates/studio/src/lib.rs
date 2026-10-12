@@ -3,12 +3,13 @@
 
 mod activity;
 mod keymaps;
+mod menus;
 mod open_graph;
 mod settings_view;
 
 use gpui::{App, AppContext as _, Entity, Focusable as _, Window, WindowBounds, WindowOptions, point, px, size};
 use graph_store::{ConnectionRegistry, ConnectionState, open_session};
-use studio_actions::workspace::{OpenGraph, OpenSettings, Quit};
+use studio_actions::workspace::{NewWindow, OpenGraph, OpenSettings, Quit};
 use studio_workspace::Workspace;
 
 pub use open_graph::OpenGraphModal;
@@ -33,6 +34,10 @@ pub fn init(cx: &mut App) {
     agent_panel::init(cx);
 
     cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &NewWindow, cx| {
+        cx.open_window(window_options(cx), build_workspace).ok();
+    });
+    menus::set(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };
         let handle = cx.entity().downgrade();

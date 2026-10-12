@@ -2,8 +2,10 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui::{Context, EventEmitter, Task};
+use studio_settings::StudioSettings;
 use graph_client::api::{GraphInfo, HealthOutput};
 use graph_client::{GraphClient, ReadError};
 use http_client::HttpClient;
@@ -80,7 +82,14 @@ pub struct Connection {
     pub graphs: GraphListing,
     has_token: bool,
     _task: Option<Task<()>>,
+    /// The next health re-check (spec 003).
+    _health_check: Option<Task<()>>,
 }
+
+/// Health re-check interval after a failure (spec 003).
+const FAILED_CHECK_INTERVAL: Duration = Duration::from_secs(120);
+/// Interval when settings are not loaded, as in tests.
+const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 impl EventEmitter<ConnectionEvent> for Connection {}
 
@@ -101,6 +110,7 @@ impl Connection {
             graphs: GraphListing::Unknown,
             has_token,
             _task: None,
+            _health_check: None,
         })
     }
 
@@ -168,9 +178,56 @@ impl Connection {
                 }
                 cx.emit(ConnectionEvent::StateChanged);
                 cx.notify();
+                this.schedule_health_check(cx);
             })
             .ok();
         }));
+    }
+
+    /// Checks `/healthz` again after the settings' interval while the server is ready, and
+    /// every two minutes after a failure. A recovered server is probed in full again. A timer
+    /// that slept through a system sleep fires on wake, which is the check on wake.
+    fn schedule_health_check(&mut self, cx: &mut Context<Self>) {
+        let interval = if self.state == ConnectionState::Ready {
+            cx.try_global::<StudioSettings>()
+                .map(|settings| Duration::from_secs(settings.studio.health_check_seconds.max(5)))
+                .unwrap_or(DEFAULT_CHECK_INTERVAL)
+        } else {
+            FAILED_CHECK_INTERVAL
+        };
+        let client = self.client.clone();
+        self._health_check = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(interval).await;
+            let health = client.health().await;
+            this.update(cx, |this, cx| this.apply_health_check(health, cx))
+                .ok();
+        }));
+    }
+
+    fn apply_health_check(
+        &mut self,
+        health: Result<graph_client::ServerHealth, ReadError>,
+        cx: &mut Context<Self>,
+    ) {
+        let next = match health {
+            Ok(health) if !health.contract_supported() => ConnectionState::ContractMismatch {
+                served: health.contract.clone(),
+            },
+            Ok(_) if self.state == ConnectionState::Ready => ConnectionState::Ready,
+            // Recovered: probe capabilities and graphs again, which schedules the next check.
+            Ok(_) => {
+                self.connect(cx);
+                return;
+            }
+            Err(ReadError::Transport(error)) => ConnectionState::Unreachable(error),
+            Err(error) => ConnectionState::Unreachable(error.to_string()),
+        };
+        if next != self.state {
+            self.state = next;
+            cx.emit(ConnectionEvent::StateChanged);
+            cx.notify();
+        }
+        self.schedule_health_check(cx);
     }
 }
 
