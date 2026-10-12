@@ -1439,7 +1439,6 @@ impl TypeTable {
     // ---- rendering ----
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let border = cx.theme().colors().border_variant;
         let count = match (&self.count, &self.total, self.filters.is_empty()) {
             (Loadable::Loaded(n), _, true) => {
                 format!(
@@ -1461,24 +1460,12 @@ impl TypeTable {
             _ => None,
         };
         let read_only = self.kind == TableKind::Edge;
-        let target = if read_only {
-            format!("read only · {}", self.branch)
-        } else {
-            format!("write · {}", self.branch)
-        };
         let target_tooltip = if read_only {
             "Edges cannot be changed in a cell: the engine has no edge update (T16).".to_owned()
         } else {
             format!("Edits, inserts and deletes here commit to {}", self.branch)
         };
-        h_flex()
-            .h(px(40.))
-            .flex_none()
-            .px_3()
-            .gap_2()
-            .items_center()
-            .border_b_1()
-            .border_color(border)
+        studio_ui::chrome::toolbar(cx)
             .child(studio_ui::type_swatch(&self.type_name))
             .child(
                 Label::new(self.type_name.clone())
@@ -1491,21 +1478,19 @@ impl TypeTable {
                     .when_some(count_error, |d, error| d.tooltip(Tooltip::text(error)))
                     .child(Label::new(count).size(LabelSize::Small).color(Color::Muted)),
             )
-            .child(
-                div()
-                    .id("write-target")
-                    .px_2()
-                    .py_0p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(border)
-                    .tooltip(Tooltip::text(target_tooltip))
-                    .child(
-                        Label::new(target)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            )
+            // Where edits go is in the title bar; the table says only when it cannot edit.
+            .when(read_only, |d| {
+                d.child(
+                    div()
+                        .id("write-target")
+                        .tooltip(Tooltip::text(target_tooltip))
+                        .child(
+                            Label::new("Read only")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
             .when(self.newer, |d| {
                 d.child(
                     Button::new("newer-data", "Newer data · Refresh")
@@ -1781,22 +1766,23 @@ impl TypeTable {
             .columns
             .iter()
             .map(|column| {
-                v_flex()
-                    .px_2()
-                    .py_0p5()
+                h_flex()
+                    .h(px(studio_ui::HEADER_HEIGHT))
+                    .px_3()
+                    .gap_1p5()
                     .w_full()
-                    .when(column.align_right, |d| d.items_end())
+                    .overflow_hidden()
+                    .when(column.align_right, |d| d.justify_end())
                     .child(
                         Label::new(column.title.clone())
                             .size(LabelSize::Small)
-                            .weight(gpui::FontWeight::MEDIUM)
-                            .single_line()
-                            .truncate(),
+                            .color(Color::Muted)
+                            .single_line(),
                     )
                     .child(
                         Label::new(column.detail.clone())
                             .size(LabelSize::XSmall)
-                            .color(Color::Muted)
+                            .color(Color::Disabled)
                             .single_line()
                             .truncate(),
                     )
@@ -1811,14 +1797,21 @@ impl TypeTable {
             .filter(|(_, row)| row.dimmed)
             .map(|(ix, _)| ix)
             .collect();
+        let hairline = studio_ui::chrome::hairline(cx);
+        // Fixed fitted widths: Zed's resizable columns draw a full-height rule between every
+        // column, which the visual language leaves out (spec 002).
+        let widths: Vec<_> = self.columns.iter().map(|c| px(c.width)).collect();
         Table::new(self.columns.len())
             .interactable(&self.table_state)
-            .width_config(ColumnWidthConfig::Resizable(self.widths.clone()))
+            .width_config(ColumnWidthConfig::explicit(widths))
             .header(headers)
             .disable_base_style()
+            .hide_row_borders()
             .pin_cols(1)
             .map_row(move |(ix, row), _window, _cx| {
-                row.when(cursor_row == Some(ix), |row| row.bg(selected_bg))
+                row.border_b_1()
+                    .border_color(hairline)
+                    .when(cursor_row == Some(ix), |row| row.bg(selected_bg))
                     .when(dimmed.contains(&ix), |row| row.opacity(0.45))
                     .into_any_element()
             })
@@ -1883,12 +1876,12 @@ impl TypeTable {
             .relative()
             .h(px(ROW_HEIGHT))
             .w_full()
-            .px_2()
+            .px_3()
             .flex()
             .items_center()
             .gap_1()
             .overflow_hidden()
-            .when(col == 0, |d| d.border_r_1().border_color(divider))
+            .when(col == 0, |d| d.border_r_1().border_color(divider.opacity(0.6)))
             .when(column.align_right, |d| d.justify_end());
         // The cursor and the editor are drawn as a ring over the cell, so no cell changes size.
         let ring = || {
@@ -2040,8 +2033,7 @@ impl TypeTable {
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors();
-        let (border, bg) = (colors.border_variant, colors.panel_background);
+        let border = studio_ui::chrome::hairline(cx);
         let loaded = if self.rows.is_empty() {
             String::new()
         } else if self.paging.exhausted {
@@ -2061,14 +2053,13 @@ impl TypeTable {
             (false, TableKind::Edge) => "↵ peek · space peek · esc back",
         };
         h_flex()
-            .h(px(26.))
+            .h(px(studio_ui::chrome::FOOTER_HEIGHT))
             .flex_none()
             .px_3()
             .gap_3()
             .items_center()
             .border_t_1()
             .border_color(border)
-            .bg(bg)
             .child(
                 Label::new(loaded)
                     .size(LabelSize::XSmall)

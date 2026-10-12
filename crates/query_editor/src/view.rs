@@ -1311,12 +1311,9 @@ impl QueryEditor {
         let Output::Rows(rows) = &self.output else {
             return Vec::new();
         };
+        let border = studio_ui::chrome::hairline(cx);
         let colors = cx.theme().colors();
-        let (border, selected_bg, row_selected_bg) = (
-            colors.border_variant,
-            colors.element_selected,
-            colors.ghost_element_hover,
-        );
+        let (selected_bg, row_selected_bg) = (colors.element_selected, colors.ghost_element_hover);
         let selected = self.selected;
         range
             .filter_map(|ix| {

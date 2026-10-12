@@ -930,28 +930,15 @@ impl Render for RelationshipTree {
             .is_some_and(|exploration| exploration.read(cx).root().is_some());
         if !has_root || self.entries.is_empty() {
             return root
-                .child(
-                    v_flex()
-                        .px_3()
-                        .py_2()
-                        .gap_1()
-                        .child(
-                            Label::new("Open a node to walk its relationships.")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Label::new("↵ on a table row, or ⌘K and Open Node.")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Disabled),
-                        ),
-                )
+                .child(studio_ui::chrome::sidebar_note(
+                    "Press ↵ on a row to walk its relationships.",
+                ))
                 .into_any_element();
         }
 
         let header = self.render_header(cx);
         // The tree fills the sidebar below the section title; other sections scroll above it.
-        let chrome = px(36. + 26. + 32.) + if header.is_some() { px(56.) } else { px(0.) };
+        let chrome = px(38. + 24. + 32.) + if header.is_some() { px(56.) } else { px(0.) };
         let height = (window.viewport_size().height - chrome).max(px(200.));
         let list = self.render_list(height, window, cx);
         root.children(header).child(list).into_any_element()

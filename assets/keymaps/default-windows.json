@@ -1,6 +1,7 @@
 [
   {
     "bindings": {
+      "ctrl-shift-p": "studio::ToggleCommandPalette",
       "ctrl-k": "studio::ToggleCommandPalette",
       "ctrl-,": "studio::OpenSettings",
       "ctrl-shift-b": "studio::SwitchBranch",

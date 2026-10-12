@@ -6,7 +6,7 @@ use graph_store::{GraphSession, Loadable, SessionEvent};
 use studio_actions::graph::OpenType;
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;
-use ui::{ListItem, ListItemSpacing, Tooltip};
+use ui::Tooltip;
 
 use crate::model::format_count;
 
@@ -100,15 +100,7 @@ impl Render for TypesList {
                     .into_any_element();
             }
             _ => {
-                return div()
-                    .px_3()
-                    .py_1()
-                    .child(
-                        Label::new("Reading types…")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .into_any_element();
+                return studio_ui::chrome::sidebar_note("Reading types…").into_any_element();
             }
         };
         let counts_error = match &s.datasets {
@@ -137,16 +129,10 @@ impl Render for TypesList {
             )
             .collect();
         let first_edge = entries.iter().position(|(_, _, edge)| *edge);
-        let mut list = v_flex().w_full().pb_2();
+        let mut list = v_flex().w_full();
         for (index, (name, count, is_edge)) in entries.into_iter().enumerate() {
             if Some(index) == first_edge {
-                list = list.child(
-                    div().px_3().pt_2().pb_0p5().child(
-                        Label::new("Relationships")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Disabled),
-                    ),
-                );
+                list = list.child(studio_ui::chrome::section_label("Relationships").pt_3());
             }
             let selected = active.as_deref() == Some(format!("type:{name}").as_str());
             let action = OpenType {
@@ -157,9 +143,7 @@ impl Render for TypesList {
                 None => format!("Rows at the head of {branch}"),
             };
             list = list.child(
-                ListItem::new(("type", index))
-                    .spacing(ListItemSpacing::Sparse)
-                    .toggle_state(selected)
+                studio_ui::chrome::sidebar_item(("type", index), selected)
                     .start_slot(studio_ui::type_swatch(&name))
                     .child(
                         h_flex()
@@ -175,12 +159,7 @@ impl Render for TypesList {
                                 div()
                                     .id(("type-count", index))
                                     .tooltip(Tooltip::text(tooltip))
-                                    .child(
-                                        Label::new(count)
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted)
-                                            .buffer_font(cx),
-                                    ),
+                                    .child(studio_ui::chrome::sidebar_count(count)),
                             ),
                     )
                     .on_click(move |_, window, cx| {
@@ -188,13 +167,6 @@ impl Render for TypesList {
                     }),
             );
         }
-        list.child(
-            div().px_3().pt_1().child(
-                Label::new(format!("Counts at the head of {branch}"))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Disabled),
-            ),
-        )
-        .into_any_element()
+        list.into_any_element()
     }
 }

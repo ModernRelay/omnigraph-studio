@@ -17,7 +17,7 @@ use studio_actions::graph::{CreateBranch, DeleteBranch, MergeBranch, ReviewBranc
 use studio_ui::{now_micros, relative_time, short_commit_id};
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;
-use ui::{ContextMenu, ContextMenuEntry, ListItem, ListItemSpacing, Tooltip, right_click_menu};
+use ui::{ContextMenu, ContextMenuEntry, Tooltip, right_click_menu};
 
 use crate::view::open_review;
 
@@ -132,10 +132,10 @@ impl BranchList {
     ) -> impl IntoElement + use<> {
         let detail = self.details.get(&branch).map(|d| {
             let actor = d.actor.clone().unwrap_or_else(|| "unknown actor".into());
-            format!(
-                "{} · {actor} · {}",
-                short_commit_id(&d.head),
-                relative_time(d.created_at, now_micros())
+            let when = relative_time(d.created_at, now_micros());
+            (
+                when.clone(),
+                format!("Head {} · {actor} · {when}", short_commit_id(&d.head)),
             )
         });
         let session = self.session.clone();
@@ -147,46 +147,27 @@ impl BranchList {
                 let session = session.clone();
                 let name = name.clone();
                 move |_, _, _| {
-                    ListItem::new(("branch", index))
-                        .spacing(ListItemSpacing::Sparse)
-                        .toggle_state(current)
+                    let (when, tooltip) = detail.clone().unzip();
+                    studio_ui::chrome::sidebar_item(("branch", index), current)
                         .start_slot(
                             Icon::new(IconName::GitBranch)
                                 .size(IconSize::Small)
-                                .color(if current { Color::Accent } else { Color::Muted }),
+                                .color(Color::Muted),
                         )
+                        .when_some(tooltip, |item, tooltip| item.tooltip(Tooltip::text(tooltip)))
                         .child(
-                            v_flex()
+                            h_flex()
+                                .w_full()
                                 .min_w_0()
+                                .gap_2()
                                 .child(
-                                    h_flex()
-                                        .gap_1()
-                                        .child(
-                                            Label::new(name.clone())
-                                                .size(LabelSize::Small)
-                                                .color(if current {
-                                                    Color::Default
-                                                } else {
-                                                    Color::Muted
-                                                })
-                                                .single_line()
-                                                .truncate(),
-                                        )
-                                        .when(current, |d| {
-                                            d.child(
-                                                Label::new("current")
-                                                    .size(LabelSize::XSmall)
-                                                    .color(Color::Accent),
-                                            )
-                                        }),
-                                )
-                                .children(detail.clone().map(|detail| {
-                                    Label::new(detail)
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Disabled)
+                                    Label::new(name.clone())
+                                        .size(LabelSize::Small)
                                         .single_line()
-                                        .truncate()
-                                })),
+                                        .truncate(),
+                                )
+                                .child(div().flex_1())
+                                .children(when.map(studio_ui::chrome::sidebar_count)),
                         )
                         .on_click({
                             let session = session.clone();
@@ -292,13 +273,15 @@ impl Render for BranchList {
             graph_store::Loadable::Failed(error) => Err(Some(error.clone())),
             _ => Err(None),
         };
-        let new_button = Button::new("new-branch", "New branch…")
-            .style(ButtonStyle::Subtle)
-            .label_size(LabelSize::Small)
-            .color(Color::Muted)
-            .start_icon(
+        let new_button = studio_ui::chrome::sidebar_item("new-branch", false)
+            .start_slot(
                 Icon::new(IconName::Plus)
                     .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                Label::new("New branch…")
+                    .size(LabelSize::Small)
                     .color(Color::Muted),
             )
             .tooltip({
@@ -313,7 +296,7 @@ impl Render for BranchList {
                 }
             })
             .on_click(|_, window, cx| window.dispatch_action(Box::new(CreateBranch), cx));
-        let mut list = v_flex().px_1();
+        let mut list = v_flex();
         match state {
             Ok(branches) => {
                 for (index, branch) in branches.into_iter().enumerate() {
@@ -331,19 +314,13 @@ impl Render for BranchList {
                 )
             }
             Err(None) => {
-                list = list.child(
-                    div().px_2().child(
-                        Label::new("Reading branches…")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-                )
+                list = list.child(studio_ui::chrome::sidebar_note("Reading branches…"))
             }
         }
         v_flex()
             .w_full()
             .child(list)
-            .child(div().px_2().pb_2().child(new_button))
+            .child(new_button)
             .into_any_element()
     }
 }

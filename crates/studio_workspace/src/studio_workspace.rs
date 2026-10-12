@@ -14,7 +14,8 @@ use std::time::Duration;
 
 use gpui::{
     Action, AnyView, App, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    MouseButton, Render, SharedString, Subscription, Task, Window, deferred, div,
+    MouseButton, Render, SharedString, Stateful, Subscription, Task, Window, WindowControlArea,
+    deferred, div,
 };
 use graph_store::{ConnectionState, GraphSession, OutcomeKind, SessionEvent};
 use studio_actions::workspace::{
@@ -22,7 +23,7 @@ use studio_actions::workspace::{
     Refresh, ToggleActivity, ToggleInspector, ToggleSidebar,
 };
 use ui::prelude::*;
-use ui::{ContextMenu, Indicator, PopoverMenu, Tab, TabBar, Tooltip};
+use ui::{ContextMenu, Indicator, PopoverMenu, Tooltip};
 
 pub use item::{Item, ItemEvent, ItemHandle};
 pub use persistence::{SavedItem, SavedWorkspace, register_item_kind, saved_window_bounds};
@@ -85,6 +86,8 @@ pub struct Workspace {
     next_toast: usize,
     actions: Vec<ActionRegistration>,
     focus_handle: FocusHandle,
+    /// A press on a header strip that becomes a window move if the pointer moves.
+    drag_pending: bool,
     /// What was last written for this graph, so unchanged state is not rewritten.
     saved: Option<SavedWorkspace>,
     _save: Option<Task<()>>,
@@ -96,6 +99,12 @@ pub struct Workspace {
 
 /// How long state must be still before it is written.
 const SAVE_DELAY: Duration = Duration::from_millis(500);
+/// Height of a column's header strip (spec 002, after Delta).
+const STRIP_HEIGHT: f32 = studio_ui::chrome::STRIP_HEIGHT;
+/// Room for the window's traffic lights at the left of the first header strip.
+const TRAFFIC_LIGHTS_WIDTH: f32 = 76.;
+const SIDEBAR_WIDTH: f32 = 248.;
+const INSPECTOR_WIDTH: f32 = 320.;
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
 
@@ -129,6 +138,7 @@ impl Workspace {
             next_toast: 0,
             actions: Vec::new(),
             focus_handle: cx.focus_handle(),
+            drag_pending: false,
             saved: None,
             _save: None,
             _save_bounds: None,
@@ -528,39 +538,272 @@ impl Workspace {
 
     // ---- rendering ----
 
-    fn render_title_bar(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A header or footer strip of a column (spec 002, after Delta): fixed height, and a place
+    /// to drag the window from. As in Zed's title bar, the move starts on the first mouse move
+    /// after a press, so clicks on the strip's buttons still land.
+    fn strip(&self, id: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
+        h_flex()
+            .id(id)
+            .window_control_area(WindowControlArea::Drag)
+            .h(px(STRIP_HEIGHT))
+            .w_full()
+            .flex_none()
+            .items_center()
+            .on_mouse_down_out(cx.listener(|this, _, _, _| this.drag_pending = false))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.drag_pending = false),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.drag_pending = true),
+            )
+            .on_mouse_move(cx.listener(|this, _, window, _| {
+                if this.drag_pending {
+                    this.drag_pending = false;
+                    window.start_window_move();
+                }
+            }))
+            .on_click(|event, window, _| {
+                if event.click_count() == 2 {
+                    window.titlebar_double_click();
+                }
+            })
+    }
+
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let mut crumbs = h_flex().gap_1().items_center();
-        let mut write_target = None;
+        let panel = colors.panel_background;
+        let hairline = studio_ui::chrome::hairline(cx);
+        let header = self
+            .strip("sidebar-header", cx)
+            .pr_1()
+            .gap_0p5()
+            .border_b_1()
+            .border_color(hairline)
+            .child(div().w(px(TRAFFIC_LIGHTS_WIDTH)).flex_none())
+            .child(
+                IconButton::new("toggle-sidebar", IconName::ThreadsSidebarLeftOpen)
+                    .icon_size(IconSize::Small)
+                    .tooltip(|_, cx| Tooltip::for_action("Hide sidebar", &ToggleSidebar, cx))
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx)),
+            )
+            .child(div().flex_1())
+            .child(
+                IconButton::new("search", IconName::MagnifyingGlass)
+                    .icon_size(IconSize::Small)
+                    .tooltip(|_, cx| {
+                        Tooltip::for_action(
+                            "Search types, queries and commands",
+                            &studio_actions::workspace::ToggleCommandPalette,
+                            cx,
+                        )
+                    })
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(
+                            Box::new(studio_actions::workspace::ToggleCommandPalette),
+                            cx,
+                        )
+                    }),
+            );
+        let sections = v_flex()
+            .id("sidebar-sections")
+            .flex_1()
+            .min_h_0()
+            .pb_2()
+            .overflow_y_scroll()
+            .children(self.sidebar_sections.iter().map(|section| {
+                v_flex()
+                    .w_full()
+                    .child(studio_ui::chrome::section_label(section.title.clone()))
+                    .child(section.view.clone())
+            }));
+        v_flex()
+            .id("sidebar")
+            .w(px(SIDEBAR_WIDTH))
+            .h_full()
+            .flex_none()
+            .bg(panel)
+            .border_r_1()
+            .border_color(hairline)
+            .child(header)
+            .child(sections)
+            .child(self.render_sidebar_footer(cx))
+    }
+
+    /// Where this window is connected, as Delta's sidebar footer shows the account: a status
+    /// dot, the graph and the server. Clicking opens "Open a graph".
+    fn render_sidebar_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let hairline = studio_ui::chrome::hairline(cx);
+        let (color, graph, server, state) = match &self.session {
+            Some(session) => {
+                let s = session.read(cx);
+                let connection = s.connection.read(cx);
+                let color = match &connection.state {
+                    ConnectionState::Ready => Color::Success,
+                    ConnectionState::Connecting | ConnectionState::Idle => Color::Muted,
+                    ConnectionState::ContractMismatch { .. } => Color::Warning,
+                    _ => Color::Error,
+                };
+                (
+                    color,
+                    s.graph_id.clone(),
+                    connection.server.name.clone(),
+                    connection.state.label(),
+                )
+            }
+            None => (
+                Color::Muted,
+                "No graph".to_owned(),
+                String::new(),
+                "Not connected".to_owned(),
+            ),
+        };
+        self.strip("sidebar-footer", cx)
+            .px_1()
+            .border_t_1()
+            .border_color(hairline)
+            .child(
+                h_flex()
+                    .id("graph-switcher")
+                    .w_full()
+                    .h(px(24.))
+                    .px_1p5()
+                    .gap_1p5()
+                    .items_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                    .tooltip(Tooltip::text(format!("{server} · {state}")))
+                    .child(Indicator::dot().color(color))
+                    .child(
+                        Label::new(graph)
+                            .size(LabelSize::Small)
+                            .single_line()
+                            .truncate(),
+                    )
+                    .child(
+                        Label::new(server)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .single_line()
+                            .truncate(),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Icon::new(IconName::ChevronUpDown)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(studio_actions::workspace::OpenGraph), cx)
+                    }),
+            )
+    }
+
+    /// The tabs, as Delta draws them: text tabs separated by hairlines, the active one joined
+    /// to the content below it.
+    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let (editor_bg, inactive_bg) = (
+            colors.editor_background,
+            colors.tab_bar_background.opacity(0.35),
+        );
+        let hairline = studio_ui::chrome::hairline(cx);
+        h_flex()
+            .h_full()
+            .min_w_0()
+            .overflow_hidden()
+            .children(self.items.iter().enumerate().map(|(index, item)| {
+                let selected = index == self.active;
+                let group: SharedString = format!("tab-{index}").into();
+                let dirty = item.is_dirty(cx);
+                let stale = item.is_stale(cx);
+                h_flex()
+                    .id(("tab", index))
+                    .group(group.clone())
+                    .h_full()
+                    .pl_3()
+                    .pr_1()
+                    .gap_1p5()
+                    .items_center()
+                    .flex_none()
+                    .relative()
+                    .border_r_1()
+                    .border_color(hairline)
+                    .when(selected, |tab| tab.bg(editor_bg))
+                    .when(!selected, |tab| {
+                        tab.bg(inactive_bg)
+                            .hover(|style| style.bg(colors.ghost_element_hover))
+                            // The rule under inactive tabs; the active tab joins the content.
+                            .child(
+                                div()
+                                    .absolute()
+                                    .bottom_0()
+                                    .left_0()
+                                    .w_full()
+                                    .h(px(1.))
+                                    .bg(hairline),
+                            )
+                    })
+                    .cursor_pointer()
+                    .children(item.tab_icon(cx).map(|icon| {
+                        Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)
+                    }))
+                    .child(
+                        Label::new(item.tab_title(cx))
+                            .size(LabelSize::Small)
+                            .color(if selected { Color::Default } else { Color::Muted })
+                            .single_line(),
+                    )
+                    .when(dirty, |tab| tab.child(Indicator::dot().color(Color::Warning)))
+                    .when(stale && !dirty, |tab| tab.child(Indicator::dot().color(Color::Muted)))
+                    .child(
+                        IconButton::new(("close", index), IconName::Close)
+                            .icon_size(IconSize::XSmall)
+                            .when(!selected, |button| button.visible_on_hover(group))
+                            .tooltip(|_, cx| Tooltip::for_action("Close", &CloseActiveItem, cx))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.close_item(index, window, cx)
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.activate_item(index, window, cx)
+                    }))
+            }))
+    }
+
+    /// The document column's header: tabs, then the branch the active tab reads and writes.
+    fn render_center_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let header_bg = colors.editor_background.blend(gpui::black().opacity(0.02));
+        let hairline = studio_ui::chrome::hairline(cx);
+        let mut context = h_flex().gap_1().items_center().pr_1();
         if let Some(session) = &self.session {
             let s = session.read(cx);
-            let server = s.server_name(cx);
             let branch = s.branch.clone();
             let branches = s.branches.loaded().cloned().unwrap_or_default();
             let session_for_menu = session.clone();
-            crumbs = crumbs
-                .child(
-                    Label::new(server)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(
-                    Label::new("▸")
-                        .size(LabelSize::Small)
-                        .color(Color::Disabled),
-                )
-                .child(Label::new(s.graph_id.clone()).size(LabelSize::Small))
-                .child(
-                    Label::new("▸")
-                        .size(LabelSize::Small)
-                        .color(Color::Disabled),
-                )
+            context = context
                 .child(
                     PopoverMenu::new("branch-menu")
                         .trigger(
-                            Button::new("branch", format!("{branch} ▾"))
+                            Button::new("branch", branch.clone())
                                 .label_size(LabelSize::Small)
-                                .style(ButtonStyle::Subtle),
+                                .style(ButtonStyle::Subtle)
+                                .tooltip(Tooltip::text(format!(
+                                    "Reads and edits in this window use {branch}. Switch branch."
+                                )))
+                                .start_icon(
+                                    Icon::new(IconName::GitBranch)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .end_icon(
+                                    Icon::new(IconName::ChevronDown)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
                         )
                         .menu(move |window, cx| {
                             let session = session_for_menu.clone();
@@ -577,141 +820,68 @@ impl Workspace {
                                 menu
                             }))
                         }),
-                );
-            write_target = Some(
-                div()
-                    .px_2()
-                    .py_0p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(colors.border_variant)
-                    .child(
-                        Label::new(format!("write · {}", s.branch))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            );
-        } else {
-            crumbs = crumbs.child(
-                Label::new("OmniGraph Studio")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                )
+                ;
+            let running = match (s.reads_in_flight, s.writes_in_flight) {
+                (0, 0) => None,
+                (reads, 0) => Some(format!(
+                    "{reads} quer{} running",
+                    if reads == 1 { "y" } else { "ies" }
+                )),
+                (_, writes) => Some(format!("Writing ({writes})…")),
+            };
+            context = context.children(
+                running.map(|text| Label::new(text).size(LabelSize::XSmall).color(Color::Muted)),
             );
         }
-        h_flex()
-            .id("title-bar")
-            .h(px(36.))
-            .w_full()
-            .pl(px(80.))
-            .pr_3()
-            .gap_3()
-            .items_center()
-            .bg(colors.title_bar_background)
-            .border_b_1()
-            .border_color(colors.border_variant)
-            .on_mouse_down(MouseButton::Left, |event, window, _| {
-                if event.click_count == 2 {
-                    window.titlebar_double_click();
-                } else {
-                    window.start_window_move();
-                }
-            })
-            .child(crumbs)
-            .child(div().flex_1())
-            .children(write_target)
-            .child(
-                IconButton::new("palette", IconName::MagnifyingGlass)
+        context = context.child(
+            IconButton::new("toggle-activity", IconName::ListTree)
+                .icon_size(IconSize::Small)
+                .toggle_state(self.activity_open)
+                .tooltip(|_, cx| Tooltip::for_action("Activity", &ToggleActivity, cx))
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleActivity), cx)),
+        );
+        if self.inspector.is_some() {
+            context = context.child(
+                IconButton::new("toggle-inspector", IconName::ThreadsSidebarRightOpen)
                     .icon_size(IconSize::Small)
-                    .tooltip(|_window, cx| {
-                        Tooltip::for_action(
-                            "Command palette",
-                            &studio_actions::workspace::ToggleCommandPalette,
-                            cx,
-                        )
-                    })
+                    .toggle_state(self.inspector_open)
+                    .tooltip(|_, cx| Tooltip::for_action("Inspector", &ToggleInspector, cx))
                     .on_click(|_, window, cx| {
-                        window.dispatch_action(
-                            Box::new(studio_actions::workspace::ToggleCommandPalette),
-                            cx,
-                        )
+                        window.dispatch_action(Box::new(ToggleInspector), cx)
                     }),
+            );
+        }
+        self.strip("center-header", cx)
+            .bg(header_bg)
+            .when(!self.sidebar_open || self.session.is_none(), |strip| {
+                strip.child(
+                    div()
+                        .w(px(TRAFFIC_LIGHTS_WIDTH))
+                        .h_full()
+                        .flex_none()
+                        .border_b_1()
+                        .border_color(hairline),
+                )
+            })
+            .child(self.render_tabs(cx))
+            .child(
+                h_flex()
+                    .flex_1()
+                    .h_full()
+                    .justify_end()
+                    .items_center()
+                    .border_b_1()
+                    .border_color(hairline)
+                    .child(context),
             )
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        v_flex()
-            .id("sidebar")
-            .w(px(260.))
-            .h_full()
-            .flex_none()
-            .bg(colors.panel_background)
-            .border_r_1()
-            .border_color(colors.border_variant)
-            .overflow_y_scroll()
-            .children(self.sidebar_sections.iter().map(|section| {
-                v_flex()
-                    .w_full()
-                    .child(
-                        div().px_3().pt_3().pb_1().child(
-                            Label::new(section.title.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        ),
-                    )
-                    .child(section.view.clone())
-            }))
-    }
-
-    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut bar = TabBar::new("tabs");
-        for (index, item) in self.items.iter().enumerate() {
-            let selected = index == self.active;
-            let mut title = Label::new(item.tab_title(cx)).size(LabelSize::Small);
-            if !selected {
-                title = title.color(Color::Muted);
-            }
-            let close = IconButton::new(("close", index), IconName::Close)
-                .icon_size(IconSize::XSmall)
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.close_item(index, window, cx)),
-                );
-            let stale = item.is_stale(cx);
-            let dirty = item.is_dirty(cx);
-            bar = bar.child(
-                Tab::new(("tab", index))
-                    .toggle_state(selected)
-                    .start_slot::<Icon>(
-                        item.tab_icon(cx)
-                            .map(|icon| Icon::new(icon).size(IconSize::Small).color(Color::Muted)),
-                    )
-                    .end_slot(close)
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(title)
-                            .when(dirty, |d| d.child(Indicator::dot().color(Color::Warning)))
-                            .when(stale && !dirty, |d| {
-                                d.child(Indicator::dot().color(Color::Muted))
-                            }),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.activate_item(index, window, cx)
-                    })),
-            );
-        }
-        bar
-    }
-
     fn render_center(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let editor_background = cx.theme().colors().editor_background;
-        let border_variant = cx.theme().colors().border_variant;
-        let panel_background = cx.theme().colors().panel_background;
-        let tabs = if self.items.is_empty() {
-            None
-        } else {
-            Some(self.render_tabs(cx).into_any_element())
-        };
+        let colors = cx.theme().colors();
+        let (editor_background, panel_background) =
+            (colors.editor_background, colors.panel_background);
+        let hairline = studio_ui::chrome::hairline(cx);
         let body = match self.items.get(self.active) {
             Some(item) => div()
                 .flex_1()
@@ -726,7 +896,7 @@ impl Workspace {
             .min_w_0()
             .h_full()
             .bg(editor_background)
-            .children(tabs)
+            .child(self.render_center_header(cx))
             .child(body)
             .when(self.activity_open, |d| {
                 d.children(self.activity.clone().map(|activity| {
@@ -736,7 +906,7 @@ impl Workspace {
                         .overflow_hidden()
                         .bg(panel_background)
                         .border_t_1()
-                        .border_color(border_variant)
+                        .border_color(hairline)
                         .child(activity)
                 }))
             })
@@ -777,98 +947,50 @@ impl Workspace {
             return None;
         }
         let colors = cx.theme().colors();
+        let editor_background = colors.editor_background;
+        let hairline = studio_ui::chrome::hairline(cx);
         Some(
-            div()
-                .id("inspector")
-                .w(px(320.))
+            v_flex()
+                .w(px(INSPECTOR_WIDTH))
                 .h_full()
                 .flex_none()
-                .bg(colors.panel_background)
+                .bg(editor_background)
                 .border_l_1()
-                .border_color(colors.border_variant)
-                .overflow_y_scroll()
-                .child(inspector),
-        )
-    }
-
-    fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        let mut left = h_flex().gap_3().items_center();
-        let mut right = h_flex().gap_3().items_center();
-        if let Some(session) = &self.session {
-            let s = session.read(cx);
-            let connection = s.connection.read(cx);
-            let (color, label) = match &connection.state {
-                ConnectionState::Ready => (Color::Success, connection.state.label()),
-                ConnectionState::Connecting | ConnectionState::Idle => {
-                    (Color::Muted, connection.state.label())
-                }
-                ConnectionState::ContractMismatch { .. } => {
-                    (Color::Warning, connection.state.label())
-                }
-                _ => (Color::Error, connection.state.label()),
-            };
-            left = left
-                .child(Indicator::dot().color(color))
-                .child(Label::new(connection.server.name.clone()).size(LabelSize::XSmall))
+                .border_color(hairline)
                 .child(
-                    Label::new(label)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                );
-            let activity = match (s.reads_in_flight, s.writes_in_flight) {
-                (0, 0) => None,
-                (reads, 0) => Some(format!(
-                    "{reads} quer{} running",
-                    if reads == 1 { "y" } else { "ies" }
-                )),
-                (_, writes) => Some(format!("Writing ({writes})…")),
-            };
-            right = right.children(
-                activity.map(|a| Label::new(a).size(LabelSize::XSmall).color(Color::Muted)),
-            );
-            if let Some(last) = s.outcomes.last() {
-                right = right.child(Label::new(toast_text(last)).size(LabelSize::XSmall).color(
-                    match last.outcome {
-                        OutcomeKind::Committed { .. } => Color::Muted,
-                        OutcomeKind::Refused { .. } => Color::Error,
-                        OutcomeKind::Unknown { .. } => Color::Warning,
-                    },
-                ));
-            }
-        } else {
-            left = left.child(
-                Label::new("Not connected")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            );
-        }
-        h_flex()
-            .h(px(26.))
-            .w_full()
-            .px_3()
-            .gap_3()
-            .items_center()
-            .bg(colors.status_bar_background)
-            .border_t_1()
-            .border_color(colors.border_variant)
-            .child(left)
-            .child(div().flex_1())
-            .child(right)
-            .child(
-                IconButton::new("toggle-activity", IconName::ListTree)
-                    .icon_size(IconSize::Small)
-                    .toggle_state(self.activity_open)
-                    .tooltip(|_window, cx| Tooltip::for_action("Activity", &ToggleActivity, cx))
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleActivity), cx)),
-            )
+                    self.strip("inspector-header", cx)
+                        .px_3()
+                        .border_b_1()
+                        .border_color(hairline)
+                        .child(Label::new("Inspector").size(LabelSize::Small))
+                        .child(div().flex_1())
+                        .child(
+                            IconButton::new("close-inspector", IconName::Close)
+                                .icon_size(IconSize::XSmall)
+                                .tooltip(|_, cx| {
+                                    Tooltip::for_action("Hide inspector", &ToggleInspector, cx)
+                                })
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(ToggleInspector), cx)
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("inspector")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .child(inspector),
+                ),
+        )
     }
 
     fn render_toasts(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         v_flex()
             .absolute()
-            .bottom(px(36.))
+            .bottom(px(12.))
             .right_3()
             .gap_2()
             .children(self.toasts.iter().map(|toast| {
@@ -939,12 +1061,17 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Every change to tabs or panels re-renders the workspace, so this sees all of them.
         self.save_if_changed(cx);
+        // As Zed's workspace does: the window's rem size is the UI font size, which every `ui`
+        // size is relative to, and the root carries the UI font.
+        let ui_font = theme_settings::setup_ui_font(window, cx);
         let colors = cx.theme().colors();
         let mut root = v_flex()
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
             .size_full()
             .relative()
+            .font(ui_font)
+            .text_ui(cx)
             .bg(colors.background)
             .text_color(colors.text)
             .on_action(cx.listener(|this, _: &CloseActiveItem, window, cx| {
@@ -1014,21 +1141,20 @@ impl Render for Workspace {
             )
             .with_priority(1)
         });
-        root.child(self.render_title_bar(window, cx))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .when(self.sidebar_open && self.session.is_some(), |d| {
-                        d.child(self.render_sidebar(cx))
-                    })
-                    .child(self.render_center(cx))
-                    .children(self.render_inspector(cx)),
-            )
-            .child(self.render_status_bar(cx))
-            .child(self.render_toasts(cx))
-            .children(modal)
+        // Columns, each with its own header and footer strip, as Delta lays out its window.
+        root.child(
+            h_flex()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .when(self.sidebar_open && self.session.is_some(), |d| {
+                    d.child(self.render_sidebar(cx))
+                })
+                .child(self.render_center(cx))
+                .children(self.render_inspector(cx)),
+        )
+        .child(self.render_toasts(cx))
+        .children(modal)
     }
 }
 

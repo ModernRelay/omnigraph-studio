@@ -9,6 +9,7 @@ use ui::prelude::*;
 
 pub use studio_theme::type_color;
 
+pub mod chrome;
 mod changes;
 mod values;
 
@@ -55,35 +56,36 @@ impl GridColumn {
     }
 }
 
-pub const ROW_HEIGHT: f32 = 28.;
-pub const HEADER_HEIGHT: f32 = 40.;
+pub const ROW_HEIGHT: f32 = 30.;
+pub const HEADER_HEIGHT: f32 = 32.;
 
-/// The header row of a grid.
+/// The header row of a grid: one line per column, the name then its type, muted, with a
+/// hairline below (spec 002, "Visual language").
 pub fn grid_header(columns: &[GridColumn], leading: Pixels, cx: &App) -> Div {
-    let colors = cx.theme().colors();
     h_flex()
         .h(px(HEADER_HEIGHT))
         .flex_none()
-        .bg(colors.panel_background)
         .border_b_1()
-        .border_color(colors.border_variant)
+        .border_color(chrome::hairline(cx))
         .child(div().w(leading).flex_none())
         .children(columns.iter().map(|column| {
-            v_flex()
+            h_flex()
                 .w(column.width)
                 .flex_none()
                 .px_2()
-                .justify_center()
-                .when(column.align_right, |d| d.items_end())
+                .gap_1p5()
+                .overflow_hidden()
+                .when(column.align_right, |d| d.justify_end())
                 .child(
                     Label::new(column.title.clone())
                         .size(LabelSize::Small)
+                        .color(Color::Muted)
                         .single_line(),
                 )
                 .children(column.detail.clone().map(|detail| {
                     Label::new(detail)
                         .size(LabelSize::XSmall)
-                        .color(Color::Muted)
+                        .color(Color::Disabled)
                         .single_line()
                 }))
         }))

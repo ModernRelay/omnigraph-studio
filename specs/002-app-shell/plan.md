@@ -111,6 +111,35 @@ second line shows it (`omnigraph branch create feature-x --from main`).
 - Errors as notifications that say what happened and what to do; they stay until dismissed.
 - The activity log (bottom dock) keeps every write with its outcome.
 
+### Visual language
+
+Delta's window, measured from the mock on delta.dev (its CSS uses Zed's One Light tokens and
+IBM Plex Sans, as Studio does), with Tower's quiet rules. Implemented as functions in
+`studio_ui::chrome` and in `studio_workspace`'s render:
+
+- **Columns, not bars.** No global title bar or status bar. Each column (sidebar, document,
+  inspector) has its own 32 px header strip, and the document and sidebar their own footer
+  strip, so the rules line up across the window. Strips are window drag areas; as in Zed, a
+  move starts on the first mouse move after a press, so clicks on strip buttons land.
+- **Sidebar column** (`panel_background`, 248 px): the header holds room for the traffic
+  lights, the sidebar toggle and search (⌘K); the footer holds the graph, server and a status
+  dot, and opens "Open a graph", as Delta's footer holds the account.
+- **Document column** (`editor_background`): the header is the tab row (text tabs split by
+  hairlines; the active tab joins the content; inactive tabs sit on `tab_bar_background` at
+  35% and show their close button on hover), then the branch menu, running reads, the activity
+  and inspector toggles. Each document draws its own footer strip.
+- **Inspector column** (`editor_background`, 320 px): a header strip with its title.
+- **Hairlines.** `border_variant` at 60%, never a solid rule.
+- **Text sizes.** The window's rem size is `ui_font_size` (15 px by default), as in Zed, so
+  every `ui` size scales with it. Body text is `Small`; labels, counts and metadata `XSmall`.
+- **Sidebar rows.** Section labels are muted, not bold. Rows are inset `ListItem`s; the
+  selected row is a grey pill. Counts are muted and right-aligned. Footnotes become tooltips.
+- **Context once.** The branch appears once, in the document header's branch menu.
+- **Tables.** Like Linear: a 40 px toolbar, a one-line header (name, then the type muted), 30
+  px rows split by hairlines, no column rules, the cursor as a ring and the selected row as a
+  pill.
+- **Empty states.** One muted sentence.
+
 ### Motion
 
 Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks enter with a
