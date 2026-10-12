@@ -163,6 +163,8 @@ pub mod tree {
             RerootHere,
             /// Show the selected node on the canvas.
             ShowOnCanvas,
+            /// Clear the text typed to filter the tree.
+            ClearFilter,
         ]
     );
 }
