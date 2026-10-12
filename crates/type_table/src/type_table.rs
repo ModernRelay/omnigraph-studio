@@ -5,6 +5,7 @@
 
 mod dialogs;
 pub mod model;
+mod nodes_panel;
 mod peek;
 mod table;
 mod types_list;
@@ -12,7 +13,7 @@ mod types_list;
 use gpui::{App, AppContext as _, Context, Entity, Window};
 use gq_language::{Filter, FilterOp};
 use serde_json::Value;
-use studio_actions::graph::{OpenNode, OpenType, PeekNode};
+use studio_actions::graph::{BrowseType, OpenNode, OpenType, PeekNode};
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
 
@@ -69,6 +70,23 @@ pub fn init(cx: &mut App) {
                 };
                 table.update(cx, |table, cx| table.show_only(filter, cx));
             }
+        });
+        // The Nodes panel in the bottom dock, and browsing a type in it.
+        let workspace_handle = cx.entity().downgrade();
+        let current = workspace.session().cloned();
+        let nodes =
+            cx.new(|cx| nodes_panel::NodesPanel::new(workspace_handle, current, window, cx));
+        workspace.add_panel(
+            PanelPosition::Bottom,
+            nodes_panel::NODES_PANEL,
+            "Nodes",
+            IconName::Table,
+            nodes.clone().into(),
+            cx,
+        );
+        workspace.register_action(move |workspace, action: &BrowseType, window, cx| {
+            nodes.update(cx, |panel, cx| panel.browse(&action.type_name, window, cx));
+            workspace.activate_panel(nodes_panel::NODES_PANEL, cx);
         });
         workspace.register_action(|workspace, action: &PeekNode, _window, cx| {
             open_node(

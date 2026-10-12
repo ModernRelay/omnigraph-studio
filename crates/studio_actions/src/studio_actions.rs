@@ -138,6 +138,14 @@ pub mod graph {
         pub links: Vec<(usize, usize)>,
     }
 
+    /// Browse a type's rows in the Nodes panel under the canvas (Tower's "click a type to browse
+    /// it").
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct BrowseType {
+        pub type_name: String,
+    }
+
     /// Show one node in the inspector without revealing it in the tree.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]

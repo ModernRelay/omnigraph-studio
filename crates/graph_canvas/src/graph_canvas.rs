@@ -638,6 +638,18 @@ impl GraphCanvas {
         let hit = self.hit(event.position, window);
         self.select(hit, cx);
         if let Some(index) = hit {
+            // A click on a type browses its rows under the canvas, as Tower's does.
+            if matches!(self.scene.nodes[index].kind, SceneKind::Type { .. })
+                && event.click_count < 2
+            {
+                window.dispatch_action(
+                    Box::new(studio_actions::graph::BrowseType {
+                        type_name: self.scene.nodes[index].label.clone(),
+                    }),
+                    cx,
+                );
+                return;
+            }
             let single_activates = matches!(
                 self.scene.nodes[index].kind,
                 SceneKind::Hub { .. } | SceneKind::More { .. }

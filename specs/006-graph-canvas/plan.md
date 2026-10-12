@@ -90,7 +90,9 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   to 16 relationships labels every line. Chips grow with the view to their size at zoom 1 and
   become marks alone from afar. Overlay: the mode switch, a "Search nodes…" pill (⌘P) and the
   zoom controls on top, the caption bottom left. Colour is kept to node types: relationships
-  show a neutral arrow wherever a type is listed.
+  show a neutral arrow wherever a type is listed. A click on a type chip browses its rows in
+  the Nodes panel of the bottom dock (`studio_graph::BrowseType`), under the canvas as in Tower;
+  a double click opens its table as a tab.
 - **Keys:** ←↑→↓ (`canvas::MoveLeft` …, nearest node in a 45° cone, `along + 2 × across`),
   `0`, `=`/`+`, `-`, ↵ expand, ⌫ collapse. Space peek, F focus and `[`/`]` are not built.
   Bindings are registered in `graph_canvas::init`; they still need entries in

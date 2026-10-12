@@ -22,7 +22,7 @@ impl PanelPosition {
         match self {
             PanelPosition::Left => 264.,
             PanelPosition::Right => 340.,
-            PanelPosition::Bottom => 240.,
+            PanelPosition::Bottom => 300.,
         }
     }
 }
