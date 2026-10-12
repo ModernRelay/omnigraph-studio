@@ -2,8 +2,9 @@
 
 Status: in progress · 2026-10-12. `crates/type_table` ships the Types sidebar, node and edge
 tables (keyset pages pinned to one commit, filtered counts, filters, a cell cursor, value-bound
-cell edits with all three outcomes, peek, insert and typed-key delete). Not yet: sorting,
-relationship columns, saved views, bulk edits, preview tabs, relative dates (see Deferred).
+cell edits with all three outcomes, peek, insert and typed-key delete), sorting by a column,
+Blob cells and previews, and preview tabs (spec 002). Not yet: relationship columns, saved
+views, bulk edits, relative dates (see Deferred).
 
 ## Problem
 
@@ -65,7 +66,9 @@ stay put), IX (paged, virtualized).
 
   Sorting by a property uses keyset pairs: `order { $n.name asc, $n.@id asc }` with
   `$n.name > $v or ($n.name = $v and $n.@id > $id)`. Nulls sort last, through an
-  `is null` split.
+  `is null` split: the engine orders nulls first when ascending, so the rows with a value are
+  read first (`is not null`, in the sort's order), then the rest (`is null`, by `@id`). A
+  header click cycles ascending, descending and key order; the sort is saved with the tab.
 - A page holds `studio.type_table_page_size` rows (100 by default; a graph can have its own,
   spec 002), the `limit` above.
 - The first page records `graph_commit_id`; later pages pass it as `snapshot` (constitution II).
@@ -133,8 +136,8 @@ opens the branch's recent commits.
   - R2 unpublished commits: staged edits as a reviewable proposal only when the server
     advertises `cluster_publishCommit`.
 - Group-by (Tower 084) until filters and editing ship.
-- Sorting by a property (keyset pairs), relationship columns, relative dates, saved views and
-  bulk edits are designed above but not built yet. The preview tab is built (spec 002).
+- Relationship columns, relative dates, saved views and bulk edits are designed above but not
+  built yet. The preview tab is built (spec 002).
 - Saving a Blob value to a file: the peek previews the first bytes only.
 - Per-row history beyond the commits that the change feed can cheaply return.
 
@@ -160,6 +163,7 @@ opens the branch's recent commits.
 | 2026-10-12 | Zed's `ui::Table` can carry the grid | `crates/ui/src/components/data_table.rs` and `crates/tabular_data_preview/src/renderer/render_table.rs` at v1.23.2 | Resizable columns + `pin_cols(1)` + `uniform_list` + `disable_base_style`, as the CSV preview uses it |
 | 2026-10-12 | Actions reach the workspace with nothing focused | `crates/gpui/src/window.rs` `dispatch_action` / `focus_node_id_in_rendered_frame` | With no focus, an action goes to the root view's node only, which is outside the workspace element that holds its handlers. The workspace now focuses itself when a session opens and nothing else has focus |
 | 2026-10-12 | Blob cells and previews | `HEAD`/`GET /graphs/notes/blob` on the 0.13 dev server (`notes.attachment`: a PNG, a query text, 1 KiB of bytes, an empty value, nulls); `graph_client` blob tests; `type_table::blob` tests; offscreen snapshots of the Note table and three peeks | A managed cell answers 200 with `content-length` and an ETag (`0` for empty); a null cell and a missing row both answer 404 `not_found`, so a 404 on a row the table read is null; `Range` answers 206. Cells read "Blob · 690 B · Preview", "Blob · 0 B" and "—", for drawn rows only, at the page's commit; the peek drew the PNG, the query text and a hex dump |
+| 2026-10-12 | Null order and sorted keyset pages on 0.13 | `order { $n.title asc, $n.@id asc }` and `desc` on the dev server; `is not null`; the keyset clause with `or`; `gq_language` `sorted_pages_read_values_then_nulls_and_compile` (text, Date, I32, an edge property); `type_table` paging test; offscreen snapshots of Person by title both ways and Company by city with 25-row pages | Nulls come first ascending and last descending, so the `is null` split is needed; Company by city ran Berlin to Toronto, then the company without a city, across the switch from values to nulls ("25 of 25") |
 | pending | Merge-mode NDJSON leaves unspecified properties untouched | run against a 0.13 server | Bulk edit not built yet |
 
 ## Corrections

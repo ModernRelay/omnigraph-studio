@@ -32,7 +32,16 @@ pub fn init(cx: &mut App) {
                 .get("at_commit")
                 .and_then(|commit| commit.as_str())
                 .map(str::to_owned);
-            open_type(workspace, type_name, at_commit, false, window, cx);
+            let sort = data.get("sort").and_then(|sort| {
+                Some(gq_language::Sort {
+                    property: sort.get("property")?.as_str()?.to_owned(),
+                    descending: sort.get("descending")?.as_bool()?,
+                })
+            });
+            let table = open_type(workspace, type_name, at_commit, false, window, cx);
+            if let (Some(table), Some(sort)) = (table, sort) {
+                table.update(cx, |table, cx| table.set_sort(Some(sort), cx));
+            }
         }
     });
     cx.observe_new(|workspace: &mut Workspace, window, cx| {

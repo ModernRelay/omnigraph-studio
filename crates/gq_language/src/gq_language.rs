@@ -13,7 +13,7 @@ pub mod lex;
 pub mod params;
 pub mod schema;
 
-pub use builder::{BuildError, BuiltQuery, Filter, FilterOp, example_read};
+pub use builder::{BuildError, BuiltQuery, Filter, FilterOp, PageStart, Sort, example_read};
 pub use check::{Diagnostic, QueryCheck, QueryInfo, ResultColumn, check};
 pub use complete::{Completion, CompletionKind, completions};
 pub use lex::{

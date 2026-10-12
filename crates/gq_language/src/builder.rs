@@ -190,6 +190,93 @@ pub fn relationship_label(key: &str) -> Option<String> {
     })
 }
 
+/// A table's order: one property, then `@id` (spec 004). Rows without a value come last in
+/// either direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sort {
+    pub property: String,
+    pub descending: bool,
+}
+
+impl Sort {
+    /// Whether a property can order a table: a single scalar a query returns.
+    pub fn allowed(property: &Property) -> bool {
+        property.projectable() && !property.list
+    }
+}
+
+/// Where a page starts. Without a sort, pages follow `@id`. With one, the rows that have a
+/// value come first in the sort's order, keyset-paged by (value, `@id`); then the rows without
+/// one, by `@id`. The engine puts nulls first when ascending, so the two runs are separate
+/// reads rather than one order.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PageStart {
+    First,
+    /// After the row with this `@id` and, with a sort, this value.
+    After {
+        id: String,
+        value: Value,
+    },
+    /// With a sort: the rows without a value, after this `@id` (`""` from their start).
+    Nulls {
+        after: String,
+    },
+}
+
+/// The match clauses and order of one keyset page over binding `var`.
+fn keyset(
+    var: &str,
+    type_name: &str,
+    properties: &[Property],
+    sort: Option<&Sort>,
+    start: &PageStart,
+    params: &mut Params,
+) -> Result<(Vec<String>, String), BuildError> {
+    let by_id = format!("${var}.@id asc");
+    let Some(sort) = sort else {
+        let after = match start {
+            PageStart::After { id, .. } | PageStart::Nulls { after: id } => id.clone(),
+            PageStart::First => String::new(),
+        };
+        let after = params.add("after", "String", Value::String(after));
+        return Ok((vec![format!("${var}.@id > {after}")], by_id));
+    };
+    let property = properties
+        .iter()
+        .find(|p| p.name == sort.property && Sort::allowed(p))
+        .ok_or_else(|| BuildError::UnknownProperty {
+            type_name: type_name.to_owned(),
+            property: sort.property.clone(),
+        })?;
+    let field = format!("${var}.{}", property.name);
+    let ordered = format!(
+        "{field} {}, {by_id}",
+        if sort.descending { "desc" } else { "asc" }
+    );
+    Ok(match start {
+        PageStart::First => (vec![format!("{field} is not null")], ordered),
+        PageStart::After { id, value } if !value.is_null() => {
+            let v = params.add("after_value", &property.param_type(false), value.clone());
+            let after = params.add("after", "String", Value::String(id.clone()));
+            let beyond = if sort.descending { "<" } else { ">" };
+            (
+                vec![
+                    format!("{field} is not null"),
+                    format!("{field} {beyond} {v} or ({field} = {v} and ${var}.@id > {after})"),
+                ],
+                ordered,
+            )
+        }
+        PageStart::After { id: after, .. } | PageStart::Nulls { after } => {
+            let after = params.add("after", "String", Value::String(after.clone()));
+            (
+                vec![format!("{field} is null"), format!("${var}.@id > {after}")],
+                by_id,
+            )
+        }
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Filter {
     pub property: String,
@@ -372,23 +459,21 @@ fn relationship_clause(
     ))
 }
 
-/// One page of a node type, keyset-paged by `@id` (spec 004). Pass the last row's `@id` as
-/// `after` for the next page.
+/// One page of a node type (spec 004): keyset-paged by `@id`, or by `sort` then `@id`, from
+/// `start`.
 pub fn node_page(
     schema: &SchemaModel,
     type_name: &str,
     filters: &[Filter],
-    after: Option<&str>,
+    sort: Option<&Sort>,
+    start: &PageStart,
     limit: u32,
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
     let mut params = Params::new();
-    let after = params.add(
-        "after",
-        "String",
-        Value::String(after.unwrap_or("").to_owned()),
-    );
-    let mut clauses = vec![format!("$n: {}", node.name), format!("$n.@id > {after}")];
+    let (keyset, order) = keyset("n", &node.name, &node.properties, sort, start, &mut params)?;
+    let mut clauses = vec![format!("$n: {}", node.name)];
+    clauses.extend(keyset);
     clauses.extend(filter_clauses(
         schema,
         &node.name,
@@ -398,7 +483,7 @@ pub fn node_page(
         &mut params,
     )?);
     let text = format!(
-        "query studio_page({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ $n }}\n  order {{ $n.@id asc }}\n  limit {limit}\n}}\n",
+        "query studio_page({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ $n }}\n  order {{ {order} }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         clauses = clauses.join("\n    "),
     );
@@ -478,21 +563,18 @@ pub fn edge_page(
     schema: &SchemaModel,
     edge_name: &str,
     filters: &[Filter],
-    after: Option<&str>,
+    sort: Option<&Sort>,
+    start: &PageStart,
     limit: u32,
 ) -> Result<BuiltQuery, BuildError> {
     let edge = edge(schema, edge_name)?;
     let mut params = Params::new();
-    let after = params.add(
-        "after",
-        "String",
-        Value::String(after.unwrap_or("").to_owned()),
-    );
+    let (keyset, order) = keyset("e", &edge.name, &edge.properties, sort, start, &mut params)?;
     let mut clauses = vec![
         format!("$a: {}", edge.from),
         format!("$a $e:{} $b", edge.traversal()),
-        format!("$e.@id > {after}"),
     ];
+    clauses.extend(keyset);
     clauses.extend(filter_clauses(
         schema,
         &edge.name,
@@ -514,7 +596,7 @@ pub fn edge_page(
         ));
     }
     let text = format!(
-        "query studio_edge_page({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ {columns} }}\n  order {{ $e.@id asc }}\n  limit {limit}\n}}\n",
+        "query studio_edge_page({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ {columns} }}\n  order {{ {order} }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         clauses = clauses.join("\n    "),
         columns = columns.join(", "),
@@ -967,6 +1049,110 @@ mod tests {
     }
 
     #[test]
+    fn sorted_pages_read_values_then_nulls_and_compile() {
+        let schema = dev();
+        let sort = Sort {
+            property: "title".into(),
+            descending: false,
+        };
+        let first = node_page(&schema, "Person", &[], Some(&sort), &PageStart::First, 50).unwrap();
+        assert!(
+            first.text.contains("$n.title is not null"),
+            "{}",
+            first.text
+        );
+        assert!(first.text.contains("order { $n.title asc, $n.@id asc }"));
+        assert_compiles(&first);
+        let next = node_page(
+            &schema,
+            "Person",
+            &[],
+            Some(&Sort {
+                descending: true,
+                ..sort.clone()
+            }),
+            &PageStart::After {
+                id: "person-000010".into(),
+                value: Value::String("Engineer".into()),
+            },
+            50,
+        )
+        .unwrap();
+        assert!(
+            next.text.contains(
+                "$n.title < $after_value or ($n.title = $after_value and $n.@id > $after)"
+            ),
+            "{}",
+            next.text
+        );
+        assert_eq!(next.params["after_value"], "Engineer");
+        assert_compiles(&next);
+        let nulls = node_page(
+            &schema,
+            "Person",
+            &[],
+            Some(&sort),
+            &PageStart::Nulls {
+                after: String::new(),
+            },
+            50,
+        )
+        .unwrap();
+        assert!(nulls.text.contains("$n.title is null"));
+        assert!(nulls.text.contains("order { $n.@id asc }"));
+        assert_compiles(&nulls);
+        // Typed values: a date and an integer bind with their own types.
+        for (type_name, property, value) in [
+            ("Person", "born", Value::String("1980-01-01".into())),
+            ("Company", "founded", Value::from(1990)),
+        ] {
+            let page = node_page(
+                &schema,
+                type_name,
+                &[],
+                Some(&Sort {
+                    property: property.into(),
+                    descending: false,
+                }),
+                &PageStart::After {
+                    id: "x".into(),
+                    value,
+                },
+                10,
+            )
+            .unwrap();
+            assert_compiles(&page);
+        }
+        let edges = edge_page(
+            &schema,
+            "WorksAt",
+            &[],
+            Some(&Sort {
+                property: "since".into(),
+                descending: true,
+            }),
+            &PageStart::First,
+            10,
+        )
+        .unwrap();
+        assert_compiles(&edges);
+        assert!(matches!(
+            node_page(
+                &schema,
+                "Person",
+                &[],
+                Some(&Sort {
+                    property: "tags".into(),
+                    descending: false
+                }),
+                &PageStart::First,
+                10
+            ),
+            Err(BuildError::UnknownProperty { .. })
+        ));
+    }
+
+    #[test]
     fn the_example_read_compiles_and_names_its_columns() {
         let schema = dev();
         let text = example_read(&schema).unwrap();
@@ -997,7 +1183,7 @@ mod tests {
     #[test]
     fn node_pages_compile_with_and_without_filters() {
         let schema = dev();
-        assert_compiles(&node_page(&schema, "Person", &[], None, 100).unwrap());
+        assert_compiles(&node_page(&schema, "Person", &[], None, &PageStart::First, 100).unwrap());
         let filters = [
             Filter {
                 property: "title".into(),
@@ -1015,7 +1201,18 @@ mod tests {
                 value: json!("1980-01-01"),
             },
         ];
-        let page = node_page(&schema, "Person", &filters, Some("person-000010"), 50).unwrap();
+        let page = node_page(
+            &schema,
+            "Person",
+            &filters,
+            None,
+            &PageStart::After {
+                id: "person-000010".into(),
+                value: Value::Null,
+            },
+            50,
+        )
+        .unwrap();
         assert_compiles(&page);
         assert_eq!(page.params["after"], json!("person-000010"));
         assert_compiles(&node_count(&schema, "Person", &filters).unwrap());
@@ -1034,7 +1231,7 @@ mod tests {
             op: FilterOp::Contains,
             value: json!("graphs"),
         }];
-        let page = node_page(&schema, "Person", &filters, None, 100).unwrap();
+        let page = node_page(&schema, "Person", &filters, None, &PageStart::First, 100).unwrap();
         assert!(page.text.contains("$f0: String"), "{}", page.text);
         assert_compiles(&page);
         assert_compiles(&node_count(&schema, "Person", &filters).unwrap());
@@ -1058,7 +1255,10 @@ mod tests {
                         op,
                         value,
                     }];
-                    assert_compiles(&node_page(&schema, &node.name, &filters, None, 10).unwrap());
+                    assert_compiles(
+                        &node_page(&schema, &node.name, &filters, None, &PageStart::First, 10)
+                            .unwrap(),
+                    );
                 }
             }
         }
@@ -1078,7 +1278,9 @@ mod tests {
     fn edge_pages_and_counts_compile() {
         let schema = dev();
         for edge in &schema.edges {
-            assert_compiles(&edge_page(&schema, &edge.name, &[], None, 100).unwrap());
+            assert_compiles(
+                &edge_page(&schema, &edge.name, &[], None, &PageStart::First, 100).unwrap(),
+            );
             assert_compiles(&edge_count(&schema, &edge.name, &[]).unwrap());
         }
         let filters = [
@@ -1093,12 +1295,23 @@ mod tests {
                 value: Value::Null,
             },
         ];
-        let page = edge_page(&schema, "WorksAt", &filters, Some("01J"), 50).unwrap();
+        let page = edge_page(
+            &schema,
+            "WorksAt",
+            &filters,
+            None,
+            &PageStart::After {
+                id: "01J".into(),
+                value: Value::Null,
+            },
+            50,
+        )
+        .unwrap();
         assert_compiles(&page);
         assert!(page.text.contains("$e.role as e_role"), "{}", page.text);
         assert_compiles(&edge_count(&schema, "WorksAt", &filters).unwrap());
         assert!(matches!(
-            edge_page(&schema, "Nope", &[], None, 1),
+            edge_page(&schema, "Nope", &[], None, &PageStart::First, 1),
             Err(BuildError::UnknownEdge(_))
         ));
     }
@@ -1158,7 +1371,7 @@ mod tests {
                 value: json!("project-00036"),
             },
         ];
-        let page = node_page(&schema, "Person", &filters, None, 100).unwrap();
+        let page = node_page(&schema, "Person", &filters, None, &PageStart::First, 100).unwrap();
         assert_compiles(&page);
         assert!(page.text.contains("$n.title in $f0"), "{}", page.text);
         assert!(page.text.contains("$n.born >= $f1"), "{}", page.text);
@@ -1182,6 +1395,7 @@ mod tests {
                     value: Value::Null,
                 }],
                 None,
+                &PageStart::First,
                 10
             ),
             Err(BuildError::UnknownEdge(_))

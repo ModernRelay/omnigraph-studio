@@ -17,7 +17,8 @@ use gpui::{
     anchored, deferred, point,
 };
 use gq_language::{
-    BuildError, BuiltQuery, Filter, FilterOp, Property, ScalarKind, SchemaModel, builder,
+    BuildError, BuiltQuery, Filter, FilterOp, PageStart, Property, ScalarKind, SchemaModel, Sort,
+    builder,
 };
 use graph_client::api::ReadOutput;
 use graph_client::{BlobCell, BlobMeta, ReadError};
@@ -102,6 +103,8 @@ pub struct TypeTable {
     count: Loadable<i64>,
     total: Loadable<i64>,
     filters: Vec<Filter>,
+    /// The order: a property then `@id`, values first and empty values last; `None` is `@id`.
+    sort: Option<Sort>,
     filter_draft: Option<FilterDraft>,
     filter_editor: Entity<Editor>,
     cursor: Option<Cursor>,
@@ -153,7 +156,14 @@ impl Item for TypeTable {
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
         Some(SavedItem {
             kind: "type_table".into(),
-            data: serde_json::json!({ "type_name": self.type_name, "at_commit": self.at_commit }),
+            data: serde_json::json!({
+                "type_name": self.type_name,
+                "at_commit": self.at_commit,
+                "sort": self.sort.as_ref().map(|sort| serde_json::json!({
+                    "property": sort.property,
+                    "descending": sort.descending,
+                })),
+            }),
         })
     }
 
@@ -273,6 +283,7 @@ impl TypeTable {
             count: Loadable::NotLoaded,
             total: Loadable::NotLoaded,
             filters: Vec::new(),
+            sort: None,
             filter_draft: None,
             filter_editor,
             cursor: None,
@@ -417,12 +428,48 @@ impl TypeTable {
 
     // ---- reading ----
 
-    fn page_query(&self, after: Option<&str>, limit: u32) -> Result<BuiltQuery, BuildError> {
+    fn page_query(&self, start: &PageStart, limit: u32) -> Result<BuiltQuery, BuildError> {
         let schema = self.schema.as_ref().expect("schema loaded before reading");
         let filters = self.resolved_filters();
+        let sort = self.sort.as_ref();
         match self.kind {
-            TableKind::Node => builder::node_page(schema, &self.type_name, &filters, after, limit),
-            TableKind::Edge => builder::edge_page(schema, &self.type_name, &filters, after, limit),
+            TableKind::Node => {
+                builder::node_page(schema, &self.type_name, &filters, sort, start, limit)
+            }
+            TableKind::Edge => {
+                builder::edge_page(schema, &self.type_name, &filters, sort, start, limit)
+            }
+        }
+    }
+
+    /// Orders the table by a column: ascending, then descending, then back to `@id`. The rows
+    /// are read again at the same commit.
+    fn cycle_sort(&mut self, property: String, cx: &mut Context<Self>) {
+        self.sort = match self.sort.take() {
+            Some(sort) if sort.property == property && !sort.descending => Some(Sort {
+                property,
+                descending: true,
+            }),
+            Some(sort) if sort.property == property => None,
+            _ => Some(Sort {
+                property,
+                descending: false,
+            }),
+        };
+        self.reload(true, cx);
+    }
+
+    /// Restores a remembered order, if the property can still order the table.
+    pub fn set_sort(&mut self, sort: Option<Sort>, cx: &mut Context<Self>) {
+        let allowed = sort.as_ref().is_none_or(|sort| {
+            self.columns
+                .iter()
+                .filter_map(ColumnSpec::property)
+                .any(|p| p.name == sort.property && Sort::allowed(p))
+        });
+        if allowed && sort != self.sort {
+            self.sort = sort;
+            self.reload(true, cx);
         }
     }
 
@@ -511,7 +558,7 @@ impl TypeTable {
             .scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
         let size = self.page_size(cx);
-        let query = match self.page_query(None, size) {
+        let query = match self.page_query(&PageStart::First, size) {
             Ok(query) => query,
             Err(error) => {
                 self.first_page = Loadable::Failed(error.to_string());
@@ -548,7 +595,8 @@ impl TypeTable {
             return;
         }
         let size = self.page_size(cx);
-        let query = match self.page_query(self.paging.after.as_deref(), size) {
+        let start = self.paging.start.clone();
+        let query = match self.page_query(&start, size) {
             Ok(query) => query,
             Err(error) => {
                 self.more_error = Some(error.to_string());
@@ -580,8 +628,9 @@ impl TypeTable {
         match result {
             Ok(output) => {
                 let page = self.rows_from(&output.rows);
+                let sort_column = self.sort.as_ref().map(|sort| sort.property.as_str());
                 self.paging
-                    .accept(output.graph_commit_id.as_deref(), &page, size);
+                    .accept(output.graph_commit_id.as_deref(), &page, size, sort_column);
                 self.rows.extend(page);
                 if first {
                     self.first_page = Loadable::Loaded(());
@@ -667,9 +716,12 @@ impl TypeTable {
         {
             return;
         }
+        // One row of the plain key order is enough to learn the head's commit.
         let saved_filters = std::mem::take(&mut self.filters);
-        let query = self.page_query(None, 1);
+        let saved_sort = self.sort.take();
+        let query = self.page_query(&PageStart::First, 1);
         self.filters = saved_filters;
+        self.sort = saved_sort;
         let Ok(query) = query else { return };
         let read = self
             .session
@@ -732,7 +784,13 @@ impl TypeTable {
         match key {
             Some(id) => {
                 values.insert(crate::model::ID_COLUMN.into(), Value::String(id.clone()));
-                if let Some(position) = insert_position(&self.rows, &id, self.paging.exhausted) {
+                // Sorted, a new row goes first, where it is seen; the next read places it.
+                let position = if self.sort.is_some() {
+                    Some(0)
+                } else {
+                    insert_position(&self.rows, &id, self.paging.exhausted)
+                };
+                if let Some(position) = position {
                     let dimmed = !row_matches(&self.filters, &values);
                     self.rows.insert(position, Row { id, values, dimmed });
                     if let Some(cursor) = &mut self.cursor
@@ -1932,11 +1990,19 @@ impl TypeTable {
 
     fn render_grid(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let selected_bg = studio_ui::ds::surface::selected_document(cx);
+        let hover_bg = studio_ui::ds::surface::hover(cx);
         let headers: Vec<AnyElement> = self
             .columns
             .iter()
-            .map(|column| {
-                h_flex()
+            .enumerate()
+            .map(|(index, column)| {
+                let sortable = column.property().filter(|p| Sort::allowed(p));
+                let sorted = self
+                    .sort
+                    .as_ref()
+                    .filter(|sort| sortable.is_some_and(|p| p.name == sort.property));
+                let header = h_flex()
+                    .id(("column-header", index))
                     .h(px(studio_ui::HEADER_HEIGHT))
                     .px_4()
                     .gap_1p5()
@@ -1946,7 +2012,11 @@ impl TypeTable {
                     .child(
                         Label::new(column.title.clone())
                             .size(LabelSize::Small)
-                            .color(Color::Muted)
+                            .color(if sorted.is_some() {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            })
                             .single_line(),
                     )
                     .child(
@@ -1956,7 +2026,36 @@ impl TypeTable {
                             .single_line()
                             .truncate(),
                     )
-                    .into_any_element()
+                    .children(sorted.map(|sort| {
+                        Icon::new(if sort.descending {
+                            IconName::ArrowDown
+                        } else {
+                            IconName::ArrowUp
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Accent)
+                    }));
+                match sortable {
+                    Some(property) => {
+                        let property = property.name.clone();
+                        let next = match sorted {
+                            None => "Sort ascending",
+                            Some(sort) if !sort.descending => "Sort descending",
+                            Some(_) => "Back to key order",
+                        };
+                        header
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(hover_bg))
+                            .tooltip(Tooltip::text(format!(
+                                "{next} · rows without a value come last"
+                            )))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.cycle_sort(property.clone(), cx)
+                            }))
+                            .into_any_element()
+                    }
+                    None => header.into_any_element(),
+                }
             })
             .collect();
         let cursor_row = self.cursor.map(|c| c.row);

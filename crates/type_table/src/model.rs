@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use gq_language::builder::edge_property_column;
 use gq_language::input::parse_scalar;
 pub use gq_language::input::{edit_text, parse_input};
-use gq_language::{EdgeType, Filter, FilterOp, NodeType, Property, ScalarKind};
+use gq_language::{EdgeType, Filter, FilterOp, NodeType, PageStart, Property, ScalarKind};
 use graph_client::WriteOutcome;
 use graph_client::api::ChangeOutput;
 use serde_json::{Map, Value};
@@ -236,20 +236,30 @@ pub fn count_of(rows: &Value) -> Option<i64> {
 }
 
 /// Keyset paging pinned to the commit the first page read (constitution II).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Paging {
     /// The `graph_commit_id` every read of this view is pinned to.
     pub pinned: Option<String>,
-    /// The last loaded row's `@id`: the next page starts after it.
-    pub after: Option<String>,
+    /// Where the next page starts.
+    pub start: PageStart,
     /// The last page came back short; there is nothing more to read.
     pub exhausted: bool,
 }
 
+impl Default for Paging {
+    fn default() -> Self {
+        Self {
+            pinned: None,
+            start: PageStart::First,
+            exhausted: false,
+        }
+    }
+}
+
 impl Paging {
-    /// Forget the rows but keep the pin: the same view re-read with other filters.
+    /// Forget the rows but keep the pin: the same view re-read with other filters or order.
     pub fn restart(&mut self) {
-        self.after = None;
+        self.start = PageStart::First;
         self.exhausted = false;
     }
 
@@ -259,14 +269,48 @@ impl Paging {
     }
 
     /// Records a page. The first page's commit becomes the pin; later pages were read at it.
-    pub fn accept(&mut self, commit: Option<&str>, page: &[Row], page_size: u32) {
+    /// With a sort (`sort_column`, the rows' column for it), a short page of rows with values
+    /// moves on to the rows without one rather than ending the list.
+    pub fn accept(
+        &mut self,
+        commit: Option<&str>,
+        page: &[Row],
+        page_size: u32,
+        sort_column: Option<&str>,
+    ) {
         if self.pinned.is_none() {
             self.pinned = commit.map(str::to_owned);
         }
-        if let Some(last) = page.last() {
-            self.after = Some(last.id.clone());
+        let short = page.len() < page_size as usize;
+        let in_nulls = matches!(self.start, PageStart::Nulls { .. });
+        match (sort_column, page.last()) {
+            (Some(_), Some(last)) if in_nulls => {
+                self.start = PageStart::Nulls {
+                    after: last.id.clone(),
+                };
+            }
+            (Some(column), Some(last)) => {
+                self.start = PageStart::After {
+                    id: last.id.clone(),
+                    value: last.value(column).clone(),
+                };
+            }
+            (None, Some(last)) => {
+                self.start = PageStart::After {
+                    id: last.id.clone(),
+                    value: Value::Null,
+                };
+            }
+            (_, None) => {}
         }
-        self.exhausted = page.len() < page_size as usize;
+        if sort_column.is_some() && short && !in_nulls {
+            self.start = PageStart::Nulls {
+                after: String::new(),
+            };
+            self.exhausted = false;
+        } else {
+            self.exhausted = short;
+        }
     }
 
     /// Whether the viewport, which ends at row `visible_end`, has passed 80% of the `loaded`
@@ -669,24 +713,66 @@ mod tests {
             .collect()
     }
 
+    fn after(id: &str, value: Value) -> PageStart {
+        PageStart::After {
+            id: id.into(),
+            value,
+        }
+    }
+
     #[test]
     fn paging_pins_the_first_commit_and_pages_by_key() {
         let mut paging = Paging::default();
-        paging.accept(Some("c1"), &rows(&["a", "b"]), 2);
+        paging.accept(Some("c1"), &rows(&["a", "b"]), 2, None);
         assert_eq!(paging.pinned.as_deref(), Some("c1"));
-        assert_eq!(paging.after.as_deref(), Some("b"));
+        assert_eq!(paging.start, after("b", Value::Null));
         assert!(!paging.exhausted);
         // A later page read at the pin cannot move it.
-        paging.accept(Some("c9"), &rows(&["c"]), 2);
+        paging.accept(Some("c9"), &rows(&["c"]), 2, None);
         assert_eq!(paging.pinned.as_deref(), Some("c1"));
-        assert_eq!(paging.after.as_deref(), Some("c"));
+        assert_eq!(paging.start, after("c", Value::Null));
         assert!(paging.exhausted);
         // New filters keep the pin; Refresh drops it.
         paging.restart();
         assert_eq!(paging.pinned.as_deref(), Some("c1"));
-        assert!(paging.after.is_none() && !paging.exhausted);
+        assert!(paging.start == PageStart::First && !paging.exhausted);
         paging.reset();
         assert!(paging.pinned.is_none());
+    }
+
+    #[test]
+    fn sorted_paging_reads_the_rows_with_values_then_those_without() {
+        let row = |id: &str, title: Value| {
+            let mut values = Map::new();
+            values.insert("title".into(), title);
+            Row {
+                id: id.into(),
+                values,
+                dimmed: false,
+            }
+        };
+        let mut paging = Paging::default();
+        let first = [row("p1", "Analyst".into()), row("p7", "CTO".into())];
+        paging.accept(Some("c1"), &first, 2, Some("title"));
+        assert_eq!(paging.start, after("p7", "CTO".into()));
+        assert!(!paging.exhausted);
+        // A short page of values goes on to the rows without one.
+        paging.accept(
+            Some("c1"),
+            &[row("p3", "Engineer".into())],
+            2,
+            Some("title"),
+        );
+        assert_eq!(
+            paging.start,
+            PageStart::Nulls {
+                after: String::new()
+            }
+        );
+        assert!(!paging.exhausted);
+        paging.accept(Some("c1"), &[row("p2", Value::Null)], 2, Some("title"));
+        assert_eq!(paging.start, PageStart::Nulls { after: "p2".into() });
+        assert!(paging.exhausted, "a short page of nulls ends the list");
     }
 
     #[test]
