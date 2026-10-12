@@ -1,7 +1,7 @@
 //! The history tab (spec 009): a branch's commits newest first, a lane graph for merges, and
 //! the selected commit's changes in a detail split.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use editor::{Editor, EditorEvent};
@@ -33,6 +33,9 @@ const ROW_HEIGHT: f32 = 34.;
 const LANE_WIDTH: f32 = 14.;
 const GRAPH_PADDING: f32 = 8.;
 
+/// Changes read per commit for a row's counts.
+const ROW_COUNT_PAGE: u32 = 500;
+
 enum State {
     Loading,
     Ready,
@@ -56,6 +59,10 @@ pub struct HistoryView {
     selected: Option<usize>,
     detail: Option<Entity<CommitView>>,
     counts: HashMap<String, (usize, usize, usize)>,
+    /// Commits whose counts come from a first page only, and those asked for already.
+    partial_counts: HashSet<String>,
+    asked_counts: HashSet<String>,
+    count_tasks: Vec<Task<()>>,
     /// Branch names by the commit they point at.
     heads: HashMap<String, Vec<String>>,
     /// Commits in the branch's own list; the rest came in through merges.
@@ -165,6 +172,9 @@ impl HistoryView {
             selected: None,
             detail: None,
             counts: HashMap::new(),
+            partial_counts: HashSet::new(),
+            asked_counts: HashSet::new(),
+            count_tasks: Vec::new(),
             heads: HashMap::new(),
             own_count: 0,
             scroll: UniformListScrollHandle::new(),
@@ -316,6 +326,7 @@ impl HistoryView {
             let detail = cx.new(|cx| CommitView::new(session, id, Some(commit), cx));
             self._detail_subscription =
                 Some(cx.subscribe(&detail, |this, _, counts: &CommitCounts, cx| {
+                    this.partial_counts.remove(&counts.commit_id);
                     this.counts.insert(
                         counts.commit_id.clone(),
                         (counts.added, counts.changed, counts.removed),
@@ -375,6 +386,62 @@ impl HistoryView {
         ((self.graph.lane_count.max(1) as f32) * LANE_WIDTH + GRAPH_PADDING * 2.).max(52.)
     }
 
+    /// Reads change counts for drawn commits that have none yet: one page each, netted as the
+    /// detail nets them. A commit with more changes than the page shows "N+". A commit's
+    /// changes never change, so an answer is kept for the life of the view.
+    fn load_row_counts(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        let session = self.session.read(cx);
+        let (client, graph) = (session.client(cx), session.graph_id.clone());
+        let ids: Vec<String> = self
+            .commits
+            .get(range.start..range.end.min(self.commits.len()))
+            .unwrap_or_default()
+            .iter()
+            .map(|commit| commit.graph_commit_id.clone())
+            .filter(|id| !self.counts.contains_key(id) && !self.asked_counts.contains(id))
+            .collect();
+        for id in ids {
+            self.asked_counts.insert(id.clone());
+            let (client, graph) = (client.clone(), graph.clone());
+            self.count_tasks.push(cx.spawn(async move |this, cx| {
+                // A parentless commit or one past cleanup cannot be compared: no count.
+                let Ok(page) = client
+                    .commit_changes(&graph, &id, None, ROW_COUNT_PAGE)
+                    .await
+                else {
+                    return;
+                };
+                let more = page.next_page_token.is_some();
+                let folded = cx
+                    .background_spawn(async move {
+                        let mut fold = graph_store::ChangeFold::new();
+                        fold.add_block(graph_client::api::ChangeBlockOutput {
+                            cause: page.cause,
+                            changes: page.changes,
+                        });
+                        fold.finish()
+                            .counts()
+                            .iter()
+                            .fold((0, 0, 0), |(a, c, r), t| {
+                                (a + t.added, c + t.changed, r + t.removed)
+                            })
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    // The detail's full count, if it arrived meanwhile, wins.
+                    if !this.counts.contains_key(&id) {
+                        this.counts.insert(id.clone(), folded);
+                        if more {
+                            this.partial_counts.insert(id);
+                        }
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+        }
+    }
+
     fn render_rows(
         &mut self,
         range: Range<usize>,
@@ -420,6 +487,7 @@ impl HistoryView {
                     .unwrap_or_else(|| "main".to_owned());
                 let id = commit.graph_commit_id.clone();
                 let counts = self.counts.get(&id).copied();
+                let partial = self.partial_counts.contains(&id);
                 let heads = self.heads.get(&id).cloned().unwrap_or_default();
                 let selected = self.selected == Some(ix);
                 let actor = commit.actor_id.clone();
@@ -497,7 +565,17 @@ impl HistoryView {
                                     .color(Color::Disabled)
                                     .into_any_element()
                             } else {
-                                change_counts(added, changed, removed).into_any_element()
+                                h_flex()
+                                    .gap_1()
+                                    .child(change_counts(added, changed, removed))
+                                    .when(partial, |d| {
+                                        d.child(
+                                            Label::new("+ more")
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                    })
+                                    .into_any_element()
                             }
                         },
                     )))
@@ -578,7 +656,11 @@ impl HistoryView {
                 uniform_list(
                     "history-rows",
                     self.commits.len(),
-                    cx.processor(|this, range, window, cx| this.render_rows(range, window, cx)),
+                    cx.processor(|this, range: Range<usize>, window, cx| {
+                        let drawn = range.clone();
+                        cx.defer_in(window, move |this, _, cx| this.load_row_counts(drawn, cx));
+                        this.render_rows(range, window, cx)
+                    }),
                 )
                 .track_scroll(&self.scroll)
                 .flex_1()

@@ -40,6 +40,10 @@ XI (lane logic forked from Zed with notices).
 - The bottom-dock panel follows the window's branch and graph; rows only, and a click opens the
   commit in its own tab.
 - More than 5,000 commits: a warning that the list loads in full until paging exists.
+- Built (row counts): a drawn row without counts reads its commit's first 500 changes and nets
+  them as the detail does ("+ more" when there are more); answers are kept, since a commit's
+  changes never change, and the detail's full count replaces a first-page one. A commit
+  without a first parent shows none.
 
 ## Decisions
 
@@ -63,6 +67,7 @@ XI (lane logic forked from Zed with notices).
 | 2026-10-12 | Merges draw against a live server | offscreen snapshot of main after merging `feature-y` and fast-forwarding `feature-z` | Both merged lanes join main; heads shown as branch chips |
 | 2026-10-12 | Parentless commit | live server: `GET /commits/{genesis}/changes` | 409 "has no first parent"; the detail says the commit cannot be compared |
 | 2026-10-12 | Pinned tables and queries read their commit | offscreen snapshot restoring `Person @ 4S3Y6CKK`, `Person @ EP12CTBE` and a query at `4S3Y6CKK`, with the History panel open | Tabs named with the commit, a "Read only · 4S3Y6CKK" chip, footer hints reduced to Peek; the query's result reads "people on commit 4S3Y6CKK" |
+| 2026-10-12 | Change counts on rows | offscreen snapshot of a scratch branch with two edits on top of main | `~3` and `~1` on the edits, `+500 + more` on the seed load, none on the first commit |
 | 2026-10-12 | Search matches by id prefix or actor | `history` test `search_finds_commits_by_id_prefix_or_actor` | An id matches only by prefix; actors match anywhere, case-blind |
 
 ## Corrections
