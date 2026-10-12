@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    Anchor, App, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
-    KeyContext, Render, ScrollStrategy, SharedString, Subscription, Task, WeakEntity, Window,
-    anchored, deferred, point,
+    Anchor, App, ClickEvent, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle,
+    Focusable, KeyContext, Render, ScrollStrategy, SharedString, Subscription, Task, WeakEntity,
+    Window, anchored, deferred, point,
 };
 use gq_language::{
     BuildError, BuiltQuery, Filter, FilterOp, PageStart, Property, RelationshipGroup, ScalarKind,
@@ -84,6 +84,14 @@ struct FilterDraft {
     error: Option<String>,
 }
 
+/// A bulk set being written: the property, and what came of the last try.
+#[derive(Default)]
+struct BulkDraft {
+    property: Option<String>,
+    notice: Option<Notice>,
+    saving: bool,
+}
+
 /// How many neighbours a relationship cell shows as chips.
 const RELATION_CHIPS: usize = 3;
 
@@ -140,6 +148,11 @@ pub struct TypeTable {
     sort: Option<Sort>,
     filter_draft: Option<FilterDraft>,
     filter_editor: Entity<Editor>,
+    /// Rows picked for a bulk set (⌘-click, ⇧-click), by id, and the row ⇧ extends from.
+    selection: Vec<String>,
+    selection_anchor: Option<usize>,
+    bulk: BulkDraft,
+    bulk_editor: Entity<Editor>,
     cursor: Option<Cursor>,
     editing: Option<Editing>,
     cell_editor: Entity<Editor>,
@@ -236,6 +249,11 @@ impl TypeTable {
             editor.set_placeholder_text("Value", window, cx);
             editor
         });
+        let bulk_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("New value", window, cx);
+            editor
+        });
         let mut subscriptions = vec![
             cx.subscribe_in(&session, window, Self::on_session_event),
             cx.subscribe_in(
@@ -323,6 +341,10 @@ impl TypeTable {
             sort: None,
             filter_draft: None,
             filter_editor,
+            selection: Vec::new(),
+            selection_anchor: None,
+            bulk: BulkDraft::default(),
+            bulk_editor,
             cursor: None,
             editing: None,
             cell_editor,
@@ -589,6 +611,298 @@ impl TypeTable {
                 SaveViewModal::new(graph, view, taken, window, cx)
             });
         });
+    }
+
+    /// Adds the row at `row` to the selection, or takes it out; with `range`, picks every row
+    /// from the last one picked to it.
+    fn pick_rows(&mut self, row: usize, range: bool, cx: &mut Context<Self>) {
+        let Some(id) = self.rows.get(row).map(|r| r.id.clone()) else {
+            return;
+        };
+        match self.selection_anchor.filter(|_| range) {
+            Some(anchor) => {
+                let (from, to) = (anchor.min(row), anchor.max(row).min(self.rows.len() - 1));
+                for picked in &self.rows[from..=to] {
+                    if !self.selection.contains(&picked.id) {
+                        self.selection.push(picked.id.clone());
+                    }
+                }
+            }
+            None => {
+                match self.selection.iter().position(|picked| *picked == id) {
+                    Some(index) => {
+                        self.selection.remove(index);
+                    }
+                    None => self.selection.push(id),
+                }
+                self.selection_anchor = Some(row);
+            }
+        }
+        self.bulk.notice = None;
+        cx.notify();
+    }
+
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.selection.clear();
+        self.selection_anchor = None;
+        self.bulk = BulkDraft::default();
+        cx.notify();
+    }
+
+    /// Sets the chosen property on every selected row in one mutation, each row bound to the
+    /// value it shows (spec 004, bulk set). Rows already holding the value are left out.
+    fn submit_bulk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(property), Some(schema)) = (
+            self.bulk
+                .property
+                .as_deref()
+                .and_then(|name| self.property_of(name)),
+            self.schema.clone(),
+        ) else {
+            return;
+        };
+        let text = self.bulk_editor.read(cx).text(cx);
+        let new = match parse_input(&property, &text) {
+            Ok(value) => value,
+            Err(message) => {
+                self.bulk.notice = Some(Notice::new(Tone::Invalid, message));
+                cx.notify();
+                return;
+            }
+        };
+        let rows: Vec<(String, Value)> = self
+            .rows
+            .iter()
+            .filter(|row| self.selection.contains(&row.id))
+            .map(|row| (row.id.clone(), row.value(&property.name).clone()))
+            .filter(|(_, old)| !same_value(old, &new))
+            .collect();
+        if rows.is_empty() {
+            self.bulk.notice = Some(Notice::new(
+                Tone::Invalid,
+                "Every selected row already has that value.".to_owned(),
+            ));
+            cx.notify();
+            return;
+        }
+        let query =
+            match builder::update_cells(&schema, &self.type_name, &property.name, &rows, &new) {
+                Ok(query) => query,
+                Err(error) => {
+                    self.bulk.notice = Some(Notice::new(Tone::Invalid, error.to_string()));
+                    cx.notify();
+                    return;
+                }
+            };
+        let count = rows.len();
+        let description = format!("Set {} on {count} {} rows", property.name, self.type_name);
+        let write = self.session.update(cx, |session, cx| {
+            session.write(&query, None, description, cx)
+        });
+        self.bulk.saving = true;
+        self.bulk.notice = None;
+        self.saves_in_flight += 1;
+        cx.notify();
+        let branch = self.branch.clone();
+        let column = property.name.clone();
+        // Detached: a write is never cancelled by closing the tab.
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = write.await;
+            this.update_in(cx, |this, _window, cx| {
+                this.finish_bulk(outcome, rows, column, new, &branch, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_bulk(
+        &mut self,
+        outcome: graph_client::WriteOutcome<graph_client::api::ChangeOutput>,
+        rows: Vec<(String, Value)>,
+        column: String,
+        new: Value,
+        branch: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.saves_in_flight = self.saves_in_flight.saturating_sub(1);
+        self.bulk.saving = false;
+        match &outcome {
+            graph_client::WriteOutcome::Committed(output) => {
+                let changed = output.affected_nodes as usize;
+                match output.commit.as_ref() {
+                    Some(commit) if changed == rows.len() => {
+                        for (id, _) in &rows {
+                            if let Some(ix) = self.row_index(id) {
+                                set_value(&mut self.rows[ix], &column, new.clone());
+                                let matches = row_matches(&self.filters, &self.rows[ix].values);
+                                self.rows[ix].dimmed = !matches;
+                            }
+                        }
+                        if self.paging.advance_for_own_commit(
+                            commit.parent_commit_id.as_deref(),
+                            &commit.graph_commit_id,
+                        ) {
+                            self.newer = true;
+                        }
+                        self.clear_selection(cx);
+                    }
+                    _ => {
+                        // Some rows held another value than the one shown: they were left
+                        // alone. Read the table at the head so every row shows what it holds.
+                        let left = rows.len().saturating_sub(changed);
+                        self.bulk.notice = Some(Notice::new(
+                            Tone::Conflict,
+                            format!(
+                                "{left} of {} rows had changed elsewhere and were left alone; \
+                                 the table now shows {branch}'s head.",
+                                rows.len()
+                            ),
+                        ));
+                        self.reload(false, cx);
+                    }
+                }
+            }
+            _ => {
+                if let SaveResult::Refused(notice) | SaveResult::Unknown(notice) =
+                    save_result(&outcome, branch)
+                {
+                    self.bulk.notice = Some(notice);
+                }
+            }
+        }
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// The bar over the table while rows are picked: how many, and setting one property on
+    /// all of them.
+    fn render_bulk_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.selection.len() < 2 {
+            return None;
+        }
+        let colors = cx.theme().colors();
+        let (border, field_border, field_bg) = (
+            colors.border_variant,
+            colors.border,
+            colors.editor_background,
+        );
+        let count = self.selection.len();
+        let read_only = self.kind == TableKind::Edge || self.at_commit.is_some();
+        let editable: Vec<String> = self
+            .columns
+            .iter()
+            .filter(|c| c.editable(self.kind))
+            .filter_map(|c| c.property().map(|p| p.name.clone()))
+            .collect();
+        let chosen = self.bulk.property.clone();
+        let table = cx.entity().downgrade();
+        let saving = self.bulk.saving;
+        let mut bar = h_flex()
+            .flex_none()
+            .px_3()
+            .py_1p5()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(border)
+            .child(
+                Label::new(format!("{count} rows selected"))
+                    .size(LabelSize::Small)
+                    .weight(gpui::FontWeight::MEDIUM),
+            );
+        if read_only {
+            bar = bar.child(studio_ui::ds::text::muted("Read only"));
+        } else {
+            bar = bar
+                .child(
+                    PopoverMenu::new("bulk-property")
+                        .trigger(
+                            Button::new(
+                                "bulk-property-button",
+                                match &chosen {
+                                    Some(name) => format!("Set {name} ▾"),
+                                    None => "Set a property ▾".to_owned(),
+                                },
+                            )
+                            .style(ButtonStyle::Outlined)
+                            .label_size(LabelSize::Small),
+                        )
+                        .menu(move |window, cx| {
+                            let editable = editable.clone();
+                            let table = table.clone();
+                            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                for name in editable {
+                                    let table = table.clone();
+                                    let chosen = name.clone();
+                                    menu = menu.entry(name, None, move |window, cx| {
+                                        let chosen = chosen.clone();
+                                        table
+                                            .update(cx, |table, cx| {
+                                                table.bulk.property = Some(chosen);
+                                                table.bulk.notice = None;
+                                                let focus = table.bulk_editor.focus_handle(cx);
+                                                window.focus(&focus, cx);
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                    });
+                                }
+                                menu
+                            }))
+                        }),
+                )
+                .when(chosen.is_some(), |bar| {
+                    bar.child(
+                        div()
+                            .w(px(220.))
+                            .px_2()
+                            .py_0p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(field_border)
+                            .bg(field_bg)
+                            .child(self.bulk_editor.clone()),
+                    )
+                    .child(
+                        Button::new(
+                            "bulk-set",
+                            if saving {
+                                format!("Setting {count}…")
+                            } else {
+                                format!("Set on {count} rows")
+                            },
+                        )
+                        .style(ButtonStyle::Tinted(TintColor::Accent))
+                        .label_size(LabelSize::Small)
+                        .disabled(saving)
+                        .tooltip(Tooltip::text(format!(
+                            "One commit to {}; each row is bound to the value it shows",
+                            self.branch
+                        )))
+                        .on_click(cx.listener(|this, _, window, cx| this.submit_bulk(window, cx))),
+                    )
+                });
+        }
+        Some(
+            bar.children(self.bulk.notice.clone().map(|notice| {
+                Label::new(notice.message)
+                    .size(LabelSize::Small)
+                    .color(match notice.tone {
+                        Tone::Refused | Tone::Invalid => Color::Error,
+                        Tone::Conflict | Tone::Unknown => Color::Warning,
+                    })
+            }))
+            .child(div().flex_1())
+            .child(
+                Button::new("bulk-clear", "Clear")
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::Small)
+                    .tooltip(Tooltip::text("Clear the selection (Esc)"))
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_selection(cx))),
+            )
+            .into_any_element(),
+        )
     }
 
     /// The toolbar's Views menu: this type's saved views, then save and delete.
@@ -1216,8 +1530,24 @@ impl TypeTable {
         }
     }
 
-    fn click_cell(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn click_cell(
+        &mut self,
+        row: usize,
+        col: usize,
+        modifiers: gpui::Modifiers,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let cursor = Cursor { row, col };
+        // ⌘-click picks a row for a bulk set; ⇧-click picks the rows from the last one picked.
+        if modifiers.secondary() || modifiers.shift {
+            self.pick_rows(row, modifiers.shift, cx);
+            self.set_cursor(cursor, window, cx);
+            return;
+        }
+        if !self.selection.is_empty() {
+            self.clear_selection(cx);
+        }
         self.set_cursor(cursor, window, cx);
         // A relationship cell opens the related rows: the other type, filtered to those related
         // to this row through the same relationship seen from the other end.
@@ -1594,6 +1924,11 @@ impl TypeTable {
     // ---- actions ----
 
     fn on_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.selection.is_empty() && self.editing.is_none() {
+            self.clear_selection(cx);
+            window.focus(&self.focus_handle, cx);
+            return;
+        }
         if self.filter_draft.is_some() {
             self.filter_draft = None;
             window.focus(&self.focus_handle, cx);
@@ -2355,6 +2690,14 @@ impl TypeTable {
             })
             .collect();
         let cursor_row = self.cursor.map(|c| c.row);
+        let picked: HashSet<usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| self.selection.contains(&row.id))
+            .map(|(ix, _)| ix)
+            .collect();
+        let picked_bg = studio_ui::ds::surface::selected_document(cx).opacity(0.6);
         let dimmed: HashSet<usize> = self
             .rows
             .iter()
@@ -2378,6 +2721,7 @@ impl TypeTable {
                 row.border_b_1()
                     .border_color(hairline)
                     .when(glass, |row| row.border_dashed())
+                    .when(picked.contains(&ix), |row| row.bg(picked_bg))
                     .when(cursor_row == Some(ix), |row| row.bg(selected_bg))
                     .when(dimmed.contains(&ix), |row| row.opacity(0.45))
                     .into_any_element()
@@ -2671,9 +3015,9 @@ impl TypeTable {
             return cell
                 .child(self.render_relation_cell(row, &column.key, group, cx))
                 .when(is_cursor, |cell| cell.child(ring()))
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.click_cell(ix, col, window, cx)),
-                )
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    this.click_cell(ix, col, event.modifiers(), window, cx)
+                }))
                 .into_any_element();
         }
         let content: AnyElement = match column.property() {
@@ -2734,7 +3078,9 @@ impl TypeTable {
         }
         cell.children(dot.map(|color| Indicator::dot().color(color)))
             .child(content)
-            .on_click(cx.listener(move |this, _, window, cx| this.click_cell(ix, col, window, cx)))
+            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                this.click_cell(ix, col, event.modifiers(), window, cx)
+            }))
             .into_any_element()
     }
 
@@ -2943,6 +3289,7 @@ impl Render for TypeTable {
         let background = cx.theme().colors().editor_background;
         let toolbar = self.render_toolbar(cx);
         let filter_bar = self.render_filter_bar(cx);
+        let bulk_bar = self.render_bulk_bar(cx);
         let body = self.render_body(cx);
         v_flex()
             .key_context(context)
@@ -2986,6 +3333,7 @@ impl Render for TypeTable {
             .on_action(cx.listener(|this, _: &ClearFilters, _, cx| this.clear_filters(cx)))
             .child(toolbar)
             .children(filter_bar)
+            .children(bulk_bar)
             .child(div().flex_1().min_h_0().child(body))
     }
 }

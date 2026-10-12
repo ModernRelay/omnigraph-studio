@@ -3,8 +3,8 @@
 Status: in progress · 2026-10-12. `crates/type_table` ships the Types sidebar, node and edge
 tables (keyset pages pinned to one commit, filtered counts, filters, a cell cursor, value-bound
 cell edits with all three outcomes, peek, insert and typed-key delete), sorting by a column,
-Blob cells and previews, relative dates, relationship columns, saved views, and preview tabs
-(spec 002). Not yet: bulk edits (see Deferred).
+Blob cells and previews, relative dates, relationship columns, saved views, bulk set, and
+preview tabs (spec 002). See Deferred for what is left.
 
 ## Problem
 
@@ -116,6 +116,12 @@ stay put), IX (paged, virtualized).
 - Bulk set and multi-row edits stage into a draft and publish as one commit. Mechanism to
   confirm in spike S1: one mutation with several statements, or `load/ndjson` in `merge` mode;
   check that merge mode leaves unspecified properties untouched before using it.
+  Built (bulk set): ⌘-click picks rows, ⇧-click the rows between; with two or more picked, a
+  bar sets one property on all of them as one mutation of one `update` per row
+  (`builder::update_cells`), each bound to the value its row shows, so one commit. Rows that
+  already hold the value are left out. A short `affected_nodes` means some rows changed
+  elsewhere: they were left alone, the bar says how many and the table reads the head. Esc or
+  Clear drops the selection.
 - Insert: a form generated from the node shape (required properties, key, enums, ranges).
 - Delete: type the row's key to confirm; uses `/mutate/if-graph-commit` with the pinned commit.
 - Every editing surface shows `write · <branch>`. A 403 shows "Your token cannot change
@@ -145,8 +151,8 @@ opens the branch's recent commits.
   - R2 unpublished commits: staged edits as a reviewable proposal only when the server
     advertises `cluster_publishCommit`.
 - Group-by (Tower 084) until filters and editing ship.
-- Bulk edits are designed above but not built yet. Views do not hold column state: columns
-  are fixed. The preview tab is built (spec 002).
+- Multi-row edits of different values staged as one draft (bulk set covers one value across
+  rows). Views do not hold column state: columns are fixed. The preview tab is built (spec 002).
 - Saving a Blob value to a file: the peek previews the first bytes only.
 - Per-row history beyond the commits that the change feed can cheaply return.
 
@@ -175,7 +181,8 @@ opens the branch's recent commits.
 | 2026-10-12 | Null order and sorted keyset pages on 0.13 | `order { $n.title asc, $n.@id asc }` and `desc` on the dev server; `is not null`; the keyset clause with `or`; `gq_language` `sorted_pages_read_values_then_nulls_and_compile` (text, Date, I32, an edge property); `type_table` paging test; offscreen snapshots of Person by title both ways and Company by city with 25-row pages | Nulls come first ascending and last descending, so the `is null` split is needed; Company by city ran Berlin to Toronto, then the company without a city, across the switch from values to nulls ("25 of 25") |
 | 2026-10-12 | Relationship columns | `gq_language` `page_relationship_reads_compile_for_every_group`; the grouped count and sample on the dev server (`person-000002` with no `knows` has no row); an offscreen snapshot of Person with its five relationship columns | Counts per id, tags in the UI font with "+N" kept in view, "—" for none |
 | 2026-10-12 | Saved views | `studio_settings` `views_are_saved_per_graph_and_type_and_replaced_by_name`; `gq_language` `filter_operators_round_trip_through_their_keys`; offscreen snapshots with `click:` and `type:` steps: a seeded "Founders" applied from the Views menu, then sorted by email and saved as "Founders by email" | "title is Founder", name ascending, "25 of 200", and the button read "Founders"; `settings.json` held both views |
-| pending | Merge-mode NDJSON leaves unspecified properties untouched | run against a 0.13 server | Bulk edit not built yet |
+| 2026-10-12 | Spike S1: several rows in one commit | on a scratch branch of the dev server: `update Person set { title: $v } where @id in $ids` (3 rows), and one mutation of two `update` statements | Both publish one commit; multi-statement mutations are the mechanism, so merge-mode NDJSON was not needed |
+| 2026-10-12 | Bulk set | `gq_language` `a_bulk_set_is_one_mutation_bound_row_by_row`; offscreen snapshots with `click:…,cmd` and `click:…,shift` on Project at branch `bulk-test`: three rows picked, status set to paused | One commit; `project-00001`, already paused, was left out ("Set status on 2 Project rows"); the rows updated in place and the selection cleared |
 
 ## Corrections
 

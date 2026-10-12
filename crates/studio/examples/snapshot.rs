@@ -8,7 +8,8 @@
 //! Each argument after the output path is an action, `name` or `name=<json>`, dispatched after
 //! the previous one settles. `type:<text>` types text into the focused editor (`\n` is a new
 //! line); it is `editor::HandleInput` with the text. `click:<x>,<y>` clicks at a point in
-//! window pixels (half the PNG's, which is drawn at 2x); `drag:<x1>,<y1>,<x2>,<y2>` presses at
+//! window pixels (half the PNG's, which is drawn at 2x), with `,cmd` or `,shift` held when
+//! added; `drag:<x1>,<y1>,<x2>,<y2>` presses at
 //! the first point, moves to the second in steps, and releases. `SNAPSHOT_WAIT_MS` (default 1500) is how
 //! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
 //! 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`.
@@ -70,6 +71,7 @@ fn click(
     cx: &mut HeadlessAppContext,
     handle: AnyWindowHandle,
     position: gpui::Point<gpui::Pixels>,
+    modifiers: Modifiers,
 ) {
     let events = [
         PlatformInput::MouseMove(MouseMoveEvent {
@@ -80,14 +82,14 @@ fn click(
         PlatformInput::MouseDown(MouseDownEvent {
             button: MouseButton::Left,
             position,
-            modifiers: Modifiers::default(),
+            modifiers,
             click_count: 1,
             first_mouse: false,
         }),
         PlatformInput::MouseUp(MouseUpEvent {
             button: MouseButton::Left,
             position,
-            modifiers: Modifiers::default(),
+            modifiers,
             click_count: 1,
         }),
     ];
@@ -178,13 +180,17 @@ fn main() {
             settle(&mut cx, wait);
             continue;
         }
-        if let Some((x, y)) = spec
-            .strip_prefix("click:")
-            .and_then(|at| at.split_once(','))
-        {
-            let x: f32 = x.trim().parse().expect("click x is a number");
-            let y: f32 = y.trim().parse().expect("click y is a number");
-            click(&mut cx, handle, point(px(x), px(y)));
+        if let Some(at) = spec.strip_prefix("click:") {
+            let parts: Vec<&str> = at.split(',').map(str::trim).collect();
+            let x: f32 = parts[0].parse().expect("click x is a number");
+            let y: f32 = parts[1].parse().expect("click y is a number");
+            let modifiers = Modifiers {
+                platform: parts.contains(&"cmd"),
+                control: parts.contains(&"ctrl"),
+                shift: parts.contains(&"shift"),
+                ..Modifiers::default()
+            };
+            click(&mut cx, handle, point(px(x), px(y)), modifiers);
             settle(&mut cx, wait);
             continue;
         }

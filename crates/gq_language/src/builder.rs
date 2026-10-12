@@ -970,6 +970,60 @@ pub fn update_cell(
     })
 }
 
+/// Sets one property on several rows in one mutation, so they publish as one commit (spec 004,
+/// bulk set). Each row's statement is bound to the value the row showed, as a cell edit is: a
+/// row changed elsewhere is left alone, and `affected_nodes` comes back short by it.
+pub fn update_cells(
+    schema: &SchemaModel,
+    type_name: &str,
+    property_name: &str,
+    rows: &[(String, Value)],
+    new: &Value,
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, type_name)?;
+    let property = property(node, property_name)?;
+    if !property.editable_in_cell() {
+        return Err(BuildError::NotEditable(property.name.clone()));
+    }
+    let mut params = Params::new();
+    let new = params.add("new", &property.param_type(true), new.clone());
+    let statements: Vec<String> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, (id, old))| {
+            let id = params.add(&format!("id{index}"), "String", Value::String(id.clone()));
+            let mut predicate = format!("@id = {id}");
+            if !property.list {
+                if old.is_null() {
+                    predicate.push_str(&format!(" and {} is null", property.name));
+                } else {
+                    let old = params.add(
+                        &format!("old{index}"),
+                        &property.param_type(false),
+                        old.clone(),
+                    );
+                    predicate.push_str(&format!(" and {} = {old}", property.name));
+                }
+            }
+            format!(
+                "update {ty} set {{ {prop}: {new} }} where {predicate}",
+                ty = node.name,
+                prop = property.name,
+            )
+        })
+        .collect();
+    let text = format!(
+        "query studio_set_rows({sig}) {{\n  {statements}\n}}\n",
+        sig = params.signature(),
+        statements = statements.join("\n  "),
+    );
+    Ok(BuiltQuery {
+        name: "studio_set_rows".into(),
+        text,
+        params: params.values,
+    })
+}
+
 /// Inserts one node with the given property values.
 pub fn insert_node(
     schema: &SchemaModel,
@@ -1169,6 +1223,37 @@ mod tests {
             query.text,
             result.diagnostics
         );
+    }
+
+    #[test]
+    fn a_bulk_set_is_one_mutation_bound_row_by_row() {
+        let schema = dev();
+        let rows = vec![
+            ("person-000001".to_owned(), Value::String("Engineer".into())),
+            ("person-000006".to_owned(), Value::Null),
+        ];
+        let query = update_cells(
+            &schema,
+            "Person",
+            "title",
+            &rows,
+            &Value::String("Founder".into()),
+        )
+        .unwrap();
+        assert!(
+            query
+                .text
+                .contains("update Person set { title: $new } where @id = $id0 and title = $old0"),
+            "{}",
+            query.text
+        );
+        assert!(query.text.contains("where @id = $id1 and title is null"));
+        assert_eq!(query.params["old0"], "Engineer");
+        assert_compiles(&query);
+        assert!(matches!(
+            update_cells(&schema, "Person", "slug", &rows, &Value::Null),
+            Err(BuildError::NotEditable(_))
+        ));
     }
 
     #[test]
