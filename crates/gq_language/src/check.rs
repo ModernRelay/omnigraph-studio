@@ -21,6 +21,9 @@ pub struct Diagnostic {
     pub byte: Option<u32>,
     /// The query declaration the problem belongs to, when known.
     pub query: Option<String>,
+    /// The compiler's suggested edits to the checked source, as byte ranges and their
+    /// replacements; empty when it suggests none (spec 007, quick fixes).
+    pub edits: Vec<(std::ops::Range<usize>, String)>,
 }
 
 impl Diagnostic {
@@ -34,6 +37,17 @@ impl Diagnostic {
             column: diagnostic.position.as_ref().map(|p| p.column),
             byte: diagnostic.position.as_ref().map(|p| p.byte),
             query: query.map(str::to_owned),
+            edits: diagnostic
+                .suggestion
+                .as_ref()
+                .map(|suggestion| {
+                    suggestion
+                        .edits
+                        .iter()
+                        .map(|edit| (edit.start..edit.end, edit.replacement.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 }
@@ -153,6 +167,7 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
                         column: None,
                         byte: None,
                         query: Some(decl.name.clone()),
+                        edits: Vec::new(),
                     },
                 };
                 result.diagnostics.push(diagnostic);
@@ -232,5 +247,20 @@ mod tests {
         assert_eq!(query.params[0], ("slug".into(), "String".into(), false));
         assert_eq!(query.params[1], ("founded".into(), "I32".into(), true));
         assert_eq!(query.params[2].1, "[String]");
+    }
+
+    #[test]
+    fn a_missing_parameter_list_comes_with_its_edit() {
+        let schema = crate::schema::tests::dev();
+        let source = "query people { match { $p: Person } return { $p.name } }";
+        let check = check(&schema, source);
+        let problem = &check.diagnostics[0];
+        assert_eq!(problem.code, "Q002");
+        assert_eq!(problem.edits, [(12..12, "()".to_owned())]);
+        let mut fixed = source.to_owned();
+        for (range, text) in problem.edits.iter().rev() {
+            fixed.replace_range(range.clone(), text);
+        }
+        assert!(super::check(&schema, &fixed).diagnostics.is_empty());
     }
 }

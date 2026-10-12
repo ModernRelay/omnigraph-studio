@@ -101,8 +101,7 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   highlight its part of the query.
 - The snapshot picker (run a read at a past commit). `QueryRequest.snapshot` is there; the editor
   sends the branch today.
-- Tree-sitter highlighting, folding and outline (`grammars/tree-sitter-gq`); quick fixes from
-  `Suggestion`/`TextEdit`.
+- Tree-sitter highlighting, folding and outline (`grammars/tree-sitter-gq`).
 - A row cap: the result shows every row the server returns, so the query's own `limit` is the
   cap today (constitution IX). The example query carries `limit 50`.
 - A write from the editor sends no `Omnigraph-If-Graph-Commit`: it is not based on a read, and
@@ -126,6 +125,7 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 | 2026-10-12 | `$` completion | `gq_language` completion tests; an offscreen snapshot of `$p.name = $` in a two-parameter query | Offers `name String`, `p Person`, `since I32?`; nothing while a parameter is being named; `$x.` follows the binding of the declaration under the cursor |
 | 2026-10-12 | Saved queries | offscreen snapshots: a new query, `key:cmd-s`, the Queries panel; a second run with restore, `OpenQueryFile` on the same path, the palette's Queries scope | `list_company.gq` written to the graph folder; the tab took its name and showed the dot after an edit; restored with its draft; the second open reused the tab |
 | 2026-10-12 | A refused read shows the server's diagnostic | `ApiErrorSummary.diagnostic` from `ErrorOutput.diagnostic`; an offscreen snapshot running `return { $p.nope }` | "T6 · type `Person` has no property `nope`" under the refusal, as writes show it; it jumps to the text when the diagnostic has a position |
+| 2026-10-12 | Quick fixes | `gq_language` `a_missing_parameter_list_comes_with_its_edit`; offscreen snapshot of `query people {` with the problems list's Fix clicked | Q002 carries its `()` edit; Fix applied it, the problem cleared and the columns showed. At 0.13 this is the one suggestion the compiler makes; any other `Suggestion` gets the same button, applied only while the text is the one checked |
 | 2026-10-12 | Run loop end to end | offscreen snapshots against the dev server: example query, run, explain, parameters, confirm bar, committed and refused writes, a parse error underline, completion | As described under What landed |
 
 ## Corrections

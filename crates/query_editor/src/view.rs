@@ -1126,6 +1126,21 @@ impl QueryEditor {
                                         .size(LabelSize::Small)
                                         .color(Color::Muted)
                                 }))
+                                .when(!problem.edits.is_empty(), |row| {
+                                    let edits = problem.edits.clone();
+                                    let checked = analysis.text.clone();
+                                    row.child(
+                                        Button::new(("apply-fix", index), "Fix")
+                                            .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                                            .label_size(LabelSize::XSmall)
+                                            .tooltip(Tooltip::text(
+                                                "Apply the compiler's suggested edit",
+                                            ))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.apply_fix(&checked, &edits, window, cx)
+                                            })),
+                                    )
+                                })
                                 .child(div().flex_1())
                                 .child(
                                     Label::new(position)
@@ -1141,6 +1156,32 @@ impl QueryEditor {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// Applies a suggestion's edits, if the text is still the text they were made for.
+    fn apply_fix(
+        &mut self,
+        checked: &str,
+        edits: &[(std::ops::Range<usize>, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editor.read(cx).text(cx) != checked {
+            return;
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.edit(
+                edits.iter().rev().map(|(range, text)| {
+                    (
+                        MultiBufferOffset(range.start)..MultiBufferOffset(range.end),
+                        text.clone(),
+                    )
+                }),
+                cx,
+            )
+        });
+        let focus = self.editor.focus_handle(cx);
+        window.focus(&focus, cx);
     }
 
     fn render_params(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
