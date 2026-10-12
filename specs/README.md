@@ -1,0 +1,46 @@
+# Specs
+
+One numbered folder per feature, each with a `plan.md`. Add `validation.md` when the validation
+log grows long. Keep folders after they land; they are the record of why Studio is the way it
+is.
+
+This is the lean form of GitHub Spec Kit that ModernRelay's Tower converged on: of Tower's 64
+spec folders, 6 use Spec Kit's full spec/plan/tasks flow and 58 are one plan in the shape below.
+Spec Kit's layout is kept, so its commands still work: the constitution is in
+`.specify/memory/constitution.md` and the plan template in `.specify/templates/`.
+
+## Shape of a plan
+
+Copy `.specify/templates/plan-template.md`. Sections, in order:
+
+1. **Status**: draft, accepted, in progress, implemented (with date), or superseded.
+2. **Problem**: what is wrong or missing, in the user's terms.
+3. **Principles**: the constitution principles this touches.
+4. **What exists today (checked)**: facts about Studio, Zed and OmniGraph that the design rests
+   on, each with a path or command.
+5. **Design**: what changes, with exact keys, states, copy, limits and timings.
+6. **Decisions**: each choice and the alternatives rejected, with reasons.
+7. **Deferred**: what waits, including engine changes (link
+   `docs/deferred-engine-changes.md`).
+8. **Validation log**: dated checks of every load-bearing claim, with results.
+9. **Corrections**: what turned out wrong after implementation.
+
+Add tasks, contracts or data-model files only for large features.
+
+## Index
+
+| # | Plan | Status |
+|---|---|---|
+| 001 | [Foundation](001-foundation/plan.md) | in progress |
+| 002 | [App shell](002-app-shell/plan.md) | draft |
+| 003 | [Connections](003-connections/plan.md) | draft |
+| 004 | [Type tables](004-type-tables/plan.md) | draft |
+| 005 | [Relationship tree](005-relationship-tree/plan.md) | draft |
+| 006 | [Graph canvas](006-graph-canvas/plan.md) | draft |
+| 007 | [Query editor](007-query-editor/plan.md) | draft |
+| 008 | [Branches, review and merge](008-branches-review-merge/plan.md) | draft |
+| 009 | [History](009-history/plan.md) | draft |
+| 010 | [Inspectors](010-inspectors/plan.md) | draft |
+| 011 | [Agent panel](011-agent-panel/plan.md) | not started |
+
+Order of work: 001, 002, 003, then 004 with the spikes in 001. 005 to 009 follow in any order.

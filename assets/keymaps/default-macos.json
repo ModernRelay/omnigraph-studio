@@ -1,0 +1,19 @@
+[
+  {
+    "bindings": {
+      "cmd-k": "workspace::ToggleCommandPalette",
+      "cmd-,": "workspace::OpenSettings",
+      "cmd-shift-b": "workspace::SwitchBranch",
+      "cmd-shift-n": "workspace::NewWindow",
+      "cmd-[": "workspace::GoBack",
+      "cmd-]": "workspace::GoForward",
+      "cmd-q": "workspace::Quit"
+    }
+  },
+  {
+    "context": "Workspace && !TextInput",
+    "bindings": {
+      "?": "workspace::ShowKeyBindings"
+    }
+  }
+]

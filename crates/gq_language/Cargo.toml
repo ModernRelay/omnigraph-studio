@@ -1,0 +1,16 @@
+[package]
+name = "gq_language"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/gq_language.rs"
+
+[dependencies]
+omnigraph-compiler = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

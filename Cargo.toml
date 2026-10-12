@@ -1,0 +1,105 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/studio",
+    "crates/studio_actions",
+    "crates/studio_settings",
+    "crates/studio_theme",
+    "crates/studio_ui",
+    "crates/studio_workspace",
+    "crates/graph_client",
+    "crates/graph_store",
+    "crates/gq_language",
+    "crates/command_palette",
+    "crates/type_table",
+    "crates/relationship_tree",
+    "crates/graph_canvas",
+    "crates/query_editor",
+    "crates/review",
+    "crates/history",
+    "crates/inspectors",
+]
+default-members = ["crates/studio"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+repository = "https://github.com/ModernRelay/omnigraph-studio"
+
+[workspace.dependencies]
+# Studio crates
+studio_actions = { path = "crates/studio_actions" }
+studio_settings = { path = "crates/studio_settings" }
+studio_theme = { path = "crates/studio_theme" }
+studio_ui = { path = "crates/studio_ui" }
+studio_workspace = { path = "crates/studio_workspace" }
+graph_client = { path = "crates/graph_client" }
+graph_store = { path = "crates/graph_store" }
+gq_language = { path = "crates/gq_language" }
+command_palette = { path = "crates/command_palette" }
+type_table = { path = "crates/type_table" }
+relationship_tree = { path = "crates/relationship_tree" }
+graph_canvas = { path = "crates/graph_canvas" }
+query_editor = { path = "crates/query_editor" }
+review = { path = "crates/review" }
+history = { path = "crates/history" }
+inspectors = { path = "crates/inspectors" }
+
+# Zed, one release tag for every crate (docs/zed-pin.md). GPL-3.0-or-later and Apache-2.0.
+gpui = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+gpui_tokio = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+ui = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+theme = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+component = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+icons = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+menu = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+refineable = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+sum_tree = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+collections = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+util = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+http_client = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+reqwest_client = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+
+# OmniGraph's parser and type checker. MIT; no Lance dependency.
+omnigraph-compiler = { git = "https://github.com/ModernRelay/omnigraph", tag = "v0.13.0" }
+
+# Third party
+anyhow = "1"
+futures = "0.3"
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+url = "2"
+
+# Zed patches crates.io crates in its own workspace. Patches do not carry over to a crate that
+# depends on Zed, so Studio repeats the ones its graph reaches. Copied from Zed v1.23.2
+# Cargo.toml; recheck on every bump (docs/zed-pin.md).
+[patch.crates-io]
+tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }
+async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
+async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
+calloop = { git = "https://github.com/zed-industries/calloop" }
+notify = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
+notify-types = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
+
+[profile.dev]
+split-debuginfo = "unpacked"
+debug = "limited"
+
+# GPUI's layout and painting are slow unoptimized; keep them fast in debug builds.
+[profile.dev.package.gpui]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "limited"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"

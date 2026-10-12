@@ -1,0 +1,138 @@
+# 001: Foundation
+
+Status: in progress · 2026-10-11
+
+## Problem
+
+Studio needs a repository that builds one GPUI application on Zed's crates, with fixed pins, a
+crate graph that keeps features apart, license and dependency rules that hold by construction,
+CI on the platforms it ships to, and a way to sign and ship a macOS app. None of it exists yet.
+
+## Principles
+
+- I: only `graph_client` reaches the network; the engine is never linked.
+- XI: Zed crates at one tag; one GPUI; GPL-3.0-or-later; forks keep notices.
+- XII: every pin and claim below is checked against source.
+
+## What exists today (checked)
+
+- Zed `v1.23.2` is the newest stable release (2026-10-07), commit `c0199504b9cc`. Its
+  `rust-toolchain.toml` pins Rust `1.98.1`.
+- At that tag, `crates/ui/Cargo.toml` declares `GPL-3.0-or-later` and depends only on `gpui`,
+  `component`, `theme`, `icons`, `menu`, `ui_macros`, `gpui_util` and small third-party
+  crates. `theme` depends on `gpui`, `refineable`, `syntax_theme`, `collections` and serde.
+- `crates/picker` depends on `project`, `workspace`, `db`, `language` and `settings`;
+  `crates/workspace` depends on `client`, `project`, `db`, `remote`, `session`, `node_runtime`
+  and more. These are forked, not depended on (docs/zed-pin.md).
+- `theme::init(LoadThemes::JustBase, cx)` sets up the registry and default theme without
+  settings (`crates/theme/src/theme.rs:119-145`). `ui` reads fonts and density through
+  `theme::ThemeSettingsProvider`, registered with `theme::set_theme_settings_provider`
+  (`crates/theme/src/theme_settings_provider.rs`).
+- `gpui_platform::application()` returns a `gpui::Application`; the `font-kit` feature is
+  required on macOS for text, `wayland` and `x11` select Linux backends
+  (`crates/gpui_platform/Cargo.toml`, `src/gpui_platform.rs`).
+- `http_client` (Apache-2.0) has no GPUI dependency and provides the `HttpClient` trait and a
+  fake for tests; `reqwest_client` implements it.
+- Zed's root `Cargo.toml` at the tag has a `[patch.crates-io]` table (tree-sitter-language,
+  async-process, async-task, windows-capture, calloop, livekit, libwebrtc, notify, notify-types,
+  webrtc-sys, scratch). Patches apply only in the workspace that declares them.
+- Delta (`com.zed-industries.delta`, CLI 0.17.0) links a Zed commit that is not public and
+  carries git checkouts of async-task, async-process, tree-sitter, font-kit and reqwest,
+  consistent with it repeating Zed's patches.
+- OmniGraph `v0.13.0`: `omnigraph-compiler` is MIT, edition 2024, "Zero Lance dependency"
+  (`crates/omnigraph-compiler/Cargo.toml`). crates.io has `omnigraph-compiler` only up to 0.8.0.
+- This machine had 7.1 GiB free when the repository was created, too little for a first build
+  of Zed's GPUI crates; the first build is still to be done.
+
+## Design
+
+### Repository
+
+```
+LICENSE              GPL-3.0 text
+AGENTS.md            agent map (CLAUDE.md links to it)
+Cargo.toml           workspace, pins, patches, profiles
+rust-toolchain.toml  1.98.1
+deny.toml            licenses, one GPUI, allowed git sources
+.specify/            constitution and plan template (Spec Kit layout)
+specs/               one folder per feature
+docs/                architecture, Zed pin, deferred engine changes
+crates/              see docs/architecture.md for layers
+assets/              keymaps, settings defaults, themes, icons, fonts (spec 002)
+grammars/            tree-sitter-gq, tree-sitter-pg (spec 007)
+script/              bundle-mac, bundle-linux, bundle-windows (later in this plan)
+.github/workflows/   ci.yml now; release.yml with signing later
+```
+
+### Crate graph
+
+As in `docs/architecture.md`. Every crate exists from the start with a short `lib.rs` that
+states its responsibility, so the graph is visible before the code is.
+
+### CI
+
+`ci.yml` runs on macOS (Apple Silicon) and Ubuntu: `cargo fmt --check`, `cargo clippy -D
+warnings`, `cargo test`, and `cargo deny check`. Windows joins once the app runs on macOS and
+Linux. CI caches `~/.cargo/git` and `target/` keyed on `Cargo.lock`.
+
+### Shipping (after 002)
+
+- macOS: `script/bundle-mac` builds a `.app` with `cargo bundle`-style metadata, signs with a
+  Developer ID with hardened runtime, notarizes with `notarytool`, staples, wraps in a DMG.
+  Needs a ModernRelay Apple Developer account.
+- Linux: tarball and AppImage. Windows: later.
+- Homebrew cask in a ModernRelay tap. Updates: a polling updater modelled on Zed's
+  `auto_update`, later.
+
+### Spikes that gate the MVP
+
+| Spike | Goal | Passes when |
+|---|---|---|
+| S0 First build | `cargo run -p studio` opens a window with Zed's `ui` and `theme` | Builds on macOS and Linux; record clean build time, `target/` size and binary size |
+| S1 Table | Zed's `ui` table with a forked CSV-preview engine, on a type with 1M nodes, staged edits | Frame p95 < 8 ms while scrolling; a page within 150 ms of scroll stop; 20 edits publish as one commit; < 400 MB |
+| S2 Canvas | Custom `canvas` at 1k, 10k and 50k nodes, layout off the main thread | Pan and zoom p95 < 16 ms at 10k nodes and 30k edges; hover pick < 1 ms; 1k layout settles < 1 s |
+| S4 Editor | Zed's `editor` with no project as the `.gq` editor, compiler-backed providers; a two-entity diff in a multibuffer | Diagnostics < 100 ms after typing stops on a 500-line file; build time and binary size recorded. If either is unacceptable, write Studio's own editor, as Delta did |
+| S6 DAG and diff | Commit-graph lanes re-specified from Zed's property tests; per-type property diff | Property tests pass on 10k random DAGs; a 5,000-change commit opens < 300 ms |
+| S7 Upgrade drill | Move the spikes to the next Zed tag | Breaks and hours recorded below |
+
+## Decisions
+
+| Decision | Rejected alternatives | Why |
+|---|---|---|
+| Zed crates from git at one release tag | GPUI Kit on `gpui-pre`; `gpui-ce`; crates.io `gpui` 0.2.2 | GPL accepted (2026-10-11), so Zed's `ui` and `theme` are usable; GPUI Kit is built on a different GPUI copy and cannot share a window with them; crates.io `gpui` is a year old |
+| Release tag, not main | Tracking main | Main changes daily; tags are what Zed ships |
+| Separate repository | A workspace inside OmniGraph's repo | OmniGraph's `deny.toml` forbids git dependencies, pins Rust 1.97.1, and its CLI binary is already 227 MB; Studio needs its own release line and signing |
+| `omnigraph-compiler` by git tag | crates.io | crates.io stops at 0.8.0 |
+| Every planned crate created now as a stub | Create crates when needed | The layer rules are visible and enforced from the first commit |
+
+## Deferred
+
+- Windows CI and packaging, until macOS and Linux run.
+- Auto-update, until there is a first signed release.
+- Everything in `docs/deferred-engine-changes.md`.
+
+## Validation log
+
+| Date | Claim | Check | Result |
+|---|---|---|---|
+| 2026-10-11 | Newest stable Zed is v1.23.2 | `gh api repos/zed-industries/zed/releases` | v1.23.2, 2026-10-07; v1.24.1-pre is a prerelease |
+| 2026-10-11 | Zed toolchain at the tag | `git show v1.23.2:rust-toolchain.toml` | `1.98.1` |
+| 2026-10-11 | `ui` license and dependencies | `git show v1.23.2:crates/ui/Cargo.toml` | GPL-3.0-or-later; gpui, component, theme, icons, menu, ui_macros, gpui_util + third party |
+| 2026-10-11 | `picker` and `workspace` are heavy | `git show v1.23.2:crates/{picker,workspace}/Cargo.toml` | picker → project, workspace, db, language; workspace → client, project, db, remote, session, … |
+| 2026-10-11 | Theme starts without settings | `crates/theme/src/theme.rs`, `theme_settings_provider.rs` at the tag | `init(LoadThemes::JustBase, cx)`; provider trait + setter exported at crate root |
+| 2026-10-11 | `ui::prelude` exports what the first window uses | `crates/ui/src/prelude.rs` at the tag | `v_flex`, `Label`, `LabelCommon`, `LabelSize`, `Color`, `Headline`, `ActiveTheme`, GPUI prelude |
+| 2026-10-11 | `http_client` is GPUI-free | `crates/http_client/Cargo.toml` at the tag | anyhow, futures, http, serde, url, …; no gpui; Apache-2.0 |
+| 2026-10-11 | Zed's git sources | grep `git =` in Zed's root and platform manifests at the tag | Recorded in `deny.toml` `allow-git` |
+| 2026-10-11 | `omnigraph-compiler` at v0.13.0 | `git show v0.13.0:crates/omnigraph-compiler/Cargo.toml` (OmniGraph repo) | MIT, edition 2024, no Lance |
+| 2026-10-11 | Workspace manifests are valid | `cargo metadata --no-deps --offline` | 17 members read |
+| 2026-10-11 | Crate layers hold | `python3 script/check-layers.py` | `layers ok: 17 crates` |
+| 2026-10-11 | Assets parse | JSON parse of `assets/**/*.json` | Keymaps and default settings valid |
+| 2026-10-11 | First build | not run | Pending: 5.8 GiB free on the machine; run S0 with ≥ 25 GiB free |
+
+## Upgrade drills
+
+None yet.
+
+## Corrections
+
+None yet.

@@ -1,0 +1,19 @@
+[package]
+name = "studio_settings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/studio_settings.rs"
+
+[dependencies]
+gpui = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

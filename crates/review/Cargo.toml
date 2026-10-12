@@ -1,0 +1,20 @@
+[package]
+name = "review"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/review.rs"
+
+[dependencies]
+gpui = { workspace = true }
+ui = { workspace = true }
+studio_ui = { workspace = true }
+studio_actions = { workspace = true }
+studio_workspace = { workspace = true }
+graph_store = { workspace = true }
+
+[lints]
+workspace = true

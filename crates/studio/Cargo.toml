@@ -1,0 +1,45 @@
+[package]
+name = "studio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "OmniGraph Studio"
+
+[[bin]]
+name = "omnigraph-studio"
+path = "src/main.rs"
+
+[dependencies]
+gpui = { workspace = true }
+ui = { workspace = true }
+theme = { workspace = true }
+studio_actions = { workspace = true }
+studio_settings = { workspace = true }
+studio_theme = { workspace = true }
+studio_ui = { workspace = true }
+studio_workspace = { workspace = true }
+graph_client = { workspace = true }
+graph_store = { workspace = true }
+gq_language = { workspace = true }
+command_palette = { workspace = true }
+type_table = { workspace = true }
+relationship_tree = { workspace = true }
+graph_canvas = { workspace = true }
+query_editor = { workspace = true }
+review = { workspace = true }
+history = { workspace = true }
+inspectors = { workspace = true }
+
+# Text needs `font-kit` on macOS; Linux needs a windowing backend.
+[target.'cfg(target_os = "macos")'.dependencies]
+gpui_platform = { workspace = true, features = ["font-kit"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui_platform = { workspace = true, features = ["wayland", "x11"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+gpui_platform = { workspace = true }
+
+[lints]
+workspace = true

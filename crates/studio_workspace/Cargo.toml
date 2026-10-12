@@ -1,0 +1,19 @@
+[package]
+name = "studio_workspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/studio_workspace.rs"
+
+[dependencies]
+gpui = { workspace = true }
+ui = { workspace = true }
+studio_ui = { workspace = true }
+studio_actions = { workspace = true }
+studio_settings = { workspace = true }
+
+[lints]
+workspace = true
