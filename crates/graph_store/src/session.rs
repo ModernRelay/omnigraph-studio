@@ -493,7 +493,7 @@ pub fn open_session(
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::TestAppContext;
     use http_client::http::Response;
     use http_client::{AsyncBody, FakeHttpClient};
 
