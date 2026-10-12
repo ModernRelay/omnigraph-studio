@@ -1,6 +1,6 @@
 # 006: Graph canvas
 
-Status: draft · 2026-10-11
+Status: first slice implemented · 2026-10-12 (`crates/graph_canvas`)
 
 ## Problem
 
@@ -61,7 +61,26 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 |---|---|---|---|
 | 2026-10-11 | Layout and edge costs at 1k/10k/50k | research benchmark on this Mac | 2.2/34/254 ms per layout step; 0.14/1.3/8 ms edges per frame |
 | pending | Pan and zoom p95 < 16 ms at 10k nodes, 30k edges | spike S2 | |
+| 2026-10-12 | Schema landing: types on a circle by sorted name, sized by `/snapshot` counts, one arrowed line per edge type, self-loops | offscreen snapshot, `OpenCanvas`, dev graph | Company 25, Person 200, Project 40; Knows drawn as a loop on Person |
+| 2026-10-12 | Exploring shares the tree's `Exploration`: hubs per group with counts, 8 neighbours then "+K more", each node drawn once, selection mirrored | snapshot Company `company-00000` with 103 incoming `WorksAt` | "← WorksAt · 103", eight people, "+95 more"; the tree's selected row is the ringed node |
+| 2026-10-12 | Canvas actions change the shared state | snapshot: tree `ShowOnCanvas` (G) on Frances Lovelace, then `canvas::ExpandNode` | Frances gets four hubs on the canvas and is expanded in the tree |
+| 2026-10-12 | Layout off the main thread is deterministic, keeps drawn nodes in place, and bounds cost at the cap | `cargo test -p graph_canvas` (`layout::tests`) | 1,999 nodes in 464 ms in an unoptimized debug build, Apple M5 Pro; same input gives the same positions |
+| 2026-10-12 | Errors and loading show in the canvas, not a blank view | snapshot `OpenNode` Person `nobody` then `OpenCanvas` | banner "No Person with key nobody at this commit." · Retry |
 
 ## Corrections
 
-None yet.
+- **Layout.** A deterministic radial seed (each node fanned away from where the walk came from)
+  plus 60 iterations of grid-based overlap relaxation, on `cx.background_spawn`; not `fjadra`.
+  Nodes already drawn never move, so expanding does not reshuffle the view. Revisit with spike
+  S2 if larger neighbourhoods need a force layout.
+- **Hit-testing** is a linear scan over at most 2,000 nodes, not an R-tree.
+- **Hub labels** sit between the hub and its node, on a backdrop, so they never cover the fan
+  of neighbours.
+- **Mode.** "Schema" and "Exploration" toggle in the canvas; the schema view never clears the
+  shared exploration.
+- **Keys:** ←↑→↓ (`canvas::MoveLeft` …, nearest node in a 45° cone, `along + 2 × across`),
+  `0`, `=`/`+`, `-`, ↵ expand, ⌫ collapse. Space peek, F focus and `[`/`]` are not built.
+  Bindings are registered in `graph_canvas::init`; they still need entries in
+  `assets/keymaps/`. Scroll and pinch zoom, drag pans.
+- **The cap exit** offers "Open as table" for the type with most hidden nodes; "Show in tree"
+  is not built. Query results opening as a canvas is not built.

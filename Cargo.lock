@@ -3980,10 +3980,12 @@ name = "graph_canvas"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "gq_language",
  "graph_store",
  "studio_actions",
  "studio_ui",
  "studio_workspace",
+ "theme",
  "ui",
 ]
 
