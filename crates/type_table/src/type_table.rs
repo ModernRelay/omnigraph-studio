@@ -3,6 +3,7 @@
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/004-type-tables/plan.md`.
 
+mod blob;
 mod dialogs;
 pub mod model;
 mod nodes_panel;

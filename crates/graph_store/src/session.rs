@@ -10,7 +10,7 @@ use graph_client::api::{
     BranchCreateOutput, BranchCreateRequest, BranchMergeOutput, BranchMergeRequest, ChangeOutput,
     ChangeRequest, QueryRequest, ReadOutput, SnapshotDatasetOutput,
 };
-use graph_client::{GraphClient, ReadError, WriteOutcome};
+use graph_client::{BlobAt, BlobCell, BlobMeta, GraphClient, ReadError, WriteOutcome};
 
 use crate::connection::Connection;
 
@@ -315,6 +315,57 @@ impl GraphSession {
                 this.reads_in_flight = this.reads_in_flight.saturating_sub(1);
                 cx.emit(SessionEvent::ActivityChanged);
                 cx.notify();
+            })
+            .ok();
+            result
+        })
+    }
+
+    /// What a Blob cell holds (spec 004): its size, or the reference it names, or null. Read at
+    /// `snapshot`, else the session's branch head.
+    pub fn blob_meta(
+        &mut self,
+        cell: BlobCell,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<BlobMeta, ReadError>> {
+        let client = self.client(cx);
+        let graph = self.graph_id.clone();
+        let branch = self.branch.clone();
+        cx.spawn(async move |this, cx| {
+            let at = match &snapshot {
+                Some(commit) => BlobAt::Snapshot(commit),
+                None => BlobAt::Branch(&branch),
+            };
+            let result = client.blob_head(&graph, &cell, at).await;
+            this.update(cx, |this, cx| this.note_read(&result, cx)).ok();
+            result
+        })
+    }
+
+    /// Bytes `range` of a managed Blob value, for a preview.
+    pub fn blob_bytes(
+        &mut self,
+        cell: BlobCell,
+        snapshot: Option<String>,
+        range: std::ops::Range<u64>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<u8>, ReadError>> {
+        let client = self.client(cx);
+        let graph = self.graph_id.clone();
+        let branch = self.branch.clone();
+        self.reads_in_flight += 1;
+        cx.emit(SessionEvent::ActivityChanged);
+        cx.spawn(async move |this, cx| {
+            let at = match &snapshot {
+                Some(commit) => BlobAt::Snapshot(commit),
+                None => BlobAt::Branch(&branch),
+            };
+            let result = client.blob_bytes(&graph, &cell, at, range).await;
+            this.update(cx, |this, cx| {
+                this.note_read(&result, cx);
+                this.reads_in_flight = this.reads_in_flight.saturating_sub(1);
+                cx.emit(SessionEvent::ActivityChanged);
             })
             .ok();
             result

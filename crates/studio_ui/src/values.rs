@@ -27,6 +27,25 @@ pub fn group_digits(n: usize) -> String {
     out
 }
 
+/// A byte count for people: "690 B", "2.1 KB", "14 MB", in powers of 1000 as macOS shows sizes.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
+    if bytes < 1000 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1000.;
+    let mut unit = 0;
+    while value >= 999.95 && unit < UNITS.len() - 1 {
+        value /= 1000.;
+        unit += 1;
+    }
+    if value < 10. {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
+    }
+}
+
 /// Now, in Unix microseconds (the unit of OmniGraph timestamps).
 pub fn now_micros() -> i64 {
     SystemTime::now()
@@ -157,6 +176,16 @@ mod tests {
         );
         assert_eq!(short_commit_id("abc"), "abc");
         assert_eq!(group_digits(20_000), "20,000");
+    }
+
+    #[test]
+    fn byte_counts_read_in_powers_of_a_thousand() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(690), "690 B");
+        assert_eq!(format_bytes(2_140), "2.1 KB");
+        assert_eq!(format_bytes(14_200_000), "14 MB");
+        assert_eq!(format_bytes(999_999), "1.0 MB");
+        assert_eq!(format_bytes(3_000_000_000), "3.0 GB");
     }
 
     #[test]

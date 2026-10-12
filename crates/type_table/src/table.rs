@@ -16,9 +16,11 @@ use gpui::{
     KeyContext, Render, ScrollStrategy, SharedString, Subscription, Task, WeakEntity, Window,
     anchored, deferred, point,
 };
-use gq_language::{BuildError, BuiltQuery, Filter, FilterOp, Property, SchemaModel, builder};
-use graph_client::ReadError;
+use gq_language::{
+    BuildError, BuiltQuery, Filter, FilterOp, Property, ScalarKind, SchemaModel, builder,
+};
 use graph_client::api::ReadOutput;
+use graph_client::{BlobCell, BlobMeta, ReadError};
 use graph_store::{GraphSession, Loadable, SessionEvent};
 use serde_json::Value;
 use studio_actions::table::{
@@ -106,6 +108,10 @@ pub struct TypeTable {
     editing: Option<Editing>,
     cell_editor: Entity<Editor>,
     cells: HashMap<(String, String), CellState>,
+    /// What each Blob cell drawn so far holds, by row id and property, read at the page's
+    /// commit; and the reads under way.
+    blobs: HashMap<(String, String), Loadable<BlobMeta>>,
+    blob_tasks: HashMap<(String, String), Task<()>>,
     peek: Option<(String, Entity<NodePeek>)>,
     newer: bool,
     saves_in_flight: usize,
@@ -273,6 +279,8 @@ impl TypeTable {
             editing: None,
             cell_editor,
             cells: HashMap::new(),
+            blobs: HashMap::new(),
+            blob_tasks: HashMap::new(),
             peek: None,
             newer: false,
             saves_in_flight: 0,
@@ -483,6 +491,8 @@ impl TypeTable {
             cx.emit(ItemEvent::UpdateTab);
         }
         self.rows.clear();
+        self.blobs.clear();
+        self.blob_tasks.clear();
         self.cursor = None;
         self.editing = None;
         self.loading_more = false;
@@ -1988,9 +1998,128 @@ impl TypeTable {
                     {
                         cx.defer_in(window, |this, _, cx| this.load_more(cx));
                     }
+                    let shown = range.clone();
+                    cx.defer_in(window, move |this, _, cx| this.load_blob_metas(shown, cx));
                     range.map(|ix| this.render_row(ix, window, cx)).collect()
                 }),
             )
+            .into_any_element()
+    }
+
+    /// Reads what the Blob cells of rows `range` hold, once each, at the page's commit. Only
+    /// drawn rows are read: a Blob cannot be projected by the page query (spec 004).
+    fn load_blob_metas(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        let properties: Vec<String> = self
+            .columns
+            .iter()
+            .filter_map(|c| c.property())
+            .filter(|p| p.kind == ScalarKind::Blob)
+            .map(|p| p.name.clone())
+            .collect();
+        if properties.is_empty() {
+            return;
+        }
+        let edge = self.kind == TableKind::Edge;
+        let snapshot = self.paging.pinned.clone();
+        let rows: Vec<String> = self
+            .rows
+            .get(range.start..range.end.min(self.rows.len()))
+            .unwrap_or_default()
+            .iter()
+            .map(|row| row.id.clone())
+            .collect();
+        for id in rows {
+            for property in &properties {
+                let key = (id.clone(), property.clone());
+                if self.blobs.contains_key(&key) {
+                    continue;
+                }
+                self.blobs.insert(key.clone(), Loadable::Loading);
+                let cell = BlobCell {
+                    edge,
+                    type_name: self.type_name.clone(),
+                    id: id.clone(),
+                    property: property.clone(),
+                };
+                let read = self.session.update(cx, |session, cx| {
+                    session.blob_meta(cell, snapshot.clone(), cx)
+                });
+                let task_key = key.clone();
+                let task = cx.spawn(async move |this, cx| {
+                    let result = read.await;
+                    this.update(cx, |this, cx| {
+                        // A reload since this read began leaves its answer out.
+                        if this.blob_tasks.remove(&task_key).is_some() {
+                            this.blobs.insert(
+                                task_key,
+                                match result {
+                                    Ok(meta) => Loadable::Loaded(meta),
+                                    Err(error) => Loadable::Failed(error.to_string()),
+                                },
+                            );
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                });
+                self.blob_tasks.insert(key, task);
+            }
+        }
+    }
+
+    /// A Blob cell: "Blob" while it is read, then its size and "Preview" (a click opens the
+    /// peek, which shows it), "—" for null, or the host of an external reference.
+    fn render_blob_cell(&self, row: &Row, property: &Property) -> AnyElement {
+        let state = self.blobs.get(&(row.id.clone(), property.name.clone()));
+        let (text, color, preview, tooltip) = match state {
+            Some(Loadable::Loaded(meta)) => (
+                crate::blob::cell_label(meta),
+                if matches!(meta, BlobMeta::Null) {
+                    Color::Disabled
+                } else {
+                    Color::Default
+                },
+                matches!(meta, BlobMeta::Managed { size, .. } if *size > 0),
+                match meta {
+                    BlobMeta::External { uri } => {
+                        Some(format!("{uri}\nStudio does not fetch external objects."))
+                    }
+                    _ => None,
+                },
+            ),
+            Some(Loadable::Failed(error)) => (
+                "Blob · ?".into(),
+                Color::Warning,
+                false,
+                Some(error.clone()),
+            ),
+            _ => ("Blob".into(), Color::Disabled, false, None),
+        };
+        h_flex()
+            .id(SharedString::from(format!(
+                "blob-{}-{}",
+                row.id, property.name
+            )))
+            .min_w_0()
+            .gap_1()
+            .when_some(tooltip, |cell, tooltip| {
+                cell.tooltip(Tooltip::text(tooltip))
+            })
+            .child(
+                Label::new(text)
+                    .size(LabelSize::Small)
+                    .color(color)
+                    .single_line()
+                    .truncate(),
+            )
+            .when(preview, |cell| {
+                cell.child(
+                    Label::new("· Preview")
+                        .size(LabelSize::Small)
+                        .color(Color::Accent)
+                        .single_line(),
+                )
+            })
             .into_any_element()
     }
 
@@ -2075,6 +2204,9 @@ impl TypeTable {
         };
         let numeric = column.align_right;
         let content: AnyElement = match column.property() {
+            Some(property) if property.kind == ScalarKind::Blob => {
+                self.render_blob_cell(row, property)
+            }
             Some(property) if property.enum_values.is_some() && !value.is_null() => {
                 ui::Chip::new(shown).into_any_element()
             }

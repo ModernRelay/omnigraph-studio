@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::AsyncReadExt;
-use http_client::http::{HeaderValue, Method, Request, StatusCode};
-use http_client::{AsyncBody, HttpClient, HttpRequestExt};
+use http_client::http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
+use http_client::{AsyncBody, HttpClient, HttpRequestExt, RedirectPolicy};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -97,8 +97,43 @@ struct RawResponse {
     contract: Option<String>,
     /// `Retry-After` in seconds; the HTTP-date form is not used by OmniGraph.
     retry_after: Option<Duration>,
+    headers: HeaderMap,
     body: Vec<u8>,
 }
+
+/// One Blob cell (spec 004): a property of a node or an edge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BlobCell {
+    pub edge: bool,
+    pub type_name: String,
+    pub id: String,
+    pub property: String,
+}
+
+/// Where a Blob is read: a branch head, or a commit.
+#[derive(Debug, Clone, Copy)]
+pub enum BlobAt<'a> {
+    Branch(&'a str),
+    Snapshot(&'a str),
+}
+
+/// What a Blob cell holds, without its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlobMeta {
+    Null,
+    /// Bytes the graph owns.
+    Managed {
+        size: u64,
+        etag: Option<String>,
+    },
+    /// A reference to an object elsewhere, which Studio never fetches.
+    External {
+        uri: String,
+    },
+}
+
+/// The most bytes [`GraphClient::blob_bytes`] reads in one request.
+pub const BLOB_READ_MAX: u64 = 16 * 1024 * 1024;
 
 /// A client for one server. Cheap to clone.
 #[derive(Clone)]
@@ -166,10 +201,13 @@ impl GraphClient {
         headers: &[(&str, &str)],
         timeout: Duration,
     ) -> Result<RawResponse, String> {
+        // No route answers with a redirect to follow; a Blob's external reference answers 302
+        // with a URI Studio shows and never fetches.
         let mut builder = Request::builder()
             .method(method)
             .uri(url.as_str())
             .header(CONTRACT_HEADER, SUPPORTED_CONTRACTS[0])
+            .follow_redirects(RedirectPolicy::NoFollow)
             .timeout(timeout);
         if let Some(token) = &self.token {
             builder = builder.header("authorization", format!("Bearer {token}"));
@@ -200,6 +238,7 @@ impl GraphClient {
             .and_then(|value: &HeaderValue| value.to_str().ok())
             .and_then(|value| value.trim().parse::<u64>().ok())
             .map(Duration::from_secs);
+        let headers = response.headers().clone();
         let mut bytes = Vec::new();
         response
             .into_body()
@@ -210,22 +249,29 @@ impl GraphClient {
             status,
             contract,
             retry_after,
+            headers,
             body: bytes,
         })
     }
 
-    async fn read<T: DeserializeOwned>(
+    /// Sends a read; one refused with 429 waits as asked and goes again.
+    async fn fetch(
         &self,
         method: Method,
-        segments: &[&str],
-        query: &[(&str, &str)],
+        url: Url,
         body: Option<Vec<u8>>,
-    ) -> Result<T, ReadError> {
-        let url = self.url(segments, query);
+        headers: &[(&str, &str)],
+    ) -> Result<RawResponse, ReadError> {
         let mut retries = 0;
-        let raw = loop {
+        loop {
             let raw = self
-                .send(method.clone(), url.clone(), body.clone(), &[], READ_TIMEOUT)
+                .send(
+                    method.clone(),
+                    url.clone(),
+                    body.clone(),
+                    headers,
+                    READ_TIMEOUT,
+                )
                 .await
                 .map_err(ReadError::Transport)?;
             // A read changes nothing, so a rate-limited one waits as asked and goes again.
@@ -237,20 +283,122 @@ impl GraphClient {
                     continue;
                 }
             }
-            break raw;
-        };
+            return Ok(raw);
+        }
+    }
+
+    async fn read<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        segments: &[&str],
+        query: &[(&str, &str)],
+        body: Option<Vec<u8>>,
+    ) -> Result<T, ReadError> {
+        let url = self.url(segments, query);
+        let raw = self.fetch(method, url, body, &[]).await?;
         if raw.status.is_success() {
-            match raw.contract.as_deref() {
-                Some(served) if SUPPORTED_CONTRACTS.contains(&served) => {}
-                served => {
-                    return Err(ReadError::ContractMismatch {
-                        served: served.map(str::to_owned),
-                    });
-                }
-            }
+            check_contract(&raw)?;
             serde_json::from_slice(&raw.body).map_err(|error| ReadError::Decode(error.to_string()))
         } else {
             Err(ReadError::Refused(summary(raw.status, &raw.body)))
+        }
+    }
+
+    fn blob_url(&self, graph: &str, cell: &BlobCell, at: BlobAt<'_>) -> Url {
+        let entity = if cell.edge { "edge" } else { "node" };
+        let (key, value) = match at {
+            BlobAt::Branch(branch) => ("branch", branch),
+            BlobAt::Snapshot(commit) => ("snapshot", commit),
+        };
+        self.url(
+            &["graphs", graph, "blob"],
+            &[
+                ("entity", entity),
+                ("type", &cell.type_name),
+                ("id", &cell.id),
+                ("property", &cell.property),
+                (key, value),
+            ],
+        )
+    }
+
+    /// `HEAD /graphs/{id}/blob`: what a cell holds, without its bytes. The server answers a null
+    /// cell and a missing row alike with 404; callers ask about rows they have read, so a 404
+    /// is null.
+    pub async fn blob_head(
+        &self,
+        graph: &str,
+        cell: &BlobCell,
+        at: BlobAt<'_>,
+    ) -> Result<BlobMeta, ReadError> {
+        let url = self.blob_url(graph, cell, at);
+        let raw = self.fetch(Method::HEAD, url, None, &[]).await?;
+        let header = |name: &str| {
+            raw.headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        match raw.status.as_u16() {
+            200 => {
+                check_contract(&raw)?;
+                let size = header("content-length")
+                    .and_then(|length| length.parse().ok())
+                    .ok_or_else(|| ReadError::Decode("a Blob without a length".into()))?;
+                Ok(BlobMeta::Managed {
+                    size,
+                    etag: header("etag"),
+                })
+            }
+            301 | 302 | 303 | 307 | 308 => match header("location") {
+                Some(uri) => Ok(BlobMeta::External { uri }),
+                None => Err(ReadError::Decode("a redirect without a location".into())),
+            },
+            404 => Ok(BlobMeta::Null),
+            _ => Err(ReadError::Refused(summary(raw.status, &raw.body))),
+        }
+    }
+
+    /// `GET /graphs/{id}/blob` with a `Range`: bytes `range` of a managed value, at most
+    /// [`BLOB_READ_MAX`]. An external reference is refused; Studio never fetches it.
+    pub async fn blob_bytes(
+        &self,
+        graph: &str,
+        cell: &BlobCell,
+        at: BlobAt<'_>,
+        range: std::ops::Range<u64>,
+    ) -> Result<Vec<u8>, ReadError> {
+        let end = range.end.min(range.start + BLOB_READ_MAX);
+        if end <= range.start {
+            return Ok(Vec::new());
+        }
+        let url = self.blob_url(graph, cell, at);
+        let bytes = format!("bytes={}-{}", range.start, end - 1);
+        let raw = self
+            .fetch(Method::GET, url, None, &[("range", &bytes)])
+            .await?;
+        match raw.status.as_u16() {
+            200 | 206 => {
+                check_contract(&raw)?;
+                let mut body = raw.body;
+                // A server that ignores Range sends the whole value from the start.
+                if raw.status == StatusCode::OK {
+                    body = body
+                        .get(range.start as usize..)
+                        .unwrap_or_default()
+                        .to_vec();
+                }
+                body.truncate((end - range.start) as usize);
+                Ok(body)
+            }
+            301 | 302 | 303 | 307 | 308 => Err(ReadError::Refused(ApiErrorSummary {
+                status: raw.status.as_u16(),
+                message: "The value is a reference to an object outside the graph; Studio does \
+                          not fetch it."
+                    .into(),
+                code: None,
+            })),
+            _ => Err(ReadError::Refused(summary(raw.status, &raw.body))),
         }
     }
 
@@ -496,6 +644,16 @@ fn json<T: Serialize>(value: &T) -> Vec<u8> {
     serde_json::to_vec(value).expect("request types serialize")
 }
 
+/// A successful read must carry a contract Studio speaks.
+fn check_contract(raw: &RawResponse) -> Result<(), ReadError> {
+    match raw.contract.as_deref() {
+        Some(served) if SUPPORTED_CONTRACTS.contains(&served) => Ok(()),
+        served => Err(ReadError::ContractMismatch {
+            served: served.map(str::to_owned),
+        }),
+    }
+}
+
 fn summary(status: StatusCode, body: &[u8]) -> ApiErrorSummary {
     match serde_json::from_slice::<ErrorOutput>(body) {
         Ok(error) => ApiErrorSummary {
@@ -729,5 +887,113 @@ mod tests {
             !ids.contains("cluster_publishCommit"),
             "0.13.0 has no commit publish"
         );
+    }
+
+    /// A server for Blob reads: answers by `id`, and records each request's `Range` and
+    /// redirect policy.
+    fn blob_server() -> (Arc<dyn HttpClient>, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let log = log.clone();
+            async move {
+                let url = request.uri().to_string();
+                let range = request
+                    .headers()
+                    .get("range")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_owned();
+                let follows = request.extensions().get::<RedirectPolicy>().cloned();
+                log.lock()
+                    .unwrap()
+                    .push(format!("{} {range} {:?}", request.method(), follows));
+                let ok = || Response::builder().header(CONTRACT_HEADER, "0.13");
+                let response = if url.contains("id=bytes") {
+                    if request.method() == Method::HEAD {
+                        ok().status(200)
+                            .header("content-length", "10")
+                            .header("etag", "\"e1\"")
+                            .body(AsyncBody::empty())
+                    } else {
+                        ok().status(206)
+                            .header("content-range", "bytes 2-4/10")
+                            .body(AsyncBody::from(vec![2u8, 3, 4]))
+                    }
+                } else if url.contains("id=external") {
+                    Response::builder()
+                        .status(302)
+                        .header("location", "s3://bucket/report.pdf")
+                        .body(AsyncBody::empty())
+                } else {
+                    Response::builder().status(404).body(AsyncBody::empty())
+                };
+                Ok(response.unwrap())
+            }
+        });
+        (http, seen)
+    }
+
+    fn cell(id: &str) -> BlobCell {
+        BlobCell {
+            edge: false,
+            type_name: "Note".into(),
+            id: id.into(),
+            property: "attachment".into(),
+        }
+    }
+
+    #[test]
+    fn a_blob_cell_is_managed_external_or_null() {
+        let (http, seen) = blob_server();
+        let client = client(http);
+        let at = BlobAt::Branch("main");
+        assert_eq!(
+            block_on(client.blob_head("g", &cell("bytes"), at)).unwrap(),
+            BlobMeta::Managed {
+                size: 10,
+                etag: Some("\"e1\"".into())
+            }
+        );
+        assert_eq!(
+            block_on(client.blob_head("g", &cell("external"), at)).unwrap(),
+            BlobMeta::External {
+                uri: "s3://bucket/report.pdf".into()
+            }
+        );
+        assert_eq!(
+            block_on(client.blob_head("g", &cell("empty"), at)).unwrap(),
+            BlobMeta::Null
+        );
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|request| request.ends_with("Some(NoFollow)")),
+            "no request follows a redirect: {:?}",
+            seen.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn blob_bytes_are_read_by_range_and_external_values_are_not_fetched() {
+        let (http, seen) = blob_server();
+        let client = client(http);
+        let at = BlobAt::Snapshot("c1");
+        assert_eq!(
+            block_on(client.blob_bytes("g", &cell("bytes"), at, 2..5)).unwrap(),
+            [2, 3, 4]
+        );
+        assert!(seen.lock().unwrap()[0].starts_with("GET bytes=2-4"));
+        assert!(matches!(
+            block_on(client.blob_bytes("g", &cell("external"), at, 0..5)),
+            Err(ReadError::Refused(e)) if e.status == 302
+        ));
+        assert_eq!(
+            block_on(client.blob_bytes("g", &cell("bytes"), at, 4..4)).unwrap(),
+            Vec::<u8>::new(),
+            "an empty range sends nothing"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 }

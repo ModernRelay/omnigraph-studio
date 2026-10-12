@@ -109,4 +109,6 @@ from the served document).
 
 ## Corrections
 
-None yet.
+- 2026-10-12 · The client followed redirects: reqwest's default follows up to ten, and nothing
+  overrode it. Every request now sets `RedirectPolicy::NoFollow`, so a Blob's external
+  reference (302 with its URI) is reported and never fetched.

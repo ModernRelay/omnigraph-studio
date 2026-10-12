@@ -69,7 +69,8 @@ fn width_for(property: &Property) -> f32 {
         ScalarKind::Integer | ScalarKind::Float => 110.,
         ScalarKind::Date => 120.,
         ScalarKind::DateTime => 190.,
-        ScalarKind::Blob => 100.,
+        // "Blob · 2.1 KB · Preview"
+        ScalarKind::Blob => 190.,
         ScalarKind::Text | ScalarKind::Vector => {
             if property.enum_values.is_some() {
                 120.

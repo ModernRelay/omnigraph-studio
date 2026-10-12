@@ -133,8 +133,9 @@ opens the branch's recent commits.
   - R2 unpublished commits: staged edits as a reviewable proposal only when the server
     advertises `cluster_publishCommit`.
 - Group-by (Tower 084) until filters and editing ship.
-- Sorting by a property (keyset pairs), relationship columns, relative dates, saved views,
-  bulk edits and the preview tab are designed above but not built yet.
+- Sorting by a property (keyset pairs), relationship columns, relative dates, saved views and
+  bulk edits are designed above but not built yet. The preview tab is built (spec 002).
+- Saving a Blob value to a file: the peek previews the first bytes only.
 - Per-row history beyond the commits that the change feed can cheaply return.
 
 ## Validation log
@@ -158,9 +159,16 @@ opens the branch's recent commits.
 | 2026-10-12 | `compile_schema_shape` keeps declaration order | `omnigraph-compiler` v0.13.0 `catalog/schema_shape.rs` | It sorts properties (and enum values) by name. `SchemaModel` now restores the `.pg` declaration order from the AST; enum values stay sorted |
 | 2026-10-12 | Zed's `ui::Table` can carry the grid | `crates/ui/src/components/data_table.rs` and `crates/tabular_data_preview/src/renderer/render_table.rs` at v1.23.2 | Resizable columns + `pin_cols(1)` + `uniform_list` + `disable_base_style`, as the CSV preview uses it |
 | 2026-10-12 | Actions reach the workspace with nothing focused | `crates/gpui/src/window.rs` `dispatch_action` / `focus_node_id_in_rendered_frame` | With no focus, an action goes to the root view's node only, which is outside the workspace element that holds its handlers. The workspace now focuses itself when a session opens and nothing else has focus |
+| 2026-10-12 | Blob cells and previews | `HEAD`/`GET /graphs/notes/blob` on the 0.13 dev server (`notes.attachment`: a PNG, a query text, 1 KiB of bytes, an empty value, nulls); `graph_client` blob tests; `type_table::blob` tests; offscreen snapshots of the Note table and three peeks | A managed cell answers 200 with `content-length` and an ETag (`0` for empty); a null cell and a missing row both answer 404 `not_found`, so a 404 on a row the table read is null; `Range` answers 206. Cells read "Blob · 690 B · Preview", "Blob · 0 B" and "—", for drawn rows only, at the page's commit; the peek drew the PNG, the query text and a hex dump |
 | pending | Merge-mode NDJSON leaves unspecified properties untouched | run against a 0.13 server | Bulk edit not built yet |
 
 ## Corrections
+
+- 2026-10-12 · Blob cells: the page query cannot project a Blob, so each drawn cell is read on
+  its own with `HEAD` at the page's commit, at most once per row and property until the table
+  reads again. The peek reads a managed value's first 64 KiB, or the whole of a PNG, JPEG,
+  GIF or WebP up to 8 MiB, and shows an image, the start of UTF-8 text, or a hex dump of the
+  first 128 bytes. An external reference shows its URI; Studio never fetches it.
 
 - 2026-10-12 · Edges are read-only in tables: the engine has no edge update (T16). An edge table
   pins its source column, then the target and the edge's properties; a click peeks the edge,

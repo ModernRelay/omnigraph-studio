@@ -13,7 +13,9 @@ use studio_actions::graph::OpenNode;
 use ui::Tooltip;
 use ui::prelude::*;
 
+use crate::blob::{IMAGE_MAX, PREVIEW_PREFIX, Preview, bytes_wanted, preview};
 use crate::model::{FROM_COLUMN, TO_COLUMN, display_value, format_count, node_rows, short_commit};
+use graph_client::{BlobCell, BlobMeta};
 
 /// First neighbours shown under an expanded relationship group.
 pub const NEIGHBOUR_LIMIT: u32 = 8;
@@ -65,8 +67,17 @@ struct Group {
     _task: Option<Task<()>>,
 }
 
+/// One Blob property of the peeked row: what it holds, and its preview.
+struct BlobSlot {
+    property: String,
+    meta: Loadable<BlobMeta>,
+    preview: Loadable<Preview>,
+    _task: Option<Task<()>>,
+}
+
 pub struct NodePeek {
     session: Entity<GraphSession>,
+    blobs: Vec<BlobSlot>,
     schema: Option<Arc<SchemaModel>>,
     subject: PeekSubject,
     snapshot: Option<String>,
@@ -91,6 +102,7 @@ impl NodePeek {
         let schema = session.read(cx).schema_model();
         let mut this = Self {
             session,
+            blobs: Vec::new(),
             schema,
             subject,
             snapshot,
@@ -103,6 +115,7 @@ impl NodePeek {
             Some(values) => {
                 this.values = Loadable::Loaded(values);
                 this.load_groups(debounce, cx);
+                this.load_blobs(debounce, cx);
             }
             None => this.load_node(cx),
         }
@@ -145,6 +158,7 @@ impl NodePeek {
                             Some(row) => {
                                 this.values = Loadable::Loaded(row.values);
                                 this.load_groups(false, cx);
+                                this.load_blobs(false, cx);
                             }
                             None => {
                                 this.values = Loadable::Failed(
@@ -159,6 +173,209 @@ impl NodePeek {
             })
             .ok();
         }));
+    }
+
+    /// The subject's Blob properties.
+    fn blob_properties(&self) -> Vec<String> {
+        let Some(schema) = &self.schema else {
+            return Vec::new();
+        };
+        let properties = match &self.subject {
+            PeekSubject::Node { type_name, .. } => schema.node(type_name).map(|n| &n.properties),
+            PeekSubject::Edge { edge_type, .. } => schema.edge(edge_type).map(|e| &e.properties),
+        };
+        properties
+            .into_iter()
+            .flatten()
+            .filter(|p| p.kind == gq_language::ScalarKind::Blob)
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    /// Reads each Blob property's metadata, then enough of a managed value to preview it: its
+    /// first bytes, or the whole of an image that fits. Pinned to the peek's commit.
+    fn load_blobs(&mut self, debounce: bool, cx: &mut Context<Self>) {
+        let edge = matches!(self.subject, PeekSubject::Edge { .. });
+        let type_name = self.subject.type_name().to_owned();
+        let id = self.subject.id().to_owned();
+        self.blobs = self
+            .blob_properties()
+            .into_iter()
+            .map(|property| BlobSlot {
+                property,
+                meta: Loadable::Loading,
+                preview: Loadable::NotLoaded,
+                _task: None,
+            })
+            .collect();
+        for index in 0..self.blobs.len() {
+            let cell = BlobCell {
+                edge,
+                type_name: type_name.clone(),
+                id: id.clone(),
+                property: self.blobs[index].property.clone(),
+            };
+            let session = self.session.downgrade();
+            let snapshot = self.snapshot.clone();
+            self.blobs[index]._task = Some(cx.spawn(async move |this, cx| {
+                if debounce {
+                    cx.background_executor().timer(COUNT_DELAY).await;
+                }
+                let Ok(read) = session.update(cx, |session, cx| {
+                    session.blob_meta(cell.clone(), snapshot.clone(), cx)
+                }) else {
+                    return;
+                };
+                let meta = read.await;
+                let size = match &meta {
+                    Ok(BlobMeta::Managed { size, .. }) => Some(*size),
+                    _ => None,
+                };
+                this.update(cx, |this, cx| {
+                    this.blobs[index].meta = match meta {
+                        Ok(meta) => Loadable::Loaded(meta),
+                        Err(error) => Loadable::Failed(error.to_string()),
+                    };
+                    if size.is_some() {
+                        this.blobs[index].preview = Loadable::Loading;
+                    }
+                    cx.notify();
+                })
+                .ok();
+                let Some(size) = size else { return };
+                let mut bytes = Vec::new();
+                let mut wanted = size.min(PREVIEW_PREFIX);
+                // The prefix, then the rest of an image that fits.
+                while (bytes.len() as u64) < wanted {
+                    let from = bytes.len() as u64;
+                    let Ok(read) = session.update(cx, |session, cx| {
+                        session.blob_bytes(cell.clone(), snapshot.clone(), from..wanted, cx)
+                    }) else {
+                        return;
+                    };
+                    match read.await {
+                        Ok(chunk) if !chunk.is_empty() => bytes.extend(chunk),
+                        Ok(_) => break,
+                        Err(error) => {
+                            this.update(cx, |this, cx| {
+                                this.blobs[index].preview = Loadable::Failed(error.to_string());
+                                cx.notify();
+                            })
+                            .ok();
+                            return;
+                        }
+                    }
+                    if from == 0 {
+                        wanted = bytes_wanted(&bytes, size).min(IMAGE_MAX);
+                    }
+                }
+                let shown = cx
+                    .background_spawn(async move { preview(bytes, size) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.blobs[index].preview = Loadable::Loaded(shown);
+                    cx.notify();
+                })
+                .ok();
+            }));
+        }
+    }
+
+    fn render_blobs(&self, cx: &mut Context<Self>) -> AnyElement {
+        let border = studio_ui::ds::surface::rule(cx);
+        v_flex()
+            .gap_2()
+            .children(self.blobs.iter().enumerate().map(|(index, slot)| {
+                let facts = match &slot.meta {
+                    Loadable::Loaded(BlobMeta::Managed { size, .. }) => {
+                        studio_ui::format_bytes(*size)
+                    }
+                    Loadable::Loaded(BlobMeta::External { .. }) => "external reference".into(),
+                    Loadable::Loaded(BlobMeta::Null) => "null".into(),
+                    Loadable::Failed(_) => "could not be read".into(),
+                    _ => "reading…".into(),
+                };
+                let body: Option<AnyElement> = match (&slot.meta, &slot.preview) {
+                    (Loadable::Failed(error), _) | (_, Loadable::Failed(error)) => Some(
+                        Label::new(error.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Error)
+                            .into_any_element(),
+                    ),
+                    (Loadable::Loaded(BlobMeta::External { uri }), _) => Some(
+                        v_flex()
+                            .gap_1()
+                            .child(studio_ui::CopyableValue::new(
+                                ("blob-uri", index),
+                                Some(uri.clone()),
+                            ))
+                            .child(studio_ui::ds::text::meta(
+                                "Studio does not fetch objects outside the graph.",
+                            ))
+                            .into_any_element(),
+                    ),
+                    (_, Loadable::Loaded(Preview::Empty)) => {
+                        Some(studio_ui::ds::text::muted("Empty value").into_any_element())
+                    }
+                    (_, Loadable::Loaded(Preview::Image(image))) => Some(
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .p_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border)
+                            .child(
+                                gpui::img(image.clone())
+                                    .max_w_full()
+                                    .max_h(px(240.))
+                                    .object_fit(gpui::ObjectFit::Contain),
+                            )
+                            .into_any_element(),
+                    ),
+                    (_, Loadable::Loaded(Preview::Text { text, more })) => Some(
+                        v_flex()
+                            .gap_1()
+                            .child(studio_ui::ds::code_block(text.clone(), cx))
+                            .when(*more > 0, |d| {
+                                d.child(studio_ui::ds::text::meta(format!(
+                                    "{} more",
+                                    studio_ui::format_bytes(*more)
+                                )))
+                            })
+                            .into_any_element(),
+                    ),
+                    (_, Loadable::Loaded(Preview::Bytes { hex, more })) => Some(
+                        v_flex()
+                            .gap_1()
+                            .child(studio_ui::ds::code_block(hex.clone(), cx))
+                            .when(*more > 0, |d| {
+                                d.child(studio_ui::ds::text::meta(format!(
+                                    "{} more",
+                                    studio_ui::format_bytes(*more)
+                                )))
+                            })
+                            .into_any_element(),
+                    ),
+                    _ => None,
+                };
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Icon::new(IconName::File)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(Label::new(slot.property.clone()).size(LabelSize::Small))
+                            .child(studio_ui::ds::text::meta(facts)),
+                    )
+                    .children(body)
+            }))
+            .into_any_element()
     }
 
     fn load_groups(&mut self, debounce: bool, cx: &mut Context<Self>) {
@@ -302,9 +519,10 @@ impl NodePeek {
             PeekSubject::Node { type_name, .. } => schema
                 .node(type_name)
                 .map(|node| {
+                    // Blob values are shown under Blobs, with their previews.
                     node.properties
                         .iter()
-                        .filter(|p| p.kind != gq_language::ScalarKind::Vector)
+                        .filter(|p| p.projectable())
                         .map(|p| (p.name.clone(), Some(p.clone()), p.display_type()))
                         .collect()
                 })
@@ -694,6 +912,9 @@ impl Render for NodePeek {
             )
             .when(has_properties, |d| {
                 d.child(section("Properties")).child(properties)
+            })
+            .when(!self.blobs.is_empty(), |d| {
+                d.child(section("Blobs")).child(self.render_blobs(cx))
             })
             .children(relationships.map(|relationships| {
                 v_flex()
