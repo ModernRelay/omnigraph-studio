@@ -800,10 +800,7 @@ impl QueryEditor {
     // ---- rendering ----
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        let (toolbar_bg, border) = (colors.toolbar_background, colors.border_variant);
         let editor_focus = self.editor.focus_handle(cx);
-        let branch = self.branch(cx);
         let current = self.current_query();
         let (summary, writes): (String, bool) = match &current {
             Some((name, Some(info))) if info.is_mutation => (format!("{name} · writes"), true),
@@ -812,14 +809,8 @@ impl QueryEditor {
             _ => (String::new(), false),
         };
         let busy = self.writing;
-        h_flex()
-            .h(px(36.))
-            .flex_none()
+        studio_ui::chrome::toolbar(cx)
             .px_2()
-            .gap_2()
-            .bg(toolbar_bg)
-            .border_b_1()
-            .border_color(border)
             .child(
                 Button::new("run", "Run")
                     .style(ButtonStyle::Filled)
@@ -872,20 +863,6 @@ impl QueryEditor {
                     Color::Muted
                 }))
             })
-            .child(
-                h_flex()
-                    .gap_1()
-                    .px_1p5()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(border)
-                    .child(
-                        Icon::new(IconName::GitBranch)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(Label::new(branch).size(LabelSize::Small)),
-            )
     }
 
     fn render_problems(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

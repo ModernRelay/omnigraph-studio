@@ -105,12 +105,14 @@ impl CopyableValue {
 impl RenderOnce for CopyableValue {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let Some(value) = self.value else {
-            return h_flex().child(
-                Label::new("Not reported by this server")
-                    .size(LabelSize::Small)
-                    .color(Color::Disabled)
-                    .italic(),
-            );
+            return h_flex()
+                .child(
+                    Label::new("Not reported by this server")
+                        .size(LabelSize::Small)
+                        .color(Color::Disabled)
+                        .italic(),
+                )
+                .into_any_element();
         };
         let mut label = Label::new(value.clone())
             .size(LabelSize::Small)
@@ -119,7 +121,12 @@ impl RenderOnce for CopyableValue {
         if self.mono {
             label = label.buffer_font(cx);
         }
+        // The copy button shows on hover, as Delta reveals row actions, so a page of values
+        // is not a column of icons.
+        let group: SharedString = format!("copy-{:?}", self.id).into();
         h_flex()
+            .id(self.id.clone())
+            .group(group.clone())
             .gap_1()
             .min_w_0()
             .child(div().min_w_0().child(label))
@@ -127,11 +134,13 @@ impl RenderOnce for CopyableValue {
                 IconButton::new(self.id, IconName::Copy)
                     .icon_size(IconSize::XSmall)
                     .icon_color(Color::Muted)
+                    .visible_on_hover(group)
                     .tooltip(Tooltip::text("Copy"))
                     .on_click(move |_, _, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(value.to_string()))
                     }),
             )
+            .into_any_element()
     }
 }
 

@@ -961,9 +961,9 @@ fn content_text(content: &ContentBlock) -> String {
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
-        let (border, panel_bg, editor_bg) = (
-            colors.border,
-            colors.panel_background,
+        let (border, field_border, editor_bg) = (
+            studio_ui::chrome::hairline(cx),
+            colors.border_variant,
             colors.editor_background,
         );
         let header = self.render_header(cx).into_any_element();
@@ -1000,7 +1000,6 @@ impl Render for AgentPanel {
                     .gap_1()
                     .border_t_1()
                     .border_color(border)
-                    .bg(panel_bg)
                     .child(
                         div()
                             .key_context("AgentComposer")
@@ -1008,7 +1007,7 @@ impl Render for AgentPanel {
                             .py_1()
                             .rounded_md()
                             .border_1()
-                            .border_color(border)
+                            .border_color(field_border)
                             .bg(editor_bg)
                             .child(composer),
                     )
@@ -1053,7 +1052,6 @@ impl Render for AgentPanel {
 
 impl AgentPanel {
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().colors().border_variant;
         let (status, color) = match &self.state {
             State::Setup => ("No agent chosen".to_owned(), Color::Muted),
             State::Idle => ("Not started".to_owned(), Color::Muted),
@@ -1068,13 +1066,7 @@ impl AgentPanel {
             self.state,
             State::Ready { .. } | State::Exited { .. }
         );
-        h_flex()
-            .flex_none()
-            .px_3()
-            .py_2()
-            .gap_2()
-            .border_b_1()
-            .border_color(border)
+        studio_ui::chrome::toolbar(cx)
             .child(Icon::new(IconName::ZedAssistant).size(IconSize::Small))
             .child(Label::new(status).size(LabelSize::Small).color(color))
             .child(

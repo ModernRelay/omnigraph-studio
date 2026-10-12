@@ -439,16 +439,17 @@ fn words(variant: &str) -> String {
 }
 
 fn section(title: &str, error: Option<String>, rows: Vec<AnyElement>, cx: &App) -> AnyElement {
-    let colors = cx.theme().colors();
     v_flex()
         .w_full()
         .gap_1()
-        .p_3()
-        .rounded_md()
-        .border_1()
-        .border_color(colors.border_variant)
-        .bg(colors.surface_background)
-        .child(Label::new(title.to_owned()).size(LabelSize::Small))
+        .py_3()
+        .border_b_1()
+        .border_color(studio_ui::chrome::hairline(cx))
+        .child(
+            Label::new(title.to_owned())
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
         .children(error.map(|e| {
             Label::new(format!("Could not read: {e}"))
                 .size(LabelSize::Small)

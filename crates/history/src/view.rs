@@ -439,14 +439,10 @@ impl HistoryView {
     }
 
     fn render_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors();
-        let header_bg = colors.panel_background;
-        let border = colors.border_variant;
+        let border = studio_ui::chrome::hairline(cx);
         let graph_width = self.graph_width();
         let column = |title: &'static str, width: Option<f32>| {
-            let label = Label::new(title)
-                .size(LabelSize::XSmall)
-                .color(Color::Muted);
+            let label = Label::new(title).size(LabelSize::Small).color(Color::Muted);
             match width {
                 Some(width) => div().w(px(width)).flex_none().child(label),
                 None => div().flex_1().child(label),
@@ -456,10 +452,9 @@ impl HistoryView {
             .size_full()
             .child(
                 h_flex()
-                    .h(px(24.))
+                    .h(px(studio_ui::HEADER_HEIGHT))
                     .flex_none()
                     .pr_2()
-                    .bg(header_bg)
                     .border_b_1()
                     .border_color(border)
                     .child(column("Graph", Some(graph_width)).pl_2())
@@ -485,12 +480,11 @@ impl HistoryView {
 
 /// A small rounded label.
 fn chip(text: String, color: Color, cx: &App) -> AnyElement {
-    let border = cx.theme().colors().border_variant;
+    let fill = cx.theme().colors().element_background;
     div()
         .px_1p5()
         .rounded_sm()
-        .border_1()
-        .border_color(border)
+        .bg(fill)
         .child(
             Label::new(text)
                 .size(LabelSize::XSmall)
