@@ -8,6 +8,7 @@
 pub mod builder;
 pub mod check;
 pub mod complete;
+pub mod input;
 pub mod lex;
 pub mod params;
 pub mod schema;

@@ -1,8 +1,7 @@
 # 008: Branches, review and merge
 
 Status: built on 0.13 · 2026-10-12 (`crates/review`, shared logic in `graph_store::changes` and
-`graph_store::fixes`, cards in `studio_ui`). Approvals, comments, the scope selector and Edit are
-not built.
+`graph_store::fixes`, cards in `studio_ui`). Approvals and comments are deferred (below).
 
 ## Problem
 
@@ -44,14 +43,21 @@ place), X (designed on 0.13; the better routes are deferred).
 ### Review (`review` crate)
 
 - Opens as a tab "Review <branch> → <target>".
-- Scope selector: since the fork (default), or one commit.
+- Scope selector: since the fork (default), or one commit (its own changes, read from
+  `GET /graphs/{g}/commits/{id}/changes`).
+- Search: a field narrows the cards to those whose id, type or a before or after value
+  contains the text; J/K move among the cards it leaves.
 - Header: one sentence ("17 entities and 22 relationships changed in 3 commits by act-alice"),
   then per-type counts (+ added, ~ changed, − removed).
 - Body: one scroll of entity cards grouped by type, changes to existing data first. A changed
   entity shows only its changed properties, before and after; a removed one stays as a real,
   searchable row; edges show endpoint changes.
 - Act in place: Revert (restore the before image), Edit, Mark reviewed (card turns hollow but
-  stays). Keys: J/K between cards, ⌘Y accept and next, ⌥⌘Z revert and next.
+  stays). Keys: J/K between cards, ↵ edit, ⌘Y accept and next, ⌥⌘Z revert and next.
+- Edit (a node that is added or changed): a form of its editable properties filled with what
+  the branch holds; Save writes only the fields that changed, each bound to that value, as one
+  mutation on the reviewed branch bound to the reviewed head. After a fix the card's other
+  fixes wait for Refresh.
 - Revert of a relationship: an added one is deleted by `@id`; a removed one is inserted again
   between its before endpoints with its before values (an unkeyed one gets a new id: a `.gq`
   insert cannot supply one). A changed relationship is not reverted here: edges cannot be
@@ -101,6 +107,8 @@ place), X (designed on 0.13; the better routes are deferred).
 | 2026-10-11 | Merge outcomes and conflict kinds in 0.13.0 | parsed `openapi.json` at `v0.13.0` | As listed |
 | 2026-10-12 | Edge mutations Studio builds compile on 0.13 | `gq_language` `writes_compile`, `graph_store` `fixes` tests type-check `insert_edge`/`delete_edge` against the 0.13 compiler; `docs/user/mutations/index.md` at `v0.13.0` (`from`/`to` assignments; no edge update; inserts and deletes cannot mix) | Pass |
 | 2026-10-12 | Relationship reverts land on the branch | dev server: branch `review-edges` adds `WorksAt person-000000 → company-00003` and deletes `Knows person-000000 → person-000005`; review restored from a workspace file; ⌥⌘Z on both cards; queries on the branch | Two commits, each bound to the head before it; the `Knows` edge is back, the `WorksAt` edge is gone |
+| 2026-10-12 | Edit writes only what changed, on the reviewed branch | dev server: `review-edges` retitles `person-000001`; ↵ on its card, " Jr" added to the name, ⏎ | One commit; the branch has "Donald Dijkstra Jr" and the retitled title unchanged; the card reads "Edited in ARZJVH2D" |
+| 2026-10-12 | Search narrows the cards | `review` test `search_matches_ids_types_and_values_case_blind` | Ids, type names and before/after values, case-blind |
 | 2026-10-11 | Change feed and commit list parameters | parsed `openapi.json` at `v0.13.0` | `/changes`: branch, cursor, start, page_token, limit, kind, type, op, set; `/commits`: branch |
 | 2026-10-12 | Folding 20,000 changes stays under 1 s off the main thread | `graph_store` `fold_instrument` (ignored instrument), debug build, Apple M5 Pro, 48 GB: 20,000 changes into 15,000 entities | 175 ms |
 | 2026-10-12 | Change-feed paging | live `omnigraph-server` 0.13.0: a terminal page carries `cursor` and `caught_up: false` but no `next_page_token` when more commits wait | `GraphClient::changes` takes no `cursor`, so review continues with `start=after:<last folded commit>` and stops at the reviewed head; a 20,500-change branch shows "Partial" at 20,000 |

@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 
+use editor::{Editor, EditorEvent};
 use gpui::{
     AnyElement, App, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
     ListAlignment, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
@@ -13,19 +14,23 @@ use graph_client::api::{
     MergeConflictOutput,
 };
 use graph_client::{GraphClient, WriteOutcome};
+use graph_store::fixes::compose;
 use graph_store::{
     ChangeFold, FoldedChange, FoldedChanges, GraphSession, NetChange, REVIEW_CHANGE_CAP,
     SessionEvent, TypeCounts, commits_since, contains_merge_of, fork_point, revert_query,
     summary_sentence,
 };
-use studio_actions::review::{AcceptAndNext, Merge, NextChange, PreviousChange, RevertAndNext};
+use serde_json::Value;
+use studio_actions::review::{
+    AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext,
+};
 use studio_ui::{
     ChangeCard, ChangeKind, PropertyRow, change_counts, change_group_header, empty_state,
     group_digits, short_commit_id, type_swatch,
 };
-use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
+use studio_workspace::{Item, ItemEvent, SavedItem, Workspace, workspace_for};
 use ui::prelude::*;
-use ui::{Banner, KeyBinding, Severity, Tooltip};
+use ui::{Banner, ContextMenu, KeyBinding, PopoverMenu, Severity, Tooltip};
 
 use crate::conflicts::{conflict_wording, resolution_hint};
 
@@ -44,6 +49,8 @@ enum FixState {
     Idle,
     Running,
     Reverted { commit: String },
+    Saving,
+    Edited { commit: String },
     Unchanged,
     Moved,
     Refused(String),
@@ -104,6 +111,10 @@ pub struct ReviewView {
     session: Entity<GraphSession>,
     branch: String,
     target: String,
+    /// `None` reviews everything since the fork; `Some` one commit of the branch.
+    scope: Option<String>,
+    /// Narrows the cards to those whose id, type or values contain the text.
+    search: Entity<Editor>,
     focus_handle: FocusHandle,
     load: LoadState,
     data: Option<ReviewData>,
@@ -170,8 +181,19 @@ impl ReviewView {
         session: Entity<GraphSession>,
         branch: String,
         target: String,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let search = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Find a change by id, type or value", window, cx);
+            editor
+        });
+        let search_subscription = cx.subscribe(&search, |this, _, event: &EditorEvent, cx| {
+            if let EditorEvent::BufferEdited = event {
+                this.apply_search(cx);
+            }
+        });
         let subscription = cx.subscribe(&session, |this, _, event: &SessionEvent, cx| {
             match event {
                 SessionEvent::Committed { branch } if *branch == this.branch => {
@@ -190,6 +212,8 @@ impl ReviewView {
             session,
             branch,
             target,
+            scope: None,
+            search,
             focus_handle: cx.focus_handle(),
             load: LoadState::Loading { folded: 0 },
             data: None,
@@ -207,7 +231,7 @@ impl ReviewView {
             _load_task: None,
             _merge_task: None,
             _fix_tasks: Vec::new(),
-            _subscriptions: vec![subscription],
+            _subscriptions: vec![subscription, search_subscription],
         };
         view.reload(cx);
         view
@@ -246,8 +270,9 @@ impl ReviewView {
         let graph = self.session.read(cx).graph_id.clone();
         let branch = self.branch.clone();
         let target = self.target.clone();
+        let scope = self.scope.clone();
         self._load_task = Some(cx.spawn(async move |this, cx| {
-            let result = read_review(client, graph, branch, target, this.clone(), cx).await;
+            let result = read_review(client, graph, branch, target, scope, this.clone(), cx).await;
             this.update(cx, |this, cx| this.finish_load(result, cx))
                 .ok();
         }));
@@ -272,9 +297,12 @@ impl ReviewView {
                         },
                     })
                     .collect();
-                self.rows = build_rows(&data);
+                self.rows = build_rows(&data, &self.search_text(cx));
                 self.list_state.reset(self.rows.len());
-                self.selected = (!data.folded.changes.is_empty()).then_some(0);
+                self.selected = self.rows.iter().find_map(|row| match row {
+                    Row::Card(ix) => Some(*ix),
+                    Row::Group(_) => None,
+                });
                 self.bound_head = data.head.as_ref().map(|h| h.graph_commit_id.clone());
                 self.newer = data.moved_while_reading;
                 self.data = Some(data);
@@ -309,14 +337,63 @@ impl ReviewView {
         }
     }
 
+    /// The cards the search leaves, in list order.
+    fn visible_cards(&self) -> Vec<usize> {
+        self.rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Card(ix) => Some(*ix),
+                Row::Group(_) => None,
+            })
+            .collect()
+    }
+
+    fn step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let visible = self.visible_cards();
+        let Some(&first) = visible.first() else {
+            return;
+        };
+        let next = match self
+            .selected
+            .and_then(|s| visible.iter().position(|&ix| ix == s))
+        {
+            Some(at) if forward => visible[(at + 1).min(visible.len() - 1)],
+            Some(at) => visible[at.saturating_sub(1)],
+            None => first,
+        };
+        self.select(next, cx);
+    }
+
     fn select_next(&mut self, _: &NextChange, _: &mut Window, cx: &mut Context<Self>) {
-        let next = self.selected.map_or(0, |s| s + 1);
-        self.select(next.min(self.change_count().saturating_sub(1)), cx);
+        self.step(true, cx);
     }
 
     fn select_previous(&mut self, _: &PreviousChange, _: &mut Window, cx: &mut Context<Self>) {
-        let previous = self.selected.map_or(0, |s| s.saturating_sub(1));
-        self.select(previous, cx);
+        self.step(false, cx);
+    }
+
+    fn search_text(&self, cx: &App) -> String {
+        self.search.read(cx).text(cx).trim().to_lowercase()
+    }
+
+    /// Shows only the cards matching the search, keeping the selection when it still shows.
+    fn apply_search(&mut self, cx: &mut Context<Self>) {
+        let Some(data) = &self.data else { return };
+        self.rows = build_rows(data, &self.search_text(cx));
+        self.list_state.reset(self.rows.len());
+        let visible = self.visible_cards();
+        if !self.selected.is_some_and(|s| visible.contains(&s)) {
+            self.selected = visible.first().copied();
+        }
+        cx.notify();
+    }
+
+    /// Reviews everything since the fork (`None`) or one commit, reading again.
+    fn set_scope(&mut self, scope: Option<String>, cx: &mut Context<Self>) {
+        if self.scope != scope {
+            self.scope = scope;
+            self.reload(cx);
+        }
     }
 
     fn accept_and_next(&mut self, _: &AcceptAndNext, window: &mut Window, cx: &mut Context<Self>) {
@@ -383,7 +460,109 @@ impl ReviewView {
         });
         self._fix_tasks.push(cx.spawn(async move |this, cx| {
             let outcome = task.await;
-            this.update(cx, |this, cx| this.finish_fix(ix, outcome, cx))
+            this.update(cx, |this, cx| this.finish_fix(ix, outcome, false, cx))
+                .ok();
+        }));
+        cx.notify();
+    }
+
+    /// The editable properties of a node change, with what the branch holds now; `None` for
+    /// a relationship, a removed node, or a type the schema no longer has.
+    fn edit_values(&self, ix: usize, cx: &App) -> Option<Vec<(gq_language::Property, Value)>> {
+        let change = self.data.as_ref()?.folded.changes.get(ix)?;
+        if change.is_edge() {
+            return None;
+        }
+        let after = change.after.as_ref()?;
+        let schema = self.session.read(cx).schema_model()?;
+        let node = schema.node(&change.type_name)?;
+        let values: Vec<_> = node
+            .properties
+            .iter()
+            .filter(|p| p.editable_in_cell())
+            .map(|p| {
+                let value = after
+                    .properties
+                    .get(&p.name)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                (p.clone(), value)
+            })
+            .collect();
+        (!values.is_empty()).then_some(values)
+    }
+
+    fn open_edit(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(values) = self.edit_values(ix, cx) else {
+            return;
+        };
+        let Some(change) = self.data.as_ref().and_then(|d| d.folded.changes.get(ix)) else {
+            return;
+        };
+        let title = format!("{} {}", change.type_name, change.id);
+        let branch = self.branch.clone();
+        let view = cx.entity().downgrade();
+        let Some(workspace) = workspace_for(window) else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, move |window, cx| {
+                crate::edit::EditModal::new(view, ix, title, branch, values, window, cx)
+            })
+        });
+    }
+
+    /// Writes edited fields on the reviewed branch, each bound to the value the review showed,
+    /// in one mutation bound to the head this review holds. Never retried.
+    pub(crate) fn save_edit(
+        &mut self,
+        ix: usize,
+        changes: Vec<(String, Value, Value)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(change) = self.data.as_ref().and_then(|d| d.folded.changes.get(ix)) else {
+            return;
+        };
+        let Some(schema) = self.session.read(cx).schema_model() else {
+            return;
+        };
+        let parts: Result<Vec<_>, _> = changes
+            .iter()
+            .map(|(property, old, new)| {
+                gq_language::builder::update_cell(
+                    &schema,
+                    &change.type_name,
+                    property,
+                    &change.id,
+                    old,
+                    new,
+                )
+            })
+            .collect();
+        let query = match parts {
+            Ok(parts) => compose("studio_edit", parts),
+            Err(error) => {
+                self.cards[ix].fix = FixState::Refused(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        let request = ChangeRequest {
+            query: query.text.clone(),
+            name: Some(query.name.clone()),
+            params: query.params_value(),
+            branch: Some(self.branch.clone()),
+        };
+        let description = format!("Edit {} {}", change.type_name, change.id);
+        let if_commit = self.bound_head.clone();
+        self.cards[ix].fix = FixState::Saving;
+        self.fixes_running += 1;
+        let task = self.session.update(cx, |session, cx| {
+            session.write_request(request, if_commit, description, cx)
+        });
+        self._fix_tasks.push(cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            this.update(cx, |this, cx| this.finish_fix(ix, outcome, true, cx))
                 .ok();
         }));
         cx.notify();
@@ -393,6 +572,7 @@ impl ReviewView {
         &mut self,
         ix: usize,
         outcome: WriteOutcome<ChangeOutput>,
+        edited: bool,
         cx: &mut Context<Self>,
     ) {
         self.fixes_running = self.fixes_running.saturating_sub(1);
@@ -400,8 +580,11 @@ impl ReviewView {
             WriteOutcome::Committed(output) => match output.commit {
                 Some(commit) => {
                     self.bound_head = Some(commit.graph_commit_id.clone());
-                    FixState::Reverted {
-                        commit: commit.graph_commit_id,
+                    let commit = commit.graph_commit_id;
+                    if edited {
+                        FixState::Edited { commit }
+                    } else {
+                        FixState::Reverted { commit }
                     }
                 }
                 None => FixState::Unchanged,
@@ -600,12 +783,19 @@ impl ReviewView {
 
         let (sentence, detail) = match (&self.load, &self.data) {
             (LoadState::Ready, Some(data)) => {
+                // The commits in scope: all since the fork, or the one chosen.
+                let in_scope: Vec<&CommitOutput> = data
+                    .commits
+                    .iter()
+                    .filter(|c| {
+                        self.scope
+                            .as_ref()
+                            .is_none_or(|id| *id == c.graph_commit_id)
+                    })
+                    .collect();
                 let actors: Vec<String> = {
-                    let mut actors: Vec<String> = data
-                        .commits
-                        .iter()
-                        .filter_map(|c| c.actor_id.clone())
-                        .collect();
+                    let mut actors: Vec<String> =
+                        in_scope.iter().filter_map(|c| c.actor_id.clone()).collect();
                     actors.sort();
                     actors.dedup();
                     actors
@@ -613,7 +803,7 @@ impl ReviewView {
                 let sentence = summary_sentence(
                     data.folded.entity_count(),
                     data.folded.relationship_count(),
-                    data.commits.len(),
+                    in_scope.len().max(usize::from(self.scope.is_some())),
                     &actors,
                 );
                 let detail = match (&data.fork, &data.head) {
@@ -720,6 +910,83 @@ impl ReviewView {
             banners.push(banner);
         }
 
+        // What is reviewed (everything since the fork, or one commit) and a search over the
+        // cards.
+        let commits: Vec<(String, String)> = self
+            .data
+            .as_ref()
+            .map(|data| {
+                let now = studio_ui::now_micros();
+                data.commits
+                    .iter()
+                    .map(|commit| {
+                        let mut label = short_commit_id(&commit.graph_commit_id);
+                        if let Some(actor) = &commit.actor_id {
+                            label.push_str(&format!(" · {actor}"));
+                        }
+                        label.push_str(&format!(
+                            " · {}",
+                            studio_ui::relative_time(commit.created_at, now)
+                        ));
+                        (commit.graph_commit_id.clone(), label)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let scope_label = match &self.scope {
+            None => "Since the fork".to_owned(),
+            Some(id) => format!("Commit {}", short_commit_id(id)),
+        };
+        let view = cx.entity().downgrade();
+        let scope_menu = PopoverMenu::new("review-scope")
+            .trigger(
+                Button::new("review-scope-button", scope_label)
+                    .style(ButtonStyle::Outlined)
+                    .label_size(LabelSize::Small)
+                    .end_icon(
+                        Icon::new(IconName::ChevronDown)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .menu(move |window, cx| {
+                let view = view.clone();
+                let commits = commits.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    let since = view.clone();
+                    menu = menu.entry("Since the fork", None, move |_, cx| {
+                        since.update(cx, |this, cx| this.set_scope(None, cx)).ok();
+                    });
+                    if !commits.is_empty() {
+                        menu = menu.separator().header("One commit");
+                    }
+                    for (id, label) in commits {
+                        let view = view.clone();
+                        menu = menu.entry(label, None, move |_, cx| {
+                            view.update(cx, |this, cx| this.set_scope(Some(id.clone()), cx))
+                                .ok();
+                        });
+                    }
+                    menu
+                }))
+            });
+        let search = h_flex()
+            .w(px(280.))
+            .h(px(28.))
+            .px_2()
+            .gap_1p5()
+            .items_center()
+            .rounded_md()
+            .border_1()
+            .border_color(border)
+            .bg(cx.theme().colors().editor_background)
+            .child(
+                Icon::new(IconName::MagnifyingGlass)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .child(div().flex_1().child(self.search.clone()));
+
         v_flex()
             .flex_none()
             .px_4()
@@ -740,6 +1007,7 @@ impl ReviewView {
                     .child(refresh)
                     .child(merge_button),
             )
+            .child(h_flex().gap_2().child(scope_menu).child(search))
             .child(Label::new(sentence))
             .when(!detail.is_empty(), |d| {
                 d.child(
@@ -992,16 +1260,21 @@ impl ReviewView {
                 card = match &state.fix {
                     FixState::Idle => card,
                     FixState::Running => card.status("Reverting…", Color::Muted),
+                    FixState::Saving => card.status("Saving…", Color::Muted),
                     FixState::Reverted { commit } => card.status(
                         format!("Reverted in {}", short_commit_id(commit)),
                         Color::Success,
                     ),
+                    FixState::Edited { commit } => card.status(
+                        format!("Edited in {}", short_commit_id(commit)),
+                        Color::Success,
+                    ),
                     FixState::Unchanged => card.status(
-                        "Not reverted: the value changed since this review. Refresh.",
+                        "Not written: the value changed since this review. Refresh.",
                         Color::Warning,
                     ),
                     FixState::Moved => card.status(
-                        "Not reverted: the branch moved. Refresh, then try again.",
+                        "Not written: the branch moved. Refresh, then try again.",
                         Color::Warning,
                     ),
                     FixState::Refused(message) => {
@@ -1038,7 +1311,37 @@ impl ReviewView {
                     })
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_reviewed(ix, cx)));
                 let blocked = state.revert_blocked.clone();
-                let done = matches!(state.fix, FixState::Running | FixState::Reverted { .. });
+                // After a fix the card shows the review as read; the next one waits for Refresh.
+                let done = matches!(
+                    state.fix,
+                    FixState::Running
+                        | FixState::Saving
+                        | FixState::Reverted { .. }
+                        | FixState::Edited { .. }
+                );
+                let editable = self.edit_values(ix, cx).is_some();
+                let edit_button = editable.then(|| {
+                    Button::new(("edit", ix), "Edit")
+                        .label_size(LabelSize::XSmall)
+                        .style(ButtonStyle::Subtle)
+                        .start_icon(Icon::new(IconName::Pencil).size(IconSize::XSmall))
+                        .disabled(done)
+                        .tooltip({
+                            let focus = focus.clone();
+                            let branch = self.branch.clone();
+                            move |_, cx| {
+                                Tooltip::for_action_in(
+                                    format!("Change what {branch} holds now"),
+                                    &EditChange,
+                                    &focus,
+                                    cx,
+                                )
+                            }
+                        })
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| this.open_edit(ix, window, cx)),
+                        )
+                });
                 let branch = self.branch.clone();
                 let revert_button = Button::new(("revert", ix), "Revert")
                     .label_size(LabelSize::XSmall)
@@ -1060,6 +1363,7 @@ impl ReviewView {
                     .py_1()
                     .child(
                         card.action(review_button)
+                            .when_some(edit_button, |card, button| card.action(button))
                             .action(revert_button)
                             .on_click(cx.listener(move |this, _, _, cx| this.select(ix, cx))),
                     )
@@ -1098,11 +1402,32 @@ pub(crate) fn change_card(
     card
 }
 
-fn build_rows(data: &ReviewData) -> Vec<Row> {
+/// Whether a change's id, type or any before or after value contains `query` (lowercase).
+fn change_matches(change: &FoldedChange, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let found = |text: &str| text.to_lowercase().contains(query);
+    found(&change.id)
+        || found(&change.type_name)
+        || [&change.before, &change.after]
+            .into_iter()
+            .flatten()
+            .flat_map(|image| image.properties.values())
+            .any(|value| match value {
+                Value::String(text) => found(text),
+                other => found(&other.to_string()),
+            })
+}
+
+fn build_rows(data: &ReviewData, query: &str) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut group = None;
     let mut group_index = 0;
     for (ix, change) in data.folded.changes.iter().enumerate() {
+        if !change_matches(change, query) {
+            continue;
+        }
         let key = (change.is_edge(), change.type_id.as_str());
         if group != Some(key) {
             if group.is_some() {
@@ -1123,6 +1448,7 @@ async fn read_review(
     graph: String,
     branch: String,
     target: String,
+    scope: Option<String>,
     this: WeakEntity<ReviewView>,
     cx: &mut AsyncApp,
 ) -> Result<ReviewData, String> {
@@ -1149,7 +1475,43 @@ async fn read_review(
     let mut fold = ChangeFold::new();
     let mut partial = false;
     let mut moved_while_reading = false;
-    if !since.is_empty() {
+    if let Some(commit) = &scope {
+        // One commit: its own changes, page by page, up to the cap.
+        let mut token: Option<String> = None;
+        loop {
+            let limit = FEED_PAGE.min(REVIEW_CHANGE_CAP - fold.raw_changes()).max(1) as u32;
+            let page = client
+                .commit_changes(&graph, commit, token.as_deref(), limit)
+                .await
+                .map_err(|e| e.to_string())?;
+            let block = graph_client::api::ChangeBlockOutput {
+                cause: page.cause,
+                changes: page.changes,
+            };
+            let (folded, complete) = cx
+                .background_executor()
+                .spawn(async move {
+                    let complete = fold.add_block_capped(block, REVIEW_CHANGE_CAP);
+                    (fold, complete)
+                })
+                .await;
+            fold = folded;
+            let raw = fold.raw_changes();
+            this.update(cx, |this, cx| {
+                this.load = LoadState::Loading { folded: raw };
+                cx.notify();
+            })
+            .ok();
+            match page.next_page_token {
+                Some(next) if complete && raw < REVIEW_CHANGE_CAP => token = Some(next),
+                Some(_) => {
+                    partial = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+    } else if !since.is_empty() {
         let mut start = Some(match &fork {
             Some(fork) => format!("after:{}", fork.graph_commit_id),
             None => "beginning".to_owned(),
@@ -1260,7 +1622,7 @@ async fn merge_landed(
 }
 
 impl Render for ReviewView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let header = self.render_header(cx);
         let body = match (&self.load, &self.data) {
             (LoadState::Ready, Some(data)) if self.show_conflicts => {
@@ -1295,14 +1657,25 @@ impl Render for ReviewView {
             }
             _ => empty_state("Reading changes…", None).into_any_element(),
         };
+        // Typing in the search box must not move between cards.
+        let mut context = gpui::KeyContext::new_with_defaults();
+        context.add("Review");
+        if self.search.focus_handle(cx).is_focused(window) {
+            context.add("searching");
+        }
         v_flex()
-            .key_context("Review")
+            .key_context(context)
             .track_focus(&self.focus_handle)
             .size_full()
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::accept_and_next))
             .on_action(cx.listener(Self::revert_and_next))
+            .on_action(cx.listener(|this, _: &EditChange, window, cx| {
+                if let Some(ix) = this.selected {
+                    this.open_edit(ix, window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &Merge, _, cx| this.merge(cx)))
             .child(header)
             .child(body)
@@ -1331,10 +1704,47 @@ pub fn open_review(
         return;
     }
     let key = review_key(&branch, &target);
-    let view = workspace.open_item::<ReviewView>(key, window, cx, |_, cx| {
-        ReviewView::new(session, branch, target, cx)
+    let view = workspace.open_item::<ReviewView>(key, window, cx, |window, cx| {
+        ReviewView::new(session, branch, target, window, cx)
     });
     if merge && let Some(view) = view {
         view.update(cx, |view, cx| view.merge(cx));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use graph_client::api::{ChangeImageOutput, EntityKind};
+    use serde_json::json;
+
+    use super::*;
+
+    fn change(id: &str, after: Value) -> FoldedChange {
+        FoldedChange {
+            kind: EntityKind::Node,
+            type_id: "t-Person".into(),
+            type_name: "Person".into(),
+            id: id.into(),
+            before: None,
+            after: Some(ChangeImageOutput {
+                properties: after.as_object().unwrap().clone(),
+                endpoints: None,
+            }),
+            commits: vec!["c1".into()],
+        }
+    }
+
+    #[test]
+    fn search_matches_ids_types_and_values_case_blind() {
+        let c = change(
+            "person-000001",
+            json!({"name": "Donald Dijkstra", "born": 1985}),
+        );
+        assert!(change_matches(&c, ""));
+        assert!(change_matches(&c, "000001"));
+        assert!(change_matches(&c, "person"));
+        assert!(change_matches(&c, "dijkstra"));
+        assert!(change_matches(&c, "1985"));
+        assert!(!change_matches(&c, "lovelace"));
     }
 }

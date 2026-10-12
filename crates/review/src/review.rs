@@ -5,6 +5,7 @@
 
 mod branches;
 mod conflicts;
+mod edit;
 mod view;
 
 use gpui::{App, AppContext as _, Focusable as _};

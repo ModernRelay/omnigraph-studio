@@ -227,6 +227,8 @@ pub mod review {
             AcceptAndNext,
             /// Revert the current change and go to the next.
             RevertAndNext,
+            /// Edit the current change's node on the reviewed branch.
+            EditChange,
             /// Merge the reviewed branch.
             Merge,
         ]

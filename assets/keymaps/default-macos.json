@@ -193,12 +193,18 @@
     }
   },
   {
-    "context": "Review",
+    "context": "Review && !searching",
     "bindings": {
+      "enter": "studio_review::EditChange",
       "j": "studio_review::NextChange",
       "down": "studio_review::NextChange",
       "k": "studio_review::PreviousChange",
-      "up": "studio_review::PreviousChange",
+      "up": "studio_review::PreviousChange"
+    }
+  },
+  {
+    "context": "Review",
+    "bindings": {
       "cmd-y": "studio_review::AcceptAndNext",
       "alt-cmd-z": "studio_review::RevertAndNext",
       "cmd-shift-enter": "studio_review::Merge"
