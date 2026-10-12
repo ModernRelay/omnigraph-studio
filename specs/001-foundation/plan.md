@@ -136,6 +136,7 @@ Linux. CI caches `~/.cargo/git` and `target/` keyed on `Cargo.lock`.
 | 2026-10-11 | Assets parse | JSON parse of `assets/**/*.json` | Keymaps and default settings valid |
 | 2026-10-12 | `script/bundle-mac` produces a valid app and DMG | `script/bundle-mac --debug`; `codesign -dv`, `codesign -d --entitlements -`, `hdiutil verify` | App bundle (arm64), ad hoc signature valid and satisfying its designated requirement, two entitlements, DMG checksum valid (113 MB from the debug build). Developer ID signing and notarization not exercised: no identity on this machine |
 | 2026-10-11 | First build | not run | Pending: 5.8 GiB free on the machine; run S0 with ≥ 25 GiB free |
+| 2026-10-12 | S0 first build: clean build time, `target/` size, binary size | `cargo clean`, then `RUSTC_WRAPPER= cargo build --locked -p studio --bin omnigraph-studio` and the same with `--release` (no sccache); Apple M5 Pro, 18 cores, 48 GB, rustc 1.98.1 | Debug: 152 s, `target/` 7.6 GB, binary 472 MB. Release (thin LTO, one codegen unit, limited debug info, unstripped): 615 s, `target/release` 6.9 GB, binary 114 MB. With the sccache wrapper in `~/.cargo/config.toml` a warm-cache clean debug build took 53 s. Builds on macOS; Linux is left to CI |
 
 ## Upgrade drills
 
