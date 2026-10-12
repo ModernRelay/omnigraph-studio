@@ -3,8 +3,10 @@
 //!
 //! Layer 3 (`docs/architecture.md`). Plan: `specs/003-connections/plan.md`.
 
+pub mod changes;
 pub mod cli_config;
 mod connection;
+pub mod fixes;
 mod registry;
 mod session;
 
@@ -12,9 +14,14 @@ use std::sync::Arc;
 
 use gpui::App;
 
+pub use changes::{
+    ChangeFold, FoldedChange, FoldedChanges, NetChange, PropertyDiff, REVIEW_CHANGE_CAP,
+    TypeCounts, commits_since, contains_merge_of, fork_point, grouped, summary_sentence,
+};
 pub use connection::{
     Connection, ConnectionEvent, ConnectionState, GraphListing, ServerEntry, ServerSource,
 };
+pub use fixes::{RevertUnavailable, revert_query};
 pub use registry::{ConnectionRegistry, RegistryEvent, data_dir};
 pub use session::{GraphSession, Loadable, OutcomeEntry, OutcomeKind, SessionEvent, open_session};
 
