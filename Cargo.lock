@@ -4165,6 +4165,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "studio_settings",
  "url",
 ]
 
@@ -9796,6 +9797,8 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "graph_store",
+ "serde",
+ "serde_json",
  "studio_actions",
  "studio_settings",
  "studio_ui",
