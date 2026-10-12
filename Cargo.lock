@@ -10464,8 +10464,13 @@ dependencies = [
 name = "type_table"
 version = "0.1.0"
 dependencies = [
+ "editor",
  "gpui",
+ "gq_language",
+ "graph_client",
  "graph_store",
+ "menu",
+ "serde_json",
  "studio_actions",
  "studio_ui",
  "studio_workspace",

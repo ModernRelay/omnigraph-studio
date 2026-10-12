@@ -135,6 +135,12 @@ pub mod table {
             DeleteRow,
             /// Copy the selected cell's value.
             CopyCell,
+            /// Add a filter on the selected column.
+            AddFilter,
+            /// Show only rows whose selected column equals the selected cell's value.
+            FilterBySelection,
+            /// Remove every filter from the table.
+            ClearFilters,
         ]
     );
 }
