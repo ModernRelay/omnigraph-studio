@@ -41,11 +41,10 @@ struct ProfileConfig {
 
 /// `$OMNIGRAPH_HOME`, else `~/.omnigraph`.
 pub fn operator_dir() -> Option<PathBuf> {
-    if let Ok(home) = std::env::var("OMNIGRAPH_HOME") {
-        if !home.is_empty() {
+    if let Ok(home) = std::env::var("OMNIGRAPH_HOME")
+        && !home.is_empty() {
             return Some(expand_tilde(&home));
         }
-    }
     home_dir().map(|home| home.join(".omnigraph"))
 }
 
@@ -89,13 +88,11 @@ pub fn load_servers_from(path: &Path) -> Result<Vec<CliServer>, String> {
         })
         .collect();
     for profile in config.profiles.values() {
-        if let (Some(server), Some(graph)) = (&profile.server, &profile.default_graph) {
-            if let Some(entry) = servers.iter_mut().find(|s| &s.name == server) {
-                if !entry.graphs.contains(graph) {
+        if let (Some(server), Some(graph)) = (&profile.server, &profile.default_graph)
+            && let Some(entry) = servers.iter_mut().find(|s| &s.name == server)
+                && !entry.graphs.contains(graph) {
                     entry.graphs.push(graph.clone());
                 }
-            }
-        }
     }
     Ok(servers)
 }
@@ -120,11 +117,10 @@ pub fn token_for(server: &str) -> Result<Option<String>, String> {
             return Ok(Some(token.to_owned()));
         }
     }
-    if let Some(dir) = operator_dir() {
-        if let Some(token) = read_credential_at(&dir.join("credentials"), server)? {
+    if let Some(dir) = operator_dir()
+        && let Some(token) = read_credential_at(&dir.join("credentials"), server)? {
             return Ok(Some(token));
         }
-    }
     if let Ok(token) = std::env::var("OMNIGRAPH_BEARER_TOKEN") {
         let token = token.trim();
         if !token.is_empty() {
@@ -151,14 +147,12 @@ pub fn read_credential_at(path: &Path, server: &str) -> Result<Option<String>, S
             in_section = section.trim() == server;
             continue;
         }
-        if in_section {
-            if let Some((key, value)) = line.split_once('=') {
-                if key.trim() == "token" {
+        if in_section
+            && let Some((key, value)) = line.split_once('=')
+                && key.trim() == "token" {
                     let value = value.trim().trim_matches('"').trim_matches('\'');
                     return Ok((!value.is_empty()).then(|| value.to_owned()));
                 }
-            }
-        }
     }
     Ok(None)
 }

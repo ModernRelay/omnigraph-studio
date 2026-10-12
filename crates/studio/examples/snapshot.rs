@@ -92,12 +92,11 @@ fn main() {
         cx.update_window(handle, |_, window, cx| {
             // With nothing focused an action reaches only global handlers, so give the
             // workspace focus first, as a click in the window would.
-            if window.focused(cx).is_none() {
-                if let Some(workspace) = studio_workspace::workspace_for(window) {
+            if window.focused(cx).is_none()
+                && let Some(workspace) = studio_workspace::workspace_for(window) {
                     let focus = workspace.read(cx).focus_handle(cx);
                     window.focus(&focus, cx);
                 }
-            }
             let action = cx
                 .build_action(&name, data)
                 .unwrap_or_else(|error| panic!("unknown action {name}: {error:?}"));

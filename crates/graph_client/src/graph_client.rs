@@ -24,6 +24,9 @@ pub const SUPPORTED_CONTRACTS: &[&str] = &["0.13"];
 pub const IF_GRAPH_COMMIT_HEADER: &str = "Omnigraph-If-Graph-Commit";
 
 /// How a write ended (constitution III). A write is never retried by this crate.
+// A value of this type is returned once per write and matched at once; boxing the refusal
+// would only add an allocation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum WriteOutcome<T> {
     /// The server published the change.

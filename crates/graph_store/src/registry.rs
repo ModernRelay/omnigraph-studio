@@ -243,11 +243,10 @@ impl ConnectionRegistry {
             .collect();
         let saved = SavedServers { servers };
         let dir = data_dir();
-        if std::fs::create_dir_all(&dir).is_ok() {
-            if let Ok(text) = serde_json::to_string_pretty(&saved) {
+        if std::fs::create_dir_all(&dir).is_ok()
+            && let Ok(text) = serde_json::to_string_pretty(&saved) {
                 let _ = std::fs::write(saved_path(), text);
             }
-        }
     }
 
     pub fn find(&self, name: &str, cx: &App) -> Option<Entity<Connection>> {

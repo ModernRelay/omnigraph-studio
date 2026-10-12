@@ -426,8 +426,7 @@ impl AgentPanel {
                         title,
                         status,
                     } = entry
-                    {
-                        if *existing == id {
+                        && *existing == id {
                             if let Some(new_title) = update.fields.title.clone() {
                                 *title = new_title;
                             }
@@ -436,7 +435,6 @@ impl AgentPanel {
                             }
                             break;
                         }
-                    }
                 }
             }
             SessionUpdate::Plan(plan) => {
@@ -579,8 +577,8 @@ impl AgentPanel {
     }
 
     fn choose_option(&mut self, index: usize, option_index: usize, cx: &mut Context<Self>) {
-        if let Some(Entry::Permission(card)) = self.entries.get_mut(index) {
-            if let (Some(reply), Some(option)) =
+        if let Some(Entry::Permission(card)) = self.entries.get_mut(index)
+            && let (Some(reply), Some(option)) =
                 (card.reply.take(), card.options.get(option_index))
             {
                 card.answer = Some(option.name.clone());
@@ -590,7 +588,6 @@ impl AgentPanel {
                     ))
                     .ok();
             }
-        }
         cx.notify();
     }
 
@@ -663,14 +660,13 @@ impl AgentPanel {
                     };
                     text.push_str(&format!("{branch}{mark}\n"));
                 }
-                if agent_branch.is_none() {
-                    if let Some(branch) = &self.branch {
+                if agent_branch.is_none()
+                    && let Some(branch) = &self.branch {
                         text.push_str(&format!(
                             "\nYour branch will be {} once you propose a change.\n",
                             branch.name
                         ));
                     }
-                }
                 reply.send((text, false)).ok();
             }
             ToolCall::Query {
@@ -861,11 +857,10 @@ impl AgentPanel {
             let (state, text, is_error) = describe_outcome(&outcome);
             let committed = matches!(&outcome, WriteOutcome::Committed(output) if output.commit.is_some());
             this.update(cx, |this, cx| {
-                if committed {
-                    if let Some(branch) = &mut this.branch {
+                if committed
+                    && let Some(branch) = &mut this.branch {
                         branch.changes += 1;
                     }
-                }
                 this.set_proposal_state(index, state, cx);
             })
             .ok();
@@ -901,11 +896,10 @@ impl AgentPanel {
 /// The proxy runs Studio's own executable. Test binaries and examples are not Studio, so they
 /// name the built `omnigraph-studio` next to them when it exists.
 fn proxy_executable(current: PathBuf) -> PathBuf {
-    if let Ok(path) = std::env::var("OMNIGRAPH_STUDIO_PROXY") {
-        if !path.is_empty() {
+    if let Ok(path) = std::env::var("OMNIGRAPH_STUDIO_PROXY")
+        && !path.is_empty() {
             return PathBuf::from(path);
         }
-    }
     current
 }
 

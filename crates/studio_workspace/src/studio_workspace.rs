@@ -290,8 +290,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(key) = item.dedupe_key(cx) {
-            if let Some(index) = self
+        if let Some(key) = item.dedupe_key(cx)
+            && let Some(index) = self
                 .items
                 .iter()
                 .position(|existing| existing.dedupe_key(cx).as_ref() == Some(&key))
@@ -299,7 +299,6 @@ impl Workspace {
                 self.activate_item(index, window, cx);
                 return;
             }
-        }
         self.items.push(item);
         let index = self.items.len() - 1;
         self.activate_item(index, window, cx);
@@ -420,12 +419,11 @@ impl Workspace {
         cx: &mut Context<Self>,
         build: impl FnOnce(&mut Window, &mut Context<V>) -> V,
     ) {
-        if let Some(active) = &self.modal {
-            if active.view.clone().downcast::<V>().is_ok() {
+        if let Some(active) = &self.modal
+            && active.view.clone().downcast::<V>().is_ok() {
                 self.hide_modal(window, cx);
                 return;
             }
-        }
         let previous_focus = window.focused(cx);
         let view = cx.new(|cx| build(window, cx));
         let subscription =

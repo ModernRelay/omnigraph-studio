@@ -512,13 +512,11 @@ fn classify_write<T: DeserializeOwned>(raw: RawResponse) -> WriteOutcome<T> {
     let refused = raw.status.is_client_error()
         || raw.status == StatusCode::SERVICE_UNAVAILABLE
         || raw.status == StatusCode::TOO_MANY_REQUESTS;
-    if refused {
-        if let Ok(body) = serde_json::from_slice::<ErrorOutput>(&raw.body) {
-            return WriteOutcome::Refused(ApiError {
-                status: raw.status.as_u16(),
-                body,
-            });
-        }
+    if refused && let Ok(body) = serde_json::from_slice::<ErrorOutput>(&raw.body) {
+        return WriteOutcome::Refused(ApiError {
+            status: raw.status.as_u16(),
+            body,
+        });
     }
     WriteOutcome::Unknown {
         reason: format!("the server answered {}", raw.status),
