@@ -4312,7 +4312,10 @@ name = "history"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "gq_language",
+ "graph_client",
  "graph_store",
+ "menu",
  "studio_actions",
  "studio_ui",
  "studio_workspace",
@@ -4877,6 +4880,7 @@ name = "inspectors"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "graph_client",
  "graph_store",
  "studio_actions",
  "studio_ui",
@@ -8473,8 +8477,12 @@ dependencies = [
 name = "review"
 version = "0.1.0"
 dependencies = [
+ "editor",
  "gpui",
+ "gq_language",
+ "graph_client",
  "graph_store",
+ "menu",
  "studio_actions",
  "studio_ui",
  "studio_workspace",

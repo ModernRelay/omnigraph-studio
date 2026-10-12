@@ -9,6 +9,14 @@ use ui::prelude::*;
 
 pub use studio_theme::type_color;
 
+mod changes;
+mod values;
+
+pub use changes::{ChangeCard, ChangeKind, PropertyRow, change_counts, change_group_header};
+pub use values::{
+    CopyableValue, group_digits, now_micros, relative_time, short_commit_id, utc_date_time,
+};
+
 /// A column in a data grid.
 #[derive(Debug, Clone)]
 pub struct GridColumn {

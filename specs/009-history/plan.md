@@ -1,6 +1,8 @@
 # 009: History
 
-Status: draft · 2026-10-11
+Status: built on 0.13 · 2026-10-12 (`crates/history`): a History tab with the lane graph and a
+commit detail split, and `OpenCommit` as its own tab. Not built: the bottom-dock panel, search
+by id prefix or actor, and opening a type table or query editor pinned to a commit.
 
 ## Problem
 
@@ -50,7 +52,16 @@ XI (lane logic forked from Zed with notices).
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-10-11 | `git_graph.rs` exists at the pin | `git ls-tree -r v1.23.2 crates/git_ui/src` | Present |
+| 2026-10-12 | Lanes connect and never collide | `history::lanes` property test over 2,000 seeded random commit graphs (up to 60 commits, merges, missing parents): every edge is one line, rows join edge to edge, no two lines share a lane, width bounded | Passes; a mutation that leaves ending lanes busy fails at seed 0 |
+| 2026-10-12 | Merges draw against a live server | offscreen snapshot of main after merging `feature-y` and fast-forwarding `feature-z` | Both merged lanes join main; heads shown as branch chips |
+| 2026-10-12 | Parentless commit | live server: `GET /commits/{genesis}/changes` | 409 "has no first parent"; the detail says the commit cannot be compared |
 
 ## Corrections
 
-None yet.
+- 2026-10-12: lanes are a fresh implementation of the idea in Zed's `GraphData::add_commits`, not a
+  fork: each row records the lines through it, ending at its commit and leaving it, so every
+  row of the virtualized list draws itself with a `canvas`. The property tests are Studio's own.
+- 2026-10-12: `GET /commits?branch=` lists one branch's first-parent chain; merged-in commits appear
+  only as `merged_parent_commit_id`. History also reads up to 20 other live branches' lists and
+  adds every commit reachable through a merged parent (`history::merged`). Merges from deleted
+  branches draw as a short stub. E9 and E10 remove this.

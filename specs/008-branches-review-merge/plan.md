@@ -1,6 +1,8 @@
 # 008: Branches, review and merge
 
-Status: draft · 2026-10-11
+Status: built on 0.13 · 2026-10-12 (`crates/review`, shared logic in `graph_store::changes` and
+`graph_store::fixes`, cards in `studio_ui`). Approvals, comments, the scope selector and Edit are
+not built.
 
 ## Problem
 
@@ -93,8 +95,31 @@ place), X (designed on 0.13; the better routes are deferred).
 |---|---|---|---|
 | 2026-10-11 | Merge outcomes and conflict kinds in 0.13.0 | parsed `openapi.json` at `v0.13.0` | As listed |
 | 2026-10-11 | Change feed and commit list parameters | parsed `openapi.json` at `v0.13.0` | `/changes`: branch, cursor, start, page_token, limit, kind, type, op, set; `/commits`: branch |
-| pending | Folding 20,000 changes stays under 1 s off the main thread | measure | |
+| 2026-10-12 | Folding 20,000 changes stays under 1 s off the main thread | `graph_store` `fold_instrument` (ignored instrument), debug build, Apple M5 Pro, 48 GB: 20,000 changes into 15,000 entities | 175 ms |
+| 2026-10-12 | Change-feed paging | live `omnigraph-server` 0.13.0: a terminal page carries `cursor` and `caught_up: false` but no `next_page_token` when more commits wait | `GraphClient::changes` takes no `cursor`, so review continues with `start=after:<last folded commit>` and stops at the reviewed head; a 20,500-change branch shows "Partial" at 20,000 |
+| 2026-10-12 | Merge outcomes | live server: `feature-y` merged as a new commit; `feature-z` fast-forwarded; `feature-x` refused with 409 | 409 listed `divergent_update` and `delete_vs_update` with `entity_id`; nothing moved on main |
+| 2026-10-12 | Target history after merges | live server: `GET /commits?branch=main` after both merges | Lists main's own chain only; merged branch commits appear only as `merged_parent_commit_id` |
+| 2026-10-12 | Fast-forward shape | live server: main's head after fast-forwarding `feature-z` | A new main commit whose `merged_parent_commit_id` is the branch head, not the branch head itself |
+| 2026-10-12 | A revert of several properties publishes once | live server, scratch branch: two `update` statements joined by `graph_store::fixes::compose` | One commit, `affected_nodes: 2` |
+| 2026-10-12 | Fixes bound to the reviewed head | offscreen snapshot: Revert on `feature-x` `person-000002` through `/mutate/if-graph-commit` | Committed; the value read back as before; the card stays, hollow, "Reverted in …" |
+| 2026-10-12 | Merge refuses a moved branch | offscreen snapshot: a second writer committed on `feature-v` after the review was read | "feature-v moved to …"; no merge request sent; main unchanged |
 
 ## Corrections
 
-None yet.
+- 2026-10-12: a target's `GET /commits` holds only its own first-parent chain, and a fast-forward
+  publishes a new target commit whose merged parent is the branch head. The fork point is the
+  newest branch commit that is in the target's list *or* is a merged parent there
+  (`graph_store::fork_point`); merge verification and settling an unknown outcome look for the
+  merge commit or a commit whose merged parent is the reviewed head (`contains_merge_of`).
+- 2026-10-12: relationships cannot be reverted from the review: `gq_language::builder` has no edge
+  insert or delete builder. Their Revert is disabled with the reason.
+- 2026-10-12: a revert that sets several properties joins the builder's statements into one
+  mutation (`graph_store::fixes::compose`, renaming parameters). It belongs in
+  `gq_language::builder` next to the builders it composes.
+- 2026-10-12: the review's keys (j/k, ↑/↓, ⌘Y, ⌥⌘Z, ⌘⇧↩ for Merge) are bound in `review::init` in
+  the `Review` context; they move to `assets/keymaps/` with the next keymap change.
+- 2026-10-12: a fresh window focuses nothing, so window-level actions never reached the
+  workspace's handlers. `review::init` focuses the workspace when nothing is focused; the fix
+  belongs in `studio_workspace`.
+- 2026-10-12: the change feed folds first-parent history, so a branch that merged its target in
+  shows the merged-in changes too. E6 removes this.
