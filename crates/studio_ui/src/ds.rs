@@ -305,6 +305,8 @@ pub fn section_label(title: impl Into<SharedString>) -> Div {
 
 type TooltipBuilder = Box<dyn Fn(&mut Window, &mut App) -> gpui::AnyView + 'static>;
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
+/// What a setting row's reset button does.
+pub type SettingReset = ClickHandler;
 
 /// A sidebar row: an icon or dot, a label, a trailing count; inset with rounded corners, and
 /// a pill when selected (grey when flat, raised white on glass).
@@ -536,6 +538,92 @@ pub fn meta_code(icon: IconName, value: impl Into<SharedString>, cx: &App) -> Di
         .flex_none()
         .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
         .child(text::code(value, cx).color(Color::Muted).single_line())
+}
+
+/// A segmented control: a sunken track holding [`segment`]s, for a choice of two to four.
+/// Concentric: the track's radius is a segment's plus its padding.
+pub fn segmented(cx: &App) -> Div {
+    h_flex()
+        .flex_none()
+        .p(px(space::XXS))
+        .gap(px(space::XXS))
+        .rounded(px(radius::SM + space::XXS))
+        .bg(surface::sunken(cx).blend(gpui::black().opacity(0.03)))
+}
+
+/// One option of a [`segmented`] control; the selected one is raised.
+pub fn segment(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    cx: &App,
+) -> Stateful<Div> {
+    let hover = surface::hover(cx);
+    let raised = cx.theme().colors().editor_background;
+    h_flex()
+        .id(id.into())
+        .h(px(24.))
+        .px(px(space::MD + space::XXS))
+        .items_center()
+        .rounded(px(radius::SM))
+        .cursor_pointer()
+        .when(selected, |segment| {
+            segment.bg(raised).shadow(elevation::raised())
+        })
+        .when(!selected, |segment| {
+            segment.hover(move |style| style.bg(hover))
+        })
+        .child(
+            Label::new(label.into())
+                .size(LabelSize::Small)
+                .color(if selected {
+                    Color::Default
+                } else {
+                    Color::Muted
+                })
+                .single_line(),
+        )
+}
+
+/// A setting: its title (with a reset button once changed) and one-line description on the
+/// leading side, its control on the trailing side, as Zed's settings rows.
+pub fn setting_row(
+    id: impl Into<ElementId>,
+    title: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+    control: impl IntoElement,
+    reset: Option<SettingReset>,
+) -> Stateful<Div> {
+    let id: ElementId = id.into();
+    h_flex()
+        .id(id.clone())
+        .w_full()
+        .min_h(px(size::ROW + space::XXL))
+        .py(px(space::LG))
+        .gap(px(space::XXL))
+        .items_center()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(space::WITHIN))
+                .child(
+                    h_flex()
+                        .gap(px(space::XS))
+                        .child(Label::new(title.into()))
+                        .when_some(reset, |title, reset| {
+                            title.child(
+                                IconButton::new("reset", IconName::Undo)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Reset to default"))
+                                    .on_click(reset),
+                            )
+                        }),
+                )
+                .child(text::muted(description)),
+        )
+        .child(div().flex_none().child(control))
 }
 
 /// A key cap and a one-word label, as Zed's hints show keys.

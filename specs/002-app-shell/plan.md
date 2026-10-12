@@ -101,6 +101,13 @@ second line shows it (`omnigraph branch create feature-x --from main`).
 - A settings window (⌘,) generated from the same schema: search box, left nav, rows of title,
   one-line description and control, "Reset to default" per row. Forked in spirit from Zed's
   `settings_ui`; rows are generated, not hand-written.
+  - Built: `studio_settings::fields` walks the `schemars` schema of `StudioSettings`. A field's
+    doc comment is its description; `title`, `range` and the extensions `x-section`,
+    `x-control` (`theme`, `font`, `agent`), `x-step` and `x-hidden` give the rest. The tab
+    draws a control per kind (segmented choice up to four, a menu above that, a stepper in
+    range, a switch, the theme and font menus, the agent presets) and writes by path, so a new
+    setting is a field and its attributes. The nav counts changed settings per section;
+    search spans every section; the search box has focus when the tab opens.
 - `studio_theme` implements `theme::ThemeSettingsProvider` from these settings: UI font,
   buffer font, sizes, density.
 
@@ -178,6 +185,7 @@ Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks ente
 | Palette lists only available actions | A global list of every command | Zed's model: a listed action always works where you are |
 | Every tab kind restores; a query tab keeps its draft, in an owner-only (0600) workspace file | Restore query tabs empty; keep drafts only in memory | Spec 007: a draft is never cleared. The rule against logging query text is about logs; the workspace file is the person's own document state |
 | Panels in docks, one active panel per dock | Stacked sidebar sections | Zed's and Obsidian's model; every panel gets the same bounded chrome and the sidebar stays short |
+| Settings rows from a JSON schema (`schemars`) of the settings types | A hand-written row list; Zed's `settings_ui` page macros | One source: the field, its doc comment and attributes. The same schema can later validate `settings.json` in an editor |
 
 ## Deferred
 
@@ -198,6 +206,7 @@ Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks ente
 | 2026-10-12 | The palette's rows come from where the person was | `gpui/src/window.rs` `available_actions` (the focused node in the rendered frame, plus global listeners) and `dispatch_action` (captures focus when called) at `v1.23.2` | The list is built before the modal takes focus; on ↵ focus is restored, the modal dismissed, then the action dispatched |
 | 2026-10-12 | Zed's global handlers appear as rows | palette snapshot | `editor::init` registers `workspace::NewFile` and `workspace::NewWindow` globally; their handlers read Zed's `AppState` with `cx.global`, which panics in Studio. The palette hides `workspace::`, `zed::` and `menu::`; ⌘N is rebound to `studio_graph::NewQuery` at the root (spec 007), so the key no longer reaches `NewFile` |
 | 2026-10-12 | With nothing focused, an action reaches only global handlers | offscreen snapshots: `studio::ToggleSidebar` and `studio::OpenGraph` did nothing until the workspace had focus | A window opens with no focus, so the workspace's handlers and key bindings are unreachable until something is clicked. The snapshot example now focuses the workspace first; the app should focus it when a window opens |
+| 2026-10-12 | Settings rows are generated in declaration order | `studio_settings` field tests (row order, sections, kinds, path writes and resets); `serde_json`'s `preserve_order` is on in the workspace graph; offscreen snapshots of the Appearance section and of searches for "page" and "agent" | Fourteen rows in four sections; `agent.env` hidden; changed rows show Reset and the nav counts them |
 | 2026-10-12 | Every tab kind comes back after a restart | offscreen snapshots: one run opened a type table, a query with a draft, history, canvas and storage; a second run with `OMNIGRAPH_STUDIO_NO_RESTORE=0` | All five tabs restored in order, the draft intact; the workspace file is `-rw-------` |
 
 ## Corrections

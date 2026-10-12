@@ -9792,6 +9792,7 @@ name = "studio_settings"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "schemars 1.0.4",
  "serde",
  "serde_json",
  "settings",

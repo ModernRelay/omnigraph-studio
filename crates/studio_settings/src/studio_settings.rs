@@ -9,10 +9,15 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use gpui::{App, BorrowAppContext, Global};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{ParseStatus, SettingsStore};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+mod fields;
+
+pub use fields::{Choice, FieldKind, SettingField, fields, sections};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeMode {
     System,
@@ -20,11 +25,17 @@ pub enum ThemeMode {
     Dark,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ThemeChoice {
+    /// Follow the system, or always use the light or dark theme.
+    #[schemars(title = "Theme")]
     pub mode: ThemeMode,
+    /// The theme used in light appearance.
+    #[schemars(title = "Light theme", extend("x-control" = "theme"))]
     pub light: String,
+    /// The theme used in dark appearance.
+    #[schemars(title = "Dark theme", extend("x-control" = "theme"))]
     pub dark: String,
 }
 
@@ -38,9 +49,8 @@ impl Default for ThemeChoice {
     }
 }
 
-/// How the window's surfaces are drawn (spec 002, "Visual language").
 /// Spacing in Zed's `ui` components.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Density {
     Compact,
@@ -49,7 +59,8 @@ pub enum Density {
     Comfortable,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// How the window's surfaces are drawn (spec 002, "Visual language").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WindowStyle {
     /// Columns on solid panels, split by hairlines.
@@ -60,18 +71,39 @@ pub enum WindowStyle {
 }
 
 /// Studio's own settings.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct StudioOptions {
-    /// Flat columns, or glass sheets.
+    /// Columns on solid panels, or the document as a sheet over a faint wash.
+    #[schemars(title = "Window style", extend("x-section" = "Appearance"))]
     pub window_style: WindowStyle,
-    /// Rows per page in type tables.
+    /// Rows read per page in type tables.
+    #[schemars(
+        title = "Table page size",
+        range(min = 25, max = 1000),
+        extend("x-section" = "Browsing", "x-step" = 25)
+    )]
     pub type_table_page_size: u32,
-    /// Neighbours per page in the relationship tree.
+    /// Neighbours shown per page in the relationship tree.
+    #[schemars(
+        title = "Relationship page size",
+        range(min = 10, max = 500),
+        extend("x-section" = "Browsing", "x-step" = 10)
+    )]
     pub tree_page_size: u32,
     /// Most nodes the canvas draws before offering a table instead.
+    #[schemars(
+        title = "Canvas node limit",
+        range(min = 500, max = 20000),
+        extend("x-section" = "Browsing", "x-step" = 500)
+    )]
     pub canvas_max_nodes: u32,
-    /// Seconds between server health checks.
+    /// Seconds between checks that the server still answers.
+    #[schemars(
+        title = "Health check interval",
+        range(min = 5, max = 600),
+        extend("x-section" = "Connection", "x-step" = 5)
+    )]
     pub health_check_seconds: u64,
 }
 
@@ -89,26 +121,56 @@ impl Default for StudioOptions {
 
 /// The agent the agent panel runs (spec 011): a program and its arguments, and extra
 /// environment variables. Empty until the person chooses one.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct AgentSettings {
+    /// The program the agent panel runs over the Agent Client Protocol.
+    #[schemars(title = "Agent", extend("x-control" = "agent"))]
     pub command: Vec<String>,
+    /// Extra environment for the agent; edited in `settings.json`.
+    #[schemars(extend("x-hidden" = true))]
     pub env: BTreeMap<String, String>,
 }
 
-/// The whole settings document.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// The whole settings document. Each field's doc comment is its row's description in the
+/// settings tab, and its `schemars` attributes give the title, section, range and control
+/// ([`fields`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct StudioSettings {
+    #[schemars(extend("x-section" = "Appearance"))]
     pub theme: ThemeChoice,
-    /// The interface font; `null` keeps Zed's.
+    /// The font for menus, tables and panels. Default keeps Zed's.
+    #[schemars(
+        title = "Interface font",
+        extend("x-section" = "Appearance", "x-control" = "font")
+    )]
     pub ui_font_family: Option<String>,
+    /// Text size for menus, tables and panels.
+    #[schemars(
+        title = "Interface font size",
+        range(min = 10, max = 24),
+        extend("x-section" = "Appearance", "x-step" = 1)
+    )]
     pub ui_font_size: f32,
-    /// The query editor's font; `null` keeps Zed's.
+    /// The font of the query editor. Default keeps Zed's.
+    #[schemars(
+        title = "Editor font",
+        extend("x-section" = "Appearance", "x-control" = "font")
+    )]
     pub buffer_font_family: Option<String>,
+    /// Text size in the query editor.
+    #[schemars(
+        title = "Editor font size",
+        range(min = 10, max = 24),
+        extend("x-section" = "Appearance", "x-step" = 1)
+    )]
     pub buffer_font_size: f32,
+    /// Spacing in lists, buttons and panels.
+    #[schemars(title = "Density", extend("x-section" = "Appearance"))]
     pub ui_density: Density,
     pub studio: StudioOptions,
+    #[schemars(extend("x-section" = "Agent"))]
     pub agent: AgentSettings,
 }
 

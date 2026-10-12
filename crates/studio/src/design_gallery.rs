@@ -636,6 +636,31 @@ impl Render for DesignGallery {
                     .child(ds::round_button("g-send", IconName::ArrowUp, true, cx)),
             );
 
+        let settings_rows = ds::card(cx)
+            .px(px(space::XL))
+            .child(
+                ds::setting_row(
+                    "g-setting-style",
+                    "Window style",
+                    "Columns on solid panels, or the document as a sheet over a faint wash.",
+                    ds::segmented(cx)
+                        .child(ds::segment("g-flat", "Flat", true, cx))
+                        .child(ds::segment("g-glass", "Glass", false, cx)),
+                    None,
+                )
+                .border_b_1()
+                .border_color(ds::surface::rule(cx)),
+            )
+            .child(ds::setting_row(
+                "g-setting-size",
+                "Table page size",
+                "Rows read per page in type tables.",
+                text::body("100"),
+                Some(Box::new(
+                    |_: &gpui::ClickEvent, _: &mut Window, _: &mut App| {},
+                )),
+            ));
+
         v_flex()
             .id("design-gallery")
             .track_focus(&self.focus_handle)
@@ -676,6 +701,10 @@ impl Render for DesignGallery {
                     .child(section("Card", div().w(px(520.)).child(card)))
                     .child(section("Empty state", div().w(px(360.)).child(empty))),
             )
+            .child(section(
+                "Settings rows · segmented control",
+                div().w(px(720.)).child(settings_rows),
+            ))
             .child(
                 h_flex()
                     .gap(px(space::XXXL))
