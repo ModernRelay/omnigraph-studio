@@ -754,6 +754,31 @@ impl Workspace {
         self.activate_in(pane_id, index, true, window, cx);
     }
 
+    /// Every tab of the shown graph, pane by pane.
+    pub fn all_items(&self) -> impl Iterator<Item = &dyn ItemHandle> {
+        self.center
+            .panes()
+            .into_iter()
+            .filter_map(|id| self.pane(id))
+            .flat_map(|pane| pane.items.iter().map(|item| item.as_ref()))
+    }
+
+    /// Activates a tab of the shown graph wherever it is; false when there is none.
+    pub fn activate_item_by_id(
+        &mut self,
+        id: EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match self.find_item(id) {
+            Some((pane, index)) => {
+                self.activate_in(pane, index, true, window, cx);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The active pane's tabs.
     pub fn items(&self) -> &[Box<dyn ItemHandle>] {
         self.pane(self.active_pane)

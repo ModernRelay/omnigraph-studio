@@ -249,5 +249,52 @@
       "enter": "studio_history::NextMatch",
       "shift-enter": "studio_history::PreviousMatch"
     }
+  },
+  {
+    "context": "CommandPalette",
+    "bindings": {
+      "cmd-1": [
+        "studio_palette::ShowScope",
+        {
+          "index": 0
+        }
+      ],
+      "cmd-2": [
+        "studio_palette::ShowScope",
+        {
+          "index": 1
+        }
+      ],
+      "cmd-3": [
+        "studio_palette::ShowScope",
+        {
+          "index": 2
+        }
+      ],
+      "cmd-4": [
+        "studio_palette::ShowScope",
+        {
+          "index": 3
+        }
+      ],
+      "cmd-5": [
+        "studio_palette::ShowScope",
+        {
+          "index": 4
+        }
+      ],
+      "cmd-6": [
+        "studio_palette::ShowScope",
+        {
+          "index": 5
+        }
+      ]
+    }
+  },
+  {
+    "context": "CommandPalette > Editor",
+    "bindings": {
+      "tab": "studio_palette::AskAgent"
+    }
   }
 ]

@@ -1,7 +1,7 @@
 # 002: App shell
 
-Status: draft · 2026-10-11. The command palette landed 2026-10-12 (`crates/command_palette`);
-its scope tabs are not built yet.
+Status: draft · 2026-10-11. The command palette landed 2026-10-12 (`crates/command_palette`),
+with scope tabs and the Ask hand-off.
 
 ## Problem
 
@@ -97,6 +97,13 @@ across launches (see Deferred).
   action runs.
 - Scope tabs: All ⌘1, Types ⌘2, Nodes ⌘3, Queries ⌘4, Branches ⌘5, Commands ⌘6. Tab hands the
   text to the agent ("Ask") once spec 011 lands.
+  Built: a segmented control under the search field; ⌘1–⌘6 (Alt elsewhere) inside the
+  palette. ⌘K opens All, ⌘P Nodes, ⌘⇧B Branches; the key sheet (`?`) has no tabs. Queries
+  lists the open query tabs with their first line, since saved queries are not built. Tab
+  (bound under `CommandPalette > Editor`, so it outranks the editor's) dismisses the palette
+  and sends `studio_agent::Ask`; with no agent chosen, the agent tab says the question waits.
+  Node search tries the text as typed, lowercase and capitalized, because `contains` is
+  exact on 0.13 ("ada" finds "Ada Turing").
 - Opens in one frame with no animation (constitution VII).
 - Landed 2026-10-12: ⌘K and ⌘⇧P (Ctrl elsewhere; each bound in `init` only when the keymap
   does not already bind it). Rows are humanized action names (`studio_graph::OpenType` → "Graph:
@@ -215,7 +222,6 @@ Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks ente
 
 ## Deferred
 
-- Palette scope tabs (Types, Nodes, Queries, Branches, Commands) and the Ask hand-off.
 - Multi-window session restore across launches beyond the last window.
 - A URL scheme (`omnigraph-studio://`) for deep links, until the launcher (E1) needs it. Deep
   links will fill a query tab and never run it.
@@ -236,6 +242,7 @@ Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks ente
 | 2026-10-12 | A graph's own value reaches its views | offscreen snapshots with the new `click:x,y` step: the scope switch, then + on Table page size in the graph scope; `settings.json` after; the Person table after | `graphs."environment/knowledge".type_table_page_size` 125, `studio.type_table_page_size` still 100; the table footer reads "125 of 200" |
 | 2026-10-12 | Panes, pins and previews | `studio_workspace` pane tests (preview replaced in place and kept, pin order, close others, removal, split nesting and collapse, JSON round trip); offscreen snapshots: preview Person then Company, pin a query, split right and down, restart with restore, drag the boundary with the new `drag:` step | Company replaced Person in its place in italics; the query stayed first with a pin; both splits showed a copy of the Project table; the layout, pins and shares came back after the restart |
 | 2026-10-12 | Two graphs in one window | a second dev graph `notes` (`dev/cluster/notes.pg`, `dev/notes-seed.jsonl`); offscreen snapshots: Person and a query on `knowledge`, Open Graph, `click:` on `notes`, a Note table split in two, the switcher; then ⌃⌘] | The switcher listed both with `notes` checked and "+1 graph" in the footer; stepping back showed `knowledge` with its Person tab and the query draft |
+| 2026-10-12 | Palette scopes and Ask | offscreen snapshots with the new `key:` step: All for "pro", Nodes for "ada", ⌘4 with two query tabs, then Tab on "who knows ada" | Types, nodes and commands under All; five Adas under Nodes; both query tabs under Queries; Tab opened the agent tab with the question waiting. A Tab bound under `CommandPalette` alone lost to a binding at the editor level |
 | 2026-10-12 | Every tab kind comes back after a restart | offscreen snapshots: one run opened a type table, a query with a draft, history, canvas and storage; a second run with `OMNIGRAPH_STUDIO_NO_RESTORE=0` | All five tabs restored in order, the draft intact; the workspace file is `-rw-------` |
 
 ## Corrections

@@ -1197,6 +1197,14 @@ impl AgentPanel {
                                     ),
                             ),
                     )
+                    // A question asked before an agent was chosen waits, and says so.
+                    .children(self.queued.clone().map(|question| {
+                        div().mb_2().child(
+                            Label::new(format!("“{question}” is sent once you choose an agent."))
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                    }))
                     .children(PRESETS.iter().enumerate().map(|(index, (name, command))| {
                         let command: Vec<String> =
                             command.iter().map(|s| (*s).to_owned()).collect();

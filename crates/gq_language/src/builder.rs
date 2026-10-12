@@ -837,16 +837,10 @@ pub fn neighbours(
     // A search narrows the neighbours to ids starting with, or labels containing, the text.
     let search = match search.filter(|text| !text.is_empty()) {
         Some(text) => {
-            let q = params.add("q", "String", Value::String(text.to_owned()));
-            match other
+            let label = other
                 .label_property()
-                .filter(|label| Some(*label) != other.key.as_deref())
-            {
-                Some(label) => {
-                    format!("\n    ($m.@id starts_with {q} or $m.{label} contains {q})")
-                }
-                None => format!("\n    $m.@id starts_with {q}"),
-            }
+                .filter(|label| Some(*label) != other.key.as_deref());
+            format!("\n    {}", text_match("m", label, text, &mut params))
         }
         None => String::new(),
     };
@@ -904,18 +898,14 @@ pub fn node_search(
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
     let mut params = Params::new();
-    let q = params.add("q", "String", Value::String(text.to_owned()));
     let label = node
         .label_property()
         .filter(|label| Some(*label) != node.key.as_deref());
     let mut columns = vec!["$n.@id as id".to_owned()];
-    let predicate = match label {
-        Some(label) => {
-            columns.push(format!("$n.{label} as label"));
-            format!("($n.@id starts_with {q} or $n.{label} contains {q})")
-        }
-        None => format!("$n.@id starts_with {q}"),
-    };
+    if let Some(label) = label {
+        columns.push(format!("$n.{label} as label"));
+    }
+    let predicate = text_match("n", label, text, &mut params);
     let text = format!(
         "query studio_find({sig}) {{\n  match {{\n    $n: {ty}\n    {predicate}\n  }}\n  return {{ {columns} }}\n  order {{ $n.@id asc }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
@@ -927,6 +917,44 @@ pub fn node_search(
         text,
         params: params.values,
     })
+}
+
+/// The spellings a search tries, since `contains` and `starts_with` compare exactly: as typed,
+/// lowercase, and with each word capitalized ("ada lov" also finds "Ada Lovelace").
+fn spellings(text: &str) -> Vec<String> {
+    let capitalize = |word: &str| {
+        let mut chars = word.chars();
+        match chars.next() {
+            Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+            None => String::new(),
+        }
+    };
+    let words: Vec<String> = text.split(' ').map(capitalize).collect();
+    let mut found: Vec<String> = Vec::new();
+    for spelling in [
+        text.to_owned(),
+        text.to_lowercase(),
+        capitalize(text),
+        words.join(" "),
+    ] {
+        if !spelling.is_empty() && !found.contains(&spelling) {
+            found.push(spelling);
+        }
+    }
+    found
+}
+
+/// `$var`'s id starting with, or its label containing, `text` in any of its [`spellings`].
+fn text_match(var: &str, label: Option<&str>, text: &str, params: &mut Params) -> String {
+    let mut tests = Vec::new();
+    for (index, spelling) in spellings(text).into_iter().enumerate() {
+        let q = params.add(&format!("q{index}"), "String", Value::String(spelling));
+        tests.push(format!("${var}.@id starts_with {q}"));
+        if let Some(label) = label {
+            tests.push(format!("${var}.{label} contains {q}"));
+        }
+    }
+    format!("({})", tests.join(" or "))
 }
 
 /// Sets one property of one node, bound to the value the cell showed (spec 004). Zero affected
@@ -1223,6 +1251,21 @@ mod tests {
             query.text,
             result.diagnostics
         );
+    }
+
+    #[test]
+    fn searches_try_the_usual_spellings() {
+        assert_eq!(spellings("ada lov"), ["ada lov", "Ada lov", "Ada Lov"]);
+        assert_eq!(spellings("Ada"), ["Ada", "ada"]);
+        assert_eq!(spellings("person-0001"), ["person-0001", "Person-0001"]);
+        let schema = dev();
+        let query = node_search(&schema, "Person", "ada", 5).unwrap();
+        assert!(
+            query.text.contains("$n.name contains $q1"),
+            "{}",
+            query.text
+        );
+        assert_compiles(&query);
     }
 
     #[test]
@@ -1644,11 +1687,12 @@ mod tests {
         for node in &schema.nodes {
             let query = node_search(&schema, &node.name, "ada", 5).unwrap();
             assert_compiles(&query);
-            assert_eq!(query.params["q"], json!("ada"));
+            assert_eq!(query.params["q0"], json!("ada"));
+            assert_eq!(query.params["q1"], json!("Ada"));
         }
         let person = node_search(&schema, "Person", "ada", 5).unwrap();
         assert!(
-            person.text.contains("$n.name contains $q"),
+            person.text.contains("$n.name contains $q0"),
             "{}",
             person.text
         );

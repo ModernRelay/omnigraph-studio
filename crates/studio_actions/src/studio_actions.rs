@@ -98,6 +98,28 @@ pub mod workspace {
     );
 }
 
+pub mod palette {
+    use gpui::{Action, actions};
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    actions!(
+        studio_palette,
+        [
+            /// Hand the palette's text to the agent as a question.
+            AskAgent,
+        ]
+    );
+
+    /// Show one scope of the palette: 0 All, 1 Types, 2 Nodes, 3 Queries, 4 Branches,
+    /// 5 Commands.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_palette)]
+    pub struct ShowScope {
+        pub index: usize,
+    }
+}
+
 pub mod graph {
     use gpui::{Action, actions};
     use schemars::JsonSchema;

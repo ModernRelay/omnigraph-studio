@@ -191,6 +191,8 @@ pub enum Group {
     Studio,
     /// Quick-open rows for node and edge types.
     Type,
+    /// Open query tabs.
+    Query,
     /// Nodes found by id or label (⌘P).
     Node,
     /// The session's branches (⌘⇧B).

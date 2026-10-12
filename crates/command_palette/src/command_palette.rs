@@ -1,7 +1,8 @@
 //! The command palette (spec 002): every action available where the person is, with its
-//! binding, fuzzy filtered and ranked by recent use, plus quick-open rows for node and edge
-//! types. The same picker serves ⌘P (go to a type or a node), ⌘⇧B (switch branch) and `?`
-//! (the keyboard shortcuts available where the person is).
+//! binding, fuzzy filtered and ranked by recent use, plus the graph's types, nodes found by id
+//! or name, open query tabs and branches. Scope tabs narrow it (All ⌘1, Types ⌘2, Nodes ⌘3,
+//! Queries ⌘4, Branches ⌘5, Commands ⌘6); Tab hands the text to the agent. ⌘K opens All, ⌘P
+//! Nodes, ⌘⇧B Branches; `?` opens the keyboard shortcuts available where the person is.
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/002-app-shell/plan.md`.
 //!
@@ -17,14 +18,16 @@ use std::time::Duration;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    Action, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, KeyBinding,
-    Keystroke, Render, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle,
-    Window, uniform_list,
+    Action, App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
+    KeyBinding, Keystroke, Render, ScrollStrategy, SharedString, Subscription, Task,
+    UniformListScrollHandle, WeakEntity, Window, uniform_list,
 };
 use gq_language::builder::node_search;
 use graph_store::{GraphSession, Loadable};
 use serde_json::Value;
+use studio_actions::agent::Ask;
 use studio_actions::graph::{OpenNode, OpenType};
+use studio_actions::palette::{AskAgent, ShowScope};
 use studio_actions::workspace::{GoTo, ShowKeyBindings, SwitchBranch, ToggleCommandPalette};
 use studio_workspace::{ToastKind, Workspace};
 use ui::prelude::*;
@@ -40,13 +43,13 @@ pub fn init(cx: &mut App) {
     bind_default_keys(cx);
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &ToggleCommandPalette, window, cx| {
-            open(workspace, Mode::Commands, window, cx);
+            open(workspace, Mode::Picker(Scope::All), window, cx);
         });
         workspace.register_action(|workspace, _: &GoTo, window, cx| {
-            open(workspace, Mode::GoTo, window, cx);
+            open(workspace, Mode::Picker(Scope::Nodes), window, cx);
         });
         workspace.register_action(|workspace, _: &SwitchBranch, window, cx| {
-            open(workspace, Mode::Branches, window, cx);
+            open(workspace, Mode::Picker(Scope::Branches), window, cx);
         });
         workspace.register_action(|workspace, _: &ShowKeyBindings, window, cx| {
             open(workspace, Mode::Keys, window, cx);
@@ -62,24 +65,84 @@ fn open(
     cx: &mut gpui::Context<Workspace>,
 ) {
     let session = workspace.session().cloned();
-    if session.is_none() && matches!(mode, Mode::GoTo | Mode::Branches) {
+    if session.is_none() && matches!(mode, Mode::Picker(Scope::Nodes | Scope::Branches)) {
         workspace.show_toast(ToastKind::Info, "Open a graph first.", cx);
         return;
     }
+    // Open query tabs, for the Queries scope: the tab, its title and its first line.
+    let queries: Vec<(EntityId, String, String)> = workspace
+        .all_items()
+        .filter_map(|item| {
+            let saved = item.serialize(cx).filter(|saved| saved.kind == "query")?;
+            let first = saved
+                .data
+                .get("text")
+                .and_then(Value::as_str)
+                .and_then(|text| text.lines().map(str::trim).find(|l| !l.is_empty()))
+                .unwrap_or_default()
+                .to_owned();
+            Some((item.item_id(), item.tab_title(cx).to_string(), first))
+        })
+        .collect();
+    let handle = cx.entity().downgrade();
     workspace.toggle_modal(window, cx, move |window, cx| {
-        CommandPalette::new(mode, session, window, cx)
+        CommandPalette::new(mode, session, handle, queries, window, cx)
     });
 }
 
-/// What the picker lists.
+/// A slice of what the picker lists (spec 002, scope tabs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    All,
+    Types,
+    Nodes,
+    Queries,
+    Branches,
+    Commands,
+}
+
+impl Scope {
+    const TABS: [Scope; 6] = [
+        Scope::All,
+        Scope::Types,
+        Scope::Nodes,
+        Scope::Queries,
+        Scope::Branches,
+        Scope::Commands,
+    ];
+
+    fn title(self) -> &'static str {
+        match self {
+            Scope::All => "All",
+            Scope::Types => "Types",
+            Scope::Nodes => "Nodes",
+            Scope::Queries => "Queries",
+            Scope::Branches => "Branches",
+            Scope::Commands => "Commands",
+        }
+    }
+
+    fn includes(self, group: Group) -> bool {
+        match self {
+            Scope::All => true,
+            Scope::Types => group == Group::Type,
+            Scope::Nodes => group == Group::Node,
+            Scope::Queries => group == Group::Query,
+            Scope::Branches => group == Group::Branch,
+            Scope::Commands => matches!(group, Group::Studio | Group::Other),
+        }
+    }
+
+    /// Whether typing looks for nodes on the server.
+    fn searches_nodes(self) -> bool {
+        matches!(self, Scope::All | Scope::Nodes)
+    }
+}
+
+/// The picker, in one of its scopes, or the keyboard-shortcut sheet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// ⌘K: every action available where the person is, then the graph's types.
-    Commands,
-    /// ⌘P: the graph's types, then nodes whose id starts with, or label contains, the text.
-    GoTo,
-    /// ⌘⇧B: the session's branches.
-    Branches,
+    Picker(Scope),
     /// `?`: every action with a key binding where the person is.
     Keys,
 }
@@ -87,32 +150,46 @@ pub enum Mode {
 impl Mode {
     fn placeholder(self) -> &'static str {
         match self {
-            Mode::Commands => "Run a command or open a type…",
-            Mode::GoTo => "Go to a type, or find a node by id or name…",
-            Mode::Branches => "Switch to a branch…",
+            Mode::Picker(Scope::All) => "Search commands, types, nodes, queries and branches…",
+            Mode::Picker(Scope::Types) => "Open a type…",
+            Mode::Picker(Scope::Nodes) => "Find a node by id or name…",
+            Mode::Picker(Scope::Queries) => "Go to a query…",
+            Mode::Picker(Scope::Branches) => "Switch to a branch…",
+            Mode::Picker(Scope::Commands) => "Run a command…",
             Mode::Keys => "Search keyboard shortcuts…",
         }
     }
 
     fn noun(self, count: usize) -> &'static str {
-        match (self, count == 1) {
-            (Mode::Commands, true) => "command",
-            (Mode::Commands, false) => "commands",
-            (Mode::GoTo, true) => "result",
-            (Mode::GoTo, false) => "results",
-            (Mode::Branches, true) => "branch",
-            (Mode::Branches, false) => "branches",
-            (Mode::Keys, true) => "shortcut",
-            (Mode::Keys, false) => "shortcuts",
+        let one = count == 1;
+        match self {
+            Mode::Picker(Scope::Types) => ["types", "type"][one as usize],
+            Mode::Picker(Scope::Nodes) => ["nodes", "node"][one as usize],
+            Mode::Picker(Scope::Queries) => ["queries", "query"][one as usize],
+            Mode::Picker(Scope::Branches) => ["branches", "branch"][one as usize],
+            Mode::Picker(Scope::Commands) => ["commands", "command"][one as usize],
+            Mode::Picker(Scope::All) => ["results", "result"][one as usize],
+            Mode::Keys => ["shortcuts", "shortcut"][one as usize],
         }
     }
 
-    fn empty(self) -> &'static str {
+    fn empty(self, typed: bool) -> &'static str {
         match self {
-            Mode::Commands => "No command matches.",
-            Mode::GoTo => "No type or node matches.",
-            Mode::Branches => "No branch matches.",
+            Mode::Picker(Scope::Nodes) if !typed => "Type an id or a name to find nodes.",
+            Mode::Picker(Scope::Nodes) => "No node matches.",
+            Mode::Picker(Scope::Types) => "No type matches.",
+            Mode::Picker(Scope::Queries) => "No query tab matches.",
+            Mode::Picker(Scope::Branches) => "No branch matches.",
+            Mode::Picker(Scope::Commands) => "No command matches.",
+            Mode::Picker(Scope::All) => "Nothing matches.",
             Mode::Keys => "No shortcut matches.",
+        }
+    }
+
+    fn scope(self) -> Option<Scope> {
+        match self {
+            Mode::Picker(scope) => Some(scope),
+            Mode::Keys => None,
         }
     }
 }
@@ -166,6 +243,11 @@ enum Row {
         name: String,
         current: bool,
     },
+    /// An open query tab: its first line.
+    Tab {
+        id: EntityId,
+        first_line: String,
+    },
 }
 
 impl Row {
@@ -174,7 +256,7 @@ impl Row {
             Row::Action { action, .. } | Row::Type { action, .. } | Row::Node { action, .. } => {
                 Some(action.as_ref())
             }
-            Row::Branch { .. } => None,
+            Row::Branch { .. } | Row::Tab { .. } => None,
         }
     }
 }
@@ -185,6 +267,7 @@ const VISIBLE_ROWS: usize = 11;
 pub struct CommandPalette {
     mode: Mode,
     session: Option<Entity<GraphSession>>,
+    workspace: WeakEntity<Workspace>,
     previous_focus: Option<FocusHandle>,
     query: Entity<Editor>,
     rows: Vec<Row>,
@@ -212,30 +295,36 @@ impl CommandPalette {
     pub fn new(
         mode: Mode,
         session: Option<Entity<GraphSession>>,
+        workspace: WeakEntity<Workspace>,
+        queries: Vec<(EntityId, String, String)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let previous_focus = window.focused(cx);
         let mut rows = Vec::new();
         let mut candidates = Vec::new();
-        match mode {
-            Mode::Commands | Mode::Keys => add_action_rows(
-                mode,
-                previous_focus.as_ref(),
-                window,
-                cx,
-                &mut rows,
-                &mut candidates,
-            ),
-            Mode::GoTo | Mode::Branches => {}
-        }
-        if let Some(session) = &session {
-            match mode {
-                Mode::Commands | Mode::GoTo => {
-                    add_type_rows(session, window, cx, &mut rows, &mut candidates)
-                }
-                Mode::Branches => add_branch_rows(session, cx, &mut rows, &mut candidates),
-                Mode::Keys => {}
+        add_action_rows(
+            mode,
+            previous_focus.as_ref(),
+            window,
+            cx,
+            &mut rows,
+            &mut candidates,
+        );
+        if let (Some(session), Mode::Picker(_)) = (&session, mode) {
+            add_type_rows(session, window, cx, &mut rows, &mut candidates);
+            add_branch_rows(session, cx, &mut rows, &mut candidates);
+            for (id, title, first_line) in queries {
+                candidates.push(Candidate {
+                    label: if first_line.is_empty() {
+                        title.clone()
+                    } else {
+                        format!("{title} · {first_line}")
+                    },
+                    key: format!("query-tab:{title}"),
+                    group: Group::Query,
+                });
+                rows.push(Row::Tab { id, first_line });
             }
         }
 
@@ -247,7 +336,7 @@ impl CommandPalette {
         let subscription = cx.subscribe(&query, |this, _, event: &EditorEvent, cx| {
             if let EditorEvent::BufferEdited = event {
                 this.update_matches(cx);
-                if this.mode == Mode::GoTo {
+                if this.mode.scope().is_some_and(Scope::searches_nodes) {
                     this.schedule_node_search(cx);
                 }
             }
@@ -256,6 +345,7 @@ impl CommandPalette {
         let mut palette = Self {
             mode,
             session,
+            workspace,
             previous_focus,
             query,
             rows,
@@ -343,9 +433,51 @@ impl CommandPalette {
         self.update_matches(cx);
     }
 
+    /// Shows another scope, keeping the text.
+    fn set_scope(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == Mode::Keys || self.mode == Mode::Picker(scope) {
+            return;
+        }
+        self.mode = Mode::Picker(scope);
+        let placeholder = self.mode.placeholder();
+        self.query.update(cx, |query, cx| {
+            query.set_placeholder_text(placeholder, window, cx)
+        });
+        if scope.searches_nodes() && self.rows.len() == self.fixed {
+            self.schedule_node_search(cx);
+        }
+        self.update_matches(cx);
+    }
+
+    fn show_scope(&mut self, action: &ShowScope, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(scope) = Scope::TABS.get(action.index) {
+            self.set_scope(*scope, window, cx);
+        }
+    }
+
+    /// Tab: the text goes to the agent as a question (spec 011's Ask).
+    fn ask_agent(&mut self, _: &AskAgent, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.query.read(cx).text(cx).trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        match &self.previous_focus {
+            Some(focus) => window.focus(focus, cx),
+            None => window.blur(cx),
+        }
+        cx.emit(DismissEvent);
+        window.dispatch_action(Box::new(Ask { text }), cx);
+    }
+
     fn update_matches(&mut self, cx: &mut Context<Self>) {
         let query = self.query.read(cx).text(cx);
-        self.matches = rank(&self.candidates, &query, &recent::keys(cx));
+        let scope = self.mode.scope();
+        self.matches = rank(&self.candidates, &query, &recent::keys(cx))
+            .into_iter()
+            .filter(|ranked| {
+                scope.is_none_or(|scope| scope.includes(self.candidates[ranked.index].group))
+            })
+            .collect();
         // The branch picker starts on the branch the window is on.
         self.selected = self
             .matches
@@ -417,7 +549,14 @@ impl CommandPalette {
             Row::Branch { name, .. } => Some(name.clone()),
             _ => None,
         };
-        recent::record(&self.candidates[ranked.index].key, cx);
+        let tab = match row {
+            Row::Tab { id, .. } => Some(*id),
+            _ => None,
+        };
+        // A tab is not a destination to remember across launches.
+        if tab.is_none() {
+            recent::record(&self.candidates[ranked.index].key, cx);
+        }
         match &self.previous_focus {
             Some(focus) => window.focus(focus, cx),
             None => window.blur(cx),
@@ -428,6 +567,13 @@ impl CommandPalette {
         }
         if let (Some(branch), Some(session)) = (branch, &self.session) {
             session.update(cx, |session, cx| session.set_branch(branch, cx));
+        }
+        if let Some(id) = tab {
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace.activate_item_by_id(id, window, cx)
+                })
+                .ok();
         }
     }
 
@@ -466,6 +612,7 @@ impl CommandPalette {
                     } else {
                         String::new()
                     }),
+                    Row::Tab { .. } => muted("open tab".into()),
                 };
                 let start: Option<gpui::Div> = match row {
                     Row::Type { kind, .. } => {
@@ -481,6 +628,13 @@ impl CommandPalette {
                             })
                             .size(IconSize::Small)
                             .color(Color::Muted),
+                        ),
+                    ),
+                    Row::Tab { .. } => Some(
+                        div().child(
+                            Icon::new(IconName::Code)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
                         ),
                     ),
                     Row::Action { .. } => None,
@@ -526,6 +680,10 @@ impl CommandPalette {
             Row::Branch { name, .. } => {
                 Some(format!("Read and edit on {name} in this window.").into())
             }
+            Row::Tab { first_line, .. } if !first_line.is_empty() => {
+                Some(format!("Go to this tab: {first_line}").into())
+            }
+            Row::Tab { .. } => Some("Go to this tab.".into()),
         }
     }
 }
@@ -665,7 +823,7 @@ impl Render for CommandPalette {
                 .items_center()
                 .justify_center()
                 .child(
-                    Label::new(self.mode.empty())
+                    Label::new(self.mode.empty(!self.query.read(cx).is_empty(cx)))
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                 )
@@ -682,6 +840,30 @@ impl Render for CommandPalette {
             .into_any_element()
         };
         let description = self.selected_description();
+        let typed = !self.query.read(cx).is_empty(cx);
+        let focus = self.query.focus_handle(cx);
+        // The scope tabs, as a segmented control; each carries its ⌘ number in the tooltip.
+        let tabs = self.mode.scope().map(|current| {
+            let mut tabs = studio_ui::ds::segmented(cx);
+            for (index, scope) in Scope::TABS.into_iter().enumerate() {
+                let focus = focus.clone();
+                tabs = tabs.child(
+                    studio_ui::ds::segment(
+                        ("palette-scope", index),
+                        scope.title(),
+                        scope == current,
+                        cx,
+                    )
+                    .tooltip(move |_, cx| {
+                        ui::Tooltip::for_action_in(scope.title(), &ShowScope { index }, &focus, cx)
+                    })
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.set_scope(scope, window, cx)),
+                    ),
+                );
+            }
+            h_flex().px_3().pb_2().child(tabs)
+        });
         v_flex()
             .key_context("CommandPalette Picker")
             .on_action(cx.listener(Self::select_next))
@@ -690,6 +872,8 @@ impl Render for CommandPalette {
             .on_action(cx.listener(Self::select_last))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::show_scope))
+            .on_action(cx.listener(Self::ask_agent))
             .w(px(580.))
             .rounded_lg()
             .bg(surface)
@@ -709,6 +893,7 @@ impl Render for CommandPalette {
                     )
                     .child(div().flex_1().child(self.query.clone())),
             )
+            .children(tabs)
             .child(div().h_px().w_full().bg(border_variant))
             .child(list)
             .child(
@@ -728,7 +913,10 @@ impl Render for CommandPalette {
                         Label::new(format!("{count} {}", self.mode.noun(count)))
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
-                    ),
+                    )
+                    .when(typed && self.mode != Mode::Keys, |footer| {
+                        footer.child(studio_ui::ds::key_hint(&AskAgent, "Ask", &focus, cx))
+                    }),
             )
     }
 }

@@ -9,7 +9,8 @@
 //! the previous one settles. `type:<text>` types text into the focused editor (`\n` is a new
 //! line); it is `editor::HandleInput` with the text. `click:<x>,<y>` clicks at a point in
 //! window pixels (half the PNG's, which is drawn at 2x), with `,cmd` or `,shift` held when
-//! added; `drag:<x1>,<y1>,<x2>,<y2>` presses at
+//! added; `key:<keystroke>` presses keys as the keymap sees them (`key:tab`, `key:cmd-4`);
+//! `drag:<x1>,<y1>,<x2>,<y2>` presses at
 //! the first point, moves to the second in steps, and releases. `SNAPSHOT_WAIT_MS` (default 1500) is how
 //! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
 //! 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`.
@@ -163,6 +164,18 @@ fn main() {
     settle(&mut cx, wait);
 
     for spec in actions {
+        if let Some(keys) = spec.strip_prefix("key:") {
+            for key in keys.split(' ') {
+                let keystroke = gpui::Keystroke::parse(key).expect("a keystroke");
+                cx.update_window(handle, |_, window, cx| {
+                    window.dispatch_keystroke(keystroke, cx);
+                })
+                .expect("press a key");
+                cx.run_until_parked();
+            }
+            settle(&mut cx, wait);
+            continue;
+        }
         if let Some(points) = spec.strip_prefix("drag:") {
             let n: Vec<f32> = points
                 .split(',')
