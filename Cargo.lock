@@ -10792,6 +10792,7 @@ dependencies = [
  "menu",
  "serde_json",
  "studio_actions",
+ "studio_settings",
  "studio_ui",
  "studio_workspace",
  "ui",

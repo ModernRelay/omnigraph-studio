@@ -3,8 +3,8 @@
 Status: in progress · 2026-10-12. `crates/type_table` ships the Types sidebar, node and edge
 tables (keyset pages pinned to one commit, filtered counts, filters, a cell cursor, value-bound
 cell edits with all three outcomes, peek, insert and typed-key delete), sorting by a column,
-Blob cells and previews, relative dates, relationship columns, and preview tabs (spec 002).
-Not yet: saved views, bulk edits (see Deferred).
+Blob cells and previews, relative dates, relationship columns, saved views, and preview tabs
+(spec 002). Not yet: bulk edits (see Deferred).
 
 ## Problem
 
@@ -90,6 +90,11 @@ stay put), IX (paged, virtualized).
   and a bound endpoint. Measure "has none" on a large type before shipping it (Tower could not,
   on an older engine).
 - A view is a name for a filter, sort and column state; saved per graph in Studio's settings.
+  Built for filters and sort (columns are fixed today): `graphs."<server>/<graph>".views` in
+  `settings.json`, each with its type, filters (`FilterOp::key` names) and sort. The toolbar's
+  Views menu lists the type's views with the shown one checked, saves the table's state under
+  a name (the same name replaces), and deletes the shown one; the button reads the view's
+  name while the table matches it. Filters or a sort the schema no longer has are left out.
 
 ### Editing
 
@@ -140,7 +145,8 @@ opens the branch's recent commits.
   - R2 unpublished commits: staged edits as a reviewable proposal only when the server
     advertises `cluster_publishCommit`.
 - Group-by (Tower 084) until filters and editing ship.
-- Saved views and bulk edits are designed above but not built yet. The preview tab is built (spec 002).
+- Bulk edits are designed above but not built yet. Views do not hold column state: columns
+  are fixed. The preview tab is built (spec 002).
 - Saving a Blob value to a file: the peek previews the first bytes only.
 - Per-row history beyond the commits that the change feed can cheaply return.
 
@@ -168,6 +174,7 @@ opens the branch's recent commits.
 | 2026-10-12 | Blob cells and previews | `HEAD`/`GET /graphs/notes/blob` on the 0.13 dev server (`notes.attachment`: a PNG, a query text, 1 KiB of bytes, an empty value, nulls); `graph_client` blob tests; `type_table::blob` tests; offscreen snapshots of the Note table and three peeks | A managed cell answers 200 with `content-length` and an ETag (`0` for empty); a null cell and a missing row both answer 404 `not_found`, so a 404 on a row the table read is null; `Range` answers 206. Cells read "Blob · 690 B · Preview", "Blob · 0 B" and "—", for drawn rows only, at the page's commit; the peek drew the PNG, the query text and a hex dump |
 | 2026-10-12 | Null order and sorted keyset pages on 0.13 | `order { $n.title asc, $n.@id asc }` and `desc` on the dev server; `is not null`; the keyset clause with `or`; `gq_language` `sorted_pages_read_values_then_nulls_and_compile` (text, Date, I32, an edge property); `type_table` paging test; offscreen snapshots of Person by title both ways and Company by city with 25-row pages | Nulls come first ascending and last descending, so the `is null` split is needed; Company by city ran Berlin to Toronto, then the company without a city, across the switch from values to nulls ("25 of 25") |
 | 2026-10-12 | Relationship columns | `gq_language` `page_relationship_reads_compile_for_every_group`; the grouped count and sample on the dev server (`person-000002` with no `knows` has no row); an offscreen snapshot of Person with its five relationship columns | Counts per id, tags in the UI font with "+N" kept in view, "—" for none |
+| 2026-10-12 | Saved views | `studio_settings` `views_are_saved_per_graph_and_type_and_replaced_by_name`; `gq_language` `filter_operators_round_trip_through_their_keys`; offscreen snapshots with `click:` and `type:` steps: a seeded "Founders" applied from the Views menu, then sorted by email and saved as "Founders by email" | "title is Founder", name ascending, "25 of 200", and the button read "Founders"; `settings.json` held both views |
 | pending | Merge-mode NDJSON leaves unspecified properties untouched | run against a 0.13 server | Bulk edit not built yet |
 
 ## Corrections

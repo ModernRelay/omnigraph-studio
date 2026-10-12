@@ -119,8 +119,9 @@ impl Default for StudioOptions {
     }
 }
 
-/// One graph's own values for the settings marked `x-per-graph`, over `studio` (spec 002).
-/// Each is unset unless the person chose it for this graph.
+/// One graph's own values for the settings marked `x-per-graph`, over `studio` (spec 002),
+/// and its saved table views (spec 004). Each value is unset unless the person chose it for
+/// this graph.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct GraphOverrides {
@@ -130,6 +131,37 @@ pub struct GraphOverrides {
     pub tree_page_size: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canvas_max_nodes: Option<u32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub views: Vec<SavedView>,
+}
+
+/// A named filter and order for one type's table (spec 004).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct SavedView {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub filters: Vec<SavedFilter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort: Option<SavedSort>,
+}
+
+/// A filter as the table holds it: a property or relationship key, an operator's key
+/// (`gq_language::FilterOp::key`) and its value.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct SavedFilter {
+    pub property: String,
+    pub op: String,
+    pub value: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct SavedSort {
+    pub property: String,
+    pub descending: bool,
 }
 
 impl GraphOverrides {
@@ -264,6 +296,43 @@ pub fn settings_path() -> PathBuf {
 impl StudioSettings {
     pub fn get(cx: &App) -> &Self {
         cx.global::<Self>()
+    }
+
+    /// The views saved for one type of a graph (key from [`graph_key`]).
+    pub fn views_for(&self, graph: &str, type_name: &str) -> Vec<SavedView> {
+        self.graphs
+            .get(graph)
+            .map(|overrides| {
+                overrides
+                    .views
+                    .iter()
+                    .filter(|view| view.type_name == type_name)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Saves `view` for a graph, replacing one of the same type and name.
+    pub fn save_view(&mut self, graph: &str, view: SavedView) {
+        let views = &mut self.graphs.entry(graph.to_owned()).or_default().views;
+        match views
+            .iter_mut()
+            .find(|v| v.type_name == view.type_name && v.name == view.name)
+        {
+            Some(existing) => *existing = view,
+            None => views.push(view),
+        }
+    }
+
+    /// Removes a graph's view of a type by name.
+    pub fn delete_view(&mut self, graph: &str, type_name: &str, name: &str) {
+        if let Some(overrides) = self.graphs.get_mut(graph) {
+            overrides
+                .views
+                .retain(|v| !(v.type_name == type_name && v.name == name));
+        }
+        self.graphs.retain(|_, overrides| !overrides.is_empty());
     }
 
     /// The limits in effect for `graph` on the server named `server`.
@@ -456,6 +525,35 @@ mod tests {
         assert_eq!(dev.canvas_max_nodes, 3000, "else the shared value");
         let other = settings.for_graph("prod", "knowledge");
         assert_eq!(other.tree_page_size, 50, "a key names one server's graph");
+    }
+
+    #[test]
+    fn views_are_saved_per_graph_and_type_and_replaced_by_name() {
+        let mut settings = StudioSettings::default();
+        let view = |name: &str, op: &str| SavedView {
+            name: name.into(),
+            type_name: "Person".into(),
+            filters: vec![SavedFilter {
+                property: "title".into(),
+                op: op.into(),
+                value: "Founder".into(),
+            }],
+            sort: Some(SavedSort {
+                property: "name".into(),
+                descending: false,
+            }),
+        };
+        settings.save_view("dev/knowledge", view("Founders", "eq"));
+        settings.save_view("dev/knowledge", view("Founders", "ne"));
+        let saved = settings.views_for("dev/knowledge", "Person");
+        assert_eq!(saved.len(), 1, "same name replaces");
+        assert_eq!(saved[0].filters[0].op, "ne");
+        assert!(settings.views_for("dev/knowledge", "Company").is_empty());
+        assert!(settings.views_for("prod/knowledge", "Person").is_empty());
+        let text = serde_json::to_string(&settings).unwrap();
+        assert_eq!(StudioSettings::parse(&text).unwrap(), settings);
+        settings.delete_view("dev/knowledge", "Person", "Founders");
+        assert!(settings.graphs.is_empty(), "an empty entry is dropped");
     }
 
     #[test]

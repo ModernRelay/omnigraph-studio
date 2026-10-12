@@ -34,11 +34,11 @@ use studio_workspace::{
 };
 use ui::prelude::*;
 use ui::{
-    ColumnWidthConfig, ContextMenu, Indicator, PopoverMenu, ResizableColumnsState, Table,
-    TableInteractionState, TableResizeBehavior, TintColor, Tooltip,
+    ColumnWidthConfig, ContextMenu, ContextMenuEntry, Indicator, PopoverMenu,
+    ResizableColumnsState, Table, TableInteractionState, TableResizeBehavior, TintColor, Tooltip,
 };
 
-use crate::dialogs::{DeleteRowModal, InsertRowModal};
+use crate::dialogs::{DeleteRowModal, InsertRowModal, SaveViewModal};
 use crate::model::{
     ColumnRole, ColumnSpec, Notice, Paging, Row, SaveResult, TableKind, Tone, changed_elsewhere,
     copy_text, count_of, display_value, edge_columns, edge_rows, edit_text, filter_label,
@@ -496,6 +496,171 @@ impl TypeTable {
             }),
         };
         self.reload(true, cx);
+    }
+
+    /// The table's filters and order as a view, without a name.
+    fn current_view(&self) -> studio_settings::SavedView {
+        studio_settings::SavedView {
+            name: String::new(),
+            type_name: self.type_name.clone(),
+            filters: self
+                .filters
+                .iter()
+                .map(|filter| studio_settings::SavedFilter {
+                    property: filter.property.clone(),
+                    op: filter.op.key().to_owned(),
+                    value: filter.value.clone(),
+                })
+                .collect(),
+            sort: self.sort.as_ref().map(|sort| studio_settings::SavedSort {
+                property: sort.property.clone(),
+                descending: sort.descending,
+            }),
+        }
+    }
+
+    /// This type's saved views in this graph.
+    fn saved_views(&self, cx: &App) -> Vec<studio_settings::SavedView> {
+        let graph = self.session.read(cx).settings_key(cx);
+        cx.try_global::<studio_settings::StudioSettings>()
+            .map(|settings| settings.views_for(&graph, &self.type_name))
+            .unwrap_or_default()
+    }
+
+    /// The saved view the table shows now, if any.
+    fn active_view(&self, cx: &App) -> Option<String> {
+        let current = self.current_view();
+        self.saved_views(cx)
+            .into_iter()
+            .find(|view| view.filters == current.filters && view.sort == current.sort)
+            .map(|view| view.name)
+    }
+
+    /// Shows a saved view: its filters and order, read again at the same commit. Filters on
+    /// properties or relationships the schema no longer has are left out.
+    fn apply_view(&mut self, view: &studio_settings::SavedView, cx: &mut Context<Self>) {
+        let known: HashSet<String> = self
+            .filter_choices()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        self.filters = view
+            .filters
+            .iter()
+            .filter(|filter| known.contains(&filter.property))
+            .filter_map(|filter| {
+                Some(Filter {
+                    property: filter.property.clone(),
+                    op: FilterOp::from_key(&filter.op)?,
+                    value: filter.value.clone(),
+                })
+            })
+            .collect();
+        self.sort = view
+            .sort
+            .as_ref()
+            .map(|sort| Sort {
+                property: sort.property.clone(),
+                descending: sort.descending,
+            })
+            .filter(|sort| {
+                self.columns
+                    .iter()
+                    .filter_map(ColumnSpec::property)
+                    .any(|p| p.name == sort.property && Sort::allowed(p))
+            });
+        self.filter_draft = None;
+        self.reload(true, cx);
+    }
+
+    fn open_save_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let graph = self.session.read(cx).settings_key(cx);
+        let view = self.current_view();
+        let taken = self
+            .saved_views(cx)
+            .into_iter()
+            .map(|view| view.name)
+            .collect();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, |window, cx| {
+                SaveViewModal::new(graph, view, taken, window, cx)
+            });
+        });
+    }
+
+    /// The toolbar's Views menu: this type's saved views, then save and delete.
+    fn render_views_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let views = self.saved_views(cx);
+        let active = self.active_view(cx);
+        let can_save = !self.filters.is_empty() || self.sort.is_some();
+        let table = cx.entity().downgrade();
+        let graph = self.session.read(cx).settings_key(cx);
+        let type_name = self.type_name.clone();
+        PopoverMenu::new("views-menu")
+            .anchor(gpui::Anchor::TopRight)
+            .trigger(
+                Button::new("views", active.clone().unwrap_or_else(|| "Views".into()))
+                    .style(ButtonStyle::Subtle)
+                    .label_size(LabelSize::Small)
+                    .start_icon(Icon::new(IconName::Star).size(IconSize::Small))
+                    .tooltip(Tooltip::text("Saved filters and order for this type")),
+            )
+            .menu(move |window, cx| {
+                let views = views.clone();
+                let active = active.clone();
+                let table = table.clone();
+                let graph = graph.clone();
+                let type_name = type_name.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    if views.is_empty() {
+                        menu = menu.header("No saved views");
+                    } else {
+                        menu = menu.header("Views");
+                    }
+                    for view in views {
+                        let checked = active.as_deref() == Some(view.name.as_str());
+                        let table = table.clone();
+                        let shown = view.clone();
+                        menu = menu.toggleable_entry(
+                            view.name.clone(),
+                            checked,
+                            IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                table
+                                    .update(cx, |table, cx| table.apply_view(&shown, cx))
+                                    .ok();
+                            },
+                        );
+                    }
+                    menu = menu.separator();
+                    let save_table = table.clone();
+                    menu = menu.item(
+                        ContextMenuEntry::new("Save View…")
+                            .disabled(!can_save)
+                            .handler(move |window, cx| {
+                                save_table
+                                    .update(cx, |table, cx| table.open_save_view(window, cx))
+                                    .ok();
+                            }),
+                    );
+                    if let Some(name) = active.clone() {
+                        let graph = graph.clone();
+                        let type_name = type_name.clone();
+                        menu = menu.entry(format!("Delete “{name}”"), None, move |_, cx| {
+                            let (graph, type_name, name) =
+                                (graph.clone(), type_name.clone(), name.clone());
+                            studio_settings::update(cx, move |settings| {
+                                settings.delete_view(&graph, &type_name, &name)
+                            });
+                        });
+                    }
+                    menu
+                }))
+            })
     }
 
     /// Restores a remembered order, if the property can still order the table.
@@ -1865,6 +2030,7 @@ impl TypeTable {
                 )
             })
             .child(div().flex_1())
+            .child(self.render_views_menu(cx))
             .child(
                 Button::new("add-filter", "Filter")
                     .style(ButtonStyle::Subtle)

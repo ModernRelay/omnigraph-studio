@@ -574,3 +574,133 @@ impl Render for DeleteRowModal {
             )
     }
 }
+
+/// Names the table's filters and order as a view of its type, saved per graph in the
+/// settings (spec 004). A name already used for this type is replaced.
+pub struct SaveViewModal {
+    graph: String,
+    view: studio_settings::SavedView,
+    taken: Vec<String>,
+    name: Entity<Editor>,
+    _subscription: Subscription,
+}
+
+impl EventEmitter<DismissEvent> for SaveViewModal {}
+
+impl Focusable for SaveViewModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.name.focus_handle(cx)
+    }
+}
+
+impl SaveViewModal {
+    /// `view` is the table's state without a name; `taken` the names of this type's views.
+    pub fn new(
+        graph: String,
+        view: studio_settings::SavedView,
+        taken: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let name = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Name, for example Founders", window, cx);
+            editor
+        });
+        let subscription = cx.subscribe(&name, |_, _, event: &EditorEvent, cx| {
+            if let EditorEvent::BufferEdited = event {
+                cx.notify();
+            }
+        });
+        Self {
+            graph,
+            view,
+            taken,
+            name,
+            _subscription: subscription,
+        }
+    }
+
+    fn entered(&self, cx: &App) -> String {
+        self.name.read(cx).text(cx).trim().to_owned()
+    }
+
+    fn submit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.entered(cx);
+        if name.is_empty() {
+            return;
+        }
+        let graph = self.graph.clone();
+        let view = studio_settings::SavedView {
+            name,
+            ..self.view.clone()
+        };
+        studio_settings::update(cx, move |settings| settings.save_view(&graph, view));
+        cx.emit(DismissEvent);
+    }
+}
+
+impl Render for SaveViewModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let name = self.entered(cx);
+        let replaces = self.taken.contains(&name);
+        let summary = {
+            let filters = self.view.filters.len();
+            let filters = match filters {
+                0 => "no filters".to_owned(),
+                1 => "1 filter".to_owned(),
+                n => format!("{n} filters"),
+            };
+            match &self.view.sort {
+                Some(sort) => format!(
+                    "{filters}, ordered by {} {}",
+                    sort.property,
+                    if sort.descending {
+                        "descending"
+                    } else {
+                        "ascending"
+                    }
+                ),
+                None => filters,
+            }
+        };
+        frame(cx)
+            .key_context("SaveViewModal")
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.submit(window, cx)))
+            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
+            .child(
+                Headline::new(format!("Save a view of {}", self.view.type_name))
+                    .size(HeadlineSize::Small),
+            )
+            .child(
+                Label::new(format!(
+                    "The table's {summary}, kept for this graph in your settings."
+                ))
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+            .child(field_box(&self.name, false, cx))
+            .when(replaces, |d| {
+                d.child(
+                    Label::new(format!("Replaces the view “{name}”."))
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                )
+            })
+            .child(
+                h_flex()
+                    .gap_2()
+                    .justify_end()
+                    .child(
+                        Button::new("cancel-view", "Cancel")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    )
+                    .child(
+                        Button::new("save-view", if replaces { "Replace" } else { "Save" })
+                            .style(ButtonStyle::Filled)
+                            .disabled(name.is_empty())
+                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                    ),
+            )
+    }
+}

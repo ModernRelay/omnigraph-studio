@@ -56,6 +56,52 @@ pub enum FilterOp {
 }
 
 impl FilterOp {
+    /// Every operator, for [`FilterOp::from_key`].
+    const ALL: [FilterOp; 16] = [
+        FilterOp::Eq,
+        FilterOp::Ne,
+        FilterOp::Lt,
+        FilterOp::Le,
+        FilterOp::Gt,
+        FilterOp::Ge,
+        FilterOp::Contains,
+        FilterOp::In,
+        FilterOp::IsEmpty,
+        FilterOp::IsNotEmpty,
+        FilterOp::Today,
+        FilterOp::ThisWeek,
+        FilterOp::Last30Days,
+        FilterOp::HasAny,
+        FilterOp::HasNone,
+        FilterOp::RelatedTo,
+    ];
+
+    /// A stable name, for saved views.
+    pub fn key(self) -> &'static str {
+        match self {
+            FilterOp::Eq => "eq",
+            FilterOp::Ne => "ne",
+            FilterOp::Lt => "lt",
+            FilterOp::Le => "le",
+            FilterOp::Gt => "gt",
+            FilterOp::Ge => "ge",
+            FilterOp::Contains => "contains",
+            FilterOp::In => "in",
+            FilterOp::IsEmpty => "is_empty",
+            FilterOp::IsNotEmpty => "is_not_empty",
+            FilterOp::Today => "today",
+            FilterOp::ThisWeek => "this_week",
+            FilterOp::Last30Days => "last_30_days",
+            FilterOp::HasAny => "has_any",
+            FilterOp::HasNone => "has_none",
+            FilterOp::RelatedTo => "related_to",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<FilterOp> {
+        Self::ALL.into_iter().find(|op| op.key() == key)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             FilterOp::Eq => "is",
@@ -1123,6 +1169,14 @@ mod tests {
             query.text,
             result.diagnostics
         );
+    }
+
+    #[test]
+    fn filter_operators_round_trip_through_their_keys() {
+        for op in FilterOp::ALL {
+            assert_eq!(FilterOp::from_key(op.key()), Some(op));
+        }
+        assert_eq!(FilterOp::from_key("nope"), None);
     }
 
     #[test]
