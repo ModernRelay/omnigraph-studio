@@ -145,6 +145,11 @@ impl Workspace {
             },
         ));
         self.session = Some(session);
+        // With nothing focused, GPUI dispatches actions to the window's root view, which is
+        // outside the element that carries the workspace's action handlers.
+        if window.focused(cx).is_none() {
+            window.focus(&self.focus_handle, cx);
+        }
         cx.emit(WorkspaceEvent::SessionChanged);
         cx.notify();
     }
@@ -170,6 +175,8 @@ impl Workspace {
             return;
         }
         let kind = match latest.outcome {
+            // No publish, no toast (constitution VII); the surface that wrote explains it.
+            OutcomeKind::Committed { commit: None } => return,
             OutcomeKind::Committed { .. } => ToastKind::Success,
             _ => ToastKind::Error,
         };
@@ -758,6 +765,13 @@ impl Workspace {
 
 fn toast_text(entry: &graph_store::OutcomeEntry) -> String {
     match &entry.outcome {
+        // A mutation that matched nothing answers without a commit: nothing was published.
+        OutcomeKind::Committed { commit: None } => {
+            format!(
+                "{} · matched nothing; nothing was written",
+                entry.description
+            )
+        }
         OutcomeKind::Committed { .. } => {
             format!("{} · committed to {}", entry.description, entry.branch)
         }
