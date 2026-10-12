@@ -190,7 +190,8 @@ impl FoldedChange {
     }
 }
 
-fn endpoints_of(value: &Value) -> Option<(String, String)> {
+/// `(from, to)` from a change image's endpoints.
+pub(crate) fn endpoints_of(value: &Value) -> Option<(String, String)> {
     let text = |key: &str| match value.get(key)? {
         Value::String(s) => Some(s.clone()),
         other => Some(other.to_string()),

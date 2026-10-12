@@ -52,6 +52,11 @@ place), X (designed on 0.13; the better routes are deferred).
   searchable row; edges show endpoint changes.
 - Act in place: Revert (restore the before image), Edit, Mark reviewed (card turns hollow but
   stays). Keys: J/K between cards, ⌘Y accept and next, ⌥⌘Z revert and next.
+- Revert of a relationship: an added one is deleted by `@id`; a removed one is inserted again
+  between its before endpoints with its before values (an unkeyed one gets a new id: a `.gq`
+  insert cannot supply one). A changed relationship is not reverted here: edges cannot be
+  updated, and the delete and insert it needs cannot share one mutation, so it would publish
+  twice. Its card says so and points to the query editor.
 - Every fix is a write on the branch, bound to the reviewed head with
   `/mutate/if-graph-commit`; a 412 says the branch moved and offers Refresh.
 - Data: change feed from the fork, folded per entity (first before, last after), capped at
@@ -94,6 +99,8 @@ place), X (designed on 0.13; the better routes are deferred).
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-10-11 | Merge outcomes and conflict kinds in 0.13.0 | parsed `openapi.json` at `v0.13.0` | As listed |
+| 2026-10-12 | Edge mutations Studio builds compile on 0.13 | `gq_language` `writes_compile`, `graph_store` `fixes` tests type-check `insert_edge`/`delete_edge` against the 0.13 compiler; `docs/user/mutations/index.md` at `v0.13.0` (`from`/`to` assignments; no edge update; inserts and deletes cannot mix) | Pass |
+| 2026-10-12 | Relationship reverts land on the branch | dev server: branch `review-edges` adds `WorksAt person-000000 → company-00003` and deletes `Knows person-000000 → person-000005`; review restored from a workspace file; ⌥⌘Z on both cards; queries on the branch | Two commits, each bound to the head before it; the `Knows` edge is back, the `WorksAt` edge is gone |
 | 2026-10-11 | Change feed and commit list parameters | parsed `openapi.json` at `v0.13.0` | `/changes`: branch, cursor, start, page_token, limit, kind, type, op, set; `/commits`: branch |
 | 2026-10-12 | Folding 20,000 changes stays under 1 s off the main thread | `graph_store` `fold_instrument` (ignored instrument), debug build, Apple M5 Pro, 48 GB: 20,000 changes into 15,000 entities | 175 ms |
 | 2026-10-12 | Change-feed paging | live `omnigraph-server` 0.13.0: a terminal page carries `cursor` and `caught_up: false` but no `next_page_token` when more commits wait | `GraphClient::changes` takes no `cursor`, so review continues with `start=after:<last folded commit>` and stops at the reviewed head; a 20,500-change branch shows "Partial" at 20,000 |

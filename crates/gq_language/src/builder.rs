@@ -604,6 +604,70 @@ pub fn delete_node(
     })
 }
 
+/// Inserts one edge between two existing nodes with the given property values. An unkeyed edge
+/// gets a new id: a `.gq` insert cannot supply one.
+pub fn insert_edge(
+    schema: &SchemaModel,
+    edge_name: &str,
+    from: &str,
+    to: &str,
+    values: &[(String, Value)],
+) -> Result<BuiltQuery, BuildError> {
+    let edge = edge(schema, edge_name)?;
+    let mut params = Params::new();
+    let from = params.add("from", "String", Value::String(from.to_owned()));
+    let to = params.add("to", "String", Value::String(to.to_owned()));
+    let mut assignments = vec![format!("from: {from}"), format!("to: {to}")];
+    for (i, (name, value)) in values.iter().enumerate() {
+        let property = edge
+            .properties
+            .iter()
+            .find(|p| &p.name == name)
+            .ok_or_else(|| BuildError::UnknownProperty {
+                type_name: edge.name.clone(),
+                property: name.clone(),
+            })?;
+        let param = params.add(
+            &format!("p{i}"),
+            &property.param_type(property.nullable),
+            value.clone(),
+        );
+        assignments.push(format!("{}: {param}", property.name));
+    }
+    let text = format!(
+        "query studio_insert_edge({sig}) {{\n  insert {ty} {{ {assignments} }}\n}}\n",
+        sig = params.signature(),
+        ty = edge.name,
+        assignments = assignments.join(", "),
+    );
+    Ok(BuiltQuery {
+        name: "studio_insert_edge".into(),
+        text,
+        params: params.values,
+    })
+}
+
+/// Deletes one edge by its id.
+pub fn delete_edge(
+    schema: &SchemaModel,
+    edge_name: &str,
+    id: &str,
+) -> Result<BuiltQuery, BuildError> {
+    let edge = edge(schema, edge_name)?;
+    let mut params = Params::new();
+    let id = params.add("id", "String", Value::String(id.to_owned()));
+    let text = format!(
+        "query studio_delete_edge({sig}) {{\n  delete {ty} where @id = {id}\n}}\n",
+        sig = params.signature(),
+        ty = edge.name,
+    );
+    Ok(BuiltQuery {
+        name: "studio_delete_edge".into(),
+        text,
+        params: params.values,
+    })
+}
+
 /// The text a new query editor starts with (spec 007): a read over the first node type, with
 /// its key and a few properties, ordered by its label. `None` when the schema has no node type.
 pub fn example_read(schema: &SchemaModel) -> Option<String> {
@@ -924,6 +988,27 @@ mod tests {
             .unwrap(),
         );
         assert_compiles(&delete_node(&schema, "Person", "person-new").unwrap());
+        assert_compiles(
+            &insert_edge(
+                &schema,
+                "WorksAt",
+                "person-000000",
+                "company-00002",
+                &[
+                    ("role".into(), json!("Engineer")),
+                    ("since".into(), json!("2020-01-01")),
+                ],
+            )
+            .unwrap(),
+        );
+        assert_compiles(
+            &insert_edge(&schema, "Knows", "person-000000", "person-000001", &[]).unwrap(),
+        );
+        assert_compiles(&delete_edge(&schema, "Knows", "edge-1").unwrap());
+        assert!(matches!(
+            insert_edge(&schema, "Knows", "a", "b", &[("role".into(), json!("x"))]),
+            Err(BuildError::UnknownProperty { .. })
+        ));
         assert!(matches!(
             update_cell(&schema, "Person", "slug", "x", &json!("a"), &json!("b")),
             Err(BuildError::NotEditable(_))

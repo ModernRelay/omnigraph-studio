@@ -4,11 +4,11 @@
 //! `delete_node`). A revert that needs several statements joins them into one mutation with
 //! [`compose`], so it publishes once. Values stay parameters; only parameter names are renamed.
 
-use gq_language::builder::{delete_node, insert_node, update_cell};
+use gq_language::builder::{delete_edge, delete_node, insert_edge, insert_node, update_cell};
 use gq_language::{BuiltQuery, SchemaModel};
 use serde_json::{Map, Value};
 
-use crate::changes::{FoldedChange, NetChange};
+use crate::changes::{FoldedChange, NetChange, endpoints_of};
 
 /// Why a change cannot be reverted from Studio; shown on the disabled control (constitution VI).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,16 +27,18 @@ impl std::fmt::Display for RevertUnavailable {
 /// - Changed node: set each changed property back, each bound to the value the review saw, so
 ///   a value changed since then is left alone (zero affected rows).
 ///
-/// Relationships, Blob and Vector values, and types missing from the schema cannot be
+/// - Added relationship: delete it.
+/// - Removed relationship: insert it again between its before endpoints with its before
+///   values. An unkeyed relationship comes back under a new id; a `.gq` insert cannot supply one.
+///
+/// A changed relationship, Blob and Vector values, and types missing from the schema cannot be
 /// reverted here.
 pub fn revert_query(
     schema: &SchemaModel,
     change: &FoldedChange,
 ) -> Result<BuiltQuery, RevertUnavailable> {
     if change.is_edge() {
-        return Err(RevertUnavailable(
-            "Relationships cannot be reverted from the review yet. Use the query editor.".into(),
-        ));
+        return revert_edge(schema, change);
     }
     let Some(node) = schema.node(&change.type_name) else {
         return Err(RevertUnavailable(format!(
@@ -104,6 +106,57 @@ pub fn revert_query(
             }
             Ok(compose("studio_revert", parts))
         }
+    }
+}
+
+fn revert_edge(
+    schema: &SchemaModel,
+    change: &FoldedChange,
+) -> Result<BuiltQuery, RevertUnavailable> {
+    let Some(edge) = schema.edge(&change.type_name) else {
+        return Err(RevertUnavailable(format!(
+            "The current schema has no relationship {}.",
+            change.type_name
+        )));
+    };
+    let unavailable = |error: gq_language::BuildError| RevertUnavailable(error.to_string());
+    match change.net() {
+        None => Err(RevertUnavailable("Nothing to revert.".into())),
+        Some(NetChange::Added) => delete_edge(schema, &edge.name, &change.id).map_err(unavailable),
+        Some(NetChange::Removed) => {
+            let before = change
+                .before
+                .as_ref()
+                .expect("a removed entity has a before image");
+            let Some((from, to)) = before.endpoints.as_ref().and_then(endpoints_of) else {
+                return Err(RevertUnavailable(
+                    "The change feed did not say which nodes this relationship joined.".into(),
+                ));
+            };
+            let mut values = Vec::new();
+            for property in &edge.properties {
+                match before.properties.get(&property.name) {
+                    Some(Value::Null) | None => {}
+                    Some(value) if property.projectable() => {
+                        values.push((property.name.clone(), value.clone()))
+                    }
+                    Some(_) => {
+                        return Err(RevertUnavailable(format!(
+                            "{} holds a {} value, which the review cannot restore.",
+                            property.name, property.base_type
+                        )));
+                    }
+                }
+            }
+            insert_edge(schema, &edge.name, &from, &to, &values).map_err(unavailable)
+        }
+        // Relationships cannot be updated: restoring one means a delete and an insert, which a
+        // mutation cannot combine, so the revert would publish twice.
+        Some(NetChange::Changed) => Err(RevertUnavailable(
+            "A changed relationship is restored by deleting it and inserting it again, two \
+             commits. Use the query editor."
+                .into(),
+        )),
     }
 }
 
@@ -225,7 +278,7 @@ mod tests {
     ) -> FoldedChange {
         let image = |v: Value| ChangeImageOutput {
             properties: v.as_object().unwrap().clone(),
-            endpoints: None,
+            endpoints: Some(json!({"from": "person-000001", "to": "company-00002"})),
         };
         FoldedChange {
             kind,
@@ -308,9 +361,61 @@ mod tests {
     }
 
     #[test]
+    fn added_and_removed_relationships_revert_with_delete_and_insert() {
+        let added = change(
+            EntityKind::Edge,
+            "WorksAt",
+            None,
+            Some(json!({"role": "Engineer"})),
+        );
+        let query = revert_query(&schema(), &added).unwrap();
+        assert_compiles(&query);
+        assert!(query.text.contains("delete WorksAt where @id"));
+        assert_eq!(query.params["id"], json!("person-000001"));
+
+        let removed = change(
+            EntityKind::Edge,
+            "WorksAt",
+            Some(json!({"role": "Engineer", "since": null})),
+            None,
+        );
+        let query = revert_query(&schema(), &removed).unwrap();
+        assert_compiles(&query);
+        assert!(query.text.contains("insert WorksAt"));
+        assert_eq!(query.params["from"], json!("person-000001"));
+        assert_eq!(query.params["to"], json!("company-00002"));
+        assert_eq!(query.params.len(), 3, "nulls are left out");
+    }
+
+    #[test]
     fn relationships_and_unknown_types_say_why_not() {
-        let edge = change(EntityKind::Edge, "WorksAt", None, Some(json!({})));
-        assert!(revert_query(&schema(), &edge).is_err());
+        let changed = change(
+            EntityKind::Edge,
+            "WorksAt",
+            Some(json!({"role": "Engineer"})),
+            Some(json!({"role": "Manager"})),
+        );
+        assert!(
+            revert_query(&schema(), &changed)
+                .unwrap_err()
+                .0
+                .contains("two")
+        );
+        let mut removed = change(EntityKind::Edge, "Knows", Some(json!({})), None);
+        removed.before.as_mut().unwrap().endpoints = None;
+        assert!(
+            revert_query(&schema(), &removed)
+                .unwrap_err()
+                .0
+                .contains("nodes")
+        );
+        let unknown = change(EntityKind::Edge, "Likes", None, Some(json!({})));
+        assert!(
+            revert_query(&schema(), &unknown)
+                .unwrap_err()
+                .0
+                .contains("Likes")
+        );
         let gone = change(EntityKind::Node, "Robot", None, Some(json!({})));
         assert!(
             revert_query(&schema(), &gone)
