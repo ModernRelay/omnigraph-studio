@@ -7,13 +7,14 @@
 //! crates attach to it with `cx.observe_new::<Workspace>` and `Workspace::register_action`.
 
 mod item;
+mod persistence;
 
 use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
     Action, AnyView, App, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    MouseButton, Render, SharedString, Subscription, Window, deferred, div,
+    MouseButton, Render, SharedString, Subscription, Task, Window, deferred, div,
 };
 use graph_store::{ConnectionState, GraphSession, OutcomeKind, SessionEvent};
 use studio_actions::workspace::{
@@ -24,6 +25,7 @@ use ui::prelude::*;
 use ui::{ContextMenu, Indicator, PopoverMenu, Tab, TabBar, Tooltip};
 
 pub use item::{Item, ItemEvent, ItemHandle};
+pub use persistence::{SavedItem, SavedWorkspace, register_item_kind, saved_window_bounds};
 
 /// A modal: dismissing it emits [`DismissEvent`].
 pub trait ModalView: Render + Focusable + EventEmitter<DismissEvent> {}
@@ -83,9 +85,17 @@ pub struct Workspace {
     next_toast: usize,
     actions: Vec<ActionRegistration>,
     focus_handle: FocusHandle,
+    /// What was last written for this graph, so unchanged state is not rewritten.
+    saved: Option<SavedWorkspace>,
+    _save: Option<Task<()>>,
+    _save_bounds: Option<Task<()>>,
+    _bounds_subscription: Subscription,
     _session_subscription: Option<Subscription>,
     _item_subscriptions: Vec<(gpui::EntityId, Subscription)>,
 }
+
+/// How long state must be still before it is written.
+const SAVE_DELAY: Duration = Duration::from_millis(500);
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
 
@@ -96,7 +106,14 @@ impl Focusable for Workspace {
 }
 
 impl Workspace {
-    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let bounds_subscription = cx.observe_window_bounds(window, |this, window, cx| {
+            let bounds = window.bounds();
+            this._save_bounds = Some(cx.spawn(async move |_, cx| {
+                cx.background_executor().timer(SAVE_DELAY).await;
+                persistence::save_window_bounds(bounds);
+            }));
+        });
         Self {
             session: None,
             items: Vec::new(),
@@ -112,9 +129,78 @@ impl Workspace {
             next_toast: 0,
             actions: Vec::new(),
             focus_handle: cx.focus_handle(),
+            saved: None,
+            _save: None,
+            _save_bounds: None,
+            _bounds_subscription: bounds_subscription,
             _session_subscription: None,
             _item_subscriptions: Vec::new(),
         }
+    }
+
+    /// The server URL and graph id the open session belongs to.
+    fn graph_key(&self, cx: &App) -> Option<(String, String)> {
+        let session = self.session.as_ref()?.read(cx);
+        let url = session.connection.read(cx).server.url.clone();
+        Some((url, session.graph_id.clone()))
+    }
+
+    fn snapshot(&self, cx: &App) -> SavedWorkspace {
+        let mut items = Vec::new();
+        let mut active = 0;
+        for (index, item) in self.items.iter().enumerate() {
+            if let Some(saved) = item.serialize(cx) {
+                if index == self.active {
+                    active = items.len();
+                }
+                items.push(saved);
+            }
+        }
+        SavedWorkspace {
+            items,
+            active,
+            sidebar_open: self.sidebar_open,
+            inspector_open: self.inspector_open,
+            activity_open: self.activity_open,
+        }
+    }
+
+    /// Writes the workspace's state shortly after it stops changing.
+    fn save_if_changed(&mut self, cx: &mut Context<Self>) {
+        let Some((url, graph)) = self.graph_key(cx) else {
+            return;
+        };
+        let snapshot = self.snapshot(cx);
+        if self.saved.as_ref() == Some(&snapshot) {
+            return;
+        }
+        self.saved = Some(snapshot.clone());
+        self._save = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(SAVE_DELAY).await;
+            persistence::save(&url, &graph, &snapshot);
+        }));
+    }
+
+    /// Reopens the tabs and panels remembered for the open graph.
+    fn restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((url, graph)) = self.graph_key(cx) else {
+            return;
+        };
+        let Some(saved) = persistence::load(&url, &graph) else {
+            return;
+        };
+        self.sidebar_open = saved.sidebar_open;
+        self.inspector_open = saved.inspector_open;
+        self.activity_open = saved.activity_open;
+        for item in &saved.items {
+            if let Some(open) = persistence::opener(cx, &item.kind) {
+                open(&item.data, self, window, cx);
+            }
+        }
+        if !self.items.is_empty() {
+            self.activate_item(saved.active.min(self.items.len() - 1), window, cx);
+        }
+        self.saved = Some(saved);
     }
 
     // ---- session ----
@@ -152,6 +238,10 @@ impl Workspace {
             },
         ));
         self.session = Some(session);
+        if !same_graph && persistence::restore_enabled() {
+            self.saved = None;
+            self.restore(window, cx);
+        }
         cx.emit(WorkspaceEvent::SessionChanged);
         cx.notify();
     }
@@ -611,6 +701,7 @@ impl Workspace {
     fn render_center(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let editor_background = cx.theme().colors().editor_background;
         let border_variant = cx.theme().colors().border_variant;
+        let panel_background = cx.theme().colors().panel_background;
         let tabs = if self.items.is_empty() {
             None
         } else {
@@ -620,6 +711,7 @@ impl Workspace {
             Some(item) => div()
                 .flex_1()
                 .min_h_0()
+                .overflow_hidden()
                 .child(item.to_any())
                 .into_any_element(),
             None => self.render_empty_center(cx).into_any_element(),
@@ -636,6 +728,8 @@ impl Workspace {
                     div()
                         .h(px(200.))
                         .flex_none()
+                        .overflow_hidden()
+                        .bg(panel_background)
                         .border_t_1()
                         .border_color(border_variant)
                         .child(activity)
@@ -831,6 +925,8 @@ fn toast_text(entry: &graph_store::OutcomeEntry) -> String {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Every change to tabs or panels re-renders the workspace, so this sees all of them.
+        self.save_if_changed(cx);
         let colors = cx.theme().colors();
         let mut root = v_flex()
             .key_context("Workspace")

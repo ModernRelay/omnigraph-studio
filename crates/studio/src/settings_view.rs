@@ -4,7 +4,7 @@
 use editor::{Editor, EditorEvent};
 use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString, Subscription, Window};
 use studio_settings::{StudioSettings, ThemeMode};
-use studio_workspace::{Item, ItemEvent};
+use studio_workspace::{Item, ItemEvent, SavedItem};
 use theme::ThemeRegistry;
 use ui::prelude::*;
 use ui::{ContextMenu, PopoverMenu};
@@ -34,6 +34,13 @@ impl Item for SettingsView {
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
         Some("settings".into())
+    }
+
+    fn serialize(&self, _cx: &App) -> Option<SavedItem> {
+        Some(SavedItem {
+            kind: "settings".into(),
+            data: serde_json::Value::Null,
+        })
     }
 }
 

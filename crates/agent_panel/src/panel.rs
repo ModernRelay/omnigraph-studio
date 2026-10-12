@@ -23,7 +23,7 @@ use serde_json::{Map, Value};
 use studio_actions::agent::{Allow, AllowAlways, Reject, Restart, Send, Stop};
 use studio_actions::graph::ReviewBranch;
 use studio_settings::StudioSettings;
-use studio_workspace::{Item, ItemEvent, Workspace};
+use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::KeyBinding;
 use ui::prelude::*;
 
@@ -163,6 +163,14 @@ impl Item for AgentPanel {
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
         Some("agent".into())
+    }
+
+    /// The tab comes back after a restart; the agent starts again only when a message is sent.
+    fn serialize(&self, _cx: &App) -> Option<SavedItem> {
+        Some(SavedItem {
+            kind: "agent".into(),
+            data: Value::Null,
+        })
     }
 }
 
@@ -1106,7 +1114,10 @@ impl AgentPanel {
     fn render_setup(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let border = cx.theme().colors().border;
         v_flex()
+            .id("agent-setup")
+            .overflow_y_scroll()
             .flex_1()
+            .min_h_0()
             .p_6()
             .gap_3()
             .child(Headline::new("Choose an agent").size(HeadlineSize::Small))
@@ -1174,6 +1185,7 @@ impl AgentPanel {
             .track_scroll(&self.scroll)
             .overflow_y_scroll()
             .flex_1()
+            .min_h_0()
             .p_3()
             .gap_2();
         if self.entries.is_empty() {

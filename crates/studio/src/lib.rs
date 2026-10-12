@@ -33,6 +33,9 @@ pub fn init(cx: &mut App) {
     inspectors::init(cx);
     agent_panel::init(cx);
 
+    studio_workspace::register_item_kind(cx, "settings", |_, workspace, window, cx| {
+        workspace.open_item("settings", window, cx, settings_view::SettingsView::new);
+    });
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &NewWindow, cx| {
         cx.open_window(window_options(cx), build_workspace).ok();
@@ -57,7 +60,8 @@ pub fn init(cx: &mut App) {
 }
 
 pub fn window_options(cx: &App) -> WindowOptions {
-    let bounds = gpui::Bounds::centered(None, size(px(1440.), px(900.)), cx);
+    let bounds = studio_workspace::saved_window_bounds(cx)
+        .unwrap_or_else(|| gpui::Bounds::centered(None, size(px(1440.), px(900.)), cx));
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(gpui::TitlebarOptions {

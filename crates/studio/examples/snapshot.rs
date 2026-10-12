@@ -7,18 +7,23 @@
 //!
 //! Each argument after the output path is an action, `name` or `name=<json>`, dispatched after
 //! the previous one settles. `SNAPSHOT_WAIT_MS` (default 1500) is how long to let each step's
-//! network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default 1440x900).
+//! network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default 1440x900). Remembered tabs are
+//! not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{AnyWindowHandle, HeadlessAppContext, px, size};
 
+/// Runs the app for `wait` of real time. The headless dispatcher's clock is simulated, so it is
+/// moved forward as real time passes and timers (debounced saves, toasts) fire as in the app.
 fn settle(cx: &mut HeadlessAppContext, wait: Duration) {
+    let step = Duration::from_millis(25);
     let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
         cx.run_until_parked();
-        std::thread::sleep(Duration::from_millis(25));
+        std::thread::sleep(step);
+        cx.advance_clock(step);
     }
     cx.run_until_parked();
 }
@@ -31,6 +36,12 @@ fn main() {
         let socket = raw.get(1).expect("mcp-proxy needs a socket path");
         agent_panel::proxy(std::path::Path::new(socket)).expect("proxy the MCP socket");
         return;
+    }
+    // Start without remembered tabs so a render depends only on its actions; set the variable
+    // to 0 to check restoring.
+    if std::env::var_os("OMNIGRAPH_STUDIO_NO_RESTORE").is_none() {
+        // SAFETY: no other thread exists yet.
+        unsafe { std::env::set_var("OMNIGRAPH_STUDIO_NO_RESTORE", "1") };
     }
     let mut args = std::env::args().skip(1);
     let out = args.next().unwrap_or_else(|| "snapshot.png".into());

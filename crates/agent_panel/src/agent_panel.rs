@@ -21,6 +21,9 @@ use studio_workspace::Workspace;
 pub const PROXY_COMMAND: &str = "mcp-proxy";
 
 pub fn init(cx: &mut App) {
+    studio_workspace::register_item_kind(cx, "agent", |_, workspace, window, cx| {
+        panel::open(workspace, window, cx);
+    });
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &OpenAgent, window, cx| {
             panel::open(workspace, window, cx);

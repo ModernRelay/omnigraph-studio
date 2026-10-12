@@ -6,6 +6,8 @@ use gpui::{
 };
 use ui::IconName;
 
+use crate::persistence::SavedItem;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemEvent {
     /// The tab's title, icon or dirty state changed.
@@ -35,6 +37,12 @@ pub trait Item: Render + Focusable + EventEmitter<ItemEvent> {
     fn is_stale(&self, _cx: &App) -> bool {
         false
     }
+
+    /// What reopens this tab after a restart; `None` is not remembered. The kind must be
+    /// registered with `register_item_kind`.
+    fn serialize(&self, _cx: &App) -> Option<SavedItem> {
+        None
+    }
 }
 
 pub trait ItemHandle: 'static {
@@ -47,6 +55,7 @@ pub trait ItemHandle: 'static {
     fn is_stale(&self, cx: &App) -> bool;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
     fn boxed_clone(&self) -> Box<dyn ItemHandle>;
+    fn serialize(&self, cx: &App) -> Option<SavedItem>;
 }
 
 impl<T: Item> ItemHandle for Entity<T> {
@@ -84,5 +93,9 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn boxed_clone(&self) -> Box<dyn ItemHandle> {
         Box::new(self.clone())
+    }
+
+    fn serialize(&self, cx: &App) -> Option<SavedItem> {
+        self.read(cx).serialize(cx)
     }
 }
