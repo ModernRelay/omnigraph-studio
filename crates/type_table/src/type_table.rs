@@ -31,7 +31,7 @@ pub fn init(cx: &mut App) {
                 .get("at_commit")
                 .and_then(|commit| commit.as_str())
                 .map(str::to_owned);
-            open_type(workspace, type_name, at_commit, window, cx);
+            open_type(workspace, type_name, at_commit, false, window, cx);
         }
     });
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
@@ -52,6 +52,7 @@ pub fn init(cx: &mut App) {
                 workspace,
                 &action.type_name,
                 action.at_commit.clone(),
+                action.preview,
                 window,
                 cx,
             );
@@ -113,6 +114,7 @@ fn open_type(
     workspace: &mut Workspace,
     type_name: &str,
     at_commit: Option<String>,
+    preview: bool,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Option<Entity<TypeTable>> {
@@ -130,8 +132,9 @@ fn open_type(
     }
     let handle = cx.entity().downgrade();
     let name = type_name.to_owned();
-    workspace.open_item::<TypeTable>(
+    workspace.open_item_with::<TypeTable>(
         table_key(type_name, at_commit.as_deref()),
+        preview,
         window,
         cx,
         move |window, cx| TypeTable::new(handle, session, name, at_commit, window, cx),

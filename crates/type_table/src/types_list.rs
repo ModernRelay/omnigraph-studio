@@ -134,11 +134,13 @@ impl Render for TypesList {
                 list = list.child(studio_ui::ds::section_label("Relationships").pt_3());
             }
             let selected = active.as_deref() == Some(format!("type:{name}").as_str());
+            // A click previews the type in the pane's preview tab; a double click keeps it.
             let action = OpenType {
                 type_name: name.clone(),
                 at_commit: None,
                 filter_id: None,
                 via: None,
+                preview: true,
             };
             let tooltip = match &counts_error {
                 Some(error) => format!("Counts could not be read: {error}"),
@@ -151,8 +153,10 @@ impl Render for TypesList {
                     .muted(is_edge)
                     .selected(selected)
                     .tooltip(tooltip)
-                    .on_click(move |_, window, cx| {
-                        window.dispatch_action(Box::new(action.clone()), cx)
+                    .on_click(move |event, window, cx| {
+                        let mut action = action.clone();
+                        action.preview = event.click_count() < 2;
+                        window.dispatch_action(Box::new(action), cx)
                     }),
             );
         }

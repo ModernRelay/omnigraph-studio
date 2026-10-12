@@ -49,6 +49,18 @@ Steps:
    directory, keyed by server and graph. No SQLite.
 3. One window can hold several graph sessions as tabs; a second window is "New Window" (⌘⇧N).
 
+Built (`studio_workspace::pane`): the document area is a tree of panes (`Member`, splits with
+shares that drag to resize). Each pane has its own tab strip; the top-right pane carries the
+dock toggles and the top-left one makes room for the traffic lights. ⌘\ and ⌘⇧\ split right
+and down with a copy of the active tab (reopened from its saved form), ⌘⌥→/← move between
+panes, a pane that loses its last tab closes. Pinned tabs come first with a pin instead of a
+close button and survive "Close others" and "Close all"; a tab's right-click menu has the
+close variants, Pin and the splits. A preview tab (italic title) is what a single click in the
+Types list opens; the next preview replaces it in place, and a double click, opening it again
+without preview, or work in it keeps it. Tabs that hold unsaved work stay open on the bulk
+closes. The workspace file saves each pane's tabs, active tab and pinned count, the split tree
+and the active pane; a file from before splits restores as one pane.
+
 ### Window chrome
 
 - Transparent title bar with traffic lights; the title area shows
@@ -213,10 +225,14 @@ Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks ente
 | 2026-10-12 | With nothing focused, an action reaches only global handlers | offscreen snapshots: `studio::ToggleSidebar` and `studio::OpenGraph` did nothing until the workspace had focus | A window opens with no focus, so the workspace's handlers and key bindings are unreachable until something is clicked. The snapshot example now focuses the workspace first; the app should focus it when a window opens |
 | 2026-10-12 | Settings rows are generated in declaration order | `studio_settings` field tests (row order, sections, kinds, path writes and resets); `serde_json`'s `preserve_order` is on in the workspace graph; offscreen snapshots of the Appearance section and of searches for "page" and "agent" | Fourteen rows in four sections; `agent.env` hidden; changed rows show Reset and the nav counts them |
 | 2026-10-12 | A graph's own value reaches its views | offscreen snapshots with the new `click:x,y` step: the scope switch, then + on Table page size in the graph scope; `settings.json` after; the Person table after | `graphs."environment/knowledge".type_table_page_size` 125, `studio.type_table_page_size` still 100; the table footer reads "125 of 200" |
+| 2026-10-12 | Panes, pins and previews | `studio_workspace` pane tests (preview replaced in place and kept, pin order, close others, removal, split nesting and collapse, JSON round trip); offscreen snapshots: preview Person then Company, pin a query, split right and down, restart with restore, drag the boundary with the new `drag:` step | Company replaced Person in its place in italics; the query stayed first with a pin; both splits showed a copy of the Project table; the layout, pins and shares came back after the restart |
 | 2026-10-12 | Every tab kind comes back after a restart | offscreen snapshots: one run opened a type table, a query with a draft, history, canvas and storage; a second run with `OMNIGRAPH_STUDIO_NO_RESTORE=0` | All five tabs restored in order, the draft intact; the workspace file is `-rw-------` |
 
 ## Corrections
 
+- 2026-10-12 · ⌘W, the dock toggles (⌘B, ⌘⌥B, ⌘J) and next and previous tab had no key:
+  Zed's bindings for them name Zed's actions, which Studio's keymap loader drops. Studio binds
+  its own in the `Workspace` context.
 - 2026-10-12 · The table page size, relationship page size and canvas node limit were settings
   rows that changed nothing: the views used constants of the same values. They now read the
   settings through `GraphSession::options`.

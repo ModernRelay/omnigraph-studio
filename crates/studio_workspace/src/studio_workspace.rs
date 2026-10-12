@@ -7,6 +7,7 @@
 //! crates attach to it with `cx.observe_new::<Workspace>` and `Workspace::register_action`.
 
 mod item;
+mod pane;
 mod panels;
 mod persistence;
 
@@ -14,23 +15,29 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    Action, AnyView, App, Context, DismissEvent, Div, DragMoveEvent, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, MouseButton, Pixels, Point, Render, SharedString,
-    Stateful, Subscription, Task, WeakEntity, Window, WindowControlArea, deferred, div, point,
+    Action, AnyView, App, ClickEvent, Context, DismissEvent, Div, DragMoveEvent, ElementId, Entity,
+    EntityId, EventEmitter, FocusHandle, Focusable, MouseButton, Pixels, Point, Render,
+    SharedString, Stateful, Subscription, Task, WeakEntity, Window, WindowControlArea, deferred,
+    div, point,
 };
 use graph_store::{ConnectionState, GraphSession, OutcomeKind, SessionEvent};
 use studio_actions::graph::{OpenCommit, OpenHistory};
 use studio_actions::workspace::{
-    ActivateItem, ActivateLastItem, ActivateNextItem, ActivatePreviousItem, CloseActiveItem,
-    GoBack, GoForward, Refresh, ToggleActivity, ToggleInspector, ToggleSidebar,
+    ActivateItem, ActivateLastItem, ActivateNextItem, ActivateNextPane, ActivatePreviousItem,
+    ActivatePreviousPane, CloseActiveItem, CloseAllItems, CloseOtherItems, GoBack, GoForward,
+    KeepPreviewTab, Refresh, SplitDown, SplitRight, ToggleActivity, ToggleInspector, TogglePinTab,
+    ToggleSidebar,
 };
 use studio_settings::StudioSettings;
 use ui::prelude::*;
-use ui::{CommonAnimationExt as _, ContextMenu, Indicator, PopoverMenu, Tooltip};
+use ui::{CommonAnimationExt as _, ContextMenu, Indicator, PopoverMenu, Tooltip, right_click_menu};
 
 pub use item::{Item, ItemEvent, ItemFooter, ItemHandle};
+pub use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};
 pub use panels::{Dock, PanelEntry, PanelPosition};
-pub use persistence::{SavedItem, SavedWorkspace, register_item_kind, saved_window_bounds};
+pub use persistence::{
+    SavedItem, SavedPane, SavedWorkspace, register_item_kind, saved_window_bounds,
+};
 
 /// A modal: dismissing it emits [`DismissEvent`].
 pub trait ModalView: Render + Focusable + EventEmitter<DismissEvent> {}
@@ -74,8 +81,14 @@ type ActionRegistration = Rc<dyn Fn(Div, &mut Window, &mut Context<Workspace>) -
 
 pub struct Workspace {
     session: Option<Entity<GraphSession>>,
-    items: Vec<Box<dyn ItemHandle>>,
-    active: usize,
+    /// The document area: panes of tabs in a tree of splits (spec 002, "Frame").
+    panes: Vec<Pane<Box<dyn ItemHandle>>>,
+    center: Member,
+    active_pane: PaneId,
+    next_pane: PaneId,
+    /// Whether opening an item another pane shows activates it there. Off while restoring and
+    /// splitting, which put copies in the pane being filled.
+    dedupe_across_panes: bool,
     /// Panels: the left dock (types, explore, branches), the right (inspector) and the bottom
     /// (activity), after Zed's docks and Obsidian's side docks.
     left: Dock,
@@ -121,6 +134,12 @@ const INSPECTOR_PANEL: &str = "inspector";
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
 
+impl Tab for Box<dyn ItemHandle> {
+    fn tab_id(&self) -> EntityId {
+        self.item_id()
+    }
+}
+
 impl Focusable for Workspace {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -141,8 +160,11 @@ impl Workspace {
         });
         Self {
             session: None,
-            items: Vec::new(),
-            active: 0,
+            panes: vec![Pane::new(0)],
+            center: Member::Pane(0),
+            active_pane: 0,
+            next_pane: 1,
+            dedupe_across_panes: true,
             left: Dock::new(PanelPosition::Left, true),
             right: Dock::new(PanelPosition::Right, true),
             bottom: Dock::new(PanelPosition::Bottom, false),
@@ -174,19 +196,37 @@ impl Workspace {
     }
 
     fn snapshot(&self, cx: &App) -> SavedWorkspace {
-        let mut items = Vec::new();
-        let mut active = 0;
-        for (index, item) in self.items.iter().enumerate() {
-            if let Some(saved) = item.serialize(cx) {
-                if index == self.active {
-                    active = items.len();
+        let order = self.center.panes();
+        let mut panes = Vec::new();
+        let mut active_pane = 0;
+        for (position, id) in order.iter().enumerate() {
+            let Some(pane) = self.pane(*id) else { continue };
+            let mut saved = SavedPane::default();
+            for (index, item) in pane.items.iter().enumerate() {
+                if let Some(item) = item.serialize(cx) {
+                    if index == pane.active {
+                        saved.active = saved.items.len();
+                    }
+                    if pane.is_pinned(index) {
+                        saved.pinned += 1;
+                    }
+                    saved.items.push(item);
                 }
-                items.push(saved);
             }
+            if *id == self.active_pane {
+                active_pane = position;
+            }
+            panes.push(saved);
         }
+        let layout = self
+            .center
+            .map(&|id| order.iter().position(|p| *p == id).unwrap_or_default());
         SavedWorkspace {
-            items,
-            active,
+            items: Vec::new(),
+            active: 0,
+            panes,
+            layout: Some(layout),
+            active_pane,
             sidebar_open: self.left.open,
             inspector_open: self.right.open,
             activity_open: self.bottom.open,
@@ -246,14 +286,56 @@ impl Workspace {
                 dock.open = open;
             }
         }
-        for item in &saved.items {
-            if let Some(open) = persistence::opener(cx, &item.kind) {
-                open(&item.data, self, window, cx);
+        // A file from before splits has its tabs at the top level: one pane.
+        let (layout, panes) = if saved.panes.is_empty() {
+            let pane = SavedPane {
+                items: saved.items.clone(),
+                active: saved.active,
+                pinned: 0,
+            };
+            (Member::Pane(0), vec![pane])
+        } else {
+            let mut ids = saved.layout.as_ref().map(Member::panes).unwrap_or_default();
+            ids.sort_unstable();
+            match &saved.layout {
+                Some(layout) if ids == (0..saved.panes.len()).collect::<Vec<_>>() => {
+                    (layout.clone(), saved.panes.clone())
+                }
+                // A layout that does not name every pane once: the first pane alone.
+                _ => (Member::Pane(0), vec![saved.panes[0].clone()]),
+            }
+        };
+        self.panes = (0..panes.len()).map(Pane::new).collect();
+        self.center = layout;
+        self.next_pane = panes.len();
+        self.dedupe_across_panes = false;
+        for (id, saved_pane) in panes.iter().enumerate() {
+            self.active_pane = id;
+            for item in &saved_pane.items {
+                if let Some(open) = persistence::opener(cx, &item.kind) {
+                    open(&item.data, self, window, cx);
+                }
+            }
+            if let Some(pane) = self.pane_mut(id) {
+                pane.pinned = saved_pane.pinned.min(pane.items.len());
+                pane.preview = None;
+                pane.active = saved_pane.active.min(pane.items.len().saturating_sub(1));
             }
         }
-        if !self.items.is_empty() {
-            self.activate_item(saved.active.min(self.items.len() - 1), window, cx);
+        self.dedupe_across_panes = true;
+        // A pane whose tabs could not be reopened is dropped.
+        for id in self.center.panes() {
+            if self.pane(id).is_some_and(|p| p.items.is_empty()) && self.panes.len() > 1 {
+                self.remove_pane(id);
+            }
         }
+        let order = self.center.panes();
+        let active = order
+            .get(saved.active_pane)
+            .copied()
+            .unwrap_or_else(|| self.center.top_left());
+        let index = self.pane(active).map_or(0, |p| p.active);
+        self.activate_in(active, index, false, window, cx);
         self.saved = Some(saved);
     }
 
@@ -276,9 +358,11 @@ impl Workspace {
             current.graph_id == next.graph_id && current.connection == next.connection
         });
         if !same_graph {
-            self.items.clear();
+            self.panes = vec![Pane::new(0)];
+            self.center = Member::Pane(0);
+            self.active_pane = 0;
+            self.next_pane = 1;
             self._item_subscriptions.clear();
-            self.active = 0;
             self.right.remove(INSPECTOR_PANEL);
         }
         self._session_subscription = Some(cx.subscribe_in(
@@ -351,9 +435,39 @@ impl Workspace {
         }
     }
 
-    // ---- items ----
+    // ---- panes and items ----
 
-    /// Adds an item as a tab, or activates the tab with the same dedupe key.
+    fn pane(&self, id: PaneId) -> Option<&Pane<Box<dyn ItemHandle>>> {
+        self.panes.iter().find(|pane| pane.id == id)
+    }
+
+    fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane<Box<dyn ItemHandle>>> {
+        self.panes.iter_mut().find(|pane| pane.id == id)
+    }
+
+    /// The pane and position of an open item.
+    fn find_item(&self, id: EntityId) -> Option<(PaneId, usize)> {
+        self.panes
+            .iter()
+            .find_map(|pane| pane.position(id).map(|index| (pane.id, index)))
+    }
+
+    /// The tab with `key`: in the active pane, else (unless restoring or splitting) another.
+    fn find_key(&self, key: &SharedString, cx: &App) -> Option<(PaneId, usize)> {
+        let in_pane = |pane: &Pane<Box<dyn ItemHandle>>| {
+            pane.items
+                .iter()
+                .position(|item| item.dedupe_key(cx).as_ref() == Some(key))
+                .map(|index| (pane.id, index))
+        };
+        self.pane(self.active_pane).and_then(in_pane).or_else(|| {
+            self.dedupe_across_panes
+                .then(|| self.panes.iter().find_map(in_pane))
+                .flatten()
+        })
+    }
+
+    /// Adds an item as a tab of the active pane, or activates the tab with the same dedupe key.
     pub fn add_item(
         &mut self,
         item: Box<dyn ItemHandle>,
@@ -361,17 +475,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if let Some(key) = item.dedupe_key(cx)
-            && let Some(index) = self
-                .items
-                .iter()
-                .position(|existing| existing.dedupe_key(cx).as_ref() == Some(&key))
+            && let Some((pane, index)) = self.find_key(&key, cx)
         {
-            self.activate_item(index, window, cx);
+            self.activate_in(pane, index, true, window, cx);
             return;
         }
-        self.items.push(item);
-        let index = self.items.len() - 1;
-        self.activate_item(index, window, cx);
+        self.insert(item, false, window, cx);
     }
 
     /// Opens an item of type `T`, unless a tab with `key` is open, which is activated instead.
@@ -382,84 +491,148 @@ impl Workspace {
         cx: &mut Context<Self>,
         build: impl FnOnce(&mut Window, &mut Context<T>) -> T,
     ) -> Option<Entity<T>> {
+        self.open_item_with(key, false, window, cx, build)
+    }
+
+    /// As [`Self::open_item`]; a `preview` tab takes the place of the pane's preview tab, so
+    /// browsing does not pile up tabs (spec 002). Opening it again without `preview` keeps it.
+    pub fn open_item_with<T: Item>(
+        &mut self,
+        key: impl Into<SharedString>,
+        preview: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(&mut Window, &mut Context<T>) -> T,
+    ) -> Option<Entity<T>> {
         let key = key.into();
-        if let Some(index) = self
-            .items
-            .iter()
-            .position(|existing| existing.dedupe_key(cx).as_ref() == Some(&key))
-        {
-            self.activate_item(index, window, cx);
-            return self.items[index].to_any().downcast::<T>().ok();
+        if let Some((pane, index)) = self.find_key(&key, cx) {
+            let item = &self.pane(pane)?.items[index];
+            let (id, view) = (item.item_id(), item.to_any());
+            if !preview && let Some(pane) = self.pane_mut(pane) {
+                pane.keep(id);
+            }
+            self.activate_in(pane, index, true, window, cx);
+            return view.downcast::<T>().ok();
         }
         let item = cx.new(|cx| build(window, cx));
         let subscription = cx.subscribe_in(
             &item,
             window,
             |this, item, event: &ItemEvent, window, cx| match event {
-                ItemEvent::UpdateTab => cx.notify(),
+                ItemEvent::UpdateTab => {
+                    // Work in a preview tab keeps it.
+                    let id = item.entity_id();
+                    if item.read(cx).is_dirty(cx)
+                        && let Some((pane, _)) = this.find_item(id)
+                        && let Some(pane) = this.pane_mut(pane)
+                    {
+                        pane.keep(id);
+                    }
+                    cx.notify()
+                }
                 // The item asked to close; it has already decided.
                 ItemEvent::Close => {
-                    if let Some(index) = this
-                        .items
-                        .iter()
-                        .position(|i| i.item_id() == item.entity_id())
-                    {
-                        this.force_close_item(index, window, cx);
+                    if let Some((pane, index)) = this.find_item(item.entity_id()) {
+                        this.force_close(pane, index, window, cx);
                     }
                 }
             },
         );
         self._item_subscriptions
             .push((item.entity_id(), subscription));
-        self.items.push(Box::new(item.clone()));
-        let index = self.items.len() - 1;
-        self.activate_item(index, window, cx);
+        self.insert(Box::new(item.clone()), preview, window, cx);
         Some(item)
     }
 
+    /// Puts an item in the active pane and activates it.
+    fn insert(
+        &mut self,
+        item: Box<dyn ItemHandle>,
+        preview: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pane_id = self.active_pane;
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        // A preview with work in it is not replaced.
+        if let Some(current) = pane.preview
+            && let Some(index) = pane.position(current)
+            && pane.items[index].is_dirty(cx)
+        {
+            pane.keep(current);
+        }
+        let (index, replaced) = pane.add(item, preview);
+        if let Some(replaced) = replaced {
+            let id = replaced.item_id();
+            self._item_subscriptions.retain(|(item, _)| *item != id);
+            self.back.retain(|visited| *visited != id);
+        }
+        self.activate_in(pane_id, index, true, window, cx);
+    }
+
+    /// The active pane's tabs.
     pub fn items(&self) -> &[Box<dyn ItemHandle>] {
-        &self.items
+        self.pane(self.active_pane)
+            .map_or(&[], |pane| pane.items.as_slice())
     }
 
     pub fn active_item(&self) -> Option<&dyn ItemHandle> {
-        self.items.get(self.active).map(|item| item.as_ref())
+        self.pane(self.active_pane)?
+            .active_item()
+            .map(|item| item.as_ref())
     }
 
+    /// Activates a tab of the active pane.
     pub fn activate_item(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.activate(index, true, window, cx);
+        self.activate_in(self.active_pane, index, true, window, cx);
     }
 
-    /// Activates a tab; `record` remembers the tab left for ⌘[ and forgets the ⌘] trail.
-    fn activate(
+    /// Activates a pane's tab; `record` remembers the tab left for ⌘[ and forgets the ⌘] trail.
+    fn activate_in(
         &mut self,
+        pane_id: PaneId,
         index: usize,
         record: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if index >= self.items.len() {
+        let Some(next) = self
+            .pane(pane_id)
+            .and_then(|pane| pane.items.get(index))
+            .map(|item| item.item_id())
+        else {
+            // An empty pane takes the focus itself.
+            if self.pane(pane_id).is_some() {
+                self.active_pane = pane_id;
+                window.focus(&self.focus_handle, cx);
+                cx.notify();
+            }
             return;
-        }
+        };
         if record
-            && index != self.active
-            && let Some(current) = self.items.get(self.active)
+            && let Some(current) = self.active_item().map(|item| item.item_id())
+            && current != next
         {
-            let id = current.item_id();
-            self.back.retain(|visited| *visited != id);
-            self.back.push(id);
+            self.back.retain(|visited| *visited != current);
+            self.back.push(current);
             if self.back.len() > NAV_HISTORY {
                 self.back.remove(0);
             }
             self.forward.clear();
         }
-        self.active = index;
-        let focus = self.items[index].focus_handle(cx);
-        window.focus(&focus, cx);
+        self.active_pane = pane_id;
+        if let Some(pane) = self.pane_mut(pane_id) {
+            pane.active = index;
+            let focus = pane.items[index].focus_handle(cx);
+            window.focus(&focus, cx);
+        }
         cx.notify();
     }
 
-    /// ⌘[ and ⌘]: the previous or next tab in the order they were visited, skipping closed
-    /// ones.
+    /// ⌘[ and ⌘]: the previous or next tab in the order they were visited, across panes,
+    /// skipping closed ones.
     fn navigate(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
         loop {
             let next = if back {
@@ -468,32 +641,42 @@ impl Workspace {
                 self.forward.pop()
             };
             let Some(id) = next else { return };
-            let Some(index) = self.items.iter().position(|item| item.item_id() == id) else {
+            let Some((pane, index)) = self.find_item(id) else {
                 continue;
             };
-            if index == self.active {
+            let current = self.active_item().map(|item| item.item_id());
+            if current == Some(id) {
                 continue;
             }
-            if let Some(current) = self.items.get(self.active) {
-                let current = current.item_id();
+            if let Some(current) = current {
                 if back {
                     self.forward.push(current);
                 } else {
                     self.back.push(current);
                 }
             }
-            self.activate(index, false, window, cx);
+            self.activate_in(pane, index, false, window, cx);
             return;
         }
     }
 
-    /// Closes a tab; one with unsaved work or a write in flight asks first.
+    /// Closes a tab of the active pane; one with unsaved work or a write in flight asks first.
     pub fn close_item(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.items.get(index) else {
+        self.close_in(self.active_pane, index, window, cx);
+    }
+
+    fn close_in(
+        &mut self,
+        pane: PaneId,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.pane(pane).and_then(|p| p.items.get(index)) else {
             return;
         };
         if !item.is_dirty(cx) {
-            self.force_close_item(index, window, cx);
+            self.force_close(pane, index, window, cx);
             return;
         }
         let item_id = item.item_id();
@@ -507,22 +690,112 @@ impl Workspace {
         });
     }
 
-    /// Closes a tab without asking.
-    pub fn force_close_item(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index >= self.items.len() {
-            return;
+    /// Closes the tabs with these ids that have nothing unsaved; the others stay open, with
+    /// their dot.
+    fn close_clean(&mut self, ids: Vec<EntityId>, window: &mut Window, cx: &mut Context<Self>) {
+        for id in ids {
+            if let Some((pane, index)) = self.find_item(id)
+                && !self.pane(pane).is_some_and(|p| p.items[index].is_dirty(cx))
+            {
+                self.force_close(pane, index, window, cx);
+            }
         }
-        let removed = self.items.remove(index);
+    }
+
+    /// Closes a tab of the active pane without asking.
+    pub fn force_close_item(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.force_close(self.active_pane, index, window, cx);
+    }
+
+    /// Closes a tab without asking. A pane left empty closes too, unless it is the only one.
+    fn force_close(
+        &mut self,
+        pane_id: PaneId,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(removed) = self.pane_mut(pane_id).and_then(|pane| pane.remove(index)) else {
+            return;
+        };
         self._item_subscriptions
             .retain(|(id, _)| *id != removed.item_id());
-        if self.active >= self.items.len() {
-            self.active = self.items.len().saturating_sub(1);
+        let emptied = self.pane(pane_id).is_some_and(|p| p.items.is_empty());
+        if emptied && self.panes.len() > 1 {
+            self.remove_pane(pane_id);
         }
-        if let Some(item) = self.items.get(self.active) {
-            let focus = item.focus_handle(cx);
-            window.focus(&focus, cx);
+        if pane_id == self.active_pane || !self.center.contains(pane_id) {
+            let active = self.active_pane;
+            let index = self.pane(active).map_or(0, |p| p.active);
+            self.activate_in(active, index, false, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Takes a pane out of the split tree; its neighbour in reading order becomes active.
+    fn remove_pane(&mut self, id: PaneId) {
+        let order = self.center.panes();
+        if !self.center.remove(id) {
+            return;
+        }
+        self.panes.retain(|pane| pane.id != id);
+        if self.active_pane == id {
+            let position = order.iter().position(|p| *p == id).unwrap_or_default();
+            self.active_pane = order
+                .get(position.wrapping_sub(1))
+                .or_else(|| order.get(position + 1))
+                .copied()
+                .filter(|p| *p != id)
+                .unwrap_or_else(|| self.center.top_left());
+        }
+    }
+
+    /// Splits the active pane; the new pane opens a copy of the active tab, when the tab can
+    /// be reopened, and becomes active.
+    pub fn split(
+        &mut self,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let at = self.active_pane;
+        let new = self.next_pane;
+        if !self.center.split(at, new, direction) {
+            return;
+        }
+        self.next_pane += 1;
+        self.panes.push(Pane::new(new));
+        let copy = self.active_item().and_then(|item| item.serialize(cx));
+        self.active_pane = new;
+        if let Some(copy) = copy
+            && let Some(open) = persistence::opener(cx, &copy.kind)
+        {
+            self.dedupe_across_panes = false;
+            open(&copy.data, self, window, cx);
+            self.dedupe_across_panes = true;
+        }
+        let index = self.pane(new).map_or(0, |p| p.active);
+        self.activate_in(new, index, true, window, cx);
+    }
+
+    /// Moves to the next (or previous) pane in reading order.
+    fn activate_pane_step(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let order = self.center.panes();
+        let Some(position) = order.iter().position(|p| *p == self.active_pane) else {
+            return;
+        };
+        let next = if forward {
+            order[(position + 1) % order.len()]
         } else {
-            window.focus(&self.focus_handle, cx);
+            order[(position + order.len() - 1) % order.len()]
+        };
+        let index = self.pane(next).map_or(0, |p| p.active);
+        self.activate_in(next, index, true, window, cx);
+    }
+
+    fn toggle_pin(&mut self, pane: PaneId, index: usize, cx: &mut Context<Self>) {
+        if let Some(pane) = self.pane_mut(pane) {
+            pane.toggle_pin(index);
         }
         cx.notify();
     }
@@ -765,7 +1038,7 @@ impl Workspace {
     /// A header or footer strip of a column (spec 002, after Delta): fixed height, and a place
     /// to drag the window from. As in Zed's title bar, the move starts on the first mouse move
     /// after a press, so clicks on the strip's buttons still land.
-    fn strip(&self, id: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn strip(&self, id: impl Into<ElementId>, cx: &mut Context<Self>) -> Stateful<Div> {
         h_flex()
             .id(id)
             .window_control_area(WindowControlArea::Drag)
@@ -974,9 +1247,10 @@ impl Workspace {
             )
     }
 
-    /// The tabs, as Delta draws them: text tabs separated by hairlines, the active one joined
-    /// to the content below it.
-    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A pane's tabs, as Delta draws them: text tabs separated by hairlines, the active one
+    /// joined to the content below it. Pinned tabs come first with a pin; a preview tab's title
+    /// is in italics until it is kept (a double click, or work in it).
+    fn render_tabs(&self, pane_id: PaneId, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         // In the glass style the tab strip is part of the sheet: the active tab is clear and the
         // others are barely shaded.
@@ -989,17 +1263,30 @@ impl Workspace {
             )
         };
         let hairline = studio_ui::ds::surface::rule(cx);
+        let hover_bg = colors.ghost_element_hover;
+        let split = self.panes.len() > 1;
+        let focused_pane = pane_id == self.active_pane;
+        let workspace = cx.entity().downgrade();
+        let Some(pane) = self.pane(pane_id) else {
+            return h_flex().into_any_element();
+        };
         h_flex()
             .h_full()
             .min_w_0()
             .overflow_hidden()
-            .children(self.items.iter().enumerate().map(|(index, item)| {
-                let selected = index == self.active;
-                let group: SharedString = format!("tab-{index}").into();
+            .children(pane.items.iter().enumerate().map(|(index, item)| {
+                let selected = index == pane.active;
+                let pinned = pane.is_pinned(index);
+                let preview = pane.is_preview(index);
+                let group: SharedString = format!("tab-{pane_id}-{index}").into();
                 let dirty = item.is_dirty(cx);
                 let stale = item.is_stale(cx);
-                h_flex()
-                    .id(("tab", index))
+                let item_id = item.item_id();
+                // With a split, the active pane's tab reads at full strength and the others'
+                // active tabs are muted, so the focused document is clear.
+                let strong = selected && (!split || focused_pane);
+                let tab = h_flex()
+                    .id(SharedString::from(format!("tab-{pane_id}-{index}")))
                     .group(group.clone())
                     .h_full()
                     .pl_4()
@@ -1013,7 +1300,7 @@ impl Workspace {
                     .when(selected, |tab| tab.bg(editor_bg))
                     .when(!selected, |tab| {
                         tab.bg(inactive_bg)
-                            .hover(|style| style.bg(colors.ghost_element_hover))
+                            .hover(move |style| style.bg(hover_bg))
                             // The rule under inactive tabs; the active tab joins the content.
                             .child(
                                 div()
@@ -1033,11 +1320,8 @@ impl Workspace {
                     .child(
                         Label::new(item.tab_title(cx))
                             .size(LabelSize::Small)
-                            .color(if selected {
-                                Color::Default
-                            } else {
-                                Color::Muted
-                            })
+                            .color(if strong { Color::Default } else { Color::Muted })
+                            .when(preview, |label| label.italic())
                             .single_line(),
                     )
                     .when(dirty, |tab| {
@@ -1046,25 +1330,62 @@ impl Workspace {
                     .when(stale && !dirty, |tab| {
                         tab.child(Indicator::dot().color(Color::Muted))
                     })
-                    .child(
-                        IconButton::new(("close", index), IconName::Close)
-                            .icon_size(IconSize::XSmall)
-                            .when(!selected, |button| button.visible_on_hover(group))
-                            .tooltip(|_, cx| Tooltip::for_action("Close", &CloseActiveItem, cx))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.close_item(index, window, cx)
-                            })),
-                    )
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| {
-                            this.activate_item(index, window, cx)
-                        }),
-                    )
+                    .map(|tab| {
+                        if pinned {
+                            tab.child(
+                                IconButton::new(
+                                    SharedString::from(format!("unpin-{pane_id}-{index}")),
+                                    IconName::Pin,
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Unpin"))
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| this.toggle_pin(pane_id, index, cx),
+                                )),
+                            )
+                        } else {
+                            tab.child(
+                                IconButton::new(
+                                    SharedString::from(format!("close-{pane_id}-{index}")),
+                                    IconName::Close,
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .when(!selected, |button| button.visible_on_hover(group))
+                                .tooltip(|_, cx| Tooltip::for_action("Close", &CloseActiveItem, cx))
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.close_in(pane_id, index, window, cx)
+                                    },
+                                )),
+                            )
+                        }
+                    })
+                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        if event.click_count() == 2
+                            && let Some(pane) = this.pane_mut(pane_id)
+                        {
+                            pane.keep(item_id);
+                        }
+                        this.activate_in(pane_id, index, true, window, cx)
+                    }));
+                let workspace = workspace.clone();
+                right_click_menu(SharedString::from(format!("tab-menu-{pane_id}-{index}")))
+                    .trigger(move |_, _, _| tab)
+                    .menu(move |window, cx| {
+                        let workspace = workspace.clone();
+                        ContextMenu::build(window, cx, move |menu, _, _| {
+                            tab_menu(menu, workspace.clone(), item_id, pinned)
+                        })
+                    })
             }))
+            .into_any_element()
     }
 
-    /// The document column's header: the tabs, then the toggles of the right and bottom docks.
-    fn render_center_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A pane's header strip: its tabs, then, on the top-right pane, the toggles of the right
+    /// and bottom docks. The top-left pane makes room for the traffic lights when the sidebar
+    /// is hidden.
+    fn render_pane_header(&self, pane_id: PaneId, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let header_bg = if studio_ui::ds::is_glass(cx) {
             gpui::transparent_black()
@@ -1072,38 +1393,45 @@ impl Workspace {
             colors.editor_background.blend(gpui::black().opacity(0.02))
         };
         let hairline = studio_ui::ds::surface::rule(cx);
+        let top_right = self.center.top_right() == pane_id;
+        let top_left = self.center.top_left() == pane_id;
         let mut context = h_flex().gap_1().items_center().pr_1();
-        context = context.child(
-            IconButton::new("toggle-activity", IconName::ListTree)
-                .icon_size(IconSize::Small)
-                .toggle_state(self.bottom.open)
-                .tooltip(|_, cx| Tooltip::for_action("Activity", &ToggleActivity, cx))
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleActivity), cx)),
-        );
-        if !self.right.panels.is_empty() {
+        if top_right {
             context = context.child(
-                IconButton::new("toggle-inspector", IconName::ThreadsSidebarRightOpen)
+                IconButton::new("toggle-activity", IconName::ListTree)
                     .icon_size(IconSize::Small)
-                    .toggle_state(self.right.open)
-                    .tooltip(|_, cx| Tooltip::for_action("Inspector", &ToggleInspector, cx))
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(ToggleInspector), cx)
-                    }),
+                    .toggle_state(self.bottom.open)
+                    .tooltip(|_, cx| Tooltip::for_action("Activity", &ToggleActivity, cx))
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleActivity), cx)),
             );
+            if !self.right.panels.is_empty() {
+                context = context.child(
+                    IconButton::new("toggle-inspector", IconName::ThreadsSidebarRightOpen)
+                        .icon_size(IconSize::Small)
+                        .toggle_state(self.right.open)
+                        .tooltip(|_, cx| Tooltip::for_action("Inspector", &ToggleInspector, cx))
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(ToggleInspector), cx)
+                        }),
+                );
+            }
         }
-        self.strip("center-header", cx)
+        self.strip(SharedString::from(format!("pane-header-{pane_id}")), cx)
             .bg(header_bg)
-            .when(!self.left.visible() || self.session.is_none(), |strip| {
-                strip.child(
-                    div()
-                        .w(px(TRAFFIC_LIGHTS_WIDTH))
-                        .h_full()
-                        .flex_none()
-                        .border_b_1()
-                        .border_color(hairline),
-                )
-            })
-            .child(self.render_tabs(cx))
+            .when(
+                top_left && (!self.left.visible() || self.session.is_none()),
+                |strip| {
+                    strip.child(
+                        div()
+                            .w(px(TRAFFIC_LIGHTS_WIDTH))
+                            .h_full()
+                            .flex_none()
+                            .border_b_1()
+                            .border_color(hairline),
+                    )
+                },
+            )
+            .child(self.render_tabs(pane_id, cx))
             .child(
                 h_flex()
                     .flex_1()
@@ -1114,6 +1442,124 @@ impl Workspace {
                     .border_color(hairline)
                     .child(context),
             )
+    }
+
+    /// One pane: its header and its active tab. Pressing anywhere in it makes it the active
+    /// pane.
+    fn render_pane(&self, pane_id: PaneId, cx: &mut Context<Self>) -> AnyElement {
+        let body = match self.pane(pane_id).and_then(|pane| pane.active_item()) {
+            Some(item) => div()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .child(item.to_any())
+                .into_any_element(),
+            None if self.panes.len() == 1 => self.render_empty_center(cx).into_any_element(),
+            None => studio_ui::ds::empty_state(IconName::Sparkle, "No tab open").into_any_element(),
+        };
+        v_flex()
+            .id(SharedString::from(format!("pane-{pane_id}")))
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
+                if this.active_pane != pane_id {
+                    this.active_pane = pane_id;
+                    cx.notify();
+                }
+            }))
+            .child(self.render_pane_header(pane_id, cx))
+            .child(body)
+            .into_any_element()
+    }
+
+    /// The split tree: panes side by side or stacked, each with its share, a hairline between
+    /// them that drags to resize.
+    fn render_member(
+        &self,
+        member: &Member,
+        path: Vec<usize>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Member::Split {
+            axis,
+            members,
+            flexes,
+        } = member
+        else {
+            let Member::Pane(id) = member else {
+                unreachable!()
+            };
+            return self.render_pane(*id, cx);
+        };
+        let axis = *axis;
+        let hairline = studio_ui::ds::surface::rule(cx);
+        let horizontal = axis == SplitAxis::Horizontal;
+        let split_id = SharedString::from(format!(
+            "split-{}",
+            path.iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join("-")
+        ));
+        // Members stretch across the split's other axis.
+        let mut container = div()
+            .flex()
+            .when(horizontal, |d| d.flex_row())
+            .when(!horizontal, |d| d.flex_col())
+            .id(split_id)
+            .size_full()
+            .min_w_0()
+            .min_h_0();
+        for (index, (child, flex)) in members.iter().zip(flexes).enumerate() {
+            let mut child_path = path.clone();
+            child_path.push(index);
+            let mut cell = div()
+                .relative()
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .min_h_0()
+                .flex_basis(px(0.))
+                .flex_grow(*flex)
+                .flex_shrink(1.)
+                .child(self.render_member(child, child_path, cx));
+            if index > 0 {
+                cell = if horizontal {
+                    cell.border_l_1()
+                } else {
+                    cell.border_t_1()
+                }
+                .border_color(hairline)
+                .child(split_handle(path.clone(), index - 1, axis));
+            }
+            container = container.child(cell);
+        }
+        let path_for_drag = path.clone();
+        container
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<DraggedSplit>, _, cx| {
+                    let drag = event.drag(cx);
+                    if drag.path != path_for_drag {
+                        return;
+                    }
+                    let bounds = event.bounds;
+                    let (position, start, length) = if drag.axis == SplitAxis::Horizontal {
+                        (event.event.position.x, bounds.origin.x, bounds.size.width)
+                    } else {
+                        (event.event.position.y, bounds.origin.y, bounds.size.height)
+                    };
+                    let Some(flexes) = this.center.flexes_at(&drag.path) else {
+                        return;
+                    };
+                    let fraction = f32::from(position - start) / f32::from(length).max(1.);
+                    if let Some(next) = resized(flexes, drag.boundary, fraction) {
+                        this.center.set_flexes(&drag.path, next);
+                        cx.notify();
+                    }
+                }),
+            )
+            .into_any_element()
     }
 
     /// The document column's footer, after Delta's: where the open tab reads and writes (graph
@@ -1260,15 +1706,13 @@ impl Workspace {
         let (editor_background, panel_background) =
             (colors.editor_background, colors.panel_background);
         let hairline = studio_ui::ds::surface::rule(cx);
-        let body = match self.items.get(self.active) {
-            Some(item) => div()
+        let center = self.center.clone();
+        let body =
+            div()
                 .flex_1()
                 .min_h_0()
-                .overflow_hidden()
-                .child(item.to_any())
-                .into_any_element(),
-            None => self.render_empty_center(cx).into_any_element(),
-        };
+                .flex()
+                .child(self.render_member(&center, Vec::new(), cx));
         let column = if studio_ui::ds::is_glass(cx) {
             studio_ui::ds::sheet(cx)
         } else {
@@ -1280,7 +1724,6 @@ impl Workspace {
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(self.render_center_header(cx))
             .child(body)
             .when(self.bottom.visible(), |d| {
                 d.child(
@@ -1596,28 +2039,71 @@ impl Render for Workspace {
             })
             .text_color(colors.text)
             .on_action(cx.listener(|this, _: &CloseActiveItem, window, cx| {
-                let index = this.active;
+                let index = this.pane(this.active_pane).map_or(0, |p| p.active);
                 this.close_item(index, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateNextItem, window, cx| {
-                if !this.items.is_empty() {
-                    let next = (this.active + 1) % this.items.len();
-                    this.activate_item(next, window, cx);
+                let (len, active) = this
+                    .pane(this.active_pane)
+                    .map_or((0, 0), |p| (p.items.len(), p.active));
+                if len > 0 {
+                    this.activate_item((active + 1) % len, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ActivatePreviousItem, window, cx| {
-                if !this.items.is_empty() {
-                    let previous = (this.active + this.items.len() - 1) % this.items.len();
-                    this.activate_item(previous, window, cx);
+                let (len, active) = this
+                    .pane(this.active_pane)
+                    .map_or((0, 0), |p| (p.items.len(), p.active));
+                if len > 0 {
+                    this.activate_item((active + len - 1) % len, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, action: &ActivateItem, window, cx| {
                 this.activate_item(action.index, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateLastItem, window, cx| {
-                if let Some(last) = this.items.len().checked_sub(1) {
+                if let Some(last) = this.items().len().checked_sub(1) {
                     this.activate_item(last, window, cx);
                 }
+            }))
+            .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
+                this.split(SplitDirection::Right, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SplitDown, window, cx| {
+                this.split(SplitDirection::Down, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateNextPane, window, cx| {
+                this.activate_pane_step(true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivatePreviousPane, window, cx| {
+                this.activate_pane_step(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &TogglePinTab, _, cx| {
+                let pane = this.active_pane;
+                let index = this.pane(pane).map_or(0, |p| p.active);
+                this.toggle_pin(pane, index, cx);
+            }))
+            .on_action(cx.listener(|this, _: &KeepPreviewTab, _, cx| {
+                if let Some(id) = this.active_item().map(|item| item.item_id())
+                    && let Some(pane) = this.pane_mut(this.active_pane)
+                {
+                    pane.keep(id);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CloseOtherItems, window, cx| {
+                let ids = this
+                    .pane(this.active_pane)
+                    .map(|p| p.others(p.active))
+                    .unwrap_or_default();
+                this.close_clean(ids, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseAllItems, window, cx| {
+                let ids = this
+                    .pane(this.active_pane)
+                    .map(|p| p.all_unpinned())
+                    .unwrap_or_default();
+                this.close_clean(ids, window, cx);
             }))
             .on_action(cx.listener(
                 |this, action: &studio_actions::workspace::ActivatePanel, _, cx| {
@@ -1689,8 +2175,8 @@ impl Render for Workspace {
             window.set_traffic_light_position(lights);
         }
         let footer = self
-            .items
-            .get(self.active)
+            .pane(self.active_pane)
+            .and_then(|pane| pane.active_item())
             .and_then(|item| item.footer(window, cx));
         root.child(
             h_flex()
@@ -1715,6 +2201,152 @@ impl Render for DraggedDock {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         gpui::Empty
     }
+}
+
+/// The hairline between two panes of a split being dragged: the split's path in the tree and
+/// the boundary after member `boundary`.
+#[derive(Clone)]
+struct DraggedSplit {
+    path: Vec<usize>,
+    boundary: usize,
+    axis: SplitAxis,
+}
+
+impl Render for DraggedSplit {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// The strip on a pane's leading edge that drags the boundary before it.
+fn split_handle(path: Vec<usize>, boundary: usize, axis: SplitAxis) -> impl IntoElement {
+    let drag = DraggedSplit {
+        path,
+        boundary,
+        axis,
+    };
+    let handle = div()
+        .id(SharedString::from(format!(
+            "split-handle-{}-{boundary}",
+            drag.path
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join("-")
+        )))
+        .absolute()
+        .occlude();
+    let handle = match axis {
+        SplitAxis::Horizontal => handle
+            .top_0()
+            .left(px(-3.))
+            .h_full()
+            .w(px(6.))
+            .cursor_col_resize(),
+        SplitAxis::Vertical => handle
+            .left_0()
+            .top(px(-3.))
+            .w_full()
+            .h(px(6.))
+            .cursor_row_resize(),
+    };
+    handle.on_drag(drag, |drag, _, _, cx| {
+        cx.stop_propagation();
+        cx.new(|_| drag.clone())
+    })
+}
+
+/// The shares after moving the boundary after member `boundary` to `fraction` of the split's
+/// length, keeping every member at least a tenth of the pair being resized.
+fn resized(flexes: &[f32], boundary: usize, fraction: f32) -> Option<Vec<f32>> {
+    if boundary + 1 >= flexes.len() {
+        return None;
+    }
+    let total: f32 = flexes.iter().sum();
+    let before: f32 = flexes[..boundary].iter().sum();
+    let pair = flexes[boundary] + flexes[boundary + 1];
+    let min = pair * 0.1;
+    let first = (fraction * total - before).clamp(min, pair - min);
+    let mut next = flexes.to_vec();
+    next[boundary] = first;
+    next[boundary + 1] = pair - first;
+    Some(next)
+}
+
+/// A tab's right-click menu, after Zed's: close variants, pin, then splits.
+fn tab_menu(
+    menu: ContextMenu,
+    workspace: WeakEntity<Workspace>,
+    item: EntityId,
+    pinned: bool,
+) -> ContextMenu {
+    let on = |f: fn(&mut Workspace, PaneId, usize, &mut Window, &mut Context<Workspace>)| {
+        let workspace = workspace.clone();
+        move |window: &mut Window, cx: &mut App| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    if let Some((pane, index)) = workspace.find_item(item) {
+                        f(workspace, pane, index, window, cx);
+                    }
+                })
+                .ok();
+        }
+    };
+    menu.entry(
+        "Close",
+        None,
+        on(|w, pane, index, window, cx| w.close_in(pane, index, window, cx)),
+    )
+    .entry(
+        "Close Others",
+        None,
+        on(|w, pane, index, window, cx| {
+            let ids = w.pane(pane).map(|p| p.others(index)).unwrap_or_default();
+            w.close_clean(ids, window, cx);
+        }),
+    )
+    .entry(
+        "Close to the Right",
+        None,
+        on(|w, pane, index, window, cx| {
+            let ids = w
+                .pane(pane)
+                .map(|p| p.to_the_right(index))
+                .unwrap_or_default();
+            w.close_clean(ids, window, cx);
+        }),
+    )
+    .entry(
+        "Close All",
+        None,
+        on(|w, pane, _, window, cx| {
+            let ids = w.pane(pane).map(|p| p.all_unpinned()).unwrap_or_default();
+            w.close_clean(ids, window, cx);
+        }),
+    )
+    .separator()
+    .entry(
+        if pinned { "Unpin Tab" } else { "Pin Tab" },
+        None,
+        on(|w, pane, index, _, cx| w.toggle_pin(pane, index, cx)),
+    )
+    .separator()
+    .entry(
+        "Split Right",
+        None,
+        on(|w, pane, index, window, cx| {
+            w.activate_in(pane, index, true, window, cx);
+            w.split(SplitDirection::Right, window, cx)
+        }),
+    )
+    .entry(
+        "Split Down",
+        None,
+        on(|w, pane, index, window, cx| {
+            w.activate_in(pane, index, true, window, cx);
+            w.split(SplitDirection::Down, window, cx)
+        }),
+    )
 }
 
 /// The strip along a dock's inner edge that resizes it.
@@ -1775,8 +2407,8 @@ impl ConfirmClose {
         cx.emit(DismissEvent);
         self.workspace
             .update(cx, |workspace, cx| {
-                if let Some(index) = workspace.items.iter().position(|i| i.item_id() == item_id) {
-                    workspace.force_close_item(index, window, cx);
+                if let Some((pane, index)) = workspace.find_item(item_id) {
+                    workspace.force_close(pane, index, window, cx);
                 }
             })
             .ok();

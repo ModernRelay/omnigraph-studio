@@ -19,6 +19,23 @@
     }
   },
   {
+    "context": "Workspace",
+    "bindings": {
+      "ctrl-w": "studio::CloseActiveItem",
+      "ctrl-tab": "studio::ActivateNextItem",
+      "ctrl-shift-tab": "studio::ActivatePreviousItem",
+      "ctrl-pagedown": "studio::ActivateNextItem",
+      "ctrl-pageup": "studio::ActivatePreviousItem",
+      "ctrl-b": "studio::ToggleSidebar",
+      "ctrl-alt-b": "studio::ToggleInspector",
+      "ctrl-j": "studio::ToggleActivity",
+      "ctrl-\\": "studio::SplitRight",
+      "ctrl-shift-\\": "studio::SplitDown",
+      "ctrl-alt-right": "studio::ActivateNextPane",
+      "ctrl-alt-left": "studio::ActivatePreviousPane"
+    }
+  },
+  {
     "bindings": {
       "ctrl-shift-a": "studio_agent::OpenAgent"
     }

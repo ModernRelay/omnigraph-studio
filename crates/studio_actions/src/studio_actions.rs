@@ -68,6 +68,22 @@ pub mod workspace {
         [
             /// Activate the last tab.
             ActivateLastItem,
+            /// Split the document area, with a copy of the active tab on the right.
+            SplitRight,
+            /// Split the document area, with a copy of the active tab below.
+            SplitDown,
+            /// Move to the next pane of a split.
+            ActivateNextPane,
+            /// Move to the previous pane of a split.
+            ActivatePreviousPane,
+            /// Pin or unpin the active tab; pinned tabs come first and stay on "Close others".
+            TogglePinTab,
+            /// Keep the active preview tab, so the next preview opens beside it.
+            KeepPreviewTab,
+            /// Close every unpinned tab of the pane except the active one.
+            CloseOtherItems,
+            /// Close every unpinned tab of the pane.
+            CloseAllItems,
             /// Open the design system gallery: every token and component in the current window
             /// style.
             OpenDesignSystem,
@@ -116,6 +132,9 @@ pub mod graph {
         pub filter_id: Option<String>,
         #[serde(default)]
         pub via: Option<String>,
+        /// Open as the pane's preview tab, which the next preview replaces (spec 002).
+        #[serde(default)]
+        pub preview: bool,
     }
 
     /// One node of a query result, for [`ShowResultsOnCanvas`].

@@ -539,6 +539,7 @@ impl GraphCanvas {
                         at_commit: None,
                         filter_id: None,
                         via: None,
+                        preview: false,
                     }),
                     cx,
                 );
@@ -1143,6 +1144,7 @@ impl GraphCanvas {
                                             at_commit: None,
                                             filter_id: None,
                                             via: None,
+                                            preview: false,
                                         }),
                                         cx,
                                     )

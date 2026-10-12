@@ -404,6 +404,7 @@ impl CommitView {
                                         at_commit: Some(commit.clone()),
                                         filter_id: None,
                                         via: None,
+                                        preview: false,
                                     }),
                                 );
                             }

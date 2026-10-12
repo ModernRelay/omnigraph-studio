@@ -8,7 +8,8 @@
 //! Each argument after the output path is an action, `name` or `name=<json>`, dispatched after
 //! the previous one settles. `type:<text>` types text into the focused editor (`\n` is a new
 //! line); it is `editor::HandleInput` with the text. `click:<x>,<y>` clicks at a point in
-//! window pixels (half the PNG's, which is drawn at 2x). `SNAPSHOT_WAIT_MS` (default 1500) is how
+//! window pixels (half the PNG's, which is drawn at 2x); `drag:<x1>,<y1>,<x2>,<y2>` presses at
+//! the first point, moves to the second in steps, and releases. `SNAPSHOT_WAIT_MS` (default 1500) is how
 //! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
 //! 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`.
 
@@ -19,6 +20,50 @@ use gpui::{
     AnyWindowHandle, Focusable as _, HeadlessAppContext, Modifiers, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, PlatformInput, point, px, size,
 };
+
+/// A left-button drag from `from` to `to`, in ten moves.
+fn drag(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    from: gpui::Point<gpui::Pixels>,
+    to: gpui::Point<gpui::Pixels>,
+) {
+    let mut events = vec![
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position: from,
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        }),
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position: from,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        }),
+    ];
+    for step in 1..=10 {
+        let t = step as f32 / 10.;
+        events.push(PlatformInput::MouseMove(MouseMoveEvent {
+            position: point(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        }));
+    }
+    events.push(PlatformInput::MouseUp(MouseUpEvent {
+        button: MouseButton::Left,
+        position: to,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    }));
+    for event in events {
+        cx.update_window(handle, |_, window, cx| {
+            window.dispatch_event(event, cx);
+        })
+        .expect("dispatch a mouse event");
+        cx.run_until_parked();
+    }
+}
 
 /// A left click at `position`, as the platform delivers one: move, press, release.
 fn click(
@@ -116,6 +161,23 @@ fn main() {
     settle(&mut cx, wait);
 
     for spec in actions {
+        if let Some(points) = spec.strip_prefix("drag:") {
+            let n: Vec<f32> = points
+                .split(',')
+                .map(|v| v.trim().parse().expect("drag points are numbers"))
+                .collect();
+            let [x1, y1, x2, y2] = n[..] else {
+                panic!("drag:<x1>,<y1>,<x2>,<y2>")
+            };
+            drag(
+                &mut cx,
+                handle,
+                point(px(x1), px(y1)),
+                point(px(x2), px(y2)),
+            );
+            settle(&mut cx, wait);
+            continue;
+        }
         if let Some((x, y)) = spec
             .strip_prefix("click:")
             .and_then(|at| at.split_once(','))

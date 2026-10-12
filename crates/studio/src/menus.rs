@@ -7,9 +7,10 @@ use studio_actions::graph::{
     CreateBranch, MergeBranch, NewQuery, OpenCanvas, OpenHistory, OpenInspector, ReviewBranch,
 };
 use studio_actions::workspace::{
-    CloseActiveItem, GoBack, GoForward, GoTo, NewWindow, OpenGraph, OpenSettings, Quit, Refresh,
-    ShowKeyBindings, SwitchBranch, ToggleActivity, ToggleCommandPalette, ToggleInspector,
-    ToggleSidebar,
+    ActivateNextPane, ActivatePreviousPane, CloseActiveItem, CloseAllItems, CloseOtherItems,
+    GoBack, GoForward, GoTo, NewWindow, OpenGraph, OpenSettings, Quit, Refresh, ShowKeyBindings,
+    SplitDown, SplitRight, SwitchBranch, ToggleActivity, ToggleCommandPalette, ToggleInspector,
+    TogglePinTab, ToggleSidebar,
 };
 
 pub fn set(cx: &mut App) {
@@ -26,6 +27,8 @@ pub fn set(cx: &mut App) {
             MenuItem::action("New Window", NewWindow),
             MenuItem::separator(),
             MenuItem::action("Close Tab", CloseActiveItem),
+            MenuItem::action("Close Other Tabs", CloseOtherItems),
+            MenuItem::action("Close All Tabs", CloseAllItems),
         ]),
         Menu::new("Edit").items([
             MenuItem::os_action("Undo", editor::actions::Undo, OsAction::Undo),
@@ -50,6 +53,12 @@ pub fn set(cx: &mut App) {
             MenuItem::action("Sidebar", ToggleSidebar),
             MenuItem::action("Inspector", ToggleInspector),
             MenuItem::action("Activity", ToggleActivity),
+            MenuItem::separator(),
+            MenuItem::action("Split Right", SplitRight),
+            MenuItem::action("Split Down", SplitDown),
+            MenuItem::action("Next Pane", ActivateNextPane),
+            MenuItem::action("Previous Pane", ActivatePreviousPane),
+            MenuItem::action("Pin Tab", TogglePinTab),
         ]),
         Menu::new("Graph").items([
             MenuItem::action("Refresh", Refresh),

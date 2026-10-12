@@ -631,6 +631,7 @@ fn add_type_rows(
             at_commit: None,
             filter_id: None,
             via: None,
+            preview: false,
         };
         if !window.is_action_available(&action, cx) {
             return;

@@ -24,11 +24,25 @@ pub struct SavedItem {
     pub data: Value,
 }
 
+/// One pane's tabs: the active one and how many are pinned (they come first).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedPane {
+    pub items: Vec<SavedItem>,
+    pub active: usize,
+    pub pinned: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SavedWorkspace {
+    /// The tabs of a file written before splits; read as one pane.
     pub items: Vec<SavedItem>,
     pub active: usize,
+    /// The panes in reading order, and the split tree over their positions in this list.
+    pub panes: Vec<SavedPane>,
+    pub layout: Option<crate::Member>,
+    pub active_pane: usize,
     pub sidebar_open: bool,
     pub inspector_open: bool,
     pub activity_open: bool,
@@ -182,12 +196,24 @@ mod tests {
 
     #[test]
     fn a_saved_workspace_round_trips_and_tolerates_missing_keys() {
+        let mut layout = crate::Member::Pane(0);
+        layout.split(0, 1, crate::SplitDirection::Right);
         let saved = SavedWorkspace {
-            items: vec![SavedItem {
-                kind: "type_table".into(),
-                data: serde_json::json!({"type_name": "Person"}),
-            }],
+            items: Vec::new(),
             active: 0,
+            panes: vec![
+                SavedPane {
+                    items: vec![SavedItem {
+                        kind: "type_table".into(),
+                        data: serde_json::json!({"type_name": "Person"}),
+                    }],
+                    active: 0,
+                    pinned: 1,
+                },
+                SavedPane::default(),
+            ],
+            layout: Some(layout),
+            active_pane: 1,
             sidebar_open: true,
             inspector_open: false,
             activity_open: true,
@@ -206,5 +232,9 @@ mod tests {
         let partial: SavedWorkspace = serde_json::from_str(r#"{"active": 2}"#).unwrap();
         assert_eq!(partial.active, 2);
         assert!(partial.items.is_empty());
+        assert!(
+            partial.panes.is_empty() && partial.layout.is_none(),
+            "a file from before splits"
+        );
     }
 }

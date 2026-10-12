@@ -502,6 +502,7 @@ impl RelationshipTree {
                 at_commit: None,
                 filter_id: Some(node.id.clone()),
                 via: None,
+                preview: false,
             },
             Some(EntryKind::Group { key, .. }) => {
                 // Seen from the other type, the relationship runs the other way.
@@ -518,6 +519,7 @@ impl RelationshipTree {
                     at_commit: None,
                     filter_id: Some(key.node.id.clone()),
                     via: Some(gq_language::builder::relationship_key(&back)),
+                    preview: false,
                 }
             }
             _ => return,
