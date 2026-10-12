@@ -1,9 +1,13 @@
 //! Completion for `.gq` source from the schema (spec 007).
 //!
-//! A lexical heuristic, not a parser: after `$var.` it offers the bound type's properties;
-//! otherwise types, relationships (traversal spelling) and keywords that start with the word
-//! being typed.
+//! A lexical heuristic, not a parser: after `$` it offers the parameters and bindings of the
+//! declaration under the cursor; after `$var.` the bound type's properties; after `$param:` in
+//! a signature the parameter types; otherwise types, relationships (traversal spelling) and
+//! keywords that start with the word being typed.
 
+use std::ops::Range;
+
+use crate::lex::{TokenKind, outline, tokenize};
 use crate::schema::{SchemaModel, traversal_name};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,6 +16,8 @@ pub enum CompletionKind {
     Type,
     Relationship,
     Property,
+    /// A parameter or a `match` binding, offered after `$`.
+    Variable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +31,11 @@ const KEYWORDS: &[&str] = &[
     "query", "match", "return", "order", "limit", "insert", "update", "set", "where", "delete",
     "not", "exists", "count", "sum", "min", "max", "avg", "and", "or", "in", "is", "null", "asc",
     "desc", "nearest", "search", "fuzzy", "bm25", "rrf", "now", "explain", "branch", "show",
+];
+
+/// The types a parameter can be declared with.
+const PARAMETER_TYPES: &[&str] = &[
+    "String", "Bool", "I32", "I64", "U32", "U64", "F32", "F64", "Date", "DateTime",
 ];
 
 /// Completions for the word ending at `offset` (a byte offset into `source`). Returns the byte
@@ -43,6 +54,55 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
     let lower = prefix.to_lowercase();
     let matches = |label: &str| label.to_lowercase().starts_with(&lower);
 
+    let declaration = outline(source)
+        .declaration_at(offset)
+        .map(|d| d.range.clone())
+        .unwrap_or(0..source.len());
+    let signature = signature(source, declaration.clone());
+    let in_signature = signature
+        .as_ref()
+        .is_some_and(|s| s.start <= start && offset <= s.end);
+
+    // `$` → the declaration's parameters and bindings; none while a parameter is being named.
+    if before[..start].ends_with('$') {
+        if in_signature {
+            return (start, Vec::new());
+        }
+        let mut items: Vec<Completion> = Vec::new();
+        let names = parameters(source, signature.as_ref())
+            .into_iter()
+            .chain(bindings(
+                schema,
+                source,
+                declaration.clone(),
+                signature.as_ref(),
+            ));
+        for (name, detail) in names {
+            if matches(&name) && name != prefix && !items.iter().any(|i| i.label == name) {
+                items.push(Completion {
+                    label: name,
+                    kind: CompletionKind::Variable,
+                    detail: Some(detail),
+                });
+            }
+        }
+        return (start, items);
+    }
+
+    // `$param: ` in a signature → parameter types.
+    if in_signature && ends_with_after_space(&before[..start], &[':', '[']) {
+        let items = PARAMETER_TYPES
+            .iter()
+            .filter(|t| matches(t))
+            .map(|t| Completion {
+                label: (*t).into(),
+                kind: CompletionKind::Type,
+                detail: Some("parameter type".into()),
+            })
+            .collect();
+        return (start, items);
+    }
+
     // `$var.` → properties of the type `$var` is bound to.
     if before[..start].ends_with('.') {
         let var_end = start - 1;
@@ -56,7 +116,11 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
         if var_start > 0 && before.as_bytes()[var_start - 1] == b'$' {
             let var = &before[var_start..var_end];
             let mut items = Vec::new();
-            if let Some(type_name) = bound_type(source, var) {
+            let bound = bindings(schema, source, declaration.clone(), signature.as_ref())
+                .into_iter()
+                .find(|(name, _)| name == var)
+                .map(|(_, type_name)| type_name);
+            if let Some(type_name) = bound {
                 let properties = schema
                     .node(&type_name)
                     .map(|n| n.properties.clone())
@@ -117,22 +181,113 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
     (start, items)
 }
 
-/// The type in the first `$var: Type` binding, or the edge in `$var:edge` for edge bindings.
-fn bound_type(source: &str, var: &str) -> Option<String> {
-    let needle = format!("${var}:");
-    let at = source.find(&needle)? + needle.len();
-    let rest = source[at..].trim_start();
-    let name: String = rest
+/// Whether `text` ends with one of `chars`, ignoring trailing spaces.
+fn ends_with_after_space(text: &str, chars: &[char]) -> bool {
+    text.trim_end()
         .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect();
-    if name.is_empty() {
-        return None;
+        .last()
+        .is_some_and(|c| chars.contains(&c))
+}
+
+/// The text between a declaration's signature parentheses, or to its end while unclosed.
+/// `None` when the declaration has no signature before its body.
+fn signature(source: &str, declaration: Range<usize>) -> Option<Range<usize>> {
+    let text = &source[declaration.clone()];
+    let mut open = None;
+    let mut depth = 0usize;
+    for token in tokenize(text) {
+        match &text[token.range.clone()] {
+            "{" if open.is_none() => return None,
+            "(" => {
+                open.get_or_insert(token.range.end);
+                depth += 1;
+            }
+            ")" if open.is_some() => {
+                depth -= 1;
+                if depth == 0 {
+                    let open = open?;
+                    return Some(declaration.start + open..declaration.start + token.range.start);
+                }
+            }
+            _ => {}
+        }
     }
-    // `$e:worksAt` binds an edge; edges are declared with a capital first letter.
-    let mut chars = name.chars();
-    let first = chars.next()?;
-    Some(first.to_uppercase().chain(chars).collect())
+    open.map(|open| declaration.start + open..declaration.end)
+}
+
+/// `$name: Type` parameters of a signature, as (name, declared type).
+fn parameters(source: &str, signature: Option<&Range<usize>>) -> Vec<(String, String)> {
+    let Some(signature) = signature else {
+        return Vec::new();
+    };
+    let text = &source[signature.clone()];
+    let mut parts = Vec::new();
+    let (mut depth, mut from) = (0usize, 0);
+    for (i, c) in text.char_indices() {
+        match c {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&text[from..i]);
+                from = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[from..]);
+    parts
+        .into_iter()
+        .filter_map(|part| {
+            let (name, type_name) = part.trim().strip_prefix('$')?.split_once(':')?;
+            let (name, type_name) = (name.trim(), type_name.trim());
+            (!name.is_empty() && !type_name.is_empty())
+                .then(|| (name.to_owned(), type_name.to_owned()))
+        })
+        .collect()
+}
+
+/// `$var: Type` and `$var:edge` bindings in a declaration's body, as (name, node or edge type).
+fn bindings(
+    schema: &SchemaModel,
+    source: &str,
+    declaration: Range<usize>,
+    signature: Option<&Range<usize>>,
+) -> Vec<(String, String)> {
+    let body = signature.map_or(declaration.start, |s| s.end)..declaration.end;
+    let text = &source[body];
+    let tokens = tokenize(text);
+    let word = |i: usize| tokens.get(i).map(|t| &text[t.range.clone()]);
+    let mut found = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        if token.kind != TokenKind::Variable || word(i + 1) != Some(":") {
+            continue;
+        }
+        let Some(target) = tokens.get(i + 2) else {
+            continue;
+        };
+        let name = &text[token.range.start + 1..token.range.end];
+        let target = &text[target.range.clone()];
+        let type_name = if schema.node(target).is_some() || schema.edge(target).is_some() {
+            target.to_owned()
+        } else if let Some(edge) = schema
+            .edges
+            .iter()
+            .find(|e| traversal_name(&e.name) == target)
+        {
+            edge.name.clone()
+        } else {
+            // `$e:worksAt` for an edge the schema does not know: edges are capitalised.
+            let mut chars = target.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+                None => continue,
+            }
+        };
+        if !name.is_empty() && !found.iter().any(|(n, _)| n == name) {
+            found.push((name.to_owned(), type_name));
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -164,5 +319,57 @@ mod tests {
         assert!(items.iter().any(|i| i.label == "worksAt"));
         let (_, items) = completions(&schema, "ret", 3);
         assert!(items.iter().any(|i| i.label == "return"));
+    }
+
+    #[test]
+    fn completes_parameters_and_bindings_after_a_dollar() {
+        let schema = dev();
+        let source = "query q($name: String, $ids: [String]?) {\n  match { $p: Person  $p worksAt $c  $e:worksAt }\n  return { $";
+        let (start, items) = completions(&schema, source, source.len());
+        assert_eq!(start, source.len());
+        let found: Vec<_> = items
+            .iter()
+            .map(|i| (i.label.as_str(), i.detail.as_deref().unwrap_or_default()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("name", "String"),
+                ("ids", "[String]?"),
+                ("p", "Person"),
+                ("e", "WorksAt"),
+            ]
+        );
+        assert!(items.iter().all(|i| i.kind == CompletionKind::Variable));
+        let typed = format!("{source}i");
+        let (_, items) = completions(&schema, &typed, typed.len());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "ids");
+    }
+
+    #[test]
+    fn a_dollar_in_a_signature_names_a_parameter() {
+        let schema = dev();
+        let source = "query q($";
+        let (_, items) = completions(&schema, source, source.len());
+        assert!(items.is_empty());
+        let source = "query q($n: I";
+        let (_, items) = completions(&schema, source, source.len());
+        let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["I32", "I64"]);
+    }
+
+    #[test]
+    fn variables_belong_to_the_declaration_under_the_cursor() {
+        let schema = dev();
+        let source = "query a() { match { $x: Company } return { $x.name } }\nquery b($x: String) { match { $p: Person } return { $p.na";
+        let (_, items) = completions(&schema, source, source.len());
+        assert_eq!(items[0].label, "name");
+        let source = "query a() { match { $x: Company } return { $x.name } }\nquery b() { match { $x: Person } return { $x.bo";
+        let (_, items) = completions(&schema, source, source.len());
+        assert_eq!(
+            items[0].label, "born",
+            "`$x` is a Person here, not the first query's Company"
+        );
     }
 }

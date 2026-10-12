@@ -93,6 +93,6 @@ impl CompletionProvider for GqCompletionProvider {
     ) -> bool {
         text.chars()
             .last()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '$'))
     }
 }

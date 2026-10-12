@@ -66,7 +66,10 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   listed under the editor (code, message, fix, line:column; a click moves the cursor there).
   A type error the compiler reports without a position is placed on the last name its message
   quotes.
-- Completion goes through Zed's `CompletionProvider` with `gq_language::completions`.
+- Completion goes through Zed's `CompletionProvider` with `gq_language::completions`. After `$`
+  it offers the parameters and `match` bindings of the declaration under the cursor with their
+  types; after `$var.` the properties of that declaration's binding of `$var`; after `$param:`
+  in a signature the parameter types; elsewhere types, relationships and keywords.
 - ⌘↵ runs the declaration under the cursor (else the last one before it, else the first) as the
   settings prefix plus that declaration, so a broken sibling does not stop it. A read goes to
   `POST /query` on the session branch; the result header shows rows, elapsed time, the branch
@@ -117,6 +120,7 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 | 2026-10-12 | `explain` rows | `POST /query` with `explain query …` against the 0.13 dev server | Columns `tree, depth, node, detail`; trees `logical`, `physical`, `datafusion`, then `plan` rows with a null depth (`pass`, `route`, `logical_hash`, `statistics`, `assumptions`) |
 | 2026-10-12 | Statements and mutations on `POST /query` | dev server | A statement with a `branch` target is refused ("a branch statement names its branches itself; drop the request target"); a mutation is refused ("use POST /mutate for write queries"), so a mis-classified write cannot run as a read |
 | 2026-10-12 | Compiler result names | `describe_query_operation` in `gq_language::check` | Names a projected property alone (`slug`) where the server says `c.slug`; types are matched to server columns by position |
+| 2026-10-12 | `$` completion | `gq_language` completion tests; an offscreen snapshot of `$p.name = $` in a two-parameter query | Offers `name String`, `p Person`, `since I32?`; nothing while a parameter is being named; `$x.` follows the binding of the declaration under the cursor |
 | 2026-10-12 | Run loop end to end | offscreen snapshots against the dev server: example query, run, explain, parameters, confirm bar, committed and refused writes, a parse error underline, completion | As described under What landed |
 
 ## Corrections
