@@ -4,8 +4,10 @@
 use gpui::{App, Menu, MenuItem, OsAction, SystemMenuType};
 use studio_actions::agent::OpenAgent;
 use studio_actions::graph::{
-    CreateBranch, MergeBranch, NewQuery, OpenCanvas, OpenHistory, OpenInspector, ReviewBranch,
+    CreateBranch, MergeBranch, NewQuery, OpenCanvas, OpenHistory, OpenInspector, OpenQueryFile,
+    ReviewBranch,
 };
+use studio_actions::query::{Save, SaveAs};
 use studio_actions::workspace::{
     ActivateNextPane, ActivatePreviousPane, CloseActiveItem, CloseAllItems, CloseOtherItems,
     GoBack, GoForward, GoTo, NewWindow, OpenGraph, OpenSettings, Quit, Refresh, ShowKeyBindings,
@@ -25,6 +27,11 @@ pub fn set(cx: &mut App) {
         Menu::new("File").items([
             MenuItem::action("Open Graph…", OpenGraph),
             MenuItem::action("New Window", NewWindow),
+            MenuItem::separator(),
+            MenuItem::action("New Query", NewQuery),
+            MenuItem::action("Open Query File…", OpenQueryFile::default()),
+            MenuItem::action("Save Query", Save),
+            MenuItem::action("Save Query As…", SaveAs),
             MenuItem::separator(),
             MenuItem::action("Close Tab", CloseActiveItem),
             MenuItem::action("Close Other Tabs", CloseOtherItems),

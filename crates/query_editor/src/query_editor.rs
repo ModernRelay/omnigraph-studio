@@ -5,14 +5,63 @@
 
 mod analysis;
 mod completion;
+mod queries_panel;
 mod results;
 mod view;
 
-use gpui::App;
-use studio_actions::graph::{NewQuery, OpenQueryAt};
-use studio_workspace::{ToastKind, Workspace};
+use std::path::PathBuf;
+
+use gpui::{App, AppContext as _, Context, Global, PathPromptOptions, Window};
+use studio_actions::graph::{NewQuery, OpenQueryAt, OpenQueryFile};
+use studio_workspace::{PanelPosition, ToastKind, Workspace};
+use ui::IconName;
 
 pub use view::QueryEditor;
+
+/// Bumped whenever a query file is written, so lists of saved queries read the folder again.
+#[derive(Default)]
+pub struct SavedQueriesChanged(pub usize);
+
+impl Global for SavedQueriesChanged {}
+
+pub(crate) fn saved_queries_changed(cx: &mut App) {
+    cx.default_global::<SavedQueriesChanged>().0 += 1;
+}
+
+/// Opens `path` in a query tab, or the tab already editing it; the draft comes from `text`
+/// when given (a remembered tab), else from the file.
+fn open_file(
+    workspace: &mut Workspace,
+    path: PathBuf,
+    text: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(session) = workspace.session().cloned() else {
+        return;
+    };
+    let on_disk = std::fs::read_to_string(&path).ok();
+    if on_disk.is_none() && text.is_none() {
+        workspace.show_toast(
+            ToastKind::Error,
+            format!("{} could not be read.", path.display()),
+            cx,
+        );
+        return;
+    }
+    let number = view::next_number();
+    let key = view::file_key(&path);
+    workspace.open_item(key, window, cx, move |window, cx| {
+        let mut editor = QueryEditor::new(number, session, window, cx);
+        editor.set_text(
+            text.as_deref().or(on_disk.as_deref()).unwrap_or_default(),
+            window,
+            cx,
+        );
+        editor.set_file(path, on_disk, cx);
+        editor
+    });
+}
 
 /// Registers `NewQuery` with every new workspace and binds the editor's keys.
 pub fn init(cx: &mut App) {
@@ -29,6 +78,10 @@ pub fn init(cx: &mut App) {
             .get("at_commit")
             .and_then(|commit| commit.as_str())
             .map(str::to_owned);
+        if let Some(path) = data.get("path").and_then(|path| path.as_str()) {
+            open_file(workspace, PathBuf::from(path), Some(text), window, cx);
+            return;
+        }
         let number = view::next_number();
         workspace.open_item(format!("query:{number}"), window, cx, |window, cx| {
             let mut editor = QueryEditor::new(number, session, window, cx);
@@ -39,7 +92,47 @@ pub fn init(cx: &mut App) {
             editor
         });
     });
-    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
+    cx.observe_new(|workspace: &mut Workspace, window, cx| {
+        if let Some(window) = window {
+            let handle = cx.entity().downgrade();
+            let session = workspace.session().cloned();
+            let panel = cx.new(|cx| queries_panel::QueriesPanel::new(handle, session, window, cx));
+            workspace.add_panel(
+                PanelPosition::Left,
+                queries_panel::QUERIES_PANEL,
+                "Queries",
+                IconName::FileCode,
+                panel.into(),
+                cx,
+            );
+        }
+        workspace.register_action(|workspace, action: &OpenQueryFile, window, cx| {
+            match &action.path {
+                Some(path) => open_file(workspace, PathBuf::from(path), None, window, cx),
+                None => {
+                    let chosen = cx.prompt_for_paths(PathPromptOptions {
+                        files: true,
+                        directories: false,
+                        multiple: false,
+                        prompt: Some("Open".into()),
+                    });
+                    cx.spawn_in(window, async move |workspace, cx| {
+                        let Ok(Ok(Some(paths))) = chosen.await else {
+                            return;
+                        };
+                        let Some(path) = paths.into_iter().next() else {
+                            return;
+                        };
+                        workspace
+                            .update_in(cx, |workspace, window, cx| {
+                                open_file(workspace, path, None, window, cx)
+                            })
+                            .ok();
+                    })
+                    .detach();
+                }
+            }
+        });
         workspace.register_action(|workspace, action: &OpenQueryAt, window, cx| {
             let Some(session) = workspace.session().cloned() else {
                 return;

@@ -46,6 +46,14 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 - **Explain:** `explain query …` rendered as a tree; hovering an operator highlights its part of
   the query.
 - **Files:** `.gq` files on disk can be opened; queries can be saved per graph.
+  Built: ⌘S saves a query tab to its file; a new query goes to the graph's queries folder
+  (`<data dir>/queries/<server>~<graph>/`), named after its first declaration
+  (`list_company.gq`, then `-2`, …). ⌘⇧S picks any path in the system dialog; ⌘O opens a file
+  (or `studio_graph::OpenQueryFile { path }`). A file tab is titled by the file, keyed by its
+  path so it opens once, and shows the changed dot while its text differs from the file; its
+  draft and path come back after a restart. The left dock's Queries panel lists the folder,
+  newest first, with New query, Open a file… and Show the folder; the palette's Queries scope
+  lists saved files no tab has open.
 
 ## Decisions
 
@@ -95,7 +103,6 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   sends the branch today.
 - Tree-sitter highlighting, folding and outline (`grammars/tree-sitter-gq`); quick fixes from
   `Suggestion`/`TextEdit`.
-- Opening and saving `.gq` files, and saved queries per graph.
 - A row cap: the result shows every row the server returns, so the query's own `limit` is the
   cap today (constitution IX). The example query carries `limit 50`.
 - A read's server diagnostic: `graph_client::ReadError::Refused` keeps only the message, status
@@ -121,6 +128,7 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 | 2026-10-12 | Statements and mutations on `POST /query` | dev server | A statement with a `branch` target is refused ("a branch statement names its branches itself; drop the request target"); a mutation is refused ("use POST /mutate for write queries"), so a mis-classified write cannot run as a read |
 | 2026-10-12 | Compiler result names | `describe_query_operation` in `gq_language::check` | Names a projected property alone (`slug`) where the server says `c.slug`; types are matched to server columns by position |
 | 2026-10-12 | `$` completion | `gq_language` completion tests; an offscreen snapshot of `$p.name = $` in a two-parameter query | Offers `name String`, `p Person`, `since I32?`; nothing while a parameter is being named; `$x.` follows the binding of the declaration under the cursor |
+| 2026-10-12 | Saved queries | offscreen snapshots: a new query, `key:cmd-s`, the Queries panel; a second run with restore, `OpenQueryFile` on the same path, the palette's Queries scope | `list_company.gq` written to the graph folder; the tab took its name and showed the dot after an edit; restored with its draft; the second open reused the tab |
 | 2026-10-12 | Run loop end to end | offscreen snapshots against the dev server: example query, run, explain, parameters, confirm bar, committed and refused writes, a parse error underline, completion | As described under What landed |
 
 ## Corrections

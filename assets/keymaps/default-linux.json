@@ -34,7 +34,11 @@
       "ctrl-alt-right": "studio::ActivateNextPane",
       "ctrl-alt-left": "studio::ActivatePreviousPane",
       "ctrl-alt-]": "studio::ActivateNextGraph",
-      "ctrl-alt-[": "studio::ActivatePreviousGraph"
+      "ctrl-alt-[": "studio::ActivatePreviousGraph",
+      "ctrl-o": [
+        "studio_graph::OpenQueryFile",
+        {}
+      ]
     }
   },
   {
@@ -194,14 +198,18 @@
     "context": "QueryEditor > Editor",
     "bindings": {
       "ctrl-enter": "studio_query::Run",
-      "ctrl-shift-enter": "studio_query::Explain"
+      "ctrl-shift-enter": "studio_query::Explain",
+      "ctrl-s": "studio_query::Save",
+      "ctrl-shift-s": "studio_query::SaveAs"
     }
   },
   {
     "context": "QueryEditor",
     "bindings": {
       "ctrl-enter": "studio_query::Run",
-      "ctrl-shift-enter": "studio_query::Explain"
+      "ctrl-shift-enter": "studio_query::Explain",
+      "ctrl-s": "studio_query::Save",
+      "ctrl-shift-s": "studio_query::SaveAs"
     }
   },
   {

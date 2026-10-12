@@ -195,6 +195,10 @@ pub fn next_number() -> usize {
 pub struct QueryEditor {
     number: usize,
     session: Entity<GraphSession>,
+    /// The `.gq` file this tab edits, and its text as last read or written (spec 007).
+    path: Option<std::path::PathBuf>,
+    saved_text: Option<String>,
+    file_error: Option<String>,
     /// Reads run at this commit and writes are refused (spec 009); `None` uses the branch.
     at_commit: Option<String>,
     editor: Entity<Editor>,
@@ -225,10 +229,26 @@ impl Focusable for QueryEditor {
 
 impl Item for QueryEditor {
     fn tab_title(&self, _cx: &App) -> SharedString {
+        let name = match &self.path {
+            Some(path) => path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("Query {}", self.number)),
+            None => format!("Query {}", self.number),
+        };
         match &self.at_commit {
-            Some(commit) => format!("Query {} @ {}", self.number, short_commit_id(commit)).into(),
-            None => format!("Query {}", self.number).into(),
+            Some(commit) => format!("{name} @ {}", short_commit_id(commit)).into(),
+            None => name.into(),
         }
+    }
+
+    /// A file-backed query with changes since it was saved.
+    fn is_dirty(&self, cx: &App) -> bool {
+        self.writing
+            || self
+                .saved_text
+                .as_ref()
+                .is_some_and(|saved| *saved != self.editor.read(cx).text(cx))
     }
 
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
@@ -236,7 +256,10 @@ impl Item for QueryEditor {
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
-        Some(format!("query:{}", self.number).into())
+        Some(match &self.path {
+            Some(path) => file_key(path).into(),
+            None => format!("query:{}", self.number).into(),
+        })
     }
 
     /// The draft comes back after a restart (spec 007: the text is never cleared). It is
@@ -247,6 +270,7 @@ impl Item for QueryEditor {
             data: serde_json::json!({
                 "text": self.editor.read(cx).text(cx),
                 "at_commit": self.at_commit,
+                "path": self.path.as_ref().map(|path| path.to_string_lossy().into_owned()),
             }),
         })
     }
@@ -297,6 +321,9 @@ impl QueryEditor {
         let mut this = Self {
             number,
             session,
+            path: None,
+            saved_text: None,
+            file_error: None,
             at_commit: None,
             editor,
             analysis: None,
@@ -323,6 +350,108 @@ impl QueryEditor {
         self.at_commit = Some(commit);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
+    }
+
+    /// Makes this tab edit `path`, whose text on disk is `saved` (`None` when it could not be
+    /// read, so any text counts as changed).
+    pub fn set_file(
+        &mut self,
+        path: std::path::PathBuf,
+        saved: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.path = Some(path);
+        self.saved_text = Some(saved.unwrap_or_default());
+        self.file_error = None;
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// ⌘S: writes the file this tab edits; a new query is saved in this graph's queries folder,
+    /// named after its first declaration.
+    fn save(
+        &mut self,
+        _: &studio_actions::query::Save,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = match &self.path {
+            Some(path) => path.clone(),
+            None => {
+                let graph = self.session.read(cx).settings_key(cx);
+                let name = gq_language::outline(&self.editor.read(cx).text(cx))
+                    .declarations
+                    .first()
+                    .map(|d| d.name.clone())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| format!("query-{}", self.number));
+                unused_path(&studio_settings::queries_dir(&graph), &name)
+            }
+        };
+        self.write_to(path, window, cx);
+    }
+
+    /// ⌘⇧S: writes the query to a file chosen in the system's save dialog.
+    fn save_as(
+        &mut self,
+        _: &studio_actions::query::SaveAs,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let graph = self.session.read(cx).settings_key(cx);
+        let directory = self
+            .path
+            .as_ref()
+            .and_then(|path| path.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| studio_settings::queries_dir(&graph));
+        std::fs::create_dir_all(&directory).ok();
+        let suggested = self
+            .path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "query.gq".to_owned());
+        let chosen = cx.prompt_for_new_path(&directory, Some(&suggested));
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(path))) = chosen.await else {
+                return;
+            };
+            this.update_in(cx, |this, window, cx| this.write_to(path, window, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    fn write_to(&mut self, path: std::path::PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.editor.read(cx).text(cx);
+        let written = text.clone();
+        let target = path.clone();
+        let write = cx.background_spawn(async move {
+            if let Some(dir) = target.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&target, written)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = write.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.path = Some(path);
+                        this.saved_text = Some(text);
+                        this.file_error = None;
+                        crate::saved_queries_changed(cx);
+                    }
+                    Err(error) => {
+                        this.file_error = Some(format!("Could not save: {error}"));
+                    }
+                }
+                cx.emit(ItemEvent::UpdateTab);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Replaces the draft, as when a remembered tab comes back.
@@ -364,6 +493,10 @@ impl QueryEditor {
     // ---- editing ----
 
     fn edited(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saved_text.is_some() {
+            // The tab's changed-since-saved dot follows the text.
+            cx.emit(ItemEvent::UpdateTab);
+        }
         self.highlight_syntax(cx);
         self.schedule_check(window, cx);
         self.cursor_moved(window, cx);
@@ -861,8 +994,12 @@ impl QueryEditor {
         };
         let busy = self.writing;
         let pinned = self.at_commit.clone();
+        let file_error = self.file_error.clone();
         studio_ui::ds::toolbar(cx)
             .px_2()
+            .when_some(file_error, |toolbar, error| {
+                toolbar.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+            })
             .when_some(pinned, |toolbar, commit| {
                 toolbar.child(
                     div()
@@ -1673,6 +1810,8 @@ impl Render for QueryEditor {
             .key_context("QueryEditor")
             .on_action(cx.listener(Self::run))
             .on_action(cx.listener(Self::explain))
+            .on_action(cx.listener(Self::save))
+            .on_action(cx.listener(Self::save_as))
             .size_full()
             .child(toolbar)
             .child(
@@ -1689,4 +1828,30 @@ impl Render for QueryEditor {
             .children(confirm)
             .child(results)
     }
+}
+
+/// The dedupe key of a tab editing `path`, so a file opens once.
+pub fn file_key(path: &std::path::Path) -> String {
+    format!("query-file:{}", path.display())
+}
+
+/// `dir/name.gq`, or `dir/name-2.gq` and so on when that is taken.
+fn unused_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut candidate = dir.join(format!("{safe}.gq"));
+    let mut n = 2;
+    while candidate.exists() {
+        candidate = dir.join(format!("{safe}-{n}.gq"));
+        n += 1;
+    }
+    candidate
 }

@@ -210,6 +210,14 @@ pub mod graph {
         pub id: String,
     }
 
+    /// Open a `.gq` file in a query tab; without a path, choose one.
+    #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct OpenQueryFile {
+        #[serde(default)]
+        pub path: Option<String>,
+    }
+
     /// Open a query editor that reads one commit, read-only (spec 009).
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
@@ -323,6 +331,10 @@ pub mod query {
             CopyCell,
             /// Copy the selected result row as JSON.
             CopyRow,
+            /// Save the query to its file, or to this graph's saved queries.
+            Save,
+            /// Save the query to a file you choose.
+            SaveAs,
         ]
     );
 }

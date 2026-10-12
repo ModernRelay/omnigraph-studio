@@ -289,6 +289,40 @@ pub fn data_dir() -> PathBuf {
     }
 }
 
+/// Where a graph's saved queries live (spec 007): one folder per [`graph_key`] under the data
+/// directory, its name made safe for any file system.
+pub fn queries_dir(graph: &str) -> PathBuf {
+    let safe: String = graph
+        .chars()
+        .map(|c| match c {
+            '/' => '~',
+            c if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') => c,
+            _ => '_',
+        })
+        .collect();
+    data_dir().join("queries").join(safe)
+}
+
+/// A graph's saved `.gq` files, the most recently changed first.
+pub fn saved_queries(graph: &str) -> Vec<(PathBuf, SystemTime)> {
+    let Ok(entries) = std::fs::read_dir(queries_dir(graph)) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(PathBuf, SystemTime)> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "gq"))
+        .map(|path| {
+            let modified = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            (path, modified)
+        })
+        .collect();
+    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    files
+}
+
 pub fn settings_path() -> PathBuf {
     data_dir().join("settings.json")
 }
@@ -554,6 +588,13 @@ mod tests {
         assert_eq!(StudioSettings::parse(&text).unwrap(), settings);
         settings.delete_view("dev/knowledge", "Person", "Founders");
         assert!(settings.graphs.is_empty(), "an empty entry is dropped");
+    }
+
+    #[test]
+    fn query_folders_are_safe_names_per_graph() {
+        let dir = queries_dir("environment/knowledge");
+        assert!(dir.ends_with("queries/environment~knowledge"), "{dir:?}");
+        assert!(queries_dir("http://a b/g").ends_with("queries/http_~~a_b~g"));
     }
 
     #[test]

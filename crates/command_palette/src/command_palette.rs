@@ -26,7 +26,7 @@ use gq_language::builder::node_search;
 use graph_store::{GraphSession, Loadable};
 use serde_json::Value;
 use studio_actions::agent::Ask;
-use studio_actions::graph::{OpenNode, OpenType};
+use studio_actions::graph::{OpenNode, OpenQueryFile, OpenType};
 use studio_actions::palette::{AskAgent, ShowScope};
 use studio_actions::workspace::{GoTo, ShowKeyBindings, SwitchBranch, ToggleCommandPalette};
 use studio_workspace::{ToastKind, Workspace};
@@ -69,11 +69,16 @@ fn open(
         workspace.show_toast(ToastKind::Info, "Open a graph first.", cx);
         return;
     }
-    // Open query tabs, for the Queries scope: the tab, its title and its first line.
+    // Open query tabs, for the Queries scope: the tab, its title and its first line; then the
+    // graph's saved query files that no tab has open.
+    let mut open_paths = Vec::new();
     let queries: Vec<(EntityId, String, String)> = workspace
         .all_items()
         .filter_map(|item| {
             let saved = item.serialize(cx).filter(|saved| saved.kind == "query")?;
+            if let Some(path) = saved.data.get("path").and_then(Value::as_str) {
+                open_paths.push(path.to_owned());
+            }
             let first = saved
                 .data
                 .get("text")
@@ -84,9 +89,19 @@ fn open(
             Some((item.item_id(), item.tab_title(cx).to_string(), first))
         })
         .collect();
+    let saved: Vec<String> = session
+        .as_ref()
+        .map(|session| {
+            studio_settings::saved_queries(&session.read(cx).settings_key(cx))
+                .into_iter()
+                .map(|(path, _)| path.to_string_lossy().into_owned())
+                .filter(|path| !open_paths.contains(path))
+                .collect()
+        })
+        .unwrap_or_default();
     let handle = cx.entity().downgrade();
     workspace.toggle_modal(window, cx, move |window, cx| {
-        CommandPalette::new(mode, session, handle, queries, window, cx)
+        CommandPalette::new(mode, session, handle, queries, saved, window, cx)
     });
 }
 
@@ -248,14 +263,19 @@ enum Row {
         id: EntityId,
         first_line: String,
     },
+    /// A saved query file of this graph.
+    Saved {
+        action: Box<dyn Action>,
+    },
 }
 
 impl Row {
     fn action(&self) -> Option<&dyn Action> {
         match self {
-            Row::Action { action, .. } | Row::Type { action, .. } | Row::Node { action, .. } => {
-                Some(action.as_ref())
-            }
+            Row::Action { action, .. }
+            | Row::Type { action, .. }
+            | Row::Node { action, .. }
+            | Row::Saved { action } => Some(action.as_ref()),
             Row::Branch { .. } | Row::Tab { .. } => None,
         }
     }
@@ -297,6 +317,7 @@ impl CommandPalette {
         session: Option<Entity<GraphSession>>,
         workspace: WeakEntity<Workspace>,
         queries: Vec<(EntityId, String, String)>,
+        saved: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -325,6 +346,20 @@ impl CommandPalette {
                     group: Group::Query,
                 });
                 rows.push(Row::Tab { id, first_line });
+            }
+            for path in saved {
+                let name = std::path::Path::new(&path)
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                candidates.push(Candidate {
+                    label: name,
+                    key: format!("query-file:{path}"),
+                    group: Group::Query,
+                });
+                rows.push(Row::Saved {
+                    action: Box::new(OpenQueryFile { path: Some(path) }),
+                });
             }
         }
 
@@ -613,6 +648,7 @@ impl CommandPalette {
                         String::new()
                     }),
                     Row::Tab { .. } => muted("open tab".into()),
+                    Row::Saved { .. } => muted("saved".into()),
                 };
                 let start: Option<gpui::Div> = match row {
                     Row::Type { kind, .. } => {
@@ -630,7 +666,7 @@ impl CommandPalette {
                             .color(Color::Muted),
                         ),
                     ),
-                    Row::Tab { .. } => Some(
+                    Row::Tab { .. } | Row::Saved { .. } => Some(
                         div().child(
                             Icon::new(IconName::Code)
                                 .size(IconSize::Small)
@@ -684,6 +720,7 @@ impl CommandPalette {
                 Some(format!("Go to this tab: {first_line}").into())
             }
             Row::Tab { .. } => Some("Go to this tab.".into()),
+            Row::Saved { .. } => Some("Open this saved query in a tab.".into()),
         }
     }
 }
