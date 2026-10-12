@@ -57,8 +57,8 @@ impl GridColumn {
     }
 }
 
-pub const ROW_HEIGHT: f32 = 36.;
-pub const HEADER_HEIGHT: f32 = 36.;
+pub const ROW_HEIGHT: f32 = ds::size::ROW;
+pub const HEADER_HEIGHT: f32 = ds::size::HEADER;
 
 /// The header row of a grid: one line per column, the name then its type, muted, with a
 /// hairline below (spec 002, "Visual language").

@@ -707,8 +707,89 @@ pub fn short_commit(id: &str) -> String {
     tail[start..].to_owned()
 }
 
+/// The most neighbour rows one page reads per relationship, and the most one row may bring:
+/// a row with more shows its count alone, rather than starving the rows after it.
+pub const RELATION_SAMPLE_BUDGET: i64 = 2000;
+pub const RELATION_SAMPLE_HUB: i64 = 200;
+
+/// The rows whose neighbours a page reads, in page order, and how many neighbour rows that is:
+/// every row's whole list, while the budget lasts. Paging by count would hand the first rows
+/// all of it and leave the rest bare.
+pub fn relation_sample(
+    ids: &[String],
+    counts: &std::collections::HashMap<String, i64>,
+) -> (Vec<String>, i64) {
+    let mut picked = Vec::new();
+    let mut total = 0;
+    for id in ids {
+        let degree = counts.get(id).copied().unwrap_or(0);
+        if degree == 0 || degree > RELATION_SAMPLE_HUB || total + degree > RELATION_SAMPLE_BUDGET {
+            continue;
+        }
+        picked.push(id.clone());
+        total += degree;
+    }
+    (picked, total)
+}
+
+/// How many chips fit whole in `available` pixels, with room for a "+N" after them when some
+/// are left out: by an estimate of each label's width at the tag's size, since a cell is laid
+/// out before its text is measured. A chip cut mid-name reads as a glitch.
+pub fn chips_that_fit(labels: &[&str], count: i64, available: f32) -> usize {
+    const CHAR: f32 = 6.8;
+    const CHROME: f32 = 2. * studio_ui::ds::space::SM;
+    const GAP: f32 = 4.;
+    let more_width = |left: i64| format!("+{left}").len() as f32 * CHAR + GAP;
+    let mut used = 0.;
+    for (shown, label) in labels.iter().enumerate() {
+        let chip = (label.chars().count() as f32 * CHAR + CHROME).min(studio_ui::ds::TAG_MAX_WIDTH);
+        let left = count - shown as i64 - 1;
+        let reserve = if left > 0 { more_width(left) } else { 0. };
+        if used + chip + reserve > available {
+            return shown;
+        }
+        used += chip + GAP;
+    }
+    labels.len()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_page_samples_every_rows_neighbours_while_the_budget_lasts() {
+        let ids: Vec<String> = ["a", "hub", "b", "none", "c"].map(String::from).to_vec();
+        let counts = [
+            ("a", 3),
+            ("hub", RELATION_SAMPLE_HUB + 1),
+            ("b", 5),
+            ("c", 2),
+        ]
+        .map(|(id, n)| (id.to_owned(), n))
+        .into_iter()
+        .collect();
+        let (picked, total) = relation_sample(&ids, &counts);
+        assert_eq!(picked, ["a", "b", "c"]);
+        assert_eq!(total, 10);
+
+        let many: Vec<String> = (0..30).map(|i| format!("r{i}")).collect();
+        let counts = many.iter().map(|id| (id.clone(), 100)).collect();
+        let (picked, total) = relation_sample(&many, &counts);
+        assert_eq!(picked.len() as i64, RELATION_SAMPLE_BUDGET / 100);
+        assert!(total <= RELATION_SAMPLE_BUDGET);
+    }
+
+    #[test]
+    fn chips_fit_whole_with_room_for_the_rest() {
+        let labels = ["Ada Lovelace", "Alan Turing", "Grace Hopper"];
+        // Everything fits on a wide cell.
+        assert_eq!(chips_that_fit(&labels, 3, 1000.), 3);
+        // A narrow one keeps whole chips and the "+N" after them.
+        let one = chips_that_fit(&labels, 9, 160.);
+        assert_eq!(one, 1);
+        // Nothing fits: the cell shows the count alone.
+        assert_eq!(chips_that_fit(&labels, 9, 20.), 0);
+    }
+
     use gq_language::SchemaModel;
     use graph_client::api::{CommitOutput, ErrorOutput, PreconditionFailureOutput};
     use graph_client::{ApiError, WriteOutcome};

@@ -29,7 +29,7 @@ pub const LONG_HISTORY: usize = 5_000;
 /// Other branches whose lists History reads for heads and merged-in commits.
 const OTHER_BRANCHES: usize = 20;
 
-const ROW_HEIGHT: f32 = 34.;
+const ROW_HEIGHT: f32 = studio_ui::ds::size::ROW;
 const LANE_WIDTH: f32 = 14.;
 const GRAPH_PADDING: f32 = 8.;
 

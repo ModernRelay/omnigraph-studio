@@ -189,9 +189,11 @@ than styling one-off elements.
 - **Sidebar rows.** `ds::SidebarRow`: section labels muted, not bold; the selected row a grey
   pill; counts muted and right-aligned. Footnotes become tooltips.
 - **Context once.** The branch appears once, in the document footer's branch menu.
-- **Tables.** Like Linear: a 48 px toolbar, a one-line header (name, then the type muted), 36
-  px rows split by hairlines, no column rules, the cursor as a ring and the selected row as a
-  pill.
+- **Tables.** Like Linear: a 48 px toolbar, a one-line header (name, then the type muted, 30
+  px), 28 px rows split by hairlines, no column rules, the cursor as a ring and the selected row
+  as a pill. Dense enough to scan a page at a glance; an 18 px borderless tag or chip still sits
+  inside a row. Sidebar rows are 26 px, feed rows 36 px; every list takes its height from
+  `ds::size`, never its own constant.
 - **Layout, not sentences.** Information sits in structure, as in Delta's thread and Zed's
   panels: metadata as an icon and a short value (`ds::meta`, `meta_code`: a count, a commit, a
   branch); keys as key caps (`ds::key_hint`, `KeyBinding` on buttons), never "↵ edit · …"

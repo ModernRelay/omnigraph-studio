@@ -61,15 +61,16 @@ pub mod size {
     pub const STRIP: f32 = 40.;
     /// A surface's toolbar.
     pub const TOOLBAR: f32 = 48.;
-    /// A data row and a data header.
-    pub const ROW: f32 = 36.;
-    pub const HEADER: f32 = 36.;
+    /// A data row and a data header: dense enough to scan a page at a glance, with room for a
+    /// chip (an enum value, a relationship) inside a row.
+    pub const ROW: f32 = 28.;
+    pub const HEADER: f32 = 30.;
     /// A sidebar row.
-    pub const SIDEBAR_ROW: f32 = 28.;
+    pub const SIDEBAR_ROW: f32 = 26.;
     /// A thread's or feed's gutter, where each entry's icon sits.
     pub const GUTTER: f32 = 24.;
     /// A row of an activity feed: taller than a data row, as a feed is read, not scanned.
-    pub const FEED_ROW: f32 = 44.;
+    pub const FEED_ROW: f32 = 36.;
     pub const SIDEBAR_WIDTH: f32 = 264.;
     pub const INSPECTOR_WIDTH: f32 = 340.;
     /// Width of a field's label column.
@@ -116,6 +117,11 @@ pub mod surface {
             .colors()
             .editor_background
             .blend(gpui::black().opacity(0.02))
+    }
+
+    /// A tag's fill: a faint ink, borderless, so a row of tags reads as one quiet band.
+    pub fn tag(cx: &App) -> Hsla {
+        cx.theme().colors().ghost_element_hover.opacity(0.7)
     }
 
     /// A selected row on chrome (the sidebar): Tower's pressed pill, 5% ink, in both styles.
@@ -540,20 +546,21 @@ pub fn meta_code(icon: IconName, value: impl Into<SharedString>, cx: &App) -> Di
         .child(text::code(value, cx).color(Color::Muted).single_line())
 }
 
+/// The widest a [`tag`] grows before its label truncates.
+pub const TAG_MAX_WIDTH: f32 = 160.;
+
 /// A tag: a name in a quiet pill, as a table shows a row's neighbours. The UI font, unlike
 /// `ui::Chip`, which is for code-like values such as enum members.
 pub fn tag(label: impl Into<SharedString>, cx: &App) -> Div {
     div()
         .flex_none()
-        .max_w(px(160.))
-        .h(px(20.))
+        .max_w(px(TAG_MAX_WIDTH))
+        .h(px(18.))
         .px(px(space::SM))
         .flex()
         .items_center()
         .rounded(px(radius::XS))
-        .border_1()
-        .border_color(surface::raised_border(cx))
-        .bg(surface::sunken(cx))
+        .bg(surface::tag(cx))
         .child(
             Label::new(label.into())
                 .size(LabelSize::XSmall)
@@ -620,8 +627,8 @@ pub fn setting_row(
     h_flex()
         .id(id.clone())
         .w_full()
-        .min_h(px(size::ROW + space::XXL))
-        .py(px(space::LG))
+        .min_h(px(size::ROW + space::XL))
+        .py(px(space::MD))
         .gap(px(space::XXL))
         .items_center()
         .child(

@@ -41,9 +41,10 @@ use ui::{
 use crate::dialogs::{DeleteRowModal, InsertRowModal, SaveViewModal};
 use crate::model::{
     ColumnRole, ColumnSpec, Notice, Paging, Row, SaveResult, TableKind, Tone, changed_elsewhere,
-    copy_text, count_of, display_value, edge_columns, edge_rows, edit_text, filter_label,
-    format_count, insert_position, node_columns, node_rows, parse_filter_list, parse_filter_value,
-    parse_input, preset_start, row_matches, same_value, save_result, short_commit,
+    chips_that_fit, copy_text, count_of, display_value, edge_columns, edge_rows, edit_text,
+    filter_label, format_count, insert_position, node_columns, node_rows, parse_filter_list,
+    parse_filter_value, parse_input, preset_start, relation_sample, row_matches, same_value,
+    save_result, short_commit,
 };
 use crate::peek::{NodePeek, PeekSubject};
 
@@ -92,8 +93,8 @@ struct BulkDraft {
     saving: bool,
 }
 
-/// How many neighbours a relationship cell shows as chips.
-const RELATION_CHIPS: usize = 3;
+/// The most neighbours a relationship cell keeps; it shows the ones that fit whole.
+const RELATION_CHIPS: usize = 4;
 
 /// One row's neighbours through one relationship: how many, and the first few.
 struct Relation {
@@ -1190,33 +1191,54 @@ impl TypeTable {
             .cloned()
             .collect();
         let snapshot = self.paging.pinned.clone();
-        // Enough for three chips a row on most pages; a row past it shows its count alone.
-        let sample = (ids.len() as u32 * 3).clamp(30, 1000);
         for group in groups {
             let key = builder::relationship_key(&group);
-            let queries = (
-                builder::page_degrees(&schema, &self.type_name, &group, &ids),
-                builder::page_neighbours(&schema, &self.type_name, &group, &ids, sample),
-            );
-            let (Ok(degrees), Ok(neighbours)) = queries else {
+            let Ok(degrees) = builder::page_degrees(&schema, &self.type_name, &group, &ids) else {
                 continue;
             };
             let degrees = self.session.update(cx, |session, cx| {
                 session.read(&degrees, snapshot.clone(), cx)
             });
-            let neighbours = self.session.update(cx, |session, cx| {
-                session.read(&neighbours, snapshot.clone(), cx)
-            });
             let ids = ids.clone();
+            let schema = schema.clone();
+            let type_name = self.type_name.clone();
+            let snapshot = snapshot.clone();
+            // The degrees first: they size the neighbour read, so every row gets its chips.
             self.relation_tasks.push(cx.spawn(async move |this, cx| {
-                let (degrees, neighbours) = (degrees.await, neighbours.await);
+                let degrees = degrees.await;
+                let counts: HashMap<String, i64> = match &degrees {
+                    Ok(output) => relation_counts(&output.rows),
+                    Err(_) => HashMap::new(),
+                };
+                let (sampled, total) = relation_sample(&ids, &counts);
+                let neighbours = if sampled.is_empty() {
+                    None
+                } else {
+                    let query = builder::page_neighbours(
+                        &schema,
+                        &type_name,
+                        &group,
+                        &sampled,
+                        total as u32,
+                    );
+                    match query {
+                        Ok(query) => this
+                            .update(cx, |this, cx| {
+                                this.session.update(cx, |session, cx| {
+                                    session.read(&query, snapshot.clone(), cx)
+                                })
+                            })
+                            .ok(),
+                        Err(_) => None,
+                    }
+                };
+                let neighbours = match neighbours {
+                    Some(read) => Some(read.await),
+                    None => None,
+                };
                 this.update(cx, |this, cx| {
-                    let counts: HashMap<String, i64> = match &degrees {
-                        Ok(output) => relation_counts(&output.rows),
-                        Err(_) => HashMap::new(),
-                    };
                     let mut shown: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
-                    if let Ok(output) = &neighbours {
+                    if let Some(Ok(output)) = &neighbours {
                         for (id, other, label) in relation_samples(&output.rows) {
                             let list = shown.entry(id).or_default();
                             if list.len() < RELATION_CHIPS {
@@ -2812,6 +2834,7 @@ impl TypeTable {
         row: &Row,
         key: &str,
         group: &RelationshipGroup,
+        available: f32,
         cx: &App,
     ) -> AnyElement {
         let Some(relation) = self.relations.get(&(row.id.clone(), key.to_owned())) else {
@@ -2836,8 +2859,14 @@ impl TypeTable {
                 .color(Color::Disabled)
                 .into_any_element();
         }
-        let more = count - relation.neighbours.len() as i64;
-        // The count stays in view; the tags give way.
+        let labels: Vec<&str> = relation
+            .neighbours
+            .iter()
+            .map(|(id, label)| label.as_deref().unwrap_or(id))
+            .collect();
+        let fit = chips_that_fit(&labels, count, available);
+        let more = count - fit as i64;
+        // The count stays in view; the tags give way, whole.
         h_flex()
             .id(SharedString::from(format!("relation-{}-{key}", row.id)))
             .w_full()
@@ -2848,15 +2877,17 @@ impl TypeTable {
                 format_count(count),
                 group.other_type
             )))
-            .child(h_flex().min_w_0().gap_1().overflow_hidden().children(
-                relation.neighbours.iter().map(|(id, label)| {
-                    studio_ui::ds::tag(label.clone().unwrap_or_else(|| id.clone()), cx)
-                }),
-            ))
+            .child(
+                h_flex().min_w_0().gap_1().overflow_hidden().children(
+                    labels[..fit]
+                        .iter()
+                        .map(|label| studio_ui::ds::tag(label.to_string(), cx)),
+                ),
+            )
             .when(more > 0, |cell| {
                 cell.child(
                     div().flex_none().child(
-                        Label::new(if relation.neighbours.is_empty() {
+                        Label::new(if fit == 0 {
                             format_count(count)
                         } else {
                             format!("+{}", format_count(more))
@@ -3012,8 +3043,13 @@ impl TypeTable {
         };
         let numeric = column.align_right;
         if let Some(group) = column.relationship() {
+            let rem = window.rem_size();
+            let widths = self.widths.read(cx);
+            let width = widths.scrollable_width(col, rem) - widths.scrollable_width(col + 1, rem);
+            // The cell's padding (`px_4`) on both sides.
+            let available = f32::from(width) - 32.;
             return cell
-                .child(self.render_relation_cell(row, &column.key, group, cx))
+                .child(self.render_relation_cell(row, &column.key, group, available, cx))
                 .when(is_cursor, |cell| cell.child(ring()))
                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     this.click_cell(ix, col, event.modifiers(), window, cx)

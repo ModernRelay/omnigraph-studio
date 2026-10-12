@@ -75,11 +75,13 @@ stay put), IX (paged, virtualized).
 - The next page is fetched when the viewport passes 80% of loaded rows. No row cap: the grid is
   virtualized.
 - Relationship columns: one query per page and relationship, with the page's ids as an `in`
-  list parameter; the first three neighbours as chips, then "+N". Built as two reads per page
-  and relationship at the page's commit: a grouped count (`return { $n.@id as id, count($m)
-  as n }`) and the first neighbours with labels, capped at three a row on average (30 to
-  1,000 rows), so a row past the cap shows its count alone. A click opens the other type
-  filtered to this row's neighbours through the same relationship.
+  list parameter; the neighbours that fit the column whole as chips, then "+N" (a chip is
+  never cut mid-name; its width is estimated from its label, as a cell is laid out before its
+  text is measured). Built as two reads per page and relationship at the page's commit, in
+  turn: a grouped count (`return { $n.@id as id, count($m) as n }`), then every neighbour of
+  the rows it sizes, in page order, up to 2,000 rows; a row with more than 200 neighbours, or
+  past the budget, shows its count alone, so a hub never leaves the rows after it bare. A
+  click opens the other type filtered to this row's neighbours through the same relationship.
 - Filtered counts: `return { count($n) as n }` with the same filters, pinned to the snapshot.
 
 ### Filters and views
