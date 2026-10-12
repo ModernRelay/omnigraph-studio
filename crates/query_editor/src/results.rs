@@ -157,8 +157,8 @@ pub enum PlanItem {
     Operator {
         depth: usize,
         node: String,
-        /// `key=value` pairs from the operator's details, for one line.
-        summary: String,
+        /// The details as named facts, readable, in the server's order (see [`detail_facts`]).
+        facts: Vec<(String, String)>,
         /// The details as the server sent them.
         detail: String,
     },
@@ -198,7 +198,7 @@ pub fn plan_items(rows: &Value) -> Vec<PlanItem> {
             Some(depth) => PlanItem::Operator {
                 depth: depth as usize,
                 node,
-                summary: summarize_detail(&detail),
+                facts: detail_facts(&detail),
                 detail,
             },
             None => PlanItem::Note {
@@ -229,6 +229,73 @@ fn tree_title(tree: &str) -> String {
 /// `{"binding":"p","table":"node:Person","filter":null,"id":0,"properties":{…}}` →
 /// `binding=p, table=node:Person`. Nulls, ids and the planner's property bag are left out;
 /// text that is not a JSON object is kept as it is.
+/// Details that say how the engine keeps its books, not what the operator does: identities,
+/// table versions, statistics, tie-breaks.
+const BOOKKEEPING: &[&str] = &[
+    "id",
+    "properties",
+    "version",
+    "versions",
+    "tiebreak",
+    "edge_binding",
+    "resume",
+];
+
+/// An operator's details as facts to read: JSON details become `(key, value)` pairs, where a
+/// filter is its text, an edge selection is `Knows out`, a list is its items, and bookkeeping
+/// is left out; a text detail (DataFusion's) is one fact without a name.
+pub fn detail_facts(detail: &str) -> Vec<(String, String)> {
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(detail) else {
+        return if detail.is_empty() {
+            Vec::new()
+        } else {
+            vec![(String::new(), detail.to_owned())]
+        };
+    };
+    map.iter()
+        .filter(|(key, _)| !BOOKKEEPING.contains(&key.as_str()))
+        .filter(|(key, value)| !(key.as_str() == "bytes" && value.as_u64() == Some(0)))
+        .filter_map(|(key, value)| Some((key.clone(), readable(value)?)))
+        .collect()
+}
+
+/// A detail value as words: `None` for nothing to say.
+fn readable(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(text) if text.is_empty() => None,
+        Value::String(text) => Some(text.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Array(items) => {
+            let filters = items.iter().all(|item| item.get("text").is_some());
+            let parts: Vec<String> = items.iter().filter_map(readable).collect();
+            (!parts.is_empty()).then(|| parts.join(if filters { " and " } else { ", " }))
+        }
+        Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(Value::as_str) {
+                return Some(text.to_owned());
+            }
+            if let Some(Value::Array(members)) = map.get("members") {
+                let edges: Vec<String> = members
+                    .iter()
+                    .map(|member| {
+                        let edge = member.get("edge_type").and_then(Value::as_str);
+                        let direction = member.get("direction").and_then(Value::as_str);
+                        [edge, direction]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .collect();
+                return Some(edges.join(" | "));
+            }
+            Some(value.to_string())
+        }
+    }
+}
+
 pub fn summarize_detail(detail: &str) -> String {
     let Ok(Value::Object(map)) = serde_json::from_str::<Value>(detail) else {
         return detail.to_owned();
@@ -423,13 +490,18 @@ mod tests {
         ]));
         let items = plan_items(&rows);
         assert_eq!(items[0], PlanItem::Header("Logical plan".into()));
-        assert!(matches!(
-            &items[2],
-            PlanItem::Operator { depth: 1, node, summary, .. }
-                if node == "TableScan" && summary == "binding=p, table=node:Person"
-        ));
+        let facts = |ix: usize| match &items[ix] {
+            PlanItem::Operator { facts, .. } => facts.clone(),
+            other => panic!("not an operator: {other:?}"),
+        };
+        let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        // Bookkeeping (`id`, `properties`) is left out.
+        assert_eq!(
+            facts(2),
+            [pair("binding", "p"), pair("table", "node:Person")]
+        );
         assert_eq!(items[3], PlanItem::Header("DataFusion plan".into()));
-        assert!(matches!(&items[4], PlanItem::Operator { summary, .. } if summary == "rows=3"));
+        assert_eq!(facts(4), [pair("", "rows=3")]);
         assert_eq!(items[5], PlanItem::Header("Planner".into()));
         assert_eq!(
             items[6],
@@ -438,6 +510,44 @@ mod tests {
                 value: "engine".into()
             }
         );
+    }
+
+    #[test]
+    fn details_read_as_facts() {
+        let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        assert_eq!(
+            detail_facts(
+                r#"{"src":"p","dst":"f","edges":{"kind":"named","members":[{"edge_type":"Knows","direction":"out"},{"edge_type":"WorksAt","direction":"in"}]},"min_hops":1,"edge_binding":null,"versions":{"Knows":1}}"#
+            ),
+            [
+                pair("src", "p"),
+                pair("dst", "f"),
+                pair("edges", "Knows out | WorksAt in"),
+                pair("min_hops", "1"),
+            ]
+        );
+        assert_eq!(
+            detail_facts(
+                r#"{"conjuncts":[{"kind":"gq","text":"$p.age > 3"},{"kind":"gq","text":"$p.name != $f.name"}]}"#
+            ),
+            [pair("conjuncts", "$p.age > 3 and $p.name != $f.name")]
+        );
+        assert_eq!(
+            detail_facts(
+                r#"{"binding":"p","table":"node:Person","version":139,"projection":["__id","name"],"filter":{"kind":"gq","reads":[],"text":"$p.x = 1"}}"#
+            ),
+            [
+                pair("binding", "p"),
+                pair("table", "node:Person"),
+                pair("projection", "__id, name"),
+                pair("filter", "$p.x = 1"),
+            ]
+        );
+        assert_eq!(
+            detail_facts(r#"{"rows":5,"bytes":0,"resume":null}"#),
+            [pair("rows", "5")]
+        );
+        assert!(detail_facts("").is_empty());
     }
 
     #[test]

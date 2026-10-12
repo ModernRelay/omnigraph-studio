@@ -104,14 +104,23 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 - Parameters of the query under the cursor get an input each; values are typed by
   `gq_language::param_value` and sent as JSON (`null` for an empty nullable).
 - ⌘⇧↵ sends `explain query …` and shows the logical, physical and DataFusion trees indented by
-  depth, then the planner's notes.
+  depth, then the planner's notes. Each operator's details read as named facts (muted name,
+  plain value): a filter is its text, an edge selection `Knows out`, a list its items, and
+  bookkeeping (ids, table versions, statistics, tie-breaks) is left out; the tooltip has every
+  fact in full.
+- Hovering an operator lights its part of the query in the editor
+  (`gq_language::operator_parts`): a scan or join its variable's binding (or the traversal that
+  reaches it) and the filters it applies, an expand the traversal between its two variables, an
+  anti-join the `not` block naming its outer variable, a filter its clause, a sort the `order`
+  clause, a limit or page the `limit`, a projection or aggregate the `return`. The match is
+  lexical (`gq_language::query_parts` reads a declaration's clauses with byte ranges), since
+  the compiler's AST has no spans; the declaration is found again by name, so edits since the
+  plan move the light with the text. An operator the planner adds on its own lights nothing.
 - Statements (`branch …`, `show …`) run without a request target; `branch create/delete/merge`
   asks first like a mutation.
 
 ## Deferred
 
-- Hovering a plan operator to
-  highlight its part of the query.
 - Tree-sitter highlighting, folding and outline (`grammars/tree-sitter-gq`).
 - A row cap: the result shows every row the server returns, so the query's own `limit` is the
   cap today (constitution IX). The example query carries `limit 50`.
@@ -140,6 +149,7 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 | 2026-10-12 | Hover types | `gq_language` `hovers_name_types`; an offscreen snapshot with the new `hover:` step resting on `$p` | "$p: Person · node" in Zed's hover popover, the token highlighted |
 | 2026-10-12 | Snapshot picker | offscreen snapshots: the picker on a new query, the older of main's two commits chosen, Run | The tab and picker named the commit; the read ran "on commit EPD69MJ0" and returned no rows, that commit being before the seed load |
 | 2026-10-12 | Run lines | offscreen snapshot of two declarations, Run clicked on the first's line | The first ran and its line read "25 rows · 96 ms". A first version ran the declaration under the old cursor: the editor reports a moved cursor after the click, so the line now sets it before running |
+| 2026-10-12 | Plan operators light their clauses | `gq_language::parts` tests over logical, physical and DataFusion details from the 0.13 dev server (the fixture checked by the compiler); offscreen snapshots hovering Expand, AntiJoin and Filter | `$p knows $f`, `not { $f worksAt $c }` and `$p.name != $f.name` lit in turn |
 | 2026-10-12 | Run loop end to end | offscreen snapshots against the dev server: example query, run, explain, parameters, confirm bar, committed and refused writes, a parse error underline, completion | As described under What landed |
 
 ## Corrections

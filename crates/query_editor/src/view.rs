@@ -49,6 +49,8 @@ const PLAN_ROW_HEIGHT: f32 = 24.;
 /// a number. Studio's syntax classes and diagnostics take numbers no Zed console uses.
 const SYNTAX_KEY: usize = 0x6751_0000;
 const DIAGNOSTIC_KEY: usize = 0x6751_0100;
+/// The parts of the query the hovered plan operator stands for.
+const PLAN_KEY: usize = 0x6751_0200;
 const SYNTAX: [(TokenKind, &str); 9] = [
     (TokenKind::Keyword, "keyword"),
     (TokenKind::Variable, "variable"),
@@ -106,6 +108,8 @@ struct RowsOutput {
 
 struct PlanOutput {
     label: String,
+    /// The planned declaration's name, to find it again in the text as it is now.
+    name: Option<String>,
     items: Vec<PlanItem>,
     elapsed: Duration,
     commit: Option<String>,
@@ -229,6 +233,8 @@ pub struct QueryEditor {
     cursor: usize,
     params: HashMap<String, Entity<Editor>>,
     output: Output,
+    /// The plan row under the pointer; its parts of the query are lit.
+    plan_hovered: Option<usize>,
     pending_write: Option<PendingWrite>,
     writing: bool,
     selected: Option<(usize, usize)>,
@@ -363,6 +369,7 @@ impl QueryEditor {
             cursor: 0,
             params: HashMap::new(),
             output: Output::Empty,
+            plan_hovered: None,
             pending_write: None,
             writing: false,
             selected: None,
@@ -1031,6 +1038,8 @@ impl QueryEditor {
             let result = task.await;
             let elapsed = started.elapsed();
             this.update(cx, |this, cx| {
+                // A new output replaces the plan whose operator lit the text.
+                this.light_plan_parts(None, cx);
                 this.finish_read(prepared, branch, result, elapsed);
                 this.run_task = None;
                 cx.notify();
@@ -1063,6 +1072,7 @@ impl QueryEditor {
         self.note_run(prepared.name.as_deref(), note);
         self.output = match result {
             Ok(output) if is_plan(&output.columns) => Output::Plan(PlanOutput {
+                name: prepared.name.clone(),
                 label: prepared.label,
                 items: plan_items(&output.rows),
                 elapsed,
@@ -1885,11 +1895,62 @@ impl QueryEditor {
             .into_any_element()
     }
 
+    /// Lights the parts of the query that the plan operator at `ix` stands for, or none
+    /// (spec 007). The declaration is found again by name, so edits since the plan was read
+    /// move the light with the text.
+    fn light_plan_parts(&mut self, ix: Option<usize>, cx: &mut Context<Self>) {
+        let key = HighlightKey::ConsoleAnsiHighlight(PLAN_KEY);
+        self.plan_hovered = ix;
+        let ranges = match (ix, &self.output) {
+            (Some(ix), Output::Plan(plan)) => match plan.items.get(ix) {
+                Some(PlanItem::Operator { node, detail, .. }) => {
+                    let text = self.editor.read(cx).text(cx);
+                    let outline = gq_language::outline(&text);
+                    plan.name
+                        .as_deref()
+                        .and_then(|name| outline.declarations.iter().find(|d| d.name == name))
+                        .or_else(|| outline.declaration_at(self.cursor))
+                        .map(|declaration| {
+                            let parts = gq_language::query_parts(&text, declaration.range.clone());
+                            gq_language::operator_parts(&parts, node, detail)
+                        })
+                        .unwrap_or_default()
+                }
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        self.editor.update(cx, |editor, cx| {
+            if ranges.is_empty() {
+                editor.clear_background_highlights(key, cx);
+                return;
+            }
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let anchors: Vec<_> = ranges
+                .iter()
+                .map(|range| {
+                    snapshot.anchor_after(MultiBufferOffset(range.start))
+                        ..snapshot.anchor_before(MultiBufferOffset(range.end))
+                })
+                .collect();
+            editor.highlight_background(
+                key,
+                &anchors,
+                |_, theme| theme.colors().text_accent.opacity(0.16),
+                cx,
+            );
+        });
+        cx.notify();
+    }
+
     fn render_plan_rows(
         &mut self,
         range: std::ops::Range<usize>,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
+        let hover_bg = studio_ui::ds::surface::hover(cx);
+        let lit_bg = studio_ui::ds::surface::selected_document(cx);
+        let hovered = self.plan_hovered;
         let Output::Plan(plan) = &self.output else {
             return Vec::new();
         };
@@ -1908,14 +1969,24 @@ impl QueryEditor {
                     PlanItem::Operator {
                         depth,
                         node,
-                        summary,
-                        detail,
+                        facts,
+                        detail: _,
                     } => h_flex()
                         .id(("plan-row", ix))
+                        .w_full()
                         .h(px(PLAN_ROW_HEIGHT))
                         .pl(px(12. + *depth as f32 * 16.))
                         .pr_2()
                         .gap_2()
+                        .hover(|row| row.bg(hover_bg))
+                        .when(hovered == Some(ix), |row| row.bg(lit_bg))
+                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if *hovered {
+                                this.light_plan_parts(Some(ix), cx);
+                            } else if this.plan_hovered == Some(ix) {
+                                this.light_plan_parts(None, cx);
+                            }
+                        }))
                         .child(
                             Icon::new(if *depth == 0 {
                                 IconName::ChevronDown
@@ -1926,15 +1997,9 @@ impl QueryEditor {
                             .color(Color::Muted),
                         )
                         .child(Label::new(node.clone()).size(LabelSize::Small))
-                        .child(
-                            Label::new(summary.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .single_line()
-                                .truncate(),
-                        )
-                        .when(!detail.is_empty(), |d| {
-                            d.tooltip(Tooltip::text(detail.clone()))
+                        .child(render_facts(facts))
+                        .when(!facts.is_empty(), |d| {
+                            d.tooltip(Tooltip::text(facts_tooltip(facts)))
                         })
                         .into_any_element(),
                     PlanItem::Note { name, value } => h_flex()
@@ -2187,4 +2252,49 @@ fn run_line(
                 })
         }))
         .into_any_element()
+}
+
+/// An operator's facts on one line: each name muted, then its value, the line clipped at the
+/// row's end.
+fn render_facts(facts: &[(String, String)]) -> impl IntoElement {
+    const SHOWN: usize = 48;
+    h_flex()
+        .min_w_0()
+        .flex_1()
+        .gap_3()
+        .overflow_hidden()
+        .children(facts.iter().map(|(name, value)| {
+            let value = if value.chars().count() > SHOWN {
+                format!("{}…", value.chars().take(SHOWN - 1).collect::<String>())
+            } else {
+                value.clone()
+            };
+            h_flex()
+                .flex_none()
+                .gap_1()
+                .when(!name.is_empty(), |fact| {
+                    fact.child(
+                        Label::new(name.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                })
+                .child(Label::new(value).size(LabelSize::XSmall).single_line())
+        }))
+}
+
+/// An operator's facts in full, one a line.
+fn facts_tooltip(facts: &[(String, String)]) -> String {
+    facts
+        .iter()
+        .map(|(name, value)| {
+            let value: String = value.chars().take(240).collect();
+            if name.is_empty() {
+                value
+            } else {
+                format!("{name}  {value}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
