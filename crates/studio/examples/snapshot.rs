@@ -7,14 +7,53 @@
 //!
 //! Each argument after the output path is an action, `name` or `name=<json>`, dispatched after
 //! the previous one settles. `type:<text>` types text into the focused editor (`\n` is a new
-//! line); it is `editor::HandleInput` with the text. `SNAPSHOT_WAIT_MS` (default 1500) is how
+//! line); it is `editor::HandleInput` with the text. `click:<x>,<y>` clicks at a point in
+//! window pixels (half the PNG's, which is drawn at 2x). `SNAPSHOT_WAIT_MS` (default 1500) is how
 //! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
 //! 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui::{AnyWindowHandle, Focusable as _, HeadlessAppContext, px, size};
+use gpui::{
+    AnyWindowHandle, Focusable as _, HeadlessAppContext, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PlatformInput, point, px, size,
+};
+
+/// A left click at `position`, as the platform delivers one: move, press, release.
+fn click(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    position: gpui::Point<gpui::Pixels>,
+) {
+    let events = [
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position,
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        }),
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        }),
+        PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Left,
+            position,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        }),
+    ];
+    for event in events {
+        cx.update_window(handle, |_, window, cx| {
+            window.dispatch_event(event, cx);
+        })
+        .expect("dispatch a mouse event");
+        cx.run_until_parked();
+    }
+}
 
 /// Runs the app for `wait` of real time. The headless dispatcher's clock is simulated, so it is
 /// moved forward as real time passes and timers (debounced saves, toasts) fire as in the app.
@@ -33,7 +72,8 @@ fn main() {
     // The agent panel starts the running executable as its MCP proxy (spec 011); answer that
     // here as Studio's own binary does.
     let raw: Vec<_> = std::env::args_os().skip(1).collect();
-    if raw.first().map(|a| a.as_os_str()) == Some(std::ffi::OsStr::new(agent_panel::PROXY_COMMAND)) {
+    if raw.first().map(|a| a.as_os_str()) == Some(std::ffi::OsStr::new(agent_panel::PROXY_COMMAND))
+    {
         let socket = raw.get(1).expect("mcp-proxy needs a socket path");
         agent_panel::proxy(std::path::Path::new(socket)).expect("proxy the MCP socket");
         return;
@@ -76,6 +116,16 @@ fn main() {
     settle(&mut cx, wait);
 
     for spec in actions {
+        if let Some((x, y)) = spec
+            .strip_prefix("click:")
+            .and_then(|at| at.split_once(','))
+        {
+            let x: f32 = x.trim().parse().expect("click x is a number");
+            let y: f32 = y.trim().parse().expect("click y is a number");
+            click(&mut cx, handle, point(px(x), px(y)));
+            settle(&mut cx, wait);
+            continue;
+        }
         let (name, data) = match spec.strip_prefix("type:") {
             Some(text) => (
                 "editor::HandleInput".to_owned(),
@@ -93,10 +143,11 @@ fn main() {
             // With nothing focused an action reaches only global handlers, so give the
             // workspace focus first, as a click in the window would.
             if window.focused(cx).is_none()
-                && let Some(workspace) = studio_workspace::workspace_for(window) {
-                    let focus = workspace.read(cx).focus_handle(cx);
-                    window.focus(&focus, cx);
-                }
+                && let Some(workspace) = studio_workspace::workspace_for(window)
+            {
+                let focus = workspace.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            }
             let action = cx
                 .build_action(&name, data)
                 .unwrap_or_else(|error| panic!("unknown action {name}: {error:?}"));

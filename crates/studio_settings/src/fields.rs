@@ -7,6 +7,7 @@
 //! - `x-control`: a control whose options come from the running app (`theme`, `font`, `agent`).
 //! - `x-step`: the stepper increment of a number.
 //! - `x-hidden`: edited in `settings.json` only.
+//! - `x-per-graph`: a graph may override it under `graphs` ([`Scope::Graph`]).
 //!
 //! Values are read and written by path through the document's JSON form, so a new setting
 //! needs only its field and attributes.
@@ -25,6 +26,16 @@ pub struct SettingField {
     pub title: String,
     pub description: String,
     pub kind: FieldKind,
+    /// Whether a graph can have its own value (`x-per-graph`).
+    pub per_graph: bool,
+}
+
+/// Where the settings tab reads and writes: the shared document, or one graph's overrides
+/// under `graphs` (the key from [`crate::graph_key`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    All,
+    Graph(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,6 +127,7 @@ fn walk(
         title: text(schema, "title").map_or_else(|| sentence(&key), str::to_owned),
         description: text(schema, "description").unwrap_or_default().to_owned(),
         kind,
+        per_graph: schema.get("x-per-graph") == Some(&Value::Bool(true)),
     });
 }
 
@@ -193,6 +205,18 @@ fn kind(resolved: &Value, field: &Value) -> Option<FieldKind> {
     None
 }
 
+/// Where a graph's override of `field` lives: `graphs.<key>.<last key>`.
+fn override_path(scope: &Scope, field: &SettingField) -> Option<Vec<String>> {
+    match scope {
+        Scope::Graph(key) if field.per_graph => Some(vec![
+            "graphs".into(),
+            key.clone(),
+            field.path.last()?.clone(),
+        ]),
+        _ => None,
+    }
+}
+
 fn text<'a>(schema: &'a Value, key: &str) -> Option<&'a str> {
     schema
         .get(key)
@@ -246,6 +270,56 @@ impl StudioSettings {
     pub fn reset_at(&self, path: &[String]) -> Self {
         self.with_value(path, StudioSettings::default().value_at(path))
             .unwrap_or_else(|_| self.clone())
+    }
+
+    /// The value `field` has in `scope`: a graph's override, else the shared value.
+    pub fn value_in(&self, scope: &Scope, field: &SettingField) -> Value {
+        match override_path(scope, field) {
+            Some(path) => match self.value_at(&path) {
+                Value::Null => self.value_at(&field.path),
+                value => value,
+            },
+            None => self.value_at(&field.path),
+        }
+    }
+
+    /// Whether `field` is unchanged in `scope`: at its default, or not overridden by the graph.
+    pub fn is_default_in(&self, scope: &Scope, field: &SettingField) -> bool {
+        match override_path(scope, field) {
+            Some(path) => self.value_at(&path).is_null(),
+            None => self.is_default_at(&field.path),
+        }
+    }
+
+    /// The document with `value` for `field` in `scope`.
+    pub fn with_value_in(
+        &self,
+        scope: &Scope,
+        field: &SettingField,
+        value: Value,
+    ) -> Result<Self, String> {
+        let Some(path) = override_path(scope, field) else {
+            return self.with_value(&field.path, value);
+        };
+        let Scope::Graph(key) = scope else {
+            unreachable!("only a graph scope has an override path")
+        };
+        let mut next = self.clone();
+        next.graphs.entry(key.clone()).or_default();
+        let mut next = next.with_value(&path, value)?;
+        next.graphs.retain(|_, overrides| !overrides.is_empty());
+        Ok(next)
+    }
+
+    /// The document with `field` reset in `scope`: to its default, or the graph's override
+    /// removed.
+    pub fn reset_in(&self, scope: &Scope, field: &SettingField) -> Self {
+        match override_path(scope, field) {
+            Some(_) => self
+                .with_value_in(scope, field, Value::Null)
+                .unwrap_or_else(|_| self.clone()),
+            None => self.reset_at(&field.path),
+        }
     }
 }
 
@@ -351,6 +425,41 @@ mod tests {
             settings
                 .with_value(&path("ui_density"), "roomy".into())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn a_graph_scope_writes_and_clears_its_own_override() {
+        let page = field("studio.tree_page_size");
+        assert!(page.per_graph);
+        assert!(!field("studio.health_check_seconds").per_graph);
+        let scope = Scope::Graph("dev/knowledge".into());
+        let settings = StudioSettings::default();
+        assert_eq!(
+            settings.value_in(&scope, page),
+            50,
+            "the shared value shows through"
+        );
+        assert!(settings.is_default_in(&scope, page));
+        let changed = settings.with_value_in(&scope, page, 20.into()).unwrap();
+        assert_eq!(changed.value_in(&scope, page), 20);
+        assert_eq!(
+            changed.studio.tree_page_size, 50,
+            "the shared value is untouched"
+        );
+        assert!(!changed.is_default_in(&scope, page));
+        assert!(changed.is_default_in(&Scope::All, page));
+        assert_eq!(changed.for_graph("dev", "knowledge").tree_page_size, 20);
+        let cleared = changed.reset_in(&scope, page);
+        assert!(
+            cleared.graphs.is_empty(),
+            "an empty override leaves no entry"
+        );
+        let health = field("studio.health_check_seconds");
+        let shared = settings.with_value_in(&scope, health, 60.into()).unwrap();
+        assert_eq!(
+            shared.studio.health_check_seconds, 60,
+            "not per graph: writes the shared value"
         );
     }
 }

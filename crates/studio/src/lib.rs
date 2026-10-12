@@ -9,8 +9,8 @@ mod open_graph;
 mod settings_view;
 
 use gpui::{
-    App, AppContext as _, Entity, Focusable as _, Window, WindowBounds, WindowOptions, point, px,
-    size,
+    App, AppContext as _, Context, Entity, Focusable as _, Window, WindowBounds, WindowOptions,
+    point, px, size,
 };
 use graph_store::{ConnectionRegistry, ConnectionState, open_session};
 use studio_actions::workspace::{NewWindow, OpenGraph, OpenSettings, Quit};
@@ -46,7 +46,7 @@ pub fn init(cx: &mut App) {
         );
     });
     studio_workspace::register_item_kind(cx, "settings", |_, workspace, window, cx| {
-        workspace.open_item("settings", window, cx, settings_view::SettingsView::new);
+        open_settings(workspace, window, cx);
     });
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &NewWindow, cx| {
@@ -70,7 +70,7 @@ pub fn init(cx: &mut App) {
             },
         );
         workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
-            workspace.open_item("settings", window, cx, settings_view::SettingsView::new);
+            open_settings(workspace, window, cx);
         });
         workspace.register_action(|workspace, _: &OpenGraph, window, cx| {
             let handle = cx.entity().downgrade();
@@ -80,6 +80,17 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+/// Opens the settings tab, offering the workspace's graph as a scope.
+fn open_settings(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    let graph = workspace.session().map(|session| {
+        let session = session.read(cx);
+        (session.settings_key(cx), session.graph_id.clone())
+    });
+    workspace.open_item("settings", window, cx, move |window, cx| {
+        settings_view::SettingsView::new(graph, window, cx)
+    });
 }
 
 pub fn window_options(cx: &App) -> WindowOptions {

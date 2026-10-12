@@ -1,7 +1,7 @@
 //! What the tree shows, without GPUI: row identity, the text a filter matches, filtering that
 //! keeps ancestors, and the moves the keys make.
 
-use graph_store::{Entry, EntryKind, ExplorePath, ExploreState, NEIGHBOUR_PAGE, NodeRef};
+use graph_store::{Entry, EntryKind, ExplorePath, ExploreState, NodeRef};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -186,14 +186,14 @@ pub fn edge_summary(edge: &[(String, Value)]) -> String {
 }
 
 /// "Show 50 more of 418": the next page size and how many are not shown yet.
-pub fn more_label(shown: usize, total: Option<u64>) -> String {
+pub fn more_label(shown: usize, total: Option<u64>, page: u32) -> String {
     match total {
         Some(total) => {
             let remaining = total.saturating_sub(shown as u64);
-            let next = remaining.min(u64::from(NEIGHBOUR_PAGE));
+            let next = remaining.min(u64::from(page));
             format!("Show {next} more of {remaining}")
         }
-        None => format!("Show {NEIGHBOUR_PAGE} more"),
+        None => format!("Show {page} more"),
     }
 }
 
@@ -278,7 +278,7 @@ mod tests {
             .map(|ix| {
                 let entry = &entries[*ix];
                 let text = match &entry.kind {
-                    EntryKind::More { shown, total, .. } => more_label(*shown, *total),
+                    EntryKind::More { shown, total, .. } => more_label(*shown, *total, 50),
                     EntryKind::Cycle { .. } => format!("↺ {}", row_text(entry, state)),
                     _ => row_text(entry, state),
                 };
@@ -382,8 +382,9 @@ mod tests {
             edge_summary(&[("role".into(), json!("lead")), ("hours".into(), json!(12))]),
             "role lead · hours 12"
         );
-        assert_eq!(more_label(50, Some(418)), "Show 50 more of 368");
-        assert_eq!(more_label(50, Some(60)), "Show 10 more of 10");
-        assert_eq!(more_label(50, None), "Show 50 more");
+        assert_eq!(more_label(50, Some(418), 50), "Show 50 more of 368");
+        assert_eq!(more_label(50, Some(60), 50), "Show 10 more of 10");
+        assert_eq!(more_label(50, None, 50), "Show 50 more");
+        assert_eq!(more_label(20, Some(418), 20), "Show 20 more of 398");
     }
 }

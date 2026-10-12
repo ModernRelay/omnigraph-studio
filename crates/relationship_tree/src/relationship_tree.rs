@@ -776,7 +776,7 @@ impl RelationshipTree {
                 } else if let Some(search) = searching {
                     format!("Show more matching “{search}”")
                 } else {
-                    rows::more_label(*shown, *total)
+                    rows::more_label(*shown, *total, exploration.read(cx).page_size(cx))
                 };
                 Label::new(text)
                     .size(LabelSize::XSmall)

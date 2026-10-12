@@ -39,7 +39,7 @@ use ui::Tooltip;
 use ui::prelude::*;
 
 use layout::{LayoutKind, LayoutNode, Vec2};
-use model::{HUB_STEP, NODE_CAP, Scene, SceneId, SceneKind};
+use model::{HUB_STEP, Scene, SceneId, SceneKind};
 
 /// Labels of graph nodes show from this zoom up; hubs from a little further out.
 const MAX_ZOOM: f32 = 2.;
@@ -330,7 +330,7 @@ impl GraphCanvas {
                     exploration.state(),
                     &schema,
                     &self.hub_limits,
-                    NODE_CAP,
+                    self.node_cap(cx),
                 );
                 let nodes: Vec<LayoutNode> = scene
                     .nodes
@@ -364,7 +364,7 @@ impl GraphCanvas {
     /// Lays out a query's nodes: a node first reached through a row hangs off the node before
     /// it in that row; the rest sit on a ring.
     fn rebuild_results(&mut self, results: &ResultsData, cx: &mut Context<Self>) {
-        let mut scene = model::results_scene(&results.nodes, &results.links);
+        let mut scene = model::results_scene(&results.nodes, &results.links, self.node_cap(cx));
         let count = scene.nodes.len();
         let mut parent = vec![None; count];
         for (from, to) in &results.links {
@@ -880,6 +880,12 @@ impl GraphCanvas {
             .child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted))
     }
 
+    /// The most nodes this graph's canvas draws (setting `studio.canvas_max_nodes`, or the
+    /// graph's own).
+    fn node_cap(&self, cx: &App) -> usize {
+        self.session.read(cx).options(cx).canvas_max_nodes.max(1) as usize
+    }
+
     fn render_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let exploration = self.exploration.read(cx);
         let state = exploration.state();
@@ -927,6 +933,7 @@ impl GraphCanvas {
             _ => None,
         };
         let capped = self.scene.capped.clone();
+        let cap = self.node_cap(cx);
         // Tower's floating pills are white cards in the light theme, like its chips.
         let surface = if cx.theme().appearance.is_light() {
             gpui::white()
@@ -1108,7 +1115,7 @@ impl GraphCanvas {
                         )
                         .child(
                             Label::new(format!(
-                                "Too many nodes to draw · {hidden} not shown (limit {NODE_CAP})"
+                                "Too many nodes to draw · {hidden} not shown (limit {cap})"
                             ))
                             .size(LabelSize::Small),
                         )

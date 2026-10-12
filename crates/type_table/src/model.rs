@@ -12,9 +12,6 @@ use graph_client::WriteOutcome;
 use graph_client::api::ChangeOutput;
 use serde_json::{Map, Value};
 
-/// Rows per keyset page (spec 004).
-pub const PAGE_SIZE: u32 = 100;
-
 /// The system column holding a node's or edge's `@id`.
 pub const ID_COLUMN: &str = "@id";
 /// An edge row's source and target ids.

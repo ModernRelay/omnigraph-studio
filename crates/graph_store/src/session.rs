@@ -248,6 +248,21 @@ impl GraphSession {
         }));
     }
 
+    /// The `graphs` key of this graph in the settings (spec 002).
+    pub fn settings_key(&self, cx: &App) -> String {
+        studio_settings::graph_key(&self.connection.read(cx).server.name, &self.graph_id)
+    }
+
+    /// The browsing limits in effect for this graph: its overrides in the settings, else the
+    /// shared ones.
+    pub fn options(&self, cx: &App) -> studio_settings::GraphOptions {
+        let server = &self.connection.read(cx).server.name;
+        match cx.try_global::<studio_settings::StudioSettings>() {
+            Some(settings) => settings.for_graph(server, &self.graph_id),
+            None => studio_settings::StudioSettings::default().for_graph(server, &self.graph_id),
+        }
+    }
+
     /// The row count of a type at the branch head, from the snapshot.
     pub fn count_of(&self, type_name: &str) -> Option<i64> {
         self.datasets

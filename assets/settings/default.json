@@ -19,5 +19,6 @@
   "agent": {
     "command": [],
     "env": {}
-  }
+  },
+  "graphs": {}
 }

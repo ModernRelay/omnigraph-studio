@@ -37,11 +37,10 @@ use ui::{
 
 use crate::dialogs::{DeleteRowModal, InsertRowModal};
 use crate::model::{
-    ColumnRole, ColumnSpec, Notice, PAGE_SIZE, Paging, Row, SaveResult, TableKind, Tone,
-    changed_elsewhere, copy_text, count_of, display_value, edge_columns, edge_rows, edit_text,
-    filter_label, format_count, insert_position, node_columns, node_rows, parse_filter_list,
-    parse_filter_value, parse_input, preset_start, row_matches, same_value, save_result,
-    short_commit,
+    ColumnRole, ColumnSpec, Notice, Paging, Row, SaveResult, TableKind, Tone, changed_elsewhere,
+    copy_text, count_of, display_value, edge_columns, edge_rows, edit_text, filter_label,
+    format_count, insert_position, node_columns, node_rows, parse_filter_list, parse_filter_value,
+    parse_input, preset_start, row_matches, same_value, save_result, short_commit,
 };
 use crate::peek::{NodePeek, PeekSubject};
 
@@ -501,7 +500,8 @@ impl TypeTable {
             .read(cx)
             .scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
-        let query = match self.page_query(None, PAGE_SIZE) {
+        let size = self.page_size(cx);
+        let query = match self.page_query(None, size) {
             Ok(query) => query,
             Err(error) => {
                 self.first_page = Loadable::Failed(error.to_string());
@@ -515,10 +515,19 @@ impl TypeTable {
             .update(cx, |session, cx| session.read(&query, snapshot, cx));
         self.page_task = Some(cx.spawn(async move |this, cx| {
             let result = read.await;
-            this.update(cx, |this, cx| this.apply_page(result, true, cx))
+            this.update(cx, |this, cx| this.apply_page(result, true, size, cx))
                 .ok();
         }));
         cx.notify();
+    }
+
+    /// Rows per page for this graph (setting `studio.type_table_page_size`, or the graph's own).
+    fn page_size(&self, cx: &App) -> u32 {
+        self.session
+            .read(cx)
+            .options(cx)
+            .type_table_page_size
+            .max(1)
     }
 
     fn load_more(&mut self, cx: &mut Context<Self>) {
@@ -528,7 +537,8 @@ impl TypeTable {
         {
             return;
         }
-        let query = match self.page_query(self.paging.after.as_deref(), PAGE_SIZE) {
+        let size = self.page_size(cx);
+        let query = match self.page_query(self.paging.after.as_deref(), size) {
             Ok(query) => query,
             Err(error) => {
                 self.more_error = Some(error.to_string());
@@ -544,7 +554,7 @@ impl TypeTable {
             .update(cx, |session, cx| session.read(&query, snapshot, cx));
         self.page_task = Some(cx.spawn(async move |this, cx| {
             let result = read.await;
-            this.update(cx, |this, cx| this.apply_page(result, false, cx))
+            this.update(cx, |this, cx| this.apply_page(result, false, size, cx))
                 .ok();
         }));
         cx.notify();
@@ -554,13 +564,14 @@ impl TypeTable {
         &mut self,
         result: Result<ReadOutput, ReadError>,
         first: bool,
+        size: u32,
         cx: &mut Context<Self>,
     ) {
         match result {
             Ok(output) => {
                 let page = self.rows_from(&output.rows);
                 self.paging
-                    .accept(output.graph_commit_id.as_deref(), &page, PAGE_SIZE);
+                    .accept(output.graph_commit_id.as_deref(), &page, size);
                 self.rows.extend(page);
                 if first {
                     self.first_page = Loadable::Loaded(());

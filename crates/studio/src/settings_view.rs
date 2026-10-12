@@ -1,8 +1,9 @@
 //! The settings tab (spec 002): a left nav of sections and, for the chosen one, a row per
 //! setting with a title, a one-line description, a control and Reset. Rows and controls are
 //! generated from the settings schema (`studio_settings::fields`); nothing here names a
-//! setting. A search across every section replaces the section while it has text. Changes
-//! write `settings.json` and apply at once.
+//! setting. A search across every section replaces the section while it has text. With a
+//! graph open, a scope switch shows that graph's own values for the settings a graph may
+//! override (`graphs` in `settings.json`). Changes write `settings.json` and apply at once.
 
 use editor::{Editor, EditorEvent};
 use gpui::{
@@ -10,7 +11,7 @@ use gpui::{
     Window,
 };
 use serde_json::Value;
-use studio_settings::{FieldKind, SettingField, StudioSettings};
+use studio_settings::{FieldKind, Scope, SettingField, StudioSettings};
 use studio_ui::ds::{self, radius, size, space};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use theme::ThemeRegistry;
@@ -20,6 +21,9 @@ use ui::{Callout, ContextMenu, PopoverMenu, Severity, Switch, Tooltip};
 pub struct SettingsView {
     search: Entity<Editor>,
     section: usize,
+    /// The open graph's settings key and name, when there is one.
+    graph: Option<(String, String)>,
+    scope: Scope,
     _subscription: Subscription,
 }
 
@@ -54,7 +58,12 @@ impl Item for SettingsView {
 }
 
 impl SettingsView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// `graph` is the open graph's settings key and name, offered as a scope.
+    pub fn new(
+        graph: Option<(String, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let search = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Search settings", window, cx);
@@ -68,28 +77,38 @@ impl SettingsView {
         Self {
             search,
             section: 0,
+            graph,
+            scope: Scope::All,
             _subscription: subscription,
         }
     }
 }
 
-/// Writes `value` at the field's path.
-fn set(path: &[String], value: Value, cx: &mut App) {
-    let path = path.to_vec();
-    studio_settings::update(cx, move |settings| {
-        if let Ok(next) = settings.with_value(&path, value) {
-            *settings = next;
-        }
-    });
+/// One setting in one scope: what a control reads and writes.
+#[derive(Clone)]
+struct Target {
+    scope: Scope,
+    field: &'static SettingField,
 }
 
-fn id(field: &SettingField, part: &str) -> SharedString {
-    format!("{}-{part}", field.path.join(".")).into()
+impl Target {
+    fn set(&self, value: Value, cx: &mut App) {
+        let target = self.clone();
+        studio_settings::update(cx, move |settings| {
+            if let Ok(next) = settings.with_value_in(&target.scope, target.field, value) {
+                *settings = next;
+            }
+        });
+    }
+
+    fn id(&self, part: &str) -> SharedString {
+        format!("{}-{part}", self.field.path.join(".")).into()
+    }
 }
 
 /// A stepper within the field's range.
 fn stepper(
-    field: &SettingField,
+    target: &Target,
     value: f64,
     min: f64,
     max: f64,
@@ -108,15 +127,15 @@ fn stepper(
             serde_json::Number::from_f64(next).map_or(Value::Null, Value::Number)
         }
     };
-    let (down, up) = (field.path.clone(), field.path.clone());
+    let (down, up) = (target.clone(), target.clone());
     h_flex()
         .gap(px(space::XS))
         .child(
-            IconButton::new(id(field, "down"), IconName::Dash)
+            IconButton::new(target.id("down"), IconName::Dash)
                 .icon_size(IconSize::Small)
                 .disabled(value <= min)
                 .on_click(move |_, _, cx| {
-                    set(&down, to_value((value - step).max(min)), cx);
+                    down.set(to_value((value - step).max(min)), cx);
                 }),
         )
         .child(
@@ -127,31 +146,27 @@ fn stepper(
                 .child(ds::text::body(shown)),
         )
         .child(
-            IconButton::new(id(field, "up"), IconName::Plus)
+            IconButton::new(target.id("up"), IconName::Plus)
                 .icon_size(IconSize::Small)
                 .disabled(value >= max)
                 .on_click(move |_, _, cx| {
-                    set(&up, to_value((value + step).min(max)), cx);
+                    up.set(to_value((value + step).min(max)), cx);
                 }),
         )
         .into_any_element()
 }
 
 /// A menu of named values; the current one is checked.
-fn dropdown(
-    field: &SettingField,
-    current: Value,
-    options: Vec<(SharedString, Value)>,
-) -> AnyElement {
+fn dropdown(target: &Target, current: Value, options: Vec<(SharedString, Value)>) -> AnyElement {
     let shown = options
         .iter()
         .find(|(_, value)| *value == current)
         .map(|(label, _)| label.clone())
         .unwrap_or_else(|| current.as_str().unwrap_or_default().to_owned().into());
-    let path = field.path.clone();
-    PopoverMenu::new(id(field, "menu"))
+    let target = target.clone();
+    PopoverMenu::new(target.id("menu"))
         .trigger(
-            Button::new(id(field, "trigger"), shown)
+            Button::new(target.id("trigger"), shown)
                 .label_size(LabelSize::Small)
                 .style(ButtonStyle::Outlined)
                 .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
@@ -159,13 +174,13 @@ fn dropdown(
         .menu(move |window, cx| {
             let options = options.clone();
             let current = current.clone();
-            let path = path.clone();
+            let target = target.clone();
             Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                 for (label, value) in options {
-                    let path = path.clone();
+                    let target = target.clone();
                     let checked = value == current;
                     menu = menu.toggleable_entry(label, checked, IconPosition::Start, None, {
-                        move |_, cx| set(&path, value.clone(), cx)
+                        move |_, cx| target.set(value.clone(), cx)
                     });
                 }
                 menu
@@ -176,7 +191,7 @@ fn dropdown(
 }
 
 /// The agent's presets as a segmented choice, with the command it runs underneath.
-fn agent_control(field: &SettingField, current: Value, cx: &App) -> AnyElement {
+fn agent_control(target: &Target, current: Value, cx: &App) -> AnyElement {
     let command: Vec<String> = serde_json::from_value(current).unwrap_or_default();
     let mut options: Vec<(&str, Vec<String>)> = vec![("None", Vec::new())];
     options.extend(
@@ -187,15 +202,15 @@ fn agent_control(field: &SettingField, current: Value, cx: &App) -> AnyElement {
     let known = options.iter().any(|(_, preset)| *preset == command);
     let mut segments = ds::segmented(cx);
     for (index, (name, preset)) in options.into_iter().enumerate() {
-        let path = field.path.clone();
+        let target = target.clone();
         let selected = preset == command;
         segments = segments.child(
-            ds::segment(id(field, &index.to_string()), name, selected, cx)
-                .on_click(move |_, _, cx| set(&path, Value::from(preset.clone()), cx)),
+            ds::segment(target.id(&index.to_string()), name, selected, cx)
+                .on_click(move |_, _, cx| target.set(Value::from(preset.clone()), cx)),
         );
     }
     if !known {
-        segments = segments.child(ds::segment(id(field, "custom"), "Custom", true, cx));
+        segments = segments.child(ds::segment(target.id("custom"), "Custom", true, cx));
     }
     v_flex()
         .items_end()
@@ -214,27 +229,27 @@ fn agent_control(field: &SettingField, current: Value, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn control(field: &SettingField, settings: &StudioSettings, cx: &App) -> AnyElement {
-    let current = settings.value_at(&field.path);
-    match &field.kind {
+fn control(target: &Target, settings: &StudioSettings, cx: &App) -> AnyElement {
+    let current = settings.value_in(&target.scope, target.field);
+    match &target.field.kind {
         FieldKind::Choice(choices) if choices.len() <= 4 => {
             let mut segments = ds::segmented(cx);
             for choice in choices {
-                let path = field.path.clone();
+                let choice_target = target.clone();
                 let value = Value::from(choice.value.clone());
                 let selected = current == value;
                 segments = segments.child(
-                    ds::segment(id(field, &choice.value), choice.label.clone(), selected, cx)
+                    ds::segment(target.id(&choice.value), choice.label.clone(), selected, cx)
                         .when_some(choice.description.clone(), |segment, description| {
                             segment.tooltip(Tooltip::text(description))
                         })
-                        .on_click(move |_, _, cx| set(&path, value.clone(), cx)),
+                        .on_click(move |_, _, cx| choice_target.set(value.clone(), cx)),
                 );
             }
             segments.into_any_element()
         }
         FieldKind::Choice(choices) => dropdown(
-            field,
+            target,
             current,
             choices
                 .iter()
@@ -247,7 +262,7 @@ fn control(field: &SettingField, settings: &StudioSettings, cx: &App) -> AnyElem
             step,
             integer,
         } => stepper(
-            field,
+            target,
             current.as_f64().unwrap_or_default(),
             *min,
             *max,
@@ -256,17 +271,17 @@ fn control(field: &SettingField, settings: &StudioSettings, cx: &App) -> AnyElem
         ),
         FieldKind::Toggle => {
             let on = current.as_bool().unwrap_or_default();
-            let path = field.path.clone();
-            Switch::new(id(field, "switch"), on.into())
+            let switch_target = target.clone();
+            Switch::new(target.id("switch"), on.into())
                 .on_click(move |state, _, cx| {
-                    set(&path, Value::Bool(*state == ToggleState::Selected), cx)
+                    switch_target.set(Value::Bool(*state == ToggleState::Selected), cx)
                 })
                 .into_any_element()
         }
         FieldKind::Custom(kind) if kind == "theme" => {
             let names = ThemeRegistry::global(cx).list_names();
             dropdown(
-                field,
+                target,
                 current,
                 names
                     .into_iter()
@@ -286,9 +301,9 @@ fn control(field: &SettingField, settings: &StudioSettings, cx: &App) -> AnyElem
                         .map(|name| (name.clone().into(), Value::from(name))),
                 )
                 .collect();
-            dropdown(field, current, options)
+            dropdown(target, current, options)
         }
-        FieldKind::Custom(kind) if kind == "agent" => agent_control(field, current, cx),
+        FieldKind::Custom(kind) if kind == "agent" => agent_control(target, current, cx),
         FieldKind::Custom(_) | FieldKind::Text { .. } => {
             let shown = match &current {
                 Value::Null => "Not set".to_owned(),
@@ -303,30 +318,75 @@ fn control(field: &SettingField, settings: &StudioSettings, cx: &App) -> AnyElem
     }
 }
 
+impl SettingsView {
+    /// The scope switch, when a graph is open: the shared values, or this graph's own.
+    fn render_scope(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (key, name) = self.graph.clone()?;
+        let all = self.scope == Scope::All;
+        Some(
+            ds::segmented(cx)
+                .child(
+                    ds::segment("scope-all", "All graphs", all, cx)
+                        .tooltip(Tooltip::text("Settings for every graph"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.scope = Scope::All;
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    ds::segment("scope-graph", name.clone(), !all, cx)
+                        .tooltip(Tooltip::text(format!(
+                            "Values for {name} only, over those for all graphs"
+                        )))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.scope = Scope::Graph(key.clone());
+                            cx.notify();
+                        })),
+                ),
+        )
+    }
+}
+
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self.search.read(cx).text(cx).to_lowercase();
-        let searching = !query.trim().is_empty();
-        let sections = studio_settings::sections();
+        let query = query.trim();
+        let searching = !query.is_empty();
+        let scope = self.scope.clone();
+        let in_scope = |field: &&'static SettingField| scope == Scope::All || field.per_graph;
+        let sections: Vec<&str> = studio_settings::sections()
+            .into_iter()
+            .filter(|section| {
+                studio_settings::fields()
+                    .iter()
+                    .filter(in_scope)
+                    .any(|f| f.section == *section)
+            })
+            .collect();
         self.section = self.section.min(sections.len().saturating_sub(1));
         let chosen = sections.get(self.section).copied().unwrap_or_default();
         let settings = StudioSettings::get(cx).clone();
-        let matches = |field: &SettingField| {
-            if searching {
-                field.title.to_lowercase().contains(query.trim())
-                    || field.description.to_lowercase().contains(query.trim())
-                    || field.path.join(".").contains(query.trim())
-            } else {
-                field.section == chosen
-            }
-        };
-        let shown: Vec<&SettingField> = studio_settings::fields()
+        let shown: Vec<&'static SettingField> = studio_settings::fields()
             .iter()
-            .filter(|f| matches(f))
+            .filter(in_scope)
+            .filter(|field| {
+                if searching {
+                    field.title.to_lowercase().contains(query)
+                        || field.description.to_lowercase().contains(query)
+                        || field.path.join(".").contains(query)
+                } else {
+                    field.section == chosen
+                }
+            })
             .collect();
         let path = studio_settings::settings_path();
         let error = studio_settings::file_error(cx);
         let rule = ds::surface::rule(cx);
+        let changed_word = if scope == Scope::All {
+            "changed"
+        } else {
+            "own"
+        };
 
         let nav = v_flex()
             .w(px(200.))
@@ -339,12 +399,13 @@ impl Render for SettingsView {
             .children(sections.iter().enumerate().map(|(index, section)| {
                 let count = studio_settings::fields()
                     .iter()
-                    .filter(|f| f.section == *section && !settings.is_default_at(&f.path))
+                    .filter(in_scope)
+                    .filter(|f| f.section == *section && !settings.is_default_in(&scope, f))
                     .count();
                 ds::SidebarRow::new(("settings-section", index), *section)
                     .selected(!searching && index == self.section)
                     .when(count > 0, |row| {
-                        row.end(ds::sidebar_count(format!("{count} changed")))
+                        row.end(ds::sidebar_count(format!("{count} {changed_word}")))
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.section = index;
@@ -355,7 +416,7 @@ impl Render for SettingsView {
             }));
 
         // While searching, the matches are grouped by section under a label each.
-        let mut groups: Vec<(&str, Vec<&SettingField>)> = Vec::new();
+        let mut groups: Vec<(&str, Vec<&'static SettingField>)> = Vec::new();
         for field in shown {
             match groups.last_mut() {
                 Some((section, fields)) if *section == field.section => fields.push(field),
@@ -374,22 +435,36 @@ impl Render for SettingsView {
                     .when(searching, |group| group.child(ds::text::meta(section)))
                     .child(ds::card(cx).px(px(space::XL)).children(
                         fields.into_iter().enumerate().map(|(index, field)| {
-                            let reset = (!settings.is_default_at(&field.path)).then(|| {
-                                let path = field.path.clone();
+                            let target = Target {
+                                scope: scope.clone(),
+                                field,
+                            };
+                            let overridden = !settings.is_default_in(&scope, field);
+                            let reset = overridden.then(|| {
+                                let target = target.clone();
                                 Box::new(
                                     move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
-                                        let path = path.clone();
+                                        let target = target.clone();
                                         studio_settings::update(cx, move |s| {
-                                            *s = s.reset_at(&path)
+                                            *s = s.reset_in(&target.scope, target.field)
                                         });
                                     },
                                 ) as _
                             });
+                            // In a graph's scope, an own value says what every other graph uses.
+                            let description = match (&scope, overridden) {
+                                (Scope::Graph(_), true) => format!(
+                                    "{} All graphs: {}.",
+                                    field.description,
+                                    studio_ui::format_value(&settings.value_at(&field.path))
+                                ),
+                                _ => field.description.clone(),
+                            };
                             let row = ds::setting_row(
-                                id(field, "row"),
+                                target.id("row"),
                                 field.title.clone(),
-                                field.description.clone(),
-                                control(field, &settings, cx),
+                                description,
+                                control(&target, &settings, cx),
                                 reset,
                             );
                             if index + 1 < count {
@@ -401,10 +476,11 @@ impl Render for SettingsView {
                     ))
             }))
             .when(empty, |body| {
-                body.child(div().pt(px(space::XXXL)).child(ds::text::muted(format!(
-                    "No setting matches “{}”",
-                    query.trim()
-                ))))
+                body.child(
+                    div()
+                        .pt(px(space::XXXL))
+                        .child(ds::text::muted(format!("No setting matches “{query}”"))),
+                )
             });
 
         h_flex()
@@ -436,9 +512,10 @@ impl Render for SettingsView {
                                 .size(HeadlineSize::Small),
                             )
                             .child(div().flex_1())
+                            .children(self.render_scope(cx))
                             .child(
                                 h_flex()
-                                    .w(px(240.))
+                                    .w(px(220.))
                                     .h(px(size::SIDEBAR_ROW))
                                     .px(px(space::MD))
                                     .gap(px(space::SM))

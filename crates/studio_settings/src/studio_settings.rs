@@ -15,7 +15,7 @@ use settings::{ParseStatus, SettingsStore};
 
 mod fields;
 
-pub use fields::{Choice, FieldKind, SettingField, fields, sections};
+pub use fields::{Choice, FieldKind, Scope, SettingField, fields, sections};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -81,21 +81,21 @@ pub struct StudioOptions {
     #[schemars(
         title = "Table page size",
         range(min = 25, max = 1000),
-        extend("x-section" = "Browsing", "x-step" = 25)
+        extend("x-section" = "Browsing", "x-step" = 25, "x-per-graph" = true)
     )]
     pub type_table_page_size: u32,
     /// Neighbours shown per page in the relationship tree.
     #[schemars(
         title = "Relationship page size",
         range(min = 10, max = 500),
-        extend("x-section" = "Browsing", "x-step" = 10)
+        extend("x-section" = "Browsing", "x-step" = 10, "x-per-graph" = true)
     )]
     pub tree_page_size: u32,
     /// Most nodes the canvas draws before offering a table instead.
     #[schemars(
         title = "Canvas node limit",
         range(min = 500, max = 20000),
-        extend("x-section" = "Browsing", "x-step" = 500)
+        extend("x-section" = "Browsing", "x-step" = 500, "x-per-graph" = true)
     )]
     pub canvas_max_nodes: u32,
     /// Seconds between checks that the server still answers.
@@ -117,6 +117,39 @@ impl Default for StudioOptions {
             health_check_seconds: 30,
         }
     }
+}
+
+/// One graph's own values for the settings marked `x-per-graph`, over `studio` (spec 002).
+/// Each is unset unless the person chose it for this graph.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct GraphOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_table_page_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tree_page_size: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canvas_max_nodes: Option<u32>,
+}
+
+impl GraphOverrides {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The browsing limits in effect for one graph: its overrides, else `studio`'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphOptions {
+    pub type_table_page_size: u32,
+    pub tree_page_size: u32,
+    pub canvas_max_nodes: u32,
+}
+
+/// The `graphs` key for a graph on a server: `<server name>/<graph id>`, as the settings tab
+/// writes it.
+pub fn graph_key(server: &str, graph: &str) -> String {
+    format!("{server}/{graph}")
 }
 
 /// The agent the agent panel runs (spec 011): a program and its arguments, and extra
@@ -172,6 +205,9 @@ pub struct StudioSettings {
     pub studio: StudioOptions,
     #[schemars(extend("x-section" = "Agent"))]
     pub agent: AgentSettings,
+    /// Per-graph overrides, keyed by [`graph_key`]; edited in the settings tab's graph scope.
+    #[schemars(extend("x-hidden" = true))]
+    pub graphs: BTreeMap<String, GraphOverrides>,
 }
 
 impl Default for StudioSettings {
@@ -185,6 +221,7 @@ impl Default for StudioSettings {
             ui_density: Density::default(),
             studio: StudioOptions::default(),
             agent: AgentSettings::default(),
+            graphs: BTreeMap::new(),
         }
     }
 }
@@ -227,6 +264,22 @@ pub fn settings_path() -> PathBuf {
 impl StudioSettings {
     pub fn get(cx: &App) -> &Self {
         cx.global::<Self>()
+    }
+
+    /// The limits in effect for `graph` on the server named `server`.
+    pub fn for_graph(&self, server: &str, graph: &str) -> GraphOptions {
+        let own = self.graphs.get(&graph_key(server, graph));
+        let pick = |get: fn(&GraphOverrides) -> Option<u32>, fallback: u32| {
+            own.and_then(get).unwrap_or(fallback)
+        };
+        GraphOptions {
+            type_table_page_size: pick(
+                |o| o.type_table_page_size,
+                self.studio.type_table_page_size,
+            ),
+            tree_page_size: pick(|o| o.tree_page_size, self.studio.tree_page_size),
+            canvas_max_nodes: pick(|o| o.canvas_max_nodes, self.studio.canvas_max_nodes),
+        }
     }
 
     /// Parses a settings file; unknown keys are ignored, missing keys take defaults.
@@ -387,6 +440,22 @@ mod tests {
         assert_eq!(settings.studio.tree_page_size, 20);
         assert_eq!(settings.studio.type_table_page_size, 100);
         assert_eq!(settings.theme, ThemeChoice::default());
+    }
+
+    #[test]
+    fn a_graph_takes_its_own_limits_then_the_shared_ones() {
+        let settings = StudioSettings::parse(
+            r#"{
+                "studio": {"canvas_max_nodes": 3000},
+                "graphs": {"dev/knowledge": {"tree_page_size": 10}}
+            }"#,
+        )
+        .unwrap();
+        let dev = settings.for_graph("dev", "knowledge");
+        assert_eq!(dev.tree_page_size, 10, "the graph's own value");
+        assert_eq!(dev.canvas_max_nodes, 3000, "else the shared value");
+        let other = settings.for_graph("prod", "knowledge");
+        assert_eq!(other.tree_page_size, 50, "a key names one server's graph");
     }
 
     #[test]

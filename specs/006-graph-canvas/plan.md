@@ -36,7 +36,8 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   edges batched by color in one paint layer with cached geometry; hit-testing through an
   R-tree. Layout runs on a background thread and streams positions; the main thread only paints.
 - **Caps:** a legibility cap (start at 2,000 visible nodes, tune with spike S2) with "Too many
-  nodes to draw · Open as table · Show in tree".
+  nodes to draw · Open as table · Show in tree". The cap is `studio.canvas_max_nodes`, which
+  a graph can override (spec 002).
 - **Keys (context `Canvas`):** arrows move to the nearest node; ↵ expand; Space peek; ⌫ collapse;
   `0` fit; `+`/`-` zoom; F focus; `[`/`]` walk the expansion path.
 - **Query results:** a query whose result has node or edge columns can open as a canvas.
@@ -75,7 +76,8 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   plus 60 iterations of grid-based overlap relaxation, on `cx.background_spawn`; not `fjadra`.
   Nodes already drawn never move, so expanding does not reshuffle the view. Revisit with spike
   S2 if larger neighbourhoods need a force layout.
-- **Hit-testing** is a linear scan over at most 2,000 nodes, not an R-tree.
+- **Hit-testing** is a linear scan over at most the node cap (2,000 by default), not an
+  R-tree.
 - **Hub labels** sit between the hub and its node, on a backdrop, so they never cover the fan
   of neighbours.
 - **Mode.** "Schema" and "Exploration" toggle in the canvas; the schema view never clears the

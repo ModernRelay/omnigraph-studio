@@ -10,7 +10,9 @@ use graph_store::{Entry, EntryKind, ExplorePath, ExploreState, GroupKey, Loadabl
 /// Neighbours a hub shows before "+K more", and how many each click on it adds.
 pub const HUB_STEP: usize = 8;
 
-/// The most nodes the canvas draws; past it, it says so (constitution IX).
+/// The most nodes the canvas draws by default; past the cap it says so (constitution IX). The
+/// cap in use is the graph's `canvas_max_nodes` setting.
+#[cfg(test)]
 pub const NODE_CAP: usize = 2_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -68,7 +70,7 @@ pub struct SceneEdge {
 pub struct Scene {
     pub nodes: Vec<SceneNode>,
     pub edges: Vec<SceneEdge>,
-    /// Nodes left out because of [`NODE_CAP`], and the type most of them belong to.
+    /// Nodes left out because of the node cap, and the type most of them belong to.
     pub capped: Option<(usize, String)>,
 }
 
@@ -131,11 +133,15 @@ pub fn schema_scene(schema: &SchemaModel, count_of: impl Fn(&str) -> Option<i64>
 
 /// A query result as the canvas draws it: each node once, a line between the nodes of a row.
 /// No hubs: a double click explores from a node.
-pub fn results_scene(nodes: &[(NodeRef, Option<String>)], links: &[(usize, usize)]) -> Scene {
-    let capped = nodes.len().saturating_sub(NODE_CAP);
+pub fn results_scene(
+    nodes: &[(NodeRef, Option<String>)],
+    links: &[(usize, usize)],
+    cap: usize,
+) -> Scene {
+    let capped = nodes.len().saturating_sub(cap);
     let scene_nodes: Vec<SceneNode> = nodes
         .iter()
-        .take(NODE_CAP)
+        .take(cap)
         .map(|(node, label)| SceneNode {
             id: SceneId::Node(node.clone()),
             kind: SceneKind::Node {
@@ -163,7 +169,7 @@ pub fn results_scene(nodes: &[(NodeRef, Option<String>)], links: &[(usize, usize
         .collect();
     let capped = (capped > 0).then(|| {
         let mut counts: HashMap<&str, usize> = HashMap::new();
-        for (node, _) in nodes.iter().skip(NODE_CAP) {
+        for (node, _) in nodes.iter().skip(cap) {
             *counts.entry(node.type_name.as_str()).or_default() += 1;
         }
         let most = counts

@@ -6,7 +6,7 @@
 //! the session's branch raises [`Exploration::newer_available`] and changes nothing until
 //! [`Exploration::refresh`]. Counts come from one `builder::degree` query per relationship
 //! group, run concurrently (engine change E16 would replace them); neighbours come in keyset
-//! pages of [`NEIGHBOUR_PAGE`] from `builder::neighbours`.
+//! pages from `builder::neighbours`, as many as the graph's `tree_page_size` setting.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -21,9 +21,6 @@ use graph_client::api::ReadOutput;
 use serde_json::Value;
 
 use crate::session::{GraphSession, Loadable, SessionEvent};
-
-/// How many neighbours one page of a relationship group holds.
-pub const NEIGHBOUR_PAGE: u32 = 50;
 
 /// One node, by type and key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -158,6 +155,8 @@ pub struct NeighbourList {
     pub status: PageStatus,
     /// The last page came back short: there are no more rows.
     pub exhausted: bool,
+    /// The size of the page last asked for, so a short page is recognised.
+    pub page_size: u32,
 }
 
 impl NeighbourList {
@@ -741,6 +740,11 @@ pub struct Exploration {
 impl EventEmitter<ExplorationEvent> for Exploration {}
 
 impl Exploration {
+    /// Neighbours per page for this graph (setting `studio.tree_page_size`, or the graph's own).
+    pub fn page_size(&self, cx: &App) -> u32 {
+        self.session.read(cx).options(cx).tree_page_size.max(1)
+    }
+
     /// The exploration of `session`, created on first use.
     pub fn for_session(session: &Entity<GraphSession>, cx: &mut App) -> Entity<Exploration> {
         let id = session.entity_id();
@@ -1040,8 +1044,10 @@ impl Exploration {
                 builder::degree(&schema, &key.node.type_name, &key.group, &key.node.id)
             }
             LoadTarget::Page(key) => {
+                let page_size = self.page_size(cx);
                 let list = self.state.neighbours.entry(key.clone()).or_default();
                 list.status = PageStatus::Loading;
+                list.page_size = page_size;
                 builder::neighbours(
                     &schema,
                     &key.node.type_name,
@@ -1049,7 +1055,7 @@ impl Exploration {
                     &key.node.id,
                     list.next_after(),
                     self.state.searches.get(key).map(String::as_str),
-                    NEIGHBOUR_PAGE,
+                    page_size,
                 )
             }
         };
@@ -1095,7 +1101,14 @@ impl Exploration {
         match target {
             LoadTarget::Root => self.state.apply_root(&output),
             LoadTarget::Count(key) => self.state.apply_count(key.clone(), &output),
-            LoadTarget::Page(key) => self.state.apply_page(key.clone(), &output, NEIGHBOUR_PAGE),
+            LoadTarget::Page(key) => {
+                let page_size = self
+                    .state
+                    .neighbours
+                    .get(key)
+                    .map_or(1, |list| list.page_size.max(1));
+                self.state.apply_page(key.clone(), &output, page_size)
+            }
         }
     }
 

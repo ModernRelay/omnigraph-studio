@@ -66,6 +66,8 @@ stay put), IX (paged, virtualized).
   Sorting by a property uses keyset pairs: `order { $n.name asc, $n.@id asc }` with
   `$n.name > $v or ($n.name = $v and $n.@id > $id)`. Nulls sort last, through an
   `is null` split.
+- A page holds `studio.type_table_page_size` rows (100 by default; a graph can have its own,
+  spec 002), the `limit` above.
 - The first page records `graph_commit_id`; later pages pass it as `snapshot` (constitution II).
 - The next page is fetched when the viewport passes 80% of loaded rows. No row cap: the grid is
   virtualized.

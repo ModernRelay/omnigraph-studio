@@ -57,7 +57,8 @@ on the canvas. Typing filters the visible rows.
   }
   ```
 
-- Neighbour pages: keyset by `@id`, 50 per page, with edge properties through an edge binding.
+- Neighbour pages: keyset by `@id`, `studio.tree_page_size` per page (50 by default; a graph
+  can have its own, spec 002), with edge properties through an edge binding.
 - The whole tree reads one commit; when the branch moves, "Newer data · Refresh" appears.
 
 ### Rendering and state
