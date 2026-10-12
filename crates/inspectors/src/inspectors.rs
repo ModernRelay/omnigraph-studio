@@ -13,6 +13,14 @@ pub use storage::{STORAGE_KEY, StorageInspector};
 
 /// Registers this surface with every new workspace.
 pub fn init(cx: &mut App) {
+    studio_workspace::register_item_kind(cx, "storage", |_, workspace, window, cx| {
+        let Some(session) = workspace.session().cloned() else {
+            return;
+        };
+        workspace.open_item::<StorageInspector>(STORAGE_KEY, window, cx, |_, cx| {
+            StorageInspector::new(session, cx)
+        });
+    });
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &OpenInspector, window, cx| {
             let Some(session) = workspace.session().cloned() else {

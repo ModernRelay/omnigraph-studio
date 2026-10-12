@@ -16,6 +16,22 @@ pub use view::QueryEditor;
 
 /// Registers `NewQuery` with every new workspace and binds the editor's keys.
 pub fn init(cx: &mut App) {
+    studio_workspace::register_item_kind(cx, "query", |data, workspace, window, cx| {
+        let Some(session) = workspace.session().cloned() else {
+            return;
+        };
+        let text = data
+            .get("text")
+            .and_then(|text| text.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let number = view::next_number();
+        workspace.open_item(format!("query:{number}"), window, cx, |window, cx| {
+            let mut editor = QueryEditor::new(number, session, window, cx);
+            editor.set_text(&text, window, cx);
+            editor
+        });
+    });
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &NewQuery, window, cx| {
             let Some(session) = workspace.session().cloned() else {
@@ -34,4 +50,3 @@ pub fn init(cx: &mut App) {
     })
     .detach();
 }
-

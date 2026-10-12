@@ -22,6 +22,11 @@ pub use types_list::TypesList;
 /// Registers this surface with every new workspace: the left dock's Types panel, `OpenType`,
 /// and `OpenNode`. Its keys are in `assets/keymaps/` (`TypeTable`, `TypeTable && editing`).
 pub fn init(cx: &mut App) {
+    studio_workspace::register_item_kind(cx, "type_table", |data, workspace, window, cx| {
+        if let Some(type_name) = data.get("type_name").and_then(|name| name.as_str()) {
+            open_type(workspace, type_name, window, cx);
+        }
+    });
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };
         let handle = cx.entity().downgrade();

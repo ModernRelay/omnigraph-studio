@@ -9,6 +9,7 @@ publish.workspace = true
 path = "src/history.rs"
 
 [dependencies]
+serde_json = { workspace = true }
 gpui = { workspace = true }
 ui = { workspace = true }
 menu = { workspace = true }

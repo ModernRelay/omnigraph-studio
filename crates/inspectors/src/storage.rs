@@ -12,7 +12,7 @@ use graph_client::api::{
 };
 use graph_store::{GraphSession, Loadable};
 use studio_ui::{CopyableValue, type_swatch};
-use studio_workspace::{Item, ItemEvent};
+use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 
 pub const STORAGE_KEY: &str = "inspector:storage";
@@ -47,6 +47,13 @@ impl Item for StorageInspector {
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
         Some(STORAGE_KEY.into())
+    }
+
+    fn serialize(&self, _cx: &App) -> Option<SavedItem> {
+        Some(SavedItem {
+            kind: "storage".into(),
+            data: serde_json::Value::Null,
+        })
     }
 }
 

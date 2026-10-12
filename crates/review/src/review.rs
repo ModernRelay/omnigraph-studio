@@ -17,6 +17,19 @@ pub use view::{ReviewView, open_review, review_key};
 
 /// Registers this surface with every new workspace.
 pub fn init(cx: &mut App) {
+    studio_workspace::register_item_kind(cx, "review", |data, workspace, window, cx| {
+        let field = |name: &str| data.get(name).and_then(|value| value.as_str());
+        if let (Some(branch), Some(target)) = (field("branch"), field("target")) {
+            open_review(
+                workspace,
+                branch.to_owned(),
+                target.to_owned(),
+                false,
+                window,
+                cx,
+            );
+        }
+    });
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };
         // Window-level actions reach the workspace only through a focused element, and a fresh

@@ -18,6 +18,30 @@ pub use view::{HistoryView, LONG_HISTORY, history_key};
 
 /// Registers this surface with every new workspace.
 pub fn init(cx: &mut App) {
+    studio_workspace::register_item_kind(cx, "history", |data, workspace, window, cx| {
+        let (Some(session), Some(branch)) = (
+            workspace.session().cloned(),
+            data.get("branch").and_then(|branch| branch.as_str()),
+        ) else {
+            return;
+        };
+        let branch = branch.to_owned();
+        workspace.open_item::<HistoryView>(history_key(&branch), window, cx, |_, cx| {
+            HistoryView::new(session, branch, cx)
+        });
+    });
+    studio_workspace::register_item_kind(cx, "commit", |data, workspace, window, cx| {
+        let (Some(session), Some(id)) = (
+            workspace.session().cloned(),
+            data.get("commit_id").and_then(|id| id.as_str()),
+        ) else {
+            return;
+        };
+        let id = id.to_owned();
+        workspace.open_item::<CommitView>(commit_key(&id), window, cx, |_, cx| {
+            CommitView::new(session, id, None, cx)
+        });
+    });
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &OpenHistory, window, cx| {
             let Some(session) = workspace.session().cloned() else {

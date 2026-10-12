@@ -9,6 +9,7 @@ publish.workspace = true
 path = "src/inspectors.rs"
 
 [dependencies]
+serde_json = { workspace = true }
 gpui = { workspace = true }
 ui = { workspace = true }
 studio_ui = { workspace = true }

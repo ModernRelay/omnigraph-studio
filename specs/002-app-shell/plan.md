@@ -176,6 +176,8 @@ Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks ente
 | Fork and trim `workspace`, `picker`, `command_palette` | Depend on them | They require `project`, `client`, `db`, `language`; Delta also wrote its own panes and picker |
 | JSON files for layout persistence | Zed's SQLite `db` | Small state; no migrations to carry |
 | Palette lists only available actions | A global list of every command | Zed's model: a listed action always works where you are |
+| Every tab kind restores; a query tab keeps its draft, in an owner-only (0600) workspace file | Restore query tabs empty; keep drafts only in memory | Spec 007: a draft is never cleared. The rule against logging query text is about logs; the workspace file is the person's own document state |
+| Panels in docks, one active panel per dock | Stacked sidebar sections | Zed's and Obsidian's model; every panel gets the same bounded chrome and the sidebar stays short |
 
 ## Deferred
 
@@ -196,6 +198,7 @@ Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks ente
 | 2026-10-12 | The palette's rows come from where the person was | `gpui/src/window.rs` `available_actions` (the focused node in the rendered frame, plus global listeners) and `dispatch_action` (captures focus when called) at `v1.23.2` | The list is built before the modal takes focus; on ↵ focus is restored, the modal dismissed, then the action dispatched |
 | 2026-10-12 | Zed's global handlers appear as rows | palette snapshot | `editor::init` registers `workspace::NewFile` and `workspace::NewWindow` globally; their handlers read Zed's `AppState` with `cx.global`, which panics in Studio. The palette hides `workspace::`, `zed::` and `menu::`; ⌘N is rebound to `studio_graph::NewQuery` at the root (spec 007), so the key no longer reaches `NewFile` |
 | 2026-10-12 | With nothing focused, an action reaches only global handlers | offscreen snapshots: `studio::ToggleSidebar` and `studio::OpenGraph` did nothing until the workspace had focus | A window opens with no focus, so the workspace's handlers and key bindings are unreachable until something is clicked. The snapshot example now focuses the workspace first; the app should focus it when a window opens |
+| 2026-10-12 | Every tab kind comes back after a restart | offscreen snapshots: one run opened a type table, a query with a draft, history, canvas and storage; a second run with `OMNIGRAPH_STUDIO_NO_RESTORE=0` | All five tabs restored in order, the draft intact; the workspace file is `-rw-------` |
 
 ## Corrections
 

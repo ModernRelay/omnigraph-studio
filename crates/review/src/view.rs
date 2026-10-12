@@ -23,7 +23,7 @@ use studio_ui::{
     ChangeCard, ChangeKind, PropertyRow, change_counts, change_group_header, empty_state,
     group_digits, short_commit_id, type_swatch,
 };
-use studio_workspace::{Item, ItemEvent, Workspace};
+use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
 use ui::{Banner, KeyBinding, Severity, Tooltip};
 
@@ -146,6 +146,13 @@ impl Item for ReviewView {
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
         Some(review_key(&self.branch, &self.target).into())
+    }
+
+    fn serialize(&self, _cx: &App) -> Option<SavedItem> {
+        Some(SavedItem {
+            kind: "review".into(),
+            data: serde_json::json!({ "branch": self.branch, "target": self.target }),
+        })
     }
 
     fn is_stale(&self, _cx: &App) -> bool {

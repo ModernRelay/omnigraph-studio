@@ -18,9 +18,9 @@ use std::sync::Arc;
 
 use gpui::{
     App, AppContext as _, BorderStyle, Bounds, ContentMask, Context, Entity, EventEmitter,
-    FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathBuilder, PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString,
-    Subscription, Task, TextAlign, TextRun, Window, canvas, point, px, quad, size,
+    FocusHandle, Focusable, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathBuilder, PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Subscription,
+    Task, TextAlign, TextRun, Window, canvas, point, px, quad, size,
 };
 use graph_store::{
     Exploration, ExplorationEvent, ExplorePath, GraphSession, GroupKey, Loadable, NodeRef,
@@ -31,7 +31,7 @@ use studio_actions::canvas::{
 };
 use studio_actions::graph::{OpenCanvas, OpenNode, OpenType, ShowNodeOnCanvas};
 use studio_ui::{empty_state, type_color};
-use studio_workspace::{Item, ItemEvent, Workspace};
+use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::Tooltip;
 use ui::prelude::*;
 
@@ -47,6 +47,9 @@ const LABEL_SIZE: f32 = 12.;
 
 /// Registers the canvas's keys and the actions that open it.
 pub fn init(cx: &mut App) {
+    studio_workspace::register_item_kind(cx, "canvas", |_, workspace, window, cx| {
+        open_canvas(workspace, window, cx);
+    });
     cx.observe_new(|workspace: &mut Workspace, window, _cx| {
         if window.is_none() {
             return;
@@ -137,6 +140,13 @@ impl Item for GraphCanvas {
 
     fn dedupe_key(&self, cx: &App) -> Option<SharedString> {
         Some(canvas_key(&self.session.read(cx).graph_id))
+    }
+
+    fn serialize(&self, _cx: &App) -> Option<SavedItem> {
+        Some(SavedItem {
+            kind: "canvas".into(),
+            data: serde_json::Value::Null,
+        })
     }
 
     fn is_stale(&self, cx: &App) -> bool {

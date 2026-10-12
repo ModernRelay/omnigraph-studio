@@ -16,7 +16,7 @@ use studio_ui::{
     ChangeCard, ChangeKind, CopyableValue, PropertyRow, change_counts, change_group_header,
     empty_state, now_micros, relative_time, short_commit_id, type_swatch, utc_date_time,
 };
-use studio_workspace::{Item, ItemEvent};
+use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 
 /// Changes asked for per page.
@@ -81,6 +81,13 @@ impl Item for CommitView {
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
         Some(commit_key(&self.commit_id).into())
+    }
+
+    fn serialize(&self, _cx: &App) -> Option<SavedItem> {
+        Some(SavedItem {
+            kind: "commit".into(),
+            data: serde_json::json!({ "commit_id": self.commit_id }),
+        })
     }
 }
 

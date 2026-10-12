@@ -3,10 +3,12 @@
 //! data directory; no database.
 //!
 //! A tab is remembered only if its item returns [`SavedItem`] from `Item::serialize`, and comes
-//! back only if a feature registered its kind with [`register_item_kind`].
+//! back only if a feature registered its kind with [`register_item_kind`]. A query tab keeps its
+//! draft, so the files are readable by their owner only.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use gpui::{App, Bounds, Context, Global, Pixels, Window, point, px, size};
 use serde::{Deserialize, Serialize};
@@ -86,8 +88,20 @@ pub(crate) fn save(server_url: &str, graph: &str, saved: &SavedWorkspace) {
         return;
     }
     if let Ok(text) = serde_json::to_string_pretty(saved) {
-        std::fs::write(dir.join(key(server_url, graph)), text).ok();
+        write_private(&dir.join(key(server_url, graph)), &text).ok();
     }
+}
+
+/// Writes `text` to a file only its owner can read, including a file an older build created.
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    file.write_all(text.as_bytes())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -138,6 +152,22 @@ pub(crate) fn save_window_bounds(bounds: Bounds<Pixels>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_files_are_private_even_when_they_existed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("studio-persistence-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("workspace.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&path, r#"{"active": 1}"#).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"active": 1}"#);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn keys_are_stable_and_distinct() {

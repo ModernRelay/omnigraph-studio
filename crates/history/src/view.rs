@@ -13,7 +13,7 @@ use graph_client::api::CommitOutput;
 use graph_store::GraphSession;
 use studio_actions::graph::OpenCommit;
 use studio_ui::{change_counts, empty_state, now_micros, relative_time, short_commit_id};
-use studio_workspace::{Item, ItemEvent};
+use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 use ui::{Banner, ContextMenu, Severity, right_click_menu};
 
@@ -75,6 +75,13 @@ impl Item for HistoryView {
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
         Some(history_key(&self.branch).into())
+    }
+
+    fn serialize(&self, _cx: &App) -> Option<SavedItem> {
+        Some(SavedItem {
+            kind: "history".into(),
+            data: serde_json::json!({ "branch": self.branch }),
+        })
     }
 }
 

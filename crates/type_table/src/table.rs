@@ -26,7 +26,9 @@ use studio_actions::table::{
     InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp, PeekRow, RefreshTable,
 };
 use studio_ui::ROW_HEIGHT;
-use studio_workspace::{Item, ItemEvent, ItemFooter, ToastKind, Workspace, WorkspaceEvent};
+use studio_workspace::{
+    Item, ItemEvent, ItemFooter, SavedItem, ToastKind, Workspace, WorkspaceEvent,
+};
 use ui::prelude::*;
 use ui::{
     ColumnWidthConfig, ContextMenu, Indicator, PopoverMenu, ResizableColumnsState, Table,
@@ -135,6 +137,13 @@ impl Item for TypeTable {
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
         Some(format!("type:{}", self.type_name).into())
+    }
+
+    fn serialize(&self, _cx: &App) -> Option<SavedItem> {
+        Some(SavedItem {
+            kind: "type_table".into(),
+            data: serde_json::json!({ "type_name": self.type_name }),
+        })
     }
 
     fn is_dirty(&self, _cx: &App) -> bool {

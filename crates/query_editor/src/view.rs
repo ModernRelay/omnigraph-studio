@@ -23,7 +23,7 @@ use graph_store::{GraphSession, SessionEvent};
 use serde_json::{Map, Value};
 use studio_actions::query::{CopyCell, CopyRow, Explain, Run};
 use studio_ui::{GridColumn, ROW_HEIGHT, format_value, grid_cell, grid_header, is_numeric};
-use studio_workspace::{Item, ItemEvent};
+use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 use ui::{KeyBinding, Tooltip};
 
@@ -231,6 +231,15 @@ impl Item for QueryEditor {
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
         Some(format!("query:{}", self.number).into())
     }
+
+    /// The draft comes back after a restart (spec 007: the text is never cleared). It is
+    /// written to the workspace file, never to a log.
+    fn serialize(&self, cx: &App) -> Option<SavedItem> {
+        Some(SavedItem {
+            kind: "query".into(),
+            data: serde_json::json!({ "text": self.editor.read(cx).text(cx) }),
+        })
+    }
 }
 
 impl QueryEditor {
@@ -296,6 +305,12 @@ impl QueryEditor {
         };
         this.set_example(window, cx);
         this
+    }
+
+    /// Replaces the draft, as when a remembered tab comes back.
+    pub fn set_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor
+            .update(cx, |editor, cx| editor.set_text(text, window, cx));
     }
 
     fn schema(&self, cx: &App) -> Option<Arc<SchemaModel>> {
