@@ -48,6 +48,14 @@ pub mod workspace {
         ]
     );
 
+    /// Show a panel in its dock: `explore`, `types`, `branches`, `inspector`, `activity`,
+    /// `history`.
+    #[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+    #[action(namespace = studio)]
+    pub struct ActivatePanel {
+        pub id: String,
+    }
+
     /// Activate the tab at a position, counted from zero.
     #[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
     #[action(namespace = studio)]
@@ -108,6 +116,26 @@ pub mod graph {
         pub filter_id: Option<String>,
         #[serde(default)]
         pub via: Option<String>,
+    }
+
+    /// One node of a query result, for [`ShowResultsOnCanvas`].
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema)]
+    pub struct ResultNode {
+        pub type_name: String,
+        pub id: String,
+        #[serde(default)]
+        pub label: Option<String>,
+    }
+
+    /// Draw a query result's nodes on a canvas of their own, linking the nodes of each row
+    /// (specs 006, 007).
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct ShowResultsOnCanvas {
+        pub title: String,
+        pub nodes: Vec<ResultNode>,
+        /// Pairs of indices into `nodes` that share a row.
+        pub links: Vec<(usize, usize)>,
     }
 
     /// Show one node in the inspector without revealing it in the tree.
@@ -303,6 +331,14 @@ pub mod canvas {
             MoveUp,
             /// Select the nearest node below.
             MoveDown,
+            /// Show the selected node in the inspector.
+            PeekSelected,
+            /// Center and zoom on the selected node.
+            FocusSelected,
+            /// Select the node the selected one was reached from.
+            WalkBack,
+            /// Go back down the path walked with WalkBack.
+            WalkForward,
         ]
     );
 }

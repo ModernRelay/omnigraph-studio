@@ -66,6 +66,8 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | 2026-10-12 | Canvas actions change the shared state | snapshot: tree `ShowOnCanvas` (G) on Frances Lovelace, then `canvas::ExpandNode` | Frances gets four hubs on the canvas and is expanded in the tree |
 | 2026-10-12 | Layout off the main thread is deterministic, keeps drawn nodes in place, and bounds cost at the cap | `cargo test -p graph_canvas` (`layout::tests`) | 1,999 nodes in 464 ms in an unoptimized debug build, Apple M5 Pro; same input gives the same positions |
 | 2026-10-12 | Errors and loading show in the canvas, not a blank view | snapshot `OpenNode` Person `nobody` then `OpenCanvas` | banner "No Person with key nobody at this commit." · Retry |
+| 2026-10-12 | Keys walk and focus | offscreen snapshot: Allen Labs expanded, → → `[` F Space | `[` returned to Allen Labs, F centred it, Space showed it in the inspector |
+| 2026-10-12 | Query results as a canvas | `gq_language` `whole_node_columns_carry_their_type`; `query_editor` `node_columns_become_a_graph_of_distinct_nodes_linked_by_row`; snapshot of `return { $p, $c }` | The result offers Canvas; a results canvas draws each node once and links the nodes of a row; it is a tab of its own and is not restored |
 
 ## Corrections
 

@@ -1284,6 +1284,34 @@ impl QueryEditor {
                         cx.listener(|this, _, window, cx| this.copy_cell(&CopyCell, window, cx)),
                     ),
             )
+            .when_some(
+                self.session
+                    .read(cx)
+                    .schema_model()
+                    .and_then(|schema| rows.table.graph(&schema)),
+                |status, (nodes, links)| {
+                    let title = format!("{} · result", rows.label);
+                    status.child(
+                        Button::new("result-canvas", "Canvas")
+                            .label_size(LabelSize::Small)
+                            .start_icon(Icon::new(IconName::GitGraph).size(IconSize::XSmall))
+                            .tooltip(Tooltip::text(format!(
+                                "Draw the result's {} nodes, linking those in the same row",
+                                nodes.len()
+                            )))
+                            .on_click(move |_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(studio_actions::graph::ShowResultsOnCanvas {
+                                        title: title.clone(),
+                                        nodes: nodes.clone(),
+                                        links: links.clone(),
+                                    }),
+                                    cx,
+                                )
+                            }),
+                    )
+                },
+            )
             .child(
                 Button::new("copy-row", "Copy row")
                     .label_size(LabelSize::Small)

@@ -1619,6 +1619,11 @@ impl Render for Workspace {
                     this.activate_item(last, window, cx);
                 }
             }))
+            .on_action(cx.listener(
+                |this, action: &studio_actions::workspace::ActivatePanel, _, cx| {
+                    this.activate_panel(&action.id, cx)
+                },
+            ))
             .on_action(cx.listener(|this, _: &GoBack, window, cx| this.navigate(true, window, cx)))
             .on_action(
                 cx.listener(|this, _: &GoForward, window, cx| this.navigate(false, window, cx)),

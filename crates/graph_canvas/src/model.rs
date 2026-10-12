@@ -129,6 +129,57 @@ pub fn schema_scene(schema: &SchemaModel, count_of: impl Fn(&str) -> Option<i64>
     }
 }
 
+/// A query result as the canvas draws it: each node once, a line between the nodes of a row.
+/// No hubs: a double click explores from a node.
+pub fn results_scene(nodes: &[(NodeRef, Option<String>)], links: &[(usize, usize)]) -> Scene {
+    let capped = nodes.len().saturating_sub(NODE_CAP);
+    let scene_nodes: Vec<SceneNode> = nodes
+        .iter()
+        .take(NODE_CAP)
+        .map(|(node, label)| SceneNode {
+            id: SceneId::Node(node.clone()),
+            kind: SceneKind::Node {
+                node: node.clone(),
+                root: false,
+                expanded: false,
+            },
+            label: label.clone().unwrap_or_else(|| node.id.clone()),
+            color_key: node.type_name.clone(),
+            parent: None,
+            path: None,
+            radius: NODE_RADIUS,
+        })
+        .collect();
+    let shown = scene_nodes.len();
+    let edges = links
+        .iter()
+        .filter(|(from, to)| *from < shown && *to < shown && from != to)
+        .map(|(from, to)| SceneEdge {
+            from: *from,
+            to: *to,
+            color_key: scene_nodes[*to].color_key.clone(),
+            label: None,
+        })
+        .collect();
+    let capped = (capped > 0).then(|| {
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for (node, _) in nodes.iter().skip(NODE_CAP) {
+            *counts.entry(node.type_name.as_str()).or_default() += 1;
+        }
+        let most = counts
+            .into_iter()
+            .max_by_key(|(_, n)| *n)
+            .map(|(t, _)| t.to_owned())
+            .unwrap_or_default();
+        (capped, most)
+    });
+    Scene {
+        nodes: scene_nodes,
+        edges,
+        capped,
+    }
+}
+
 /// The exploration as the canvas draws it. `limits` holds how many neighbours each opened hub
 /// shows; a hub without an entry shows [`HUB_STEP`].
 pub fn explore_scene(

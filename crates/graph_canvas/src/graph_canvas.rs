@@ -27,9 +27,12 @@ use graph_store::{
     PageStatus, SessionEvent,
 };
 use studio_actions::canvas::{
-    CollapseNode, ExpandNode, FitToWindow, MoveDown, MoveLeft, MoveRight, MoveUp, ZoomIn, ZoomOut,
+    CollapseNode, ExpandNode, FitToWindow, FocusSelected, MoveDown, MoveLeft, MoveRight, MoveUp,
+    PeekSelected, WalkBack, WalkForward, ZoomIn, ZoomOut,
 };
-use studio_actions::graph::{OpenCanvas, OpenNode, OpenType, ShowNodeOnCanvas};
+use studio_actions::graph::{
+    OpenCanvas, OpenNode, OpenType, PeekNode, ShowNodeOnCanvas, ShowResultsOnCanvas,
+};
 use studio_ui::{empty_state, type_color};
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::Tooltip;
@@ -54,6 +57,19 @@ pub fn init(cx: &mut App) {
         if window.is_none() {
             return;
         }
+        workspace.register_action(|workspace, action: &ShowResultsOnCanvas, window, cx| {
+            let Some(session) = workspace.session().cloned() else {
+                return;
+            };
+            let action = action.clone();
+            let seq = NEXT_RESULTS.load(std::sync::atomic::Ordering::Relaxed);
+            workspace.open_item::<GraphCanvas>(
+                format!("canvas-results:{seq}"),
+                window,
+                cx,
+                move |_, cx| GraphCanvas::with_results(session, &action, cx),
+            );
+        });
         workspace.register_action(|workspace, _: &OpenCanvas, window, cx| {
             open_canvas(workspace, window, cx);
         });
@@ -85,7 +101,19 @@ fn canvas_key(graph_id: &str) -> SharedString {
 enum Mode {
     Schema,
     Explore,
+    /// A query's result nodes (specs 006, 007).
+    Results,
 }
+
+/// What a results canvas draws: a query's nodes, and which ones share a row.
+struct ResultsData {
+    title: String,
+    nodes: Vec<(NodeRef, Option<String>)>,
+    links: Vec<(usize, usize)>,
+}
+
+/// Results canvases are tabs of their own, one per showing.
+static NEXT_RESULTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
 struct Drag {
     start: Point<Pixels>,
@@ -97,6 +125,8 @@ struct Drag {
 pub struct GraphCanvas {
     session: Entity<GraphSession>,
     exploration: Entity<Exploration>,
+    /// Set for a canvas of query results; such a canvas never shows the exploration.
+    results: Option<(usize, Arc<ResultsData>)>,
     focus_handle: FocusHandle,
     /// The person asked to see the schema although an exploration exists.
     show_schema: bool,
@@ -115,6 +145,8 @@ pub struct GraphCanvas {
     fit_pending: bool,
     center_on: Option<SceneId>,
     selected: Option<SceneId>,
+    /// Nodes stepped back from with `[`, most recent last, for `]`.
+    walked: Vec<SceneId>,
     hovered: Option<usize>,
     drag: Option<Drag>,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
@@ -131,7 +163,10 @@ impl Focusable for GraphCanvas {
 
 impl Item for GraphCanvas {
     fn tab_title(&self, _cx: &App) -> SharedString {
-        "Canvas".into()
+        match &self.results {
+            Some((_, results)) => results.title.clone().into(),
+            None => "Canvas".into(),
+        }
     }
 
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
@@ -139,18 +174,22 @@ impl Item for GraphCanvas {
     }
 
     fn dedupe_key(&self, cx: &App) -> Option<SharedString> {
-        Some(canvas_key(&self.session.read(cx).graph_id))
+        Some(match &self.results {
+            Some((seq, _)) => format!("canvas-results:{seq}").into(),
+            None => canvas_key(&self.session.read(cx).graph_id),
+        })
     }
 
+    /// The exploration canvas comes back after a restart; a results canvas is transient.
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
-        Some(SavedItem {
+        self.results.is_none().then(|| SavedItem {
             kind: "canvas".into(),
             data: serde_json::Value::Null,
         })
     }
 
     fn is_stale(&self, cx: &App) -> bool {
-        self.exploration.read(cx).newer_available()
+        self.results.is_none() && self.exploration.read(cx).newer_available()
     }
 }
 
@@ -177,6 +216,7 @@ impl GraphCanvas {
         let mut canvas = Self {
             session,
             exploration,
+            results: None,
             focus_handle: cx.focus_handle(),
             show_schema: false,
             mode: Mode::Schema,
@@ -193,6 +233,7 @@ impl GraphCanvas {
             fit_pending: true,
             center_on: None,
             selected: None,
+            walked: Vec::new(),
             hovered: None,
             drag: None,
             bounds: Rc::new(Cell::new(None)),
@@ -200,6 +241,37 @@ impl GraphCanvas {
         };
         canvas.rebuild(cx);
         canvas.follow_selection(cx);
+        canvas
+    }
+
+    /// A canvas of a query's result nodes.
+    fn with_results(
+        session: Entity<GraphSession>,
+        action: &ShowResultsOnCanvas,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut canvas = Self::new(session, cx);
+        let nodes = action
+            .nodes
+            .iter()
+            .map(|n| {
+                (
+                    NodeRef::new(n.type_name.clone(), n.id.clone()),
+                    n.label.clone(),
+                )
+            })
+            .collect();
+        let seq = NEXT_RESULTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        canvas.results = Some((
+            seq,
+            Arc::new(ResultsData {
+                title: action.title.clone(),
+                nodes,
+                links: action.links.clone(),
+            }),
+        ));
+        canvas.selected = None;
+        canvas.rebuild(cx);
         canvas
     }
 
@@ -221,6 +293,10 @@ impl GraphCanvas {
             cx.notify();
             return;
         };
+        if let Some((_, results)) = self.results.clone() {
+            self.rebuild_results(&results, cx);
+            return;
+        }
         let exploration = self.exploration.read(cx);
         let root = exploration.root().cloned();
         let mode = if root.is_some() && !self.show_schema {
@@ -238,6 +314,8 @@ impl GraphCanvas {
         self.layout_generation += 1;
         let generation = self.layout_generation;
         match mode {
+            // Handled before: a results canvas never reaches here.
+            Mode::Results => {}
             Mode::Schema => {
                 let session = self.session.read(cx);
                 let scene = model::schema_scene(&schema, |name| session.count_of(name));
@@ -281,6 +359,56 @@ impl GraphCanvas {
                 }));
             }
         }
+    }
+
+    /// Lays out a query's nodes: a node first reached through a row hangs off the node before
+    /// it in that row; the rest sit on a ring.
+    fn rebuild_results(&mut self, results: &ResultsData, cx: &mut Context<Self>) {
+        let mut scene = model::results_scene(&results.nodes, &results.links);
+        let count = scene.nodes.len();
+        let mut parent = vec![None; count];
+        for (from, to) in &results.links {
+            if *from < count && *to < count && from < to && parent[*to].is_none() {
+                parent[*to] = Some(*from);
+            }
+        }
+        let roots: Vec<usize> = (0..count).filter(|i| parent[*i].is_none()).collect();
+        let ring = layout::schema_positions(roots.len());
+        let mut fixed = vec![None; count];
+        for (root, position) in roots.iter().zip(ring) {
+            fixed[*root] = Some(position);
+        }
+        for (node, parent) in scene.nodes.iter_mut().zip(&parent) {
+            node.parent = *parent;
+        }
+        let nodes: Vec<LayoutNode> = scene
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| LayoutNode {
+                parent: node.parent,
+                kind: LayoutKind::Node,
+                space: layout_space(&node.kind, node.radius),
+                previous: fixed[i],
+            })
+            .collect();
+        if self.layout_key.is_none() {
+            self.fit_pending = true;
+        }
+        self.layout_key = Some((Mode::Results, None));
+        self.mode = Mode::Results;
+        self.layout_generation += 1;
+        let generation = self.layout_generation;
+        let positions = cx.background_spawn(async move { layout::explore_positions(&nodes) });
+        self._layout_task = Some(cx.spawn(async move |this, cx| {
+            let positions = positions.await;
+            this.update(cx, |this, cx| {
+                if this.layout_generation == generation {
+                    this.apply_layout(scene, positions, cx);
+                }
+            })
+            .ok();
+        }));
     }
 
     fn apply_layout(&mut self, scene: Scene, positions: Vec<Vec2>, cx: &mut Context<Self>) {
@@ -399,6 +527,8 @@ impl GraphCanvas {
     // ---- interaction ----
 
     fn select(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
+        // A new selection starts a new walk; `[` and `]` keep theirs.
+        self.walked.clear();
         let Some(index) = index else {
             self.selected = None;
             cx.notify();
@@ -599,6 +729,70 @@ impl GraphCanvas {
         }
     }
 
+    /// The node a node was reached from, past its hub: what `[` walks back to.
+    fn reached_from(&self, index: usize) -> Option<usize> {
+        let mut current = self.scene.nodes.get(index)?.parent;
+        while let Some(ix) = current {
+            match self.scene.nodes[ix].kind {
+                SceneKind::Hub { .. } | SceneKind::More { .. } => {
+                    current = self.scene.nodes[ix].parent
+                }
+                _ => return Some(ix),
+            }
+        }
+        None
+    }
+
+    fn walk_back(&mut self, _: &WalkBack, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(from) = self.selected_index() else {
+            return;
+        };
+        if let Some(parent) = self.reached_from(from) {
+            let mut walked = std::mem::take(&mut self.walked);
+            walked.push(self.scene.nodes[from].id.clone());
+            self.select(Some(parent), cx);
+            self.walked = walked;
+        }
+    }
+
+    fn walk_forward(&mut self, _: &WalkForward, _: &mut Window, cx: &mut Context<Self>) {
+        let mut walked = std::mem::take(&mut self.walked);
+        while let Some(id) = walked.pop() {
+            if let Some(index) = self.scene.index_of(&id) {
+                self.select(Some(index), cx);
+                break;
+            }
+        }
+        self.walked = walked;
+    }
+
+    fn peek_selected(&mut self, _: &PeekSelected, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.selected_index() else {
+            return;
+        };
+        if let SceneKind::Node { node, .. } = &self.scene.nodes[index].kind {
+            window.dispatch_action(
+                Box::new(PeekNode {
+                    type_name: node.type_name.clone(),
+                    id: node.id.clone(),
+                }),
+                cx,
+            );
+        }
+    }
+
+    /// F: the selected node in the middle, close enough to read.
+    fn focus_selected(&mut self, _: &FocusSelected, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self.selected_index() else {
+            return;
+        };
+        if let Some(position) = self.positions.get(index) {
+            self.center = *position;
+            self.zoom = self.zoom.clamp(1.25, 2.);
+            cx.notify();
+        }
+    }
+
     fn move_selection(&mut self, direction: Vec2, cx: &mut Context<Self>) {
         let from = self.selected_index();
         let next = match from {
@@ -657,6 +851,16 @@ impl GraphCanvas {
                 let edges = schema.as_ref().map_or(0, |s| s.edges.len());
                 format!("{types} types · {edges} relationships")
             }
+            Mode::Results => {
+                let count = self.scene.nodes.len();
+                let noun = if count == 1 { "node" } else { "nodes" };
+                let title = self
+                    .results
+                    .as_ref()
+                    .map(|(_, r)| r.title.clone())
+                    .unwrap_or_default();
+                format!("{title} · {count} {noun}")
+            }
             Mode::Explore => {
                 let root = exploration
                     .root()
@@ -709,30 +913,33 @@ impl GraphCanvas {
                     .gap_2()
                     .child(
                         panel("canvas-mode")
-                            .child(
-                                Button::new("mode-schema", "Schema")
-                                    .label_size(LabelSize::Small)
-                                    .toggle_state(mode == Mode::Schema)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.show_schema = true;
-                                        this.rebuild(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("mode-explore", "Exploration")
-                                    .label_size(LabelSize::Small)
-                                    .toggle_state(mode == Mode::Explore)
-                                    .disabled(!has_root)
-                                    .tooltip(Tooltip::text(if has_root {
-                                        "The nodes walked in the tree and here"
-                                    } else {
-                                        "Open a node first: ↵ on a table row or tree row"
-                                    }))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.show_schema = false;
-                                        this.rebuild(cx);
-                                    })),
-                            )
+                            .when(mode != Mode::Results, |panel| {
+                                panel
+                                    .child(
+                                        Button::new("mode-schema", "Schema")
+                                            .label_size(LabelSize::Small)
+                                            .toggle_state(mode == Mode::Schema)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.show_schema = true;
+                                                this.rebuild(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("mode-explore", "Exploration")
+                                            .label_size(LabelSize::Small)
+                                            .toggle_state(mode == Mode::Explore)
+                                            .disabled(!has_root)
+                                            .tooltip(Tooltip::text(if has_root {
+                                                "The nodes walked in the tree and here"
+                                            } else {
+                                                "Open a node first: ↵ on a table row or tree row"
+                                            }))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.show_schema = false;
+                                                this.rebuild(cx);
+                                            })),
+                                    )
+                            })
                             .child(
                                 div().px_1().child(
                                     Label::new(summary)
@@ -742,7 +949,7 @@ impl GraphCanvas {
                                 ),
                             ),
                     )
-                    .when(newer, |d| {
+                    .when(newer && mode != Mode::Results, |d| {
                         d.child(
                             panel("canvas-newer").child(
                                 Button::new("canvas-refresh", "Newer data · Refresh")
@@ -828,6 +1035,19 @@ impl GraphCanvas {
                                 "Too many nodes to draw · {hidden} not shown (limit {NODE_CAP})"
                             ))
                             .size(LabelSize::Small),
+                        )
+                        .child(
+                            Button::new("canvas-tree", "Show in tree")
+                                .label_size(LabelSize::Small)
+                                .style(ButtonStyle::Outlined)
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(studio_actions::workspace::ActivatePanel {
+                                            id: "explore".into(),
+                                        }),
+                                        cx,
+                                    )
+                                }),
                         )
                         .child(
                             Button::new("canvas-table", "Open as table")
@@ -934,8 +1154,9 @@ fn paint_scene(
             && p.y <= bounds.bottom() + px(margin)
     };
 
-    // Edges, batched by color into a few paths in one layer.
-    let mut lines: HashMap<&str, Vec<Segment>> = HashMap::new();
+    // Edges, batched by color into a few paths in one layer. Hovering a node (a type, on the
+    // schema landing) brings out its edges and fades the rest (spec 006).
+    let mut lines: HashMap<(&str, bool), Vec<Segment>> = HashMap::new();
     let mut loops: Vec<(usize, &str, &str)> = Vec::new();
     let mut arrows: Vec<(Point<Pixels>, Point<Pixels>, &str)> = Vec::new();
     let mut labels: Vec<(Point<Pixels>, &str)> = Vec::new();
@@ -973,7 +1194,11 @@ fn paint_scene(
         // From boundary to boundary, so a line never shows through a node.
         let start = shorten(to, from, radius[edge.from]);
         let end = shorten(from, to, radius[edge.to] + 1.);
-        lines.entry(&edge.color_key).or_default().push((start, end));
+        let lit = hovered.is_some_and(|h| edge.from == h || edge.to == h);
+        lines
+            .entry((edge.color_key.as_str(), lit))
+            .or_default()
+            .push((start, end));
         if let Some(label) = &edge.label {
             arrows.push((start, end, &edge.color_key));
             labels.push((point((from.x + to.x) / 2., (from.y + to.y) / 2.), label));
@@ -981,10 +1206,16 @@ fn paint_scene(
     }
     let stroke = px((1.5 * zoom.sqrt()).clamp(1., 2.));
     window.paint_layer(bounds, |window| {
-        for (color_key, segments) in &lines {
-            let color = type_color(color_key).opacity(0.55);
+        for ((color_key, lit), segments) in &lines {
+            let opacity = match (hovered.is_some(), lit) {
+                (false, _) => 0.55,
+                (true, true) => 0.95,
+                (true, false) => 0.15,
+            };
+            let color = type_color(color_key).opacity(opacity);
+            let width = if *lit { stroke * 1.6 } else { stroke };
             for chunk in segments.chunks(SEGMENTS_PER_PATH) {
-                let mut builder = PathBuilder::stroke(stroke);
+                let mut builder = PathBuilder::stroke(width);
                 for (from, to) in chunk {
                     builder.move_to(*from);
                     builder.line_to(*to);
@@ -1304,6 +1535,7 @@ impl Render for GraphCanvas {
                     match self.mode {
                         Mode::Schema => "The schema has no node types",
                         Mode::Explore => "Laying out…",
+                        Mode::Results => "The result has no nodes",
                     },
                     None,
                 )
@@ -1331,6 +1563,10 @@ impl Render for GraphCanvas {
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::expand_node))
             .on_action(cx.listener(Self::collapse_node))
+            .on_action(cx.listener(Self::walk_back))
+            .on_action(cx.listener(Self::walk_forward))
+            .on_action(cx.listener(Self::peek_selected))
+            .on_action(cx.listener(Self::focus_selected))
             .on_action(
                 cx.listener(|this, _: &MoveLeft, _, cx| {
                     this.move_selection(Vec2::new(-1., 0.), cx)

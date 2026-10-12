@@ -1,10 +1,11 @@
 //! Diagnostics and result types for `.gq` source, from `omnigraph-compiler` (spec 007).
 
 use omnigraph_compiler::describe_query_operation;
+use omnigraph_compiler::query::ast::Expr;
 use omnigraph_compiler::query::ast::FileBody;
 use omnigraph_compiler::query::diagnostic::QueryDiagnostic;
 use omnigraph_compiler::query::parser::parse_query_diagnostic;
-use omnigraph_compiler::query::typecheck::typecheck_query_decl;
+use omnigraph_compiler::query::typecheck::{BoundVariable, CheckedQuery, typecheck_query_decl};
 
 use crate::schema::SchemaModel;
 
@@ -44,6 +45,9 @@ pub struct ResultColumn {
     /// The compiler's value kind, for example `String`, `I64`, `Date`, `Node`.
     pub kind: String,
     pub nullable: bool,
+    /// The node type of a column that returns a whole node (`return { $p }`), from the
+    /// variable's binding.
+    pub node_type: Option<String>,
 }
 
 /// One declaration in the source.
@@ -98,8 +102,27 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
             columns: Vec::new(),
         };
         match typecheck_query_decl(&schema.catalog, decl) {
-            Ok(_) => {
+            Ok(checked) => {
                 let mut info = info;
+                // Columns that return a whole node, by name, with the node's type.
+                let node_types: Vec<(String, String)> = match &checked {
+                    CheckedQuery::Read(context) => decl
+                        .return_clause
+                        .iter()
+                        .filter_map(|projection| {
+                            let Expr::Variable(var) = &projection.expr else {
+                                return None;
+                            };
+                            let Some(BoundVariable::Node { type_name }) = context.bindings.get(var)
+                            else {
+                                return None;
+                            };
+                            let name = projection.alias.clone().unwrap_or_else(|| var.clone());
+                            Some((name, type_name.clone()))
+                        })
+                        .collect(),
+                    CheckedQuery::Mutation(_) => Vec::new(),
+                };
                 if !info.is_mutation
                     && let Ok(operation) = describe_query_operation(&schema.catalog, decl)
                 {
@@ -110,6 +133,10 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
                             name: field.name.clone(),
                             kind: format!("{:?}", field.kind),
                             nullable: field.nullable,
+                            node_type: node_types
+                                .iter()
+                                .find(|(name, _)| *name == field.name)
+                                .map(|(_, ty)| ty.clone()),
                         })
                         .collect();
                 }
@@ -151,6 +178,21 @@ mod tests {
         let columns = &result.queries[0].columns;
         assert_eq!(columns.len(), 2);
         assert!(columns[1].nullable);
+    }
+
+    #[test]
+    fn whole_node_columns_carry_their_type() {
+        let result = check(
+            &dev(),
+            "query q() { match { $p: Person  $p worksAt $c } return { $p, $c as employer, $p.name } }",
+        );
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let types: Vec<Option<&str>> = result.queries[0]
+            .columns
+            .iter()
+            .map(|c| c.node_type.as_deref())
+            .collect();
+        assert_eq!(types, [Some("Person"), Some("Company"), None]);
     }
 
     #[test]

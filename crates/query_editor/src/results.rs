@@ -3,8 +3,14 @@
 
 use std::time::Duration;
 
-use gq_language::ResultColumn;
+use std::collections::HashMap;
+
+use gq_language::{ResultColumn, SchemaModel};
 use serde_json::{Map, Value};
+use studio_actions::graph::ResultNode;
+
+/// A result's distinct nodes and the pairs of them that share a row.
+pub type ResultGraph = (Vec<ResultNode>, Vec<(usize, usize)>);
 
 /// Rows of a read, one value per column in the server's column order. A null cell's key is
 /// omitted by the server; it reads as `Null` here.
@@ -13,6 +19,8 @@ pub struct ResultTable {
     pub columns: Vec<String>,
     /// The compiler's type for each column, when it knew the query (`String?`, `I32`, `Node`).
     pub types: Vec<Option<String>>,
+    /// The node type of each column that returns whole nodes.
+    pub node_types: Vec<Option<String>>,
     pub rows: Vec<Vec<Value>>,
 }
 
@@ -33,17 +41,64 @@ impl ResultTable {
                 .collect(),
             _ => Vec::new(),
         };
-        let types = match expected {
-            Some(expected) if expected.len() == columns.len() => {
-                expected.iter().map(|c| Some(type_label(c))).collect()
-            }
-            _ => vec![None; columns.len()],
+        let (types, node_types) = match expected {
+            Some(expected) if expected.len() == columns.len() => (
+                expected.iter().map(|c| Some(type_label(c))).collect(),
+                expected.iter().map(|c| c.node_type.clone()).collect(),
+            ),
+            _ => (vec![None; columns.len()], vec![None; columns.len()]),
         };
         Self {
             columns,
             types,
+            node_types,
             rows,
         }
+    }
+
+    /// The result's nodes, each once, and which of them share a row, for drawing on a canvas
+    /// (specs 006, 007). `None` when no column returns whole nodes.
+    pub fn graph(&self, schema: &SchemaModel) -> Option<ResultGraph> {
+        if self.node_types.iter().all(Option::is_none) {
+            return None;
+        }
+        let mut nodes: Vec<ResultNode> = Vec::new();
+        let mut index: HashMap<(String, String), usize> = HashMap::new();
+        let mut links: Vec<(usize, usize)> = Vec::new();
+        for row in &self.rows {
+            let mut previous: Option<usize> = None;
+            for (value, node_type) in row.iter().zip(&self.node_types) {
+                let (Some(type_name), Some(id)) =
+                    (node_type, value.get("@id").and_then(Value::as_str))
+                else {
+                    continue;
+                };
+                let key = (type_name.clone(), id.to_owned());
+                let at = *index.entry(key).or_insert_with(|| {
+                    let label = schema
+                        .node(type_name)
+                        .and_then(|node| node.label_property())
+                        .and_then(|label| value.get(label))
+                        .and_then(Value::as_str)
+                        .filter(|label| *label != id)
+                        .map(str::to_owned);
+                    nodes.push(ResultNode {
+                        type_name: type_name.clone(),
+                        id: id.to_owned(),
+                        label,
+                    });
+                    nodes.len() - 1
+                });
+                if let Some(previous) = previous
+                    && previous != at
+                    && !links.contains(&(previous, at))
+                {
+                    links.push((previous, at));
+                }
+                previous = Some(at);
+            }
+        }
+        Some((nodes, links))
     }
 
     /// One row as a JSON object, for copying.
@@ -285,7 +340,34 @@ mod tests {
             name: name.into(),
             kind: kind.into(),
             nullable,
+            node_type: None,
         }
+    }
+
+    #[test]
+    fn node_columns_become_a_graph_of_distinct_nodes_linked_by_row() {
+        let schema = SchemaModel::parse(include_str!("../../../dev/cluster/knowledge.pg")).unwrap();
+        let mut person = column("p", "Object", false);
+        person.node_type = Some("Person".into());
+        let mut company = column("c", "Object", false);
+        company.node_type = Some("Company".into());
+        let rows = serde_json::json!([
+            {"p": {"@id": "p1", "name": "Ada"}, "c": {"@id": "c1", "name": "Acme"}},
+            {"p": {"@id": "p2", "name": "Bob"}, "c": {"@id": "c1", "name": "Acme"}},
+            {"p": {"@id": "p1", "name": "Ada"}, "c": {"@id": "c1", "name": "Acme"}}
+        ]);
+        let table = ResultTable::new(
+            vec!["p".into(), "c".into()],
+            &rows,
+            Some(&[person, company]),
+        );
+        let (nodes, links) = table.graph(&schema).unwrap();
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["p1", "c1", "p2"]);
+        assert_eq!(nodes[0].label.as_deref(), Some("Ada"));
+        assert_eq!(links, [(0, 1), (2, 1)]);
+        let plain = ResultTable::new(vec!["n".into()], &serde_json::json!([{"n": 1}]), None);
+        assert!(plain.graph(&schema).is_none());
     }
 
     #[test]

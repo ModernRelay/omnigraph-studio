@@ -164,7 +164,11 @@
       "left": "studio_canvas::MoveLeft",
       "right": "studio_canvas::MoveRight",
       "up": "studio_canvas::MoveUp",
-      "down": "studio_canvas::MoveDown"
+      "down": "studio_canvas::MoveDown",
+      "space": "studio_canvas::PeekSelected",
+      "f": "studio_canvas::FocusSelected",
+      "[": "studio_canvas::WalkBack",
+      "]": "studio_canvas::WalkForward"
     }
   },
   {
