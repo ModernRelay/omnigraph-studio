@@ -1,12 +1,23 @@
 {
-  "ui_font_family": ".SystemUIFont",
-  "ui_font_size": 14,
-  "buffer_font_family": "Menlo",
-  "buffer_font_size": 13,
+  "theme": {
+    "mode": "system",
+    "light": "One Light",
+    "dark": "One Dark"
+  },
+  "ui_font_family": null,
+  "ui_font_size": 16.0,
+  "buffer_font_family": null,
+  "buffer_font_size": 14.0,
   "ui_density": "default",
-  "theme": { "mode": "system", "light": "One Light", "dark": "One Dark" },
-  "type_table": { "page_size": 100 },
-  "relationship_tree": { "page_size": 50, "hide_empty_groups": false },
-  "graph_canvas": { "max_visible_nodes": 2000 },
-  "connections": { "health_check_seconds": 30 }
+  "studio": {
+    "window_style": "flat",
+    "type_table_page_size": 100,
+    "tree_page_size": 50,
+    "canvas_max_nodes": 2000,
+    "health_check_seconds": 30
+  },
+  "agent": {
+    "command": [],
+    "env": {}
+  }
 }

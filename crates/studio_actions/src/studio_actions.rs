@@ -13,6 +13,8 @@ pub mod workspace {
         [
             /// Open the command palette.
             ToggleCommandPalette,
+            /// Go to a type, or find a node by its id or label.
+            GoTo,
             /// Open Studio's settings.
             OpenSettings,
             /// Switch the active tab to another branch.

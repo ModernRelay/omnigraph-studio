@@ -36,6 +36,10 @@ pub struct SavedWorkspace {
     pub left_panel: Option<String>,
     pub right_panel: Option<String>,
     pub bottom_panel: Option<String>,
+    /// Each dock's size in pixels, once dragged.
+    pub left_size: Option<f32>,
+    pub right_size: Option<f32>,
+    pub bottom_size: Option<f32>,
 }
 
 /// Opens a remembered tab of one kind.
@@ -190,6 +194,9 @@ mod tests {
             left_panel: Some("types".into()),
             right_panel: None,
             bottom_panel: None,
+            left_size: Some(300.),
+            right_size: None,
+            bottom_size: None,
         };
         let text = serde_json::to_string(&saved).unwrap();
         assert_eq!(

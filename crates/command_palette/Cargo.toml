@@ -17,6 +17,7 @@ studio_ui = { workspace = true }
 studio_actions = { workspace = true }
 studio_workspace = { workspace = true }
 graph_store = { workspace = true }
+gq_language = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

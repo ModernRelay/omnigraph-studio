@@ -14,15 +14,17 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    Action, AnyView, App, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    MouseButton, Pixels, Point, Render, SharedString, Stateful, Subscription, Task, Window,
-    WindowControlArea, deferred, div, point,
+    Action, AnyView, App, Context, DismissEvent, Div, DragMoveEvent, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, MouseButton, Pixels, Point, Render, SharedString,
+    Stateful, Subscription, Task, WeakEntity, Window, WindowControlArea, deferred, div, point,
 };
 use graph_store::{ConnectionState, GraphSession, OutcomeKind, SessionEvent};
+use studio_actions::graph::{OpenCommit, OpenHistory};
 use studio_actions::workspace::{
     ActivateItem, ActivateLastItem, ActivateNextItem, ActivatePreviousItem, CloseActiveItem,
-    Refresh, ToggleActivity, ToggleInspector, ToggleSidebar,
+    GoBack, GoForward, Refresh, ToggleActivity, ToggleInspector, ToggleSidebar,
 };
+use studio_settings::StudioSettings;
 use ui::prelude::*;
 use ui::{CommonAnimationExt as _, ContextMenu, Indicator, PopoverMenu, Tooltip};
 
@@ -52,6 +54,8 @@ struct Toast {
     id: usize,
     kind: ToastKind,
     message: SharedString,
+    /// The one follow-up a toast offers ("View commit"), run by its button.
+    action: Option<(SharedString, Box<dyn Action>)>,
     /// Time left on screen; `None` stays until dismissed (errors, spec 002).
     remaining: Option<Duration>,
     hovered: bool,
@@ -86,6 +90,13 @@ pub struct Workspace {
     drag_pending: bool,
     /// Where the traffic lights were last placed; they move with the window style.
     traffic_lights: Option<Point<Pixels>>,
+    /// Tabs visited before the active one, most recent last (⌘[), and those stepped back
+    /// from (⌘]).
+    back: Vec<EntityId>,
+    forward: Vec<EntityId>,
+    /// The settings file problem last shown, so a toast appears once per problem.
+    settings_error: Option<String>,
+    _settings_subscription: Subscription,
     /// What was last written for this graph, so unchanged state is not rewritten.
     saved: Option<SavedWorkspace>,
     _save: Option<Task<()>>,
@@ -103,8 +114,8 @@ const STRIP_HEIGHT: f32 = studio_ui::ds::size::STRIP;
 const TRAFFIC_LIGHTS_WIDTH: f32 = 76.;
 /// The traffic lights' offset from the top of that strip: centers the 16-point buttons in it.
 const TRAFFIC_LIGHTS_TOP: f32 = (STRIP_HEIGHT - 16.) / 2.;
-const SIDEBAR_WIDTH: f32 = 264.;
-const INSPECTOR_WIDTH: f32 = 340.;
+/// How many visited tabs ⌘[ remembers.
+const NAV_HISTORY: usize = 100;
 /// The id of the right dock's inspector panel.
 const INSPECTOR_PANEL: &str = "inspector";
 
@@ -118,6 +129,9 @@ impl Focusable for Workspace {
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // A settings file that cannot be read is named in a toast that stays until dismissed.
+        let settings_subscription =
+            cx.observe_global::<StudioSettings>(|this, cx| this.show_settings_error(cx));
         let bounds_subscription = cx.observe_window_bounds(window, |this, window, cx| {
             let bounds = window.bounds();
             this._save_bounds = Some(cx.spawn(async move |_, cx| {
@@ -139,6 +153,10 @@ impl Workspace {
             focus_handle: cx.focus_handle(),
             drag_pending: false,
             traffic_lights: None,
+            back: Vec::new(),
+            forward: Vec::new(),
+            settings_error: None,
+            _settings_subscription: settings_subscription,
             saved: None,
             _save: None,
             _save_bounds: None,
@@ -175,6 +193,9 @@ impl Workspace {
             left_panel: self.left.active_id().map(|id| id.to_string()),
             right_panel: self.right.active_id().map(|id| id.to_string()),
             bottom_panel: self.bottom.active_id().map(|id| id.to_string()),
+            left_size: Some(self.left.size),
+            right_size: Some(self.right.size),
+            bottom_size: Some(self.bottom.size),
         }
     }
 
@@ -205,6 +226,15 @@ impl Workspace {
         self.left.open = saved.sidebar_open;
         self.right.open = saved.inspector_open;
         self.bottom.open = saved.activity_open;
+        for (dock, size) in [
+            (&mut self.left, saved.left_size),
+            (&mut self.right, saved.right_size),
+            (&mut self.bottom, saved.bottom_size),
+        ] {
+            if let Some(size) = size {
+                dock.size = size;
+            }
+        }
         for (dock, id) in [
             (&mut self.left, &saved.left_panel),
             (&mut self.right, &saved.right_panel),
@@ -295,14 +325,30 @@ impl Workspace {
         if elapsed > Duration::from_secs(2) {
             return;
         }
-        let kind = match latest.outcome {
-            // No publish, no toast (constitution VII); the surface that wrote explains it.
-            OutcomeKind::Committed { commit: None } => return,
-            OutcomeKind::Committed { .. } => ToastKind::Success,
-            _ => ToastKind::Error,
-        };
         let text = toast_text(latest);
-        self.show_toast(kind, text, cx);
+        match &latest.outcome {
+            // No publish, no toast (constitution VII); the surface that wrote explains it.
+            OutcomeKind::Committed { commit: None } => {}
+            OutcomeKind::Committed {
+                commit: Some(commit),
+            } => {
+                let action = Box::new(OpenCommit {
+                    commit_id: commit.clone(),
+                });
+                self.show_toast_with_action(ToastKind::Success, text, "View commit", action, cx);
+            }
+            // The write may or may not have landed: the branch's history says which.
+            OutcomeKind::Unknown { .. } => {
+                self.show_toast_with_action(
+                    ToastKind::Error,
+                    text,
+                    "Open history",
+                    Box::new(OpenHistory),
+                    cx,
+                );
+            }
+            OutcomeKind::Refused { .. } => self.show_toast(ToastKind::Error, text, cx),
+        }
     }
 
     // ---- items ----
@@ -351,13 +397,14 @@ impl Workspace {
             window,
             |this, item, event: &ItemEvent, window, cx| match event {
                 ItemEvent::UpdateTab => cx.notify(),
+                // The item asked to close; it has already decided.
                 ItemEvent::Close => {
                     if let Some(index) = this
                         .items
                         .iter()
                         .position(|i| i.item_id() == item.entity_id())
                     {
-                        this.close_item(index, window, cx);
+                        this.force_close_item(index, window, cx);
                     }
                 }
             },
@@ -379,15 +426,89 @@ impl Workspace {
     }
 
     pub fn activate_item(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if index < self.items.len() {
-            self.active = index;
-            let focus = self.items[index].focus_handle(cx);
-            window.focus(&focus, cx);
-            cx.notify();
+        self.activate(index, true, window, cx);
+    }
+
+    /// Activates a tab; `record` remembers the tab left for ⌘[ and forgets the ⌘] trail.
+    fn activate(
+        &mut self,
+        index: usize,
+        record: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index >= self.items.len() {
+            return;
+        }
+        if record
+            && index != self.active
+            && let Some(current) = self.items.get(self.active)
+        {
+            let id = current.item_id();
+            self.back.retain(|visited| *visited != id);
+            self.back.push(id);
+            if self.back.len() > NAV_HISTORY {
+                self.back.remove(0);
+            }
+            self.forward.clear();
+        }
+        self.active = index;
+        let focus = self.items[index].focus_handle(cx);
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// ⌘[ and ⌘]: the previous or next tab in the order they were visited, skipping closed
+    /// ones.
+    fn navigate(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+        loop {
+            let next = if back {
+                self.back.pop()
+            } else {
+                self.forward.pop()
+            };
+            let Some(id) = next else { return };
+            let Some(index) = self.items.iter().position(|item| item.item_id() == id) else {
+                continue;
+            };
+            if index == self.active {
+                continue;
+            }
+            if let Some(current) = self.items.get(self.active) {
+                let current = current.item_id();
+                if back {
+                    self.forward.push(current);
+                } else {
+                    self.back.push(current);
+                }
+            }
+            self.activate(index, false, window, cx);
+            return;
         }
     }
 
+    /// Closes a tab; one with unsaved work or a write in flight asks first.
     pub fn close_item(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.items.get(index) else {
+            return;
+        };
+        if !item.is_dirty(cx) {
+            self.force_close_item(index, window, cx);
+            return;
+        }
+        let item_id = item.item_id();
+        let title = item.tab_title(cx);
+        let workspace = cx.entity().downgrade();
+        self.toggle_modal(window, cx, move |_, cx| ConfirmClose {
+            workspace,
+            item_id,
+            title,
+            focus_handle: cx.focus_handle(),
+        });
+    }
+
+    /// Closes a tab without asking.
+    pub fn force_close_item(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.items.len() {
             return;
         }
@@ -529,6 +650,45 @@ impl Workspace {
         message: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) {
+        self.push_toast(kind, message.into(), None, cx);
+    }
+
+    /// A toast with one follow-up button, such as "View commit" (spec 002).
+    pub fn show_toast_with_action(
+        &mut self,
+        kind: ToastKind,
+        message: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        action: Box<dyn Action>,
+        cx: &mut Context<Self>,
+    ) {
+        self.push_toast(kind, message.into(), Some((label.into(), action)), cx);
+    }
+
+    fn show_settings_error(&mut self, cx: &mut Context<Self>) {
+        let error = studio_settings::file_error(cx);
+        if error == self.settings_error {
+            return;
+        }
+        self.settings_error = error.clone();
+        if let Some(error) = error {
+            self.show_toast_with_action(
+                ToastKind::Error,
+                error,
+                "Open settings",
+                Box::new(studio_actions::workspace::OpenSettings),
+                cx,
+            );
+        }
+    }
+
+    fn push_toast(
+        &mut self,
+        kind: ToastKind,
+        message: SharedString,
+        action: Option<(SharedString, Box<dyn Action>)>,
+        cx: &mut Context<Self>,
+    ) {
         let id = self.next_toast;
         self.next_toast += 1;
         let remaining = match kind {
@@ -538,7 +698,8 @@ impl Workspace {
         self.toasts.push(Toast {
             id,
             kind,
-            message: message.into(),
+            message,
+            action,
             remaining,
             hovered: false,
         });
@@ -692,14 +853,16 @@ impl Workspace {
         };
         column
             .id("sidebar")
+            .relative()
             .flex()
             .flex_col()
-            .w(px(SIDEBAR_WIDTH))
+            .w(px(self.left.size))
             .h_full()
             .flex_none()
             .child(header)
             .child(body)
             .child(self.render_sidebar_footer(cx))
+            .child(resize_handle(PanelPosition::Left))
     }
 
     /// A dock's panels as icon tabs (the left dock, as Obsidian and Delta switch sidebar modes):
@@ -1113,7 +1276,8 @@ impl Workspace {
             .when(self.bottom.visible(), |d| {
                 d.child(
                     v_flex()
-                        .h(px(240.))
+                        .h(px(self.bottom.size))
+                        .relative()
                         .flex_none()
                         .overflow_hidden()
                         .when(!studio_ui::ds::is_glass(cx), |d| d.bg(panel_background))
@@ -1146,7 +1310,8 @@ impl Workspace {
                                 .flex_1()
                                 .min_h_0()
                                 .children(self.bottom.active_panel().map(|p| p.view.clone())),
-                        ),
+                        )
+                        .child(resize_handle(PanelPosition::Bottom)),
                 )
             })
             .children(self.render_center_footer(footer, cx))
@@ -1235,11 +1400,13 @@ impl Workspace {
         };
         Some(
             column
+                .relative()
                 .flex()
                 .flex_col()
-                .w(px(INSPECTOR_WIDTH))
+                .w(px(self.right.size))
                 .h_full()
                 .flex_none()
+                .child(resize_handle(PanelPosition::Right))
                 .child(
                     self.strip("right-dock-header", cx)
                         .px(px(studio_ui::ds::space::SM))
@@ -1265,6 +1432,39 @@ impl Workspace {
                         .child(panel),
                 ),
         )
+    }
+
+    /// Follows a dock edge being dragged. Sizes are measured from the window's edges, inside the
+    /// glass style's gap and above the document footer.
+    fn resize_dock(
+        &mut self,
+        event: &DragMoveEvent<DraggedDock>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let gap = if studio_ui::ds::is_glass(cx) {
+            studio_ui::ds::size::SHEET_GAP
+        } else {
+            0.
+        };
+        let bounds = event.bounds;
+        let pointer = event.event.position;
+        let (width, height) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+        let x = f32::from(pointer.x - bounds.origin.x);
+        let y = f32::from(pointer.y - bounds.origin.y);
+        match event.drag(cx).0 {
+            PanelPosition::Left => self.left.resize(x - gap, width),
+            PanelPosition::Right => self.right.resize(width - gap - x, width),
+            PanelPosition::Bottom => {
+                let footer = if self.session.is_some() {
+                    STRIP_HEIGHT
+                } else {
+                    0.
+                };
+                self.bottom.resize(height - gap - footer - y, height)
+            }
+        }
+        cx.notify();
     }
 
     fn render_toasts(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1317,6 +1517,16 @@ impl Workspace {
                             .min_w_0()
                             .child(Label::new(toast.message.clone()).size(LabelSize::Small)),
                     )
+                    .children(toast.action.as_ref().map(|(label, action)| {
+                        let action = action.boxed_clone();
+                        Button::new(("toast-action", id), label.clone())
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.dismiss_toast(id, cx);
+                                window.dispatch_action(action.boxed_clone(), cx);
+                            }))
+                    }))
                     .child(
                         IconButton::new(("dismiss-toast", id), IconName::Close)
                             .icon_size(IconSize::XSmall)
@@ -1400,6 +1610,11 @@ impl Render for Workspace {
                     this.activate_item(last, window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &GoBack, window, cx| this.navigate(true, window, cx)))
+            .on_action(
+                cx.listener(|this, _: &GoForward, window, cx| this.navigate(false, window, cx)),
+            )
+            .on_drag_move(cx.listener(Self::resize_dock))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.left.open = !this.left.open;
                 cx.notify();
@@ -1475,6 +1690,120 @@ impl Render for Workspace {
         )
         .child(self.render_toasts(cx))
         .children(modal)
+    }
+}
+
+/// A dock edge being dragged.
+#[derive(Clone, Copy)]
+struct DraggedDock(PanelPosition);
+
+impl Render for DraggedDock {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// The strip along a dock's inner edge that resizes it.
+fn resize_handle(position: PanelPosition) -> impl IntoElement {
+    let handle = div()
+        .id(match position {
+            PanelPosition::Left => "resize-left-dock",
+            PanelPosition::Right => "resize-right-dock",
+            PanelPosition::Bottom => "resize-bottom-dock",
+        })
+        .absolute()
+        .occlude();
+    let handle = match position {
+        PanelPosition::Left => handle
+            .top_0()
+            .right_0()
+            .h_full()
+            .w(px(5.))
+            .cursor_col_resize(),
+        PanelPosition::Right => handle
+            .top_0()
+            .left_0()
+            .h_full()
+            .w(px(5.))
+            .cursor_col_resize(),
+        PanelPosition::Bottom => handle
+            .top_0()
+            .left_0()
+            .w_full()
+            .h(px(5.))
+            .cursor_row_resize(),
+    };
+    handle.on_drag(DraggedDock(position), |dock, _, _, cx| {
+        cx.stop_propagation();
+        cx.new(|_| *dock)
+    })
+}
+
+/// Asks before closing a tab that has unsaved work or a write in flight.
+struct ConfirmClose {
+    workspace: WeakEntity<Workspace>,
+    item_id: EntityId,
+    title: SharedString,
+    focus_handle: FocusHandle,
+}
+
+impl EventEmitter<DismissEvent> for ConfirmClose {}
+
+impl Focusable for ConfirmClose {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl ConfirmClose {
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let item_id = self.item_id;
+        cx.emit(DismissEvent);
+        self.workspace
+            .update(cx, |workspace, cx| {
+                if let Some(index) = workspace.items.iter().position(|i| i.item_id() == item_id) {
+                    workspace.force_close_item(index, window, cx);
+                }
+            })
+            .ok();
+    }
+}
+
+impl Render for ConfirmClose {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus = self.focus_handle.clone();
+        studio_ui::ds::card(cx)
+            .key_context("ConfirmClose")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.close(window, cx)))
+            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
+            .w(px(380.))
+            .child(
+                studio_ui::ds::card_body()
+                    .gap(px(studio_ui::ds::space::SM))
+                    .child(studio_ui::ds::text::title(format!("Close {}?", self.title)))
+                    .child(studio_ui::ds::text::muted(
+                        "It has unsaved changes or a write still running. A write in flight \
+                         still finishes; the activity log keeps its outcome.",
+                    )),
+            )
+            .child(
+                studio_ui::ds::card_footer(cx)
+                    .justify_end()
+                    .gap(px(studio_ui::ds::space::SM))
+                    .child(
+                        Button::new("keep-open", "Keep open")
+                            .style(ButtonStyle::Outlined)
+                            .key_binding(ui::KeyBinding::for_action_in(&menu::Cancel, &focus, cx))
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    )
+                    .child(
+                        Button::new("close-anyway", "Close")
+                            .style(ButtonStyle::Filled)
+                            .key_binding(ui::KeyBinding::for_action_in(&menu::Confirm, &focus, cx))
+                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    ),
+            )
     }
 }
 

@@ -3,6 +3,7 @@
     "bindings": {
       "cmd-shift-p": "studio::ToggleCommandPalette",
       "cmd-k": "studio::ToggleCommandPalette",
+      "cmd-p": "studio::GoTo",
       "cmd-,": "studio::OpenSettings",
       "cmd-shift-b": "studio::SwitchBranch",
       "cmd-shift-n": "studio::NewWindow",

@@ -39,6 +39,16 @@ impl Default for ThemeChoice {
 }
 
 /// How the window's surfaces are drawn (spec 002, "Visual language").
+/// Spacing in Zed's `ui` components.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Density {
+    Compact,
+    #[default]
+    Default,
+    Comfortable,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WindowStyle {
@@ -91,8 +101,13 @@ pub struct AgentSettings {
 #[serde(default)]
 pub struct StudioSettings {
     pub theme: ThemeChoice,
+    /// The interface font; `null` keeps Zed's.
+    pub ui_font_family: Option<String>,
     pub ui_font_size: f32,
+    /// The query editor's font; `null` keeps Zed's.
+    pub buffer_font_family: Option<String>,
     pub buffer_font_size: f32,
+    pub ui_density: Density,
     pub studio: StudioOptions,
     pub agent: AgentSettings,
 }
@@ -101,8 +116,11 @@ impl Default for StudioSettings {
     fn default() -> Self {
         Self {
             theme: ThemeChoice::default(),
+            ui_font_family: None,
             ui_font_size: 16.,
+            buffer_font_family: None,
             buffer_font_size: 14.,
+            ui_density: Density::default(),
             studio: StudioOptions::default(),
             agent: AgentSettings::default(),
         }
@@ -161,12 +179,24 @@ impl StudioSettings {
             ThemeMode::Light => "light",
             ThemeMode::Dark => "dark",
         };
-        serde_json::json!({
+        let density = match self.ui_density {
+            Density::Compact => "compact",
+            Density::Default => "default",
+            Density::Comfortable => "comfortable",
+        };
+        let mut zed = serde_json::json!({
             "theme": { "mode": mode, "light": self.theme.light, "dark": self.theme.dark },
             "ui_font_size": self.ui_font_size,
             "buffer_font_size": self.buffer_font_size,
-        })
-        .to_string()
+            "unstable.ui_density": density,
+        });
+        if let Some(family) = &self.ui_font_family {
+            zed["ui_font_family"] = family.clone().into();
+        }
+        if let Some(family) = &self.buffer_font_family {
+            zed["buffer_font_family"] = family.clone().into();
+        }
+        zed.to_string()
     }
 }
 
@@ -255,6 +285,36 @@ fn watch(cx: &mut App) {
 mod tests {
     use super::*;
 
+    /// `assets/settings/default.json` documents the defaults (spec 002); it must say what the
+    /// code does.
+    #[test]
+    fn the_documented_defaults_are_the_defaults() {
+        let text = include_str!("../../../assets/settings/default.json");
+        assert_eq!(
+            StudioSettings::parse(text).unwrap(),
+            StudioSettings::default()
+        );
+        let documented: serde_json::Value = serde_json::from_str(text).unwrap();
+        let actual = serde_json::to_value(StudioSettings::default()).unwrap();
+        assert_eq!(documented, actual, "default.json names every setting");
+    }
+
+    #[test]
+    fn fonts_and_density_reach_zed() {
+        let mut settings = StudioSettings::default();
+        let zed: serde_json::Value = serde_json::from_str(&settings.zed_user_settings()).unwrap();
+        assert!(
+            zed.get("ui_font_family").is_none(),
+            "unset keeps Zed's font"
+        );
+        assert_eq!(zed["unstable.ui_density"], "default");
+        settings.ui_font_family = Some("IBM Plex Sans".into());
+        settings.ui_density = Density::Compact;
+        let zed: serde_json::Value = serde_json::from_str(&settings.zed_user_settings()).unwrap();
+        assert_eq!(zed["ui_font_family"], "IBM Plex Sans");
+        assert_eq!(zed["unstable.ui_density"], "compact");
+    }
+
     #[test]
     fn missing_keys_take_defaults_and_unknown_keys_are_ignored() {
         let settings = StudioSettings::parse(
@@ -273,6 +333,14 @@ mod tests {
             serde_json::from_str(&StudioSettings::default().zed_user_settings()).unwrap();
         let mut keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(keys, vec!["buffer_font_size", "theme", "ui_font_size"]);
+        assert_eq!(
+            keys,
+            vec![
+                "buffer_font_size",
+                "theme",
+                "ui_font_size",
+                "unstable.ui_density"
+            ]
+        );
     }
 }

@@ -4,11 +4,12 @@
 use gpui::{App, Menu, MenuItem, OsAction, SystemMenuType};
 use studio_actions::agent::OpenAgent;
 use studio_actions::graph::{
-    CreateBranch, MergeBranch, NewQuery, OpenCanvas, OpenHistory, ReviewBranch,
+    CreateBranch, MergeBranch, NewQuery, OpenCanvas, OpenHistory, OpenInspector, ReviewBranch,
 };
 use studio_actions::workspace::{
-    CloseActiveItem, NewWindow, OpenGraph, OpenSettings, Quit, Refresh, ShowKeyBindings,
-    SwitchBranch, ToggleActivity, ToggleCommandPalette, ToggleInspector, ToggleSidebar,
+    CloseActiveItem, GoBack, GoForward, GoTo, NewWindow, OpenGraph, OpenSettings, Quit, Refresh,
+    ShowKeyBindings, SwitchBranch, ToggleActivity, ToggleCommandPalette, ToggleInspector,
+    ToggleSidebar,
 };
 
 pub fn set(cx: &mut App) {
@@ -33,10 +34,18 @@ pub fn set(cx: &mut App) {
             MenuItem::os_action("Cut", editor::actions::Cut, OsAction::Cut),
             MenuItem::os_action("Copy", editor::actions::Copy, OsAction::Copy),
             MenuItem::os_action("Paste", editor::actions::Paste, OsAction::Paste),
-            MenuItem::os_action("Select All", editor::actions::SelectAll, OsAction::SelectAll),
+            MenuItem::os_action(
+                "Select All",
+                editor::actions::SelectAll,
+                OsAction::SelectAll,
+            ),
         ]),
         Menu::new("View").items([
             MenuItem::action("Command Palette", ToggleCommandPalette),
+            MenuItem::action("Go to Type or Node…", GoTo),
+            MenuItem::separator(),
+            MenuItem::action("Back", GoBack),
+            MenuItem::action("Forward", GoForward),
             MenuItem::separator(),
             MenuItem::action("Sidebar", ToggleSidebar),
             MenuItem::action("Inspector", ToggleInspector),
@@ -49,6 +58,7 @@ pub fn set(cx: &mut App) {
             MenuItem::action("New Query", NewQuery),
             MenuItem::action("History", OpenHistory),
             MenuItem::action("Canvas", OpenCanvas),
+            MenuItem::action("Storage Inspector", OpenInspector),
             MenuItem::action("Agent", OpenAgent),
             MenuItem::separator(),
             MenuItem::action("Create Branch…", CreateBranch),

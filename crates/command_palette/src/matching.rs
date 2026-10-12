@@ -191,6 +191,10 @@ pub enum Group {
     Studio,
     /// Quick-open rows for node and edge types.
     Type,
+    /// Nodes found by id or label (⌘P).
+    Node,
+    /// The session's branches (⌘⇧B).
+    Branch,
     /// Actions from Zed's crates, such as the editor's.
     Other,
 }

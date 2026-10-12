@@ -511,6 +511,41 @@ pub fn node_label(
     })
 }
 
+/// Nodes of one type whose id starts with `text`, or whose label contains it (spec 002, ⌘P go
+/// to a node). Columns: `id`, then `label` when the type has a label other than its key.
+pub fn node_search(
+    schema: &SchemaModel,
+    type_name: &str,
+    text: &str,
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, type_name)?;
+    let mut params = Params::new();
+    let q = params.add("q", "String", Value::String(text.to_owned()));
+    let label = node
+        .label_property()
+        .filter(|label| Some(*label) != node.key.as_deref());
+    let mut columns = vec!["$n.@id as id".to_owned()];
+    let predicate = match label {
+        Some(label) => {
+            columns.push(format!("$n.{label} as label"));
+            format!("($n.@id starts_with {q} or $n.{label} contains {q})")
+        }
+        None => format!("$n.@id starts_with {q}"),
+    };
+    let text = format!(
+        "query studio_find({sig}) {{\n  match {{\n    $n: {ty}\n    {predicate}\n  }}\n  return {{ {columns} }}\n  order {{ $n.@id asc }}\n  limit {limit}\n}}\n",
+        sig = params.signature(),
+        ty = node.name,
+        columns = columns.join(", "),
+    );
+    Ok(BuiltQuery {
+        name: "studio_find".into(),
+        text,
+        params: params.values,
+    })
+}
+
 /// Sets one property of one node, bound to the value the cell showed (spec 004). Zero affected
 /// nodes means the value changed elsewhere. List properties cannot be compared, so they are
 /// bound to the row only.
@@ -904,6 +939,22 @@ mod tests {
                 &neighbours(&schema, "Company", &group, "company-00000", None, 50).unwrap(),
             );
         }
+    }
+
+    #[test]
+    fn node_search_compiles_for_every_type() {
+        let schema = dev();
+        for node in &schema.nodes {
+            let query = node_search(&schema, &node.name, "ada", 5).unwrap();
+            assert_compiles(&query);
+            assert_eq!(query.params["q"], json!("ada"));
+        }
+        let person = node_search(&schema, "Person", "ada", 5).unwrap();
+        assert!(
+            person.text.contains("$n.name contains $q"),
+            "{}",
+            person.text
+        );
     }
 
     #[test]

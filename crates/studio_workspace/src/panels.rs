@@ -17,6 +17,16 @@ pub enum PanelPosition {
     Bottom,
 }
 
+impl PanelPosition {
+    pub fn default_size(self) -> f32 {
+        match self {
+            PanelPosition::Left => 264.,
+            PanelPosition::Right => 340.,
+            PanelPosition::Bottom => 240.,
+        }
+    }
+}
+
 /// One panel: what it is called, its icon in the dock's tabs, and its view.
 pub struct PanelEntry<V = AnyView> {
     pub id: SharedString,
@@ -31,6 +41,8 @@ pub struct Dock<V = AnyView> {
     pub panels: Vec<PanelEntry<V>>,
     pub active: usize,
     pub open: bool,
+    /// Width of a side dock or height of the bottom dock, in pixels; dragged by its edge.
+    pub size: f32,
 }
 
 impl<V> Dock<V> {
@@ -40,7 +52,18 @@ impl<V> Dock<V> {
             panels: Vec::new(),
             active: 0,
             open,
+            size: position.default_size(),
         }
+    }
+
+    /// Sets the size within what keeps the dock and the document usable in `available` pixels
+    /// (the window's width for a side dock, its height for the bottom dock).
+    pub fn resize(&mut self, size: f32, available: f32) {
+        let (min, share) = match self.position {
+            PanelPosition::Left | PanelPosition::Right => (200., 0.45),
+            PanelPosition::Bottom => (120., 0.6),
+        };
+        self.size = size.min(available * share).max(min);
     }
 
     pub fn active_panel(&self) -> Option<&PanelEntry<V>> {
@@ -127,5 +150,22 @@ mod tests {
         assert_eq!(dock.active_id().as_deref(), Some("explore"));
         dock.remove("explore");
         assert_eq!(dock.active_id().as_deref(), Some("types"));
+    }
+
+    #[test]
+    fn a_dock_resizes_within_bounds() {
+        let mut side = Dock::<()>::new(PanelPosition::Left, true);
+        assert_eq!(side.size, 264.);
+        side.resize(120., 1440.);
+        assert_eq!(side.size, 200., "never narrower than a row of the sidebar");
+        side.resize(1000., 1440.);
+        assert_eq!(
+            side.size,
+            1440. * 0.45,
+            "the document keeps most of the window"
+        );
+        let mut bottom = Dock::<()>::new(PanelPosition::Bottom, false);
+        bottom.resize(400., 900.);
+        assert_eq!(bottom.size, 400.);
     }
 }

@@ -1731,6 +1731,7 @@ version = "0.1.0"
 dependencies = [
  "editor",
  "gpui",
+ "gq_language",
  "graph_store",
  "menu",
  "serde",
@@ -9827,6 +9828,7 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "graph_store",
+ "menu",
  "serde",
  "serde_json",
  "studio_actions",
