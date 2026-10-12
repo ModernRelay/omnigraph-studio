@@ -1,6 +1,7 @@
 # 010: Inspectors
 
-Status: draft · 2026-10-11
+Status: built on 0.13 · 2026-10-12 (`crates/inspectors`): a "Storage" tab. Not built: index facts
+from `explain` (E13).
 
 ## Problem
 
@@ -40,7 +41,11 @@ I (read through HTTP only), VI (missing data labelled, never blank).
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-10-11 | Snapshot fields in 0.13.0 | parsed `openapi.json` at `v0.13.0` | `datasets`, `graph_branch`, `graph_manifest_version`, `internal_schema_version` |
+| 2026-10-12 | Every field renders from a live server | offscreen snapshot against `omnigraph-server` 0.13.0 | `/healthz`, `/readyz`, `/graphs` and `/snapshot` values shown and copyable; `source_version` absent and labelled "Not reported by this server" |
 
 ## Corrections
 
-None yet.
+- 2026-10-12: the inspector opens as a tab ("Storage", `OpenInspector`) in the graph's window
+  rather than a separate window; it covers the session's graph and branch, and every graph's
+  state from `GET /graphs`. The snapshot route returns no `graph_commit_id`, so the tab shows the
+  manifest version instead.
