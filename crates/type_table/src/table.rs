@@ -39,8 +39,9 @@ use crate::dialogs::{DeleteRowModal, InsertRowModal};
 use crate::model::{
     ColumnRole, ColumnSpec, Notice, PAGE_SIZE, Paging, Row, SaveResult, TableKind, Tone,
     changed_elsewhere, copy_text, count_of, display_value, edge_columns, edge_rows, edit_text,
-    filter_label, format_count, insert_position, node_columns, node_rows, parse_filter_value,
-    parse_input, row_matches, same_value, save_result, short_commit,
+    filter_label, format_count, insert_position, node_columns, node_rows, parse_filter_list,
+    parse_filter_value, parse_input, preset_start, row_matches, same_value, save_result,
+    short_commit,
 };
 use crate::peek::{NodePeek, PeekSubject};
 
@@ -376,7 +377,12 @@ impl TypeTable {
         };
         self.missing = false;
         let names: HashSet<&str> = columns.iter().map(|c| c.key.as_str()).collect();
-        self.filters.retain(|f| names.contains(f.property.as_str()));
+        // A filter stays while its column, or its relationship, is still in the schema.
+        self.filters
+            .retain(|f| match builder::parse_relationship_key(&f.property) {
+                Some((_, edge)) => schema.edge(edge).is_some(),
+                None => names.contains(f.property.as_str()),
+            });
         self.set_columns(columns, cx);
         self.schema = Some(schema);
         self.reload(false, cx);
@@ -396,18 +402,44 @@ impl TypeTable {
 
     fn page_query(&self, after: Option<&str>, limit: u32) -> Result<BuiltQuery, BuildError> {
         let schema = self.schema.as_ref().expect("schema loaded before reading");
+        let filters = self.resolved_filters();
         match self.kind {
-            TableKind::Node => {
-                builder::node_page(schema, &self.type_name, &self.filters, after, limit)
-            }
-            TableKind::Edge => {
-                builder::edge_page(schema, &self.type_name, &self.filters, after, limit)
-            }
+            TableKind::Node => builder::node_page(schema, &self.type_name, &filters, after, limit),
+            TableKind::Edge => builder::edge_page(schema, &self.type_name, &filters, after, limit),
         }
+    }
+
+    /// The filters with each date preset's start computed now, in local time.
+    fn resolved_filters(&self) -> Vec<Filter> {
+        let now = chrono::Local::now();
+        self.filters
+            .iter()
+            .map(|filter| {
+                if !filter.op.is_date_preset() {
+                    return filter.clone();
+                }
+                let kind = self
+                    .columns
+                    .iter()
+                    .filter_map(ColumnSpec::property)
+                    .find(|p| p.name == filter.property)
+                    .map(|p| p.kind);
+                Filter {
+                    value: preset_start(filter.op, kind, now),
+                    ..filter.clone()
+                }
+            })
+            .collect()
     }
 
     fn count_query(&self, filters: &[Filter]) -> Result<BuiltQuery, BuildError> {
         let schema = self.schema.as_ref().expect("schema loaded before reading");
+        let filters = if filters.is_empty() {
+            Vec::new()
+        } else {
+            self.resolved_filters()
+        };
+        let filters = filters.as_slice();
         match self.kind {
             TableKind::Node => builder::node_count(schema, &self.type_name, filters),
             TableKind::Edge => builder::edge_count(schema, &self.type_name, filters),
@@ -1309,6 +1341,42 @@ impl TypeTable {
             .collect()
     }
 
+    /// What a filter can test: each filterable property, then (in a node table) each
+    /// relationship group, as `(key, label)`.
+    fn filter_choices(&self) -> Vec<(String, String)> {
+        let mut choices: Vec<(String, String)> = self
+            .filterable()
+            .into_iter()
+            .map(|p| (p.name.clone(), p.name))
+            .collect();
+        if self.kind == TableKind::Node
+            && let Some(schema) = &self.schema
+        {
+            for group in schema.relationships_of(&self.type_name) {
+                let key = builder::relationship_key(&group);
+                let label = format!(
+                    "{} {}",
+                    builder::relationship_label(&key).unwrap_or_default(),
+                    group.other_type
+                );
+                choices.push((key, label));
+            }
+        }
+        choices
+    }
+
+    /// The tests offered for a filter key.
+    fn ops_for(&self, key: &str) -> Vec<FilterOp> {
+        if builder::parse_relationship_key(key).is_some() {
+            return FilterOp::for_relationship();
+        }
+        self.filterable()
+            .iter()
+            .find(|p| p.name == key)
+            .map(FilterOp::for_property)
+            .unwrap_or_default()
+    }
+
     fn open_filter_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let filterable = self.filterable();
         let preferred = self
@@ -1326,17 +1394,18 @@ impl TypeTable {
     }
 
     fn set_draft_property(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(property) = self.filterable().into_iter().find(|p| p.name == name) else {
+        let Some(&op) = self.ops_for(&name).first() else {
             return;
         };
-        let op = FilterOp::for_property(&property)[0];
         self.filter_draft = Some(FilterDraft {
             property: name,
             op,
             error: None,
         });
-        self.filter_editor
-            .update(cx, |editor, cx| editor.set_text("", window, cx));
+        self.filter_editor.update(cx, |editor, cx| {
+            editor.set_text("", window, cx);
+            editor.set_placeholder_text(filter_placeholder(op), window, cx);
+        });
         window.focus(&self.filter_editor.focus_handle(cx), cx);
         cx.notify();
     }
@@ -1346,6 +1415,9 @@ impl TypeTable {
             draft.op = op;
             draft.error = None;
         }
+        self.filter_editor.update(cx, |editor, cx| {
+            editor.set_placeholder_text(filter_placeholder(op), window, cx)
+        });
         if op.takes_value() {
             window.focus(&self.filter_editor.focus_handle(cx), cx);
         }
@@ -1356,17 +1428,29 @@ impl TypeTable {
         let Some(draft) = &self.filter_draft else {
             return;
         };
-        let Some(property) = self
-            .filterable()
-            .into_iter()
-            .find(|p| p.name == draft.property)
-        else {
-            return;
-        };
+        let key = draft.property.clone();
         let op = draft.op;
-        let value = if op.takes_value() {
-            let text = self.filter_editor.read(cx).text(cx);
-            match parse_filter_value(&property, &text) {
+        let text = self.filter_editor.read(cx).text(cx);
+        let parsed = if op.is_relationship() {
+            match op {
+                FilterOp::RelatedTo if text.trim().is_empty() => Err("Enter a node id".to_owned()),
+                FilterOp::RelatedTo => Ok(Value::String(text.trim().to_owned())),
+                _ => Ok(Value::Null),
+            }
+        } else {
+            let Some(property) = self.filterable().into_iter().find(|p| p.name == key) else {
+                return;
+            };
+            if op == FilterOp::In {
+                parse_filter_list(&property, &text)
+            } else if op.takes_value() {
+                parse_filter_value(&property, &text)
+            } else {
+                Ok(Value::Null)
+            }
+        };
+        let value = {
+            match parsed {
                 Ok(value) => value,
                 Err(error) => {
                     if let Some(draft) = &mut self.filter_draft {
@@ -1376,12 +1460,10 @@ impl TypeTable {
                     return;
                 }
             }
-        } else {
-            Value::Null
         };
         self.filter_draft = None;
         self.filters.push(Filter {
-            property: property.name,
+            property: key,
             op,
             value,
         });
@@ -1594,46 +1676,43 @@ impl TypeTable {
         }
         if let Some(draft) = &self.filter_draft {
             let table = cx.entity().downgrade();
-            let properties = self.filterable();
-            let property = properties
+            let choices = self.filter_choices();
+            let chosen = choices
                 .iter()
-                .find(|p| p.name == draft.property)
-                .cloned();
-            let ops = property
-                .as_ref()
-                .map(FilterOp::for_property)
-                .unwrap_or_default();
+                .find(|(key, _)| *key == draft.property)
+                .map(|(_, label)| label.clone())
+                .unwrap_or_else(|| draft.property.clone());
+            let ops = self.ops_for(&draft.property);
             let property_table = table.clone();
             bar = bar
                 .child(
                     PopoverMenu::new("filter-property")
                         .trigger(
-                            Button::new("filter-property-button", format!("{} ▾", draft.property))
+                            Button::new("filter-property-button", format!("{chosen} ▾"))
                                 .style(ButtonStyle::Outlined)
                                 .label_size(LabelSize::Small),
                         )
                         .menu(move |window, cx| {
                             let table = property_table.clone();
-                            let properties = properties.clone();
+                            let choices = choices.clone();
                             Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                                for property in properties {
+                                let mut relationships = false;
+                                for (key, label) in choices {
+                                    if !relationships
+                                        && builder::parse_relationship_key(&key).is_some()
+                                    {
+                                        relationships = true;
+                                        menu = menu.separator().header("Relationships");
+                                    }
                                     let table = table.clone();
-                                    let name = property.name.clone();
-                                    menu = menu.entry(
-                                        property.name.clone(),
-                                        None,
-                                        move |window, cx| {
-                                            table
-                                                .update(cx, |this, cx| {
-                                                    this.set_draft_property(
-                                                        name.clone(),
-                                                        window,
-                                                        cx,
-                                                    )
-                                                })
-                                                .ok();
-                                        },
-                                    );
+                                    let name = key.clone();
+                                    menu = menu.entry(label, None, move |window, cx| {
+                                        table
+                                            .update(cx, |this, cx| {
+                                                this.set_draft_property(name.clone(), window, cx)
+                                            })
+                                            .ok();
+                                    });
                                 }
                                 menu
                             }))
@@ -2021,6 +2100,7 @@ impl TypeTable {
                                 .bg(bg)
                                 .shadow_md()
                                 .children(notice.map(|notice| {
+                                    let unknown = notice.tone == Tone::Unknown;
                                     h_flex()
                                         .gap_1p5()
                                         .child(Indicator::dot().color(notice_color(notice.tone)))
@@ -2029,6 +2109,22 @@ impl TypeTable {
                                                 .size(LabelSize::Small)
                                                 .color(notice_color(notice.tone)),
                                         )
+                                        // Whether the save landed is in the branch's history.
+                                        .when(unknown, |row| {
+                                            row.child(
+                                                Button::new("open-history", "Open history")
+                                                    .style(ButtonStyle::Subtle)
+                                                    .label_size(LabelSize::Small)
+                                                    .on_click(|_, window, cx| {
+                                                        window.dispatch_action(
+                                                            Box::new(
+                                                                studio_actions::graph::OpenHistory,
+                                                            ),
+                                                            cx,
+                                                        )
+                                                    }),
+                                            )
+                                        })
                                 }))
                                 .children(hint.map(|hint| {
                                     Label::new(hint).size(LabelSize::XSmall).color(Color::Muted)
@@ -2137,6 +2233,15 @@ impl TypeTable {
             start,
             end: vec![hints.into_any_element()],
         }
+    }
+}
+
+/// What the value field asks for.
+fn filter_placeholder(op: FilterOp) -> &'static str {
+    match op {
+        FilterOp::In => "Values, separated by commas",
+        FilterOp::RelatedTo => "Node id, for example company-00002",
+        _ => "Value",
     }
 }
 

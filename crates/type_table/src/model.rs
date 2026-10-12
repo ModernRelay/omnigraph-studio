@@ -430,6 +430,57 @@ pub fn parse_filter_value(property: &Property, text: &str) -> Result<Value, Stri
     parse_scalar(&element, text)
 }
 
+/// The values of an "is one of" filter, separated by commas: `Founder, Engineer`.
+pub fn parse_filter_list(property: &Property, text: &str) -> Result<Value, String> {
+    let element = Property {
+        list: false,
+        nullable: false,
+        ..property.clone()
+    };
+    let values = text
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| parse_scalar(&element, part))
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.is_empty() {
+        return Err("Enter values separated by commas".into());
+    }
+    Ok(Value::Array(values))
+}
+
+/// Where a date preset starts at `now`: today, the Monday of this week, or 30 days ago; a
+/// `Date` as `YYYY-MM-DD`, a `DateTime` as that local midnight in UTC.
+pub fn preset_start(
+    op: FilterOp,
+    kind: Option<ScalarKind>,
+    now: chrono::DateTime<chrono::Local>,
+) -> Value {
+    use chrono::{Datelike as _, Duration, TimeZone as _};
+    let today = now.date_naive();
+    let start = match op {
+        FilterOp::ThisWeek => today - Duration::days(today.weekday().num_days_from_monday() as i64),
+        FilterOp::Last30Days => today - Duration::days(30),
+        _ => today,
+    };
+    match kind {
+        Some(ScalarKind::DateTime) => {
+            let midnight = start.and_hms_opt(0, 0, 0).expect("midnight exists");
+            let local = chrono::Local
+                .from_local_datetime(&midnight)
+                .earliest()
+                .unwrap_or(now);
+            Value::String(
+                local
+                    .with_timezone(&chrono::Utc)
+                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .to_string(),
+            )
+        }
+        _ => Value::String(start.format("%Y-%m-%d").to_string()),
+    }
+}
+
 fn compare(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::Number(a), Value::Number(b)) => a.as_f64()?.partial_cmp(&b.as_f64()?),
@@ -451,13 +502,19 @@ pub fn same_value(a: &Value, b: &Value) -> bool {
 
 /// Whether a row's values satisfy every filter, with the engine's semantics: a comparison with
 /// a null is false; `contains` is a substring test on text and membership on lists.
+/// Relationship filters are not checked here: a row's relationships are not in the row.
 pub fn row_matches(filters: &[Filter], values: &Map<String, Value>) -> bool {
     filters.iter().all(|filter| {
         let value = values.get(&filter.property).unwrap_or(&Value::Null);
         match filter.op {
+            FilterOp::HasAny | FilterOp::HasNone | FilterOp::RelatedTo => true,
             FilterOp::IsEmpty => value.is_null(),
             FilterOp::IsNotEmpty => !value.is_null(),
             _ if value.is_null() => false,
+            FilterOp::In => filter
+                .value
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| same_value(value, item))),
             FilterOp::Contains => match (value, &filter.value) {
                 (Value::String(text), Value::String(part)) => text.contains(part.as_str()),
                 (Value::Array(items), wanted) => items.iter().any(|v| same_value(v, wanted)),
@@ -471,16 +528,25 @@ pub fn row_matches(filters: &[Filter], values: &Map<String, Value>) -> bool {
                 Some(Ordering::Less | Ordering::Equal)
             ),
             FilterOp::Gt => compare(value, &filter.value) == Some(Ordering::Greater),
-            FilterOp::Ge => matches!(
-                compare(value, &filter.value),
-                Some(Ordering::Greater | Ordering::Equal)
-            ),
+            FilterOp::Ge | FilterOp::Today | FilterOp::ThisWeek | FilterOp::Last30Days => {
+                matches!(
+                    compare(value, &filter.value),
+                    Some(Ordering::Greater | Ordering::Equal)
+                )
+            }
         }
     })
 }
 
-/// A filter as a chip reads: `title is Engineer`, `email is empty`.
+/// A filter as a chip reads: `title is Engineer`, `email is empty`, `has worksAt →`.
 pub fn filter_label(filter: &Filter) -> String {
+    if let Some(relationship) = gq_language::builder::relationship_label(&filter.property) {
+        return match filter.op {
+            FilterOp::HasAny => format!("has {relationship}"),
+            FilterOp::HasNone => format!("no {relationship}"),
+            _ => format!("{relationship} {}", edit_text(&filter.value)),
+        };
+    }
     if filter.op.takes_value() {
         format!(
             "{} {} {}",
@@ -951,5 +1017,82 @@ mod tests {
         assert!(same_value(&json!(1), &json!(1.0)));
         assert!(!same_value(&json!(["a"]), &json!(["b"])));
         assert_eq!(display_value(None, &Value::Null), "—");
+    }
+
+    #[test]
+    fn list_filters_parse_each_value_with_the_propertys_type() {
+        assert_eq!(
+            parse_filter_list(&prop("Person", "title"), "Founder, Engineer,").unwrap(),
+            json!(["Founder", "Engineer"])
+        );
+        assert!(parse_filter_list(&prop("Person", "born"), "2020-01-01, soon").is_err());
+        assert!(parse_filter_list(&prop("Person", "title"), " , ").is_err());
+    }
+
+    #[test]
+    fn date_presets_start_today_on_monday_or_thirty_days_back() {
+        use chrono::TimeZone as _;
+        // Wednesday 2026-10-14, mid-afternoon local time.
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 10, 14, 15, 30, 0)
+            .unwrap();
+        let date = Some(ScalarKind::Date);
+        assert_eq!(
+            preset_start(FilterOp::Today, date, now),
+            json!("2026-10-14")
+        );
+        assert_eq!(
+            preset_start(FilterOp::ThisWeek, date, now),
+            json!("2026-10-12")
+        );
+        assert_eq!(
+            preset_start(FilterOp::Last30Days, date, now),
+            json!("2026-09-14")
+        );
+        let instant = preset_start(FilterOp::Today, Some(ScalarKind::DateTime), now);
+        let text = instant.as_str().unwrap();
+        assert!(text.ends_with('Z') && text.len() == 20, "{text}");
+    }
+
+    #[test]
+    fn membership_and_presets_match_rows_locally_and_relationships_are_left_to_the_engine() {
+        let row: Map<String, Value> = serde_json::from_value(json!({
+            "title": "Founder",
+            "born": "2026-10-13"
+        }))
+        .unwrap();
+        let filter = |property: &str, op: FilterOp, value: Value| Filter {
+            property: property.into(),
+            op,
+            value,
+        };
+        assert!(row_matches(
+            &[filter(
+                "title",
+                FilterOp::In,
+                json!(["Engineer", "Founder"])
+            )],
+            &row
+        ));
+        assert!(!row_matches(
+            &[filter("title", FilterOp::In, json!([]))],
+            &row
+        ));
+        assert!(row_matches(
+            &[filter("born", FilterOp::ThisWeek, json!("2026-10-12"))],
+            &row
+        ));
+        assert!(!row_matches(
+            &[filter("born", FilterOp::Today, json!("2026-10-14"))],
+            &row
+        ));
+        assert!(row_matches(
+            &[filter("out:WorksAt", FilterOp::HasNone, Value::Null)],
+            &row
+        ));
+        assert_eq!(
+            filter_label(&filter("in:Knows", FilterOp::HasAny, Value::Null)),
+            "has ← knows"
+        );
     }
 }

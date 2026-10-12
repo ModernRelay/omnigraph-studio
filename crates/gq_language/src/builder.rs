@@ -29,7 +29,7 @@ impl BuiltQuery {
     }
 }
 
-/// A comparison on one property.
+/// A comparison on one property, or a test on one relationship (spec 004).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterOp {
     Eq,
@@ -39,8 +39,20 @@ pub enum FilterOp {
     Gt,
     Ge,
     Contains,
+    /// Membership in a list of values (`$n.p in $f`).
+    In,
     IsEmpty,
     IsNotEmpty,
+    /// Date presets: on or after the start of today, of this week (Monday), or of the day 30
+    /// days ago. The table fills the value with that start each time it reads.
+    Today,
+    ThisWeek,
+    Last30Days,
+    /// Relationship tests; the filter's property is a [`relationship_key`].
+    HasAny,
+    HasNone,
+    /// Joined to the node whose id is the value.
+    RelatedTo,
 }
 
 impl FilterOp {
@@ -53,13 +65,50 @@ impl FilterOp {
             FilterOp::Gt => "greater than",
             FilterOp::Ge => "at least",
             FilterOp::Contains => "contains",
+            FilterOp::In => "is one of",
             FilterOp::IsEmpty => "is empty",
             FilterOp::IsNotEmpty => "is not empty",
+            FilterOp::Today => "is today",
+            FilterOp::ThisWeek => "is this week",
+            FilterOp::Last30Days => "is in the last 30 days",
+            FilterOp::HasAny => "has any",
+            FilterOp::HasNone => "has none",
+            FilterOp::RelatedTo => "is related to",
         }
     }
 
+    /// Whether the person types a value: presets compute theirs, and emptiness and
+    /// relationship presence need none.
     pub fn takes_value(self) -> bool {
-        !matches!(self, FilterOp::IsEmpty | FilterOp::IsNotEmpty)
+        !matches!(
+            self,
+            FilterOp::IsEmpty
+                | FilterOp::IsNotEmpty
+                | FilterOp::Today
+                | FilterOp::ThisWeek
+                | FilterOp::Last30Days
+                | FilterOp::HasAny
+                | FilterOp::HasNone
+        )
+    }
+
+    pub fn is_date_preset(self) -> bool {
+        matches!(
+            self,
+            FilterOp::Today | FilterOp::ThisWeek | FilterOp::Last30Days
+        )
+    }
+
+    pub fn is_relationship(self) -> bool {
+        matches!(
+            self,
+            FilterOp::HasAny | FilterOp::HasNone | FilterOp::RelatedTo
+        )
+    }
+
+    /// The tests a relationship supports, in menu order.
+    pub fn for_relationship() -> Vec<FilterOp> {
+        vec![FilterOp::HasAny, FilterOp::HasNone, FilterOp::RelatedTo]
     }
 
     /// The comparisons a property supports, in menu order. Lists take membership only (the
@@ -70,14 +119,26 @@ impl FilterOp {
         } else {
             match property.kind {
                 ScalarKind::Text if property.enum_values.is_none() => {
-                    vec![FilterOp::Eq, FilterOp::Ne, FilterOp::Contains]
+                    vec![FilterOp::Eq, FilterOp::Ne, FilterOp::Contains, FilterOp::In]
                 }
-                ScalarKind::Text | ScalarKind::Bool => vec![FilterOp::Eq, FilterOp::Ne],
-                ScalarKind::Integer
-                | ScalarKind::Float
-                | ScalarKind::Date
-                | ScalarKind::DateTime => {
+                ScalarKind::Text => vec![FilterOp::Eq, FilterOp::Ne, FilterOp::In],
+                ScalarKind::Bool => vec![FilterOp::Eq, FilterOp::Ne],
+                ScalarKind::Integer | ScalarKind::Float => {
                     vec![
+                        FilterOp::Eq,
+                        FilterOp::Ne,
+                        FilterOp::Lt,
+                        FilterOp::Le,
+                        FilterOp::Gt,
+                        FilterOp::Ge,
+                        FilterOp::In,
+                    ]
+                }
+                ScalarKind::Date | ScalarKind::DateTime => {
+                    vec![
+                        FilterOp::Today,
+                        FilterOp::ThisWeek,
+                        FilterOp::Last30Days,
                         FilterOp::Eq,
                         FilterOp::Ne,
                         FilterOp::Lt,
@@ -94,6 +155,36 @@ impl FilterOp {
         }
         ops
     }
+}
+
+/// The filter key of a relationship group: `out:WorksAt`, `in:Knows`.
+pub fn relationship_key(group: &RelationshipGroup) -> String {
+    let direction = match group.direction {
+        Direction::Outgoing => "out",
+        Direction::Incoming => "in",
+    };
+    format!("{direction}:{}", group.edge)
+}
+
+/// The direction and edge of a [`relationship_key`].
+pub fn parse_relationship_key(key: &str) -> Option<(Direction, &str)> {
+    let (direction, edge) = key.split_once(':')?;
+    let direction = match direction {
+        "out" => Direction::Outgoing,
+        "in" => Direction::Incoming,
+        _ => return None,
+    };
+    Some((direction, edge))
+}
+
+/// How a relationship key reads: `worksAt →`, `← knows`.
+pub fn relationship_label(key: &str) -> Option<String> {
+    let (direction, edge) = parse_relationship_key(key)?;
+    let name = traversal_name(edge);
+    Some(match direction {
+        Direction::Outgoing => format!("{name} →"),
+        Direction::Incoming => format!("← {name}"),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -166,6 +257,7 @@ impl Params {
 }
 
 fn filter_clauses(
+    schema: &SchemaModel,
     type_name: &str,
     properties: &[Property],
     var: &str,
@@ -174,6 +266,10 @@ fn filter_clauses(
 ) -> Result<Vec<String>, BuildError> {
     let mut clauses = Vec::new();
     for (i, filter) in filters.iter().enumerate() {
+        if filter.op.is_relationship() {
+            clauses.push(relationship_clause(schema, var, i, filter, params)?);
+            continue;
+        }
         let property = properties
             .iter()
             .find(|p| p.name == filter.property)
@@ -196,6 +292,17 @@ fn filter_clauses(
                 } else {
                     property.param_type(false)
                 };
+                // `in` takes a list of the property's values.
+                let ty = if op == FilterOp::In {
+                    Property {
+                        list: true,
+                        nullable: false,
+                        ..property.clone()
+                    }
+                    .param_type(false)
+                } else {
+                    ty
+                };
                 let param = params.add(&format!("f{i}"), &ty, filter.value.clone());
                 let operator = match op {
                     FilterOp::Eq => "=",
@@ -203,9 +310,16 @@ fn filter_clauses(
                     FilterOp::Lt => "<",
                     FilterOp::Le => "<=",
                     FilterOp::Gt => ">",
-                    FilterOp::Ge => ">=",
+                    FilterOp::Ge | FilterOp::Today | FilterOp::ThisWeek | FilterOp::Last30Days => {
+                        ">="
+                    }
                     FilterOp::Contains => "contains",
-                    FilterOp::IsEmpty | FilterOp::IsNotEmpty => unreachable!(),
+                    FilterOp::In => "in",
+                    FilterOp::IsEmpty
+                    | FilterOp::IsNotEmpty
+                    | FilterOp::HasAny
+                    | FilterOp::HasNone
+                    | FilterOp::RelatedTo => unreachable!(),
                 };
                 format!("{target} {operator} {param}")
             }
@@ -213,6 +327,40 @@ fn filter_clauses(
         clauses.push(clause);
     }
     Ok(clauses)
+}
+
+/// A relationship filter as a correlated block: `exists { $r0: Company  $n worksAt $r0 }`, or
+/// `not { … }` for "has none"; "related to" also binds the other node's id.
+fn relationship_clause(
+    schema: &SchemaModel,
+    var: &str,
+    i: usize,
+    filter: &Filter,
+    params: &mut Params,
+) -> Result<String, BuildError> {
+    let Some((direction, edge_name)) = parse_relationship_key(&filter.property) else {
+        return Err(BuildError::UnknownEdge(filter.property.clone()));
+    };
+    let edge = edge(schema, edge_name)?;
+    let other = format!("$r{i}");
+    let (other_type, hop) = match direction {
+        Direction::Outgoing => (&edge.to, format!("${var} {} {other}", edge.traversal())),
+        Direction::Incoming => (&edge.from, format!("{other} {} ${var}", edge.traversal())),
+    };
+    let mut body = vec![format!("{other}: {other_type}"), hop];
+    if filter.op == FilterOp::RelatedTo {
+        let id = params.add(&format!("f{i}"), "String", filter.value.clone());
+        body.push(format!("{other}.@id = {id}"));
+    }
+    let block = if filter.op == FilterOp::HasNone {
+        "not"
+    } else {
+        "exists"
+    };
+    Ok(format!(
+        "{block} {{\n      {}\n    }}",
+        body.join("\n      ")
+    ))
 }
 
 /// One page of a node type, keyset-paged by `@id` (spec 004). Pass the last row's `@id` as
@@ -233,6 +381,7 @@ pub fn node_page(
     );
     let mut clauses = vec![format!("$n: {}", node.name), format!("$n.@id > {after}")];
     clauses.extend(filter_clauses(
+        schema,
         &node.name,
         &node.properties,
         "n",
@@ -261,6 +410,7 @@ pub fn node_count(
     let mut params = Params::new();
     let mut clauses = vec![format!("$n: {}", node.name)];
     clauses.extend(filter_clauses(
+        schema,
         &node.name,
         &node.properties,
         "n",
@@ -335,6 +485,7 @@ pub fn edge_page(
         format!("$e.@id > {after}"),
     ];
     clauses.extend(filter_clauses(
+        schema,
         &edge.name,
         &edge.properties,
         "e",
@@ -380,6 +531,7 @@ pub fn edge_count(
         format!("$a $e:{} $b", edge.traversal()),
     ];
     clauses.extend(filter_clauses(
+        schema,
         &edge.name,
         &edge.properties,
         "e",
@@ -939,6 +1091,66 @@ mod tests {
                 &neighbours(&schema, "Company", &group, "company-00000", None, 50).unwrap(),
             );
         }
+    }
+
+    #[test]
+    fn membership_presets_and_relationship_filters_compile() {
+        let schema = dev();
+        let filters = [
+            Filter {
+                property: "title".into(),
+                op: FilterOp::In,
+                value: json!(["Founder", "Engineer"]),
+            },
+            Filter {
+                property: "born".into(),
+                op: FilterOp::Last30Days,
+                value: json!("2026-09-12"),
+            },
+            Filter {
+                property: "out:WorksAt".into(),
+                op: FilterOp::HasAny,
+                value: Value::Null,
+            },
+            Filter {
+                property: "in:Knows".into(),
+                op: FilterOp::HasNone,
+                value: Value::Null,
+            },
+            Filter {
+                property: "out:Contributes".into(),
+                op: FilterOp::RelatedTo,
+                value: json!("project-00036"),
+            },
+        ];
+        let page = node_page(&schema, "Person", &filters, None, 100).unwrap();
+        assert_compiles(&page);
+        assert!(page.text.contains("$n.title in $f0"), "{}", page.text);
+        assert!(page.text.contains("$n.born >= $f1"), "{}", page.text);
+        assert!(page.text.contains("exists {"), "{}", page.text);
+        assert!(
+            page.text
+                .contains("not {\n      $r3: Person\n      $r3 knows $n"),
+            "{}",
+            page.text
+        );
+        assert!(page.text.contains("$r4.@id = $f4"), "{}", page.text);
+        assert_compiles(&node_count(&schema, "Person", &filters).unwrap());
+        assert_eq!(relationship_label("in:Knows").as_deref(), Some("← knows"));
+        assert!(matches!(
+            node_page(
+                &schema,
+                "Person",
+                &[Filter {
+                    property: "out:Likes".into(),
+                    op: FilterOp::HasAny,
+                    value: Value::Null,
+                }],
+                None,
+                10
+            ),
+            Err(BuildError::UnknownEdge(_))
+        ));
     }
 
     #[test]
