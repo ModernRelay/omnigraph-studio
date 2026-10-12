@@ -119,6 +119,40 @@ fn theme_picker(id: &'static str, current: String, dark: bool, cx: &App) -> AnyE
         .into_any_element()
 }
 
+fn agent_control(command: &[String]) -> AnyElement {
+    let shown = if command.is_empty() {
+        "None".to_owned()
+    } else {
+        command.join(" ")
+    };
+    v_flex()
+        .items_end()
+        .gap_1()
+        .child(
+            div().max_w(px(320.)).overflow_hidden().child(
+                Label::new(shown)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .single_line()
+                    .truncate(),
+            ),
+        )
+        .child(h_flex().gap_1().children(agent_panel::PRESETS.iter().enumerate().map(
+            |(index, (name, preset))| {
+                let preset: Vec<String> = preset.iter().map(|s| (*s).to_owned()).collect();
+                Button::new(("agent-preset", index), *name)
+                    .label_size(LabelSize::Small)
+                    .style(ButtonStyle::Subtle)
+                    .toggle_state(preset.as_slice() == command)
+                    .on_click(move |_, _, cx| {
+                        let preset = preset.clone();
+                        studio_settings::update(cx, move |s| s.agent.command = preset);
+                    })
+            },
+        )))
+        .into_any_element()
+}
+
 impl SettingsView {
     fn rows(&self, cx: &App) -> Vec<Row> {
         let settings = StudioSettings::get(cx).clone();
@@ -194,6 +228,13 @@ impl SettingsView {
                     s.studio.tree_page_size = next.clamp(10, 500) as u32
                 }),
                 reset: |s| s.studio.tree_page_size = StudioSettings::default().studio.tree_page_size,
+            },
+            Row {
+                title: "Agent",
+                description: "The program the agent panel runs over the Agent Client Protocol.",
+                is_default: settings.agent.command.is_empty(),
+                control: agent_control(&settings.agent.command),
+                reset: |s| s.agent = StudioSettings::default().agent,
             },
             Row {
                 title: "Canvas node limit",

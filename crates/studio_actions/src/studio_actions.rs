@@ -220,3 +220,36 @@ pub mod canvas {
         ]
     );
 }
+
+pub mod agent {
+    use gpui::{Action, actions};
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    actions!(
+        studio_agent,
+        [
+            /// Open the agent panel.
+            OpenAgent,
+            /// Send the message in the agent composer.
+            Send,
+            /// Stop the agent's current turn.
+            Stop,
+            /// Allow the change or request the agent is waiting on.
+            Allow,
+            /// Allow this and every later change on the agent's branch in this session.
+            AllowAlways,
+            /// Reject the change or request the agent is waiting on.
+            Reject,
+            /// Start the agent again after it stopped.
+            Restart,
+        ]
+    );
+
+    /// Ask the agent a question about the graph.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_agent)]
+    pub struct Ask {
+        pub text: String,
+    }
+}

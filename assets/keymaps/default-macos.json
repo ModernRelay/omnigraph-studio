@@ -15,5 +15,20 @@
     "bindings": {
       "?": "studio::ShowKeyBindings"
     }
+  },
+  {
+    "bindings": {
+      "cmd-shift-a": "studio_agent::OpenAgent"
+    }
+  },
+  {
+    "context": "AgentPanel",
+    "bindings": {
+      "cmd-enter": "studio_agent::Send",
+      "cmd-shift-.": "studio_agent::Stop",
+      "cmd-y": "studio_agent::Allow",
+      "cmd-alt-y": "studio_agent::AllowAlways",
+      "cmd-alt-n": "studio_agent::Reject"
+    }
   }
 ]

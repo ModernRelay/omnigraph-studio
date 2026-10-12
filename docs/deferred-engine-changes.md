@@ -26,6 +26,7 @@ one is picked up it goes through OmniGraph's own RFC process.
 | E17 | `omnigraph lsp` language server | 007 | `gq_language` calls `omnigraph-compiler` in-process |
 | E18 | Tree-sitter grammars and a Zed extension in the OmniGraph repository | E17 | Grammars in this repository under `grammars/` |
 | E19 | Publish `omnigraph-compiler` to crates.io again (stops at 0.8.0) | 001 | Git dependency on tag `v0.13.0` |
+| E20 | Record commits made on behalf of an agent (agent identity beside the actor) | 011 | Agent commits are recorded under the person's actor, on a branch named `agent/<stamp>` |
 
 Already on OmniGraph main but not in 0.13.0, used only when a server advertises them:
 

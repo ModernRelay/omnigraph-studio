@@ -30,6 +30,7 @@ pub fn init(cx: &mut App) {
     review::init(cx);
     history::init(cx);
     inspectors::init(cx);
+    agent_panel::init(cx);
 
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.observe_new(|workspace: &mut Workspace, window, cx| {

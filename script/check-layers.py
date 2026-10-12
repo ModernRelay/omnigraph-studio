@@ -24,6 +24,7 @@ LAYERS = {
     "review": 5,
     "history": 5,
     "inspectors": 5,
+    "agent_panel": 5,
     "studio": 6,
 }
 NO_GPUI = {"graph_client", "gq_language"}

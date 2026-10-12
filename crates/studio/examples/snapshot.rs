@@ -24,6 +24,14 @@ fn settle(cx: &mut HeadlessAppContext, wait: Duration) {
 }
 
 fn main() {
+    // The agent panel starts the running executable as its MCP proxy (spec 011); answer that
+    // here as Studio's own binary does.
+    let raw: Vec<_> = std::env::args_os().skip(1).collect();
+    if raw.first().map(|a| a.as_os_str()) == Some(std::ffi::OsStr::new(agent_panel::PROXY_COMMAND)) {
+        let socket = raw.get(1).expect("mcp-proxy needs a socket path");
+        agent_panel::proxy(std::path::Path::new(socket)).expect("proxy the MCP socket");
+        return;
+    }
     let mut args = std::env::args().skip(1);
     let out = args.next().unwrap_or_else(|| "snapshot.png".into());
     let actions: Vec<String> = args.collect();

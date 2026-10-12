@@ -18,7 +18,7 @@ other: what two features share moves down a layer.
 | 2 | `studio_ui` | Studio components on Zed's `ui`: state chips, write-outcome banners, empty and error states, key hints | `ui`, `theme`, `studio_theme`, `studio_actions` |
 | 3 | `graph_store` | GPUI entities: connections, graph sessions, schema model, snapshot pins, exploration, drafts | `gpui`, `graph_client`, `gq_language`, `gpui_tokio` |
 | 4 | `studio_workspace` | The window frame: panes, tabs, docks, panels, status bar, modal and toast layers | `gpui`, `ui`, `studio_ui`, `studio_actions`, `studio_settings` |
-| 5 | `command_palette`, `type_table`, `relationship_tree`, `graph_canvas`, `query_editor`, `review`, `history`, `inspectors` | One surface each | layers 0–4 |
+| 5 | `command_palette`, `type_table`, `relationship_tree`, `graph_canvas`, `query_editor`, `review`, `history`, `inspectors`, `agent_panel` | One surface each | layers 0–4 |
 | 6 | `studio` | The binary: initialises every crate in order, menus, windows, single instance, URL scheme | everything |
 
 `studio_workspace` is forked and trimmed from Zed's `workspace`, without projects,

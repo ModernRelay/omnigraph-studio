@@ -5,3 +5,4 @@
 /.vscode
 *.profraw
 /dev/.data
+/.claude/worktrees/

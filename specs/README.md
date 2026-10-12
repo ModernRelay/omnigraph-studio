@@ -41,7 +41,7 @@ Add tasks, contracts or data-model files only for large features.
 | 008 | [Branches, review and merge](008-branches-review-merge/plan.md) | draft |
 | 009 | [History](009-history/plan.md) | draft |
 | 010 | [Inspectors](010-inspectors/plan.md) | draft |
-| 011 | [Agent panel](011-agent-panel/plan.md) | not started |
+| 011 | [Agent panel](011-agent-panel/plan.md) | implemented |
 | 012 | [OmniGraph engine changes](012-omnigraph-engine-changes/plan.md) | deferred |
 
 Order of work: 001, 002, 003, then 004 with the spikes in 001. 005 to 009 follow in any order.

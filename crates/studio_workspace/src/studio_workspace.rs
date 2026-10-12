@@ -751,7 +751,13 @@ impl Workspace {
                     .border_color(colors.border)
                     .shadow_md()
                     .child(Indicator::dot().color(color))
-                    .child(Label::new(toast.message.clone()).size(LabelSize::Small))
+                    // `min_w_0` lets the text wrap inside the toast instead of widening it.
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Label::new(toast.message.clone()).size(LabelSize::Small)),
+                    )
             }))
     }
 }

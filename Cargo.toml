@@ -18,6 +18,7 @@ members = [
     "crates/review",
     "crates/history",
     "crates/inspectors",
+    "crates/agent_panel",
 ]
 default-members = ["crates/studio"]
 
@@ -46,6 +47,7 @@ query_editor = { path = "crates/query_editor" }
 review = { path = "crates/review" }
 history = { path = "crates/history" }
 inspectors = { path = "crates/inspectors" }
+agent_panel = { path = "crates/agent_panel" }
 
 # Zed, one release tag for every crate (docs/zed-pin.md). GPL-3.0-or-later and Apache-2.0.
 gpui = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
@@ -76,6 +78,10 @@ omnigraph-compiler = { git = "https://github.com/ModernRelay/omnigraph", tag = "
 # Third party
 anyhow = "1"
 futures = "0.3"
+# The Agent Client Protocol at the version Zed v1.23.2 pins; stable v1 only (spec 011).
+agent-client-protocol = "=2.2.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+smol = "2"
 schemars = "1"
 semver = "1"
 serde = { version = "1", features = ["derive"] }

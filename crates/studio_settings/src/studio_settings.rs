@@ -4,6 +4,7 @@
 //!
 //! Layer 1 (`docs/architecture.md`).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -62,6 +63,15 @@ impl Default for StudioOptions {
     }
 }
 
+/// The agent the agent panel runs (spec 011): a program and its arguments, and extra
+/// environment variables. Empty until the person chooses one.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentSettings {
+    pub command: Vec<String>,
+    pub env: BTreeMap<String, String>,
+}
+
 /// The whole settings document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -70,6 +80,7 @@ pub struct StudioSettings {
     pub ui_font_size: f32,
     pub buffer_font_size: f32,
     pub studio: StudioOptions,
+    pub agent: AgentSettings,
 }
 
 impl Default for StudioSettings {
@@ -79,6 +90,7 @@ impl Default for StudioSettings {
             ui_font_size: 15.,
             buffer_font_size: 14.,
             studio: StudioOptions::default(),
+            agent: AgentSettings::default(),
         }
     }
 }

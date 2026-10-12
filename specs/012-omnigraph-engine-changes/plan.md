@@ -118,6 +118,16 @@ them. *Waits:* E17. *Today:* `grammars/` in this repository.
 **E19. Publish `omnigraph-compiler` to crates.io again.** crates.io stops at 0.8.0; the repo is
 at 0.13. *Waits:* 001. *Today:* git dependency on tag `v0.13.0`.
 
+### Agent identity
+
+**E20. Commits made on behalf of an agent.** Spec 011 runs agent writes through the person's
+token, so the commit records the person's actor. Recording an agent beside the actor (for
+example an `on_behalf_of` field set by the server from a token the person scoped for the agent)
+would let history and review say which changes an agent made. Engine rule: the server resolves
+both identities from bearer tokens at the boundary (invariant 10); a client never asserts the
+agent identity. Studio today: agent writes go only to a branch named `agent/<stamp>`, so the
+branch name says who made them.
+
 ### Already on OmniGraph main, not in 0.13.0
 
 **R1. Blob writes** (`PUT`/`DELETE /graphs/{id}/blob`). Studio offers Blob upload and clear only
