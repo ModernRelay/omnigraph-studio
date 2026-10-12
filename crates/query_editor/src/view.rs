@@ -6,6 +6,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use editor::display_map::{
+    BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId,
+};
 use editor::scroll::Autoscroll;
 use editor::{
     Editor, EditorEvent, HighlightKey, MultiBufferOffset, SelectionEffects, ToOffset as _,
@@ -210,6 +213,11 @@ pub struct QueryEditor {
     path: Option<std::path::PathBuf>,
     saved_text: Option<String>,
     file_error: Option<String>,
+    /// The run line above each declaration (spec 007): the blocks, the declarations they were
+    /// made for, and each declaration's last outcome by name.
+    run_lines: Vec<CustomBlockId>,
+    run_line_names: Vec<String>,
+    last_runs: HashMap<String, RunNote>,
     /// The branch's latest commits, for the snapshot picker: id, Unix micros, actor.
     commits: Vec<(String, i64, Option<String>)>,
     commits_task: Option<Task<()>>,
@@ -346,6 +354,9 @@ impl QueryEditor {
             file_error: None,
             commits: Vec::new(),
             commits_task: None,
+            run_lines: Vec::new(),
+            run_line_names: Vec::new(),
+            last_runs: HashMap::new(),
             at_commit: None,
             editor,
             analysis: None,
@@ -746,7 +757,76 @@ impl QueryEditor {
         });
         self.analysis = Some(analysis);
         self.sync_params(window, cx);
+        self.sync_run_lines(cx);
         cx.notify();
+    }
+
+    /// Puts a run line above each declaration, when the declarations changed since the lines
+    /// were placed; anchored to the text, the lines move with edits in between.
+    fn sync_run_lines(&mut self, cx: &mut Context<Self>) {
+        let Some(analysis) = self.analysis.clone() else {
+            return;
+        };
+        let names: Vec<String> = analysis
+            .outline
+            .declarations
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        if names == self.run_line_names {
+            return;
+        }
+        let this = cx.entity().downgrade();
+        let old: collections::HashSet<CustomBlockId> = self.run_lines.drain(..).collect();
+        let lines = self.editor.update(cx, |editor, cx| {
+            editor.remove_blocks(old, None, cx);
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let blocks: Vec<BlockProperties<editor::Anchor>> = analysis
+                .outline
+                .declarations
+                .iter()
+                .enumerate()
+                .map(|(index, declaration)| {
+                    let this = this.clone();
+                    let name = declaration.name.clone();
+                    let at = snapshot.anchor_before(MultiBufferOffset(declaration.range.start));
+                    BlockProperties {
+                        placement: BlockPlacement::Above(at),
+                        height: Some(1),
+                        style: BlockStyle::Flex,
+                        priority: 0,
+                        render: std::sync::Arc::new(move |block: &mut BlockContext| {
+                            run_line(&this, &name, index, block)
+                        }),
+                    }
+                })
+                .collect();
+            editor.insert_blocks(blocks, None, cx)
+        });
+        self.run_lines = lines;
+        self.run_line_names = names;
+    }
+
+    /// The run line's click: run the declaration it sits above.
+    fn run_declaration(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(start) = self
+            .analysis
+            .as_ref()
+            .and_then(|a| a.outline.declarations.get(index))
+            .map(|d| d.range.start)
+        else {
+            return;
+        };
+        self.jump_to(start, window, cx);
+        // The editor reports the moved cursor later; run what the line sits above now.
+        self.cursor = start;
+        self.run(&Run, window, cx);
+    }
+
+    fn note_run(&mut self, name: Option<&str>, note: RunNote) {
+        if let Some(name) = name {
+            self.last_runs.insert(name.to_owned(), note);
+        }
     }
 
     /// The declaration under the cursor and what the last check said about it.
@@ -966,6 +1046,21 @@ impl QueryEditor {
         result: Result<ReadOutput, ReadError>,
         elapsed: Duration,
     ) {
+        let note = match &result {
+            Ok(output) => RunNote {
+                text: format!(
+                    "{} · {}",
+                    rows_label(output.row_count),
+                    format_elapsed(elapsed)
+                ),
+                failed: false,
+            },
+            Err(_) => RunNote {
+                text: "Refused".into(),
+                failed: true,
+            },
+        };
+        self.note_run(prepared.name.as_deref(), note);
         self.output = match result {
             Ok(output) if is_plan(&output.columns) => Output::Plan(PlanOutput {
                 label: prepared.label,
@@ -1032,6 +1127,7 @@ impl QueryEditor {
             label: format!("Writing {} to {branch}…", prepared.label).into(),
         };
         let map = prepared.map;
+        let name = prepared.name.clone();
         // Detached, not stored: closing the tab must not cancel a write in flight, and the
         // session logs its outcome either way (constitution III).
         cx.spawn(async move |this, cx| {
@@ -1039,6 +1135,24 @@ impl QueryEditor {
             let elapsed = started.elapsed();
             this.update(cx, |this, cx| {
                 this.writing = false;
+                let note = match &outcome {
+                    WriteOutcome::Committed(output) => RunNote {
+                        text: format!(
+                            "Committed · {} nodes, {} edges",
+                            output.affected_nodes, output.affected_edges
+                        ),
+                        failed: false,
+                    },
+                    WriteOutcome::Refused(_) => RunNote {
+                        text: "Refused · nothing written".into(),
+                        failed: true,
+                    },
+                    WriteOutcome::Unknown { .. } => RunNote {
+                        text: "Outcome unknown · check History".into(),
+                        failed: true,
+                    },
+                };
+                this.note_run(name.as_deref(), note);
                 this.output = Output::Written(match outcome {
                     WriteOutcome::Committed(output) => WriteResult::Committed {
                         branch: output.branch,
@@ -2021,4 +2135,56 @@ fn unused_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
         n += 1;
     }
     candidate
+}
+
+/// A declaration's last outcome, shown on its run line.
+#[derive(Debug, Clone)]
+struct RunNote {
+    text: String,
+    failed: bool,
+}
+
+/// The line above a declaration: Run, and how its last run went.
+fn run_line(
+    editor: &gpui::WeakEntity<QueryEditor>,
+    name: &str,
+    index: usize,
+    block: &mut BlockContext,
+) -> AnyElement {
+    let note = editor
+        .upgrade()
+        .and_then(|editor| editor.read(block.app).last_runs.get(name).cloned());
+    let editor = editor.clone();
+    h_flex()
+        .id(("run-line", index))
+        .w_full()
+        .pl(block.margins.gutter.full_width())
+        .gap_2()
+        .items_center()
+        .child(
+            Button::new(("run-line-run", index), "Run")
+                .style(ButtonStyle::Transparent)
+                .label_size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .start_icon(
+                    Icon::new(IconName::PlayFilled)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .on_click(move |_, window, cx| {
+                    editor
+                        .update(cx, |editor, cx| editor.run_declaration(index, window, cx))
+                        .ok();
+                }),
+        )
+        .children(note.map(|note| {
+            Label::new(note.text)
+                .size(LabelSize::XSmall)
+                .color(if note.failed {
+                    Color::Error
+                } else {
+                    Color::Muted
+                })
+        }))
+        .into_any_element()
 }
