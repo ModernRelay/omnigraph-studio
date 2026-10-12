@@ -167,12 +167,12 @@ impl Render for EditModal {
                 ds::card_footer(cx)
                     .child(div().flex_1())
                     .child(
-                        Button::new("cancel-edit", "Cancel")
+                        studio_ui::ds::button("cancel-edit", "Cancel")
                             .style(ButtonStyle::Outlined)
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
-                        Button::new("save-edit", "Save")
+                        studio_ui::ds::button("save-edit", "Save")
                             .style(ButtonStyle::Filled)
                             .tooltip(ui::Tooltip::text(format!(
                                 "Writes the changed fields to {}, bound to the reviewed head",

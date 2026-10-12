@@ -184,6 +184,14 @@ than styling one-off elements.
   floats the three columns as sheets over a soft wash, with one gap around and between them,
   and moves the traffic lights into the sidebar sheet.
 - **Hairlines.** `ds::surface::rule`, never a solid border; dashed between rows on glass.
+- **Tabs** fill the 40 px strip (an explicit height: the right-click wrapper lays a tab out at
+  its content's height, so `h_full` would shrink it to its label); the active tab joins the
+  document, inactive ones sit on the strip's rule.
+- **Buttons.** `ds::button` and `ds::icon_button` (Zed's medium size: 28 px, an 8 px inset)
+  for every button in a toolbar, strip, panel, card footer or dialog, so a hover or pressed
+  fill has room around its label. Buttons inside a dense row (a filter pill's segments, a
+  tab's close, a tree row's toggle, an inline Fix or Run, the sidebar header's icons) keep
+  Zed's compact default.
 - **Text sizes.** The window's rem size is `ui_font_size` (16 px by default), as in Zed, so
   every `ui` size scales with it. Body text is `Small`; labels, counts and metadata `XSmall`.
 - **Sidebar rows.** `ds::SidebarRow`: section labels muted, not bold; the selected row a grey

@@ -833,7 +833,7 @@ impl TypeTable {
                 .child(
                     PopoverMenu::new("bulk-property")
                         .trigger(
-                            Button::new(
+                            studio_ui::ds::button(
                                 "bulk-property-button",
                                 match &chosen {
                                     Some(name) => format!("Set {name} ▾"),
@@ -880,7 +880,7 @@ impl TypeTable {
                             .child(self.bulk_editor.clone()),
                     )
                     .child(
-                        Button::new(
+                        studio_ui::ds::button(
                             "bulk-set",
                             if saving {
                                 format!("Setting {count}…")
@@ -910,7 +910,7 @@ impl TypeTable {
             }))
             .child(div().flex_1())
             .child(
-                Button::new("bulk-clear", "Clear")
+                studio_ui::ds::button("bulk-clear", "Clear")
                     .style(ButtonStyle::Subtle)
                     .label_size(LabelSize::Small)
                     .tooltip(Tooltip::text("Clear the selection (Esc)"))
@@ -931,7 +931,7 @@ impl TypeTable {
         PopoverMenu::new("views-menu")
             .anchor(gpui::Anchor::TopRight)
             .trigger(
-                Button::new("views", active.clone().unwrap_or_else(|| "Views".into()))
+                studio_ui::ds::button("views", active.clone().unwrap_or_else(|| "Views".into()))
                     .style(ButtonStyle::Subtle)
                     .label_size(LabelSize::Small)
                     .start_icon(Icon::new(IconName::Star).size(IconSize::Small))
@@ -2405,7 +2405,7 @@ impl TypeTable {
             })
             .when(self.newer, |d| {
                 d.child(
-                    Button::new("newer-data", "Newer data · Refresh")
+                    studio_ui::ds::button("newer-data", "Newer data · Refresh")
                         .style(ButtonStyle::Tinted(TintColor::Accent))
                         .label_size(LabelSize::Small)
                         .tooltip(|_, cx| {
@@ -2417,7 +2417,7 @@ impl TypeTable {
             .child(div().flex_1())
             .child(self.render_views_menu(cx))
             .child(
-                Button::new("add-filter", "Filter")
+                studio_ui::ds::button("add-filter", "Filter")
                     .style(ButtonStyle::Subtle)
                     .label_size(LabelSize::Small)
                     .start_icon(Icon::new(IconName::Filter).size(IconSize::Small))
@@ -2427,7 +2427,7 @@ impl TypeTable {
                     ),
             )
             .child(
-                Button::new("insert-row", "Row")
+                studio_ui::ds::button("insert-row", "Row")
                     .style(ButtonStyle::Subtle)
                     .label_size(LabelSize::Small)
                     .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
@@ -2444,7 +2444,7 @@ impl TypeTable {
                     ),
             )
             .child(
-                IconButton::new("refresh-table", IconName::RotateCw)
+                studio_ui::ds::icon_button("refresh-table", IconName::RotateCw)
                     .icon_size(IconSize::Small)
                     .tooltip(|_, cx| Tooltip::for_action("Refresh", &RefreshTable, cx))
                     .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
@@ -2637,7 +2637,7 @@ impl TypeTable {
         }
         if !self.filters.is_empty() {
             bar = bar.child(div().flex_1()).child(
-                Button::new("clear-filters", "Clear all")
+                studio_ui::ds::button("clear-filters", "Clear all")
                     .style(ButtonStyle::Subtle)
                     .label_size(LabelSize::Small)
                     .tooltip(|_, cx| Tooltip::for_action("Remove every filter", &ClearFilters, cx))
@@ -2666,7 +2666,7 @@ impl TypeTable {
                     ))
                     .child(
                         h_flex().justify_center().pb_6().child(
-                            Button::new("retry-table", "Refresh")
+                            studio_ui::ds::button("retry-table", "Refresh")
                                 .style(ButtonStyle::Filled)
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.refresh(window, cx)),
@@ -3228,17 +3228,20 @@ impl TypeTable {
                                         // Whether the save landed is in the branch's history.
                                         .when(unknown, |row| {
                                             row.child(
-                                                Button::new("open-history", "Open history")
-                                                    .style(ButtonStyle::Subtle)
-                                                    .label_size(LabelSize::Small)
-                                                    .on_click(|_, window, cx| {
-                                                        window.dispatch_action(
-                                                            Box::new(
-                                                                studio_actions::graph::OpenHistory,
-                                                            ),
-                                                            cx,
-                                                        )
-                                                    }),
+                                                studio_ui::ds::button(
+                                                    "open-history",
+                                                    "Open history",
+                                                )
+                                                .style(ButtonStyle::Subtle)
+                                                .label_size(LabelSize::Small)
+                                                .on_click(|_, window, cx| {
+                                                    window.dispatch_action(
+                                                        Box::new(
+                                                            studio_actions::graph::OpenHistory,
+                                                        ),
+                                                        cx,
+                                                    )
+                                                }),
                                             )
                                         })
                                 }))
@@ -3312,7 +3315,7 @@ impl TypeTable {
         }
         if let Some(error) = self.more_error.clone() {
             start.push(
-                Button::new("retry-more", "Retry")
+                studio_ui::ds::button("retry-more", "Retry")
                     .style(ButtonStyle::Subtle)
                     .label_size(LabelSize::XSmall)
                     .start_icon(

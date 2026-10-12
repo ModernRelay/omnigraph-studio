@@ -460,11 +460,11 @@ impl Render for CreateBranchModal {
                     .gap_2()
                     .justify_end()
                     .child(
-                        Button::new("cancel", "Cancel")
+                        studio_ui::ds::button("cancel", "Cancel")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
-                        Button::new(
+                        studio_ui::ds::button(
                             "create",
                             if self.running {
                                 "Creating…"
@@ -609,11 +609,11 @@ impl Render for DeleteBranchModal {
                         reason.map(|r| Label::new(r).size(LabelSize::XSmall).color(Color::Muted)),
                     )
                     .child(
-                        Button::new("cancel", "Cancel")
+                        studio_ui::ds::button("cancel", "Cancel")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
-                        Button::new(
+                        studio_ui::ds::button(
                             "delete",
                             if self.running {
                                 "Deleting…"

@@ -112,7 +112,9 @@
   },
   {
     "bindings": {
-      "cmd-n": "studio_graph::NewQuery"
+      "cmd-n": "studio_graph::NewQuery",
+      "cmd-shift-o": "studio_graph::OpenOntology",
+      "cmd-shift-e": "studio_graph::OpenCanvas"
     }
   },
   {
@@ -191,7 +193,8 @@
       "space": "studio_canvas::PeekSelected",
       "f": "studio_canvas::FocusSelected",
       "[": "studio_canvas::WalkBack",
-      "]": "studio_canvas::WalkForward"
+      "]": "studio_canvas::WalkForward",
+      "r": "studio_canvas::ResetLayout"
     }
   },
   {

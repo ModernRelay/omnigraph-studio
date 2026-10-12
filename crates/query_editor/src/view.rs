@@ -434,7 +434,7 @@ impl QueryEditor {
         };
         PopoverMenu::new("snapshot-picker")
             .trigger(
-                Button::new("snapshot-picker-button", label)
+                studio_ui::ds::button("snapshot-picker-button", label)
                     .style(ButtonStyle::Subtle)
                     .label_size(LabelSize::Small)
                     .start_icon(
@@ -1264,7 +1264,7 @@ impl QueryEditor {
                 toolbar.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
             })
             .child(
-                Button::new("run", "Run")
+                studio_ui::ds::button("run", "Run")
                     .style(ButtonStyle::Filled)
                     .label_size(LabelSize::Small)
                     .start_icon(Icon::new(IconName::PlayFilled).size(IconSize::XSmall))
@@ -1288,7 +1288,7 @@ impl QueryEditor {
                     .on_click(cx.listener(|this, _, window, cx| this.run(&Run, window, cx))),
             )
             .child(
-                Button::new("explain", "Explain")
+                studio_ui::ds::button("explain", "Explain")
                     .label_size(LabelSize::Small)
                     .start_icon(Icon::new(IconName::ListTree).size(IconSize::XSmall))
                     .key_binding(KeyBinding::for_action_in(&Explain, &editor_focus, cx))
@@ -1515,7 +1515,7 @@ impl QueryEditor {
                 .child(Label::new(what).size(LabelSize::Small))
                 .child(div().flex_1())
                 .child(
-                    Button::new("confirm-write", button)
+                    studio_ui::ds::button("confirm-write", button)
                         .style(ButtonStyle::Filled)
                         .label_size(LabelSize::Small)
                         .key_binding(KeyBinding::for_action_in(
@@ -1528,7 +1528,7 @@ impl QueryEditor {
                         })),
                 )
                 .child(
-                    Button::new("cancel-write", "Cancel")
+                    studio_ui::ds::button("cancel-write", "Cancel")
                         .label_size(LabelSize::Small)
                         .key_binding(KeyBinding::for_action_in(
                             &menu::Cancel,
@@ -1692,7 +1692,7 @@ impl QueryEditor {
             }))
             .child(div().flex_1())
             .child(
-                Button::new("copy-cell", "Copy cell")
+                studio_ui::ds::button("copy-cell", "Copy cell")
                     .label_size(LabelSize::Small)
                     .start_icon(Icon::new(IconName::Copy).size(IconSize::XSmall))
                     .disabled(!has_selection)
@@ -1720,7 +1720,7 @@ impl QueryEditor {
                 |status, (nodes, links)| {
                     let title = format!("{} · result", rows.label);
                     status.child(
-                        Button::new("result-canvas", "Canvas")
+                        studio_ui::ds::button("result-canvas", "Canvas")
                             .label_size(LabelSize::Small)
                             .start_icon(Icon::new(IconName::GitGraph).size(IconSize::XSmall))
                             .tooltip(Tooltip::text(format!(
@@ -1741,7 +1741,7 @@ impl QueryEditor {
                 },
             )
             .child(
-                Button::new("copy-row", "Copy row")
+                studio_ui::ds::button("copy-row", "Copy row")
                     .label_size(LabelSize::Small)
                     .disabled(!has_selection)
                     .key_binding(KeyBinding::for_action_in(&CopyRow, &self.results_focus, cx))
@@ -2119,7 +2119,7 @@ impl QueryEditor {
             .children(diagnostic.map(|diagnostic| {
                 let at = diagnostic.byte;
                 div().pl_6().child(
-                    Button::new(
+                    studio_ui::ds::button(
                         "server-diagnostic",
                         format!(
                             "{}{}",

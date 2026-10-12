@@ -226,7 +226,7 @@ impl OpenGraphModal {
                     }),
             )
             .child(
-                Button::new("add-server", "Add server…")
+                studio_ui::ds::button("add-server", "Add server…")
                     .style(ButtonStyle::Subtle)
                     .label_size(LabelSize::Small)
                     .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
@@ -281,7 +281,7 @@ impl OpenGraphModal {
                     .child(div().flex_1())
                     .map(|row| match &state {
                         ConnectionState::Connecting => row.child(
-                            Button::new("cancel-connect", "Cancel")
+                            studio_ui::ds::button("cancel-connect", "Cancel")
                                 .style(ButtonStyle::Subtle)
                                 .label_size(LabelSize::Small)
                                 .on_click(cx.listener(move |_, _, _, cx| {
@@ -289,7 +289,7 @@ impl OpenGraphModal {
                                 })),
                         ),
                         ConnectionState::Unreachable(_) | ConnectionState::Idle => row.child(
-                            Button::new("retry-connect", "Retry")
+                            studio_ui::ds::button("retry-connect", "Retry")
                                 .style(ButtonStyle::Subtle)
                                 .label_size(LabelSize::Small)
                                 .start_icon(Icon::new(IconName::RotateCw).size(IconSize::XSmall))
@@ -315,7 +315,7 @@ impl OpenGraphModal {
                                 .child(self.replacement_token.clone()),
                         )
                         .child(
-                            Button::new("update-token", "Update token")
+                            studio_ui::ds::button("update-token", "Update token")
                                 .style(ButtonStyle::Filled)
                                 .tooltip(ui::Tooltip::text(if cli {
                                     "Used until Studio quits. Run `omnigraph login` to keep it \
@@ -390,7 +390,7 @@ impl OpenGraphModal {
                             .child(self.graph_id.clone()),
                     )
                     .child(
-                        Button::new("open", "Open")
+                        studio_ui::ds::button("open", "Open")
                             .style(ButtonStyle::Filled)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 let id = this.graph_id.read(cx).text(cx);
@@ -431,18 +431,20 @@ impl OpenGraphModal {
                 h_flex()
                     .gap_2()
                     .child(
-                        Button::new("add", "Add and connect")
+                        studio_ui::ds::button("add", "Add and connect")
                             .style(ButtonStyle::Filled)
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.add_server(window, cx)),
                             ),
                     )
-                    .child(Button::new("cancel-add", "Cancel").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.adding = false;
-                            cx.notify();
-                        },
-                    ))),
+                    .child(
+                        studio_ui::ds::button("cancel-add", "Cancel").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.adding = false;
+                                cx.notify();
+                            },
+                        )),
+                    ),
             )
     }
 }

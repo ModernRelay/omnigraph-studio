@@ -546,6 +546,22 @@ pub fn meta_code(icon: IconName, value: impl Into<SharedString>, cx: &App) -> Di
         .child(text::code(value, cx).color(Color::Muted).single_line())
 }
 
+/// A button in a toolbar, strip, panel or dialog: Zed's medium size (28 px tall, an 8 px
+/// inset) with a small label, so its hover and pressed fills have room around the label. A
+/// button inside a dense row (a pill segment, a tree row, a tab) keeps Zed's compact default.
+pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    Button::new(id, label)
+        .size(ButtonSize::Medium)
+        .label_size(LabelSize::Small)
+}
+
+/// [`button`] for an icon alone: a 28 px square.
+pub fn icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
+    IconButton::new(id, icon)
+        .size(ButtonSize::Medium)
+        .icon_size(IconSize::Small)
+}
+
 /// The text of a single-line field that sits among `Small` labels (a filter value, a search
 /// box): an editor's text at the label's size rather than the body size.
 pub fn field_text(cx: &App) -> gpui::TextStyleRefinement {

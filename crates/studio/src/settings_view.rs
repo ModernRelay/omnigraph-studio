@@ -131,7 +131,7 @@ fn stepper(
     h_flex()
         .gap(px(space::XS))
         .child(
-            IconButton::new(target.id("down"), IconName::Dash)
+            studio_ui::ds::icon_button(target.id("down"), IconName::Dash)
                 .icon_size(IconSize::Small)
                 .disabled(value <= min)
                 .on_click(move |_, _, cx| {
@@ -146,7 +146,7 @@ fn stepper(
                 .child(ds::text::body(shown)),
         )
         .child(
-            IconButton::new(target.id("up"), IconName::Plus)
+            studio_ui::ds::icon_button(target.id("up"), IconName::Plus)
                 .icon_size(IconSize::Small)
                 .disabled(value >= max)
                 .on_click(move |_, _, cx| {
@@ -166,7 +166,7 @@ fn dropdown(target: &Target, current: Value, options: Vec<(SharedString, Value)>
     let target = target.clone();
     PopoverMenu::new(target.id("menu"))
         .trigger(
-            Button::new(target.id("trigger"), shown)
+            studio_ui::ds::button(target.id("trigger"), shown)
                 .label_size(LabelSize::Small)
                 .style(ButtonStyle::Outlined)
                 .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
@@ -530,7 +530,7 @@ impl Render for SettingsView {
                                     .child(div().flex_1().child(self.search.clone())),
                             )
                             .child(
-                                IconButton::new("reveal-settings", IconName::Folder)
+                                studio_ui::ds::icon_button("reveal-settings", IconName::Folder)
                                     .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text(format!(
                                         "Show settings.json · {}",

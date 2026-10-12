@@ -800,7 +800,7 @@ impl Render for HistoryView {
             .child(div().flex_1())
             .child(search)
             .child(
-                IconButton::new("refresh-history", IconName::RotateCw)
+                studio_ui::ds::icon_button("refresh-history", IconName::RotateCw)
                     .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Read the history again"))

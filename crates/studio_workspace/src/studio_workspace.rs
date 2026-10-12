@@ -1547,13 +1547,15 @@ impl Workspace {
                 // With a split, the active pane's tab reads at full strength and the others'
                 // active tabs are muted, so the focused document is clear.
                 let strong = selected && (!split || focused_pane);
+                // The strip's height, not `h_full`: the right-click wrapper lays out at its
+                // content's height, so a percentage would shrink the tab to its label.
                 let tab = h_flex()
                     .id(SharedString::from(format!("tab-{pane_id}-{index}")))
                     .group(group.clone())
-                    .h_full()
-                    .pl_4()
-                    .pr_1p5()
-                    .gap_2()
+                    .h(px(STRIP_HEIGHT))
+                    .pl(px(studio_ui::ds::space::LG))
+                    .pr(px(studio_ui::ds::space::SM))
+                    .gap(px(studio_ui::ds::space::MD))
                     .items_center()
                     .flex_none()
                     .relative()
@@ -1660,7 +1662,7 @@ impl Workspace {
         let mut context = h_flex().gap_1().items_center().pr_1();
         if top_right {
             context = context.child(
-                IconButton::new("toggle-activity", IconName::ListTree)
+                studio_ui::ds::icon_button("toggle-activity", IconName::ListTree)
                     .icon_size(IconSize::Small)
                     .toggle_state(self.bottom.open)
                     .tooltip(|_, cx| Tooltip::for_action("Activity", &ToggleActivity, cx))
@@ -1668,13 +1670,16 @@ impl Workspace {
             );
             if !self.right.panels.is_empty() {
                 context = context.child(
-                    IconButton::new("toggle-inspector", IconName::ThreadsSidebarRightOpen)
-                        .icon_size(IconSize::Small)
-                        .toggle_state(self.right.open)
-                        .tooltip(|_, cx| Tooltip::for_action("Inspector", &ToggleInspector, cx))
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(Box::new(ToggleInspector), cx)
-                        }),
+                    studio_ui::ds::icon_button(
+                        "toggle-inspector",
+                        IconName::ThreadsSidebarRightOpen,
+                    )
+                    .icon_size(IconSize::Small)
+                    .toggle_state(self.right.open)
+                    .tooltip(|_, cx| Tooltip::for_action("Inspector", &ToggleInspector, cx))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(ToggleInspector), cx)
+                    }),
                 );
             }
         }
@@ -1897,7 +1902,7 @@ impl Workspace {
                 PopoverMenu::new("branch-menu")
                     .anchor(gpui::Anchor::BottomLeft)
                     .trigger(
-                        Button::new("branch", branch.clone())
+                        studio_ui::ds::button("branch", branch.clone())
                             .label_size(LabelSize::Small)
                             .style(ButtonStyle::Subtle)
                             .tooltip(Tooltip::text(format!(
@@ -2009,14 +2014,19 @@ impl Workspace {
                                 .child(self.render_title_tabs(&self.bottom, cx))
                                 .child(div().flex_1())
                                 .child(
-                                    IconButton::new("close-bottom-dock", IconName::Close)
-                                        .icon_size(IconSize::XSmall)
-                                        .tooltip(|_, cx| {
-                                            Tooltip::for_action("Hide", &ToggleActivity, cx)
-                                        })
-                                        .on_click(|_, window, cx| {
+                                    studio_ui::ds::icon_button(
+                                        "close-bottom-dock",
+                                        IconName::Close,
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .tooltip(|_, cx| {
+                                        Tooltip::for_action("Hide", &ToggleActivity, cx)
+                                    })
+                                    .on_click(
+                                        |_, window, cx| {
                                             window.dispatch_action(Box::new(ToggleActivity), cx)
-                                        }),
+                                        },
+                                    ),
                                 ),
                         )
                         .child(
@@ -2040,7 +2050,7 @@ impl Workspace {
                              action: Box<dyn Action>,
                              cx: &mut Context<Self>| {
             let binding = ui::KeyBinding::for_action_in(action.as_ref(), &focus, cx);
-            Button::new(id, label)
+            studio_ui::ds::button(id, label)
                 .full_width()
                 .style(ButtonStyle::Outlined)
                 .label_size(LabelSize::Small)
@@ -2129,7 +2139,7 @@ impl Workspace {
                         .child(self.render_title_tabs(&self.right, cx))
                         .child(div().flex_1())
                         .child(
-                            IconButton::new("close-right-dock", IconName::Close)
+                            studio_ui::ds::icon_button("close-right-dock", IconName::Close)
                                 .icon_size(IconSize::XSmall)
                                 .tooltip(|_, cx| Tooltip::for_action("Hide", &ToggleInspector, cx))
                                 .on_click(|_, window, cx| {
@@ -2233,7 +2243,7 @@ impl Workspace {
                     )
                     .children(toast.action.as_ref().map(|(label, action)| {
                         let action = action.boxed_clone();
-                        Button::new(("toast-action", id), label.clone())
+                        studio_ui::ds::button(("toast-action", id), label.clone())
                             .style(ButtonStyle::Subtle)
                             .label_size(LabelSize::Small)
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -2242,7 +2252,7 @@ impl Workspace {
                             }))
                     }))
                     .child(
-                        IconButton::new(("dismiss-toast", id), IconName::Close)
+                        studio_ui::ds::icon_button(("dismiss-toast", id), IconName::Close)
                             .icon_size(IconSize::XSmall)
                             .on_click(
                                 cx.listener(move |this, _, _, cx| this.dismiss_toast(id, cx)),
@@ -2713,13 +2723,13 @@ impl Render for ConfirmClose {
                     .justify_end()
                     .gap(px(studio_ui::ds::space::SM))
                     .child(
-                        Button::new("keep-open", "Keep open")
+                        studio_ui::ds::button("keep-open", "Keep open")
                             .style(ButtonStyle::Outlined)
                             .key_binding(ui::KeyBinding::for_action_in(&menu::Cancel, &focus, cx))
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
-                        Button::new("close-anyway", "Close")
+                        studio_ui::ds::button("close-anyway", "Close")
                             .style(ButtonStyle::Filled)
                             .key_binding(ui::KeyBinding::for_action_in(&menu::Confirm, &focus, cx))
                             .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),

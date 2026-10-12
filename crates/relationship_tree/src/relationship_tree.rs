@@ -932,7 +932,7 @@ impl RelationshipTree {
                         .child(
                             h_flex().flex_1().min_w_0().flex_wrap().gap_0p5().children(
                             breadcrumb.into_iter().map(|(index, text)| {
-                                Button::new(("crumb", index), format!("{text} ›"))
+                                studio_ui::ds::button(("crumb", index), format!("{text} ›"))
                                     .label_size(LabelSize::XSmall)
                                     .style(ButtonStyle::Subtle)
                                     .tooltip(Tooltip::text("Explore from here again"))
@@ -945,7 +945,7 @@ impl RelationshipTree {
                 )
                 .when(newer, |d| {
                     d.child(
-                        Button::new("newer", "Newer data · Refresh")
+                        studio_ui::ds::button("newer", "Newer data · Refresh")
                             .label_size(LabelSize::XSmall)
                             .style(ButtonStyle::Tinted(ui::TintColor::Accent))
                             .tooltip(Tooltip::text(

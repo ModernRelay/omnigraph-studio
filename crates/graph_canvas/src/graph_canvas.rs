@@ -28,10 +28,10 @@ use graph_store::{
 };
 use studio_actions::canvas::{
     CollapseNode, ExpandNode, FitToWindow, FocusSelected, MoveDown, MoveLeft, MoveRight, MoveUp,
-    PeekSelected, WalkBack, WalkForward, ZoomIn, ZoomOut,
+    PeekSelected, ResetLayout, WalkBack, WalkForward, ZoomIn, ZoomOut,
 };
 use studio_actions::graph::{
-    OpenCanvas, OpenNode, OpenType, PeekNode, ShowNodeOnCanvas, ShowResultsOnCanvas,
+    OpenCanvas, OpenNode, OpenOntology, OpenType, PeekNode, ShowNodeOnCanvas, ShowResultsOnCanvas,
 };
 use studio_ui::empty_state;
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
@@ -47,8 +47,11 @@ const ZOOM_STEP: f32 = 1.25;
 
 /// Registers the canvas's keys and the actions that open it.
 pub fn init(cx: &mut App) {
-    studio_workspace::register_item_kind(cx, "canvas", |_, workspace, window, cx| {
-        open_canvas(workspace, window, cx);
+    studio_workspace::register_item_kind(cx, "canvas", |data, workspace, window, cx| {
+        let pinned = pins_from_json(data);
+        if let Some(canvas) = open_canvas(workspace, window, cx) {
+            canvas.update(cx, |canvas, cx| canvas.restore_pins(pinned, cx));
+        }
     });
     cx.observe_new(|workspace: &mut Workspace, window, _cx| {
         if window.is_none() {
@@ -68,7 +71,14 @@ pub fn init(cx: &mut App) {
             );
         });
         workspace.register_action(|workspace, _: &OpenCanvas, window, cx| {
-            open_canvas(workspace, window, cx);
+            if let Some(canvas) = open_canvas(workspace, window, cx) {
+                canvas.update(cx, |canvas, cx| canvas.set_ontology(false, cx));
+            }
+        });
+        workspace.register_action(|workspace, _: &OpenOntology, window, cx| {
+            if let Some(canvas) = open_canvas(workspace, window, cx) {
+                canvas.update(cx, |canvas, cx| canvas.set_ontology(true, cx));
+            }
         });
         workspace.register_action(|workspace, action: &ShowNodeOnCanvas, window, cx| {
             if let Some(canvas) = open_canvas(workspace, window, cx) {
@@ -116,6 +126,46 @@ struct Drag {
     start: Point<Pixels>,
     center: Vec2,
     moved: bool,
+    /// A drag that began on a node moves the node (from where it was) instead of the view.
+    node: Option<(usize, Vec2)>,
+}
+
+/// The key a placed node is remembered by: a type on the schema canvas, a node while
+/// exploring. Hubs and "+K more" follow their node and are never placed by hand.
+fn pin_key(id: &SceneId) -> Option<String> {
+    match id {
+        SceneId::Type(name) => Some(format!("type:{name}")),
+        SceneId::Node(node) => Some(format!("node:{}/{}", node.type_name, node.id)),
+        SceneId::Hub(_) | SceneId::More(_) => None,
+    }
+}
+
+/// The placed nodes of a saved canvas, `{key: [x, y]}`; anything else reads as none.
+fn pins_from_json(data: &serde_json::Value) -> HashMap<String, Vec2> {
+    data.get("pinned")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, at)| {
+            let at = at.as_array()?;
+            let x = at.first()?.as_f64()? as f32;
+            let y = at.get(1)?.as_f64()? as f32;
+            (x.is_finite() && y.is_finite()).then(|| (key.clone(), Vec2::new(x, y)))
+        })
+        .collect()
+}
+
+fn pins_to_json(pinned: &HashMap<String, Vec2>) -> serde_json::Value {
+    let mut keys: Vec<&String> = pinned.keys().collect();
+    keys.sort();
+    let map: serde_json::Map<String, serde_json::Value> = keys
+        .into_iter()
+        .map(|key| {
+            let at = pinned[key];
+            (key.clone(), serde_json::json!([at.x.round(), at.y.round()]))
+        })
+        .collect();
+    serde_json::json!({ "pinned": map })
 }
 
 /// The canvas tab of one graph.
@@ -132,6 +182,9 @@ pub struct GraphCanvas {
     positions: Arc<Vec<Vec2>>,
     /// Where each node was drawn, for the current mode and root: such nodes never move.
     known: HashMap<SceneId, Vec2>,
+    /// Nodes the person dragged into place, by [`pin_key`]: kept across layouts and restarts,
+    /// with the graph's tabs (spec 006, saved layouts).
+    pinned: HashMap<String, Vec2>,
     layout_key: Option<(Mode, Option<NodeRef>)>,
     layout_generation: u64,
     _layout_task: Option<Task<()>>,
@@ -164,7 +217,8 @@ impl Item for GraphCanvas {
     fn tab_title(&self, _cx: &App) -> SharedString {
         match &self.results {
             Some((_, results)) => results.title.clone().into(),
-            None => "Canvas".into(),
+            None if self.mode == Mode::Explore => "Explorer".into(),
+            None => "Ontology".into(),
         }
     }
 
@@ -183,7 +237,11 @@ impl Item for GraphCanvas {
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
         self.results.is_none().then(|| SavedItem {
             kind: "canvas".into(),
-            data: serde_json::Value::Null,
+            data: if self.pinned.is_empty() {
+                serde_json::Value::Null
+            } else {
+                pins_to_json(&self.pinned)
+            },
         })
     }
 
@@ -222,6 +280,7 @@ impl GraphCanvas {
             scene: Arc::default(),
             positions: Arc::default(),
             known: HashMap::new(),
+            pinned: HashMap::new(),
             layout_key: None,
             layout_generation: 0,
             _layout_task: None,
@@ -275,6 +334,16 @@ impl GraphCanvas {
         canvas
     }
 
+    /// Shows the ontology (the schema's types and relationships), or the exploration when
+    /// there is one.
+    pub fn set_ontology(&mut self, ontology: bool, cx: &mut Context<Self>) {
+        if self.show_schema != ontology {
+            self.show_schema = ontology;
+            self.rebuild(cx);
+            cx.emit(ItemEvent::UpdateTab);
+        }
+    }
+
     /// Shows `node`: selects it where the exploration shows it, else roots the exploration
     /// there; then centers on it.
     pub fn show_node(&mut self, node: NodeRef, cx: &mut Context<Self>) {
@@ -319,7 +388,12 @@ impl GraphCanvas {
             Mode::Schema => {
                 let session = self.session.read(cx);
                 let scene = model::schema_scene(&schema, |name| session.count_of(name));
-                let positions = layout::schema_positions(scene.nodes.len());
+                let mut positions = layout::schema_positions(scene.nodes.len());
+                for (node, position) in scene.nodes.iter().zip(positions.iter_mut()) {
+                    if let Some(pinned) = pin_key(&node.id).and_then(|key| self.pinned.get(&key)) {
+                        *position = *pinned;
+                    }
+                }
                 self._layout_task = None;
                 self.apply_layout(scene, positions, cx);
             }
@@ -343,7 +417,10 @@ impl GraphCanvas {
                             _ => LayoutKind::Node,
                         },
                         space: layout_space(&node.kind, &node.label),
-                        previous: self.known.get(&node.id).copied(),
+                        previous: pin_key(&node.id)
+                            .and_then(|key| self.pinned.get(&key))
+                            .or_else(|| self.known.get(&node.id))
+                            .copied(),
                     })
                     .collect();
                 let positions =
@@ -389,7 +466,9 @@ impl GraphCanvas {
                 parent: node.parent,
                 kind: LayoutKind::Node,
                 space: layout_space(&node.kind, &node.label),
-                previous: fixed[i],
+                previous: pin_key(&node.id)
+                    .and_then(|key| self.pinned.get(&key).copied())
+                    .or(fixed[i]),
             })
             .collect();
         if self.layout_key.is_none() {
@@ -411,7 +490,13 @@ impl GraphCanvas {
         }));
     }
 
-    fn apply_layout(&mut self, scene: Scene, positions: Vec<Vec2>, cx: &mut Context<Self>) {
+    fn apply_layout(&mut self, scene: Scene, mut positions: Vec<Vec2>, cx: &mut Context<Self>) {
+        // A placed node stays exactly where it was put.
+        for (node, position) in scene.nodes.iter().zip(positions.iter_mut()) {
+            if let Some(pinned) = pin_key(&node.id).and_then(|key| self.pinned.get(&key)) {
+                *position = *pinned;
+            }
+        }
         for (node, position) in scene.nodes.iter().zip(&positions) {
             self.known.insert(node.id.clone(), *position);
         }
@@ -604,10 +689,15 @@ impl GraphCanvas {
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
+        let node = self
+            .hit(event.position, window)
+            .filter(|index| pin_key(&self.scene.nodes[*index].id).is_some())
+            .and_then(|index| Some((index, *self.positions.get(index)?)));
         self.drag = Some(Drag {
             start: event.position,
             center: self.center,
             moved: false,
+            node,
         });
     }
 
@@ -617,7 +707,18 @@ impl GraphCanvas {
             let dy = f32::from(event.position.y - drag.start.y);
             if drag.moved || dx.abs() + dy.abs() > 3. {
                 drag.moved = true;
-                self.center = drag.center - Vec2::new(dx, dy) * (1. / self.zoom);
+                let delta = Vec2::new(dx, dy) * (1. / self.zoom);
+                match drag.node {
+                    Some((index, from)) => {
+                        let at = from + delta;
+                        if let Some(position) = Arc::make_mut(&mut self.positions).get_mut(index) {
+                            *position = at;
+                        }
+                        let id = self.scene.nodes[index].id.clone();
+                        self.known.insert(id, at);
+                    }
+                    None => self.center = drag.center - delta,
+                }
                 cx.notify();
             }
             return;
@@ -634,6 +735,14 @@ impl GraphCanvas {
             return;
         };
         if drag.moved {
+            // A dragged node stays where it was dropped, and is remembered there.
+            if let Some((index, _)) = drag.node
+                && let Some(key) = pin_key(&self.scene.nodes[index].id)
+                && let Some(at) = self.positions.get(index)
+            {
+                self.pinned.insert(key, *at);
+                cx.emit(ItemEvent::UpdateTab);
+            }
             return;
         }
         let hit = self.hit(event.position, window);
@@ -675,6 +784,24 @@ impl GraphCanvas {
     fn pinch(&mut self, event: &PinchEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.zoom_around(1. + event.delta, Some(event.position), window);
         cx.notify();
+    }
+
+    /// Takes the placed nodes of a restored canvas, and lays out again around them.
+    fn restore_pins(&mut self, pinned: HashMap<String, Vec2>, cx: &mut Context<Self>) {
+        if pinned.is_empty() {
+            return;
+        }
+        self.pinned = pinned;
+        self.fit_pending = true;
+        self.rebuild(cx);
+    }
+
+    fn reset_layout(&mut self, _: &ResetLayout, _window: &mut Window, cx: &mut Context<Self>) {
+        self.pinned.clear();
+        self.known.clear();
+        self.fit_pending = true;
+        cx.emit(ItemEvent::UpdateTab);
+        self.rebuild(cx);
     }
 
     fn fit_to_window(&mut self, _: &FitToWindow, window: &mut Window, cx: &mut Context<Self>) {
@@ -973,16 +1100,15 @@ impl GraphCanvas {
                             .when(mode != Mode::Results, |panel| {
                                 panel
                                     .child(
-                                        Button::new("mode-schema", "Schema")
+                                        studio_ui::ds::button("mode-schema", "Ontology")
                                             .label_size(LabelSize::Small)
                                             .toggle_state(mode == Mode::Schema)
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.show_schema = true;
-                                                this.rebuild(cx);
+                                                this.set_ontology(true, cx)
                                             })),
                                     )
                                     .child(
-                                        Button::new("mode-explore", "Exploration")
+                                        studio_ui::ds::button("mode-explore", "Explorer")
                                             .label_size(LabelSize::Small)
                                             .toggle_state(mode == Mode::Explore)
                                             .disabled(!has_root)
@@ -992,8 +1118,7 @@ impl GraphCanvas {
                                                 "Open a node first: ↵ on a table row or tree row"
                                             }))
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                this.show_schema = false;
-                                                this.rebuild(cx);
+                                                this.set_ontology(false, cx)
                                             })),
                                     )
                             })
@@ -1011,7 +1136,7 @@ impl GraphCanvas {
                     .when(newer && mode != Mode::Results, |d| {
                         d.child(
                             panel("canvas-newer").child(
-                                Button::new("canvas-refresh", "Newer data · Refresh")
+                                studio_ui::ds::button("canvas-refresh", "Newer data · Refresh")
                                     .label_size(LabelSize::Small)
                                     .tooltip(Tooltip::text(
                                         "The branch moved since this exploration was read",
@@ -1050,8 +1175,24 @@ impl GraphCanvas {
                     .child(div().flex_1())
                     .child(
                         panel("canvas-zoom")
+                            .when(!self.pinned.is_empty(), |panel| {
+                                panel.child(
+                                    studio_ui::ds::icon_button("reset-layout", IconName::RotateCcw)
+                                        .icon_size(IconSize::Small)
+                                        .tooltip(|_window, cx| {
+                                            Tooltip::for_action(
+                                                "Reset the layout: forget the nodes you placed",
+                                                &ResetLayout,
+                                                cx,
+                                            )
+                                        })
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.reset_layout(&ResetLayout, window, cx)
+                                        })),
+                                )
+                            })
                             .child(
-                                IconButton::new("zoom-out", IconName::Dash)
+                                studio_ui::ds::icon_button("zoom-out", IconName::Dash)
                                     .icon_size(IconSize::Small)
                                     .tooltip(|_window, cx| {
                                         Tooltip::for_action("Zoom out", &ZoomOut, cx)
@@ -1061,7 +1202,7 @@ impl GraphCanvas {
                                     })),
                             )
                             .child(
-                                Button::new("zoom-fit", "Fit")
+                                studio_ui::ds::button("zoom-fit", "Fit")
                                     .label_size(LabelSize::Small)
                                     .tooltip(|_window, cx| {
                                         Tooltip::for_action("Fit to window", &FitToWindow, cx)
@@ -1071,7 +1212,7 @@ impl GraphCanvas {
                                     })),
                             )
                             .child(
-                                IconButton::new("zoom-in", IconName::Plus)
+                                studio_ui::ds::icon_button("zoom-in", IconName::Plus)
                                     .icon_size(IconSize::Small)
                                     .tooltip(|_window, cx| {
                                         Tooltip::for_action("Zoom in", &ZoomIn, cx)
@@ -1096,7 +1237,7 @@ impl GraphCanvas {
                                 .color(Color::Error),
                         )
                         .child(
-                            Button::new("canvas-retry", "Retry")
+                            studio_ui::ds::button("canvas-retry", "Retry")
                                 .label_size(LabelSize::Small)
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.exploration.update(cx, |e, cx| {
@@ -1121,7 +1262,7 @@ impl GraphCanvas {
                             .size(LabelSize::Small),
                         )
                         .child(
-                            Button::new("canvas-tree", "Show in tree")
+                            studio_ui::ds::button("canvas-tree", "Show in tree")
                                 .label_size(LabelSize::Small)
                                 .style(ButtonStyle::Outlined)
                                 .on_click(|_, window, cx| {
@@ -1134,7 +1275,7 @@ impl GraphCanvas {
                                 }),
                         )
                         .child(
-                            Button::new("canvas-table", "Open as table")
+                            studio_ui::ds::button("canvas-table", "Open as table")
                                 .label_size(LabelSize::Small)
                                 .style(ButtonStyle::Filled)
                                 .on_click(move |_, window, cx| {
@@ -1235,6 +1376,7 @@ impl Render for GraphCanvas {
             .overflow_hidden()
             .bg(background)
             .on_action(cx.listener(Self::fit_to_window))
+            .on_action(cx.listener(Self::reset_layout))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::expand_node))
@@ -1269,5 +1411,46 @@ impl Render for GraphCanvas {
             .children(body.map(|body| div().absolute().size_full().top_0().left_0().child(body)))
             .child(overlay)
             .child(self.render_caption(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placed_nodes_round_trip_and_bad_data_reads_as_none() {
+        let node = SceneId::Node(NodeRef {
+            type_name: "Person".into(),
+            id: "person-000001".into(),
+        });
+        let mut pinned = HashMap::new();
+        pinned.insert(
+            pin_key(&SceneId::Type("Person".into())).unwrap(),
+            Vec2::new(12.4, -30.6),
+        );
+        pinned.insert(pin_key(&node).unwrap(), Vec2::new(-5., 7.));
+        let saved = pins_to_json(&pinned);
+        let back = pins_from_json(&saved);
+        assert_eq!(back.len(), 2);
+        assert_eq!(back["type:Person"], Vec2::new(12., -31.));
+        assert_eq!(back["node:Person/person-000001"], Vec2::new(-5., 7.));
+        // Hubs follow their node; they are never placed by hand.
+        let hub = SceneId::Hub(GroupKey {
+            node: NodeRef {
+                type_name: "Person".into(),
+                id: "person-000001".into(),
+            },
+            group: gq_language::RelationshipGroup {
+                edge: "Knows".into(),
+                direction: gq_language::Direction::Outgoing,
+                other_type: "Person".into(),
+            },
+        });
+        assert_eq!(pin_key(&hub), None);
+        assert!(pins_from_json(&serde_json::Value::Null).is_empty());
+        assert!(
+            pins_from_json(&serde_json::json!({"pinned": {"a": [1, "x"], "b": [1]}})).is_empty()
+        );
     }
 }

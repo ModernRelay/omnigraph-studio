@@ -751,7 +751,7 @@ impl ReviewView {
         let focus = self.focus_handle.clone();
         let mergeable = matches!(self.load, LoadState::Ready)
             && !matches!(self.merge, MergeState::Checking | MergeState::Merging);
-        let merge_button = Button::new(
+        let merge_button = studio_ui::ds::button(
             "merge",
             format!("Merge {} into {}", self.branch, self.target),
         )
@@ -775,7 +775,7 @@ impl ReviewView {
             }
         })
         .on_click(cx.listener(|this, _, _, cx| this.merge(cx)));
-        let refresh = Button::new("refresh", "Refresh")
+        let refresh = studio_ui::ds::button("refresh", "Refresh")
             .style(ButtonStyle::Subtle)
             .label_size(LabelSize::Small)
             .start_icon(Icon::new(IconName::RotateCw).size(IconSize::Small))
@@ -880,7 +880,7 @@ impl ReviewView {
                         .size(LabelSize::Small),
                     )
                     .action_slot(
-                        Button::new("refresh-own", "Refresh")
+                        studio_ui::ds::button("refresh-own", "Refresh")
                             .label_size(LabelSize::Small)
                             .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
                     )
@@ -899,7 +899,7 @@ impl ReviewView {
                         .size(LabelSize::Small),
                     )
                     .action_slot(
-                        Button::new("refresh-newer", "Refresh")
+                        studio_ui::ds::button("refresh-newer", "Refresh")
                             .label_size(LabelSize::Small)
                             .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
                     )
@@ -940,7 +940,7 @@ impl ReviewView {
         let view = cx.entity().downgrade();
         let scope_menu = PopoverMenu::new("review-scope")
             .trigger(
-                Button::new("review-scope-button", scope_label)
+                studio_ui::ds::button("review-scope-button", scope_label)
                     .style(ButtonStyle::Outlined)
                     .label_size(LabelSize::Small)
                     .end_icon(
@@ -1039,7 +1039,7 @@ impl ReviewView {
                         .unwrap_or_else(|| "nothing".into())
                 ),
                 Some(
-                    Button::new("refresh-moved", "Refresh")
+                    studio_ui::ds::button("refresh-moved", "Refresh")
                         .label_size(LabelSize::Small)
                         .on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
                         .into_any_element(),
@@ -1099,7 +1099,7 @@ impl ReviewView {
                     resolution_hint(&self.branch, &self.target)
                 ),
                 Some(
-                    Button::new(
+                    studio_ui::ds::button(
                         "toggle-conflicts",
                         if self.show_conflicts {
                             "Show changes"

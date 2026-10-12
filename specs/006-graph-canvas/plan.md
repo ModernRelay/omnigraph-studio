@@ -49,12 +49,22 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | Custom GPUI canvas | WebView with a JS renderer | WebView embedding needs a GPUI fork; not on Zed's lineage |
 | Grow by relationship group | Show the whole neighbourhood | Counts first keep large hubs from flooding the view |
 
+## Ontology, explorer and placed nodes
+
+- The canvas has two faces, named for what they show: the **Ontology** (the schema's types
+  and relationships, `studio_graph::OpenOntology`, ⌘⇧O) and the **Explorer** (the nodes walked
+  from a root, `studio_graph::OpenCanvas`, ⌘⇧E). Both are rows at the top of the sidebar's
+  Graph panel, above Types, and items of the Graph menu; the tab is titled by the face shown.
+- Dragging a type or a node places it: it stays where it was dropped through every later
+  layout, and the canvas tab saves the placed nodes with the graph's tabs (`{"pinned": {key:
+  [x, y]}}`, keys `type:Name` and `node:Type/id`). Hubs and "+K more" follow their node.
+  Reset layout (↺, R) forgets them. A drag that starts on empty space pans.
+
 ## Deferred
 
 - Engine change E16 (neighbourhood counts per node), [spec 012](../012-omnigraph-engine-changes/plan.md), for hub counts; shared with the
   tree's interim count queries until then.
 - GPU compute layout above 50k nodes (spike S3, later).
-- Saved layouts per graph.
 
 ## Validation log
 
@@ -68,6 +78,8 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | 2026-10-12 | Layout off the main thread is deterministic, keeps drawn nodes in place, and bounds cost at the cap | `cargo test -p graph_canvas` (`layout::tests`) | 1,999 nodes in 464 ms in an unoptimized debug build, Apple M5 Pro; same input gives the same positions |
 | 2026-10-12 | Errors and loading show in the canvas, not a blank view | snapshot `OpenNode` Person `nobody` then `OpenCanvas` | banner "No Person with key nobody at this commit." · Retry |
 | 2026-10-12 | Keys walk and focus | offscreen snapshot: Allen Labs expanded, → → `[` F Space | `[` returned to Allen Labs, F centred it, Space showed it in the inspector |
+| 2026-10-12 | Placed nodes persist per graph | `graph_canvas` `placed_nodes_round_trip_and_bad_data_reads_as_none`; offscreen snapshot: drag Company on the ontology, then reopen the data directory with restore | The saved canvas holds `{"pinned": {"type:Company": [-174, -275]}}`; after restore Company is where it was dropped, the rest laid out around it, and ↺ (Reset layout, R) shows |
+| 2026-10-12 | The ontology and the explorer are found without the menu | offscreen snapshot of `OpenOntology` (⌘⇧O) | The sidebar's Graph panel opens with Ontology (selected) and Explorer above Types; the tab and the mode switch read Ontology / Explorer |
 | 2026-10-12 | Query results as a canvas | `gq_language` `whole_node_columns_carry_their_type`; `query_editor` `node_columns_become_a_graph_of_distinct_nodes_linked_by_row`; snapshot of `return { $p, $c }` | The result offers Canvas; a results canvas draws each node once and links the nodes of a row; it is a tab of its own and is not restored |
 
 ## Corrections

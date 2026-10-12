@@ -231,7 +231,7 @@ impl Item for AgentPanel {
         let mut end = Vec::new();
         if matches!(self.state, State::Ready { .. } | State::Exited { .. }) {
             end.push(
-                IconButton::new("restart", IconName::RotateCw)
+                studio_ui::ds::icon_button("restart", IconName::RotateCw)
                     .icon_size(IconSize::Small)
                     .tooltip(|_, cx| Tooltip::for_action("New agent session", &Restart, cx))
                     .on_click(cx.listener(|this, _, window, cx| this.restart(&Restart, window, cx)))
@@ -1217,7 +1217,7 @@ impl AgentPanel {
                         let command: Vec<String> =
                             command.iter().map(|s| (*s).to_owned()).collect();
                         let shown = command.join(" ");
-                        Button::new(("preset", index), *name)
+                        studio_ui::ds::button(("preset", index), *name)
                             .full_width()
                             .style(ButtonStyle::Outlined)
                             .label_size(LabelSize::Small)
@@ -1255,7 +1255,7 @@ impl AgentPanel {
                                     .child(self.custom_command.clone()),
                             )
                             .child(
-                                IconButton::new("use-custom", IconName::ArrowRight)
+                                studio_ui::ds::icon_button("use-custom", IconName::ArrowRight)
                                     .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text("Use this command"))
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1497,7 +1497,7 @@ impl AgentPanel {
                         }
                         _ => (IconName::Close, Color::Error),
                     };
-                    Button::new(
+                    studio_ui::ds::button(
                         ("permission", index * 16 + option_index),
                         option.name.clone(),
                     )
@@ -1575,7 +1575,7 @@ impl AgentPanel {
         let footer = match &proposal.state {
             ProposalState::Waiting(_) => studio_ui::ds::card_footer(cx)
                 .child(
-                    Button::new(("allow", index), "Allow")
+                    studio_ui::ds::button(("allow", index), "Allow")
                         .label_size(LabelSize::Small)
                         .start_icon(
                             Icon::new(IconName::Check)
@@ -1588,7 +1588,7 @@ impl AgentPanel {
                         })),
                 )
                 .child(
-                    Button::new(("always", index), "Always on this branch")
+                    studio_ui::ds::button(("always", index), "Always on this branch")
                         .label_size(LabelSize::Small)
                         .start_icon(
                             Icon::new(IconName::CheckDouble)
@@ -1602,7 +1602,7 @@ impl AgentPanel {
                 )
                 .child(div().flex_1())
                 .child(
-                    Button::new(("reject", index), "Reject")
+                    studio_ui::ds::button(("reject", index), "Reject")
                         .label_size(LabelSize::Small)
                         .start_icon(
                             Icon::new(IconName::Close)
@@ -1712,7 +1712,7 @@ impl AgentPanel {
                 )
                 .child(div().flex_1())
                 .child(
-                    Button::new("review", "Review")
+                    studio_ui::ds::button("review", "Review")
                         .label_size(LabelSize::Small)
                         .start_icon(Icon::new(IconName::Eye).size(IconSize::XSmall))
                         .on_click(cx.listener(|this, _, window, cx| this.review(window, cx))),

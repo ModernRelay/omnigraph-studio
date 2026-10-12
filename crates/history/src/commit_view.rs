@@ -364,7 +364,7 @@ impl CommitView {
             .child(
                 PopoverMenu::new("open-table-at")
                     .trigger(
-                        Button::new("open-table-at-button", "Table")
+                        studio_ui::ds::button("open-table-at-button", "Table")
                             .style(ButtonStyle::Subtle)
                             .label_size(LabelSize::Small)
                             .start_icon(Icon::new(IconName::Table).size(IconSize::XSmall))
@@ -393,7 +393,7 @@ impl CommitView {
                     }),
             )
             .child(
-                Button::new("query-at", "Query")
+                studio_ui::ds::button("query-at", "Query")
                     .style(ButtonStyle::Subtle)
                     .label_size(LabelSize::Small)
                     .start_icon(Icon::new(IconName::FileCode).size(IconSize::XSmall))
@@ -447,7 +447,7 @@ impl CommitView {
                 .px_4()
                 .py_2()
                 .child(
-                    Button::new("load-more", "Load more changes")
+                    studio_ui::ds::button("load-more", "Load more changes")
                         .style(ButtonStyle::Subtle)
                         .on_click(cx.listener(|this, _, _, cx| this.load_more(cx))),
                 )

@@ -134,8 +134,10 @@ pub mod graph {
             ReviewBranch,
             /// Open the commit history.
             OpenHistory,
-            /// Open the graph canvas on the schema.
+            /// Open the graph explorer: the canvas around the nodes being explored.
             OpenCanvas,
+            /// Open the ontology: the graph's types and relationships as a map.
+            OpenOntology,
             /// Open the inspector for the graph's storage.
             OpenInspector,
             /// Create a branch from the current branch.
@@ -407,6 +409,8 @@ pub mod canvas {
             WalkBack,
             /// Go back down the path walked with WalkBack.
             WalkForward,
+            /// Let the layout place every node again, forgetting where nodes were dragged.
+            ResetLayout,
         ]
     );
 }

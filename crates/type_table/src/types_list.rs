@@ -3,8 +3,9 @@
 
 use gpui::{Context, Entity, Render, SharedString, Subscription, WeakEntity, Window};
 use graph_store::{GraphSession, Loadable, SessionEvent};
-use studio_actions::graph::OpenType;
+use studio_actions::graph::{OpenCanvas, OpenOntology, OpenType};
 use studio_workspace::{Workspace, WorkspaceEvent};
+use ui::Tooltip;
 use ui::prelude::*;
 
 use crate::model::format_count;
@@ -62,6 +63,16 @@ impl TypesList {
         let workspace = self.workspace.upgrade()?;
         workspace.read(cx).active_item()?.dedupe_key(cx)
     }
+
+    /// Whether the active tab is the canvas showing an exploration rather than the ontology.
+    fn exploring(&self, cx: &App) -> bool {
+        self.workspace.upgrade().is_some_and(|workspace| {
+            workspace
+                .read(cx)
+                .active_item()
+                .is_some_and(|item| item.tab_title(cx) == "Explorer")
+        })
+    }
 }
 
 impl Render for TypesList {
@@ -89,7 +100,7 @@ impl Render for TypesList {
                             .color(Color::Muted),
                     )
                     .child(
-                        Button::new("reload-schema", "Try again")
+                        studio_ui::ds::button("reload-schema", "Try again")
                             .label_size(LabelSize::Small)
                             .style(ButtonStyle::Subtle)
                             .on_click(move |_, _, cx| {
@@ -128,7 +139,41 @@ impl Render for TypesList {
             )
             .collect();
         let first_edge = entries.iter().position(|(_, _, edge)| *edge);
-        let mut list = v_flex().w_full();
+        // The graph as a whole first: its ontology and the explorer, then its types.
+        let canvas_open = active
+            .as_deref()
+            .is_some_and(|key| key.starts_with("canvas:"));
+        let view_row = |id: &'static str, label: &'static str, icon: IconName| {
+            studio_ui::ds::SidebarRow::new(id, label)
+                .start(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+        };
+        let mut list = v_flex()
+            .w_full()
+            .child(
+                view_row("view-ontology", "Ontology", IconName::GitGraph)
+                    .selected(canvas_open && !self.exploring(cx))
+                    .tooltip_fn(|_, cx| {
+                        Tooltip::for_action(
+                            "The types and relationships as a map",
+                            &OpenOntology,
+                            cx,
+                        )
+                    })
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenOntology), cx)),
+            )
+            .child(
+                view_row("view-explorer", "Explorer", IconName::Crosshair)
+                    .selected(canvas_open && self.exploring(cx))
+                    .tooltip_fn(|_, cx| {
+                        Tooltip::for_action(
+                            "Walk the graph from a node: ↵ on a row opens one",
+                            &OpenCanvas,
+                            cx,
+                        )
+                    })
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenCanvas), cx)),
+            )
+            .child(studio_ui::ds::section_label("Types").pt_3());
         for (index, (name, count, is_edge)) in entries.into_iter().enumerate() {
             if Some(index) == first_edge {
                 list = list.child(studio_ui::ds::section_label("Relationships").pt_3());

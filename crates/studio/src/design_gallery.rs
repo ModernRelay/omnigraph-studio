@@ -192,7 +192,7 @@ impl Render for DesignGallery {
                         .into_iter()
                         .enumerate()
                         .map(|(index, (icon, title))| {
-                            IconButton::new(("g-dock-tab", index), icon)
+                            studio_ui::ds::icon_button(("g-dock-tab", index), icon)
                                 .icon_size(IconSize::Small)
                                 .toggle_state(index == 0)
                                 .tooltip(ui::Tooltip::text(title))
@@ -269,7 +269,10 @@ impl Render for DesignGallery {
                 cx,
             ))
             .child(div().flex_1())
-            .child(IconButton::new("g-close-dock", IconName::Close).icon_size(IconSize::XSmall));
+            .child(
+                studio_ui::ds::icon_button("g-close-dock", IconName::Close)
+                    .icon_size(IconSize::XSmall),
+            );
         // The document footer, after Delta: graph / branch, the tab's facts, its controls.
         let footer_context = || {
             h_flex()
@@ -324,7 +327,7 @@ impl Render for DesignGallery {
                     .child(text::muted("200 rows"))
                     .child(div().flex_1())
                     .child(
-                        Button::new("g-filter", "Filter")
+                        studio_ui::ds::button("g-filter", "Filter")
                             .label_size(LabelSize::Small)
                             .start_icon(Icon::new(IconName::Filter).size(IconSize::Small)),
                     ),
@@ -379,7 +382,7 @@ impl Render for DesignGallery {
             .child(
                 ds::card_footer(cx)
                     .child(
-                        Button::new("g-allow", "Allow")
+                        studio_ui::ds::button("g-allow", "Allow")
                             .label_size(LabelSize::Small)
                             .start_icon(
                                 Icon::new(IconName::Check)
@@ -389,7 +392,7 @@ impl Render for DesignGallery {
                             .key_binding(ui::KeyBinding::for_action_in(&Allow, &focus, cx)),
                     )
                     .child(
-                        Button::new("g-always", "Always on this branch")
+                        studio_ui::ds::button("g-always", "Always on this branch")
                             .label_size(LabelSize::Small)
                             .start_icon(
                                 Icon::new(IconName::CheckDouble)
@@ -400,7 +403,7 @@ impl Render for DesignGallery {
                     )
                     .child(div().flex_1())
                     .child(
-                        Button::new("g-reject", "Reject")
+                        studio_ui::ds::button("g-reject", "Reject")
                             .label_size(LabelSize::Small)
                             .start_icon(
                                 Icon::new(IconName::Close)
@@ -451,7 +454,7 @@ impl Render for DesignGallery {
             .child(
                 ds::empty_state(IconName::Sparkle, "No tab open").child(
                     div().w(px(220.)).child(
-                        Button::new("g-search", "Search")
+                        studio_ui::ds::button("g-search", "Search")
                             .full_width()
                             .style(ButtonStyle::Outlined)
                             .label_size(LabelSize::Small)
@@ -621,7 +624,8 @@ impl Render for DesignGallery {
                     .child(footer_context())
                     .child(div().flex_1())
                     .child(
-                        IconButton::new("g-restart", IconName::RotateCw).icon_size(IconSize::Small),
+                        studio_ui::ds::icon_button("g-restart", IconName::RotateCw)
+                            .icon_size(IconSize::Small),
                     )
                     .child(
                         ds::pill("g-agent", cx)

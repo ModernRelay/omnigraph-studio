@@ -499,7 +499,7 @@ impl Render for StorageInspector {
                     })
                     .child(div().flex_1())
                     .child(
-                        Button::new("refresh-storage", "Refresh")
+                        studio_ui::ds::button("refresh-storage", "Refresh")
                             .style(ButtonStyle::Subtle)
                             .label_size(LabelSize::Small)
                             .start_icon(Icon::new(IconName::RotateCw).size(IconSize::Small))

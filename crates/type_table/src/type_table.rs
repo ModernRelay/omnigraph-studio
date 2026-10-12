@@ -52,7 +52,7 @@ pub fn init(cx: &mut App) {
         workspace.add_panel(
             PanelPosition::Left,
             "types",
-            "Types",
+            "Graph",
             IconName::Table,
             types.into(),
             cx,

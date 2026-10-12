@@ -366,16 +366,19 @@ impl Render for InsertRowModal {
                     .gap_2()
                     .justify_end()
                     .child(
-                        Button::new("cancel-insert", "Cancel")
+                        studio_ui::ds::button("cancel-insert", "Cancel")
                             .disabled(saving)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
-                        Button::new("insert", if saving { "Inserting…" } else { "Insert" })
-                            .style(ButtonStyle::Filled)
-                            .disabled(saving || self.blocked.is_some())
-                            .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
-                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                        studio_ui::ds::button(
+                            "insert",
+                            if saving { "Inserting…" } else { "Insert" },
+                        )
+                        .style(ButtonStyle::Filled)
+                        .disabled(saving || self.blocked.is_some())
+                        .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
+                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             )
     }
@@ -561,15 +564,18 @@ impl Render for DeleteRowModal {
                     .gap_2()
                     .justify_end()
                     .child(
-                        Button::new("cancel-delete", "Cancel")
+                        studio_ui::ds::button("cancel-delete", "Cancel")
                             .disabled(saving)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
-                        Button::new("delete", if saving { "Deleting…" } else { "Delete" })
-                            .style(ButtonStyle::Tinted(ui::TintColor::Error))
-                            .disabled(saving || !confirmed)
-                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                        studio_ui::ds::button(
+                            "delete",
+                            if saving { "Deleting…" } else { "Delete" },
+                        )
+                        .style(ButtonStyle::Tinted(ui::TintColor::Error))
+                        .disabled(saving || !confirmed)
+                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             )
     }
@@ -692,14 +698,17 @@ impl Render for SaveViewModal {
                     .gap_2()
                     .justify_end()
                     .child(
-                        Button::new("cancel-view", "Cancel")
+                        studio_ui::ds::button("cancel-view", "Cancel")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
-                        Button::new("save-view", if replaces { "Replace" } else { "Save" })
-                            .style(ButtonStyle::Filled)
-                            .disabled(name.is_empty())
-                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                        studio_ui::ds::button(
+                            "save-view",
+                            if replaces { "Replace" } else { "Save" },
+                        )
+                        .style(ButtonStyle::Filled)
+                        .disabled(name.is_empty())
+                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             )
     }
