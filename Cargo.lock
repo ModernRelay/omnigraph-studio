@@ -7950,7 +7950,10 @@ name = "query_editor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clock",
+ "collections",
  "editor",
+ "futures",
  "gpui",
  "gq_language",
  "graph_client",

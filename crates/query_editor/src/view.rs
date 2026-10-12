@@ -301,6 +301,9 @@ impl QueryEditor {
             editor.set_completion_provider(Some(std::rc::Rc::new(GqCompletionProvider::new(
                 Some(session.downgrade()),
             ))));
+            editor.set_semantics_provider(Some(std::rc::Rc::new(crate::hover::GqSemantics::new(
+                Some(session.downgrade()),
+            ))));
             editor
         });
         let subscriptions = vec![

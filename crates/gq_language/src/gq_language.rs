@@ -15,7 +15,7 @@ pub mod schema;
 
 pub use builder::{BuildError, BuiltQuery, Filter, FilterOp, PageStart, Sort, example_read};
 pub use check::{Diagnostic, QueryCheck, QueryInfo, ResultColumn, check};
-pub use complete::{Completion, CompletionKind, completions};
+pub use complete::{Completion, CompletionKind, completions, hover};
 pub use lex::{
     Declaration, Outline, Statement, Token, TokenKind, looks_like_mutation, offset_of, outline,
     problem_range, tokenize,

@@ -5,6 +5,7 @@
 
 mod analysis;
 mod completion;
+mod hover;
 mod queries_panel;
 mod results;
 mod view;

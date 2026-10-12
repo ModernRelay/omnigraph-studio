@@ -290,6 +290,85 @@ fn bindings(
     found
 }
 
+/// What hovering at `offset` shows (spec 007): a parameter's or binding's type, a property's
+/// declared type, a type's kind, or a relationship's ends; with the byte range it covers.
+pub fn hover(schema: &SchemaModel, source: &str, offset: usize) -> Option<(Range<usize>, String)> {
+    let tokens = tokenize(source);
+    let index = tokens
+        .iter()
+        .position(|t| t.range.start <= offset && offset < t.range.end)?;
+    let token = &tokens[index];
+    let word = &source[token.range.clone()];
+    let declaration = outline(source)
+        .declaration_at(offset)
+        .map(|d| d.range.clone())
+        .unwrap_or(0..source.len());
+    let signature = signature(source, declaration.clone());
+    let text = match token.kind {
+        TokenKind::Variable => {
+            let name = word.trim_start_matches('$');
+            if let Some((_, ty)) = parameters(source, signature.as_ref())
+                .into_iter()
+                .find(|(n, _)| n == name)
+            {
+                format!("${name}: {ty} · parameter")
+            } else {
+                let (_, ty) = bindings(schema, source, declaration, signature.as_ref())
+                    .into_iter()
+                    .find(|(n, _)| n == name)?;
+                let kind = if schema.edge(&ty).is_some() {
+                    "edge"
+                } else {
+                    "node"
+                };
+                format!("${name}: {ty} · {kind}")
+            }
+        }
+        TokenKind::Property => {
+            // `$var.property`: the token before the dot is the variable.
+            let var = index
+                .checked_sub(2)
+                .and_then(|i| tokens.get(i))
+                .filter(|t| t.kind == TokenKind::Variable)
+                .map(|t| source[t.range.clone()].trim_start_matches('$'))?;
+            let (_, ty) = bindings(schema, source, declaration, signature.as_ref())
+                .into_iter()
+                .find(|(n, _)| n == var)?;
+            let properties = schema
+                .node(&ty)
+                .map(|n| &n.properties)
+                .or_else(|| schema.edge(&ty).map(|e| &e.properties))?;
+            match properties.iter().find(|p| p.name == word) {
+                Some(property) => format!("{ty}.{word}: {}", property.display_type()),
+                None if word == "@id" => format!("{ty}.@id: String · the row's id"),
+                None => return None,
+            }
+        }
+        TokenKind::Type => {
+            if let Some(node) = schema.node(word) {
+                let n = node.properties.len();
+                format!(
+                    "node {word} · {n} propert{}",
+                    if n == 1 { "y" } else { "ies" }
+                )
+            } else if let Some(edge) = schema.edge(word) {
+                format!("edge {word}: {} → {}", edge.from, edge.to)
+            } else {
+                return None;
+            }
+        }
+        TokenKind::Identifier => {
+            let edge = schema
+                .edges
+                .iter()
+                .find(|e| traversal_name(&e.name) == word)?;
+            format!("{word}: {} → {} · edge {}", edge.from, edge.to, edge.name)
+        }
+        _ => return None,
+    };
+    Some((token.range.clone(), text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +450,28 @@ mod tests {
             items[0].label, "born",
             "`$x` is a Person here, not the first query's Company"
         );
+    }
+
+    #[test]
+    fn hovers_name_types() {
+        let schema = dev();
+        let source = "query q($name: String) {\n  match { $p: Person  $p worksAt $c  $p.name = $name }\n  return { $p.born }\n}";
+        let at = |needle: &str, skip: usize| source.find(needle).unwrap() + skip;
+        let text = |offset| hover(&schema, source, offset).map(|(_, t)| t);
+        assert_eq!(
+            text(at("= $name", 3)),
+            Some("$name: String · parameter".into())
+        );
+        assert_eq!(text(at("$p:", 1)), Some("$p: Person · node".into()));
+        assert_eq!(text(at("$p.born", 3)), Some("Person.born: Date?".into()));
+        assert_eq!(
+            text(at("worksAt", 2)),
+            Some("worksAt: Person → Company · edge WorksAt".into())
+        );
+        assert_eq!(
+            text(at(": Person", 2)),
+            Some("node Person · 6 properties".into())
+        );
+        assert_eq!(text(at("match", 1)), None, "keywords have no hover");
     }
 }

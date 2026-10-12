@@ -9,7 +9,7 @@
 //! the previous one settles. `type:<text>` types text into the focused editor (`\n` is a new
 //! line); it is `editor::HandleInput` with the text. `click:<x>,<y>` clicks at a point in
 //! window pixels (half the PNG's, which is drawn at 2x), with `,cmd` or `,shift` held when
-//! added; `key:<keystroke>` presses keys as the keymap sees them (`key:tab`, `key:cmd-4`);
+//! added; `hover:<x>,<y>` moves the pointer there and rests; `key:<keystroke>` presses keys as the keymap sees them (`key:tab`, `key:cmd-4`);
 //! `drag:<x1>,<y1>,<x2>,<y2>` presses at
 //! the first point, moves to the second in steps, and releases. `SNAPSHOT_WAIT_MS` (default 1500) is how
 //! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
@@ -164,6 +164,28 @@ fn main() {
     settle(&mut cx, wait);
 
     for spec in actions {
+        if let Some((x, y)) = spec
+            .strip_prefix("hover:")
+            .and_then(|at| at.split_once(','))
+        {
+            let position = point(
+                px(x.trim().parse().expect("hover x is a number")),
+                px(y.trim().parse().expect("hover y is a number")),
+            );
+            cx.update_window(handle, |_, window, cx| {
+                window.dispatch_event(
+                    PlatformInput::MouseMove(MouseMoveEvent {
+                        position,
+                        pressed_button: None,
+                        modifiers: Modifiers::default(),
+                    }),
+                    cx,
+                );
+            })
+            .expect("move the pointer");
+            settle(&mut cx, wait);
+            continue;
+        }
         if let Some(keys) = spec.strip_prefix("key:") {
             for key in keys.split(' ') {
                 let keystroke = gpui::Keystroke::parse(key).expect("a keystroke");
