@@ -351,10 +351,9 @@ pub fn hover(schema: &SchemaModel, source: &str, offset: usize) -> Option<(Range
                     "node {word} · {n} propert{}",
                     if n == 1 { "y" } else { "ies" }
                 )
-            } else if let Some(edge) = schema.edge(word) {
-                format!("edge {word}: {} → {}", edge.from, edge.to)
             } else {
-                return None;
+                let edge = schema.edge(word)?;
+                format!("edge {word}: {} → {}", edge.from, edge.to)
             }
         }
         TokenKind::Identifier => {
