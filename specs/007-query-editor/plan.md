@@ -53,8 +53,11 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 ## Deferred
 
-- `omnigraph lsp` and moving the grammars to OmniGraph (`docs/deferred-engine-changes.md`).
-- Query profiles over HTTP (deferred); plans only for now.
+- Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
+  - E11 typed result columns: types from the compiler until then.
+  - E12 query profile over HTTP: plans only, through `explain query …`, until then.
+  - E17 `omnigraph lsp` and E18 grammars in the OmniGraph repository: the compiler runs
+    in-process and the grammars live in `grammars/` until then.
 
 ## Validation log
 

@@ -122,10 +122,13 @@ opens the branch's recent commits.
 
 ## Deferred
 
-- Typed result columns from the server (deferred engine change); the compiler describes them.
+- Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
+  - E11 typed result columns: column types come from `describe_query_operation` until then.
+  - R1 Blob writes: upload and clear only when the server advertises `cluster_putBlob`.
+  - R2 unpublished commits: staged edits as a reviewable proposal only when the server
+    advertises `cluster_publishCommit`.
 - Group-by (Tower 084) until filters and editing ship.
 - Per-row history beyond the commits that the change feed can cheaply return.
-- Blob writes, available only on servers that advertise `cluster_putBlob`.
 
 ## Validation log
 

@@ -32,7 +32,8 @@ I (read through HTTP only), VI (missing data labelled, never blank).
 
 ## Deferred
 
-Index status route (deferred engine change).
+- Engine change E13 (index status), [spec 012](../012-omnigraph-engine-changes/plan.md). Index facts come from `explain` statistics until
+  then.
 
 ## Validation log
 

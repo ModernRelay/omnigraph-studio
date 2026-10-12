@@ -109,7 +109,8 @@ Linux. CI caches `~/.cargo/git` and `target/` keyed on `Cargo.lock`.
 
 - Windows CI and packaging, until macOS and Linux run.
 - Auto-update, until there is a first signed release.
-- Everything in `docs/deferred-engine-changes.md`.
+- Engine change E19 (publish `omnigraph-compiler` to crates.io again), [spec 012](../012-omnigraph-engine-changes/plan.md). Until then the
+  compiler is a git dependency on tag `v0.13.0`.
 
 ## Validation log
 

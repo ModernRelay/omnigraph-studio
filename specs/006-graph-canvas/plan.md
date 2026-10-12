@@ -50,6 +50,8 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 
 ## Deferred
 
+- Engine change E16 (neighbourhood counts per node), [spec 012](../012-omnigraph-engine-changes/plan.md), for hub counts; shared with the
+  tree's interim count queries until then.
 - GPU compute layout above 50k nodes (spike S3, later).
 - Saved layouts per graph.
 

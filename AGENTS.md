@@ -10,8 +10,9 @@ Before every task:
 1. The [constitution](.specify/memory/constitution.md). It binds every change.
 2. The [architecture](docs/architecture.md): crate layers, data flow, state model.
 3. The plan in `specs/` for the area you touch, including its validation log.
-4. [Deferred engine changes](docs/deferred-engine-changes.md) before designing around a gap in
-   the OmniGraph API.
+4. [Spec 012](specs/012-omnigraph-engine-changes/plan.md) and its index
+   [docs/deferred-engine-changes.md](docs/deferred-engine-changes.md) before designing around a
+   gap in the OmniGraph API. Cite the change ID (E1–E19, R1–R2) in the plan that waits on it.
 
 `CLAUDE.md` is a symlink to this file. Edit `AGENTS.md` only.
 
@@ -57,8 +58,8 @@ python3 script/check-layers.py   # crate layer rule; keep its table in step with
   appears in the palette.
 - Copying from Zed is allowed (GPL). Keep the file's copyright notice and add a
   `// Forked from zed-industries/zed <path> @ <commit>` line. Keep forks small.
-- No OmniGraph engine changes from this repo. Record the need in
-  `docs/deferred-engine-changes.md` and design against today's API.
+- No OmniGraph engine changes from this repo. Add the need to spec 012 with an ID, list it in
+  `docs/deferred-engine-changes.md`, and design against today's API.
 - Never add a second copy of GPUI (GPUI Kit, `gpui-pre`, `gpui-ce`, crates.io `gpui`).
 - Never retry a write automatically. Never log tokens, query text or row data.
 

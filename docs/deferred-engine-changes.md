@@ -1,48 +1,35 @@
 # Deferred OmniGraph engine changes
 
 Studio ships against the released HTTP contract (0.13) and changes nothing in the OmniGraph
-repository for now (constitution X). Each row is something Studio would use, what Studio does
-today instead, and when to revisit it. When one of these is picked up, it goes through
-OmniGraph's own RFC process; Studio's plan links to the RFC and never redefines it.
+repository for now (constitution X). This is the index; the design of each change, its engine
+rules and its evidence are in [spec 012](../specs/012-omnigraph-engine-changes/plan.md). When
+one is picked up it goes through OmniGraph's own RFC process.
 
-## Launch and local graphs
-
-| Change | Why Studio wants it | Studio today | Revisit when |
+| ID | Change | Waiting spec | Studio does today |
 |---|---|---|---|
-| `omnigraph studio` CLI command: resolve the target, start the server on loopback in-process, mint a per-launch token and policy, open Studio with a single-use code | One command from the CLI to a ready window, as with `prisma studio` or `duckdb -ui`; local graphs without running a server by hand | Studio connects to servers from `~/.omnigraph/config.yaml` or added by URL; a local graph is served with `omnigraph-server --cluster <dir>` first | Studio's shell, connections and type tables work end to end |
-| Host allowlist and Origin check in `omnigraph-server` | Protects a loopback server from DNS rebinding and cross-site requests | Not needed while Studio is a native app talking to servers the person runs | Together with the launcher, or a web build |
-| Read-only serving mode | Inspect a graph next to a live writer without the risk of a second writer | Studio's writes go through the one server that owns the graph | With the launcher |
-| Discovery file for the process that owns a graph root | CLI writes route through the running Studio server; no second writer | Not applicable until the launcher exists | With the launcher |
+| E1 | `omnigraph studio` CLI command: resolve the target, serve locally on loopback, single-use code handoff | 003 | Connects to running servers from `~/.omnigraph/config.yaml` or added by URL; local graphs served with `omnigraph-server --cluster <dir>` first |
+| E2 | Supported local embedding API in `omnigraph-server`, with a read-only mode | E1 | — |
+| E3 | Loopback guard (Host allowlist, Origin check, no CORS) in the launcher | E1 | — |
+| E4 | Owner discovery for a graph root (discovery, not fencing) | E1 | — |
+| E5 | Writer-safety rules for local sessions | E1 | Enforced by the server Studio talks to |
+| E6 | Paged branch-to-branch diff with before and after images | 008 | Change feed folded from the fork, capped at 20,000, "Partial" when capped |
+| E7 | Merge base of two refs | 008 | Walk `GET /commits` parents |
+| E8 | Merge preview with no effects | 008 | Merge on request; a 409 lists conflicts and nothing moved |
+| E9 | Branch details (head, fork, creator, times) | 002, 008 | Derived from `GET /commits?branch=` |
+| E10 | Paged commit list | 009 | Full list, virtualized, warning above 5,000 commits |
+| E11 | Typed result columns or Arrow IPC | 004, 007 | Column types from `omnigraph-compiler`'s `describe_query_operation` |
+| E12 | Query profile over HTTP | 007 | Plans only, through `explain query …` |
+| E13 | Index status | 010 | Index facts from `explain` statistics |
+| E14 | Read-only schema plan | later | Schema changes stay with `omnigraph cluster apply` |
+| E15 | Who am I and what may I do | 002 | Every action shown; a 403 is a denial and the draft stays |
+| E16 | Neighbourhood counts per node | 005, 006 | One count query per edge type, concurrent, cached per pinned commit |
+| E17 | `omnigraph lsp` language server | 007 | `gq_language` calls `omnigraph-compiler` in-process |
+| E18 | Tree-sitter grammars and a Zed extension in the OmniGraph repository | E17 | Grammars in this repository under `grammars/` |
+| E19 | Publish `omnigraph-compiler` to crates.io again (stops at 0.8.0) | 001 | Git dependency on tag `v0.13.0` |
 
-## Read routes
+Already on OmniGraph main but not in 0.13.0, used only when a server advertises them:
 
-| Change | Why Studio wants it | Studio today | Revisit when |
-|---|---|---|---|
-| Typed columns in query results (`columns: [{name, type, nullable}]`) or Arrow IPC (RFC 0051) | Column types, alignment and editors in result grids | Types from `omnigraph-compiler`: the compiler describes a query's result columns before it runs | Result grids need types the compiler cannot give (parameters bound at run time) |
-| Branch-to-branch diff, paged, with before and after images | Net review of a branch against its target | Changes since the fork from the change feed (`GET /changes?start=after:<commit>`), folded client-side, capped, with "partial" shown when capped | Review on large branches |
-| Merge base of two refs | Name the comparison base | Fork commit found by walking `GET /commits` parents | With the diff route |
-| Merge preview with no effects | Show conflicts before merging | Merge is attempted on request; a 409 lists conflicts and nothing moved | Before merge becomes a one-click flow |
-| Branch details (head, fork point, creator, times) | Sidebar and review headers | Derived from `GET /commits?branch=` | Many branches or long histories |
-| Paged commit list | History on long-lived graphs | `GET /commits` in full, rendered virtualized, with a size warning | A graph's history gets slow to list |
-| Query profile over HTTP | Explain view with executed row counts | Plan only, via `explain query …` on `/query` | The query editor's explain view |
-| Index status | Inspectors | Index facts from `explain` statistics | Inspectors |
-| Schema plan (read-only) | Show what a schema change would do | Out of scope; schema changes stay with `omnigraph cluster apply` | Schema editing is planned |
-| Who am I and what may I do | Hide actions the actor cannot take | Show every action; a 403 is shown as a denial and the draft stays | Members with mixed permissions use Studio |
-| Neighbourhood counts per node (degree per edge type and direction) | Relationship tree and canvas hub counts in one call | One `count` query per edge type, run concurrently and cached for the pinned commit | Tree expansion feels slow on real graphs |
-
-## Language tooling
-
-| Change | Why Studio wants it | Studio today | Revisit when |
-|---|---|---|---|
-| `omnigraph lsp` language server | One language service for Studio, Zed and other editors | `gq_language` calls `omnigraph-compiler` in-process | A Zed extension for `.gq` is wanted |
-| Tree-sitter grammars for `.gq` and `.pg` in the OmniGraph repository | The language's owner keeps its grammar | Grammars live in this repository under `grammars/` | The LSP work starts |
-| Publishing `omnigraph-compiler` to crates.io again (crates.io stops at 0.8.0) | Normal versioned dependency | Git dependency on tag `v0.13.0` | Any OmniGraph release |
-
-## Features already on OmniGraph main, not in 0.13.0
-
-Studio uses these only when the server's OpenAPI document advertises them (constitution X):
-
-- `PUT` and `DELETE /graphs/{id}/blob` (Blob writes).
-- `POST /graphs/{id}/commits/{commit_id}/publish` and `DELETE /graphs/{id}/commits/{commit_id}`
-  (unpublished commits), with `as_commit` on merges. This is the planned way to preview a merge
-  and to stage edits as a reviewable proposal.
+| ID | Feature | Spec |
+|---|---|---|
+| R1 | Blob writes (`PUT`/`DELETE /graphs/{id}/blob`) | 004 |
+| R2 | Unpublished commits (`as_commit`, publish, drop): staged edits as proposals, merge preview | 004, 008 |

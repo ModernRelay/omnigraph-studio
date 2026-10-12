@@ -77,9 +77,14 @@ place), X (designed on 0.13; the better routes are deferred).
 
 ## Deferred
 
-- Merge preview with no effects and `as_commit` proposals: used when the server advertises
-  `cluster_publishCommit`.
-- Paged branch-to-branch diff and merge base (deferred engine changes).
+- Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
+  - E6 paged branch-to-branch diff: the change feed is folded from the fork, capped at 20,000
+    changes, until then.
+  - E7 merge base: found by walking `GET /commits` parents until then.
+  - E8 merge preview with no effects: merge on request and show the 409 conflicts until then.
+  - E9 branch details: derived from `GET /commits?branch=` until then.
+  - R2 unpublished commits: `as_commit` merge proposals only when the server advertises
+    `cluster_publishCommit`.
 - Approvals and comments on reviews.
 
 ## Validation log

@@ -42,5 +42,8 @@ Add tasks, contracts or data-model files only for large features.
 | 009 | [History](009-history/plan.md) | draft |
 | 010 | [Inspectors](010-inspectors/plan.md) | draft |
 | 011 | [Agent panel](011-agent-panel/plan.md) | not started |
+| 012 | [OmniGraph engine changes](012-omnigraph-engine-changes/plan.md) | deferred |
 
 Order of work: 001, 002, 003, then 004 with the spikes in 001. 005 to 009 follow in any order.
+012 is not scheduled: it records every OmniGraph change Studio would use, what Studio does
+without it, and which plan waits on it. Each feature plan's Deferred section names its IDs.

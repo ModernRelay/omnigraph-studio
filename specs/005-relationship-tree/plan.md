@@ -78,7 +78,8 @@ on the canvas. Typing filters the visible rows.
 
 ## Deferred
 
-- One-call neighbourhood counts (`docs/deferred-engine-changes.md`).
+- Engine change E16 (neighbourhood counts per node), [spec 012](../012-omnigraph-engine-changes/plan.md). Until then, one count query per
+  edge type, run concurrently and cached for the pinned commit.
 - Grouping neighbours by a property ("by company").
 
 ## Validation log

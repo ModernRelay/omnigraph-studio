@@ -89,8 +89,9 @@ from the served document).
 
 ## Deferred
 
-- The `omnigraph studio` launcher, loopback serving and single-use code handoff
-  (`docs/deferred-engine-changes.md`).
+- Engine changes E1–E5, [spec 012](../012-omnigraph-engine-changes/plan.md): the `omnigraph studio` launcher, a supported local embedding
+  API, the loopback guard in the launcher, owner discovery, and writer-safety rules for local
+  sessions. Until then Studio connects to running servers.
 - OIDC and signed data credentials: supported by the server, but Studio starts with static
   bearer tokens.
 - A second contract (`0.14`) once OmniGraph ships it.

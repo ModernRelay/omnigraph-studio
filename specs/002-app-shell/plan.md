@@ -118,8 +118,11 @@ Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks ente
 ## Deferred
 
 - Multi-window session restore across launches beyond the last window.
-- A URL scheme (`omnigraph-studio://`) for deep links, until the launcher (deferred engine
-  change) needs it. Deep links will fill a query tab and never run it.
+- A URL scheme (`omnigraph-studio://`) for deep links, until the launcher (E1) needs it. Deep
+  links will fill a query tab and never run it.
+- Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
+  - E9 branch details: the branch menu derives head and fork from `GET /commits?branch=` until then.
+  - E15 who am I: every action stays visible; a 403 is shown as a denial and the draft stays.
 
 ## Validation log
 

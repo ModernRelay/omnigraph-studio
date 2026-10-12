@@ -40,7 +40,10 @@ XI (lane logic forked from Zed with notices).
 
 ## Deferred
 
-Paged commit list and branch details (deferred engine changes).
+- Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
+  - E10 paged commit list: the full list loads, virtualized, with a warning above 5,000 commits,
+    until then.
+  - E9 branch details: branch chips derived from per-branch commit lists until then.
 
 ## Validation log
 
