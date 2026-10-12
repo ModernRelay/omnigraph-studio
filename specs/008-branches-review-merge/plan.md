@@ -96,6 +96,7 @@ place), X (designed on 0.13; the better routes are deferred).
   - E7 merge base: found by walking `GET /commits` parents until then.
   - E8 merge preview with no effects: merge on request and show the 409 conflicts until then.
   - E9 branch details: derived from `GET /commits?branch=` until then.
+  - E21 a branch from a commit: 0.13 forks only a branch's head (`from` names a branch).
   - R2 unpublished commits: `as_commit` merge proposals only when the server advertises
     `cluster_publishCommit`.
 - Approvals and comments on reviews.

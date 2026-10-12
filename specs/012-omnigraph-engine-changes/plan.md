@@ -128,6 +128,17 @@ both identities from bearer tokens at the boundary (invariant 10); a client neve
 agent identity. Studio today: agent writes go only to a branch named `agent/<stamp>`, so the
 branch name says who made them.
 
+### Branching
+
+**E21. A branch from a commit.** `BranchCreateRequest` at 0.13.0 takes `name` and `from`, a
+parent branch whose head the new branch forks ("Parent branch to fork from. Defaults to
+`main`", `openapi.json`). Forking at a commit of a branch's history (`from_commit`) would let
+History start a branch where a change was made, to try a fix or revert there. Engine rule: the
+new branch's first manifest names that commit's table pins and lineage, published once
+(invariant 2); a commit that is no longer retained is refused, not approximated. *Waits:* 008,
+009. *Today:* History opens a read-only query or table at a commit; a branch starts from a
+branch head.
+
 ### Already on OmniGraph main, not in 0.13.0
 
 **R1. Blob writes** (`PUT`/`DELETE /graphs/{id}/blob`). Studio offers Blob upload and clear only
