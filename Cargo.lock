@@ -1642,8 +1642,12 @@ dependencies = [
 name = "command_palette"
 version = "0.1.0"
 dependencies = [
+ "editor",
  "gpui",
  "graph_store",
+ "menu",
+ "serde",
+ "serde_json",
  "studio_actions",
  "studio_ui",
  "studio_workspace",

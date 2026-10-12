@@ -1,6 +1,7 @@
 # 002: App shell
 
-Status: draft · 2026-10-11
+Status: draft · 2026-10-11. The command palette landed 2026-10-12 (`crates/command_palette`);
+its scope tabs are not built yet.
 
 ## Problem
 
@@ -76,6 +77,14 @@ Steps:
 - Scope tabs: All ⌘1, Types ⌘2, Nodes ⌘3, Queries ⌘4, Branches ⌘5, Commands ⌘6. Tab hands the
   text to the agent ("Ask") once spec 011 lands.
 - Opens in one frame with no animation (constitution VII).
+- Landed 2026-10-12: ⌘K and ⌘⇧P (Ctrl elsewhere; each bound in `init` only when the keymap
+  does not already bind it). Rows are humanized action names (`studio_graph::OpenType` → "Graph:
+  open type"), fuzzy matched with word-start and run bonuses, each with the binding that wins
+  where the person was and the action's doc comment in the footer. Recently run rows come first
+  (`command-palette.json` in Studio's data directory, read and written off the main thread);
+  then Studio's actions, node and edge types, and the rest. A type row dispatches
+  `studio_graph::OpenType` and appears only when that action is available where the person is.
+  ↑/↓ move, ↵ runs after the palette closes and focus returns, Esc closes.
 
 ### Tooltips and disabled states
 
@@ -117,6 +126,7 @@ Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks ente
 
 ## Deferred
 
+- Palette scope tabs (Types, Nodes, Queries, Branches, Commands) and the Ask hand-off.
 - Multi-window session restore across launches beyond the last window.
 - A URL scheme (`omnigraph-studio://`) for deep links, until the launcher (E1) needs it. Deep
   links will fill a query tab and never run it.
@@ -130,7 +140,12 @@ Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks ente
 |---|---|---|---|
 | 2026-10-11 | Fork sources exist at the tag | `git ls-tree v1.23.2 crates/workspace/src crates/picker/src crates/command_palette/src` | Present, as listed above |
 | 2026-10-11 | `ui` components needed by the frame exist | `git ls-tree -r v1.23.2 crates/ui/src/components` | Present, as listed above |
+| 2026-10-12 | The palette's rows come from where the person was | `gpui/src/window.rs` `available_actions` (the focused node in the rendered frame, plus global listeners) and `dispatch_action` (captures focus when called) at `v1.23.2` | The list is built before the modal takes focus; on ↵ focus is restored, the modal dismissed, then the action dispatched |
+| 2026-10-12 | Zed's global handlers appear as rows | palette snapshot | `editor::init` registers `workspace::NewFile` and `workspace::NewWindow` globally; their handlers read Zed's `AppState` with `cx.global`, which panics in Studio. The palette hides `workspace::`, `zed::` and `menu::`; ⌘N is rebound to `studio_graph::NewQuery` at the root (spec 007), so the key no longer reaches `NewFile` |
+| 2026-10-12 | With nothing focused, an action reaches only global handlers | offscreen snapshots: `studio::ToggleSidebar` and `studio::OpenGraph` did nothing until the workspace had focus | A window opens with no focus, so the workspace's handlers and key bindings are unreachable until something is clicked. The snapshot example now focuses the workspace first; the app should focus it when a window opens |
 
 ## Corrections
 
-None yet.
+- 2026-10-12 · The palette is not forked from Zed's `picker`, which depends on `project`,
+  `workspace` and `db`. It is a small list of its own (a uniform list, Studio's matcher and
+  recency file), following `command_palette.rs` at `v1.23.2` for the focus and dispatch order.
