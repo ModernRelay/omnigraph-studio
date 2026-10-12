@@ -96,8 +96,10 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   the Nodes panel of the bottom dock (`studio_graph::BrowseType`), under the canvas as in Tower;
   a double click opens its table as a tab.
 - **Keys:** ←↑→↓ (`canvas::MoveLeft` …, nearest node in a 45° cone, `along + 2 × across`),
-  `0`, `=`/`+`, `-`, ↵ expand, ⌫ collapse. Space peek, F focus and `[`/`]` are not built.
-  Bindings are registered in `graph_canvas::init`; they still need entries in
-  `assets/keymaps/`. Scroll and pinch zoom, drag pans.
-- **The cap exit** offers "Open as table" for the type with most hidden nodes; "Show in tree"
-  is not built. Query results opening as a canvas is not built.
+  `0`, `=`/`+`, `-`, ↵ expand, ⌫ collapse, Space peek, F focus on the selected node's
+  neighbourhood, `[`/`]` step back and forward along the nodes walked. Bound in the `Canvas`
+  context of `assets/keymaps/`. Scroll and pinch zoom, drag pans.
+- **The cap exit** offers "Open as table" for the type with most hidden nodes and "Show in
+  tree" (the Explore panel). The cap is the `canvas_max_nodes` setting, per graph if set.
+- **Query results** open as a canvas from the result header's Canvas button
+  (`studio_graph::ShowResultsOnCanvas`): each node once, a line between the nodes of a row.
