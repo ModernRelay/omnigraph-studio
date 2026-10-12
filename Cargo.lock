@@ -4704,6 +4704,7 @@ name = "inspectors"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "graph_client",
  "graph_store",
  "studio_actions",
  "studio_ui",
