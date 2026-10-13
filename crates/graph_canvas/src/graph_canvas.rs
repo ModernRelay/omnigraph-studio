@@ -1081,8 +1081,8 @@ impl GraphCanvas {
             return;
         }
         let hit = self.hit(event.position, window);
-        // ⇧-click marks a chip, or unmarks it.
-        if event.modifiers.shift {
+        // ⌘-click marks a chip, or unmarks it, as ⌘-click picks rows in a table.
+        if event.modifiers.secondary() {
             if let Some(index) = hit {
                 let id = self.scene.nodes[index].id.clone();
                 if !self.marked.remove(&id) {
@@ -1097,27 +1097,55 @@ impl GraphCanvas {
             cx.notify();
         }
         self.select(hit, cx);
-        if let Some(index) = hit {
+        let Some(index) = hit else {
+            return;
+        };
+        // ⇧-click shows the chip in the inspector and opens nothing.
+        if event.modifiers.shift {
+            self.peek(index, window, cx);
+            return;
+        }
+        match self.scene.nodes[index].kind {
             // A click on a type browses its rows under the canvas, as Tower's does.
-            if matches!(self.scene.nodes[index].kind, SceneKind::Type { .. })
-                && event.click_count < 2
-            {
+            SceneKind::Type { .. } if event.click_count < 2 => {
                 window.dispatch_action(
                     Box::new(studio_actions::graph::BrowseType {
                         type_name: self.scene.nodes[index].label.clone(),
                     }),
                     cx,
                 );
-                return;
             }
-            let single_activates = matches!(
-                self.scene.nodes[index].kind,
-                SceneKind::Hub { .. } | SceneKind::More { .. }
-            );
-            if single_activates || event.click_count >= 2 {
+            // A click opens a relationship or closes it, and shows more.
+            SceneKind::Hub { .. } | SceneKind::More { .. } => {
                 self.activate(index, false, window, cx);
             }
+            // A click expands a closed node; an open one is only selected, so a click never
+            // folds away what was walked. A double click closes it.
+            SceneKind::Node { expanded, .. }
+                if self.scene.nodes[index].path.is_some() && !expanded =>
+            {
+                self.activate(index, true, window, cx);
+            }
+            _ if event.click_count >= 2 => self.activate(index, false, window, cx),
+            _ => {}
         }
+    }
+
+    /// Shows a chip's node in the inspector without opening anything: a relationship pill
+    /// or "+K more" shows the node it belongs to.
+    fn peek(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let node = match &self.scene.nodes[index].kind {
+            SceneKind::Node { node, .. } => node.clone(),
+            SceneKind::Hub { key, .. } | SceneKind::More { key, .. } => key.node.clone(),
+            SceneKind::Type { .. } => return,
+        };
+        window.dispatch_action(
+            Box::new(PeekNode {
+                type_name: node.type_name,
+                id: node.id,
+            }),
+            cx,
+        );
     }
 
     fn mouse_up_out(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -1781,7 +1809,7 @@ impl GraphCanvas {
                     .filter(|n| matches!(n.kind, SceneKind::Node { .. }))
                     .count();
                 format!(
-                    "{nodes} {} · click a relationship to open it · double-click a node to expand it",
+                    "{nodes} {} · click to open · ⇧-click to inspect · ⇧-drag to select",
                     if nodes == 1 { "node" } else { "nodes" }
                 )
             }
