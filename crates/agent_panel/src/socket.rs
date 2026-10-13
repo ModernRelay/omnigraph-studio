@@ -75,8 +75,13 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
         Err(error) => return Err(error),
     }
     let metadata = std::fs::symlink_metadata(dir)?;
-    // A file this process creates is owned by this process's user.
-    let probe = dir.join(format!(".owner-{}", std::process::id()));
+    // A file this process creates is owned by this process's user. The name is unique per
+    // call: two sockets bound at once must not remove each other's probe.
+    let probe = dir.join(format!(
+        ".owner-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&probe, b"")?;
     let me = std::fs::metadata(&probe)?.uid();
     std::fs::remove_file(&probe).ok();
