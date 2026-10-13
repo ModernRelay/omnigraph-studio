@@ -4,8 +4,10 @@
 //! `mcp-proxy`), and on every prompt reads the schema and counts `Person` nodes. When the prompt
 //! contains "change", it also proposes retitling the first person and reports the outcome.
 //!
-//! It keeps each session's transcript in its working directory and supports `session/load`:
-//! loading a session replays its messages, so a restarted Studio can come back to it.
+//! One process serves every session Studio opens with it. It keeps each session's transcript in
+//! the session's working directory and supports `session/load` (replaying the messages),
+//! `session/list` (the transcripts in a directory, titled by their first message),
+//! `session/delete` and `session/close`.
 //!
 //! It offers the session options Claude's ACP agent does (a mode, a model grouped by family, an
 //! effort level, Fast mode as a switch when the client takes switches, and an agent profile),
@@ -15,17 +17,21 @@
 //!     cargo build -p agent_panel --example test_agent
 //!     # then set the agent command to target/debug/examples/test_agent
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{LazyLock, Mutex};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ContentBlock, ContentChunk, Cost, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpServer, McpServerStdio,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectGroup,
-    SessionConfigSelectOption, SessionId, SessionNotification, SessionUpdate,
+    AgentCapabilities, CloseSessionRequest, CloseSessionResponse, ContentBlock, ContentChunk, Cost,
+    DeleteSessionRequest, DeleteSessionResponse, Implementation, InitializeRequest,
+    InitializeResponse, ListSessionsRequest, ListSessionsResponse, LoadSessionRequest,
+    LoadSessionResponse, McpServer, McpServerStdio, NewSessionRequest, NewSessionResponse,
+    PromptRequest, PromptResponse, SessionCapabilities, SessionCloseCapabilities,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    SessionConfigSelectGroup, SessionConfigSelectOption, SessionDeleteCapabilities, SessionId,
+    SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
     ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
 };
@@ -40,60 +46,98 @@ const FIRST: &str =
     "query first() { match { $p: Person } return { $p } order { $p.@id asc } limit 1 }";
 const RETITLE: &str = "query retitle($id: String, $title: String) {\n  update Person set { title: $title } where @id = $id\n}";
 
-/// The session's options as the person last set them, by option id, kept beside the
-/// transcript so a loaded session comes back with its own. Unset options take their defaults.
-static OPTIONS: Mutex<Option<Map<String, Value>>> = Mutex::new(None);
+/// What the agent keeps about one open session. One process serves every session Studio opens
+/// with it, as Claude's ACP agent does.
+#[derive(Default, Clone)]
+struct Session {
+    /// Its messages, one JSON line each.
+    transcript: PathBuf,
+    /// The options as the person last set them, by option id, kept beside the transcript so a
+    /// loaded session comes back with its own. Unset options take their defaults.
+    options: Map<String, Value>,
+    /// Tokens in the context window and the cost so far.
+    usage: (u64, f64),
+    server: Option<McpServerStdio>,
+}
+
+static SESSIONS: LazyLock<Mutex<HashMap<String, Session>>> = LazyLock::new(Mutex::default);
+/// Every transcript the agent knows of, by session id, open or not, kept in a file so a later
+/// process can still delete one (`session/delete` names only the session), as a real agent
+/// keeps its sessions.
+static KNOWN: LazyLock<Mutex<HashMap<String, PathBuf>>> = LazyLock::new(|| {
+    let known = std::fs::read_to_string(known_path())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    Mutex::new(known)
+});
+
+fn known_path() -> PathBuf {
+    std::env::temp_dir().join("studio-test-agent-sessions.json")
+}
+
+fn remember(session: &str, transcript: PathBuf) {
+    let mut known = KNOWN.lock().unwrap();
+    known.insert(session.to_owned(), transcript);
+    std::fs::write(
+        known_path(),
+        serde_json::to_string(&*known).unwrap_or_default(),
+    )
+    .ok();
+}
 /// Whether the client takes on/off options as switches; otherwise Fast mode is an On/Off menu.
 static BOOLEANS: AtomicBool = AtomicBool::new(false);
+const WINDOW: u64 = 200_000;
 
-fn options_path() -> Option<PathBuf> {
-    let transcript = TRANSCRIPT.lock().unwrap().clone()?;
-    Some(transcript.with_extension("options.json"))
+fn options_path(transcript: &std::path::Path) -> PathBuf {
+    transcript.with_extension("options.json")
 }
 
-fn save_options() {
-    let options = OPTIONS.lock().unwrap().clone().unwrap_or_default();
-    if let Some(path) = options_path() {
-        std::fs::write(path, Value::Object(options).to_string()).ok();
-    }
-}
-
-fn load_options() {
-    let saved = options_path()
-        .and_then(|path| std::fs::read_to_string(path).ok())
+fn open(session: &str, transcript: PathBuf, server: Option<McpServerStdio>) {
+    let options = std::fs::read_to_string(options_path(&transcript))
+        .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| value.as_object().cloned());
-    *OPTIONS.lock().unwrap() = saved;
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    remember(session, transcript.clone());
+    SESSIONS.lock().unwrap().insert(
+        session.to_owned(),
+        Session {
+            transcript,
+            options,
+            usage: (0, 0.),
+            server,
+        },
+    );
 }
 
-fn chosen(id: &str, default: &str) -> String {
-    OPTIONS
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|options| options.get(id)?.as_str().map(str::to_owned))
-        .unwrap_or_else(|| default.to_owned())
+fn with_session<T>(session: &str, f: impl FnOnce(&mut Session) -> T) -> Option<T> {
+    SESSIONS.lock().unwrap().get_mut(session).map(f)
 }
 
-fn fast() -> bool {
-    OPTIONS
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|options| options.get("fast")?.as_bool())
-        .unwrap_or(false)
+fn chosen(options: &Map<String, Value>, id: &str, default: &str) -> String {
+    options
+        .get(id)
+        .and_then(Value::as_str)
+        .unwrap_or(default)
+        .to_owned()
 }
 
 /// The options Claude's ACP agent offers, in its order: mode, model, effort, Fast mode and the
 /// agent profile.
-fn config_options() -> Vec<SessionConfigOption> {
+fn config_options(session: &str) -> Vec<SessionConfigOption> {
+    let options = with_session(session, |s| s.options.clone()).unwrap_or_default();
+    let fast = options
+        .get("fast")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let fast_mode = if BOOLEANS.load(Ordering::SeqCst) {
-        SessionConfigOption::boolean("fast", "Fast mode", fast())
+        SessionConfigOption::boolean("fast", "Fast mode", fast)
     } else {
         SessionConfigOption::select(
             "fast",
             "Fast mode",
-            if fast() { "on" } else { "off" },
+            if fast { "on" } else { "off" },
             vec![
                 SessionConfigSelectOption::new("on", "On"),
                 SessionConfigSelectOption::new("off", "Off"),
@@ -104,7 +148,7 @@ fn config_options() -> Vec<SessionConfigOption> {
         SessionConfigOption::select(
             "mode",
             "Mode",
-            chosen("mode", "ask"),
+            chosen(&options, "mode", "ask"),
             vec![
                 SessionConfigSelectOption::new("ask", "Ask before changes"),
                 SessionConfigSelectOption::new("plan", "Plan only"),
@@ -115,7 +159,7 @@ fn config_options() -> Vec<SessionConfigOption> {
         SessionConfigOption::select(
             "model",
             "Model",
-            chosen("model", "sonnet"),
+            chosen(&options, "model", "sonnet"),
             vec![
                 SessionConfigSelectGroup::new(
                     "claude",
@@ -137,7 +181,7 @@ fn config_options() -> Vec<SessionConfigOption> {
         SessionConfigOption::select(
             "effort",
             "Effort",
-            chosen("effort", "high"),
+            chosen(&options, "effort", "high"),
             vec![
                 SessionConfigSelectOption::new("low", "Low"),
                 SessionConfigSelectOption::new("medium", "Medium"),
@@ -152,7 +196,7 @@ fn config_options() -> Vec<SessionConfigOption> {
         SessionConfigOption::select(
             "agent",
             "Agent",
-            chosen("agent", "default"),
+            chosen(&options, "agent", "default"),
             vec![
                 SessionConfigSelectOption::new("default", "Default"),
                 SessionConfigSelectOption::new("reviewer", "Reviewer"),
@@ -161,15 +205,8 @@ fn config_options() -> Vec<SessionConfigOption> {
     ]
 }
 
-/// Tokens in the context window and the cost so far.
-static USAGE: Mutex<(u64, f64)> = Mutex::new((0, 0.));
-const WINDOW: u64 = 200_000;
-
-/// Where the current session's messages are written, one JSON line each.
-static TRANSCRIPT: Mutex<Option<PathBuf>> = Mutex::new(None);
-
-fn record(role: &str, text: &str) {
-    let Some(path) = TRANSCRIPT.lock().unwrap().clone() else {
+fn record(session: &str, role: &str, text: &str) {
+    let Some(path) = with_session(session, |s| s.transcript.clone()) else {
         return;
     };
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -185,6 +222,42 @@ fn transcript_path(cwd: &std::path::Path, session: &str) -> PathBuf {
     cwd.join(format!("transcript-{session}.jsonl"))
 }
 
+/// The sessions whose transcripts are in `cwd`, titled by their first message.
+fn list(cwd: &std::path::Path) -> Vec<SessionInfo> {
+    let Ok(entries) = std::fs::read_dir(cwd) else {
+        return Vec::new();
+    };
+    let mut sessions = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(id) = name
+            .strip_prefix("transcript-")
+            .and_then(|rest| rest.strip_suffix(".jsonl"))
+        else {
+            continue;
+        };
+        let path = entry.path();
+        remember(id, path.clone());
+        let title = std::fs::read_to_string(&path).ok().and_then(|text| {
+            text.lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|message| message["role"] == "user")
+                .and_then(|message| message["text"].as_str().map(str::to_owned))
+        });
+        let updated = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
+        sessions.push(
+            SessionInfo::new(SessionId::new(id), cwd)
+                .title(title)
+                .updated_at(updated),
+        );
+    }
+    sessions
+}
+
 fn stdio_server(servers: Vec<McpServer>) -> Option<McpServerStdio> {
     servers.into_iter().find_map(|server| match server {
         McpServer::Stdio(stdio) => Some(stdio),
@@ -193,9 +266,6 @@ fn stdio_server(servers: Vec<McpServer>) -> Option<McpServerStdio> {
 }
 
 fn main() -> agent_client_protocol::Result<()> {
-    let server: Arc<Mutex<Option<McpServerStdio>>> = Arc::default();
-    let for_session = server.clone();
-    let for_load = server.clone();
     smol::block_on(
         Agent
             .builder()
@@ -212,25 +282,35 @@ fn main() -> agent_client_protocol::Result<()> {
                     responder.respond(
                         InitializeResponse::new(request.protocol_version)
                             .agent_info(Implementation::new("Studio test agent", "0.1.0"))
-                            .agent_capabilities(AgentCapabilities::new().load_session(true)),
+                            .agent_capabilities(
+                                AgentCapabilities::new()
+                                    .load_session(true)
+                                    .session_capabilities(
+                                        SessionCapabilities::new()
+                                            .list(SessionListCapabilities::new())
+                                            .delete(SessionDeleteCapabilities::new())
+                                            .close(SessionCloseCapabilities::new()),
+                                    ),
+                            ),
                     )
                 },
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
                 async move |request: NewSessionRequest, responder, _connection| {
-                    *for_session.lock().unwrap() = stdio_server(request.mcp_servers);
                     let nanos = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_nanos())
                         .unwrap_or(0);
                     let id = format!("test-{nanos}");
-                    *TRANSCRIPT.lock().unwrap() = Some(transcript_path(&request.cwd, &id));
-                    *USAGE.lock().unwrap() = (0, 0.);
-                    *OPTIONS.lock().unwrap() = None;
+                    open(
+                        &id,
+                        transcript_path(&request.cwd, &id),
+                        stdio_server(request.mcp_servers),
+                    );
+                    let options = config_options(&id);
                     responder.respond(
-                        NewSessionResponse::new(SessionId::new(id))
-                            .config_options(config_options()),
+                        NewSessionResponse::new(SessionId::new(id)).config_options(options),
                     )
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -239,7 +319,6 @@ fn main() -> agent_client_protocol::Result<()> {
                 async move |request: LoadSessionRequest,
                             responder,
                             connection: ConnectionTo<Client>| {
-                    *for_load.lock().unwrap() = stdio_server(request.mcp_servers);
                     let path = transcript_path(&request.cwd, &request.session_id.0);
                     let Ok(text) = std::fs::read_to_string(&path) else {
                         return responder.respond_with_error(
@@ -266,9 +345,15 @@ fn main() -> agent_client_protocol::Result<()> {
                             ))
                             .ok();
                     }
-                    *TRANSCRIPT.lock().unwrap() = Some(path);
-                    load_options();
-                    responder.respond(LoadSessionResponse::new().config_options(config_options()))
+                    open(
+                        &request.session_id.0,
+                        path,
+                        stdio_server(request.mcp_servers),
+                    );
+                    responder.respond(
+                        LoadSessionResponse::new()
+                            .config_options(config_options(&request.session_id.0)),
+                    )
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -287,7 +372,8 @@ fn main() -> agent_client_protocol::Result<()> {
                             );
                         }
                     };
-                    if !config_options()
+                    let session = request.session_id.0.to_string();
+                    if !config_options(&session)
                         .iter()
                         .any(|option| option.id.0.as_ref() == id)
                     {
@@ -295,19 +381,24 @@ fn main() -> agent_client_protocol::Result<()> {
                             agent_client_protocol::Error::invalid_params().data("no such option"),
                         );
                     }
-                    OPTIONS
-                        .lock()
-                        .unwrap()
-                        .get_or_insert_with(Map::new)
-                        .insert(id, value);
-                    save_options();
-                    responder.respond(SetSessionConfigOptionResponse::new(config_options()))
+                    with_session(&session, |s| {
+                        s.options.insert(id, value);
+                        std::fs::write(
+                            options_path(&s.transcript),
+                            Value::Object(s.options.clone()).to_string(),
+                        )
+                        .ok();
+                    });
+                    responder.respond(SetSessionConfigOptionResponse::new(config_options(
+                        &session,
+                    )))
                 },
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
                 async move |request: PromptRequest, responder, connection: ConnectionTo<Client>| {
-                    let server = server.lock().unwrap().clone();
+                    let server =
+                        with_session(&request.session_id.0, |s| s.server.clone()).flatten();
                     let turn_connection = connection.clone();
                     connection.spawn(async move {
                         let stop = match turn(&turn_connection, &request, server).await {
@@ -322,12 +413,12 @@ fn main() -> agent_client_protocol::Result<()> {
                             }
                         };
                         // Each turn fills the window by its schema read and a little more.
-                        let (used, cost) = {
-                            let mut usage = USAGE.lock().unwrap();
-                            usage.0 = (usage.0 + 41_800).min(WINDOW);
-                            usage.1 += 0.137;
-                            *usage
-                        };
+                        let (used, cost) = with_session(&request.session_id.0, |s| {
+                            s.usage.0 = (s.usage.0 + 41_800).min(WINDOW);
+                            s.usage.1 += 0.137;
+                            s.usage
+                        })
+                        .unwrap_or_default();
                         turn_connection
                             .send_notification(SessionNotification::new(
                                 request.session_id.clone(),
@@ -341,12 +432,54 @@ fn main() -> agent_client_protocol::Result<()> {
                 },
                 agent_client_protocol::on_receive_request!(),
             )
+            .on_receive_request(
+                async move |request: ListSessionsRequest, responder, _connection| {
+                    let sessions = request.cwd.as_deref().map(list).unwrap_or_default();
+                    responder.respond(ListSessionsResponse::new(sessions))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |request: DeleteSessionRequest, responder, _connection| {
+                    let id = request.session_id.0.to_string();
+                    SESSIONS.lock().unwrap().remove(&id);
+                    let path = {
+                        let mut known = KNOWN.lock().unwrap();
+                        let path = known.remove(&id);
+                        std::fs::write(
+                            known_path(),
+                            serde_json::to_string(&*known).unwrap_or_default(),
+                        )
+                        .ok();
+                        path
+                    };
+                    let Some(path) = path else {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params().data("no such session"),
+                        );
+                    };
+                    std::fs::remove_file(options_path(&path)).ok();
+                    std::fs::remove_file(path).ok();
+                    responder.respond(DeleteSessionResponse::new())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |request: CloseSessionRequest, responder, _connection| {
+                    SESSIONS
+                        .lock()
+                        .unwrap()
+                        .remove(request.session_id.0.as_ref());
+                    responder.respond(CloseSessionResponse::new())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
             .connect_to(Stdio::new()),
     )
 }
 
 fn say(connection: &ConnectionTo<Client>, session: &SessionId, text: &str) {
-    record("agent", text);
+    record(&session.0, "agent", text);
     connection
         .send_notification(SessionNotification::new(
             session.clone(),
@@ -397,7 +530,7 @@ async fn turn(
             _ => None,
         })
         .collect();
-    record("user", &prompt);
+    record(&session.0, "user", &prompt);
     // "slow" holds the turn for two seconds, to see a conversation finish in the background.
     if prompt.contains("slow") {
         smol::Timer::after(std::time::Duration::from_secs(2)).await;

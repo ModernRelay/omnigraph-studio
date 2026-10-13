@@ -1,40 +1,84 @@
 //! The Conversations panel of the left sidebar (spec 011): the graph's conversations with
 //! agents, as Delta's sidebar lists threads and Zed's lists its agent threads. Pinned ones
-//! first, then by last activity; each row is the conversation's title with what it is doing
-//! (running, waiting for the person, failed, finished unseen) or when it was last active, and
-//! pin and archive on hover. Archived ones fold away at the end. A row opens the conversation
-//! in its own tab, or shows the tab it is in.
+//! first, then by the person's last message; each row is the conversation's title with what it
+//! is doing (running, waiting for the person, failed, finished unseen) or when it was last
+//! active, and pin and archive on hover. A right click renames, pins, archives or deletes. A
+//! search field appears once the list is long; archived ones fold away at the end; the agent's
+//! own conversations in the graph's directory can be imported. A row opens the conversation in
+//! its own tab, or shows the tab it is in.
 
+use std::path::Path;
+use std::sync::Arc;
+
+use agent_client_protocol::schema::v1::SessionInfo;
 use chrono::{DateTime, Datelike as _, Utc};
+use editor::{Editor, EditorEvent};
 use gpui::{
-    App, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Subscription,
-    WeakEntity, Window, div,
+    App, AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
+    IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Task, WeakEntity,
+    Window, div,
 };
 use studio_actions::agent::{NewConversation, OpenConversation};
+use studio_settings::StudioSettings;
 use studio_ui::ds;
 use studio_workspace::Workspace;
 use ui::prelude::*;
-use ui::{CommonAnimationExt as _, IconButton, Indicator, Tooltip};
+use ui::{CommonAnimationExt as _, ContextMenu, IconButton, Indicator, Tooltip, right_click_menu};
 
-use crate::sessions::{AgentSessions, Live, SessionRecord};
+use crate::connection::{self, AgentConnection};
+use crate::host::AgentLaunch;
+use crate::sessions::{AgentSessions, Live, SessionRecord, graph_cwd};
 
 pub const PANEL_ID: &str = "agent-conversations";
+
+/// The list shows a search field once it holds more conversations than this.
+const SEARCH_FROM: usize = 6;
 
 pub struct SessionsPanel {
     workspace: WeakEntity<Workspace>,
     sessions: Entity<AgentSessions>,
     show_archived: bool,
+    search: Entity<Editor>,
+    /// The conversation being renamed, and its title field.
+    renaming: Option<(String, Entity<Editor>, Subscription)>,
+    /// What the last import or delete came to.
+    note: Option<SharedString>,
+    /// An import or delete at the agent in flight; it holds the agent's process while it runs.
+    _agent_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// What a row shows at its end.
+#[derive(Clone)]
+enum RowState {
+    Running,
+    Waiting,
+    Failed,
+    Unread,
+    /// When the person last wrote.
+    Idle(String),
 }
 
 impl SessionsPanel {
     pub fn new(
         workspace: WeakEntity<Workspace>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let sessions = AgentSessions::global(cx);
-        let mut subscriptions = vec![cx.observe(&sessions, |_, _, cx| cx.notify())];
+        let search = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Search conversations", window, cx);
+            editor
+        });
+        let mut subscriptions = vec![
+            cx.observe(&sessions, |_, _, cx| cx.notify()),
+            cx.subscribe(&search, |_, _, event: &EditorEvent, cx| {
+                if let EditorEvent::BufferEdited = event {
+                    cx.notify();
+                }
+            }),
+        ];
         // The shown tab marks its conversation; the graph decides which are listed.
         if let Some(workspace) = workspace.upgrade() {
             subscriptions.push(cx.observe(&workspace, |_, _, cx| cx.notify()));
@@ -43,6 +87,10 @@ impl SessionsPanel {
             workspace,
             sessions,
             show_archived: false,
+            search,
+            renaming: None,
+            note: None,
+            _agent_task: None,
             _subscriptions: subscriptions,
         }
     }
@@ -61,6 +109,147 @@ impl SessionsPanel {
         (!id.starts_with("new:")).then(|| id.to_owned())
     }
 
+    /// The agent the settings name, if any.
+    fn agent(cx: &App) -> Option<AgentLaunch> {
+        let settings = &StudioSettings::get(cx).agent;
+        (!settings.command.is_empty()).then(|| AgentLaunch {
+            command: settings.command.clone(),
+            env: settings.env.clone(),
+        })
+    }
+
+    // ---- rename ----
+
+    fn start_rename(
+        &mut self,
+        record: &SessionRecord,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = record.shown_title().to_owned();
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text(title, window, cx);
+            editor.select_all(&Default::default(), window, cx);
+            editor
+        });
+        window.focus(&editor.focus_handle(cx), cx);
+        // Leaving the field keeps what was typed, as renaming in a list does.
+        let subscription =
+            cx.subscribe_in(&editor, window, |this, _, event: &EditorEvent, _, cx| {
+                if let EditorEvent::Blurred = event {
+                    this.commit_rename(cx);
+                }
+            });
+        self.renaming = Some((record.session.clone(), editor, subscription));
+        cx.notify();
+    }
+
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some((id, editor, _)) = self.renaming.take() else {
+            return;
+        };
+        let title = editor.read(cx).text(cx);
+        self.sessions
+            .update(cx, |sessions, cx| sessions.rename(&id, &title, cx));
+        cx.notify();
+    }
+
+    fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        self.renaming = None;
+        cx.notify();
+    }
+
+    // ---- delete and import, at the agent ----
+
+    fn confirm_delete(
+        &mut self,
+        record: SessionRecord,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let panel = cx.entity().downgrade();
+        workspace.update(cx, |workspace, cx| {
+            workspace.toggle_modal(window, cx, move |_, cx| {
+                DeleteConversation::new(record, panel, cx)
+            });
+        });
+    }
+
+    /// Forgets the conversation here and asks the agent to delete it, when it can.
+    fn delete(&mut self, record: &SessionRecord, cx: &mut Context<Self>) {
+        let id = record.session.clone();
+        self.sessions
+            .update(cx, |sessions, cx| sessions.remove(&id, cx));
+        let Some(agent) = Self::agent(cx).filter(|agent| agent.command.join(" ") == record.agent)
+        else {
+            self.note = Some("Removed here. Another agent holds it, so it stays there.".into());
+            cx.notify();
+            return;
+        };
+        let connection = connection::connection(agent, cx);
+        let answer = connection.delete(id);
+        self._agent_task = Some(cx.spawn(async move |this, cx| {
+            let note = match answer.await {
+                Ok(Ok(())) => "Deleted here and at the agent.".to_owned(),
+                Ok(Err(reason)) => format!("Removed here; the agent did not delete it ({reason})."),
+                Err(_) => "Removed here; the agent stopped before deleting it.".to_owned(),
+            };
+            drop(connection);
+            this.update(cx, |this, cx| {
+                this.note = Some(note.into());
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Adds the agent's conversations in this graph's directory that the list does not have.
+    fn import(&mut self, cx: &mut Context<Self>) {
+        let (Some(graph), Some(agent)) = (self.graph(cx), Self::agent(cx)) else {
+            return;
+        };
+        let cwd = graph_cwd(&graph);
+        let agent_name = agent.command.join(" ");
+        let connection: Arc<AgentConnection> = connection::connection(agent, cx);
+        let answer = connection.list(cwd.clone());
+        self.note = Some("Asking the agent…".into());
+        self._agent_task = Some(cx.spawn(async move |this, cx| {
+            let result = answer.await;
+            drop(connection);
+            this.update(cx, |this, cx| {
+                let note = match result {
+                    Ok(Ok(found)) => {
+                        let records = found
+                            .into_iter()
+                            .map(|info| imported(info, &graph, &agent_name, &cwd))
+                            .collect();
+                        match this
+                            .sessions
+                            .update(cx, |sessions, cx| sessions.import(records, cx))
+                        {
+                            0 => "Nothing new to import.".to_owned(),
+                            1 => "Imported 1 conversation.".to_owned(),
+                            n => format!("Imported {n} conversations."),
+                        }
+                    }
+                    Ok(Err(reason)) => reason,
+                    Err(_) => "The agent stopped before answering.".to_owned(),
+                };
+                this.note = Some(note.into());
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    // ---- rows ----
+
     fn row(
         &self,
         record: &SessionRecord,
@@ -68,115 +257,232 @@ impl SessionsPanel {
         now: DateTime<Utc>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let sessions = self.sessions.read(cx);
         let id = record.session.clone();
-        let (end, state): (AnyElement, Option<&str>) = match sessions.live(&id) {
-            Some(Live::Running) => (
-                Icon::new(IconName::LoadCircle)
-                    .size(IconSize::XSmall)
-                    .color(Color::Accent)
-                    .with_rotate_animation(2)
-                    .into_any_element(),
-                Some("Running"),
-            ),
-            Some(Live::Waiting) => (
-                Icon::new(IconName::Warning)
-                    .size(IconSize::XSmall)
-                    .color(Color::Warning)
-                    .into_any_element(),
-                Some("Waiting for your answer"),
-            ),
-            Some(Live::Failed) => (
-                Icon::new(IconName::XCircle)
-                    .size(IconSize::XSmall)
-                    .color(Color::Error)
-                    .into_any_element(),
-                Some("The agent stopped"),
-            ),
-            None if sessions.is_unread(&id) => (
-                Indicator::dot().color(Color::Accent).into_any_element(),
-                Some("Finished while you were away"),
-            ),
-            None => (
-                ds::sidebar_count(relative_time(record.updated_at, now)).into_any_element(),
-                None,
-            ),
-        };
-        let mut about = format!(
-            "{} · {} · last active {}",
-            record.shown_title(),
-            agent_name(&record.agent),
-            record
-                .updated_at
-                .with_timezone(&chrono::Local)
-                .format("%-d %b %H:%M"),
-        );
-        if let Some(state) = state {
-            about = format!("{state} · {about}");
+        if let Some((_, editor, _)) = self.renaming.as_ref().filter(|(r, _, _)| *r == id) {
+            return h_flex()
+                .h(px(ds::size::SIDEBAR_ROW))
+                .mx(px(ds::space::SM))
+                .px(px(ds::space::SM))
+                .items_center()
+                .rounded(px(ds::radius::SM))
+                .bg(ds::surface::selected_chrome(cx))
+                .key_context("ConversationTitle")
+                .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.commit_rename(cx)))
+                .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel_rename(cx)))
+                .child(div().flex_1().text_sm().child(editor.clone()))
+                .into_any_element();
         }
-        let pin = {
-            let (id, pinned) = (id.clone(), record.pinned);
-            let sessions = self.sessions.clone();
-            IconButton::new(
-                SharedString::from(format!("pin-{id}")),
-                if pinned {
-                    IconName::Unpin
-                } else {
-                    IconName::Pin
-                },
-            )
-            .icon_size(IconSize::XSmall)
-            .icon_color(Color::Muted)
-            .tooltip(Tooltip::text(if pinned { "Unpin" } else { "Pin" }))
-            .on_click(move |_, _, cx| {
-                sessions.update(cx, |sessions, cx| sessions.set_pinned(&id, !pinned, cx));
-            })
+        let sessions = self.sessions.read(cx);
+        let state = match sessions.live(&id) {
+            Some(Live::Running) => RowState::Running,
+            Some(Live::Waiting) => RowState::Waiting,
+            Some(Live::Failed) => RowState::Failed,
+            None if sessions.is_unread(&id) => RowState::Unread,
+            None => RowState::Idle(relative_time(record.updated_at, now)),
         };
-        let archive = {
-            let (id, archived) = (id.clone(), record.archived);
-            let sessions = self.sessions.clone();
-            IconButton::new(
-                SharedString::from(format!("archive-{id}")),
-                if archived {
-                    IconName::Undo
-                } else {
-                    IconName::Archive
-                },
-            )
-            .icon_size(IconSize::XSmall)
-            .icon_color(Color::Muted)
-            .tooltip(Tooltip::text(if archived {
-                "Restore to the list"
+        let panel = cx.entity().downgrade();
+        let store = self.sessions.clone();
+        let record = record.clone();
+        right_click_menu(SharedString::from(format!("conversation-menu-{id}")))
+            .trigger({
+                let (record, store) = (record.clone(), store.clone());
+                move |_, _, _| conversation_row(&record, shown, &state, &store)
+            })
+            .menu(move |window, cx| {
+                let (record, panel, store) = (record.clone(), panel.clone(), store.clone());
+                ContextMenu::build(window, cx, move |menu, _, _| {
+                    let rename = {
+                        let (record, panel) = (record.clone(), panel.clone());
+                        move |window: &mut Window, cx: &mut App| {
+                            panel
+                                .update(cx, |panel, cx| panel.start_rename(&record, window, cx))
+                                .ok();
+                        }
+                    };
+                    let pin = {
+                        let (id, pinned, store) =
+                            (record.session.clone(), record.pinned, store.clone());
+                        move |_: &mut Window, cx: &mut App| {
+                            store.update(cx, |s, cx| s.set_pinned(&id, !pinned, cx));
+                        }
+                    };
+                    let archive = {
+                        let (id, archived, store) =
+                            (record.session.clone(), record.archived, store.clone());
+                        move |_: &mut Window, cx: &mut App| {
+                            store.update(cx, |s, cx| s.set_archived(&id, !archived, cx));
+                        }
+                    };
+                    let delete = {
+                        let (record, panel) = (record.clone(), panel.clone());
+                        move |window: &mut Window, cx: &mut App| {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    panel.confirm_delete(record.clone(), window, cx)
+                                })
+                                .ok();
+                        }
+                    };
+                    menu.entry("Rename", None, rename)
+                        .when(!record.archived, |menu| {
+                            menu.entry(if record.pinned { "Unpin" } else { "Pin" }, None, pin)
+                        })
+                        .entry(
+                            if record.archived {
+                                "Restore"
+                            } else {
+                                "Archive"
+                            },
+                            None,
+                            archive,
+                        )
+                        .separator()
+                        .entry("Delete…", None, delete)
+                })
+            })
+            .into_any_element()
+    }
+}
+
+/// A conversation's row, from what it holds: the title, its state or time at the end, Pin and
+/// Archive on hover, the details in the tooltip; a click opens it.
+fn conversation_row(
+    record: &SessionRecord,
+    shown: bool,
+    state: &RowState,
+    store: &Entity<AgentSessions>,
+) -> ds::SidebarRow {
+    let id = record.session.clone();
+    let (end, state_text): (AnyElement, Option<&str>) = match state {
+        RowState::Running => (
+            Icon::new(IconName::LoadCircle)
+                .size(IconSize::XSmall)
+                .color(Color::Accent)
+                .with_rotate_animation(2)
+                .into_any_element(),
+            Some("Running"),
+        ),
+        RowState::Waiting => (
+            Icon::new(IconName::Warning)
+                .size(IconSize::XSmall)
+                .color(Color::Warning)
+                .into_any_element(),
+            Some("Waiting for your answer"),
+        ),
+        RowState::Failed => (
+            Icon::new(IconName::XCircle)
+                .size(IconSize::XSmall)
+                .color(Color::Error)
+                .into_any_element(),
+            Some("The agent stopped"),
+        ),
+        RowState::Unread => (
+            Indicator::dot().color(Color::Accent).into_any_element(),
+            Some("Finished while you were away"),
+        ),
+        RowState::Idle(when) => (ds::sidebar_count(when.clone()).into_any_element(), None),
+    };
+    let mut about = format!(
+        "{} · {} · last active {}",
+        record.shown_title(),
+        agent_name(&record.agent),
+        record
+            .updated_at
+            .with_timezone(&chrono::Local)
+            .format("%-d %b %H:%M"),
+    );
+    if let Some(state) = state_text {
+        about = format!("{state} · {about}");
+    }
+    let pin = {
+        let (id, pinned, store) = (id.clone(), record.pinned, store.clone());
+        IconButton::new(
+            SharedString::from(format!("pin-{id}")),
+            if pinned {
+                IconName::Unpin
             } else {
-                "Archive (the agent keeps the conversation)"
-            }))
-            .on_click(move |_, _, cx| {
-                sessions.update(cx, |sessions, cx| sessions.set_archived(&id, !archived, cx));
-            })
-        };
-        ds::SidebarRow::new(
-            SharedString::from(format!("conversation-{id}")),
-            record.shown_title().to_owned(),
+                IconName::Pin
+            },
         )
-        .selected(shown)
-        .muted(record.archived)
-        .end(end)
-        .actions(
-            h_flex()
-                .gap(px(ds::space::XXS))
-                .when(!record.archived, |row| row.child(pin))
-                .child(archive),
-        )
-        .tooltip(about)
-        .on_click(move |_, window, cx| {
-            window.dispatch_action(
-                Box::new(OpenConversation {
-                    session: id.clone(),
-                }),
-                cx,
-            )
+        .icon_size(IconSize::XSmall)
+        .icon_color(Color::Muted)
+        .tooltip(Tooltip::text(if pinned { "Unpin" } else { "Pin" }))
+        .on_click(move |_, _, cx| {
+            store.update(cx, |store, cx| store.set_pinned(&id, !pinned, cx));
         })
-        .into_any_element()
+    };
+    let archive = {
+        let (id, archived, store) = (id.clone(), record.archived, store.clone());
+        IconButton::new(
+            SharedString::from(format!("archive-{id}")),
+            if archived {
+                IconName::Undo
+            } else {
+                IconName::Archive
+            },
+        )
+        .icon_size(IconSize::XSmall)
+        .icon_color(Color::Muted)
+        .tooltip(Tooltip::text(if archived {
+            "Restore to the list"
+        } else {
+            "Archive (the agent keeps the conversation)"
+        }))
+        .on_click(move |_, _, cx| {
+            store.update(cx, |store, cx| store.set_archived(&id, !archived, cx));
+        })
+    };
+    ds::SidebarRow::new(
+        SharedString::from(format!("conversation-{id}")),
+        record.shown_title().to_owned(),
+    )
+    .selected(shown)
+    .muted(record.archived)
+    .end(end)
+    .actions(
+        h_flex()
+            .gap(px(ds::space::XXS))
+            .when(!record.archived, |row| row.child(pin))
+            .child(archive),
+    )
+    .tooltip(about)
+    .on_click(move |_, window, cx| {
+        window.dispatch_action(
+            Box::new(OpenConversation {
+                session: id.clone(),
+            }),
+            cx,
+        )
+    })
+}
+
+/// A conversation the agent knows and the list does not, as a record: the agent's title and
+/// time, a branch named for when it was last active.
+fn imported(info: SessionInfo, graph: &str, agent: &str, cwd: &Path) -> SessionRecord {
+    let updated = info
+        .updated_at
+        .as_deref()
+        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| at.with_timezone(&Utc))
+        .unwrap_or_else(Utc::now);
+    SessionRecord {
+        session: info.session_id.0.to_string(),
+        graph: graph.to_owned(),
+        agent: agent.to_owned(),
+        title: info.title.filter(|title| !title.trim().is_empty()),
+        title_override: None,
+        created_at: updated,
+        updated_at: updated,
+        branch: format!(
+            "agent/{}",
+            updated
+                .with_timezone(&chrono::Local)
+                .format("%Y%m%d-%H%M%S")
+        ),
+        branch_created: false,
+        pinned: false,
+        archived: false,
+        cwd: Some(cwd.to_owned()),
     }
 }
 
@@ -194,7 +500,19 @@ impl Render for SessionsPanel {
                 sessions.archived(&graph).into_iter().cloned().collect(),
             )
         };
-        let (pinned, recent): (Vec<_>, Vec<_>) = listed.into_iter().partition(|r| r.pinned);
+        let query = self.search.read(cx).text(cx).trim().to_lowercase();
+        let searching = !query.is_empty();
+        let show_search = searching || listed.len() + archived.len() >= SEARCH_FROM;
+        let matches = |record: &SessionRecord| {
+            query.is_empty()
+                || record.shown_title().to_lowercase().contains(&query)
+                || agent_name(&record.agent).to_lowercase().contains(&query)
+        };
+        let (pinned, recent): (Vec<_>, Vec<_>) = listed
+            .into_iter()
+            .filter(|record| matches(record))
+            .partition(|record| record.pinned);
+        let archived: Vec<_> = archived.into_iter().filter(|r| matches(r)).collect();
         let is_shown = |record: &SessionRecord| shown.as_deref() == Some(record.session.as_str());
 
         let mut list = v_flex().w_full().child(
@@ -207,13 +525,41 @@ impl Render for SessionsPanel {
                 .muted(true)
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(NewConversation), cx)),
         );
-        if pinned.is_empty() && recent.is_empty() {
-            list = list.child(ds::sidebar_placeholder(
-                "no-conversations",
-                IconName::ZedAssistant,
-                "No conversations yet",
-                "Ask the agent from the Agent tab (⌘⇧A); each conversation is listed here",
-            ));
+        if show_search {
+            list = list.child(
+                h_flex()
+                    .h(px(ds::size::SIDEBAR_ROW))
+                    .mx(px(ds::space::SM))
+                    .px(px(ds::space::SM))
+                    .gap(px(ds::space::MD))
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::MagnifyingGlass)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(div().flex_1().text_sm().child(self.search.clone())),
+            );
+        }
+        if let Some(note) = self.note.clone() {
+            list = list.child(ds::sidebar_note(note));
+        }
+        if pinned.is_empty() && recent.is_empty() && archived.is_empty() {
+            list = list.child(if searching {
+                ds::sidebar_placeholder(
+                    "no-matches",
+                    IconName::MagnifyingGlass,
+                    "No conversation matches",
+                    "Titles and agents are searched",
+                )
+            } else {
+                ds::sidebar_placeholder(
+                    "no-conversations",
+                    IconName::ZedAssistant,
+                    "No conversations yet",
+                    "Ask the agent from the Agent tab (⌘⇧A); each conversation is listed here",
+                )
+            });
         }
         if !pinned.is_empty() {
             list = list.child(ds::section_label("Pinned"));
@@ -230,7 +576,8 @@ impl Render for SessionsPanel {
             list = list.child(row);
         }
         if !archived.is_empty() {
-            let open = self.show_archived;
+            // A search looks through the archive too.
+            let open = self.show_archived || searching;
             list = list.child(
                 ds::SidebarRow::new("archived", "Archived")
                     .muted(true)
@@ -256,7 +603,94 @@ impl Render for SessionsPanel {
                 }
             }
         }
+        if Self::agent(cx).is_some() {
+            list = list.child(
+                ds::SidebarRow::new("import-conversations", "Import from the agent")
+                    .start(
+                        Icon::new(IconName::Download)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .muted(true)
+                    .tooltip(
+                        "Add the agent's own conversations on this graph that are not listed here",
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.import(cx))),
+            );
+        }
         list.child(div().h(px(ds::space::SM))).into_any_element()
+    }
+}
+
+/// Asks before a conversation is deleted: Studio forgets it, and the agent deletes it when it
+/// can. Nothing on the graph changes.
+struct DeleteConversation {
+    record: SessionRecord,
+    panel: WeakEntity<SessionsPanel>,
+    focus_handle: FocusHandle,
+}
+
+impl DeleteConversation {
+    fn new(
+        record: SessionRecord,
+        panel: WeakEntity<SessionsPanel>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            record,
+            panel,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    fn delete(&mut self, cx: &mut Context<Self>) {
+        let record = self.record.clone();
+        self.panel
+            .update(cx, |panel, cx| panel.delete(&record, cx))
+            .ok();
+        cx.emit(DismissEvent);
+    }
+}
+
+impl EventEmitter<DismissEvent> for DeleteConversation {}
+
+impl Focusable for DeleteConversation {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for DeleteConversation {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        ds::dialog(format!("Delete “{}”", self.record.shown_title()), cx)
+            .key_context("DeleteConversation")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
+            .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.delete(cx)))
+            .child(
+                Label::new(
+                    "Studio forgets this conversation and its open tab closes; the agent \
+                     deletes it too when it can. This cannot be undone. The graph and the \
+                     agent's branch are not touched.",
+                )
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .justify_end()
+                    .child(
+                        ds::button("cancel", "Cancel")
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+                    )
+                    .child(
+                        ds::button("delete", "Delete")
+                            .style(ButtonStyle::Filled)
+                            .color(Color::Error)
+                            .on_click(cx.listener(|this, _, _, cx| this.delete(cx))),
+                    ),
+            )
     }
 }
 

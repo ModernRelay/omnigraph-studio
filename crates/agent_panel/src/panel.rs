@@ -34,7 +34,7 @@ use ui::{
     PopoverMenu, Severity, Tooltip,
 };
 
-use crate::host::{self, HostCommand, HostEvent, Launch};
+use crate::host::{AgentLaunch, HostCommand, HostEvent, Opened, SessionLaunch};
 use crate::sessions::{AgentSessions, Live, SessionRecord};
 use crate::socket::{ToolRequest, ToolSocket};
 use crate::tools::{self, ToolCall};
@@ -263,6 +263,8 @@ impl MessageQueue {
 
 struct Host {
     commands: mpsc::UnboundedSender<HostCommand>,
+    /// Keeps the agent's process running while this conversation is open.
+    _connection: std::sync::Arc<crate::connection::AgentConnection>,
     _socket: ToolSocket,
     _tasks: Vec<Task<()>>,
 }
@@ -293,6 +295,8 @@ pub struct AgentPanel {
     session_id: Option<String>,
     /// The agent stopped with an error.
     failed: bool,
+    /// The directory the agent works in for this conversation.
+    cwd: Option<PathBuf>,
     _focus: Option<gpui::Subscription>,
     /// The options the agent offers for this session (its model, mode, reasoning level), in its
     /// order and as it last confirmed them.
@@ -425,9 +429,19 @@ impl AgentPanel {
         })
         .detach();
         let sessions = AgentSessions::global(cx);
-        // A tab title follows the conversation's title.
-        cx.observe(&sessions, |_, _, cx| cx.emit(ItemEvent::UpdateTab))
-            .detach();
+        // A tab title follows the conversation's title; a deleted conversation's tab closes.
+        cx.observe(&sessions, |this: &mut Self, sessions, cx| {
+            let deleted = this
+                .session_id
+                .as_ref()
+                .is_some_and(|id| sessions.read(cx).was_deleted(id));
+            cx.emit(if deleted {
+                ItemEvent::Close
+            } else {
+                ItemEvent::UpdateTab
+            });
+        })
+        .detach();
         // Whatever changes the conversation (a turn, an approval card, a decision), the graph's
         // list learns what it is doing now; a closed tab's agent stops with it.
         cx.observe_self(|this, cx| this.sync_live(cx)).detach();
@@ -464,6 +478,7 @@ impl AgentPanel {
             queued: None,
             session_id,
             failed: false,
+            cwd: None,
             _focus: Some(focus),
             config_options: Vec::new(),
             setting_option: None,
@@ -510,8 +525,15 @@ impl AgentPanel {
             .session_id
             .as_ref()
             .and_then(|id| self.sessions.read(cx).get(id).cloned());
-        let data = studio_settings::data_dir().join("agent");
-        let cwd = data.join("workspace");
+        // A conversation runs where it ran before; a new one in the graph's own directory.
+        let cwd = match (&saved, &self.session_id) {
+            (Some(saved), _) => saved
+                .cwd
+                .clone()
+                .unwrap_or_else(crate::sessions::legacy_cwd),
+            (None, Some(_)) => crate::sessions::legacy_cwd(),
+            (None, None) => crate::sessions::graph_cwd(&self.session.read(cx).settings_key(cx)),
+        };
         if let Err(error) = std::fs::create_dir_all(&cwd) {
             self.fail_start(
                 format!("Studio could not create {}: {error}", cwd.display()),
@@ -558,9 +580,8 @@ impl AgentPanel {
         });
         self.always_allow = false;
 
-        let launch = Launch {
-            command: settings.command,
-            env: settings.env,
+        self.cwd = Some(cwd.clone());
+        let launch = SessionLaunch {
             cwd,
             mcp_command: proxy_executable(executable),
             mcp_args: vec![
@@ -572,9 +593,20 @@ impl AgentPanel {
         let (events_tx, mut events_rx) = mpsc::unbounded();
         let (commands_tx, commands_rx) = mpsc::unbounded();
         let (tools_tx, mut tools_rx) = mpsc::unbounded::<ToolRequest>();
+        // One process per agent, shared with the graph's other conversations.
+        let connection = crate::connection::connection(
+            AgentLaunch {
+                command: settings.command,
+                env: settings.env,
+            },
+            cx,
+        );
+        if !connection.open(launch, events_tx, commands_rx) {
+            self.fail_start("The agent is not running.".into(), cx);
+            return;
+        }
 
         let serve = cx.background_spawn(socket.serve(tools_tx));
-        let connection = cx.background_spawn(host::run(launch, events_tx, commands_rx));
         let event_pump = cx.spawn(async move |this, cx| {
             while let Some(event) = events_rx.next().await {
                 if this
@@ -597,8 +629,9 @@ impl AgentPanel {
         });
         self.host = Some(Host {
             commands: commands_tx,
+            _connection: connection,
             _socket: socket,
-            _tasks: vec![serve, connection, event_pump, tool_pump],
+            _tasks: vec![serve, event_pump, tool_pump],
         });
         self.state = State::Starting;
         cx.notify();
@@ -656,12 +689,14 @@ impl AgentPanel {
             graph: self.session.read(cx).settings_key(cx),
             agent: Self::command(cx).join(" "),
             title: None,
+            title_override: None,
             created_at: now,
             updated_at: now,
             branch: branch.name.clone(),
             branch_created: branch.created,
             pinned: false,
             archived: false,
+            cwd: self.cwd.clone(),
         };
         self.sessions
             .update(cx, |sessions, cx| sessions.upsert(record, cx));
@@ -701,15 +736,21 @@ impl AgentPanel {
             HostEvent::Ready {
                 agent,
                 session,
-                resumed,
+                opened,
             } => {
                 self.session_id = Some(session);
                 self.remember_session(cx);
                 cx.emit(ItemEvent::UpdateTab);
                 // A loaded conversation replays itself and keeps its own options; a new one
                 // starts from the ones chosen last for this agent.
-                if !resumed {
-                    self.apply_preferences(cx);
+                match opened {
+                    Opened::New => self.apply_preferences(cx),
+                    Opened::Loaded => {}
+                    Opened::Resumed => self.entries.push(Entry::Notice {
+                        text: "Resumed: the agent has the earlier messages but cannot show them."
+                            .into(),
+                        error: false,
+                    }),
                 }
                 self.state = State::Ready { agent };
                 if let Some(text) = self.queued.take() {

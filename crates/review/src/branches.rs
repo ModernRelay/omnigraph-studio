@@ -324,20 +324,6 @@ fn field(editor: &Entity<Editor>, cx: &App) -> Div {
         .child(editor.clone())
 }
 
-fn dialog(title: impl Into<SharedString>, cx: &App) -> Div {
-    let colors = cx.theme().colors();
-    v_flex()
-        .w(px(440.))
-        .p_4()
-        .gap_3()
-        .rounded_lg()
-        .bg(colors.elevated_surface_background)
-        .border_1()
-        .border_color(colors.border)
-        .shadow_lg()
-        .child(Headline::new(title.into()).size(HeadlineSize::Small))
-}
-
 /// "New branch": a name, created from the current branch, then switched to.
 pub struct CreateBranchModal {
     session: Entity<GraphSession>,
@@ -438,7 +424,7 @@ impl Render for CreateBranchModal {
             },
             self.from
         );
-        dialog(format!("New branch from {}", self.from), cx)
+        studio_ui::ds::dialog(format!("New branch from {}", self.from), cx)
             .key_context("CreateBranchModal")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
@@ -576,7 +562,7 @@ impl Render for DeleteBranchModal {
         } else {
             None
         };
-        dialog(format!("Delete branch {}", self.branch), cx)
+        studio_ui::ds::dialog(format!("Delete branch {}", self.branch), cx)
             .key_context("DeleteBranchModal")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))

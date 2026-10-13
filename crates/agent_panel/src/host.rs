@@ -1,23 +1,27 @@
-//! The ACP host (spec 011): spawns the agent, speaks ACP v1 to it, and turns its traffic into
-//! [`HostEvent`]s for the panel. Runs off the main thread; the panel talks to it through
-//! channels.
+//! The ACP host (spec 011): one process per agent, speaking ACP v1, serving every conversation
+//! Studio has open with that agent, as Zed keeps one connection per agent server. Each
+//! conversation opens a session on the connection and gets its traffic as [`HostEvent`]s, routed
+//! by session id; the connection also lists and deletes the agent's sessions when it can.
+//! Runs off the main thread; the panels talk to it through channels. The process stops when the
+//! last handle to it is dropped.
 //!
 //! ACP request handlers hold the connection's dispatch loop until they return, so a permission
 //! request that waits for the person is answered from a task spawned on the connection.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities,
-    ClientSessionCapabilities, ContentBlock, Implementation, InitializeRequest, LoadSessionRequest,
-    McpServer, McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest,
+    ClientSessionCapabilities, CloseSessionRequest, ContentBlock, DeleteSessionRequest,
+    Implementation, InitializeRequest, ListSessionsRequest, LoadSessionRequest, McpServer,
+    McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigOptionValue,
-    SessionConfigOptionsCapabilities, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, StopReason, TextContent,
+    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigId, SessionConfigOption,
+    SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionId, SessionInfo,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason, TextContent,
 };
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo, LineDirection};
 use futures::StreamExt as _;
@@ -29,29 +33,58 @@ use crate::tools;
 const STDERR_LINES: usize = 20;
 /// Bytes of the agent's stderr kept for the "stopped" state.
 const STDERR_BYTES: usize = 4096;
+/// Updates kept for a session the connection has not been told about yet: an agent may report
+/// on a session before its `session/new` answer has been read.
+const EARLY_UPDATES: usize = 256;
+/// Pages of `session/list` read at most.
+const LIST_PAGES: usize = 20;
 
-/// How to start the agent.
-#[derive(Debug, Clone)]
-pub struct Launch {
+/// How to start an agent: one process for all of its conversations.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AgentLaunch {
     /// The program and its arguments.
     pub command: Vec<String>,
     pub env: BTreeMap<String, String>,
-    /// The agent's working directory.
+}
+
+/// One conversation on the agent.
+#[derive(Debug, Clone)]
+pub struct SessionLaunch {
+    /// The session's working directory.
     pub cwd: PathBuf,
-    /// The stdio MCP server the agent starts: Studio's own executable as `mcp-proxy`.
+    /// The stdio MCP server the agent starts for it: Studio's own executable as `mcp-proxy`,
+    /// with the conversation's own socket.
     pub mcp_command: PathBuf,
     pub mcp_args: Vec<String>,
-    /// A session to come back to, when the agent can load one.
+    /// A session to come back to, when the agent can load or resume one.
     pub resume: Option<String>,
 }
 
+/// What the agent said about itself when it started.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AgentInfo {
+    name: String,
+    /// `session/list` and `session/delete`.
+    list: bool,
+    delete: bool,
+}
+
+/// How a conversation came back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Opened {
+    New,
+    /// Loaded: its messages arrive as updates before `Ready`.
+    Loaded,
+    /// Resumed without its messages; the agent knows them, Studio does not show them.
+    Resumed,
+}
+
 pub enum HostEvent {
-    /// The session is open: `resumed` when an earlier one was loaded (its messages arrive as
-    /// updates before this), else a new one.
+    /// The session is open.
     Ready {
         agent: String,
         session: String,
-        resumed: bool,
+        opened: Opened,
     },
     Update(SessionUpdate),
     /// The agent asks to use a tool that is not Studio's. Answer through `reply`; dropping it
@@ -88,15 +121,75 @@ pub enum HostCommand {
     },
 }
 
-/// Runs one agent session until the command channel closes or the agent exits. Dropping the
-/// future kills the agent's process group.
-pub async fn run(
-    launch: Launch,
-    events: mpsc::UnboundedSender<HostEvent>,
-    commands: mpsc::UnboundedReceiver<HostCommand>,
-) {
+/// What the connection is asked to do.
+pub enum ConnectionCommand {
+    /// Opens a conversation: its traffic goes to `events`, and it takes `commands` until they
+    /// close, when the agent may let the session go.
+    Open {
+        launch: SessionLaunch,
+        events: mpsc::UnboundedSender<HostEvent>,
+        commands: mpsc::UnboundedReceiver<HostCommand>,
+    },
+    /// The agent's sessions in `cwd`, when it can list them.
+    List {
+        cwd: PathBuf,
+        reply: oneshot::Sender<Result<Vec<SessionInfo>, String>>,
+    },
+    /// Deletes a session at the agent, when it can.
+    Delete {
+        session: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+}
+
+/// Where each session's traffic goes, and what arrived before the session was known.
+#[derive(Default)]
+struct Routes {
+    sessions: HashMap<SessionId, mpsc::UnboundedSender<HostEvent>>,
+    early: HashMap<SessionId, VecDeque<SessionUpdate>>,
+}
+
+impl Routes {
+    fn update(&mut self, session: SessionId, update: SessionUpdate) {
+        match self.sessions.get(&session) {
+            Some(events) => {
+                events.unbounded_send(HostEvent::Update(update)).ok();
+            }
+            None => {
+                let early = self.early.entry(session).or_default();
+                if early.len() < EARLY_UPDATES {
+                    early.push_back(update);
+                }
+            }
+        }
+    }
+
+    fn add(&mut self, session: SessionId, events: mpsc::UnboundedSender<HostEvent>) {
+        for update in self.early.remove(&session).unwrap_or_default() {
+            events.unbounded_send(HostEvent::Update(update)).ok();
+        }
+        self.sessions.insert(session, events);
+    }
+}
+
+type SharedRoutes = Arc<Mutex<Routes>>;
+/// Conversations asked to open but not yet routed: they hear an exit too.
+type Opening = Arc<Mutex<Vec<mpsc::UnboundedSender<HostEvent>>>>;
+
+/// Runs one agent until every handle to it is dropped or it exits; then every open conversation
+/// hears why. Dropping the future kills the agent's process group.
+pub async fn run(launch: AgentLaunch, commands: mpsc::UnboundedReceiver<ConnectionCommand>) {
     let stderr = Arc::new(Mutex::new(VecDeque::<String>::new()));
-    let result = connect(launch, events.clone(), commands, stderr.clone()).await;
+    let routes = SharedRoutes::default();
+    let opening = Opening::default();
+    let result = connect(
+        launch,
+        commands,
+        stderr.clone(),
+        routes.clone(),
+        opening.clone(),
+    )
+    .await;
     let failed = result.is_err();
     let message = match result {
         Ok(()) => "The agent session ended.".to_owned(),
@@ -106,20 +199,28 @@ pub async fn run(
         .lock()
         .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join("\n"))
         .unwrap_or_default();
-    events
-        .unbounded_send(HostEvent::Exited {
-            message,
-            stderr,
-            failed,
-        })
-        .ok();
+    let mut listeners: Vec<_> = routes
+        .lock()
+        .map(|routes| routes.sessions.values().cloned().collect())
+        .unwrap_or_default();
+    listeners.extend(opening.lock().map(|o| o.clone()).unwrap_or_default());
+    for events in listeners {
+        events
+            .unbounded_send(HostEvent::Exited {
+                message: message.clone(),
+                stderr: stderr.clone(),
+                failed,
+            })
+            .ok();
+    }
 }
 
 async fn connect(
-    launch: Launch,
-    events: mpsc::UnboundedSender<HostEvent>,
-    mut commands: mpsc::UnboundedReceiver<HostCommand>,
+    launch: AgentLaunch,
+    mut commands: mpsc::UnboundedReceiver<ConnectionCommand>,
     stderr: Arc<Mutex<VecDeque<String>>>,
+    routes: SharedRoutes,
+    opening: Opening,
 ) -> Result<(), agent_client_protocol::Error> {
     let Some((program, args)) = launch.command.split_first() else {
         return Err(agent_client_protocol::Error::invalid_params().data("no agent command is set"));
@@ -143,16 +244,16 @@ async fn connect(
         }
     });
 
-    let updates = events.clone();
-    let permissions = events.clone();
+    let updates = routes.clone();
+    let permissions = routes.clone();
     agent_client_protocol::Client
         .builder()
         .name("omnigraph-studio")
         .on_receive_notification(
             async move |notification: SessionNotification, _connection| {
-                updates
-                    .unbounded_send(HostEvent::Update(notification.update))
-                    .ok();
+                if let Ok(mut routes) = updates.lock() {
+                    routes.update(notification.session_id, notification.update);
+                }
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
@@ -176,10 +277,17 @@ async fn connect(
                     };
                     return responder.respond(RequestPermissionResponse::new(outcome));
                 }
+                let events = permissions
+                    .lock()
+                    .ok()
+                    .and_then(|routes| routes.sessions.get(&request.session_id).cloned());
                 let (reply, decision) = oneshot::channel();
-                permissions
-                    .unbounded_send(HostEvent::Permission { request, reply })
-                    .ok();
+                if let Some(events) = events {
+                    events
+                        .unbounded_send(HostEvent::Permission { request, reply })
+                        .ok();
+                }
+                // No conversation to ask: the dropped reply answers "cancelled".
                 connection.spawn(async move {
                     let outcome = decision
                         .await
@@ -209,101 +317,74 @@ async fn connect(
                 )
                 .block_task()
                 .await?;
-            let agent_name = initialized
-                .agent_info
-                .map(|info| info.title.unwrap_or(info.name))
-                .unwrap_or_else(|| "Agent".to_owned());
-
-            let mcp = McpServerStdio::new("omnigraph", launch.mcp_command.clone())
-                .args(launch.mcp_args.clone());
-            // Come back to the earlier conversation when the agent can load it; a session it no
-            // longer knows starts a new one.
-            let can_load = initialized.agent_capabilities.load_session;
-            let mut resumed = None;
-            let mut config_options = Vec::new();
-            if let Some(id) = launch.resume.clone().filter(|_| can_load) {
-                let loaded = connection
-                    .send_request(
-                        LoadSessionRequest::new(SessionId::new(id.clone()), launch.cwd.clone())
-                            .mcp_servers(vec![McpServer::Stdio(mcp.clone())]),
-                    )
-                    .block_task()
-                    .await;
-                if let Ok(loaded) = loaded {
-                    resumed = Some(SessionId::new(id));
-                    config_options = loaded.config_options.unwrap_or_default();
-                }
-            }
-            let session_id = match resumed.clone() {
-                Some(id) => id,
-                None => {
-                    let created = connection
-                        .send_request(
-                            NewSessionRequest::new(launch.cwd.clone())
-                                .mcp_servers(vec![McpServer::Stdio(mcp)]),
-                        )
-                        .block_task()
-                        .await?;
-                    config_options = created.config_options.unwrap_or_default();
-                    created.session_id
-                }
+            let capabilities = &initialized.agent_capabilities;
+            let sessions = &capabilities.session_capabilities;
+            let agent = AgentInfo {
+                name: initialized
+                    .agent_info
+                    .clone()
+                    .map(|info| info.title.unwrap_or(info.name))
+                    .unwrap_or_else(|| "Agent".to_owned()),
+                list: sessions.list.is_some(),
+                delete: sessions.delete.is_some(),
             };
-            events
-                .unbounded_send(HostEvent::ConfigOptions(config_options))
-                .ok();
-            events
-                .unbounded_send(HostEvent::Ready {
-                    agent: agent_name,
-                    session: session_id.0.to_string(),
-                    resumed: resumed.is_some(),
-                })
-                .ok();
+            let can = Can {
+                load: capabilities.load_session,
+                resume: sessions.resume.is_some(),
+                close: sessions.close.is_some(),
+            };
 
             while let Some(command) = commands.next().await {
                 match command {
-                    HostCommand::Prompt(text) => {
-                        let connection_for_turn = connection.clone();
-                        let session_id = session_id.clone();
-                        let events = events.clone();
+                    ConnectionCommand::Open {
+                        launch,
+                        events,
+                        commands,
+                    } => {
+                        if let Ok(mut opening) = opening.lock() {
+                            opening.push(events.clone());
+                        }
+                        let session = open_session(
+                            connection.clone(),
+                            launch,
+                            events,
+                            commands,
+                            (routes.clone(), opening.clone()),
+                            agent.name.clone(),
+                            can,
+                        );
+                        connection.spawn(session)?;
+                    }
+                    ConnectionCommand::List { cwd, reply } => {
+                        let connection_for_list = connection.clone();
+                        let can_list = agent.list;
                         connection.spawn(async move {
-                            let response = connection_for_turn
-                                .send_request(PromptRequest::new(
-                                    session_id,
-                                    vec![ContentBlock::Text(TextContent::new(text))],
-                                ))
-                                .block_task()
-                                .await;
-                            let stop = response
-                                .map(|response| response.stop_reason)
-                                .map_err(|error| error.to_string());
-                            events.unbounded_send(HostEvent::TurnEnded { stop }).ok();
+                            let result = if can_list {
+                                list_sessions(&connection_for_list, cwd).await
+                            } else {
+                                Err("The agent cannot list its conversations.".to_owned())
+                            };
+                            reply.send(result).ok();
                             Ok(())
                         })?;
                     }
-                    HostCommand::Cancel => {
-                        connection
-                            .send_notification(CancelNotification::new(session_id.clone()))?;
-                    }
-                    HostCommand::SetConfigOption { id, value } => {
-                        let connection_for_set = connection.clone();
-                        let session_id = session_id.clone();
-                        let events = events.clone();
+                    ConnectionCommand::Delete { session, reply } => {
+                        let connection_for_delete = connection.clone();
+                        let can_delete = agent.delete;
                         connection.spawn(async move {
-                            let response = connection_for_set
-                                .send_request(SetSessionConfigOptionRequest::new(
-                                    session_id,
-                                    SessionConfigId::new(id),
-                                    value,
-                                ))
-                                .block_task()
-                                .await;
-                            let event = match response {
-                                Ok(response) => HostEvent::ConfigOptions(response.config_options),
-                                Err(error) => HostEvent::ConfigOptionFailed {
-                                    message: error.to_string(),
-                                },
+                            let result = if can_delete {
+                                connection_for_delete
+                                    .send_request(DeleteSessionRequest::new(SessionId::new(
+                                        session,
+                                    )))
+                                    .block_task()
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(|error| error.to_string())
+                            } else {
+                                Err("The agent cannot delete its conversations.".to_owned())
                             };
-                            events.unbounded_send(event).ok();
+                            reply.send(result).ok();
                             Ok(())
                         })?;
                     }
@@ -312,4 +393,241 @@ async fn connect(
             Ok(())
         })
         .await
+}
+
+/// What the agent can do with an earlier session.
+#[derive(Debug, Clone, Copy)]
+struct Can {
+    load: bool,
+    resume: bool,
+    close: bool,
+}
+
+/// Opens one conversation and serves it until its panel lets go.
+async fn open_session(
+    connection: ConnectionTo<Agent>,
+    launch: SessionLaunch,
+    events: mpsc::UnboundedSender<HostEvent>,
+    mut commands: mpsc::UnboundedReceiver<HostCommand>,
+    (routes, opening): (SharedRoutes, Opening),
+    agent_name: String,
+    can: Can,
+) -> Result<(), agent_client_protocol::Error> {
+    let opened_or_failed = |opening: &Opening| {
+        if let Ok(mut opening) = opening.lock() {
+            opening.retain(|waiting| !waiting.same_receiver(&events));
+        }
+    };
+    let mcp =
+        McpServerStdio::new("omnigraph", launch.mcp_command.clone()).args(launch.mcp_args.clone());
+    let mcp_servers = vec![McpServer::Stdio(mcp)];
+    // Come back to the earlier conversation when the agent can load it (with its messages) or
+    // resume it (without); one it no longer knows starts anew.
+    let mut opened = None;
+    let mut config_options = Vec::new();
+    if let Some(id) = launch.resume.clone() {
+        let id = SessionId::new(id);
+        if can.load {
+            // The replay arrives as updates while the load runs.
+            if let Ok(mut routes) = routes.lock() {
+                routes.add(id.clone(), events.clone());
+            }
+            let loaded = connection
+                .send_request(
+                    LoadSessionRequest::new(id.clone(), launch.cwd.clone())
+                        .mcp_servers(mcp_servers.clone()),
+                )
+                .block_task()
+                .await;
+            match loaded {
+                Ok(loaded) => {
+                    opened = Some((id.clone(), Opened::Loaded));
+                    config_options = loaded.config_options.unwrap_or_default();
+                }
+                Err(_) => {
+                    if let Ok(mut routes) = routes.lock() {
+                        routes.sessions.remove(&id);
+                    }
+                }
+            }
+        } else if can.resume {
+            let resumed = connection
+                .send_request(
+                    ResumeSessionRequest::new(id.clone(), launch.cwd.clone())
+                        .mcp_servers(mcp_servers.clone()),
+                )
+                .block_task()
+                .await;
+            if let Ok(resumed) = resumed {
+                opened = Some((id.clone(), Opened::Resumed));
+                config_options = resumed.config_options.unwrap_or_default();
+            }
+        }
+    }
+    let (session_id, opened) = match opened {
+        Some(opened) => opened,
+        None => {
+            let created = connection
+                .send_request(NewSessionRequest::new(launch.cwd.clone()).mcp_servers(mcp_servers))
+                .block_task()
+                .await;
+            match created {
+                Ok(created) => {
+                    config_options = created.config_options.unwrap_or_default();
+                    (created.session_id, Opened::New)
+                }
+                Err(error) => {
+                    opened_or_failed(&opening);
+                    events
+                        .unbounded_send(HostEvent::Exited {
+                            message: format!("The agent could not open a conversation: {error}"),
+                            stderr: String::new(),
+                            failed: true,
+                        })
+                        .ok();
+                    return Ok(());
+                }
+            }
+        }
+    };
+    if let Ok(mut routes) = routes.lock() {
+        routes.add(session_id.clone(), events.clone());
+    }
+    opened_or_failed(&opening);
+    events
+        .unbounded_send(HostEvent::ConfigOptions(config_options))
+        .ok();
+    events
+        .unbounded_send(HostEvent::Ready {
+            agent: agent_name,
+            session: session_id.0.to_string(),
+            opened,
+        })
+        .ok();
+
+    while let Some(command) = commands.next().await {
+        match command {
+            HostCommand::Prompt(text) => {
+                let connection_for_turn = connection.clone();
+                let session_id = session_id.clone();
+                let events = events.clone();
+                connection.spawn(async move {
+                    let response = connection_for_turn
+                        .send_request(PromptRequest::new(
+                            session_id,
+                            vec![ContentBlock::Text(TextContent::new(text))],
+                        ))
+                        .block_task()
+                        .await;
+                    let stop = response
+                        .map(|response| response.stop_reason)
+                        .map_err(|error| error.to_string());
+                    events.unbounded_send(HostEvent::TurnEnded { stop }).ok();
+                    Ok(())
+                })?;
+            }
+            HostCommand::Cancel => {
+                connection.send_notification(CancelNotification::new(session_id.clone()))?;
+            }
+            HostCommand::SetConfigOption { id, value } => {
+                let connection_for_set = connection.clone();
+                let session_id = session_id.clone();
+                let events = events.clone();
+                connection.spawn(async move {
+                    let response = connection_for_set
+                        .send_request(SetSessionConfigOptionRequest::new(
+                            session_id,
+                            SessionConfigId::new(id),
+                            value,
+                        ))
+                        .block_task()
+                        .await;
+                    let event = match response {
+                        Ok(response) => HostEvent::ConfigOptions(response.config_options),
+                        Err(error) => HostEvent::ConfigOptionFailed {
+                            message: error.to_string(),
+                        },
+                    };
+                    events.unbounded_send(event).ok();
+                    Ok(())
+                })?;
+            }
+        }
+    }
+    // The panel let go: the agent may free the session.
+    if let Ok(mut routes) = routes.lock() {
+        routes.sessions.remove(&session_id);
+    }
+    if can.close {
+        connection
+            .send_request(CloseSessionRequest::new(session_id))
+            .block_task()
+            .await
+            .ok();
+    }
+    Ok(())
+}
+
+/// Every page of the agent's sessions in `cwd`, up to a bound.
+async fn list_sessions(
+    connection: &ConnectionTo<Agent>,
+    cwd: PathBuf,
+) -> Result<Vec<SessionInfo>, String> {
+    let mut sessions = Vec::new();
+    let mut cursor = None;
+    for _ in 0..LIST_PAGES {
+        let page = connection
+            .send_request(ListSessionsRequest::new().cwd(cwd.clone()).cursor(cursor))
+            .block_task()
+            .await
+            .map_err(|error| error.to_string())?;
+        sessions.extend(page.sessions);
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    Ok(sessions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_client_protocol::schema::v1::{ContentChunk, TextContent};
+
+    fn chunk(text: &str) -> SessionUpdate {
+        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
+            text,
+        ))))
+    }
+
+    #[test]
+    fn updates_go_to_their_session_and_early_ones_wait() {
+        let mut routes = Routes::default();
+        let (a_tx, mut a_rx) = mpsc::unbounded();
+        let (b_tx, mut b_rx) = mpsc::unbounded();
+        routes.add(SessionId::new("a"), a_tx);
+        routes.update(SessionId::new("a"), chunk("for a"));
+        // Before "b" is known its update waits, then arrives first.
+        routes.update(SessionId::new("b"), chunk("early for b"));
+        routes.add(SessionId::new("b"), b_tx);
+        routes.update(SessionId::new("b"), chunk("for b"));
+        let text = |event: Option<HostEvent>| match event {
+            Some(HostEvent::Update(SessionUpdate::AgentMessageChunk(chunk))) => match chunk.content
+            {
+                ContentBlock::Text(text) => text.text,
+                _ => String::new(),
+            },
+            _ => String::new(),
+        };
+        assert_eq!(text(a_rx.try_recv().ok()), "for a");
+        assert!(a_rx.try_recv().is_err(), "a hears nothing of b");
+        assert_eq!(text(b_rx.try_recv().ok()), "early for b");
+        assert_eq!(text(b_rx.try_recv().ok()), "for b");
+        // A session nobody opens keeps a bounded number of updates.
+        for _ in 0..EARLY_UPDATES + 10 {
+            routes.update(SessionId::new("c"), chunk("x"));
+        }
+        assert_eq!(routes.early[&SessionId::new("c")].len(), EARLY_UPDATES);
+    }
 }

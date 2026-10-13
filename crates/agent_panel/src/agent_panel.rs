@@ -4,6 +4,7 @@
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/011-agent-panel/plan.md`.
 
+mod connection;
 mod host;
 mod mcp;
 mod panel;

@@ -494,10 +494,12 @@ pub fn sidebar_placeholder(
 
 /// A one-line waiting state inside a sidebar section ("Reading types…").
 pub fn sidebar_note(label: impl Into<SharedString>) -> Div {
+    // A row tall at least, and wrapping when the note is longer than the sidebar is wide.
     div()
         .mx(px(space::SM))
         .px(px(space::SM))
-        .h(px(size::SIDEBAR_ROW))
+        .py(px(space::XS))
+        .min_h(px(size::SIDEBAR_ROW))
         .flex()
         .items_center()
         .child(text::muted(label))
@@ -792,6 +794,22 @@ pub fn key_hint(
         .flex_none()
         .child(ui::KeyBinding::for_action_in(action, focus, cx).size(rems_from_px(11_f32)))
         .child(text::meta(label))
+}
+
+/// A modal dialog's frame: a raised sheet with its title; the body and the buttons (Cancel, then
+/// the action) follow as children.
+pub fn dialog(title: impl Into<SharedString>, cx: &App) -> Div {
+    let colors = cx.theme().colors();
+    v_flex()
+        .w(px(440.))
+        .p_4()
+        .gap_3()
+        .rounded_lg()
+        .bg(colors.elevated_surface_background)
+        .border_1()
+        .border_color(colors.border)
+        .shadow_lg()
+        .child(Headline::new(title.into()).size(HeadlineSize::Small))
 }
 
 /// A bordered block of code or a command, as Delta draws edits and commands in a thread.

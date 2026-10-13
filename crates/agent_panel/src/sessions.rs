@@ -28,6 +28,9 @@ pub struct SessionRecord {
     /// The agent's title for it, else the start of the first message.
     #[serde(default)]
     pub title: Option<String>,
+    /// The person's own name for it, which wins over the agent's.
+    #[serde(default)]
+    pub title_override: Option<String>,
     pub created_at: DateTime<Utc>,
     /// The last message the person sent. The list sorts by it, as Zed's sorts by the last
     /// interaction, so a conversation finishing in the background does not move its row.
@@ -40,12 +43,19 @@ pub struct SessionRecord {
     pub pinned: bool,
     #[serde(default)]
     pub archived: bool,
+    /// The directory the agent worked in for it; none for conversations from before each graph
+    /// had its own, which ran in [`legacy_cwd`].
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
 }
 
 impl SessionRecord {
     /// The title to show.
     pub fn shown_title(&self) -> &str {
-        self.title.as_deref().unwrap_or("New conversation")
+        self.title_override
+            .as_deref()
+            .or(self.title.as_deref())
+            .unwrap_or("New conversation")
     }
 }
 
@@ -66,6 +76,8 @@ pub struct AgentSessions {
     live: HashMap<String, Live>,
     /// Conversations whose turn ended while their tab was not the one shown.
     unread: HashSet<String>,
+    /// Conversations deleted in this run: an open tab of one closes.
+    deleted: HashSet<String>,
 }
 
 struct GlobalSessions(Entity<AgentSessions>);
@@ -93,6 +105,7 @@ impl AgentSessions {
             records,
             live: HashMap::new(),
             unread: HashSet::new(),
+            deleted: HashSet::new(),
         }
     }
 
@@ -142,6 +155,9 @@ impl AgentSessions {
                 existing.branch = record.branch;
                 existing.branch_created = record.branch_created;
                 existing.archived = false;
+                if existing.cwd.is_none() {
+                    existing.cwd = record.cwd;
+                }
             }
             None => self.records.push(record),
         }
@@ -194,6 +210,48 @@ impl AgentSessions {
         self.update(session, |record| record.archived = archived, cx);
     }
 
+    /// The person's name for it; an empty one gives the agent's back.
+    pub fn rename(&mut self, session: &str, title: &str, cx: &mut Context<Self>) {
+        let title = title.trim();
+        self.update(
+            session,
+            |record| {
+                record.title_override = (!title.is_empty()).then(|| title.to_owned());
+            },
+            cx,
+        );
+    }
+
+    /// Forgets a conversation; its open tab closes.
+    pub fn remove(&mut self, session: &str, cx: &mut Context<Self>) {
+        self.records.retain(|record| record.session != session);
+        self.live.remove(session);
+        self.unread.remove(session);
+        self.deleted.insert(session.to_owned());
+        self.save();
+        cx.notify();
+    }
+
+    pub fn was_deleted(&self, session: &str) -> bool {
+        self.deleted.contains(session)
+    }
+
+    /// Adds conversations the agent knows and the list does not; returns how many were new.
+    pub fn import(&mut self, records: Vec<SessionRecord>, cx: &mut Context<Self>) -> usize {
+        let mut added = 0;
+        for record in records {
+            if self.get(&record.session).is_none() && !self.deleted.contains(&record.session) {
+                self.records.push(record);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.save();
+            cx.notify();
+        }
+        added
+    }
+
     pub fn live(&self, session: &str) -> Option<Live> {
         self.live.get(session).copied()
     }
@@ -223,6 +281,29 @@ impl AgentSessions {
             cx.notify();
         }
     }
+}
+
+/// The directory an agent works in for a graph: its own, so the agent's list of sessions in it
+/// is the graph's. The name is the graph's key made safe, and a stable hash of the key so two
+/// keys never share one.
+pub fn graph_cwd(graph: &str) -> PathBuf {
+    let slug: String = graph
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    // FNV-1a: stable across Rust versions, unlike the standard hasher.
+    let hash = graph.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+    });
+    studio_settings::data_dir()
+        .join("agent")
+        .join("graphs")
+        .join(format!("{slug}-{hash:08x}"))
+}
+
+/// Where conversations ran before each graph had a directory of its own.
+pub fn legacy_cwd() -> PathBuf {
+    studio_settings::data_dir().join("agent").join("workspace")
 }
 
 /// The first line of a message, cut to a title's length on a character.
@@ -264,6 +345,7 @@ fn read_records(path: &Path) -> Vec<SessionRecord> {
                 graph: graph.to_owned(),
                 agent: agent.to_owned(),
                 title: None,
+                title_override: None,
                 created_at: now,
                 updated_at: now,
                 branch: record.get("branch")?.as_str()?.to_owned(),
@@ -273,6 +355,7 @@ fn read_records(path: &Path) -> Vec<SessionRecord> {
                     .unwrap_or(false),
                 pinned: false,
                 archived: false,
+                cwd: None,
             })
         })
         .collect()
@@ -351,13 +434,23 @@ mod tests {
             graph: graph.into(),
             agent: agent.into(),
             title: None,
+            title_override: None,
             created_at: at,
             updated_at: at,
             branch: format!("agent/{session}"),
             branch_created: false,
             pinned: false,
             archived: false,
+            cwd: None,
         }
+    }
+
+    #[test]
+    fn each_graph_has_a_directory_of_its_own() {
+        let a = graph_cwd("server/crm");
+        assert_eq!(a, graph_cwd("server/crm"));
+        assert_ne!(a, graph_cwd("server-crm"));
+        assert!(a.to_string_lossy().contains("server-crm-"));
     }
 
     #[gpui::test]
@@ -375,6 +468,7 @@ mod tests {
             store.suggest_title("old", "a later message", cx);
             store.set_title("new", "Count people".into(), cx);
             store.set_archived("codex", true, cx);
+            store.rename("new", "  People count ", cx);
         });
         store.read_with(cx, |store, _| {
             let ids: Vec<_> = store
@@ -385,13 +479,29 @@ mod tests {
             assert_eq!(ids, ["new", "old"]);
             assert_eq!(store.archived("server/crm").len(), 1);
             assert_eq!(store.get("old").unwrap().shown_title(), "How many people?");
-            assert_eq!(store.get("new").unwrap().shown_title(), "Count people");
+            assert_eq!(store.get("new").unwrap().shown_title(), "People count");
             assert_eq!(store.latest("server/crm", "claude").unwrap().session, "new");
             assert!(store.latest("server/crm", "codex").is_none());
+        });
+        // An empty name gives the agent's back; a removed one stays out of an import.
+        store.update(cx, |store, cx| {
+            store.rename("new", " ", cx);
+            store.remove("old", cx);
+            let again = vec![
+                record("old", "server/crm", "claude", 0),
+                record("fresh", "server/crm", "claude", 0),
+            ];
+            assert_eq!(store.import(again, cx), 1);
+        });
+        store.read_with(cx, |store, _| {
+            assert_eq!(store.get("new").unwrap().shown_title(), "Count people");
+            assert!(store.get("old").is_none() && store.was_deleted("old"));
+            assert!(store.get("fresh").is_some());
         });
         // What was written comes back, owner-only.
         let reloaded = AgentSessions::load(path.clone());
         assert_eq!(reloaded.records.len(), 4);
+        assert!(reloaded.get("old").is_none());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

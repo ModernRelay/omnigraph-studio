@@ -199,9 +199,18 @@ and Delta's sidebar.
   with its conversation. ⌘⇧A shows an open agent tab, else the graph's last conversation with
   the agent, else a new one. New conversation (sidebar, model menu, `studio_agent::NewConversation`)
   opens a new tab and leaves the earlier conversation where it is. ↻ appears only after the
-  agent stopped and starts it again on the same conversation. Each tab runs its own agent
-  process; one process serving every conversation (ACP allows several sessions per connection)
-  is deferred.
+  agent stopped and starts it again on the same conversation.
+- **One process per agent.** As Zed keeps one connection per agent server, every conversation
+  with an agent (same command and environment) opens a session on one process; the host routes
+  each session's updates and permission requests by session id, holds updates that arrive
+  before a session is known (up to 256), and asks the agent to close a session (`session/close`,
+  when it can) when its tab closes. The process stops when the last conversation and the panel
+  let go of it, and is started again on the next use. A conversation the agent cannot load but
+  can resume (`session/resume`) comes back without its messages, with a note.
+- **Each graph's own directory.** A new conversation runs in `agent/graphs/<graph>-<hash>` in the
+  data directory (the key made safe plus a stable FNV-1a hash), so an agent's `session/list` in
+  it is the graph's conversations. A conversation keeps the directory it started in (recorded
+  with it); earlier ones ran in the shared `agent/workspace`.
 - **The Conversations panel** is a tab of the left sidebar (the agent mark;
   `studio_agent::ShowConversations`), after Delta's threads list: "New conversation", then
   Pinned and Recent (labels only when something is pinned), each row the title and, at the
@@ -215,6 +224,15 @@ and Delta's sidebar.
   archive sends nothing), and Archived folds away at the end with a count, where Undo brings a
   row back. The tooltip has the title, the agent and the last activity. What a conversation is
   doing and whether it was seen live in memory only.
+- A right click on a row offers Rename, Pin or Unpin, Archive or Restore, and Delete…. Rename
+  edits the title in place (↩ or leaving the field keeps it, ⎋ drops it); the person's title
+  wins over the agent's, and an empty one gives the agent's back. Delete… asks first, in a
+  dialog: Studio forgets the conversation and its open tab closes, and the agent deletes it with
+  `session/delete` when it can (otherwise the note says why); the graph and the agent's branch
+  are not touched. A search field appears once the list holds six conversations; it matches
+  titles and agent names and looks through the archive too. "Import from the agent" asks the
+  agent for its sessions in the graph's directory (`session/list`, every page up to 20) and adds
+  the ones the list lacks, titled and dated as the agent reports; the note says how many.
 - A loaded conversation keeps writing to its branch and keeps its own options; a new one starts
   from the options chosen last for the agent.
 
@@ -270,9 +288,6 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 - Windows: the proxy uses Unix sockets. Windows support waits for a named-pipe transport.
 - Agent-attributed commits: commits are recorded under the person's actor. Recording "on
   behalf of an agent" needs an engine change, E20 in `docs/deferred-engine-changes.md`.
-- One agent process for every conversation of an agent: today each tab starts its own.
-- Renaming a conversation, deleting it at the agent (`session/delete`), importing the agent's
-  sessions (`session/list`), and searching the list; Zed has all four.
 - Steering (ending a turn at the next tool boundary for a queued message): Zed does it only for
   its own agent; ACP cannot express it.
 
@@ -296,6 +311,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 | 2026-10-12 | A query the agent runs shows as code | Offscreen snapshot with the test agent reporting `rawInput` for its count query | "Query people ⌄" over the four-line query in a card, keywords, the query name and `Person` in the theme's syntax colours; the schema read stayed folded as "Read the schema ›" |
 | 2026-10-12 | Conversations are listed per graph and run side by side | `agent_panel` tests `conversations_are_kept_per_graph_newest_first`, `the_first_format_becomes_records`, `times_read_short`; offscreen snapshots with the test agent (now with a "slow" turn): two and three conversations in tabs, a hovered row, a pin, a slow turn finishing behind another tab, a restart | Tabs titled "How many people are there?" and "List the companies by size"; the shown one selected in the panel with "now"; hover showed pin and archive; the pinned row moved under Pinned; the slow conversation showed a turning circle while running and an accent dot after finishing unseen; after a restart both tabs came back and the shown one replayed |
 | 2026-10-12 | Messages sent while the agent works are queued and sent in order | `agent_panel` test `the_queue_sends_in_order_pauses_on_stop_and_lets_send_now_jump_it`; offscreen snapshots with the test agent's slow turn: two messages queued behind it, then the transcript the agent kept; then one queued and one sent with ⌘⇧↩ | The card read "2 queued messages", the next one dotted with Send now; the agent received the three in order; with ⌘⇧↩ it received the urgent one second and the queued one third |
+| 2026-10-12 | One agent process serves every conversation; the list renames, searches, deletes and imports | `agent_panel` tests `updates_go_to_their_session_and_early_ones_wait`, `conversations_are_kept_per_graph_newest_first` (rename, remove, import), `each_graph_has_a_directory_of_its_own`; offscreen snapshots with the test agent (one process for every session, `session/list`, `session/delete`, `session/close`), counting its processes | Two conversations ran on one test-agent process, each with its own tools, in `agent/graphs/environment-knowledge-2998657d`; with two records dropped, Import brought both back ("Imported 2 conversations."); Rename showed "Best-connected people"; "people" left two rows; Delete… asked, removed the row, and the agent deleted its transcript (6 to 5); a session the agent did not know left "Removed here; the agent did not delete it" |
 
 ## Corrections
 

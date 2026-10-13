@@ -9,7 +9,7 @@
 //! the previous one settles. `type:<text>` types text into the focused editor (`\n` is a new
 //! line); it is `editor::HandleInput` with the text. `click:<x>,<y>` clicks at a point in
 //! window pixels (half the PNG's, which is drawn at 2x), with `,cmd` or `,shift` held when
-//! added; `hover:<x>,<y>` moves the pointer there and rests; `key:<keystroke>` presses keys as the keymap sees them (`key:tab`, `key:cmd-4`);
+//! added and `,right` for the secondary button; `hover:<x>,<y>` moves the pointer there and rests; `key:<keystroke>` presses keys as the keymap sees them (`key:tab`, `key:cmd-4`);
 //! `drag:<x1>,<y1>,<x2>,<y2>` presses at
 //! the first point, moves to the second in steps, and releases. `SNAPSHOT_WAIT_MS` (default 1500) is how
 //! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
@@ -73,6 +73,7 @@ fn click(
     handle: AnyWindowHandle,
     position: gpui::Point<gpui::Pixels>,
     modifiers: Modifiers,
+    button: MouseButton,
 ) {
     let events = [
         PlatformInput::MouseMove(MouseMoveEvent {
@@ -81,14 +82,14 @@ fn click(
             modifiers: Modifiers::default(),
         }),
         PlatformInput::MouseDown(MouseDownEvent {
-            button: MouseButton::Left,
+            button,
             position,
             modifiers,
             click_count: 1,
             first_mouse: false,
         }),
         PlatformInput::MouseUp(MouseUpEvent {
-            button: MouseButton::Left,
+            button,
             position,
             modifiers,
             click_count: 1,
@@ -228,7 +229,13 @@ fn main() {
                 shift: parts.contains(&"shift"),
                 ..Modifiers::default()
             };
-            click(&mut cx, handle, point(px(x), px(y)), modifiers);
+            // `right` clicks with the secondary button, for context menus.
+            let button = if parts.contains(&"right") {
+                MouseButton::Right
+            } else {
+                MouseButton::Left
+            };
+            click(&mut cx, handle, point(px(x), px(y)), modifiers, button);
             settle(&mut cx, wait);
             continue;
         }
