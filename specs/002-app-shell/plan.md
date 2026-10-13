@@ -137,7 +137,8 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   does not already bind it). Rows are humanized action names (`studio_graph::OpenType` → "Graph:
   open type"), fuzzy matched with word-start and run bonuses, each with the binding that wins
   where the person was and the action's doc comment in the footer. Recently run rows come first
-  (`command-palette.json` in Studio's data directory, read and written off the main thread);
+  (`command-palette.json` in Studio's data directory, read off the main thread and written on
+  it, so two runs close together save in order);
   then Studio's actions, node and edge types, and the rest. A type row dispatches
   `studio_graph::OpenType` and appears only when that action is available where the person is.
   ↑/↓ move, ↵ runs after the palette closes and focus returns, Esc closes.
@@ -171,6 +172,31 @@ second line shows it (`omnigraph branch create feature-x --from main`).
     shared one. Views read the values in effect through `GraphSession::options`.
 - `studio_theme` implements `theme::ThemeSettingsProvider` from these settings: UI font,
   buffer font, sizes, density.
+
+### Files, logs and the data directory
+
+- Every file Studio keeps (the workspace and session files, window bounds, settings, saved
+  servers, recent commands, the agent's conversation index, saved queries) is written through
+  `studio_settings::write_atomic`: a temporary file beside the target, synced, then renamed over
+  it. A crash or a full disk leaves the old file or the new one, never an empty one. Studio's
+  own files are owner-only (`0600`); a query file the person chose keeps its mode, and a link
+  is written through to its target.
+- A file Studio wrote but cannot parse is set aside as `<name>.unreadable-<seconds>` before
+  anything replaces it (workspace, session and conversation files). A `settings.json` that
+  does not parse keeps the settings in effect and refuses changes from the settings tab until
+  it reads again, so the person's text is never replaced by defaults.
+- The data directory is the person's unless the binary is Cargo's build output (`cargo run`,
+  an example): that uses "OmniGraph Studio Dev" (`omnigraph-studio-dev` on Linux). A bundled
+  app is the person's whichever profile built it. `OMNIGRAPH_STUDIO_DATA` overrides both; the
+  snapshot tool sets a fresh temporary directory when it is unset. With restoring off, Studio
+  saves no tabs or window bounds.
+- The log (`logs/Studio.log` in the data directory, about 1 MB, with `Studio.old.log`) holds
+  warnings, errors and panics from Studio and the Zed crates, through Zed's `zlog`; a run from a
+  terminal logs to standard output, and `RUST_LOG` changes the level. A panic is logged with its
+  thread and location, its message stripped of quoted text. Help → Reveal Log File shows it.
+- A transport failure reads as its cause ("Could not reach the server: the connection was
+  refused", "… the request timed out"), never with the request URL, which can hold a Blob
+  row's key.
 
 ### Notifications
 
@@ -301,7 +327,20 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-12 | Every window comes back | `persistence` tests (the older one-window file, opening order, a closed window forgotten, the last one kept until another opens; a GPUI test removing one of two windows); the debug binary with a separate data directory and a `session.json` of three windows, one on an unknown server | Two windows opened at their saved bounds, the third dropped, and the unknown server's graph left out of the other; an older file was rewritten in the new shape on the first start |
 | 2026-10-13 | ⌘P reads only what typing could have changed | `command_palette` test `a_complete_answer_narrows_without_a_read_and_a_full_one_asks_again`, `gq_language` test `longer_search_text_matches_among_what_shorter_text_matched` (a final sigma refuses to narrow); offscreen snapshots through a request-counting proxy on the dev graph's three node types: "ad"; "ad", "a", " l"; "ad", "a", backspace | 3, 5 and 4 `POST /query` (before: 3, 9 and 9); "ada l" showed Ada Lovelace alone. The same run with "ad", "a", " l" had crashed before: typing again cut the node rows after the matches were ranked over them |
 
+| 2026-10-13 | Files are replaced in one step and unreadable ones kept | `studio_settings` `files` tests: the whole file replaced with no temporary file left, owner-only and kept modes, a link written through, a failed rename keeping the old file, an unreadable file set aside | All pass |
+| 2026-10-13 | A development run uses its own data directory | `studio_settings` test `a_build_directory_binary_is_a_development_run_and_a_bundle_is_not`; the snapshot tool run without `OMNIGRAPH_STUDIO_DATA` | `target/debug`, `target/release-fast`, `examples` and `deps` binaries are development runs; an `.app` (also under `target/bundle`) and installed paths are not. The snapshot printed `snapshot data: …/omnigraph-studio-snapshot-<pid>` |
+| 2026-10-13 | A refused connection reads as its cause | `graph_client` test `a_transport_error_names_its_cause_and_never_the_url`; the snapshot tool against `http://127.0.0.1:9` | "Studio could not read the schema. Could not reach the server: the connection was refused"; before, the message was the client's "error sending request for url (…)" with the full URL |
+| 2026-10-13 | A panic message loses quoted text | `studio` test `a_panic_message_loses_the_text_it_quotes` | ``'é'`` and `` `Ada Lovelace's notes` `` become `'…'` and `` `…` ``; messages over 300 characters are cut |
+
 ## Corrections
+
+- 2026-10-13 · Studio wrote its files by truncating them in place, so a crash or a full disk
+  could leave an empty `session.json`, workspace file or conversation index, and the next save
+  replaced it with nothing. A `settings.json` with a comment or a trailing comma loaded as
+  defaults, and the next change wrote the defaults over it. The documented snapshot command
+  used the person's data directory and overwrote that graph's tabs. Studio had no log, so a
+  panic after a Finder launch left no trace. All four are fixed (see "Files, logs and the data
+  directory").
 
 - 2026-10-12 · After a graph switch the next action went nowhere: the Open Graph modal handed
   the focus back to a tab of the graph just parked, which is no longer drawn. Parking clears the
