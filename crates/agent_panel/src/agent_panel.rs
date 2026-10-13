@@ -7,6 +7,7 @@
 mod host;
 mod mcp;
 mod panel;
+mod sessions;
 mod socket;
 mod tools;
 

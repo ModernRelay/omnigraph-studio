@@ -148,7 +148,11 @@ pub fn describe_schema(schema: &SchemaModel) -> String {
             edge.name,
             edge.from,
             edge.to,
-            if edge.at_most_one { " (at most one)" } else { "" }
+            if edge.at_most_one {
+                " (at most one)"
+            } else {
+                ""
+            }
         ));
     }
     text

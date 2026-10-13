@@ -70,7 +70,10 @@ pub fn handle(line: &str) -> Incoming {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
-            arguments: params.get("arguments").cloned().unwrap_or_else(|| json!({})),
+            arguments: params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
         },
         _ => Incoming::Reply(error(id, -32601, "Method not found")),
     }
@@ -148,8 +151,12 @@ mod tests {
             handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
             Incoming::Nothing
         );
-        assert_eq!(handle(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#), Incoming::Nothing);
-        let Incoming::Reply(reply) = handle(r#"{"jsonrpc":"2.0","id":4,"method":"resources/list"}"#)
+        assert_eq!(
+            handle(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#),
+            Incoming::Nothing
+        );
+        let Incoming::Reply(reply) =
+            handle(r#"{"jsonrpc":"2.0","id":4,"method":"resources/list"}"#)
         else {
             panic!()
         };

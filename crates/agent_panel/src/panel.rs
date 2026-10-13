@@ -54,9 +54,11 @@ pub fn open(
     cx: &mut Context<Workspace>,
 ) -> Option<Entity<AgentPanel>> {
     let session = workspace.session()?.clone();
-    workspace.open_item("agent", window, cx, move |window, cx| {
+    let panel = workspace.open_item("agent", window, cx, move |window, cx| {
         AgentPanel::new(session, window, cx)
-    })
+    })?;
+    panel.update(cx, |panel, cx| panel.resume_if_saved(cx));
+    Some(panel)
 }
 
 enum State {
@@ -161,6 +163,10 @@ pub struct AgentPanel {
     host: Option<Host>,
     /// A prompt sent before the agent was ready, sent once it is.
     queued: Option<String>,
+    /// The open session, remembered to come back to.
+    session_id: Option<String>,
+    /// The next start begins a new conversation instead of resuming the last.
+    start_fresh: bool,
 }
 
 impl EventEmitter<ItemEvent> for AgentPanel {}
@@ -298,6 +304,8 @@ impl AgentPanel {
             always_allow: false,
             host: None,
             queued: None,
+            session_id: None,
+            start_fresh: false,
         };
         panel.sync_setup_state(cx);
         panel
@@ -318,12 +326,35 @@ impl AgentPanel {
 
     // ---- lifecycle ----
 
+    /// Starts the agent at once when there is a conversation to come back to on this graph, so
+    /// it is on screen without sending anything first.
+    pub fn resume_if_saved(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.state, State::Idle) {
+            return;
+        }
+        let command = Self::command(cx);
+        let graph = self.session.read(cx).settings_key(cx);
+        if crate::sessions::load(&graph, &command).is_some() {
+            self.start(cx);
+        }
+    }
+
     fn start(&mut self, cx: &mut Context<Self>) {
         let settings = StudioSettings::get(cx).agent.clone();
         if settings.command.is_empty() {
             self.state = State::Setup;
             return;
         }
+        // The earlier conversation on this graph with this agent, unless a new one was asked
+        // for (spec 011: resuming a session).
+        let graph = self.session.read(cx).settings_key(cx);
+        let saved = if self.start_fresh {
+            self.start_fresh = false;
+            crate::sessions::forget(&graph, &settings.command);
+            None
+        } else {
+            crate::sessions::load(&graph, &settings.command)
+        };
         let data = studio_settings::data_dir().join("agent");
         let cwd = data.join("workspace");
         if let Err(error) = std::fs::create_dir_all(&cwd) {
@@ -354,11 +385,20 @@ impl AgentPanel {
             }
         };
         let base = self.session.read(cx).branch.clone();
-        self.branch = Some(AgentBranch {
-            name: format!("agent/{}", chrono::Local::now().format("%Y%m%d-%H%M%S")),
-            base,
-            created: false,
-            changes: 0,
+        // A resumed conversation keeps writing to its branch.
+        self.branch = Some(match &saved {
+            Some(saved) => AgentBranch {
+                name: saved.branch.clone(),
+                base,
+                created: saved.branch_created,
+                changes: 0,
+            },
+            None => AgentBranch {
+                name: format!("agent/{}", chrono::Local::now().format("%Y%m%d-%H%M%S")),
+                base,
+                created: false,
+                changes: 0,
+            },
         });
         self.always_allow = false;
 
@@ -371,6 +411,7 @@ impl AgentPanel {
                 crate::PROXY_COMMAND.to_owned(),
                 socket.path.to_string_lossy().into_owned(),
             ],
+            resume: saved.map(|saved| saved.session),
         };
         let (events_tx, mut events_rx) = mpsc::unbounded();
         let (commands_tx, commands_rx) = mpsc::unbounded();
@@ -433,18 +474,47 @@ impl AgentPanel {
         }
     }
 
+    /// A new conversation: the earlier one is not resumed again.
     fn restart(&mut self, _: &Restart, _window: &mut Window, cx: &mut Context<Self>) {
         self.stop_host();
-        self.entries.push(Entry::Notice {
-            text: "Started a new agent session.".into(),
-            error: false,
-        });
+        self.entries.clear();
+        self.markdown.clear();
+        self.start_fresh = true;
         self.start(cx);
+    }
+
+    /// Records the open session, to come back to it at the next start.
+    fn remember_session(&self, cx: &App) {
+        let (Some(session), Some(branch)) = (&self.session_id, &self.branch) else {
+            return;
+        };
+        let command = StudioSettings::get(cx).agent.command.clone();
+        crate::sessions::save(
+            &self.session.read(cx).settings_key(cx),
+            &command,
+            &crate::sessions::SavedSession {
+                session: session.clone(),
+                branch: branch.name.clone(),
+                branch_created: branch.created,
+            },
+        );
     }
 
     fn apply_event(&mut self, event: HostEvent, cx: &mut Context<Self>) {
         match event {
-            HostEvent::Ready { agent } => {
+            HostEvent::Ready {
+                agent,
+                session,
+                resumed,
+            } => {
+                self.session_id = Some(session);
+                self.remember_session(cx);
+                if resumed {
+                    self.entries.push(Entry::Notice {
+                        text: "Resumed the last conversation; ↻ starts a new one.".into(),
+                        error: false,
+                    });
+                }
                 self.state = State::Ready { agent };
                 if let Some(text) = self.queued.take() {
                     self.prompt(text, cx);
@@ -497,6 +567,14 @@ impl AgentPanel {
 
     fn apply_update(&mut self, update: SessionUpdate) {
         match update {
+            // A resumed session replays the person's own messages too.
+            SessionUpdate::UserMessageChunk(chunk) => {
+                let text = content_text(&chunk.content);
+                match self.entries.last_mut() {
+                    Some(Entry::User(existing)) => existing.push_str(&text),
+                    _ => self.entries.push(Entry::User(text)),
+                }
+            }
             SessionUpdate::AgentMessageChunk(chunk) => {
                 let text = content_text(&chunk.content);
                 match self.entries.last_mut() {
@@ -898,10 +976,11 @@ impl AgentPanel {
             if let Some(create) = create {
                 match create.await {
                     WriteOutcome::Committed(_) => {
-                        this.update(cx, |this, _| {
+                        this.update(cx, |this, cx| {
                             if let Some(branch) = &mut this.branch {
                                 branch.created = true;
                             }
+                            this.remember_session(cx);
                         })
                         .ok();
                     }

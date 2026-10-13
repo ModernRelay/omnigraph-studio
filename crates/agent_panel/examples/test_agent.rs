@@ -4,16 +4,22 @@
 //! `mcp-proxy`), and on every prompt reads the schema and counts `Person` nodes. When the prompt
 //! contains "change", it also proposes retitling the first person and reports the outcome.
 //!
+//! It keeps each session's transcript in its working directory and supports `session/load`:
+//! loading a session replays its messages, so a restarted Studio can come back to it.
+//!
 //!     cargo build -p agent_panel --example test_agent
 //!     # then set the agent command to target/debug/examples/test_agent
 
+use std::io::Write as _;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1::{
-    ContentBlock, ContentChunk, Implementation, InitializeRequest, InitializeResponse, McpServer,
-    McpServerStdio, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
-    SessionId, SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall,
-    ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    AgentCapabilities, ContentBlock, ContentChunk, Implementation, InitializeRequest,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpServer, McpServerStdio,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
+    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Stdio};
 use serde_json::{Value, json};
@@ -26,9 +32,37 @@ const FIRST: &str =
     "query first() { match { $p: Person } return { $p } order { $p.@id asc } limit 1 }";
 const RETITLE: &str = "query retitle($id: String, $title: String) {\n  update Person set { title: $title } where @id = $id\n}";
 
+/// Where the current session's messages are written, one JSON line each.
+static TRANSCRIPT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn record(role: &str, text: &str) {
+    let Some(path) = TRANSCRIPT.lock().unwrap().clone() else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        writeln!(file, "{}", json!({ "role": role, "text": text })).ok();
+    }
+}
+
+fn transcript_path(cwd: &std::path::Path, session: &str) -> PathBuf {
+    cwd.join(format!("transcript-{session}.jsonl"))
+}
+
+fn stdio_server(servers: Vec<McpServer>) -> Option<McpServerStdio> {
+    servers.into_iter().find_map(|server| match server {
+        McpServer::Stdio(stdio) => Some(stdio),
+        _ => None,
+    })
+}
+
 fn main() -> agent_client_protocol::Result<()> {
     let server: Arc<Mutex<Option<McpServerStdio>>> = Arc::default();
     let for_session = server.clone();
+    let for_load = server.clone();
     smol::block_on(
         Agent
             .builder()
@@ -37,22 +71,58 @@ fn main() -> agent_client_protocol::Result<()> {
                 async move |request: InitializeRequest, responder, _connection| {
                     responder.respond(
                         InitializeResponse::new(request.protocol_version)
-                            .agent_info(Implementation::new("Studio test agent", "0.1.0")),
+                            .agent_info(Implementation::new("Studio test agent", "0.1.0"))
+                            .agent_capabilities(AgentCapabilities::new().load_session(true)),
                     )
                 },
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
                 async move |request: NewSessionRequest, responder, _connection| {
-                    let stdio = request
-                        .mcp_servers
-                        .into_iter()
-                        .find_map(|server| match server {
-                            McpServer::Stdio(stdio) => Some(stdio),
-                            _ => None,
-                        });
-                    *for_session.lock().unwrap() = stdio;
-                    responder.respond(NewSessionResponse::new(SessionId::new("test-session")))
+                    *for_session.lock().unwrap() = stdio_server(request.mcp_servers);
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    let id = format!("test-{nanos}");
+                    *TRANSCRIPT.lock().unwrap() = Some(transcript_path(&request.cwd, &id));
+                    responder.respond(NewSessionResponse::new(SessionId::new(id)))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |request: LoadSessionRequest,
+                            responder,
+                            connection: ConnectionTo<Client>| {
+                    *for_load.lock().unwrap() = stdio_server(request.mcp_servers);
+                    let path = transcript_path(&request.cwd, &request.session_id.0);
+                    let Ok(text) = std::fs::read_to_string(&path) else {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params().data("no such session"),
+                        );
+                    };
+                    // Replay the conversation, then carry on writing it.
+                    for line in text.lines() {
+                        let Ok(message) = serde_json::from_str::<Value>(line) else {
+                            continue;
+                        };
+                        let content = ContentChunk::new(ContentBlock::Text(TextContent::new(
+                            message["text"].as_str().unwrap_or_default(),
+                        )));
+                        let update = if message["role"] == "user" {
+                            SessionUpdate::UserMessageChunk(content)
+                        } else {
+                            SessionUpdate::AgentMessageChunk(content)
+                        };
+                        connection
+                            .send_notification(SessionNotification::new(
+                                request.session_id.clone(),
+                                update,
+                            ))
+                            .ok();
+                    }
+                    *TRANSCRIPT.lock().unwrap() = Some(path);
+                    responder.respond(LoadSessionResponse::new())
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -82,6 +152,7 @@ fn main() -> agent_client_protocol::Result<()> {
 }
 
 fn say(connection: &ConnectionTo<Client>, session: &SessionId, text: &str) {
+    record("agent", text);
     connection
         .send_notification(SessionNotification::new(
             session.clone(),
@@ -126,6 +197,7 @@ async fn turn(
             _ => None,
         })
         .collect();
+    record("user", &prompt);
     let server = server.ok_or("Studio offered no MCP server")?;
     let mut mcp = Mcp::start(&server).await?;
 

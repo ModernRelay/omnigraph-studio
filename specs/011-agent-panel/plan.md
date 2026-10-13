@@ -165,12 +165,22 @@ Query text, parameters, rows, tokens and prompt text. Agent stderr is shown only
 | Approval is Studio's, not the agent's permission prompt | Rely on the agent asking | Agents differ in whether and how they ask; the guarantee has to hold for every agent |
 | One agent branch per agent session | Write to the person's branch; one branch per proposal | Review works per branch (spec 008), and one branch keeps a session's changes together |
 
+## Resuming a conversation
+
+- Studio keeps, per graph and agent command, the last session's id and the agent branch its
+  changes go to (`agent/sessions.json` in the data directory, owner-only; ids only, the
+  conversation stays with the agent). When the agent advertises `loadSession`, starting the
+  panel loads that session with `session/load`; the agent replays it as updates (the person's
+  messages as `user_message_chunk`), and a note says it was resumed. A session the agent no
+  longer knows starts a new one. Opening the Agent tab, or restoring it, starts the agent at
+  once when there is a conversation to come back to. The resumed conversation keeps writing to
+  its branch. ↻ (Restart) starts a new conversation and forgets the saved one.
+
 ## Deferred
 
 - Windows: the proxy uses Unix sockets. Windows support waits for a named-pipe transport.
 - Agent-attributed commits: commits are recorded under the person's actor. Recording "on
   behalf of an agent" needs an engine change, E20 in `docs/deferred-engine-changes.md`.
-- Resuming an earlier agent session (`session/load`).
 
 ## Validation log
 
@@ -195,3 +205,4 @@ Query text, parameters, rows, tokens and prompt text. Agent stderr is shown only
 - Stop was planned as ⌘.; Zed's editor binding takes it inside the composer, so it is ⌘⇧.
 - 2026-10-12 · Approval said Allow was ⌘↩ and Reject ⎋. ⌘↩ is Send in the composer and ⎋
   belongs to the editor, so the card uses the bound ⌘Y, ⌘⌥Y and ⌘⌥N, as in Actions.
+| 2026-10-12 | A conversation comes back after a restart | `agent_panel` `a_session_is_kept_per_graph_and_agent`; offscreen snapshots with the test agent (now with `loadSession` and a transcript per session): ask, close, reopen the Agent tab; then ↻ | The question and the markdown reply replayed with "Resumed the last conversation"; after ↻ the panel cleared and `sessions.json` held a new session id |

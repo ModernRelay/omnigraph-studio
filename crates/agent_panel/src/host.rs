@@ -11,10 +11,11 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, Implementation, InitializeRequest, McpServer,
-    McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest,
+    CancelNotification, ContentBlock, Implementation, InitializeRequest, LoadSessionRequest,
+    McpServer, McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, TextContent,
+    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, StopReason,
+    TextContent,
 };
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo, LineDirection};
 use futures::StreamExt as _;
@@ -38,11 +39,18 @@ pub struct Launch {
     /// The stdio MCP server the agent starts: Studio's own executable as `mcp-proxy`.
     pub mcp_command: PathBuf,
     pub mcp_args: Vec<String>,
+    /// A session to come back to, when the agent can load one.
+    pub resume: Option<String>,
 }
 
 pub enum HostEvent {
-    /// The session is open.
-    Ready { agent: String },
+    /// The session is open: `resumed` when an earlier one was loaded (its messages arrive as
+    /// updates before this), else a new one.
+    Ready {
+        agent: String,
+        session: String,
+        resumed: bool,
+    },
     Update(SessionUpdate),
     /// The agent asks to use a tool that is not Studio's. Answer through `reply`; dropping it
     /// answers "cancelled".
@@ -51,9 +59,14 @@ pub enum HostEvent {
         reply: oneshot::Sender<RequestPermissionOutcome>,
     },
     /// A prompt turn ended.
-    TurnEnded { stop: Result<StopReason, String> },
+    TurnEnded {
+        stop: Result<StopReason, String>,
+    },
     /// The agent stopped or could not start.
-    Exited { message: String, stderr: String },
+    Exited {
+        message: String,
+        stderr: String,
+    },
 }
 
 pub enum HostCommand {
@@ -90,8 +103,7 @@ async fn connect(
     stderr: Arc<Mutex<VecDeque<String>>>,
 ) -> Result<(), agent_client_protocol::Error> {
     let Some((program, args)) = launch.command.split_first() else {
-        return Err(agent_client_protocol::Error::invalid_params()
-            .data("no agent command is set"));
+        return Err(agent_client_protocol::Error::invalid_params().data("no agent command is set"));
     };
     let config = AcpAgentConfig::new(program)
         .args(args.iter().cloned())
@@ -150,7 +162,9 @@ async fn connect(
                     .unbounded_send(HostEvent::Permission { request, reply })
                     .ok();
                 connection.spawn(async move {
-                    let outcome = decision.await.unwrap_or(RequestPermissionOutcome::Cancelled);
+                    let outcome = decision
+                        .await
+                        .unwrap_or(RequestPermissionOutcome::Cancelled);
                     responder.respond(RequestPermissionResponse::new(outcome))
                 })
             },
@@ -158,12 +172,9 @@ async fn connect(
         )
         .connect_with(agent, async move |connection: ConnectionTo<Agent>| {
             let initialized = connection
-                .send_request(
-                    InitializeRequest::new(ProtocolVersion::V1).client_info(Implementation::new(
-                        "omnigraph-studio",
-                        env!("CARGO_PKG_VERSION"),
-                    )),
-                )
+                .send_request(InitializeRequest::new(ProtocolVersion::V1).client_info(
+                    Implementation::new("omnigraph-studio", env!("CARGO_PKG_VERSION")),
+                ))
                 .block_task()
                 .await?;
             let agent_name = initialized
@@ -173,16 +184,41 @@ async fn connect(
 
             let mcp = McpServerStdio::new("omnigraph", launch.mcp_command.clone())
                 .args(launch.mcp_args.clone());
-            let session = connection
-                .send_request(
-                    NewSessionRequest::new(launch.cwd.clone())
-                        .mcp_servers(vec![McpServer::Stdio(mcp)]),
-                )
-                .block_task()
-                .await?;
-            let session_id = session.session_id;
+            // Come back to the earlier conversation when the agent can load it; a session it no
+            // longer knows starts a new one.
+            let can_load = initialized.agent_capabilities.load_session;
+            let mut resumed = None;
+            if let Some(id) = launch.resume.clone().filter(|_| can_load) {
+                let loaded = connection
+                    .send_request(
+                        LoadSessionRequest::new(SessionId::new(id.clone()), launch.cwd.clone())
+                            .mcp_servers(vec![McpServer::Stdio(mcp.clone())]),
+                    )
+                    .block_task()
+                    .await;
+                if loaded.is_ok() {
+                    resumed = Some(SessionId::new(id));
+                }
+            }
+            let session_id = match resumed.clone() {
+                Some(id) => id,
+                None => {
+                    connection
+                        .send_request(
+                            NewSessionRequest::new(launch.cwd.clone())
+                                .mcp_servers(vec![McpServer::Stdio(mcp)]),
+                        )
+                        .block_task()
+                        .await?
+                        .session_id
+                }
+            };
             events
-                .unbounded_send(HostEvent::Ready { agent: agent_name })
+                .unbounded_send(HostEvent::Ready {
+                    agent: agent_name,
+                    session: session_id.0.to_string(),
+                    resumed: resumed.is_some(),
+                })
                 .ok();
 
             while let Some(command) = commands.next().await {
@@ -207,7 +243,8 @@ async fn connect(
                         })?;
                     }
                     HostCommand::Cancel => {
-                        connection.send_notification(CancelNotification::new(session_id.clone()))?;
+                        connection
+                            .send_notification(CancelNotification::new(session_id.clone()))?;
                     }
                 }
             }

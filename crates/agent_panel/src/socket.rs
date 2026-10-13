@@ -161,7 +161,8 @@ async fn serve_connection(stream: UnixStream, tools: mpsc::UnboundedSender<ToolR
                     })
                     .is_err()
                 {
-                    let reply = mcp::tool_reply(id, "Studio closed the agent session.".into(), true);
+                    let reply =
+                        mcp::tool_reply(id, "Studio closed the agent session.".into(), true);
                     replies_tx.unbounded_send(reply).ok();
                     continue;
                 }
