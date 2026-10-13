@@ -219,8 +219,12 @@ The same gateway, rules and cards apply, because the wrapper still speaks to the
   refuses `--server`, `--store`, `--uri`, `--cluster`, `--profile`, `--direct`, `--managed`,
   `--api` and `--as`, so a call cannot leave the gateway.
 - Commands: `query`, `mutate`, `load`, `branch`, `snapshot`, `export`, `blob`, `commit`,
-  `changes`, `schema show`, `graphs list`, `version`. Anything else is refused before running.
-- Files given to `--query`, `--data`, `--params-file`, `--file` and `--out`, and `save_to`, must
+  `changes`, `schema show`, `graphs list`, `version` and `lint`. Anything else is refused before
+  running. `lint` checks queries against a schema file offline (`--query`, `--schema`, `--json`
+  only, no server added): 0.13 refuses `lint` with `--server`, and a positional storage URI
+  would make Studio open storage itself.
+- Files given to `--query`, `--data`, `--params-file`, `--file`, `--out` and `--schema`, and
+  `save_to`, must
   resolve inside the working directory, so the agent can process them in its own sandbox.
 - Output over 100 KB is cut with a note to use `save_to`; standard output is bounded at 64 MiB,
   and a run at 30 minutes.
@@ -233,6 +237,28 @@ The same gateway, rules and cards apply, because the wrapper still speaks to the
 Giving Codex network access (a codex-acp mode with network) lets its shell reach the gateway
 too, and opens all network, so it stays the person's choice. E24 would let the sandbox allow one
 socket instead.
+
+### The skill
+
+Studio writes an `omnigraph-studio` skill into the graph's agent working directory at every
+conversation start, beside `AGENTS.md`: `.claude/skills/omnigraph-studio/` for Claude Code and
+`.agents/skills/omnigraph-studio/` for Codex, since neither agent reads the other's folder.
+
+- Its `SKILL.md` is Studio's own (`crates/agent_panel/skill/SKILL.md`): what differs in Studio
+  (the CLI path and flags, the agent's branch, no schema changes, unknown outcomes, offline
+  lint) and which parts of the guide to read or skip.
+- The guide is the OmniGraph skill of the release whose contract Studio speaks, copied
+  unmodified with its MIT license (`crates/agent_panel/skill/upstream/`, `SOURCE.md` names the
+  tag and commit) and embedded in Studio's binary. Its `SKILL.md` is written as `GUIDE.md`, so
+  agents do not list it as a second skill.
+- The name is not `omnigraph`. With a personal `omnigraph` skill installed, Claude Code hides a
+  project skill of the same name, and Codex lists both but loads neither by name.
+- Studio replaces files that differ and removes files it no longer ships, only inside its own
+  skill folders. `AGENTS.md` names the skill.
+
+When the CLI can export its own skill (being added as `omnigraph skill export`), Studio should
+take the guide from the CLI it chose, so the guide always matches that binary, and keep the
+embedded copy for CLIs without the command.
 
 ### The MCP tools
 
@@ -316,6 +342,9 @@ CLI is the one they trust).
 | 2026-10-13 | The stock CLI reads and writes its branch through the real gateway | `agent_panel` `the_stock_cli_reads_and_writes_its_branch_through_the_gateway` (ignored; run with `STUDIO_GATEWAY_E2E_*` against `script/dev-server` and `~/.local/bin/omnigraph` 0.13.0) | Passed: a read on main; mutate on main and a branch statement refused; branch create, a mutation (1 node) and a load on the agent branch; a merge into main refused; the branch deleted |
 | 2026-10-13 | Claude Code's MCP and shell behave as the design assumes | A minimal ACP client running claude-agent-acp 0.90.0 (Claude Code 2.1.296) with a stub stdio MCP server, plus the package source | Server instructions reach the model, cut at 2,048 characters. `AGENTS.md` loads when no `CLAUDE.md` is in the working directory or above it. Bash and MCP servers inherit the agent's environment; the sandbox is off by default. A silent stdio tool call is aborted after the 30-minute idle timeout; progress notifications reset it. Every MCP tool call asks the client unless pre-allowed. An ACP `mcpServers` entry with `"type": "stdio"` is dropped |
 | 2026-10-13 | Codex's MCP and shell behave as the design assumes | codex-acp 2.2.2 and Codex 0.160.1 source, plus live runs of the installed codex-acp with a stub client, a fake model server and throwaway `CODEX_HOME`/`HOME` | Stdio MCP servers run outside the seatbelt sandbox and reach loopback; the shell does not. The MCP tool timeout is 300 s (the docs still say 60 s); on timeout Codex sends no cancellation and drops the late reply. codex-acp passes only `command`, `args` and `env`, so a `tool_timeout_sec` for an ACP server is ignored. The shell-environment filter is off by default: a `*TOKEN*` variable reached the shell. MCP servers start with a fixed environment plus ACP `env`. Server instructions reach the model as the tool namespace's description. `AGENTS.md` loads from the cwd, which codex-acp trusts |
+| 2026-10-13 | Each agent finds the skill where Studio writes it | Claude Code: an ACP session (claude-agent-acp 0.90.0) in a non-git folder holding both skill folders, with the person's own `omnigraph` skill installed. Codex: the earlier source and live check of skill discovery | Claude listed `omnigraph-studio` beside the personal `omnigraph`, and `GUIDE.md` was not listed as a skill. Codex loads `<cwd>/.agents/skills` for a non-git working directory and lists every same-named copy |
+| 2026-10-13 | Studio writes the skill for each agent and keeps it current | `agent_panel` `writes_the_skill_for_each_agent_and_removes_only_its_own_stale_files`, `every_upstream_file_ships_and_the_entry_point_names_the_skill` | Both folders hold every file; a stale file of an older Studio is removed and a neighbouring skill kept; every file under `skill/upstream` ships; the entry point's name is the folder name |
+| 2026-10-13 | `lint` runs offline under the conversation's home | `omnigraph` 0.13.0 with a home whose default server is unreachable | `lint --query --schema` reported the type error; `lint --server` is refused by the CLI |
 | 2026-10-13 | A slow run answers with its number and finishes later | `agent_panel` `a_slow_run_answers_with_its_number_and_keeps_going` | No outcome within the limit, the number and the `wait` call in the answer, then the outcome on a later wait |
 | 2026-10-13 | `omnigraph_run` checks its arguments | `agent_panel` `run_arguments_stay_on_the_gateway_and_in_the_working_directory` | `--server studio` and the graph added; other servers, stores, profiles, `--as` and unknown commands refused; files outside the working directory refused, including through `..` and symlinks |
 | 2026-10-13 | `omnigraph_run` reads and writes through the real gateway | The ignored end-to-end test, extended to call `cli_home::run` | A query inline and with `save_to`, the file in the working directory |

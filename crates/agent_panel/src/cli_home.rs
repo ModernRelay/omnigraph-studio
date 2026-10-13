@@ -133,6 +133,9 @@ pub fn write_agents_md(cwd: &Path, graph: &str) -> std::io::Result<()> {
         "# OmniGraph graph `{graph}`\n\n\
          Written by OmniGraph Studio. You work on the OmniGraph graph `{graph}` with a person in \
          Studio.\n\n\
+         Before writing a query, a mutation or a load, read the `omnigraph-studio` skill \
+         (`.claude/skills/omnigraph-studio/SKILL.md` or `.agents/skills/omnigraph-studio/SKILL.md` \
+         here): GQ syntax, loads, search, and what differs in Studio.\n\n\
          ## The omnigraph CLI\n\n\
          - Studio sets up an `omnigraph` CLI for each conversation. Its absolute path is in the \
          instructions of the `omnigraph` MCP server, and the `omnigraph_cli` tool returns it \
@@ -231,8 +234,10 @@ pub async fn choose_cli(home: &CliHome, candidates: Vec<PathBuf>) -> Option<Path
 /// then checks. Storage, cluster, policy and login commands refuse `--server` anyway.
 const RUN_COMMANDS: &[&str] = &[
     "query", "mutate", "load", "branch", "snapshot", "export", "blob", "commit", "changes",
-    "schema", "graphs", "version",
+    "schema", "graphs", "version", "lint",
 ];
+/// What `lint` may take: it checks queries against a schema file offline, never a graph.
+const LINT_FLAGS: &[&str] = &["--query", "--schema", "--json"];
 /// Flags that would choose another address, credentials or actor than the conversation's.
 const RUN_FORBIDDEN: &[&str] = &[
     "--server",
@@ -246,7 +251,14 @@ const RUN_FORBIDDEN: &[&str] = &[
     "--as",
 ];
 /// Flags whose value is a file the CLI reads or writes; it must be in the working directory.
-const RUN_PATH_FLAGS: &[&str] = &["--query", "--data", "--params-file", "--file", "--out"];
+const RUN_PATH_FLAGS: &[&str] = &[
+    "--query",
+    "--data",
+    "--params-file",
+    "--file",
+    "--out",
+    "--schema",
+];
 /// The most output `omnigraph_run` returns in its answer; more is cut, with a pointer to
 /// `save_to`, so a large result does not fill the agent's context.
 pub const RUN_INLINE_MAX: usize = 100 * 1024;
@@ -312,6 +324,27 @@ pub fn check_run_args(args: &[String], cwd: &Path, graph: &str) -> Result<Vec<St
     {
         return Err(format!("Only `{command} show`/`list` read through Studio."));
     }
+    // `lint` reads a schema file, not the graph: a positional storage URI would make Studio
+    // open storage directly, so only its file flags pass, and no server is added.
+    let lint = command == "lint";
+    if lint {
+        let mut rest = args[1..].iter();
+        while let Some(arg) = rest.next() {
+            let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+            if !LINT_FLAGS.contains(&flag) {
+                return Err(format!(
+                    "`lint` takes only --query, --schema and --json; save the schema with \
+                     `schema show` (save_to) and lint against that file. `{arg}` is not passed."
+                ));
+            }
+            if flag != "--json" && !arg.contains('=') {
+                rest.next();
+            }
+        }
+        if !args.iter().any(|arg| arg.starts_with("--schema")) {
+            return Err("`lint` needs --schema <file>: save it first with `schema show`.".into());
+        }
+    }
     let mut checked = Vec::with_capacity(args.len() + 4);
     let mut has_graph = false;
     let mut index = 0;
@@ -347,6 +380,9 @@ pub fn check_run_args(args: &[String], cwd: &Path, graph: &str) -> Result<Vec<St
             checked.push(arg.clone());
         }
         index += 1;
+    }
+    if lint {
+        return Ok(checked);
     }
     checked.extend(["--server".to_owned(), "studio".to_owned()]);
     if !has_graph {
@@ -509,6 +545,8 @@ mod tests {
         let cwd = std::env::temp_dir().join(format!("studio-run-args-{}", std::process::id()));
         std::fs::create_dir_all(cwd.join("data")).unwrap();
         std::fs::write(cwd.join("data/rows.jsonl"), "{}\n").unwrap();
+        std::fs::write(cwd.join("q.gq"), "").unwrap();
+        std::fs::write(cwd.join("schema.pg"), "").unwrap();
         std::os::unix::fs::symlink("/etc/passwd", cwd.join("escape")).ok();
         let cwd = std::fs::canonicalize(&cwd).unwrap();
         let args = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
@@ -551,6 +589,18 @@ mod tests {
                 "studio",
             ])
         );
+        // `lint` checks against a saved schema file, offline: no server is added.
+        assert_eq!(
+            check(&["lint", "--query", "q.gq", "--schema=schema.pg", "--json"]).unwrap(),
+            args(&[
+                "lint",
+                "--query",
+                &cwd.join("q.gq").to_string_lossy(),
+                "--schema",
+                &cwd.join("schema.pg").to_string_lossy(),
+                "--json",
+            ])
+        );
         let out = check(&["blob", "get", "--out=data/picture.png"]).unwrap();
         assert_eq!(out[2], "--out");
         assert_eq!(out[3], cwd.join("data/picture.png").to_string_lossy());
@@ -566,6 +616,16 @@ mod tests {
             &["load", "--data", "../outside.jsonl"],
             &["blob", "put", "--file", "escape"],
             &["blob", "get", "--out", "missing/dir/x"],
+            &["lint", "--query", "q.gq"],
+            &[
+                "lint",
+                "s3://bucket/graph",
+                "--query",
+                "q.gq",
+                "--schema",
+                "schema.pg",
+            ],
+            &["lint", "--query", "q.gq", "--schema", "/etc/passwd"],
             &[],
         ] {
             assert!(check(refused).is_err(), "{refused:?} was let through");

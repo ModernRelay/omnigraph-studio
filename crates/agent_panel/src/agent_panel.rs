@@ -13,6 +13,7 @@ mod mcp;
 mod panel;
 mod sessions;
 mod sessions_panel;
+mod skill;
 mod socket;
 mod tools;
 

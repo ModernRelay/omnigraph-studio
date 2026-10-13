@@ -727,6 +727,7 @@ impl AgentPanel {
                 &agent_base,
             )?;
             cli_home::write_agents_md(&cwd, &graph)?;
+            crate::skill::write(&cwd)?;
             let serve = gateway.serve(
                 self.session.read(cx).client(cx),
                 Sandbox {
