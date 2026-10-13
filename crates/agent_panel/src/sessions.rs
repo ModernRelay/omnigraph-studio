@@ -95,6 +95,41 @@ fn save_to(path: &Path, graph: &str, command: &[String], saved: &SavedSession) {
     write(path, &records);
 }
 
+/// The option values the person last chose for an agent (its model, mode, reasoning level),
+/// applied to its next new session: `{agent command: {option id: value id}}`.
+fn preferences_path() -> PathBuf {
+    studio_settings::data_dir()
+        .join("agent")
+        .join("preferences.json")
+}
+
+pub fn preferences(command: &[String]) -> Map<String, Value> {
+    preferences_from(&preferences_path(), command)
+}
+
+pub fn prefer(command: &[String], option: &str, value: Value) {
+    prefer_to(&preferences_path(), command, option, value);
+}
+
+fn preferences_from(path: &Path, command: &[String]) -> Map<String, Value> {
+    read(path)
+        .get(&command.join(" "))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn prefer_to(path: &Path, command: &[String], option: &str, value: Value) {
+    let mut records = read(path);
+    let agent = records
+        .entry(command.join(" "))
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(agent) = agent.as_object_mut() {
+        agent.insert(option.to_owned(), value);
+    }
+    write(path, &records);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +151,30 @@ mod tests {
         // Another graph, or another agent, has no session to resume.
         assert_eq!(load_from(&path, "server/notes", &claude), None);
         assert_eq!(load_from(&path, "server/crm", &other), None);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn option_choices_are_kept_per_agent_and_the_latest_wins() {
+        let dir =
+            std::env::temp_dir().join(format!("studio-agent-preferences-{}", std::process::id()));
+        let path = dir.join("preferences.json");
+        let claude = vec!["claude-code-acp".to_owned()];
+        let other = vec!["other-agent".to_owned()];
+        prefer_to(&path, &claude, "model", json!("sonnet"));
+        prefer_to(&path, &claude, "model", json!("opus"));
+        prefer_to(&path, &claude, "fast", json!(true));
+        let chosen = preferences_from(&path, &claude);
+        assert_eq!(chosen.get("model"), Some(&json!("opus")));
+        assert_eq!(chosen.get("fast"), Some(&json!(true)));
+        // Another agent's options are its own.
+        assert!(preferences_from(&path, &other).is_empty());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

@@ -7,6 +7,9 @@
 //! It keeps each session's transcript in its working directory and supports `session/load`:
 //! loading a session replays its messages, so a restarted Studio can come back to it.
 //!
+//! It offers two session options, a mode and a model (grouped by family), takes
+//! `session/set_config_option`, and reports a growing context window and cost after each turn.
+//!
 //!     cargo build -p agent_panel --example test_agent
 //!     # then set the agent command to target/debug/examples/test_agent
 
@@ -15,11 +18,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ContentBlock, ContentChunk, Implementation, InitializeRequest,
+    AgentCapabilities, ContentBlock, ContentChunk, Cost, Implementation, InitializeRequest,
     InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpServer, McpServerStdio,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
-    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption, SessionId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, StopReason, TextContent, ToolCall, ToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Stdio};
 use serde_json::{Value, json};
@@ -31,6 +36,57 @@ const COUNT: &str = "query people() { match { $p: Person } return { count($p) as
 const FIRST: &str =
     "query first() { match { $p: Person } return { $p } order { $p.@id asc } limit 1 }";
 const RETITLE: &str = "query retitle($id: String, $title: String) {\n  update Person set { title: $title } where @id = $id\n}";
+
+/// The session's options as the person last set them: `(mode, model)`.
+static OPTIONS: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
+/// Tokens in the context window and the cost so far.
+static USAGE: Mutex<(u64, f64)> = Mutex::new((0, 0.));
+const WINDOW: u64 = 200_000;
+
+fn config_options() -> Vec<SessionConfigOption> {
+    let (mode, model) = OPTIONS.lock().unwrap().clone();
+    let mode = if mode.is_empty() { "ask".into() } else { mode };
+    let model = if model.is_empty() {
+        "sonnet".into()
+    } else {
+        model
+    };
+    vec![
+        SessionConfigOption::select(
+            "mode",
+            "Mode",
+            mode,
+            vec![
+                SessionConfigSelectOption::new("ask", "Ask before changes"),
+                SessionConfigSelectOption::new("plan", "Plan only"),
+            ],
+        )
+        .description("When the agent may propose changes")
+        .category(SessionConfigOptionCategory::Mode),
+        SessionConfigOption::select(
+            "model",
+            "Model",
+            model,
+            vec![
+                SessionConfigSelectGroup::new(
+                    "claude",
+                    "Claude",
+                    vec![
+                        SessionConfigSelectOption::new("opus", "Claude Opus"),
+                        SessionConfigSelectOption::new("sonnet", "Claude Sonnet"),
+                        SessionConfigSelectOption::new("haiku", "Claude Haiku"),
+                    ],
+                ),
+                SessionConfigSelectGroup::new(
+                    "local",
+                    "Local",
+                    vec![SessionConfigSelectOption::new("scripted", "Scripted")],
+                ),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model),
+    ]
+}
 
 /// Where the current session's messages are written, one JSON line each.
 static TRANSCRIPT: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -86,7 +142,11 @@ fn main() -> agent_client_protocol::Result<()> {
                         .unwrap_or(0);
                     let id = format!("test-{nanos}");
                     *TRANSCRIPT.lock().unwrap() = Some(transcript_path(&request.cwd, &id));
-                    responder.respond(NewSessionResponse::new(SessionId::new(id)))
+                    *USAGE.lock().unwrap() = (0, 0.);
+                    responder.respond(
+                        NewSessionResponse::new(SessionId::new(id))
+                            .config_options(config_options()),
+                    )
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -122,7 +182,33 @@ fn main() -> agent_client_protocol::Result<()> {
                             .ok();
                     }
                     *TRANSCRIPT.lock().unwrap() = Some(path);
-                    responder.respond(LoadSessionResponse::new())
+                    responder.respond(LoadSessionResponse::new().config_options(config_options()))
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |request: SetSessionConfigOptionRequest, responder, _connection| {
+                    let Some(value) = request.value.as_value_id() else {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params().data("not a value id"),
+                        );
+                    };
+                    let value = value.0.to_string();
+                    {
+                        let mut options = OPTIONS.lock().unwrap();
+                        match request.config_id.0.as_ref() {
+                            "mode" => options.0 = value,
+                            "model" => options.1 = value,
+                            _ => {
+                                drop(options);
+                                return responder.respond_with_error(
+                                    agent_client_protocol::Error::invalid_params()
+                                        .data("no such option"),
+                                );
+                            }
+                        }
+                    }
+                    responder.respond(SetSessionConfigOptionResponse::new(config_options()))
                 },
                 agent_client_protocol::on_receive_request!(),
             )
@@ -142,6 +228,21 @@ fn main() -> agent_client_protocol::Result<()> {
                                 StopReason::EndTurn
                             }
                         };
+                        // Each turn fills the window by its schema read and a little more.
+                        let (used, cost) = {
+                            let mut usage = USAGE.lock().unwrap();
+                            usage.0 = (usage.0 + 41_800).min(WINDOW);
+                            usage.1 += 0.137;
+                            *usage
+                        };
+                        turn_connection
+                            .send_notification(SessionNotification::new(
+                                request.session_id.clone(),
+                                SessionUpdate::UsageUpdate(
+                                    UsageUpdate::new(used, WINDOW).cost(Cost::new(cost, "USD")),
+                                ),
+                            ))
+                            .ok();
                         responder.respond(PromptResponse::new(stop))
                     })
                 },

@@ -14,7 +14,8 @@ use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, Implementation, InitializeRequest, LoadSessionRequest,
     McpServer, McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, StopReason,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigOptionValue,
+    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
     TextContent,
 };
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo, LineDirection};
@@ -58,6 +59,12 @@ pub enum HostEvent {
         request: RequestPermissionRequest,
         reply: oneshot::Sender<RequestPermissionOutcome>,
     },
+    /// The session's options as the agent now reports them: on opening, and after a change.
+    ConfigOptions(Vec<SessionConfigOption>),
+    /// Setting an option failed.
+    ConfigOptionFailed {
+        message: String,
+    },
     /// A prompt turn ended.
     TurnEnded {
         stop: Result<StopReason, String>,
@@ -72,6 +79,11 @@ pub enum HostEvent {
 pub enum HostCommand {
     Prompt(String),
     Cancel,
+    /// Sets one of the session's options (its model, mode, reasoning level).
+    SetConfigOption {
+        id: String,
+        value: SessionConfigOptionValue,
+    },
 }
 
 /// Runs one agent session until the command channel closes or the agent exits. Dropping the
@@ -188,6 +200,7 @@ async fn connect(
             // longer knows starts a new one.
             let can_load = initialized.agent_capabilities.load_session;
             let mut resumed = None;
+            let mut config_options = Vec::new();
             if let Some(id) = launch.resume.clone().filter(|_| can_load) {
                 let loaded = connection
                     .send_request(
@@ -196,23 +209,28 @@ async fn connect(
                     )
                     .block_task()
                     .await;
-                if loaded.is_ok() {
+                if let Ok(loaded) = loaded {
                     resumed = Some(SessionId::new(id));
+                    config_options = loaded.config_options.unwrap_or_default();
                 }
             }
             let session_id = match resumed.clone() {
                 Some(id) => id,
                 None => {
-                    connection
+                    let created = connection
                         .send_request(
                             NewSessionRequest::new(launch.cwd.clone())
                                 .mcp_servers(vec![McpServer::Stdio(mcp)]),
                         )
                         .block_task()
-                        .await?
-                        .session_id
+                        .await?;
+                    config_options = created.config_options.unwrap_or_default();
+                    created.session_id
                 }
             };
+            events
+                .unbounded_send(HostEvent::ConfigOptions(config_options))
+                .ok();
             events
                 .unbounded_send(HostEvent::Ready {
                     agent: agent_name,
@@ -245,6 +263,29 @@ async fn connect(
                     HostCommand::Cancel => {
                         connection
                             .send_notification(CancelNotification::new(session_id.clone()))?;
+                    }
+                    HostCommand::SetConfigOption { id, value } => {
+                        let connection_for_set = connection.clone();
+                        let session_id = session_id.clone();
+                        let events = events.clone();
+                        connection.spawn(async move {
+                            let response = connection_for_set
+                                .send_request(SetSessionConfigOptionRequest::new(
+                                    session_id,
+                                    SessionConfigId::new(id),
+                                    value,
+                                ))
+                                .block_task()
+                                .await;
+                            let event = match response {
+                                Ok(response) => HostEvent::ConfigOptions(response.config_options),
+                                Err(error) => HostEvent::ConfigOptionFailed {
+                                    message: error.to_string(),
+                                },
+                            };
+                            events.unbounded_send(event).ok();
+                            Ok(())
+                        })?;
                     }
                 }
             }

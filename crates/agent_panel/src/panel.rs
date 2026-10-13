@@ -6,7 +6,9 @@ use std::path::PathBuf;
 
 use agent_client_protocol::schema::v1::{
     ContentBlock, PermissionOption, PermissionOptionKind, PlanEntryStatus,
-    RequestPermissionOutcome, SelectedPermissionOutcome, SessionUpdate, StopReason, ToolCallStatus,
+    RequestPermissionOutcome, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionValue, SessionConfigSelectOptions, SessionUpdate, StopReason,
+    ToolCallStatus,
 };
 use editor::Editor;
 use futures::StreamExt as _;
@@ -26,7 +28,10 @@ use studio_settings::StudioSettings;
 use studio_ui::ds;
 use studio_workspace::{Item, ItemEvent, ItemFooter, SavedItem, Workspace};
 use ui::prelude::*;
-use ui::{Callout, CommonAnimationExt as _, Indicator, KeyBinding, Severity, Tooltip};
+use ui::{
+    Callout, CircularProgress, CommonAnimationExt as _, ContextMenu, Indicator, KeyBinding,
+    PopoverMenu, Severity, Switch, SwitchLabelPosition, Tooltip,
+};
 
 use crate::host::{self, HostCommand, HostEvent, Launch};
 use crate::socket::{ToolRequest, ToolSocket};
@@ -141,6 +146,14 @@ enum Entry {
     },
 }
 
+/// How full the agent's context window is, and what the session has cost so far, as the agent
+/// last reported them.
+struct Usage {
+    used: u64,
+    size: u64,
+    cost: Option<(f64, String)>,
+}
+
 struct Host {
     commands: mpsc::UnboundedSender<HostCommand>,
     _socket: ToolSocket,
@@ -167,6 +180,12 @@ pub struct AgentPanel {
     session_id: Option<String>,
     /// The next start begins a new conversation instead of resuming the last.
     start_fresh: bool,
+    /// The options the agent offers for this session (its model, mode, reasoning level), in its
+    /// order and as it last confirmed them.
+    config_options: Vec<SessionConfigOption>,
+    /// A value chosen and sent but not yet confirmed, shown in the meantime.
+    setting_option: Option<(String, SessionConfigOptionValue)>,
+    usage: Option<Usage>,
 }
 
 impl EventEmitter<ItemEvent> for AgentPanel {}
@@ -198,7 +217,8 @@ impl Item for AgentPanel {
         })
     }
 
-    /// Delta's composer footer: the agent at work, the agent, then send or stop.
+    /// Delta's composer footer: the agent at work, how full its context is, its options (model,
+    /// mode), the agent, then send or stop.
     fn footer(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<ItemFooter> {
         let running = matches!(self.state, State::Prompting { .. });
         let can_send = matches!(
@@ -259,6 +279,8 @@ impl Item for AgentPanel {
                     .into_any_element(),
             );
         }
+        end.extend(self.render_usage(cx));
+        end.extend(self.render_options(cx));
         end.push(
             h_flex()
                 .gap(px(ds::space::SM))
@@ -306,6 +328,9 @@ impl AgentPanel {
             queued: None,
             session_id: None,
             start_fresh: false,
+            config_options: Vec::new(),
+            setting_option: None,
+            usage: None,
         };
         panel.sync_setup_state(cx);
         panel
@@ -458,6 +483,9 @@ impl AgentPanel {
 
     fn stop_host(&mut self) {
         self.host = None;
+        // Options can only be set on a running session.
+        self.config_options.clear();
+        self.setting_option = None;
         for entry in &mut self.entries {
             match entry {
                 Entry::Permission(card) if card.reply.is_some() => {
@@ -479,6 +507,7 @@ impl AgentPanel {
         self.stop_host();
         self.entries.clear();
         self.markdown.clear();
+        self.usage = None;
         self.start_fresh = true;
         self.start(cx);
     }
@@ -514,6 +543,10 @@ impl AgentPanel {
                         text: "Resumed the last conversation; ↻ starts a new one.".into(),
                         error: false,
                     });
+                } else {
+                    // A resumed session keeps its own options; a new one starts from the ones
+                    // chosen last for this agent.
+                    self.apply_preferences(cx);
                 }
                 self.state = State::Ready { agent };
                 if let Some(text) = self.queued.take() {
@@ -521,6 +554,17 @@ impl AgentPanel {
                 }
             }
             HostEvent::Update(update) => self.apply_update(update),
+            HostEvent::ConfigOptions(options) => {
+                self.config_options = options;
+                self.setting_option = None;
+            }
+            HostEvent::ConfigOptionFailed { message } => {
+                self.setting_option = None;
+                self.entries.push(Entry::Notice {
+                    text: format!("The agent did not change the option: {message}"),
+                    error: true,
+                });
+            }
             HostEvent::Permission { request, reply } => {
                 self.entries.push(Entry::Permission(PermissionCard {
                     title: request
@@ -616,6 +660,16 @@ impl AgentPanel {
                     }
                 }
             }
+            SessionUpdate::ConfigOptionUpdate(update) => {
+                self.config_options = update.config_options;
+            }
+            SessionUpdate::UsageUpdate(update) => {
+                self.usage = Some(Usage {
+                    used: update.used,
+                    size: update.size,
+                    cost: update.cost.map(|cost| (cost.amount, cost.currency)),
+                });
+            }
             SessionUpdate::Plan(plan) => {
                 let entries = plan
                     .entries
@@ -628,6 +682,69 @@ impl AgentPanel {
                 }
             }
             _ => {}
+        }
+    }
+
+    // ---- session options ----
+
+    /// Sets one of the session's options and remembers the choice for this agent's next new
+    /// session.
+    fn set_option(&mut self, id: String, value: SessionConfigOptionValue, cx: &mut Context<Self>) {
+        let Some(host) = &self.host else {
+            return;
+        };
+        let remembered = match &value {
+            SessionConfigOptionValue::Boolean { value } => Value::Bool(*value),
+            other => match other.as_value_id() {
+                Some(id) => Value::String(id.0.to_string()),
+                None => return,
+            },
+        };
+        crate::sessions::prefer(&Self::command(cx), &id, remembered);
+        if host
+            .commands
+            .unbounded_send(HostCommand::SetConfigOption {
+                id: id.clone(),
+                value: value.clone(),
+            })
+            .is_ok()
+        {
+            self.setting_option = Some((id, value));
+        }
+        cx.notify();
+    }
+
+    /// Sets the options chosen last for this agent where the new session differs and still
+    /// offers the value.
+    fn apply_preferences(&mut self, cx: &mut Context<Self>) {
+        let preferences = crate::sessions::preferences(&Self::command(cx));
+        let Some(host) = &self.host else {
+            return;
+        };
+        for option in &self.config_options {
+            let Some(preferred) = preferences.get(option.id.0.as_ref()) else {
+                continue;
+            };
+            let value = match (&option.kind, preferred) {
+                (SessionConfigKind::Select(select), Value::String(preferred))
+                    if select.current_value.0.as_ref() != preferred
+                        && select_values(&select.options).any(|(value, _)| value == preferred) =>
+                {
+                    SessionConfigOptionValue::value_id(preferred.clone())
+                }
+                (SessionConfigKind::Boolean(boolean), Value::Bool(preferred))
+                    if boolean.current_value != *preferred =>
+                {
+                    SessionConfigOptionValue::boolean(*preferred)
+                }
+                _ => continue,
+            };
+            host.commands
+                .unbounded_send(HostCommand::SetConfigOption {
+                    id: option.id.0.to_string(),
+                    value,
+                })
+                .ok();
         }
     }
 
@@ -1117,6 +1234,61 @@ fn describe_outcome(outcome: &WriteOutcome<ChangeOutput>) -> (ProposalState, Str
 }
 
 /// The last eight characters of a graph commit id, as the activity log shows it.
+/// A select option's values and names, across its groups.
+fn select_values(
+    options: &SessionConfigSelectOptions,
+) -> Box<dyn Iterator<Item = (&str, &str)> + '_> {
+    match options {
+        SessionConfigSelectOptions::Ungrouped(options) => Box::new(
+            options
+                .iter()
+                .map(|option| (option.value.0.as_ref(), option.name.as_str())),
+        ),
+        SessionConfigSelectOptions::Grouped(groups) => Box::new(groups.iter().flat_map(|group| {
+            group
+                .options
+                .iter()
+                .map(|option| (option.value.0.as_ref(), option.name.as_str()))
+        })),
+        _ => Box::new(std::iter::empty()),
+    }
+}
+
+/// The longest value name a footer picker shows before it is cut.
+const OPTION_NAME_CHARS: usize = 32;
+
+fn cut(name: &str, chars: usize) -> String {
+    if name.chars().count() <= chars {
+        name.to_owned()
+    } else {
+        let kept: String = name.chars().take(chars.saturating_sub(1)).collect();
+        format!("{}…", kept.trim_end())
+    }
+}
+
+/// Token counts as people read them: 999, 1.2k, 84k, 1.2M.
+fn humanize_tokens(count: u64) -> String {
+    match count {
+        0..=999 => count.to_string(),
+        1_000..=9_999 => trim_point(format!("{:.1}", count as f64 / 1_000.)) + "k",
+        10_000..=999_999 => format!("{}k", (count as f64 / 1_000.).round() as u64),
+        _ => trim_point(format!("{:.1}", count as f64 / 1_000_000.)) + "M",
+    }
+}
+
+fn trim_point(number: String) -> String {
+    number
+        .strip_suffix(".0")
+        .map(str::to_owned)
+        .unwrap_or(number)
+}
+
+/// A session's cost: four decimals under a cent, else two.
+fn format_cost(amount: f64, currency: &str) -> String {
+    let precision = if amount > 0. && amount < 0.01 { 4 } else { 2 };
+    format!("{amount:.precision$} {currency}")
+}
+
 fn short_commit(id: &str) -> String {
     let tail = id.rsplit('.').next().unwrap_or(id);
     let skip = tail.chars().count().saturating_sub(8);
@@ -1763,6 +1935,207 @@ impl AgentPanel {
             .into_any_element()
     }
 
+    /// The agent's options as footer pickers, in the agent's order (spec 011): a menu for a
+    /// choice of values, a switch for on and off. Only while the session runs.
+    fn render_options(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        if self.host.is_none() {
+            return Vec::new();
+        }
+        let panel = cx.entity().downgrade();
+        let mut pickers = Vec::new();
+        for option in &self.config_options {
+            let id = option.id.0.to_string();
+            let pending = self
+                .setting_option
+                .as_ref()
+                .filter(|(pending, _)| *pending == id)
+                .map(|(_, value)| value);
+            let about: SharedString = match &option.description {
+                Some(description) => format!("{}: {description}", option.name).into(),
+                None => option.name.clone().into(),
+            };
+            match &option.kind {
+                SessionConfigKind::Select(select) => {
+                    let current = pending
+                        .and_then(SessionConfigOptionValue::as_value_id)
+                        .map(|value| value.0.to_string())
+                        .unwrap_or_else(|| select.current_value.0.to_string());
+                    let name = select_values(&select.options)
+                        .find(|(value, _)| *value == current)
+                        .map(|(_, name)| name.to_owned())
+                        .unwrap_or_else(|| current.clone());
+                    // The menu's sections: the agent's groups, or the option's own name.
+                    let sections: Vec<(String, Vec<(String, String)>)> = match &select.options {
+                        SessionConfigSelectOptions::Grouped(groups) => groups
+                            .iter()
+                            .map(|group| {
+                                (
+                                    group.name.clone(),
+                                    group
+                                        .options
+                                        .iter()
+                                        .map(|o| (o.value.0.to_string(), o.name.clone()))
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                        options => vec![(
+                            option.name.clone(),
+                            select_values(options)
+                                .map(|(value, name)| (value.to_owned(), name.to_owned()))
+                                .collect(),
+                        )],
+                    };
+                    let panel = panel.clone();
+                    let menu_id = id.clone();
+                    pickers.push(
+                        PopoverMenu::new(SharedString::from(format!("option-{id}")))
+                            .trigger(
+                                ds::button(
+                                    SharedString::from(format!("option-{id}-button")),
+                                    cut(&name, OPTION_NAME_CHARS),
+                                )
+                                .style(ButtonStyle::Subtle)
+                                .color(Color::Muted)
+                                .disabled(pending.is_some())
+                                .end_icon(
+                                    Icon::new(IconName::ChevronDown)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .tooltip(Tooltip::text(about)),
+                            )
+                            .menu(move |window, cx| {
+                                let sections = sections.clone();
+                                let current = current.clone();
+                                let id = menu_id.clone();
+                                let panel = panel.clone();
+                                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                    for (index, (header, values)) in
+                                        sections.into_iter().enumerate()
+                                    {
+                                        if index > 0 {
+                                            menu = menu.separator();
+                                        }
+                                        menu = menu.header(header);
+                                        for (value, name) in values {
+                                            let checked = value == current;
+                                            let panel = panel.clone();
+                                            let id = id.clone();
+                                            menu = menu.toggleable_entry(
+                                                name,
+                                                checked,
+                                                IconPosition::Start,
+                                                None,
+                                                move |_, cx| {
+                                                    if checked {
+                                                        return;
+                                                    }
+                                                    panel
+                                                        .update(cx, |panel, cx| {
+                                                            panel.set_option(
+                                                                id.clone(),
+                                                                SessionConfigOptionValue::value_id(
+                                                                    value.clone(),
+                                                                ),
+                                                                cx,
+                                                            )
+                                                        })
+                                                        .ok();
+                                                },
+                                            );
+                                        }
+                                    }
+                                    menu
+                                }))
+                            })
+                            .anchor(gpui::Anchor::BottomRight)
+                            .into_any_element(),
+                    );
+                }
+                SessionConfigKind::Boolean(boolean) => {
+                    let on = match pending {
+                        Some(SessionConfigOptionValue::Boolean { value }) => *value,
+                        _ => boolean.current_value,
+                    };
+                    let panel = panel.clone();
+                    pickers.push(
+                        h_flex()
+                            .id(SharedString::from(format!("option-{id}")))
+                            .tooltip(Tooltip::text(about))
+                            .child(
+                                Switch::new(
+                                    SharedString::from(format!("option-{id}-switch")),
+                                    on.into(),
+                                )
+                                .label(option.name.clone())
+                                .label_position(SwitchLabelPosition::Start)
+                                .label_size(LabelSize::Small)
+                                .label_color(Color::Muted)
+                                .disabled(pending.is_some())
+                                .on_click(move |state, _, cx| {
+                                    let next = matches!(state, ToggleState::Selected);
+                                    panel
+                                        .update(cx, |panel, cx| {
+                                            panel.set_option(
+                                                id.clone(),
+                                                SessionConfigOptionValue::boolean(next),
+                                                cx,
+                                            )
+                                        })
+                                        .ok();
+                                }),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        pickers
+    }
+
+    /// How full the context window is, as a ring and a percentage that turn to the warning
+    /// colour near the end; the token counts and the cost so far on hover.
+    fn render_usage(&self, cx: &App) -> Option<AnyElement> {
+        let usage = self.usage.as_ref().filter(|usage| usage.size > 0)?;
+        let ratio = (usage.used as f32 / usage.size as f32).clamp(0., 1.);
+        let nearly_full = ratio >= 0.85;
+        let color = if nearly_full {
+            cx.theme().status().warning
+        } else {
+            cx.theme().colors().text_muted
+        };
+        let percent = format!("{}%", (ratio * 100.).round() as u32);
+        let title = format!("{percent} of the context window");
+        let mut meta = format!(
+            "{} of {} tokens",
+            humanize_tokens(usage.used),
+            humanize_tokens(usage.size)
+        );
+        if let Some((amount, currency)) = &usage.cost {
+            meta.push_str(&format!(" · {} so far", format_cost(*amount, currency)));
+        }
+        Some(
+            h_flex()
+                .id("context-usage")
+                .flex_none()
+                .gap(px(ds::space::XS))
+                .items_center()
+                .child(
+                    CircularProgress::new(usage.used as f32, usage.size as f32, px(14.), cx)
+                        .stroke_width(px(2.))
+                        .progress_color(color),
+                )
+                // The number too: a ring alone reads as a spinner.
+                .child(
+                    ds::text::meta(percent).when(nearly_full, |label| label.color(Color::Warning)),
+                )
+                .tooltip(move |_, cx| Tooltip::with_meta(title.clone(), None, meta.clone(), cx))
+                .into_any_element(),
+        )
+    }
+
     fn render_branch_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let branch = self
             .branch
@@ -1798,5 +2171,36 @@ impl AgentPanel {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_counts_and_costs_read_like_zeds() {
+        assert_eq!(humanize_tokens(999), "999");
+        assert_eq!(humanize_tokens(1_000), "1k");
+        assert_eq!(humanize_tokens(1_234), "1.2k");
+        assert_eq!(humanize_tokens(83_600), "84k");
+        assert_eq!(humanize_tokens(200_000), "200k");
+        assert_eq!(humanize_tokens(1_000_000), "1M");
+        assert_eq!(humanize_tokens(1_250_000), "1.2M");
+        assert_eq!(format_cost(0.0042, "USD"), "0.0042 USD");
+        assert_eq!(format_cost(0.411, "USD"), "0.41 USD");
+        assert_eq!(format_cost(0., "USD"), "0.00 USD");
+    }
+
+    #[test]
+    fn long_option_names_are_cut_on_a_character() {
+        assert_eq!(cut("Claude Sonnet", OPTION_NAME_CHARS), "Claude Sonnet");
+        let long = "Claude Sonnet with an extended thinking budget";
+        // No space is left before the ellipsis.
+        assert_eq!(
+            cut(long, OPTION_NAME_CHARS),
+            "Claude Sonnet with an extended…"
+        );
+        assert_eq!(cut("模型模型模型", 4), "模型模…");
     }
 }

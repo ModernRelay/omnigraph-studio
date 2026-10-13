@@ -176,6 +176,33 @@ Query text, parameters, rows, tokens and prompt text. Agent stderr is shown only
   once when there is a conversation to come back to. The resumed conversation keeps writing to
   its branch. ↻ (Restart) starts a new conversation and forgets the saved one.
 
+## Session options and context usage
+
+As in Zed's agent panel (checked in `agent_ui` at `v1.23.2`), and only through stable ACP v1:
+
+- **Options.** The options an agent returns from `session/new` and `session/load`, and later in
+  `config_option_update`, are its model, mode, reasoning level and the like. The footer shows
+  one picker per option in the agent's order, between the context ring and the agent: a choice
+  of values is a subtle button with the current value's name (cut at 32 characters) and a
+  chevron, opening a menu with the agent's groups as headers and the current value checked; an
+  on/off option is a switch with its name. Choosing sends `session/set_config_option`; the
+  picker shows the chosen value and is disabled until the agent answers, and its answer
+  replaces every option, since one choice can change another (a model's reasoning levels). A
+  refusal leaves the agent's values and adds an error note to the thread. Options exist only
+  while the session runs.
+- **Remembered choices.** Studio remembers the last value chosen for each option, per agent
+  command (`agent/preferences.json`, owner-only, value ids and booleans only), and sets them on
+  the agent's next new session where it offers that value and starts on another. A resumed
+  session keeps its own.
+- **Context.** Each `usage_update` replaces the usage: a 14 px ring with the percentage beside
+  it, since a ring alone reads as a spinner, muted until 85 % and then the warning colour. Hover
+  shows the share of the window, the tokens as people read them (999, 1.2k, 84k, 1.2M) and the
+  cost so far (four decimals under a cent). Nothing shows until the agent reports usage; ↻
+  clears it.
+
+Zed's searchable picker with favourites (from five values) and its option keybindings are not
+built: agents offer few enough values for a menu.
+
 ## Deferred
 
 - Windows: the proxy uses Unix sockets. Windows support waits for a named-pipe transport.
@@ -195,6 +222,9 @@ Query text, parameters, rows, tokens and prompt text. Agent stderr is shown only
 | 2026-10-12 | A rejected change creates nothing | Same, then `studio_agent::Reject`; `GET /branches` | Card "Rejected.", the agent got "The person rejected this change.", no new branch |
 | 2026-10-12 | Key bindings reach the panel | Read every ⌘↩, ⌘Y, ⌘⌥Y, ⌘⌥N, ⌘. and ⌘⇧. binding in Zed's `default-macos.json` at `v1.23.2` | As in Actions above; ⌘. collides, ⌘⇧. is free |
 | 2026-10-12 | Agent replies render as markdown | the test agent answering "summarize people as markdown" with bold, a list, inline code and a code block; an offscreen snapshot | Zed's `markdown` crate (`Markdown::new`, not `new_text`, which parses links only) with `MarkdownStyle::themed(Agent)`; a streaming reply appends its new tail to the parsed text |
+| 2026-10-12 | A conversation comes back after a restart | `agent_panel` `a_session_is_kept_per_graph_and_agent`; offscreen snapshots with the test agent (now with `loadSession` and a transcript per session): ask, close, reopen the Agent tab; then ↻ | The question and the markdown reply replayed with "Resumed the last conversation"; after ↻ the panel cleared and `sessions.json` held a new session id |
+| 2026-10-12 | Zed's agent offers the model through ACP session options and shows context from `usage_update` | Read `agent_ui/src/config_options.rs`, `agent_servers/src/acp.rs` (`set_config_option`) and `thread_view.rs` (`render_token_usage`) at `v1.23.2`, and `SessionConfigOption`, `UsageUpdate` in `agent-client-protocol-schema` 1.9.1 | One picker per option in the agent's order, the current value's name with a chevron; the response to `session/set_config_option` replaces every option; a 16 px ring, warning colour from 85 %, used, size and cost on hover |
+| 2026-10-12 | The footer shows the agent's options and how full its context is | Offscreen snapshots with the test agent (now offering a mode and a grouped model, taking `session/set_config_option`, reporting usage after each turn): ask, open the model menu, pick Claude Opus, ↻, hover the ring | "Ask before changes ▾", "Claude Sonnet ▾", then a ring with "21%"; the menu showed the Claude and Local groups with Sonnet checked; after ↻ the new session showed Claude Opus and no ring; the tooltip read "21% of the context window · 42k of 200k tokens · 0.14 USD so far"; `preferences.json` held `"model": "opus"`, mode `0600` |
 
 ## Corrections
 
@@ -205,4 +235,3 @@ Query text, parameters, rows, tokens and prompt text. Agent stderr is shown only
 - Stop was planned as ⌘.; Zed's editor binding takes it inside the composer, so it is ⌘⇧.
 - 2026-10-12 · Approval said Allow was ⌘↩ and Reject ⎋. ⌘↩ is Send in the composer and ⎋
   belongs to the editor, so the card uses the bound ⌘Y, ⌘⌥Y and ⌘⌥N, as in Actions.
-| 2026-10-12 | A conversation comes back after a restart | `agent_panel` `a_session_is_kept_per_graph_and_agent`; offscreen snapshots with the test agent (now with `loadSession` and a transcript per session): ask, close, reopen the Agent tab; then ↻ | The question and the markdown reply replayed with "Resumed the last conversation"; after ↻ the panel cleared and `sessions.json` held a new session id |
