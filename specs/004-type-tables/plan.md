@@ -49,7 +49,11 @@ stay put), IX (paged, virtualized).
   right-aligned with tabular digits, dates relative with exact value on hover, enums as chips,
   lists truncated with "+N", Blob as "Blob · size · Preview", Vector hidden.
 - Peek in the right dock (in flow, not modal; focus stays in the table): all properties, the
-  relationship tree rooted at the row (spec 005), and Blob previews.
+  relationship tree rooted at the row (spec 005), and Blob previews. A stored Blob value has
+  "Save…": the person picks a file (named `<id>-<property>` with the extension its first bytes
+  announce), the value is read in ranges at the peek's commit into `<file>.part` beside it, off
+  the main thread, and renamed into place only when whole; the line shows how far it got, then
+  "Show in Finder".
 
 ### Reading
 
@@ -161,7 +165,6 @@ opens the branch's recent commits.
 - Group-by (Tower 084) until filters and editing ship.
 - Multi-row edits of different values staged as one draft (bulk set covers one value across
   rows). Views do not hold column state: columns are fixed. The preview tab is built (spec 002).
-- Saving a Blob value to a file: the peek previews the first bytes only.
 - Per-row history beyond the commits that the change feed can cheaply return.
 
 ## Validation log
@@ -191,6 +194,7 @@ opens the branch's recent commits.
 | 2026-10-12 | Saved views | `studio_settings` `views_are_saved_per_graph_and_type_and_replaced_by_name`; `gq_language` `filter_operators_round_trip_through_their_keys`; offscreen snapshots with `click:` and `type:` steps: a seeded "Founders" applied from the Views menu, then sorted by email and saved as "Founders by email" | "title is Founder", name ascending, "25 of 200", and the button read "Founders"; `settings.json` held both views |
 | 2026-10-12 | Spike S1: several rows in one commit | on a scratch branch of the dev server: `update Person set { title: $v } where @id in $ids` (3 rows), and one mutation of two `update` statements | Both publish one commit; multi-statement mutations are the mechanism, so merge-mode NDJSON was not needed |
 | 2026-10-12 | Bulk set | `gq_language` `a_bulk_set_is_one_mutation_bound_row_by_row`; offscreen snapshots with `click:…,cmd` and `click:…,shift` on Project at branch `bulk-test`: three rows picked, status set to paused | One commit; `project-00001`, already paused, was left out ("Set status on 2 Project rows"); the rows updated in place and the selection cleared |
+| 2026-10-12 | A Blob value saves whole or not at all | `type_table` tests `a_save_lands_whole_or_not_at_all`, `a_saved_value_is_named_for_its_row_property_and_kind`; an offscreen snapshot of a note with a 12 KB text attachment | "Save…" at the end of the attachment's line; a save writes `<name>.part`, appends each range, and renames it into place only at the value's full size (a short value or a stop removes the part); the name is `<id>-<property>` with the kind's extension. The native save dialog cannot be driven offscreen |
 
 ## Corrections
 

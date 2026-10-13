@@ -13,7 +13,9 @@ use studio_actions::graph::OpenNode;
 use ui::Tooltip;
 use ui::prelude::*;
 
-use crate::blob::{IMAGE_MAX, PREVIEW_PREFIX, Preview, bytes_wanted, preview};
+use crate::blob::{
+    IMAGE_MAX, PREVIEW_PREFIX, Preview, RangeSave, bytes_wanted, preview, suggested_file_name,
+};
 use crate::model::{FROM_COLUMN, TO_COLUMN, display_value, format_count, node_rows, short_commit};
 use graph_client::{BlobCell, BlobMeta};
 
@@ -72,7 +74,19 @@ struct BlobSlot {
     property: String,
     meta: Loadable<BlobMeta>,
     preview: Loadable<Preview>,
+    /// The value's first bytes, to name a saved file for its kind.
+    head: Vec<u8>,
+    save: Option<SaveState>,
     _task: Option<Task<()>>,
+    _save: Option<Task<()>>,
+}
+
+/// Saving a value to a file: how far it got, or how it ended.
+#[derive(Debug, Clone)]
+enum SaveState {
+    Saving { done: u64, of: u64 },
+    Saved(std::path::PathBuf),
+    Failed(String),
 }
 
 pub struct NodePeek {
@@ -205,7 +219,10 @@ impl NodePeek {
                 property,
                 meta: Loadable::Loading,
                 preview: Loadable::NotLoaded,
+                head: Vec::new(),
+                save: None,
                 _task: None,
+                _save: None,
             })
             .collect();
         for index in 0..self.blobs.len() {
@@ -269,16 +286,117 @@ impl NodePeek {
                         wanted = bytes_wanted(&bytes, size).min(IMAGE_MAX);
                     }
                 }
+                let head = bytes.iter().take(16).copied().collect();
                 let shown = cx
                     .background_spawn(async move { preview(bytes, size) })
                     .await;
                 this.update(cx, |this, cx| {
+                    this.blobs[index].head = head;
                     this.blobs[index].preview = Loadable::Loaded(shown);
                     cx.notify();
                 })
                 .ok();
             }));
         }
+    }
+
+    /// Saves a managed value to a file the person picks: read in ranges at the peek's commit and
+    /// written to a file beside it, renamed into place when complete, so memory holds one range
+    /// and a stopped save leaves no partial file under the chosen name.
+    fn save_blob(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(slot) = self.blobs.get(index) else {
+            return;
+        };
+        let Loadable::Loaded(BlobMeta::Managed { size, .. }) = slot.meta else {
+            return;
+        };
+        let id = self.subject.id().to_owned();
+        let name = suggested_file_name(&id, &slot.property, &slot.head);
+        let directory = std::env::var_os("HOME")
+            .map(|home| std::path::PathBuf::from(home).join("Downloads"))
+            .filter(|dir| dir.is_dir())
+            .unwrap_or_else(std::env::temp_dir);
+        let chosen = cx.prompt_for_new_path(&directory, Some(&name));
+        let cell = BlobCell {
+            edge: matches!(self.subject, PeekSubject::Edge { .. }),
+            type_name: self.subject.type_name().to_owned(),
+            id,
+            property: slot.property.clone(),
+        };
+        let session = self.session.downgrade();
+        let snapshot = self.snapshot.clone();
+        self.blobs[index]._save = Some(cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(path))) = chosen.await else {
+                return;
+            };
+            let set = |state: SaveState, cx: &mut gpui::AsyncWindowContext| {
+                this.update(cx, |this, cx| {
+                    if let Some(slot) = this.blobs.get_mut(index) {
+                        slot.save = Some(state);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            };
+            set(SaveState::Saving { done: 0, of: size }, cx);
+            let begun = cx
+                .background_spawn(async move { RangeSave::begin(path, size) })
+                .await;
+            let mut save = match begun {
+                Ok(save) => save,
+                Err(error) => {
+                    set(SaveState::Failed(format!("Could not write: {error}")), cx);
+                    return;
+                }
+            };
+            while save.written() < size {
+                let from = save.written();
+                let Ok(read) = session.update(cx, |session, cx| {
+                    session.blob_bytes(cell.clone(), snapshot.clone(), from..size, cx)
+                }) else {
+                    save.abandon();
+                    return;
+                };
+                let chunk = match read.await {
+                    Ok(chunk) if !chunk.is_empty() => chunk,
+                    Ok(_) => break,
+                    Err(error) => {
+                        save.abandon();
+                        set(SaveState::Failed(error.to_string()), cx);
+                        return;
+                    }
+                };
+                // Files are written off the main thread, one range at a time.
+                let (returned, written) = cx
+                    .background_spawn(async move {
+                        let written = save.append(&chunk);
+                        (save, written)
+                    })
+                    .await;
+                save = returned;
+                if let Err(error) = written {
+                    save.abandon();
+                    set(SaveState::Failed(format!("Could not write: {error}")), cx);
+                    return;
+                }
+                set(
+                    SaveState::Saving {
+                        done: save.written(),
+                        of: size,
+                    },
+                    cx,
+                );
+            }
+            let finished = cx.background_spawn(async move { save.finish() }).await;
+            set(
+                match finished {
+                    Ok(path) => SaveState::Saved(path),
+                    Err(error) => SaveState::Failed(error),
+                },
+                cx,
+            );
+        }));
+        cx.notify();
     }
 
     fn render_blobs(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -360,18 +478,59 @@ impl NodePeek {
                     ),
                     _ => None,
                 };
+                let managed = matches!(slot.meta, Loadable::Loaded(BlobMeta::Managed { .. }));
+                let save: Option<AnyElement> = match &slot.save {
+                    Some(SaveState::Saving { done, of }) => Some(
+                        studio_ui::ds::text::meta(format!(
+                            "Saving {}%",
+                            (*done * 100).checked_div(*of).unwrap_or(100)
+                        ))
+                        .into_any_element(),
+                    ),
+                    Some(SaveState::Saved(path)) => {
+                        let path = path.clone();
+                        Some(
+                            studio_ui::ds::button(("show-saved", index), "Show in Finder")
+                                .style(ButtonStyle::Subtle)
+                                .color(Color::Muted)
+                                .tooltip(Tooltip::text(format!("Saved to {}", path.display())))
+                                .on_click(move |_, _, cx| cx.reveal_path(&path))
+                                .into_any_element(),
+                        )
+                    }
+                    Some(SaveState::Failed(error)) => Some(
+                        Label::new(error.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Error)
+                            .into_any_element(),
+                    ),
+                    None if managed => Some(
+                        studio_ui::ds::button(("save-blob", index), "Save…")
+                            .style(ButtonStyle::Subtle)
+                            .color(Color::Muted)
+                            .tooltip(Tooltip::text("Save the whole value to a file"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.save_blob(index, window, cx)
+                            }))
+                            .into_any_element(),
+                    ),
+                    None => None,
+                };
                 v_flex()
                     .gap_1()
                     .child(
                         h_flex()
                             .gap_2()
+                            .items_center()
                             .child(
                                 Icon::new(IconName::File)
                                     .size(IconSize::XSmall)
                                     .color(Color::Muted),
                             )
                             .child(Label::new(slot.property.clone()).size(LabelSize::Small))
-                            .child(studio_ui::ds::text::meta(facts)),
+                            .child(studio_ui::ds::text::meta(facts))
+                            .child(div().flex_1())
+                            .children(save),
                     )
                     .children(body)
             }))

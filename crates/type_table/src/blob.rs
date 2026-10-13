@@ -49,6 +49,88 @@ pub fn sniff_image(bytes: &[u8]) -> Option<ImageFormat> {
     }
 }
 
+/// The file name a saved value is offered under: the row and the property, and the extension
+/// its first bytes announce (`.txt` for UTF-8 text, `.bin` otherwise).
+pub fn suggested_file_name(id: &str, property: &str, prefix: &[u8]) -> String {
+    let safe = |part: &str| -> String {
+        part.chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    };
+    let extension = match sniff_image(prefix) {
+        Some(ImageFormat::Png) => "png",
+        Some(ImageFormat::Jpeg) => "jpg",
+        Some(ImageFormat::Gif) => "gif",
+        Some(ImageFormat::Webp) => "webp",
+        _ if !prefix.is_empty() && std::str::from_utf8(prefix).is_ok() => "txt",
+        _ => "bin",
+    };
+    format!("{}-{}.{extension}", safe(id), safe(property))
+}
+
+/// A value being saved to a file: written to `<file>.part` beside it range by range, and moved
+/// to the chosen name only when whole, so a stopped save never leaves a partial file there.
+pub struct RangeSave {
+    path: std::path::PathBuf,
+    part: std::path::PathBuf,
+    size: u64,
+    written: u64,
+}
+
+impl RangeSave {
+    pub fn begin(path: std::path::PathBuf, size: u64) -> std::io::Result<Self> {
+        let mut part = path.clone().into_os_string();
+        part.push(".part");
+        let part = std::path::PathBuf::from(part);
+        std::fs::File::create(&part)?;
+        Ok(Self {
+            path,
+            part,
+            size,
+            written: 0,
+        })
+    }
+
+    pub fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.part)?
+            .write_all(bytes)?;
+        self.written += bytes.len() as u64;
+        Ok(())
+    }
+
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Moves the file into place, or removes it when the value came back short.
+    pub fn finish(self) -> Result<std::path::PathBuf, String> {
+        if self.written != self.size {
+            self.abandon();
+            return Err("The value ended before its size; nothing was saved.".into());
+        }
+        match std::fs::rename(&self.part, &self.path) {
+            Ok(()) => Ok(self.path),
+            Err(error) => {
+                std::fs::remove_file(&self.part).ok();
+                Err(format!("Could not write: {error}"))
+            }
+        }
+    }
+
+    pub fn abandon(self) {
+        std::fs::remove_file(&self.part).ok();
+    }
+}
+
 /// How many bytes to read for a preview of a value of `size` bytes whose first bytes are
 /// `prefix`: the whole value for an image that fits, else nothing more.
 pub fn bytes_wanted(prefix: &[u8], size: u64) -> u64 {
@@ -142,6 +224,48 @@ pub fn host(uri: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_save_lands_whole_or_not_at_all() {
+        let dir = std::env::temp_dir().join(format!("studio-blob-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("value.bin");
+        let part = dir.join("value.bin.part");
+
+        let mut save = RangeSave::begin(path.clone(), 6).unwrap();
+        save.append(b"abc").unwrap();
+        assert!(
+            part.exists() && !path.exists(),
+            "nothing under the name until whole"
+        );
+        save.append(b"def").unwrap();
+        assert_eq!(save.finish().unwrap(), path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"abcdef");
+        assert!(!part.exists());
+
+        // A short value, or a stopped save, leaves neither file.
+        std::fs::remove_file(&path).unwrap();
+        let mut short = RangeSave::begin(path.clone(), 6).unwrap();
+        short.append(b"abc").unwrap();
+        assert!(short.finish().is_err());
+        assert!(!path.exists() && !part.exists());
+        RangeSave::begin(path.clone(), 6).unwrap().abandon();
+        assert!(!part.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_saved_value_is_named_for_its_row_property_and_kind() {
+        assert_eq!(
+            suggested_file_name("doc/1", "body", b"\x89PNG\r\n\x1a\nrest"),
+            "doc-1-body.png"
+        );
+        assert_eq!(suggested_file_name("n1", "notes", b"hello"), "n1-notes.txt");
+        assert_eq!(
+            suggested_file_name("n1", "raw", &[0xff, 0x00, 0x13]),
+            "n1-raw.bin"
+        );
+    }
 
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
 
