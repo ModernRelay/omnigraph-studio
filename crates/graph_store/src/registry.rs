@@ -79,6 +79,7 @@ impl ConnectionRegistry {
         let saved = load_saved();
 
         if let Ok(url) = std::env::var("OMNIGRAPH_STUDIO_SERVER") {
+            let url = graph_client::server_root(&url).unwrap_or(url);
             let token = std::env::var("OMNIGRAPH_STUDIO_TOKEN").ok();
             let graphs = std::env::var("OMNIGRAPH_STUDIO_GRAPH")
                 .ok()
@@ -121,7 +122,7 @@ impl ConnectionRegistry {
                     this.add_connection(
                         ServerEntry {
                             name: server.name,
-                            url: server.url,
+                            url: graph_client::server_root(&server.url).unwrap_or(server.url),
                             source: ServerSource::Cli,
                             known_graphs: graphs,
                         },
@@ -134,9 +135,13 @@ impl ConnectionRegistry {
         }
 
         for saved in saved.servers.into_iter().filter(|s| s.source == "studio") {
+            // An address saved without a scheme (`localhost:8080`) is read with the one it
+            // needs; its token, kept under the old address, moves with it.
+            let url = graph_client::server_root(&saved.url).unwrap_or_else(|_| saved.url.clone());
+            let moved = url != saved.url;
             let entry = ServerEntry {
                 name: saved.name,
-                url: saved.url.clone(),
+                url,
                 source: ServerSource::Studio,
                 known_graphs: saved.graphs,
             };
@@ -148,7 +153,14 @@ impl ConnectionRegistry {
                     .flatten()
                     .and_then(|(_, bytes)| String::from_utf8(bytes).ok());
                 this.update(cx, |this, cx| {
-                    this.add_connection(entry, token, cx);
+                    if moved && let Some(token) = &token {
+                        cx.write_credentials(&entry.url, KEYCHAIN_USER, token.as_bytes())
+                            .detach();
+                    }
+                    let added = this.add_connection(entry, token, cx).is_some();
+                    if moved && added {
+                        this.save(cx);
+                    }
                     cx.emit(RegistryEvent::ServersChanged);
                     cx.notify();
                 })
@@ -188,8 +200,7 @@ impl ConnectionRegistry {
         graphs: Vec<String>,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<Entity<Connection>> {
-        let url = url.trim().trim_end_matches('/').to_owned();
-        url::Url::parse(&url)?;
+        let url = graph_client::server_root(&url).map_err(anyhow::Error::msg)?;
         if let Some(token) = &token {
             cx.write_credentials(&url, KEYCHAIN_USER, token.as_bytes())
                 .detach();

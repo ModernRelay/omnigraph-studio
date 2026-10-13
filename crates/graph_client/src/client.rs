@@ -142,6 +142,49 @@ pub enum BlobMeta {
 /// The most bytes [`GraphClient::blob_bytes`] reads in one request.
 pub const BLOB_READ_MAX: u64 = 16 * 1024 * 1024;
 
+/// A server address as typed, made into the root URL a client is built on: trimmed, without a
+/// trailing slash, and with `http://` (loopback hosts) or `https://` (any other host) when no
+/// scheme was given. Refused unless it is an `http` or `https` URL with a host.
+pub fn server_root(input: &str) -> Result<String, String> {
+    let text = input.trim().trim_end_matches('/');
+    if text.is_empty() {
+        return Err("Enter the server's address, for example https://graph.example.com".into());
+    }
+    let text = if text.contains("://") {
+        text.to_owned()
+    } else {
+        let host = text
+            .split(['/', ':'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let loopback = matches!(host.as_str(), "localhost" | "0.0.0.0" | "[")
+            || host.starts_with("127.")
+            || text.starts_with("[::1]");
+        format!("{}://{text}", if loopback { "http" } else { "https" })
+    };
+    let url = Url::parse(&text).map_err(|error| format!("“{input}” is not an address: {error}"))?;
+    check_root(&url)?;
+    Ok(text)
+}
+
+/// Whether a URL can be a server's root: `http` or `https`, with a host, and no user name or
+/// password in it (a token goes in the keychain, never in the address).
+fn check_root(url: &Url) -> Result<(), String> {
+    if !matches!(url.scheme(), "http" | "https") || url.cannot_be_a_base() || url.host().is_none() {
+        return Err(format!(
+            "“{url}” is not a server address: it needs http:// or https:// and a host"
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "A server address cannot hold a user name or password; give the token separately"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// A client for one server. Cheap to clone.
 #[derive(Clone)]
 pub struct GraphClient {
@@ -169,6 +212,7 @@ impl GraphClient {
         http: Arc<dyn HttpClient>,
     ) -> anyhow::Result<Self> {
         let mut base = Url::parse(base)?;
+        check_root(&base).map_err(anyhow::Error::msg)?;
         if !base.path().ends_with('/') {
             let path = format!("{}/", base.path());
             base.set_path(&path);
@@ -187,8 +231,8 @@ impl GraphClient {
 
     fn url(&self, segments: &[&str], query: &[(&str, &str)]) -> Url {
         let mut url = self.base.clone();
-        {
-            let mut path = url.path_segments_mut().expect("http URL has a path");
+        // `new` admits only http(s) roots with a host, which always take path segments.
+        if let Ok(mut path) = url.path_segments_mut() {
             path.pop_if_empty();
             for segment in segments {
                 path.push(segment);
@@ -1046,5 +1090,42 @@ mod tests {
             "an empty range sends nothing"
         );
         assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_server_address_gets_a_scheme_and_a_bare_word_is_refused() {
+        assert_eq!(
+            server_root("localhost:8080").as_deref(),
+            Ok("http://localhost:8080")
+        );
+        assert_eq!(
+            server_root(" 127.0.0.1:8787/ ").as_deref(),
+            Ok("http://127.0.0.1:8787")
+        );
+        assert_eq!(
+            server_root("[::1]:8787").as_deref(),
+            Ok("http://[::1]:8787")
+        );
+        assert_eq!(
+            server_root("graph.example.com").as_deref(),
+            Ok("https://graph.example.com")
+        );
+        assert_eq!(
+            server_root("https://graph.example.com/base/").as_deref(),
+            Ok("https://graph.example.com/base")
+        );
+        assert!(server_root("").is_err());
+        assert!(server_root("ftp://graph.example.com").is_err());
+        assert!(server_root("mailto:someone@example.com").is_err());
+    }
+
+    #[test]
+    fn a_client_refuses_a_root_that_cannot_take_a_path() {
+        // `localhost:8080` parses with `localhost` as its scheme; building a URL on it used to
+        // panic. The client is refused instead, with an error that says why.
+        let http = respond(200, None, "{}");
+        let error = GraphClient::new("localhost:8080", None, http.clone()).unwrap_err();
+        assert!(error.to_string().contains("http://"), "{error}");
+        assert!(GraphClient::new("http://localhost:8080", None, http).is_ok());
     }
 }

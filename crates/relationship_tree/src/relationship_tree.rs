@@ -127,6 +127,8 @@ pub struct RelationshipTree {
     scroll_handle: UniformListScrollHandle,
     exploration_subscriptions: Vec<Subscription>,
     _workspace_subscription: Subscription,
+    /// The read ahead for the row the pointer rests on, once it has rested.
+    _prefetch: Option<gpui::Task<()>>,
 }
 
 impl Focusable for RelationshipTree {
@@ -168,6 +170,7 @@ impl RelationshipTree {
             scroll_handle: UniformListScrollHandle::new(),
             exploration_subscriptions: Vec::new(),
             _workspace_subscription: workspace_subscription,
+            _prefetch: None,
         };
         if session.is_some() && window.focused(cx).is_none() {
             window.focus(&tree.focus_handle, cx);
@@ -910,6 +913,19 @@ impl RelationshipTree {
             }
         };
 
+        // A closed node or relationship the pointer rests on reads ahead what it opens to.
+        let prefetch_path = match &entry.kind {
+            EntryKind::Node {
+                expanded: false, ..
+            }
+            | EntryKind::Group {
+                expanded: false, ..
+            }
+            | EntryKind::Bucket {
+                expanded: false, ..
+            } => Some(entry.path.clone()),
+            _ => None,
+        };
         let tooltip = match &entry.kind {
             EntryKind::Node { node, via, .. } => {
                 let mut text = format!("{} · {}", node.type_name, node.id);
@@ -937,6 +953,11 @@ impl RelationshipTree {
             .when(selected, |d| d.bg(selected_bg))
             .when(selected && focused, |d| d.border_color(focus_border))
             .hover(|style| style.bg(hover_bg))
+            .when_some(prefetch_path, |row, path| {
+                row.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    this.prefetch(hovered.then(|| path.clone()), cx)
+                }))
+            })
             .when_some(tooltip, |d, tooltip| d.tooltip(Tooltip::text(tooltip)))
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.select_row(row, cx);
@@ -1143,6 +1164,21 @@ impl RelationshipTree {
                 })
                 .into_any_element(),
         )
+    }
+
+    /// Reads ahead what opening `path` will show once the pointer has rested on its row;
+    /// leaving the row first reads nothing.
+    fn prefetch(&mut self, path: Option<graph_store::ExplorePath>, cx: &mut Context<Self>) {
+        let (Some(path), Some(exploration)) = (path, self.exploration.clone()) else {
+            self._prefetch = None;
+            return;
+        };
+        self._prefetch = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(120))
+                .await;
+            exploration.update(cx, |e, cx| e.prefetch(&path, cx));
+        }));
     }
 
     /// Whether some relationship group shown has no relationships.

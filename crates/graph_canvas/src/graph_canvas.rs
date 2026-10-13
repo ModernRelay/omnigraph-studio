@@ -263,6 +263,8 @@ pub struct GraphCanvas {
     area: Option<(Point<Pixels>, Point<Pixels>)>,
     /// The right-click menu and where it opened.
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    /// The read ahead for the chip the pointer rests on, once it has rested.
+    _prefetch: Option<Task<()>>,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Each node's chip on screen as last painted, for hit testing.
     chips: Rc<RefCell<Vec<Bounds<Pixels>>>>,
@@ -366,6 +368,7 @@ impl GraphCanvas {
             marked: HashSet::new(),
             area: None,
             context_menu: None,
+            _prefetch: None,
             bounds: Rc::new(Cell::new(None)),
             chips: Rc::new(RefCell::new(Vec::new())),
             _subscriptions: subscriptions,
@@ -927,6 +930,23 @@ impl GraphCanvas {
         });
     }
 
+    /// A pointer that rests on a node or a relationship pill reads ahead what opening it will
+    /// show, so it opens at once; passing over chips reads nothing.
+    fn prefetch_hovered(&mut self, cx: &mut Context<Self>) {
+        let path = self
+            .hovered
+            .and_then(|index| self.scene.nodes.get(index))
+            .filter(|node| matches!(node.kind, SceneKind::Node { .. } | SceneKind::Hub { .. }))
+            .and_then(|node| node.path.clone());
+        self._prefetch = path.map(|path| {
+            let exploration = self.exploration.clone();
+            cx.spawn(async move |_, cx| {
+                cx.background_executor().timer(PREFETCH_AFTER).await;
+                exploration.update(cx, |e, cx| e.prefetch(&path, cx));
+            })
+        });
+    }
+
     fn is_marked(&self, index: usize) -> bool {
         self.scene
             .nodes
@@ -1013,6 +1033,7 @@ impl GraphCanvas {
         let hovered = self.hit(event.position, window);
         if hovered != self.hovered {
             self.hovered = hovered;
+            self.prefetch_hovered(cx);
             cx.notify();
         }
     }
@@ -2113,6 +2134,9 @@ fn half_widths(scene: &Scene, measure: &impl Fn(&str, f32, gpui::FontWeight) -> 
         .map(|node| paint::chip_width(&paint::chip_text(node), measure) / 2.)
         .collect()
 }
+
+/// How long the pointer rests on a chip before what it opens is read ahead.
+const PREFETCH_AFTER: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// A menu entry that dispatches `action` from the window.
 fn open_action<A: gpui::Action + Clone>(action: A) -> impl Fn(&mut Window, &mut App) + 'static {

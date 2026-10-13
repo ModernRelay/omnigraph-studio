@@ -833,6 +833,49 @@ impl ExploreState {
         }
     }
 
+    /// The reads opening `path` would need that are not made yet: a node's relationship
+    /// counts (and its single-target fields), or a relationship's first neighbours, or its
+    /// values when it is grouped. A relationship known to be empty needs none.
+    pub fn prefetch_targets(&self, schema: &SchemaModel, path: &ExplorePath) -> Vec<LoadTarget> {
+        let Some(root) = &self.root else {
+            return Vec::new();
+        };
+        if path.ends_at_node() {
+            let node = path.node(root);
+            return schema
+                .relationships_of(&node.type_name)
+                .into_iter()
+                .filter_map(|group| {
+                    let key = GroupKey::new(node.clone(), group.clone());
+                    if is_field(schema, &group) {
+                        (!self.neighbours.contains_key(&key)).then_some(LoadTarget::Page(key))
+                    } else {
+                        (!self.counts.contains_key(&key)).then_some(LoadTarget::Count(key))
+                    }
+                })
+                .collect();
+        }
+        let Some(key) = self.group_key(path) else {
+            return Vec::new();
+        };
+        if matches!(self.counts.get(&key), Some(Loadable::Loaded(0))) {
+            return Vec::new();
+        }
+        match (&key.within, self.grouping.get(&key.group)) {
+            (None, Some(by)) => {
+                let values = (key.clone(), by.clone());
+                (!self.values.contains_key(&values))
+                    .then_some(LoadTarget::Values(key, by.clone()))
+                    .into_iter()
+                    .collect()
+            }
+            _ => (!self.neighbours.contains_key(&key))
+                .then_some(LoadTarget::Page(key))
+                .into_iter()
+                .collect(),
+        }
+    }
+
     /// The reads the visible entries still need, each once, in tree order.
     pub fn missing_loads(&self, schema: &SchemaModel) -> Vec<LoadTarget> {
         if self.root.is_none() {
@@ -1257,6 +1300,23 @@ impl Exploration {
         let keys: Vec<GroupKey> = self.state.searches.keys().cloned().collect();
         for key in keys {
             self.search_group(&key, "", cx);
+        }
+    }
+
+    /// Reads ahead what opening `path` will show, without opening it, so it opens at once
+    /// (spec 006: a pill the pointer rests on). Only once the exploration has its commit, so
+    /// every read stays on it.
+    pub fn prefetch(&mut self, path: &ExplorePath, cx: &mut Context<Self>) {
+        if self.pin.is_none() {
+            return;
+        }
+        let Some(schema) = self.schema(cx) else {
+            return;
+        };
+        for target in self.state.prefetch_targets(&schema, path) {
+            if !self.tasks.contains_key(&target) {
+                self.start(target, cx);
+            }
         }
     }
 
@@ -1798,6 +1858,55 @@ mod tests {
                 .iter()
                 .any(|row| row.contains("value"))
         );
+    }
+
+    #[test]
+    fn prefetching_reads_what_opening_would_show_and_nothing_twice() {
+        let schema = schema();
+        let mut state = loaded_root(&schema);
+        let knows = group(&schema, "Person", "Knows", Direction::Outgoing);
+        let manager = group(&schema, "Person", "Manager", Direction::Outgoing);
+        let bob = ExplorePath::root()
+            .child_group(&knows)
+            .child_node(&person("bob"));
+        // A node: its relationships' counts, and its single-target field's page.
+        let targets = state.prefetch_targets(&schema, &bob);
+        assert!(targets.contains(&LoadTarget::Count(GroupKey::new(
+            person("bob"),
+            knows.clone()
+        ))));
+        assert!(targets.contains(&LoadTarget::Page(GroupKey::new(person("bob"), manager))));
+        assert!(
+            !targets
+                .iter()
+                .any(|t| matches!(t, LoadTarget::Page(key) if key.group == knows)),
+            "a relationship's neighbours wait for that relationship"
+        );
+        // A relationship: its first page, unless read or known to be empty.
+        let group_path = bob.child_group(&knows);
+        let key = GroupKey::new(person("bob"), knows.clone());
+        assert_eq!(
+            state.prefetch_targets(&schema, &group_path),
+            [LoadTarget::Page(key.clone())]
+        );
+        state.apply_count(key.clone(), &output(&["n"], json!([{"n": 0}])));
+        assert!(state.prefetch_targets(&schema, &group_path).is_empty());
+        // Grouped, its values instead.
+        let mut state = loaded_root(&schema);
+        let works_at = group(&schema, "Person", "WorksAt", Direction::Outgoing);
+        let by = GroupBy {
+            on: gq_language::builder::GroupOn::Edge,
+            property: "role".into(),
+        };
+        state.set_grouping(&works_at, Some(by.clone()));
+        let path = ExplorePath::root().child_group(&works_at);
+        let key = GroupKey::new(person("ada"), works_at);
+        assert_eq!(
+            state.prefetch_targets(&schema, &path),
+            [LoadTarget::Values(key.clone(), by.clone())]
+        );
+        state.apply_values(key, by, &output(&["value", "n"], json!([])), 100);
+        assert!(state.prefetch_targets(&schema, &path).is_empty());
     }
 
     #[test]

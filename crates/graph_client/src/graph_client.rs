@@ -13,7 +13,7 @@ mod client;
 pub use api::ErrorOutput;
 pub use client::{
     ApiErrorSummary, BLOB_READ_MAX, BlobAt, BlobCell, BlobMeta, CommitChanges, GraphClient,
-    ReadError, ServerHealth,
+    ReadError, ServerHealth, server_root,
 };
 
 /// Header every protected request sends and every response echoes

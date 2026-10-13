@@ -38,6 +38,14 @@ from the served document).
    exactly as the CLI does; Studio never writes the CLI's files.
 2. Servers added in Studio (URL, optional token). Tokens go to the OS keychain through GPUI's
    credentials API; the server list goes to Studio's settings.
+   An address is made a server root before it is used (`graph_client::server_root`): trimmed,
+   without a trailing slash, with `http://` added for a loopback host (`localhost`, `127.*`,
+   `[::1]`) and `https://` for any other when no scheme is given; anything but an `http(s)`
+   URL with a host, or one holding a user name or password, is refused with the reason. The
+   same rule applies to addresses from the CLI config, the environment and a saved list, so
+   an entry saved before it (`localhost:8080`) loads as `http://localhost:8080`, its token
+   copied to the new address. `GraphClient::new` refuses an unusable root rather than
+   building URLs on it.
 3. Graph ids for a server come from, in order: `GET /graphs` when allowed; the operator config's
    profiles and `default_graph`; graph ids the person typed before. A 403 on `/graphs` is not an
    error state; Studio says "This server does not list graphs for your token. Enter a graph id."
@@ -109,6 +117,7 @@ from the served document).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-12 | A server added as `localhost:8080` no longer crashes Studio | crash report: `GraphClient::url` panicked on `path_segments_mut().expect(..)` from the health probe, since `Url::parse("localhost:8080")` reads `localhost` as the scheme and cannot be a base; `graph_client` tests `a_server_address_gets_a_scheme_and_a_bare_word_is_refused`, `a_client_refuses_a_root_that_cannot_take_a_path` | The address becomes `http://localhost:8080`; a root without an http(s) host, or with credentials, is refused with its reason |
 | 2026-10-11 | Contract header and value | `git show v0.13.0:crates/omnigraph-api-types/src/lib.rs` | `omnigraph-http-api`, `0.13` |
 | 2026-10-11 | Routes in 0.13.0 vs main | parsed `openapi.json` at `v0.13.0` and main | Blob PUT/DELETE, commit publish/drop only on main |
 | 2026-10-11 | CLI token resolution | `git show v0.13.0:crates/omnigraph-cli/src/operator.rs` | env `OMNIGRAPH_TOKEN_<NAME>`, then credentials file section; refuses over-permissive file |
