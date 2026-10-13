@@ -183,18 +183,13 @@ pub fn ancestors(entries: &[Entry], entry: usize) -> Vec<usize> {
     out
 }
 
-/// Edge properties as a muted line: `role lead · since 2021-01-02`.
-pub fn edge_summary(edge: &[(String, Value)]) -> String {
-    edge.iter()
-        .map(|(name, value)| {
-            let value = match value {
-                Value::String(text) => text.clone(),
-                other => studio_ui::format_value(other),
-            };
-            format!("{name} {value}")
-        })
-        .collect::<Vec<_>>()
-        .join(" · ")
+/// An edge property's value as a row or a hover card shows it: text as written, other values
+/// formatted.
+pub fn edge_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => studio_ui::format_value(other),
+    }
 }
 
 /// The first edge property as a short hint at the end of a row, when it fits whole
@@ -202,11 +197,7 @@ pub fn edge_summary(edge: &[(String, Value)]) -> String {
 pub fn edge_hint(edge: &[(String, Value)]) -> Option<String> {
     const LONGEST: usize = 18;
     let (name, value) = edge.first()?;
-    let value = match value {
-        Value::String(text) => text.clone(),
-        other => studio_ui::format_value(other),
-    };
-    let hint = format!("{name} {value}");
+    let hint = format!("{name} {}", edge_value(value));
     (hint.chars().count() <= LONGEST).then_some(hint)
 }
 
@@ -412,10 +403,8 @@ mod tests {
 
     #[test]
     fn labels_read_well() {
-        assert_eq!(
-            edge_summary(&[("role".into(), json!("lead")), ("hours".into(), json!(12))]),
-            "role lead · hours 12"
-        );
+        assert_eq!(edge_value(&json!("lead")), "lead");
+        assert_eq!(edge_value(&json!(12)), "12");
         assert_eq!(more_label(50, Some(418), 50), "Show 50 more of 368");
         assert_eq!(
             edge_hint(&[("role".into(), json!("lead")), ("hours".into(), json!(12))]),

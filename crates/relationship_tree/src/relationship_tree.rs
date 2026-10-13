@@ -947,14 +947,30 @@ impl RelationshipTree {
             } => Some(entry.path.clone()),
             _ => None,
         };
-        let tooltip = match &entry.kind {
+        // A node's hover card: what it is, and the properties of the edge that led here.
+        let card = match &entry.kind {
             EntryKind::Node { node, via, .. } => {
-                let mut text = format!("{} · {}", node.type_name, node.id);
-                if let Some(via) = via.as_ref().filter(|via| !via.edge.is_empty()) {
-                    text.push('\n');
-                    text.push_str(&rows::edge_summary(&via.edge));
-                }
-                Some(SharedString::from(text))
+                let relationship =
+                    entry
+                        .parent
+                        .and_then(|parent| match &self.entries.get(parent)?.kind {
+                            // As the group row reads it: `→ WorksAt`.
+                            EntryKind::Group { key, .. } | EntryKind::Bucket { key, .. } => {
+                                let arrow = match key.group.direction {
+                                    gq_language::Direction::Outgoing => "→",
+                                    gq_language::Direction::Incoming => "←",
+                                };
+                                Some(format!("{arrow} {}", key.group.edge))
+                            }
+                            _ => None,
+                        });
+                Some(HoverCard {
+                    type_name: node.type_name.clone(),
+                    id: node.id.clone(),
+                    label: state.label(node).map(str::to_owned),
+                    relationship,
+                    edge: via.as_ref().map(|via| via.edge.clone()).unwrap_or_default(),
+                })
             }
             _ => None,
         };
@@ -979,7 +995,9 @@ impl RelationshipTree {
                     this.prefetch(hovered.then(|| path.clone()), cx)
                 }))
             })
-            .when_some(tooltip, |d, tooltip| d.tooltip(Tooltip::text(tooltip)))
+            .when_some(card, |d, card| {
+                d.tooltip(Tooltip::element(move |_, cx| card.render(cx)))
+            })
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.select_row(row, cx);
                 window.focus(&this.focus_handle, cx);
@@ -1431,5 +1449,96 @@ impl Render for ExploreActions {
                         }),
                 )
             })
+    }
+}
+
+/// What a node row's hover card shows (spec 005): the node's label, type and key, then every
+/// property of the edge that led to it, one per line.
+struct HoverCard {
+    type_name: String,
+    id: String,
+    label: Option<String>,
+    /// The relationship as its group row reads (`→ WorksAt`), when the node was reached
+    /// through one.
+    relationship: Option<String>,
+    edge: Vec<(String, serde_json::Value)>,
+}
+
+impl HoverCard {
+    fn render(&self, cx: &App) -> AnyElement {
+        let name_width = self
+            .edge
+            .iter()
+            .map(|(name, _)| name.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(16) as f32
+            * 6.5
+            + 8.;
+        v_flex()
+            .gap_1()
+            .max_w(px(320.))
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(studio_ui::ds::type_dot(&self.type_name))
+                    .child(
+                        div().min_w_0().flex_shrink(1.).child(
+                            Label::new(self.label.clone().unwrap_or_else(|| self.id.clone()))
+                                .size(LabelSize::Small)
+                                .weight(gpui::FontWeight::MEDIUM)
+                                .truncate(),
+                        ),
+                    )
+                    .child(
+                        Label::new(self.type_name.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .single_line(),
+                    ),
+            )
+            .when(self.label.is_some(), |card| {
+                card.child(
+                    Label::new(self.id.clone())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .buffer_font(cx)
+                        .truncate(),
+                )
+            })
+            .when(!self.edge.is_empty(), |card| {
+                card.child(
+                    v_flex()
+                        .mt_1()
+                        .pt_1()
+                        .gap_0p5()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .children(self.relationship.clone().map(|relationship| {
+                            Label::new(relationship)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                        }))
+                        .children(self.edge.iter().map(|(name, value)| {
+                            let value = rows::edge_value(value);
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    div().w(px(name_width)).flex_none().child(
+                                        Label::new(name.clone())
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    ),
+                                )
+                                .child(
+                                    div().min_w_0().flex_1().child(
+                                        Label::new(value).size(LabelSize::XSmall).truncate(),
+                                    ),
+                                )
+                        })),
+                )
+            })
+            .into_any_element()
     }
 }
