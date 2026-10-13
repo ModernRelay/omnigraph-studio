@@ -1,7 +1,8 @@
 # 002: App shell
 
-Status: draft · 2026-10-11. The command palette landed 2026-10-12 (`crates/command_palette`),
-with scope tabs and the Ask hand-off.
+Status: in progress · 2026-10-13. Built: the window frame with panes, tabs and docks, menus,
+settings, several windows restored on launch, and `omnigraph-studio://` links. The command
+palette landed 2026-10-12 (`crates/command_palette`), with scope tabs and the Ask hand-off.
 
 ## Problem
 

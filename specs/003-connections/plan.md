@@ -1,6 +1,8 @@
 # 003: Connections
 
-Status: draft · 2026-10-11
+Status: in progress · 2026-10-13. Built: servers from the CLI config, the environment and
+Studio's own list; token resolution; the contract check; bounded reads; and replacing a refused
+token (validation log). OIDC waits (Deferred).
 
 ## Problem
 

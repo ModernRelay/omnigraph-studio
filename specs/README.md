@@ -32,18 +32,17 @@ Add tasks, contracts or data-model files only for large features.
 | # | Plan | Status |
 |---|---|---|
 | 001 | [Foundation](001-foundation/plan.md) | in progress |
-| 002 | [App shell](002-app-shell/plan.md) | draft |
-| 003 | [Connections](003-connections/plan.md) | draft |
-| 004 | [Type tables](004-type-tables/plan.md) | draft |
-| 005 | [Relationship tree](005-relationship-tree/plan.md) | draft |
-| 006 | [Graph canvas](006-graph-canvas/plan.md) | draft |
-| 007 | [Query editor](007-query-editor/plan.md) | draft |
-| 008 | [Branches, review and merge](008-branches-review-merge/plan.md) | draft |
-| 009 | [History](009-history/plan.md) | draft |
-| 010 | [Inspectors](010-inspectors/plan.md) | draft |
+| 002 | [App shell](002-app-shell/plan.md) | in progress |
+| 003 | [Connections](003-connections/plan.md) | in progress |
+| 004 | [Type tables](004-type-tables/plan.md) | in progress |
+| 005 | [Relationship tree](005-relationship-tree/plan.md) | first slice implemented |
+| 006 | [Graph canvas](006-graph-canvas/plan.md) | first slice implemented |
+| 007 | [Query editor](007-query-editor/plan.md) | first slice landed |
+| 008 | [Branches, review and merge](008-branches-review-merge/plan.md) | built on 0.13 |
+| 009 | [History](009-history/plan.md) | built on 0.13 |
+| 010 | [Inspectors](010-inspectors/plan.md) | built on 0.13 |
 | 011 | [Agent panel](011-agent-panel/plan.md) | implemented |
 | 012 | [OmniGraph engine changes](012-omnigraph-engine-changes/plan.md) | deferred |
 
-Order of work: 001, 002, 003, then 004 with the spikes in 001. 005 to 009 follow in any order.
-012 is not scheduled: it records every OmniGraph change Studio would use, what Studio does
+Each plan's first line holds its full status. 012 is not scheduled: it records every OmniGraph change Studio would use, what Studio does
 without it, and which plan waits on it. Each feature plan's Deferred section names its IDs.
