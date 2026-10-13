@@ -9,9 +9,18 @@ use gpui::HeadlessAppContext;
 use settings::{KeymapFile, KeymapFileLoadResult};
 
 const KEYMAPS: [(&str, &str); 3] = [
-    ("macos", include_str!("../../../assets/keymaps/default-macos.json")),
-    ("linux", include_str!("../../../assets/keymaps/default-linux.json")),
-    ("windows", include_str!("../../../assets/keymaps/default-windows.json")),
+    (
+        "macos",
+        include_str!("../../../assets/keymaps/default-macos.json"),
+    ),
+    (
+        "linux",
+        include_str!("../../../assets/keymaps/default-linux.json"),
+    ),
+    (
+        "windows",
+        include_str!("../../../assets/keymaps/default-windows.json"),
+    ),
 ];
 
 fn main() {
