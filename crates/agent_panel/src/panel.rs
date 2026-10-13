@@ -757,10 +757,17 @@ impl AgentPanel {
         }
         match &self.state {
             State::Ready { .. } => self.prompt(text, cx),
-            State::Prompting { .. } => self.entries.push(Entry::Notice {
-                text: "The agent is still working. Stop it first, or wait.".into(),
-                error: false,
-            }),
+            State::Prompting { .. } => {
+                let notice = "The agent is still working. Stop it first, or wait.";
+                // One note, however often Enter is pressed.
+                if !matches!(self.entries.last(), Some(Entry::Notice { text, .. }) if text == notice)
+                {
+                    self.entries.push(Entry::Notice {
+                        text: notice.into(),
+                        error: false,
+                    });
+                }
+            }
             State::Starting => self.queued = Some(text),
             State::Setup => {
                 self.queued = Some(text);
@@ -798,6 +805,11 @@ impl AgentPanel {
     fn send(&mut self, _: &Send, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).text(cx);
         if text.trim().is_empty() {
+            return;
+        }
+        // While the agent works the message stays in the composer, to send once it is done.
+        if matches!(self.state, State::Prompting { .. }) {
+            self.send_text(text, window, cx);
             return;
         }
         self.composer

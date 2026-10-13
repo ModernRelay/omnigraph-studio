@@ -37,8 +37,30 @@ const FIRST: &str =
     "query first() { match { $p: Person } return { $p } order { $p.@id asc } limit 1 }";
 const RETITLE: &str = "query retitle($id: String, $title: String) {\n  update Person set { title: $title } where @id = $id\n}";
 
-/// The session's options as the person last set them: `(mode, model)`.
+/// The session's options as the person last set them: `(mode, model)`, kept beside the
+/// transcript so a loaded session comes back with its own.
 static OPTIONS: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
+
+fn options_path() -> Option<PathBuf> {
+    let transcript = TRANSCRIPT.lock().unwrap().clone()?;
+    Some(transcript.with_extension("options.json"))
+}
+
+fn save_options() {
+    let (mode, model) = OPTIONS.lock().unwrap().clone();
+    if let Some(path) = options_path() {
+        std::fs::write(path, json!({ "mode": mode, "model": model }).to_string()).ok();
+    }
+}
+
+fn load_options() {
+    let saved = options_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_default();
+    let field = |name: &str| saved[name].as_str().unwrap_or_default().to_owned();
+    *OPTIONS.lock().unwrap() = (field("mode"), field("model"));
+}
 /// Tokens in the context window and the cost so far.
 static USAGE: Mutex<(u64, f64)> = Mutex::new((0, 0.));
 const WINDOW: u64 = 200_000;
@@ -143,6 +165,7 @@ fn main() -> agent_client_protocol::Result<()> {
                     let id = format!("test-{nanos}");
                     *TRANSCRIPT.lock().unwrap() = Some(transcript_path(&request.cwd, &id));
                     *USAGE.lock().unwrap() = (0, 0.);
+                    *OPTIONS.lock().unwrap() = Default::default();
                     responder.respond(
                         NewSessionResponse::new(SessionId::new(id))
                             .config_options(config_options()),
@@ -182,6 +205,7 @@ fn main() -> agent_client_protocol::Result<()> {
                             .ok();
                     }
                     *TRANSCRIPT.lock().unwrap() = Some(path);
+                    load_options();
                     responder.respond(LoadSessionResponse::new().config_options(config_options()))
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -208,6 +232,7 @@ fn main() -> agent_client_protocol::Result<()> {
                             }
                         }
                     }
+                    save_options();
                     responder.respond(SetSessionConfigOptionResponse::new(config_options()))
                 },
                 agent_client_protocol::on_receive_request!(),

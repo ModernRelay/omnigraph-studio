@@ -47,6 +47,13 @@
     }
   },
   {
+    "context": "AgentComposer > Editor",
+    "bindings": {
+      "enter": "studio_agent::Send",
+      "shift-enter": "editor::Newline"
+    }
+  },
+  {
     "context": "AgentPanel",
     "bindings": {
       "cmd-enter": "studio_agent::Send",

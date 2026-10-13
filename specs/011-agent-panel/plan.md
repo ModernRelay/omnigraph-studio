@@ -134,7 +134,7 @@ committed change; Review switches the session to the agent branch and opens spec
 | Action | macOS | Linux and Windows |
 |---|---|---|
 | `studio_agent::OpenAgent` | ⌘⇧A | Ctrl+Shift+A |
-| `studio_agent::Send` | ⌘↩ | Ctrl+Enter |
+| `studio_agent::Send` | ↩ in the composer (⇧↩ for a new line), or ⌘↩ | Enter in the composer (Shift+Enter for a new line), or Ctrl+Enter |
 | `studio_agent::Allow` | ⌘Y | Ctrl+Y |
 | `studio_agent::AllowAlways` | ⌘⌥Y | Ctrl+Alt+Y |
 | `studio_agent::Reject` | ⌘⌥N | Ctrl+Alt+N |
@@ -142,7 +142,10 @@ committed change; Review switches the session to the agent branch and opens spec
 | `studio_agent::Restart` | — | — |
 | `studio_agent::Ask { text }` | the palette's Ask (spec 002) | |
 
-Studio loads Zed's keymap first. Zed binds ⌘. to `editor::ToggleCodeActions` in every editor,
+Enter sends from the composer, as in Zed's agent panel (`AcpThread > Editor`, `enter` →
+`agent::Chat` unless `use_modifier_to_send`); Studio's binding comes after Zed's editor
+bindings, so it wins over `editor::Newline`. While the agent works, Enter leaves the message in
+the composer with one note rather than dropping it. Studio loads Zed's keymap first. Zed binds ⌘. to `editor::ToggleCodeActions` in every editor,
 which would take Stop from the composer, so Stop is ⌘⇧.; Zed's ⌘Y and ⌘⌥Y editor bindings
 exclude a context named `AgentPanel`, and ⌘↩ is bound only for full-mode editors, so they reach
 the panel. The composer shows the bindings with `ui::KeyBinding`, so each platform sees its own.
