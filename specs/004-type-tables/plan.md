@@ -122,12 +122,27 @@ stay put), IX (paged, virtualized).
   `in` list adds the value and waits for the next. With nothing typed ↵ adds the filter as it
   stands. A "related to" pill reads the picked node's label. The offers hide while the
   property or operator menu is open.
-- A view is a name for a filter, sort and column state; saved per graph in Studio's settings.
-  Built for filters and sort (columns are fixed today): `graphs."<server>/<graph>".views` in
-  `settings.json`, each with its type, filters (`FilterOp::key` names) and sort. The toolbar's
+- A view is a name for a filter, sort, grouping and column state; saved per graph in Studio's
+  settings: `graphs."<server>/<graph>".views` in `settings.json`, each with its type, filters
+  (`FilterOp::key` names), sort, grouping, hidden columns and column order. The toolbar's
   Views menu lists the type's views with the shown one checked, saves the table's state under
   a name (the same name replaces), and deletes the shown one; the button reads the view's
-  name while the table matches it. Filters or a sort the schema no longer has are left out.
+  name while the table matches it. Filters, a sort or a grouping the schema no longer has are
+  left out; a hidden or ordered column the schema no longer has is ignored.
+
+### Columns
+
+Built (`model::ColumnLayout`): the first column, the key or an edge's source, is pinned and
+always shows first. Every other column can be hidden and moved. A header's right-click menu
+sorts ascending or descending, groups by the column, starts a filter on it, moves it left or
+right among the shown columns, hides it, and shows every column again once any is hidden or
+moved. Dragging a header onto another moves its column into that place. The toolbar's Columns
+menu lists every column but the pinned one, checked while it shows, and stays open while
+columns are picked; its button reads "N hidden" while any is. A column the schema adds later
+appears after the ordered ones. Hiding only stops showing: a filter, a sort or a grouping on a
+hidden column still applies, and a hidden relationship column reads nothing until it shows,
+when its neighbours are read for the rows already loaded, 100 at a time, at the table's commit.
+The layout is part of the tab and of saved views. Widths stay fitted to the column's type.
 
 ### Grouping
 
@@ -210,7 +225,7 @@ opens the branch's recent commits.
     advertises `cluster_publishCommit`.
 - Grouping edge tables by a property of an endpoint, and grouping by a relationship ("people
   by company").
-- Views do not hold column state: columns are fixed. The preview tab is built (spec 002).
+- Column widths set by hand: widths are fitted to each column's type.
 - Per-row history beyond the commits that the change feed can cheaply return.
 
 ## Validation log
@@ -237,6 +252,7 @@ opens the branch's recent commits.
 | 2026-10-12 | Blob cells and previews | `HEAD`/`GET /graphs/notes/blob` on the 0.13 dev server (`notes.attachment`: a PNG, a query text, 1 KiB of bytes, an empty value, nulls); `graph_client` blob tests; `type_table::blob` tests; offscreen snapshots of the Note table and three peeks | A managed cell answers 200 with `content-length` and an ETag (`0` for empty); a null cell and a missing row both answer 404 `not_found`, so a 404 on a row the table read is null; `Range` answers 206. Cells read "Blob · 690 B · Preview", "Blob · 0 B" and "—", for drawn rows only, at the page's commit; the peek drew the PNG, the query text and a hex dump |
 | 2026-10-12 | Null order and sorted keyset pages on 0.13 | `order { $n.title asc, $n.@id asc }` and `desc` on the dev server; `is not null`; the keyset clause with `or`; `gq_language` `sorted_pages_read_values_then_nulls_and_compile` (text, Date, I32, an edge property); `type_table` paging test; offscreen snapshots of Person by title both ways and Company by city with 25-row pages | Nulls come first ascending and last descending, so the `is null` split is needed; Company by city ran Berlin to Toronto, then the company without a city, across the switch from values to nulls ("25 of 25") |
 | 2026-10-12 | Relationship columns | `gq_language` `page_relationship_reads_compile_for_every_group`; the grouped count and sample on the dev server (`person-000002` with no `knows` has no row); an offscreen snapshot of Person with its five relationship columns | Counts per id, tags in the UI font with "+N" kept in view, "—" for none |
+| 2026-10-12 | Hidden and moved columns | `type_table` `a_layout_hides_and_orders_columns_and_keeps_the_pinned_one_first` and `a_layout_survives_schema_changes`; `studio_settings` `views_are_saved_per_graph_and_type_and_replaced_by_name` with hidden columns; offscreen snapshots of Person: right-click on `email` then Hide column, the Columns menu, a click on `email` in it, and a drag of the `born` header onto `name` | The menu read Sort ascending, Sort descending, Group by this column, Filter…, Move left, Move right, Hide column, aligned; `email` left the grid and the button read "1 hidden"; the Columns menu checked every shown column and stayed open while `email` came back ("Columns", Show all columns disabled); the drag put `born` before `name` and did not sort |
 | 2026-10-12 | Saved views | `studio_settings` `views_are_saved_per_graph_and_type_and_replaced_by_name`; `gq_language` `filter_operators_round_trip_through_their_keys`; offscreen snapshots with `click:` and `type:` steps: a seeded "Founders" applied from the Views menu, then sorted by email and saved as "Founders by email" | "title is Founder", name ascending, "25 of 200", and the button read "Founders"; `settings.json` held both views |
 | 2026-10-12 | Spike S1: several rows in one commit | on a scratch branch of the dev server: `update Person set { title: $v } where @id in $ids` (3 rows), and one mutation of two `update` statements | Both publish one commit; multi-statement mutations are the mechanism, so merge-mode NDJSON was not needed |
 | 2026-10-12 | Bulk set | `gq_language` `a_bulk_set_is_one_mutation_bound_row_by_row`; offscreen snapshots with `click:…,cmd` and `click:…,shift` on Project at branch `bulk-test`: three rows picked, status set to paused | One commit; `project-00001`, already paused, was left out ("Set status on 2 Project rows"); the rows updated in place and the selection cleared |

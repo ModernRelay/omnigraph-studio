@@ -14,8 +14,8 @@ use std::time::Duration;
 use editor::{Editor, EditorEvent};
 use gpui::{
     Anchor, App, ClickEvent, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, KeyContext, Render, ScrollStrategy, SharedString, Subscription, Task, WeakEntity,
-    Window, anchored, deferred, point,
+    Focusable, KeyContext, MouseButton, MouseDownEvent, Render, ScrollStrategy, SharedString,
+    Subscription, Task, WeakEntity, Window, anchored, deferred, point,
 };
 use gq_language::{
     BuildError, BuiltQuery, Filter, FilterOp, PageStart, Property, RelationshipGroup, ScalarKind,
@@ -43,11 +43,11 @@ use ui::{
 use crate::dialogs::{DeleteRowModal, InsertRowModal, SaveViewModal};
 use crate::grouping::{GROUP_LIMIT, Grouping, Line, SECTION_FIRST_PAGE};
 use crate::model::{
-    ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN, Row, SaveResult, TableKind, Tone,
-    changed_elsewhere, chips_that_fit, copy_text, count_of, display_value, edge_columns, edge_rows,
-    edit_text, filter_parts, format_count, insert_position, node_columns, node_rows,
-    parse_filter_list, parse_filter_value, parse_input, preset_start, relation_sample, row_matches,
-    same_value, save_result, short_commit,
+    ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN, Row, SaveResult,
+    TableKind, Tone, changed_elsewhere, chips_that_fit, copy_text, count_of, display_value,
+    edge_columns, edge_rows, edit_text, filter_parts, format_count, insert_position, node_columns,
+    node_rows, parse_filter_list, parse_filter_value, parse_input, preset_start, relation_sample,
+    row_matches, same_value, save_result, short_commit,
 };
 use crate::peek::{NodePeek, PeekSubject};
 use crate::suggest::{self, NODE_SUGGESTIONS, Suggestion};
@@ -55,6 +55,9 @@ use crate::suggest::{self, NODE_SUGGESTIONS, Suggestion};
 /// How often an open, visible table asks whether its branch moved (constitution II: offer
 /// Refresh, never change under the reader).
 const HEAD_POLL: Duration = Duration::from_secs(30);
+/// Rows per neighbour read when a relationship column comes into view: a page's worth, as the
+/// page reads do.
+const RELATION_READ_CHUNK: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cursor {
@@ -184,7 +187,14 @@ pub struct TypeTable {
     kind: TableKind,
     schema: Option<Arc<SchemaModel>>,
     missing: bool,
+    /// Every column the schema gives this type, in schema order.
+    all_columns: Vec<ColumnSpec>,
+    /// Which of them show, and in what order.
+    layout: ColumnLayout,
+    /// The columns shown, in order: what the grid, the cursor and editing address.
     columns: Vec<ColumnSpec>,
+    /// A column header's right-click menu, where it was opened.
+    header_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
     rows: Vec<Row>,
     paging: Paging,
     first_page: Loadable<()>,
@@ -204,6 +214,9 @@ pub struct TypeTable {
     /// The filter being written's property and operator menus; the offered values hide while
     /// either is open.
     filter_menus: [PopoverMenuHandle<ContextMenu>; 2],
+    /// The toolbar's Views, Columns and Group menus, whose buttons keep their tooltips quiet
+    /// while open.
+    toolbar_menus: [PopoverMenuHandle<ContextMenu>; 3],
     filter_draft: Option<FilterDraft>,
     filter_editor: Entity<Editor>,
     /// Rows picked for a bulk set (⌘-click, ⇧-click), by id, and the row ⇧ extends from.
@@ -273,6 +286,8 @@ impl Item for TypeTable {
                     "descending": sort.descending,
                 })),
                 "group_by": self.grouping.as_ref().map(|g| &g.property),
+                "hidden": self.layout.hidden,
+                "order": self.layout.order,
             }),
         })
     }
@@ -398,7 +413,10 @@ impl TypeTable {
             kind: TableKind::Node,
             schema: None,
             missing: false,
+            all_columns: Vec::new(),
+            layout: ColumnLayout::default(),
             columns: Vec::new(),
+            header_menu: None,
             rows: Vec::new(),
             paging: Paging::default(),
             first_page: Loadable::NotLoaded,
@@ -412,6 +430,7 @@ impl TypeTable {
             frame_lines: None,
             node_labels: HashMap::new(),
             filter_menus: Default::default(),
+            toolbar_menus: Default::default(),
             filter_draft: None,
             filter_editor,
             selection: Vec::new(),
@@ -533,6 +552,7 @@ impl TypeTable {
         } else {
             self.missing = true;
             self.schema = Some(schema);
+            self.all_columns.clear();
             self.columns.clear();
             self.rows.clear();
             cx.notify();
@@ -546,9 +566,70 @@ impl TypeTable {
                 Some((_, edge)) => schema.edge(edge).is_some(),
                 None => f.property == builder::ID_FILTER || names.contains(f.property.as_str()),
             });
-        self.set_columns(columns, cx);
+        self.all_columns = columns;
+        self.show_columns(cx);
         self.schema = Some(schema);
         self.reload(false, cx);
+    }
+
+    /// Shows the columns the layout picks, keeping the cursor on its column when it still shows.
+    fn show_columns(&mut self, cx: &mut Context<Self>) {
+        let cursor_key = self
+            .cursor
+            .and_then(|c| self.columns.get(c.col))
+            .map(|column| column.key.clone());
+        self.set_columns(self.layout.shown(&self.all_columns), cx);
+        if let Some(cursor) = &mut self.cursor {
+            cursor.col = cursor_key
+                .and_then(|key| self.columns.iter().position(|c| c.key == key))
+                .unwrap_or(0);
+        }
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// Shows the table with a remembered set and order of columns.
+    pub fn set_layout(&mut self, layout: ColumnLayout, cx: &mut Context<Self>) {
+        self.layout = layout;
+        self.show_columns(cx);
+        self.load_shown_relations(cx);
+    }
+
+    /// Changes which columns show or their order, then shows them.
+    fn arrange_columns(
+        &mut self,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut ColumnLayout, &[ColumnSpec]),
+    ) {
+        change(&mut self.layout, &self.all_columns);
+        self.show_columns(cx);
+        self.load_shown_relations(cx);
+    }
+
+    /// Reads the neighbours of a relationship column that has just come into view, for the rows
+    /// already read; a column that was shown before keeps what it read.
+    fn load_shown_relations(&mut self, cx: &mut Context<Self>) {
+        let groups: Vec<(RelationshipGroup, Vec<String>)> = self
+            .columns
+            .iter()
+            .filter_map(ColumnSpec::relationship)
+            .map(|group| {
+                let key = builder::relationship_key(group);
+                let missing = self
+                    .rows
+                    .iter()
+                    .filter(|row| !self.relations.contains_key(&(row.id.clone(), key.clone())))
+                    .map(|row| row.id.clone())
+                    .collect();
+                (group.clone(), missing)
+            })
+            .filter(|(_, missing): &(RelationshipGroup, Vec<String>)| !missing.is_empty())
+            .collect();
+        for (group, ids) in groups {
+            for chunk in ids.chunks(RELATION_READ_CHUNK) {
+                self.load_relation_groups(vec![group.clone()], chunk.to_vec(), cx);
+            }
+        }
     }
 
     fn set_columns(&mut self, columns: Vec<ColumnSpec>, cx: &mut Context<Self>) {
@@ -619,6 +700,8 @@ impl TypeTable {
                 descending: sort.descending,
             }),
             group_by: self.grouping.as_ref().map(|g| g.property.clone()),
+            hidden: self.layout.hidden.clone(),
+            order: self.layout.order.clone(),
         }
     }
 
@@ -636,9 +719,16 @@ impl TypeTable {
         self.saved_views(cx)
             .into_iter()
             .find(|view| {
+                let hidden = |view: &studio_settings::SavedView| {
+                    let mut hidden = view.hidden.clone();
+                    hidden.sort();
+                    hidden
+                };
                 view.filters == current.filters
                     && view.sort == current.sort
                     && view.group_by == current.group_by
+                    && hidden(view) == hidden(&current)
+                    && view.order == current.order
             })
             .map(|view| view.name)
     }
@@ -671,7 +761,7 @@ impl TypeTable {
                 descending: sort.descending,
             })
             .filter(|sort| {
-                self.columns
+                self.all_columns
                     .iter()
                     .filter_map(ColumnSpec::property)
                     .any(|p| p.name == sort.property && Sort::allowed(p))
@@ -680,12 +770,14 @@ impl TypeTable {
             .group_by
             .as_ref()
             .filter(|name| {
-                self.columns
+                self.all_columns
                     .iter()
                     .filter_map(ColumnSpec::property)
                     .any(|p| p.name == **name && builder::GroupBy::allowed(p))
             })
             .map(Grouping::new);
+        self.layout = ColumnLayout::new(view.hidden.clone(), view.order.clone());
+        self.show_columns(cx);
         self.filter_draft = None;
         self.reload(true, cx);
     }
@@ -1004,10 +1096,232 @@ impl TypeTable {
         )
     }
 
+    /// Every column but the pinned one, in the layout's order: key, title, whether it shows.
+    fn column_choices(&self) -> Vec<(String, String, bool)> {
+        self.layout
+            .columns(&self.all_columns)
+            .into_iter()
+            .skip(1)
+            .map(|(column, shown)| (column.key.clone(), column.title.clone(), shown))
+            .collect()
+    }
+
+    /// A column header's right-click menu: order, group and filter by the column, move it, or
+    /// hide it.
+    fn open_header_menu(
+        &mut self,
+        key: String,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(col) = self.column_index(&key) else {
+            return;
+        };
+        let column = self.columns[col].clone();
+        let pinned = col == 0;
+        let last = col + 1 == self.columns.len();
+        let sortable = column
+            .property()
+            .filter(|p| Sort::allowed(p))
+            .map(|p| p.name.clone());
+        let groupable = column
+            .property()
+            .filter(|p| builder::GroupBy::allowed(p))
+            .map(|p| p.name.clone());
+        let filterable = !self.ops_for(&key).is_empty();
+        let sort = self.sort.clone();
+        let grouped = self.grouping.as_ref().map(|g| g.property.clone());
+        let arranged = self.layout != ColumnLayout::default();
+        // Entries line up with the checked ones when the menu has any.
+        let checks = sortable.is_some() || groupable.is_some();
+        let plain = move |label: &'static str| {
+            let entry = ContextMenuEntry::new(label);
+            if checks {
+                entry.toggleable(IconPosition::Start, false)
+            } else {
+                entry
+            }
+        };
+        let table = cx.entity().downgrade();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            let run = |f: Box<TableAction>| {
+                let table = table.clone();
+                move |window: &mut Window, cx: &mut App| {
+                    table.update(cx, |table, cx| f(table, window, cx)).ok();
+                }
+            };
+            if let Some(name) = sortable {
+                let ordered = sort.as_ref().filter(|sort| sort.property == name);
+                for (label, descending) in [("Sort ascending", false), ("Sort descending", true)] {
+                    let name = name.clone();
+                    menu = menu.toggleable_entry(
+                        label,
+                        ordered.is_some_and(|sort| sort.descending == descending),
+                        IconPosition::Start,
+                        None,
+                        run(Box::new(move |table, _, cx| {
+                            table.set_sort(
+                                Some(Sort {
+                                    property: name.clone(),
+                                    descending,
+                                }),
+                                cx,
+                            )
+                        })),
+                    );
+                }
+            }
+            if let Some(name) = groupable {
+                let on = grouped.as_ref() == Some(&name);
+                menu = menu.toggleable_entry(
+                    "Group by this column",
+                    on,
+                    IconPosition::Start,
+                    None,
+                    run(Box::new(move |table, _, cx| {
+                        table.set_grouping((!on).then(|| name.clone()), cx)
+                    })),
+                );
+            }
+            if filterable {
+                let key = key.clone();
+                menu = menu.item(plain("Filter…").handler(run(Box::new(
+                    move |table, window, cx| table.set_draft_property(key.clone(), window, cx),
+                ))));
+            }
+            if !pinned {
+                menu = menu.separator();
+                for (label, step, disabled) in
+                    [("Move left", -1, col <= 1), ("Move right", 1, last)]
+                {
+                    let key = key.clone();
+                    menu = menu.item(plain(label).disabled(disabled).handler(run(Box::new(
+                        move |table, _, cx| {
+                            table.arrange_columns(cx, |layout, all| layout.step(all, &key, step))
+                        },
+                    ))));
+                }
+                let key = key.clone();
+                menu = menu.item(plain("Hide column").handler(run(Box::new(
+                    move |table, _, cx| {
+                        table.arrange_columns(cx, |layout, all| layout.toggle(all, &key))
+                    },
+                ))));
+            }
+            if arranged {
+                menu = menu
+                    .separator()
+                    .item(
+                        plain("Show all columns").handler(run(Box::new(|table, _, cx| {
+                            table.arrange_columns(cx, |layout, _| layout.reset())
+                        }))),
+                    );
+            }
+            menu
+        });
+        let subscription = cx.subscribe_in(
+            &menu,
+            window,
+            |this, _, _: &gpui::DismissEvent, window, cx| {
+                this.header_menu = None;
+                window.focus(&this.focus_handle, cx);
+                cx.notify();
+            },
+        );
+        window.focus(&menu.focus_handle(cx), cx);
+        self.header_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
+    /// The toolbar's Columns menu: every column but the pinned one, checked while it shows. It
+    /// stays open while columns are picked.
+    fn render_columns_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let hidden = self
+            .column_choices()
+            .iter()
+            .filter(|(_, _, shown)| !shown)
+            .count();
+        let table = cx.entity().downgrade();
+        let open = self.toolbar_menus[1].is_deployed();
+        PopoverMenu::new("columns-menu")
+            .anchor(gpui::Anchor::TopRight)
+            .with_handle(self.toolbar_menus[1].clone())
+            .trigger(
+                studio_ui::ds::button(
+                    "columns",
+                    match hidden {
+                        0 => "Columns".to_owned(),
+                        n => format!("{n} hidden"),
+                    },
+                )
+                .style(ButtonStyle::Subtle)
+                .label_size(LabelSize::Small)
+                .start_icon(Icon::new(IconName::Eye).size(IconSize::Small))
+                .disabled(self.all_columns.len() < 2)
+                .when(!open, |button| {
+                    button.tooltip(Tooltip::text(
+                        "Show or hide columns · drag a column's header to move it",
+                    ))
+                }),
+            )
+            .menu(move |window, cx| {
+                let table = table.clone();
+                Some(ContextMenu::build_persistent(
+                    window,
+                    cx,
+                    move |mut menu, _, cx| {
+                        menu = menu.keep_open_on_confirm(true);
+                        let Some(entity) = table.upgrade() else {
+                            return menu;
+                        };
+                        let (choices, arranged) = {
+                            let table = entity.read(cx);
+                            (
+                                table.column_choices(),
+                                table.layout != ColumnLayout::default(),
+                            )
+                        };
+                        for (key, title, shown) in choices {
+                            let table = table.clone();
+                            menu = menu.toggleable_entry(
+                                title,
+                                shown,
+                                IconPosition::Start,
+                                None,
+                                move |_, cx| {
+                                    table
+                                        .update(cx, |table, cx| {
+                                            table.arrange_columns(cx, |layout, all| {
+                                                layout.toggle(all, &key)
+                                            })
+                                        })
+                                        .ok();
+                                },
+                            );
+                        }
+                        let table = table.clone();
+                        menu.separator().item(
+                            ContextMenuEntry::new("Show all columns")
+                                .toggleable(IconPosition::Start, false)
+                                .disabled(!arranged)
+                                .handler(move |_, cx| {
+                                    table
+                                        .update(cx, |table, cx| {
+                                            table.arrange_columns(cx, |layout, _| layout.reset())
+                                        })
+                                        .ok();
+                                }),
+                        )
+                    },
+                ))
+            })
+    }
+
     /// The toolbar's Group menu: the properties rows can be grouped by, and No grouping.
     fn render_group_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let choices: Vec<String> = self
-            .columns
+            .all_columns
             .iter()
             .filter_map(ColumnSpec::property)
             .filter(|p| builder::GroupBy::allowed(p))
@@ -1015,8 +1329,10 @@ impl TypeTable {
             .collect();
         let current = self.grouping.as_ref().map(|g| g.property.clone());
         let table = cx.entity().downgrade();
+        let open = self.toolbar_menus[2].is_deployed();
         PopoverMenu::new("group-menu")
             .anchor(gpui::Anchor::TopRight)
+            .with_handle(self.toolbar_menus[2].clone())
             .trigger(
                 studio_ui::ds::button(
                     "group",
@@ -1029,7 +1345,9 @@ impl TypeTable {
                 .label_size(LabelSize::Small)
                 .start_icon(Icon::new(IconName::ListTree).size(IconSize::Small))
                 .disabled(choices.is_empty())
-                .tooltip(Tooltip::text("Group the rows by a property")),
+                .when(!open, |button| {
+                    button.tooltip(Tooltip::text("Group the rows by a property"))
+                }),
             )
             .menu(move |window, cx| {
                 let (table, current, choices) = (table.clone(), current.clone(), choices.clone());
@@ -1069,18 +1387,27 @@ impl TypeTable {
     fn render_views_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let views = self.saved_views(cx);
         let active = self.active_view(cx);
-        let can_save = !self.filters.is_empty() || self.sort.is_some();
+        let can_save = !self.filters.is_empty()
+            || self.sort.is_some()
+            || self.grouping.is_some()
+            || self.layout != ColumnLayout::default();
         let table = cx.entity().downgrade();
         let graph = self.session.read(cx).settings_key(cx);
         let type_name = self.type_name.clone();
+        let open = self.toolbar_menus[0].is_deployed();
         PopoverMenu::new("views-menu")
             .anchor(gpui::Anchor::TopRight)
+            .with_handle(self.toolbar_menus[0].clone())
             .trigger(
                 studio_ui::ds::button("views", active.clone().unwrap_or_else(|| "Views".into()))
                     .style(ButtonStyle::Subtle)
                     .label_size(LabelSize::Small)
                     .start_icon(Icon::new(IconName::Star).size(IconSize::Small))
-                    .tooltip(Tooltip::text("Saved filters and order for this type")),
+                    .when(!open, |button| {
+                        button.tooltip(Tooltip::text(
+                            "Saved filters, order, grouping and columns for this type",
+                        ))
+                    }),
             )
             .menu(move |window, cx| {
                 let views = views.clone();
@@ -1140,7 +1467,7 @@ impl TypeTable {
     /// Restores a remembered order, if the property can still order the table.
     pub fn set_sort(&mut self, sort: Option<Sort>, cx: &mut Context<Self>) {
         let allowed = sort.as_ref().is_none_or(|sort| {
-            self.columns
+            self.all_columns
                 .iter()
                 .filter_map(ColumnSpec::property)
                 .any(|p| p.name == sort.property && Sort::allowed(p))
@@ -1307,7 +1634,7 @@ impl TypeTable {
     /// Groups the rows by a property, or stops; the table is read again at the same commit.
     pub fn set_grouping(&mut self, property: Option<String>, cx: &mut Context<Self>) {
         let property = property.filter(|name| {
-            self.columns
+            self.all_columns
                 .iter()
                 .filter_map(ColumnSpec::property)
                 .any(|p| p.name == *name && builder::GroupBy::allowed(p))
@@ -1560,18 +1887,28 @@ impl TypeTable {
     /// Reads the relationship columns for one page's rows: per relationship, how many
     /// neighbours each row has, and the first few for the chips. Pinned to the page's commit.
     fn load_relations(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
-        let Some(schema) = self.schema.clone() else {
-            return;
-        };
-        if ids.is_empty() || self.kind != TableKind::Node {
-            return;
-        }
+        // A hidden relationship column reads nothing until it shows.
         let groups: Vec<_> = self
             .columns
             .iter()
             .filter_map(ColumnSpec::relationship)
             .cloned()
             .collect();
+        self.load_relation_groups(groups, ids, cx);
+    }
+
+    fn load_relation_groups(
+        &mut self,
+        groups: Vec<RelationshipGroup>,
+        ids: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        if ids.is_empty() || self.kind != TableKind::Node {
+            return;
+        }
         let snapshot = self.paging.pinned.clone();
         for group in groups {
             let key = builder::relationship_key(&group);
@@ -2146,7 +2483,7 @@ impl TypeTable {
     }
 
     fn property_of(&self, column: &str) -> Option<Property> {
-        self.columns
+        self.all_columns
             .iter()
             .find(|c| c.key == column)
             .and_then(|c| c.property().cloned())
@@ -3015,7 +3352,7 @@ impl TypeTable {
     }
 
     fn filterable(&self) -> Vec<Property> {
-        self.columns
+        self.all_columns
             .iter()
             .filter_map(ColumnSpec::property)
             .filter(|p| !FilterOp::for_property(p).is_empty())
@@ -3457,6 +3794,7 @@ impl TypeTable {
             })
             .child(div().flex_1())
             .child(self.render_views_menu(cx))
+            .child(self.render_columns_menu(cx))
             .child(self.render_group_menu(cx))
             .child(
                 studio_ui::ds::button("add-filter", "Filter")
@@ -3857,6 +4195,8 @@ impl TypeTable {
     fn render_grid(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let selected_bg = studio_ui::ds::surface::selected_document(cx);
         let hover_bg = studio_ui::ds::surface::hover(cx);
+        let drop_bg = studio_ui::ds::surface::selected_document(cx);
+        let menu_open = self.header_menu.is_some();
         let headers: Vec<AnyElement> = self
             .columns
             .iter()
@@ -3867,8 +4207,15 @@ impl TypeTable {
                     .sort
                     .as_ref()
                     .filter(|sort| sortable.is_some_and(|p| p.name == sort.property));
+                let key = column.key.clone();
                 let header = h_flex()
                     .id(("column-header", index))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.open_header_menu(key.clone(), event.position, window, cx)
+                        }),
+                    )
                     .h(px(studio_ui::HEADER_HEIGHT))
                     .px_4()
                     .gap_1p5()
@@ -3901,6 +4248,30 @@ impl TypeTable {
                         .size(IconSize::XSmall)
                         .color(Color::Accent)
                     }));
+                // An unpinned header drags onto another to move its column there.
+                let header = if index == 0 {
+                    header
+                } else {
+                    let target = column.key.clone();
+                    header
+                        .on_drag(
+                            DraggedColumn {
+                                key: column.key.clone(),
+                                title: column.title.clone().into(),
+                            },
+                            |dragged, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.new(|_| dragged.clone())
+                            },
+                        )
+                        .drag_over::<DraggedColumn>(move |style, _, _, _| style.bg(drop_bg))
+                        .on_drop(cx.listener(move |this, dragged: &DraggedColumn, _, cx| {
+                            let target = target.clone();
+                            this.arrange_columns(cx, |layout, all| {
+                                layout.move_onto(all, &dragged.key, &target)
+                            })
+                        }))
+                };
                 match sortable {
                     Some(property) => {
                         let property = property.name.clone();
@@ -3912,9 +4283,12 @@ impl TypeTable {
                         header
                             .cursor_pointer()
                             .hover(move |style| style.bg(hover_bg))
-                            .tooltip(Tooltip::text(format!(
-                                "{next} · rows without a value come last"
-                            )))
+                            // Not over the header's own menu, which opens under the pointer.
+                            .when(!menu_open, |header| {
+                                header.tooltip(Tooltip::text(format!(
+                                    "{next} · rows without a value come last"
+                                )))
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.cycle_sort(property.clone(), cx)
                             }))
@@ -4886,5 +5260,39 @@ impl Render for TypeTable {
                     .child(body)
                     .children(drafts_bar),
             )
+            .children(self.header_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(Anchor::TopLeft)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(menu.clone()),
+                )
+                .with_priority(1)
+            }))
+    }
+}
+
+/// What a header menu entry does to its table.
+type TableAction = dyn Fn(&mut TypeTable, &mut Window, &mut Context<TypeTable>);
+
+/// A column header being dragged onto another.
+#[derive(Clone)]
+struct DraggedColumn {
+    key: String,
+    title: SharedString,
+}
+
+impl Render for DraggedColumn {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(cx.theme().colors().elevated_surface_background)
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .shadow_md()
+            .child(Label::new(self.title.clone()).size(LabelSize::Small))
     }
 }

@@ -63,9 +63,24 @@ pub fn init(cx: &mut App) {
                 .get("group_by")
                 .and_then(|property| property.as_str())
                 .map(str::to_owned);
+            let keys = |name: &str| -> Vec<String> {
+                data.get(name)
+                    .and_then(Value::as_array)
+                    .map(|keys| {
+                        keys.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let layout = model::ColumnLayout::new(keys("hidden"), keys("order"));
             let table = open_type(workspace, type_name, at_commit, false, window, cx);
             if let Some(table) = table {
                 table.update(cx, |table, cx| {
+                    if layout != model::ColumnLayout::default() {
+                        table.set_layout(layout, cx);
+                    }
                     if sort.is_some() {
                         table.set_sort(sort, cx);
                     }

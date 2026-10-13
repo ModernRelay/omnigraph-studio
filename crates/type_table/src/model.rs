@@ -182,6 +182,125 @@ pub fn edge_columns(edge: &EdgeType) -> Vec<ColumnSpec> {
     columns
 }
 
+/// Which columns a table shows and in what order (spec 004: a view holds its columns). The
+/// first column, the key or an edge's source, is pinned: it always shows, first. The others
+/// follow `order`, then any it does not name (a property added since) in schema order. Hiding
+/// a column only stops showing it: a filter, an order or a grouping on it still applies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ColumnLayout {
+    pub hidden: Vec<String>,
+    /// The unpinned columns' keys as the person ordered them; empty is schema order.
+    pub order: Vec<String>,
+}
+
+impl ColumnLayout {
+    pub fn new(hidden: Vec<String>, order: Vec<String>) -> Self {
+        Self { hidden, order }
+    }
+
+    pub fn is_hidden(&self, key: &str) -> bool {
+        self.hidden.iter().any(|hidden| hidden == key)
+    }
+
+    /// The unpinned columns' keys in this layout's order, hidden ones included.
+    fn arranged(&self, all: &[ColumnSpec]) -> Vec<String> {
+        let rest = all.get(1..).unwrap_or_default();
+        let mut keys: Vec<String> = self
+            .order
+            .iter()
+            .filter(|key| rest.iter().any(|c| c.key == **key))
+            .cloned()
+            .collect();
+        for column in rest {
+            if !keys.contains(&column.key) {
+                keys.push(column.key.clone());
+            }
+        }
+        keys
+    }
+
+    /// Every column in this layout's order, the pinned one first, with whether it shows.
+    pub fn columns<'a>(&self, all: &'a [ColumnSpec]) -> Vec<(&'a ColumnSpec, bool)> {
+        let Some(first) = all.first() else {
+            return Vec::new();
+        };
+        let mut columns = vec![(first, true)];
+        for key in self.arranged(all) {
+            if let Some(column) = all.iter().find(|c| c.key == key) {
+                columns.push((column, !self.is_hidden(&key)));
+            }
+        }
+        columns
+    }
+
+    /// The columns the table shows, in order.
+    pub fn shown(&self, all: &[ColumnSpec]) -> Vec<ColumnSpec> {
+        self.columns(all)
+            .into_iter()
+            .filter(|(_, shown)| *shown)
+            .map(|(column, _)| column.clone())
+            .collect()
+    }
+
+    /// Shows a hidden column or hides a shown one; the pinned column always shows.
+    pub fn toggle(&mut self, all: &[ColumnSpec], key: &str) {
+        if all.first().is_some_and(|first| first.key == key) {
+            return;
+        }
+        match self.hidden.iter().position(|hidden| hidden == key) {
+            Some(index) => {
+                self.hidden.remove(index);
+            }
+            None => self.hidden.push(key.to_owned()),
+        }
+    }
+
+    /// Shows every column, in schema order.
+    pub fn reset(&mut self) {
+        self.hidden.clear();
+        self.order.clear();
+    }
+
+    /// Moves a shown column `step` places among the shown ones; the pinned column stays.
+    pub fn step(&mut self, all: &[ColumnSpec], key: &str, step: isize) {
+        let shown: Vec<String> = self
+            .arranged(all)
+            .into_iter()
+            .filter(|k| !self.is_hidden(k))
+            .collect();
+        let Some(from) = shown.iter().position(|k| k == key) else {
+            return;
+        };
+        let to = from as isize + step;
+        if to < 0 || to as usize >= shown.len() {
+            return;
+        }
+        self.move_onto(all, key, &shown[to as usize]);
+    }
+
+    /// Puts `key` in `target`'s place: after it when moving right, before it when moving left.
+    pub fn move_onto(&mut self, all: &[ColumnSpec], key: &str, target: &str) {
+        let mut keys = self.arranged(all);
+        let (Some(from), Some(to)) = (
+            keys.iter().position(|k| k == key),
+            keys.iter().position(|k| k == target),
+        ) else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        let moved = keys.remove(from);
+        keys.insert(to, moved);
+        let schema: Vec<&str> = all.iter().skip(1).map(|c| c.key.as_str()).collect();
+        self.order = if keys.iter().map(String::as_str).eq(schema) {
+            Vec::new()
+        } else {
+            keys
+        };
+    }
+}
+
 /// One row as read: its `@id` and its values by column key. A null cell is absent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
@@ -776,6 +895,88 @@ mod tests {
         let (picked, total) = relation_sample(&many, &counts);
         assert_eq!(picked.len() as i64, RELATION_SAMPLE_BUDGET / 100);
         assert!(total <= RELATION_SAMPLE_BUDGET);
+    }
+
+    fn columns(keys: &[&str]) -> Vec<ColumnSpec> {
+        keys.iter()
+            .map(|key| ColumnSpec {
+                key: (*key).into(),
+                title: (*key).into(),
+                detail: String::new(),
+                role: ColumnRole::Key,
+                width: 100.,
+                align_right: false,
+            })
+            .collect()
+    }
+
+    fn keys(columns: &[ColumnSpec]) -> Vec<&str> {
+        columns.iter().map(|c| c.key.as_str()).collect()
+    }
+
+    #[test]
+    fn a_layout_hides_and_orders_columns_and_keeps_the_pinned_one_first() {
+        let all = columns(&["slug", "name", "title", "born"]);
+        let mut layout = ColumnLayout::default();
+        assert_eq!(keys(&layout.shown(&all)), ["slug", "name", "title", "born"]);
+
+        layout.toggle(&all, "title");
+        layout.toggle(&all, "slug");
+        assert_eq!(
+            keys(&layout.shown(&all)),
+            ["slug", "name", "born"],
+            "the key stays"
+        );
+
+        layout.step(&all, "born", -1);
+        assert_eq!(
+            keys(&layout.shown(&all)),
+            ["slug", "born", "name"],
+            "over the hidden one"
+        );
+        layout.toggle(&all, "title");
+        assert_eq!(keys(&layout.shown(&all)), ["slug", "born", "name", "title"]);
+        layout.step(&all, "born", -1);
+        assert_eq!(
+            keys(&layout.shown(&all)),
+            ["slug", "born", "name", "title"],
+            "not past the key"
+        );
+
+        layout.move_onto(&all, "title", "born");
+        assert_eq!(
+            keys(&layout.shown(&all)),
+            ["slug", "title", "born", "name"],
+            "before, moving left"
+        );
+        layout.move_onto(&all, "title", "name");
+        assert_eq!(
+            keys(&layout.shown(&all)),
+            ["slug", "born", "name", "title"],
+            "after, moving right"
+        );
+        layout.move_onto(&all, "born", "title");
+        assert_eq!(
+            layout.order,
+            Vec::<String>::new(),
+            "schema order again is no order"
+        );
+    }
+
+    #[test]
+    fn a_layout_survives_schema_changes() {
+        let mut layout = ColumnLayout::new(
+            vec!["gone".into()],
+            vec!["born".into(), "gone".into(), "name".into()],
+        );
+        let all = columns(&["slug", "name", "born", "city"]);
+        assert_eq!(
+            keys(&layout.shown(&all)),
+            ["slug", "born", "name", "city"],
+            "new columns last"
+        );
+        layout.reset();
+        assert_eq!(layout, ColumnLayout::default());
     }
 
     #[test]

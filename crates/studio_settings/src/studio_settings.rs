@@ -135,7 +135,7 @@ pub struct GraphOverrides {
     pub views: Vec<SavedView>,
 }
 
-/// A named filter, order and grouping for one type's table (spec 004).
+/// A named filter, order, grouping and set of columns for one type's table (spec 004).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct SavedView {
@@ -148,6 +148,12 @@ pub struct SavedView {
     /// The property the rows are grouped by.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group_by: Option<String>,
+    /// Column keys the table does not show.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hidden: Vec<String>,
+    /// Column keys in the order the table shows them; empty is schema order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub order: Vec<String>,
 }
 
 /// A filter as the table holds it: a property or relationship key, an operator's key
@@ -580,6 +586,8 @@ mod tests {
                 descending: false,
             }),
             group_by: Some("title".into()),
+            hidden: vec!["email".into()],
+            order: Vec::new(),
         };
         settings.save_view("dev/knowledge", view("Founders", "eq"));
         settings.save_view("dev/knowledge", view("Founders", "ne"));
@@ -589,6 +597,8 @@ mod tests {
         assert!(settings.views_for("dev/knowledge", "Company").is_empty());
         assert!(settings.views_for("prod/knowledge", "Person").is_empty());
         let text = serde_json::to_string(&settings).unwrap();
+        assert!(text.contains(r#""hidden":["email"]"#), "{text}");
+        assert!(!text.contains("order"), "schema order is left out: {text}");
         assert_eq!(StudioSettings::parse(&text).unwrap(), settings);
         settings.delete_view("dev/knowledge", "Person", "Founders");
         assert!(settings.graphs.is_empty(), "an empty entry is dropped");

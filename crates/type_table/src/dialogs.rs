@@ -657,18 +657,30 @@ impl Render for SaveViewModal {
                 1 => "1 filter".to_owned(),
                 n => format!("{n} filters"),
             };
-            match &self.view.sort {
-                Some(sort) => format!(
-                    "{filters}, ordered by {} {}",
+            let mut parts = vec![filters];
+            if let Some(sort) = &self.view.sort {
+                parts.push(format!(
+                    "ordered by {} {}",
                     sort.property,
                     if sort.descending {
                         "descending"
                     } else {
                         "ascending"
                     }
-                ),
-                None => filters,
+                ));
             }
+            if let Some(property) = &self.view.group_by {
+                parts.push(format!("grouped by {property}"));
+            }
+            match self.view.hidden.len() {
+                0 => {}
+                1 => parts.push("1 hidden column".to_owned()),
+                n => parts.push(format!("{n} hidden columns")),
+            }
+            if !self.view.order.is_empty() {
+                parts.push("its column order".to_owned());
+            }
+            parts.join(", ")
         };
         frame(cx)
             .key_context("SaveViewModal")
