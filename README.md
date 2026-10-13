@@ -12,6 +12,12 @@ web view.
 
 ![Studio opening a person's relationships in the explorer, then the Person table grouped by company](docs/images/explore.gif)
 
+## Download
+
+[Releases](https://github.com/ModernRelay/omnigraph-studio/releases) have a macOS DMG (Apple
+silicon) and Linux tarballs (x86_64, arm64). macOS builds are not notarized yet; the release
+notes say how to open one. To build from source instead, see below.
+
 ## Quick start
 
 Requirements:

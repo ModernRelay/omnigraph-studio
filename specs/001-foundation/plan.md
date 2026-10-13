@@ -89,6 +89,11 @@ Linux. CI caches `~/.cargo/git` and `target/` keyed on `Cargo.lock`.
 - Linux: `script/bundle-linux` builds a tarball (`bin/`, a `.desktop` entry, `LICENSE`).
   AppImage later. Windows: later.
 - CI bundles the debug build on both systems so the scripts keep working.
+- Releases: pushing a tag `v<version>` that names the workspace version runs
+  `.github/workflows/release.yml`. It bundles release builds for macOS (Apple silicon) and Linux
+  (x86_64 and arm64) and publishes a GitHub Release with the files, `SHA256SUMS` and install
+  notes; 0.x releases are marked pre-release. The macOS build is signed and notarized when the
+  workflow's Apple secrets are set, and signed ad hoc otherwise.
 - Homebrew cask in a ModernRelay tap. Updates: a polling updater modelled on Zed's
   `auto_update`, later.
 

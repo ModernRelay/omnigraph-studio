@@ -1,0 +1,156 @@
+name: Release
+
+# Push a tag `v<version>` matching the workspace version to build and publish a release:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# macOS builds are signed and notarized when the Apple secrets below are set, and signed ad hoc
+# otherwise. Linux builds are tarballs.
+#
+#   APPLE_CERTIFICATE_P12        base64 of a "Developer ID Application" certificate (.p12)
+#   APPLE_CERTIFICATE_PASSWORD   its export password
+#   APPLE_SIGN_IDENTITY          e.g. "Developer ID Application: Modern Relay (TEAMID)"
+#   APPLE_NOTARY_KEY_P8          base64 of an App Store Connect API key (.p8)
+#   APPLE_NOTARY_KEY_ID          its key ID
+#   APPLE_NOTARY_ISSUER          its issuer ID
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: macos-arm64
+          - os: ubuntu-24.04
+            target: linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: linux-aarch64
+    runs-on: ${{ matrix.os }}
+    env:
+      SIGNED: ${{ secrets.APPLE_CERTIFICATE_P12 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The tag names the workspace version
+        shell: bash
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [[ "v$version" != "$GITHUB_REF_NAME" ]]; then
+            echo "tag $GITHUB_REF_NAME does not name the workspace version $version" >&2
+            exit 1
+          fi
+
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libfontconfig1-dev libvulkan-dev libssl-dev pkg-config
+
+      - name: Rust toolchain from rust-toolchain.toml
+        run: rustup show
+
+      - name: Signing and notarization credentials
+        if: runner.os == 'macOS' && env.SIGNED == 'true'
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGN_IDENTITY: ${{ secrets.APPLE_SIGN_IDENTITY }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password=$(openssl rand -hex 16)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          echo "$APPLE_NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          xcrun notarytool store-credentials studio-notary --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER" --keychain "$keychain"
+          rm "$RUNNER_TEMP/notary.p8"
+          echo "STUDIO_SIGN_IDENTITY=$APPLE_SIGN_IDENTITY" >> "$GITHUB_ENV"
+          echo "STUDIO_NOTARY_PROFILE=studio-notary" >> "$GITHUB_ENV"
+
+      - name: Bundle (release build)
+        run: script/bundle-${{ runner.os == 'macOS' && 'mac' || 'linux' }}
+
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/bundle/*.dmg target/bundle/*.tar.gz dist/ 2>/dev/null || true
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNED: ${{ secrets.APPLE_CERTIFICATE_P12 != '' }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          if [[ "$SIGNED" == "true" ]]; then
+            mac="The macOS app is signed with a Developer ID and notarized."
+          else
+            mac="The macOS app is signed ad hoc, not notarized. macOS blocks it the first time: open System Settings → Privacy & Security and choose Open Anyway, or run \`xattr -dr com.apple.quarantine \"/Applications/OmniGraph Studio.app\"\` after moving it to Applications."
+          fi
+          cat > notes.md <<NOTES
+          OmniGraph Studio $version, built from ${GITHUB_SHA::7} by the release workflow.
+
+          | File | Platform |
+          |---|---|
+          | \`OmniGraph-Studio-$version-arm64.dmg\` | macOS 11 or later, Apple silicon |
+          | \`omnigraph-studio-$version-linux-x86_64.tar.gz\` | Linux x86_64 (Wayland or X11, Vulkan) |
+          | \`omnigraph-studio-$version-linux-aarch64.tar.gz\` | Linux arm64 (Wayland or X11, Vulkan) |
+
+          \`SHA256SUMS\` lists every file's checksum.
+
+          $mac
+
+          On Linux, unpack the tarball and run \`bin/omnigraph-studio\`; copy its \`share/\` into \`~/.local/share\` to list Studio, with its icon, in a launcher.
+
+          Studio connects to an OmniGraph 0.13 server; see the README for connecting and for a sample graph.
+          NOTES
+          flags=()
+          [[ "$version" == 0.* ]] && flags+=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --title "OmniGraph Studio $version" --notes-file notes.md "${flags[@]}"
