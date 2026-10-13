@@ -32,6 +32,11 @@ const READ_RETRIES: usize = 2;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// The wait when a 429 names none.
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
+/// How many reads one connection has on the wire at once (spec 003). A server admits a bounded
+/// number of reads across all its clients (0.13 refuses past its read ingress cap, 64 by
+/// default), so a view that asks for many counts at once queues here rather than being refused
+/// there.
+pub const READ_CONCURRENCY: usize = 8;
 
 /// Why a read failed.
 #[derive(Debug, Clone)]
@@ -143,6 +148,8 @@ pub struct GraphClient {
     base: Url,
     token: Option<Arc<str>>,
     http: Arc<dyn HttpClient>,
+    /// Shared by every clone, so the bound holds for the whole connection.
+    read_slots: Arc<smol::lock::Semaphore>,
 }
 
 impl std::fmt::Debug for GraphClient {
@@ -170,6 +177,7 @@ impl GraphClient {
             base,
             token: token.map(Into::into),
             http,
+            read_slots: Arc::new(smol::lock::Semaphore::new(READ_CONCURRENCY)),
         })
     }
 
@@ -256,7 +264,8 @@ impl GraphClient {
         })
     }
 
-    /// Sends a read; one refused with 429 waits as asked and goes again.
+    /// Sends a read once one of the connection's read slots is free; one refused with 429
+    /// waits as asked, without its slot, and goes again.
     async fn fetch(
         &self,
         method: Method,
@@ -266,8 +275,9 @@ impl GraphClient {
     ) -> Result<RawResponse, ReadError> {
         let mut retries = 0;
         loop {
-            let raw = self
-                .send(
+            let raw = {
+                let _slot = self.read_slots.acquire().await;
+                self.send(
                     method.clone(),
                     url.clone(),
                     body.clone(),
@@ -275,7 +285,8 @@ impl GraphClient {
                     READ_TIMEOUT,
                 )
                 .await
-                .map_err(ReadError::Transport)?;
+                .map_err(ReadError::Transport)?
+            };
             // A read changes nothing, so a rate-limited one waits as asked and goes again.
             if raw.status == StatusCode::TOO_MANY_REQUESTS && retries < READ_RETRIES {
                 let wait = raw.retry_after.unwrap_or(DEFAULT_RETRY_AFTER);
@@ -859,6 +870,41 @@ mod tests {
             count.load(std::sync::atomic::Ordering::SeqCst),
             1 + READ_RETRIES
         );
+    }
+
+    #[test]
+    fn a_connection_keeps_a_bounded_number_of_reads_on_the_wire() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (current, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (now, peak) = (current.clone(), most.clone());
+        let http = FakeHttpClient::create(move |_request| {
+            let (now, peak) = (now.clone(), peak.clone());
+            async move {
+                let running = now.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(running, Ordering::SeqCst);
+                smol::Timer::after(Duration::from_millis(5)).await;
+                now.fetch_sub(1, Ordering::SeqCst);
+                Ok(Response::builder()
+                    .status(200)
+                    .header(CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(r#"{"branches":["main"]}"#))
+                    .unwrap())
+            }
+        });
+        let client = client(http);
+        // A clone shares the bound: views hold clones of their connection's client.
+        let other = client.clone();
+        let reads = (0..40).map(|i| {
+            let client = if i % 2 == 0 {
+                client.clone()
+            } else {
+                other.clone()
+            };
+            async move { client.branches("g").await }
+        });
+        let results = block_on(futures::future::join_all(reads));
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(most.load(Ordering::SeqCst), READ_CONCURRENCY);
     }
 
     #[test]
