@@ -16,11 +16,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{
     App, AppContext as _, Bounds, ContentMask, Context, Entity, EventEmitter, FocusHandle,
     Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels,
-    Point, Render, ScrollWheelEvent, SharedString, Subscription, Task, Window, canvas, point, px,
+    Point, Render, ScrollWheelEvent, SharedString, Size, Subscription, Task, Window, canvas, point,
+    px,
 };
 use graph_store::{
     Exploration, ExplorationEvent, ExplorePath, GraphSession, GroupKey, Loadable, NodeRef,
@@ -38,8 +40,9 @@ use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::Tooltip;
 use ui::prelude::*;
 
-use layout::{LayoutKind, LayoutNode, Vec2};
+use layout::{LayoutKind, LayoutNode, OntologyEdge, OntologyNode, Vec2};
 use model::{HUB_STEP, Scene, SceneId, SceneKind};
+use studio_ui::motion::{self, Ease, Lerp, Tween};
 
 /// Labels of graph nodes show from this zoom up; hubs from a little further out.
 const MAX_ZOOM: f32 = 2.;
@@ -122,6 +125,29 @@ struct ResultsData {
 /// Results canvases are tabs of their own, one per showing.
 static NEXT_RESULTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
+/// Where the view looks and how close: what a camera glide moves.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Camera {
+    center: Vec2,
+    zoom: f32,
+}
+
+impl Lerp for Camera {
+    /// Zoom blends on a log scale, so a glide zooms at an even pace.
+    fn lerp(&self, to: &Self, t: f32) -> Self {
+        Camera {
+            center: self.center.lerp(&to.center, t),
+            zoom: self.zoom.ln().lerp(&to.zoom.ln(), t).exp(),
+        }
+    }
+}
+
+impl Lerp for Vec2 {
+    fn lerp(&self, to: &Self, t: f32) -> Self {
+        Vec2::new(self.x.lerp(&to.x, t), self.y.lerp(&to.y, t))
+    }
+}
+
 struct Drag {
     start: Point<Pixels>,
     center: Vec2,
@@ -180,6 +206,8 @@ pub struct GraphCanvas {
     mode: Mode,
     scene: Arc<Scene>,
     positions: Arc<Vec<Vec2>>,
+    /// Half of each node's chip width at zoom 1, as measured for the layout.
+    half_widths: Arc<Vec<f32>>,
     /// Where each node was drawn, for the current mode and root: such nodes never move.
     known: HashMap<SceneId, Vec2>,
     /// Nodes the person dragged into place, by [`pin_key`]: kept across layouts and restarts,
@@ -191,6 +219,15 @@ pub struct GraphCanvas {
     hub_limits: HashMap<GroupKey, usize>,
     center: Vec2,
     zoom: f32,
+    /// The view on its way to `center` and `zoom` (spec 006: the view glides to what it
+    /// centres on).
+    glide: Option<Tween<Camera>>,
+    /// Nodes on their way to their places: new ones grow out of the node they came from.
+    appear: HashMap<usize, Tween<Vec2>>,
+    /// The person moved the view by hand since the last fit: a resize then leaves it alone.
+    camera_touched: bool,
+    /// The canvas's size at the last fit, to fit again when it changes.
+    fitted_size: Option<Size<Pixels>>,
     fit_zoom: f32,
     fit_pending: bool,
     center_on: Option<SceneId>,
@@ -279,6 +316,7 @@ impl GraphCanvas {
             mode: Mode::Schema,
             scene: Arc::default(),
             positions: Arc::default(),
+            half_widths: Arc::default(),
             known: HashMap::new(),
             pinned: HashMap::new(),
             layout_key: None,
@@ -287,6 +325,10 @@ impl GraphCanvas {
             hub_limits: HashMap::new(),
             center: Vec2::default(),
             zoom: 1.,
+            glide: None,
+            appear: HashMap::new(),
+            camera_touched: false,
+            fitted_size: None,
             fit_zoom: 1.,
             fit_pending: true,
             center_on: None,
@@ -388,14 +430,50 @@ impl GraphCanvas {
             Mode::Schema => {
                 let session = self.session.read(cx);
                 let scene = model::schema_scene(&schema, |name| session.count_of(name));
-                let mut positions = layout::schema_positions(scene.nodes.len());
-                for (node, position) in scene.nodes.iter().zip(positions.iter_mut()) {
-                    if let Some(pinned) = pin_key(&node.id).and_then(|key| self.pinned.get(&key)) {
-                        *position = *pinned;
-                    }
-                }
-                self._layout_task = None;
-                self.apply_layout(scene, positions, cx);
+                let measure = measurer(cx);
+                let widths = half_widths(&scene, &measure);
+                // From the schema and the placed types only: each type is laid out with room
+                // for a six-digit count, whatever its count, so a count never moves a type.
+                let nodes: Vec<OntologyNode> = scene
+                    .nodes
+                    .iter()
+                    .map(|node| OntologyNode {
+                        half_width: {
+                            let mut sized = node.clone();
+                            sized.kind = SceneKind::Type {
+                                count: Some(888_888),
+                            };
+                            paint::chip_width(&paint::chip_text(&sized), &measure) / 2.
+                        },
+                        pinned: pin_key(&node.id).and_then(|key| self.pinned.get(&key).copied()),
+                    })
+                    .collect();
+                // Labels shown at all times get room between their types; a larger ontology
+                // names a type's relationships on hover, over the chips, and stays compact.
+                let labelled = scene.edges.len() <= paint::ALWAYS_LABEL;
+                let edges: Vec<OntologyEdge> = scene
+                    .edges
+                    .iter()
+                    .map(|edge| OntologyEdge {
+                        from: edge.from,
+                        to: edge.to,
+                        label_half_width: match &edge.label {
+                            Some(label) if labelled => paint::label_width(label, &measure) / 2.,
+                            _ => 0.,
+                        },
+                    })
+                    .collect();
+                let positions =
+                    cx.background_spawn(async move { layout::ontology_positions(&nodes, &edges) });
+                self._layout_task = Some(cx.spawn(async move |this, cx| {
+                    let positions = positions.await;
+                    this.update(cx, |this, cx| {
+                        if this.layout_generation == generation {
+                            this.apply_layout(scene, widths, positions, cx);
+                        }
+                    })
+                    .ok();
+                }));
             }
             Mode::Explore => {
                 let entries = exploration.entries(cx);
@@ -406,21 +484,29 @@ impl GraphCanvas {
                     &self.hub_limits,
                     self.node_cap(cx),
                 );
+                let widths = half_widths(&scene, &measurer(cx));
                 let nodes: Vec<LayoutNode> = scene
                     .nodes
                     .iter()
-                    .map(|node| LayoutNode {
+                    .zip(&widths)
+                    .map(|(node, width)| LayoutNode {
                         parent: node.parent,
                         kind: match node.kind {
                             SceneKind::Hub { .. } => LayoutKind::Hub,
                             SceneKind::More { .. } => LayoutKind::More,
                             _ => LayoutKind::Node,
                         },
-                        space: layout_space(&node.kind, &node.label),
-                        previous: pin_key(&node.id)
-                            .and_then(|key| self.pinned.get(&key))
-                            .or_else(|| self.known.get(&node.id))
-                            .copied(),
+                        space: *width,
+                        // "+K more" stands for what is not drawn yet: it moves to the end of
+                        // its column as neighbours come in, while drawn nodes stay put.
+                        previous: if matches!(node.kind, SceneKind::More { .. }) {
+                            None
+                        } else {
+                            pin_key(&node.id)
+                                .and_then(|key| self.pinned.get(&key))
+                                .or_else(|| self.known.get(&node.id))
+                                .copied()
+                        },
                     })
                     .collect();
                 let positions =
@@ -429,7 +515,7 @@ impl GraphCanvas {
                     let positions = positions.await;
                     this.update(cx, |this, cx| {
                         if this.layout_generation == generation {
-                            this.apply_layout(scene, positions, cx);
+                            this.apply_layout(scene, widths, positions, cx);
                         }
                     })
                     .ok();
@@ -458,6 +544,7 @@ impl GraphCanvas {
         for (node, parent) in scene.nodes.iter_mut().zip(&parent) {
             node.parent = *parent;
         }
+        let widths = half_widths(&scene, &measurer(cx));
         let nodes: Vec<LayoutNode> = scene
             .nodes
             .iter()
@@ -465,7 +552,7 @@ impl GraphCanvas {
             .map(|(i, node)| LayoutNode {
                 parent: node.parent,
                 kind: LayoutKind::Node,
-                space: layout_space(&node.kind, &node.label),
+                space: widths[i],
                 previous: pin_key(&node.id)
                     .and_then(|key| self.pinned.get(&key).copied())
                     .or(fixed[i]),
@@ -483,14 +570,21 @@ impl GraphCanvas {
             let positions = positions.await;
             this.update(cx, |this, cx| {
                 if this.layout_generation == generation {
-                    this.apply_layout(scene, positions, cx);
+                    this.apply_layout(scene, widths, positions, cx);
                 }
             })
             .ok();
         }));
     }
 
-    fn apply_layout(&mut self, scene: Scene, mut positions: Vec<Vec2>, cx: &mut Context<Self>) {
+    fn apply_layout(
+        &mut self,
+        scene: Scene,
+        widths: Vec<f32>,
+        mut positions: Vec<Vec2>,
+        cx: &mut Context<Self>,
+    ) {
+        self.half_widths = Arc::new(widths);
         // A placed node stays exactly where it was put.
         for (node, position) in scene.nodes.iter().zip(positions.iter_mut()) {
             if let Some(pinned) = pin_key(&node.id).and_then(|key| self.pinned.get(&key)) {
@@ -500,18 +594,93 @@ impl GraphCanvas {
         for (node, position) in scene.nodes.iter().zip(&positions) {
             self.known.insert(node.id.clone(), *position);
         }
+        // Every node glides from where it is drawn now to its new place; a new one from where
+        // the node it hangs off is drawn, so expanding reads as growing.
+        let now = Instant::now();
+        let drawn: HashMap<SceneId, Vec2> = self
+            .scene
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.id.clone(), self.drawn_position(index, now)))
+            .collect();
+        self.appear.clear();
+        if motion::enabled(cx) && !self.fit_pending {
+            for (index, node) in scene.nodes.iter().enumerate() {
+                let to = positions[index];
+                let from = drawn.get(&node.id).copied().or_else(|| {
+                    let parent = node.parent?;
+                    drawn
+                        .get(&scene.nodes.get(parent)?.id)
+                        .copied()
+                        .or_else(|| positions.get(parent).copied())
+                });
+                if let Some(from) = from
+                    && (from - to).length() > 0.5
+                {
+                    self.appear.insert(
+                        index,
+                        Tween::glide(from, to, motion::GLIDE, Ease::OutCubic, now),
+                    );
+                }
+            }
+        }
         self.hovered = None;
         self.scene = Arc::new(scene);
         self.positions = Arc::new(positions);
         if let Some(target) = self.center_on.clone()
             && let Some(index) = self.scene.index_of(&target)
         {
+            let from = self.camera_now(now);
             self.center = self.positions[index];
             self.zoom = self.zoom.max(1.);
             self.center_on = None;
             self.fit_pending = false;
+            self.camera_touched = true;
+            self.glide_from(from, cx);
         }
         cx.notify();
+    }
+
+    /// Where node `index` is drawn at `now`: on its way, or at its place.
+    fn drawn_position(&self, index: usize, now: Instant) -> Vec2 {
+        match self.appear.get(&index) {
+            Some(tween) => tween.value(now),
+            None => self.positions.get(index).copied().unwrap_or_default(),
+        }
+    }
+
+    /// The camera as drawn at `now`: mid-glide, or at rest.
+    fn camera_now(&self, now: Instant) -> Camera {
+        match &self.glide {
+            Some(glide) if glide.is_running(now) => glide.value(now),
+            _ => Camera {
+                center: self.center,
+                zoom: self.zoom,
+            },
+        }
+    }
+
+    /// Glides the view from `from` (where it was drawn) to the camera just set.
+    fn glide_from(&mut self, from: Camera, cx: &App) {
+        let to = Camera {
+            center: self.center,
+            zoom: self.zoom,
+        };
+        self.glide = (motion::enabled(cx) && from != to)
+            .then(|| Tween::glide(from, to, motion::GLIDE, Ease::InOutCubic, Instant::now()));
+    }
+
+    /// Stops a glide where it is drawn, before the person moves the view by hand.
+    fn settle_camera(&mut self) {
+        if let Some(glide) = self.glide.take() {
+            let now = Instant::now();
+            if glide.is_running(now) {
+                let at = glide.value(now);
+                self.center = at.center;
+                self.zoom = at.zoom;
+            }
+        }
     }
 
     /// Mirrors the exploration's selection (a tree row, a reveal).
@@ -534,9 +703,9 @@ impl GraphCanvas {
     }
 
     fn fit(&mut self, viewport: Bounds<Pixels>) {
-        let scene = self.scene.clone();
+        let widths = self.half_widths.clone();
         let Some((min, max)) = layout::extent(&self.positions, |index| {
-            layout_space(&scene.nodes[index].kind, &scene.nodes[index].label)
+            widths.get(index).copied().unwrap_or(60.)
         }) else {
             return;
         };
@@ -550,6 +719,7 @@ impl GraphCanvas {
         self.fit_zoom = zoom;
         self.center = Vec2::new((min.x + max.x) / 2., (min.y + max.y) / 2.);
         self.fit_pending = false;
+        self.fitted_size = Some(viewport.size);
     }
 
     fn min_zoom(&self) -> f32 {
@@ -689,6 +859,7 @@ impl GraphCanvas {
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
+        self.settle_camera();
         let node = self
             .hit(event.position, window)
             .filter(|index| pin_key(&self.scene.nodes[*index].id).is_some())
@@ -710,6 +881,7 @@ impl GraphCanvas {
                 let delta = Vec2::new(dx, dy) * (1. / self.zoom);
                 match drag.node {
                     Some((index, from)) => {
+                        self.appear.remove(&index);
                         let at = from + delta;
                         if let Some(position) = Arc::make_mut(&mut self.positions).get_mut(index) {
                             *position = at;
@@ -717,7 +889,10 @@ impl GraphCanvas {
                         let id = self.scene.nodes[index].id.clone();
                         self.known.insert(id, at);
                     }
-                    None => self.center = drag.center - delta,
+                    None => {
+                        self.center = drag.center - delta;
+                        self.camera_touched = true;
+                    }
                 }
                 cx.notify();
             }
@@ -775,6 +950,8 @@ impl GraphCanvas {
     }
 
     fn scroll(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.settle_camera();
+        self.camera_touched = true;
         let delta = event.delta.pixel_delta(window.line_height());
         let factor = (-f32::from(delta.y) * 0.004).exp();
         self.zoom_around(factor, Some(event.position), window);
@@ -782,6 +959,8 @@ impl GraphCanvas {
     }
 
     fn pinch(&mut self, event: &PinchEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.settle_camera();
+        self.camera_touched = true;
         self.zoom_around(1. + event.delta, Some(event.position), window);
         cx.notify();
     }
@@ -805,18 +984,28 @@ impl GraphCanvas {
     }
 
     fn fit_to_window(&mut self, _: &FitToWindow, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.camera_now(Instant::now());
         let viewport = self.viewport(window);
         self.fit(viewport);
+        // Fitted on request: a resize fits again until the view is moved by hand.
+        self.camera_touched = false;
+        self.glide_from(from, cx);
         cx.notify();
     }
 
     fn zoom_in(&mut self, _: &ZoomIn, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.camera_now(Instant::now());
         self.zoom_around(ZOOM_STEP, None, window);
+        self.camera_touched = true;
+        self.glide_from(from, cx);
         cx.notify();
     }
 
     fn zoom_out(&mut self, _: &ZoomOut, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.camera_now(Instant::now());
         self.zoom_around(1. / ZOOM_STEP, None, window);
+        self.camera_touched = true;
+        self.glide_from(from, cx);
         cx.notify();
     }
 
@@ -899,9 +1088,12 @@ impl GraphCanvas {
         let Some(index) = self.selected_index() else {
             return;
         };
-        if let Some(position) = self.positions.get(index) {
-            self.center = *position;
+        if let Some(position) = self.positions.get(index).copied() {
+            let from = self.camera_now(Instant::now());
+            self.center = position;
             self.zoom = self.zoom.clamp(1.25, 2.);
+            self.camera_touched = true;
+            self.glide_from(from, cx);
             cx.notify();
         }
     }
@@ -934,16 +1126,35 @@ impl GraphCanvas {
             font: theme::theme_settings(cx).ui_font(cx).clone(),
         };
         let scene = self.scene.clone();
-        let positions = self.positions.clone();
-        let center = self.center;
-        let zoom = self.zoom;
+        let now = Instant::now();
+        let positions: Arc<Vec<Vec2>> = if self.appear.is_empty() {
+            self.positions.clone()
+        } else {
+            Arc::new(
+                (0..self.positions.len())
+                    .map(|index| self.drawn_position(index, now))
+                    .collect(),
+            )
+        };
+        let camera = self.camera_now(now);
+        let (center, zoom) = (camera.center, camera.zoom);
+        let moving = self.glide.as_ref().is_some_and(|g| g.is_running(now))
+            || self.appear.values().any(|t| t.is_running(now));
         let selected = self.selected_index();
         let hovered = self.hovered;
         let bounds_cell = self.bounds.clone();
         let chips = self.chips.clone();
         canvas(
-            move |bounds, _window, _cx| bounds_cell.set(Some(bounds)),
+            move |bounds, window, _cx| {
+                // A new size is fitted on the next frame, once the view knows it.
+                let resized = bounds_cell.get().map(|b| b.size) != Some(bounds.size);
+                bounds_cell.set(Some(bounds));
+                if resized {
+                    window.refresh();
+                }
+            },
             move |bounds, (), window, cx| {
+                motion::keep_animating(moving, window);
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
                     let screen: Vec<Point<Pixels>> = positions
                         .iter()
@@ -1298,16 +1509,28 @@ impl GraphCanvas {
 
 /// The room a node needs in layout: about half its chip's width at zoom 1 (a mark, the label
 /// at about seven pixels a character, a count, and the padding).
-fn layout_space(kind: &SceneKind, label: &str) -> f32 {
-    let chars = label.chars().count().min(32) as f32;
-    match kind {
-        SceneKind::Type { count } => {
-            let digits = count.map_or(0, |c| c.to_string().len()) as f32;
-            (46. + (chars + digits) * 7.) / 2.
-        }
-        SceneKind::Node { .. } => (46. + chars * 7.) / 2.,
-        SceneKind::Hub { .. } | SceneKind::More { .. } => (24. + chars * 6.6) / 2.,
+/// Measures text with the UI font, as the painter shapes chip text, for the layout.
+fn measurer(cx: &App) -> impl Fn(&str, f32, gpui::FontWeight) -> f32 + use<> {
+    let system = cx.text_system().clone();
+    let font = theme::theme_settings(cx).ui_font(cx).clone();
+    move |text, size, weight| {
+        let id = system.resolve_font(&gpui::Font {
+            weight,
+            ..font.clone()
+        });
+        text.chars()
+            .map(|ch| f32::from(system.layout_width(id, px(size), ch)))
+            .sum()
     }
+}
+
+/// Half of each node's chip width at zoom 1, measured as the painter draws it.
+fn half_widths(scene: &Scene, measure: &impl Fn(&str, f32, gpui::FontWeight) -> f32) -> Vec<f32> {
+    scene
+        .nodes
+        .iter()
+        .map(|node| paint::chip_width(&paint::chip_text(node), measure) / 2.)
+        .collect()
 }
 
 fn scene_id_of(path: &ExplorePath, root: &NodeRef) -> SceneId {
@@ -1360,9 +1583,24 @@ impl Render for GraphCanvas {
             ),
             Loadable::Loaded(_) => None,
         };
-        if self.fit_pending && !self.scene.nodes.is_empty() {
-            let viewport = self.viewport(window);
-            self.fit(viewport);
+        let now = Instant::now();
+        self.appear.retain(|_, tween| tween.is_running(now));
+        if self.glide.as_ref().is_some_and(|g| !g.is_running(now)) {
+            self.glide = None;
+        }
+        // The fit waits for the canvas's own bounds, known once it has been painted, and
+        // follows them while the person has not moved the view.
+        if let Some(viewport) = self.bounds.get()
+            && !self.scene.nodes.is_empty()
+        {
+            let resized = self.fitted_size.is_some_and(|size| size != viewport.size);
+            if self.fit_pending || (resized && !self.camera_touched) {
+                if self.fit_pending {
+                    self.camera_touched = false;
+                }
+                self.glide = None;
+                self.fit(viewport);
+            }
         }
         let background = cx.theme().colors().editor_background;
         let canvas = self.render_canvas(window, cx).into_any_element();

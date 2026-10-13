@@ -11,6 +11,7 @@ pub use studio_theme::type_color;
 
 mod changes;
 pub mod ds;
+pub mod motion;
 mod values;
 
 pub use changes::{ChangeCard, ChangeKind, PropertyRow, change_counts, change_group_header};

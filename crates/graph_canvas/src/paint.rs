@@ -13,7 +13,7 @@ use gpui::{
 };
 use studio_ui::type_color;
 
-use crate::model::{Scene, SceneKind};
+use crate::model::{Scene, SceneKind, SceneNode};
 
 pub(crate) struct Palette {
     pub text: Hsla,
@@ -25,27 +25,217 @@ pub(crate) struct Palette {
     pub font: Font,
 }
 
-/// A chip's text size at zoom 1.
+/// A chip's text size at zoom 1, and a hub's or "+K more"'s.
 const CHIP_TEXT: f32 = 13.;
+const HUB_TEXT: f32 = 12.5;
+/// A relationship label's text size at zoom 1.
+const LABEL_TEXT: f32 = 11.;
+/// A pill's inner spacing at zoom 1: between pieces, at each end, and its mark's size.
+const PILL_GAP: f32 = 6.;
+const PILL_PAD_X: f32 = 10.;
+const PILL_MARK: f32 = 16.;
 /// Below this text size a node is drawn as its mark alone, unless it is selected or pointed at.
 const MARK_ONLY_BELOW: f32 = 8.5;
+const TYPE_MARK_ONLY_BELOW: f32 = 6.;
 /// The dot grid's spacing, in screen pixels.
 const DOT_STEP: f32 = 22.;
 /// Up to this many relationships, the schema labels every line (Tower's `ALWAYS_LABEL`).
-const ALWAYS_LABEL: usize = 16;
+pub(crate) const ALWAYS_LABEL: usize = 16;
 /// The warm ring that marks where you are (Tower's `CHIP_FOCUS`).
 const WARM: u32 = 0xf2b48f;
 /// Segments per path: GPUI caps one path near 65k vertices.
 const SEGMENTS_PER_PATH: usize = 2_000;
 
-/// One straight line on screen.
-type Segment = (Point<Pixels>, Point<Pixels>);
+/// How a line runs between its two ends.
+#[derive(Clone, Copy)]
+enum Curve {
+    Straight,
+    /// Bowed through one control point: one of several relationships between two types.
+    Bowed(Point<Pixels>),
+    /// Leaving and arriving level: an exploration's branch, as a mind map draws it.
+    Level(Point<Pixels>, Point<Pixels>),
+}
+
+/// One line on screen.
+type Segment = (Point<Pixels>, Point<Pixels>, Curve);
+
+/// How far apart, at zoom 1, the lines of several relationships between the same two types
+/// run at their middle, and how much taller each further loop on one type is.
+const FAN: f32 = 30.;
+const LOOP_STEP: f32 = 26.;
+
+/// Where one relationship runs on screen: its line (bowed when several join the same two types,
+/// so each has its own line and label; a loop when it joins a type to itself) and where its
+/// label sits.
+struct Route {
+    curve: Curve,
+    label_at: Point<Pixels>,
+    /// For a loop: which of the type's loops this is, from the inside out.
+    loop_rank: usize,
+}
+
+fn routes(scene: &Scene, screen: &[Point<Pixels>], scale: f32, schema: bool) -> Vec<Route> {
+    let mut pair_count: HashMap<(usize, usize), usize> = HashMap::new();
+    for edge in &scene.edges {
+        *pair_count
+            .entry((edge.from.min(edge.to), edge.from.max(edge.to)))
+            .or_default() += 1;
+    }
+    let mut seen: HashMap<(usize, usize), usize> = HashMap::new();
+    scene
+        .edges
+        .iter()
+        .map(|edge| {
+            let key = (edge.from.min(edge.to), edge.from.max(edge.to));
+            let rank = {
+                let seen = seen.entry(key).or_default();
+                *seen += 1;
+                *seen - 1
+            };
+            let (a, b) = (screen[key.0], screen[key.1]);
+            if edge.from == edge.to {
+                let height = (60. + LOOP_STEP * rank as f32) * scale;
+                return Route {
+                    curve: Curve::Straight,
+                    label_at: point(a.x, a.y - px(height - 10. * scale)),
+                    loop_rank: rank,
+                };
+            }
+            let mid = point((a.x + b.x) / 2., (a.y + b.y) / 2.);
+            // An exploration's branch leaves its node level and arrives level, so a column of
+            // neighbours reads as one fan.
+            if !schema {
+                let (from, to) = (screen[edge.from], screen[edge.to]);
+                let half = (to.x - from.x) / 2.;
+                return Route {
+                    curve: Curve::Level(point(from.x + half, from.y), point(to.x - half, to.y)),
+                    label_at: mid,
+                    loop_rank: 0,
+                };
+            }
+            let count = pair_count[&key];
+            if count < 2 {
+                return Route {
+                    curve: Curve::Straight,
+                    label_at: mid,
+                    loop_rank: 0,
+                };
+            }
+            // Fan around the straight line, the same side for the same pair whichever way a
+            // relationship points.
+            let (dx, dy) = (f32::from(b.x - a.x), f32::from(b.y - a.y));
+            let length = (dx * dx + dy * dy).sqrt().max(1.);
+            let normal = (-dy / length, dx / length);
+            let offset = (rank as f32 - (count - 1) as f32 / 2.) * FAN * scale;
+            Route {
+                // A quadratic curve passes halfway to its control point at its middle.
+                curve: Curve::Bowed(point(
+                    mid.x + px(normal.0 * offset * 2.),
+                    mid.y + px(normal.1 * offset * 2.),
+                )),
+                label_at: point(mid.x + px(normal.0 * offset), mid.y + px(normal.1 * offset)),
+                loop_rank: 0,
+            }
+        })
+        .collect()
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Tone {
     /// Line opacity, in thousandths, so tones batch.
     alpha: u16,
     dotted: bool,
+}
+
+/// What a piece of a chip's text is, which sets its colour and weight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Role {
+    Name,
+    RootName,
+    Count,
+    OpenHub,
+    Muted,
+}
+
+impl Role {
+    pub(crate) fn weight(self) -> FontWeight {
+        match self {
+            Role::RootName => FontWeight::MEDIUM,
+            _ => FontWeight::NORMAL,
+        }
+    }
+}
+
+/// What a chip says, before colour: the same for painting it and for measuring it, so the
+/// layout makes room for the chip the painter draws.
+pub(crate) struct ChipText {
+    pub mark: bool,
+    pub pieces: Vec<(String, Role)>,
+    /// The text size at zoom 1.
+    pub size: f32,
+}
+
+pub(crate) fn chip_text(node: &SceneNode) -> ChipText {
+    match &node.kind {
+        SceneKind::Type { count } => ChipText {
+            mark: true,
+            pieces: std::iter::once((node.label.clone(), Role::RootName))
+                .chain(count.map(|count| (format_count(count), Role::Count)))
+                .collect(),
+            size: CHIP_TEXT,
+        },
+        SceneKind::Node { root, .. } => ChipText {
+            mark: true,
+            pieces: vec![(
+                truncate(&node.label, 32),
+                if *root { Role::RootName } else { Role::Name },
+            )],
+            size: CHIP_TEXT,
+        },
+        SceneKind::Hub { open, .. } => {
+            let (name, count) = match node.label.rsplit_once(" · ") {
+                Some((name, count)) => (name.to_owned(), Some(count.to_owned())),
+                None => (node.label.clone(), None),
+            };
+            ChipText {
+                mark: false,
+                pieces: std::iter::once((name, if *open { Role::OpenHub } else { Role::Muted }))
+                    .chain(count.map(|count| (count, Role::Count)))
+                    .collect(),
+                size: HUB_TEXT,
+            }
+        }
+        SceneKind::More { .. } => ChipText {
+            mark: false,
+            pieces: vec![(node.label.clone(), Role::Muted)],
+            size: HUB_TEXT,
+        },
+    }
+}
+
+/// A chip's width at zoom 1, as [`paint_pill`] draws it, given the width of a text at a size
+/// and weight.
+pub(crate) fn chip_width(text: &ChipText, measure: impl Fn(&str, f32, FontWeight) -> f32) -> f32 {
+    let widths: f32 = text
+        .pieces
+        .iter()
+        .map(|(piece, role)| measure(piece, text.size, role.weight()))
+        .sum();
+    let gaps = PILL_GAP * text.pieces.len().saturating_sub(1) as f32;
+    let mark = if text.mark { PILL_MARK + PILL_GAP } else { 0. };
+    PILL_PAD_X * 2. + widths + gaps + mark
+}
+
+/// A relationship label's width at zoom 1, as the canvas draws its pill.
+pub(crate) fn label_width(label: &str, measure: impl Fn(&str, f32, FontWeight) -> f32) -> f32 {
+    chip_width(
+        &ChipText {
+            mark: false,
+            pieces: vec![(label.to_owned(), Role::Muted)],
+            size: LABEL_TEXT,
+        },
+        measure,
+    )
 }
 
 /// One piece of a chip's text.
@@ -101,9 +291,10 @@ pub(crate) fn paint(
     });
 
     // Lines, batched by tone.
+    let routes = routes(scene, screen, scale, schema);
     let mut batches: HashMap<Tone, Vec<Segment>> = HashMap::new();
-    let mut loops: Vec<(usize, Tone)> = Vec::new();
-    for edge in &scene.edges {
+    let mut loops: Vec<(usize, usize, Tone)> = Vec::new();
+    for (edge, route) in scene.edges.iter().zip(&routes) {
         let (a, b) = (screen[edge.from], screen[edge.to]);
         if !visible(a, 400.) && !visible(b, 400.) {
             continue;
@@ -154,9 +345,9 @@ pub(crate) fn paint(
             dotted,
         };
         if edge.from == edge.to {
-            loops.push((edge.from, tone));
+            loops.push((edge.from, route.loop_rank, tone));
         } else {
-            batches.entry(tone).or_default().push((a, b));
+            batches.entry(tone).or_default().push((a, b, route.curve));
         }
     }
     window.paint_layer(bounds, |window| {
@@ -167,26 +358,35 @@ pub(crate) fn paint(
                 if tone.dotted {
                     builder = builder.dash_array(&[px(2.), px(3.)]);
                 }
-                for (from, to) in chunk {
+                for (from, to, curve) in chunk {
                     builder.move_to(*from);
-                    builder.line_to(*to);
+                    match curve {
+                        Curve::Straight => builder.line_to(*to),
+                        Curve::Bowed(control) => builder.curve_to(*to, *control),
+                        Curve::Level(first, second) => {
+                            builder.cubic_bezier_to(*to, *first, *second)
+                        }
+                    }
                 }
                 if let Ok(path) = builder.build() {
                     window.paint_path(path, color);
                 }
             }
         }
-        // A relationship from a type to itself: a loop over its chip.
-        for (node, tone) in &loops {
+        // A relationship from a type to itself: a loop over its chip, each further loop on the
+        // same type a size larger.
+        for (node, rank, tone) in &loops {
             let p = screen[*node];
             let s = scale;
-            let spread = 10. * s;
+            let grow = *rank as f32;
+            let spread = (10. + 6. * grow) * s;
+            let height = (60. + LOOP_STEP * grow) * s;
             let mut builder = PathBuilder::stroke(px(1.));
             builder.move_to(point(p.x - px(spread), p.y - px(12. * s)));
             builder.cubic_bezier_to(
                 point(p.x + px(spread), p.y - px(12. * s)),
-                point(p.x - px(30. * s + spread), p.y - px(60. * s)),
-                point(p.x + px(30. * s + spread), p.y - px(60. * s)),
+                point(p.x - px(30. * s + spread), p.y - px(height)),
+                point(p.x + px(30. * s + spread), p.y - px(height)),
             );
             if let Ok(path) = builder.build() {
                 window.paint_path(path, palette.text.opacity(f32::from(tone.alpha) / 1000.));
@@ -194,16 +394,17 @@ pub(crate) fn paint(
         }
     });
 
-    // A small schema names every line up front.
-    if schema && scene.edges.len() <= ALWAYS_LABEL {
-        for edge in &scene.edges {
+    // A small schema names every line up front, under the chips; a larger one names the lines
+    // of the type the pointer is on, over them, so no chip hides a name.
+    let label_all = schema && scene.edges.len() <= ALWAYS_LABEL;
+    let paint_labels = |window: &mut Window, cx: &mut App| {
+        for (edge, route) in scene.edges.iter().zip(&routes) {
             let Some(label) = &edge.label else { continue };
-            let (a, b) = (screen[edge.from], screen[edge.to]);
-            let at = if edge.from == edge.to {
-                point(a.x, a.y - px(50. * scale))
-            } else {
-                point((a.x + b.x) / 2., (a.y + b.y) / 2.)
-            };
+            let touches_hovered = hovered.is_some_and(|h| edge.from == h || edge.to == h);
+            if !label_all && !touches_hovered {
+                continue;
+            }
+            let at = route.label_at;
             if !visible(at, 60.) {
                 continue;
             }
@@ -220,11 +421,11 @@ pub(crate) fn paint(
                 at,
                 &pieces,
                 None,
-                11. * scale.max(0.8),
+                LABEL_TEXT * scale.max(0.8),
                 PillStyle {
-                    fill: palette.card.opacity(0.9 * alpha),
+                    fill: palette.card.opacity(0.95 * alpha),
                     border: palette.border.opacity(alpha),
-                    shadow: false,
+                    shadow: !label_all,
                     ring: None,
                 },
                 palette,
@@ -232,6 +433,9 @@ pub(crate) fn paint(
                 cx,
             );
         }
+    };
+    if label_all {
+        paint_labels(window, cx);
     }
 
     // Chips.
@@ -249,8 +453,14 @@ pub(crate) fn paint(
         let dim = near.as_ref().is_some_and(|n| !n.contains(&index));
         let alpha = if dim { 0.3 } else { 1. };
         let root = matches!(node.kind, SceneKind::Node { root: true, .. });
-        // From afar a node is its mark alone, and a closed hub a dot on its line.
-        if text_size < MARK_ONLY_BELOW && !focus && !pointed && !root {
+        // From afar a node is its mark alone, and a closed hub a dot on its line. A type keeps
+        // its name further out: an ontology has few, and their names are the point.
+        let mark_only_below = if matches!(node.kind, SceneKind::Type { .. }) {
+            TYPE_MARK_ONLY_BELOW
+        } else {
+            MARK_ONLY_BELOW
+        };
+        if text_size < mark_only_below && !focus && !pointed && !root {
             rects[index] = match node.kind {
                 SceneKind::Hub { .. } | SceneKind::More { .. } => {
                     paint_dot(p, 4., palette.text.opacity(0.25 * alpha), window)
@@ -269,65 +479,22 @@ pub(crate) fn paint(
             continue;
         }
         let tint = type_color(&node.color_key);
-        let (mark, pieces): (Option<Hsla>, Vec<Piece>) = match &node.kind {
-            SceneKind::Type { count } => (
-                Some(tint),
-                std::iter::once(Piece {
-                    text: node.label.clone(),
-                    color: palette.text.opacity(alpha),
-                    weight: FontWeight::MEDIUM,
-                })
-                .chain(count.map(|count| Piece {
-                    text: format_count(count),
-                    color: palette.muted.opacity(alpha),
-                    weight: FontWeight::NORMAL,
-                }))
-                .collect(),
-            ),
-            SceneKind::Node { root, .. } => (
-                Some(tint),
-                vec![Piece {
-                    text: truncate(&node.label, 32),
-                    color: palette.text.opacity(alpha),
-                    weight: if *root {
-                        FontWeight::MEDIUM
-                    } else {
-                        FontWeight::NORMAL
-                    },
-                }],
-            ),
-            SceneKind::Hub { open, .. } => {
-                let (name, count) = match node.label.rsplit_once(" · ") {
-                    Some((name, count)) => (name.to_owned(), Some(count.to_owned())),
-                    None => (node.label.clone(), None),
-                };
-                let color = if *open { palette.text } else { palette.muted };
-                (
-                    None,
-                    std::iter::once(Piece {
-                        text: name,
-                        color: color.opacity(alpha),
-                        weight: FontWeight::NORMAL,
-                    })
-                    .chain(count.map(|count| Piece {
-                        text: count,
-                        color: palette.muted.opacity(alpha),
-                        weight: FontWeight::NORMAL,
-                    }))
-                    .collect(),
-                )
-            }
-            SceneKind::More { .. } => (
-                None,
-                vec![Piece {
-                    text: node.label.clone(),
-                    color: palette.muted.opacity(alpha),
-                    weight: FontWeight::NORMAL,
-                }],
-            ),
-        };
-        let hub_size = matches!(node.kind, SceneKind::Hub { .. } | SceneKind::More { .. });
-        let size = if hub_size { 12.5 * scale } else { text_size };
+        let text = chip_text(node);
+        let mark = text.mark.then_some(tint);
+        let pieces: Vec<Piece> = text
+            .pieces
+            .iter()
+            .map(|(text, role)| Piece {
+                text: text.clone(),
+                color: match role {
+                    Role::Name | Role::RootName | Role::OpenHub => palette.text,
+                    Role::Count | Role::Muted => palette.muted,
+                }
+                .opacity(alpha),
+                weight: role.weight(),
+            })
+            .collect();
+        let size = text.size * scale;
         let border = if focus {
             gpui::rgb(WARM).into()
         } else if pointed {
@@ -350,6 +517,10 @@ pub(crate) fn paint(
             window,
             cx,
         );
+    }
+    drop(rects);
+    if schema && !label_all {
+        paint_labels(window, cx);
     }
 }
 
@@ -420,11 +591,11 @@ fn paint_pill(
             )
         })
         .collect();
-    let gap = 6. * s;
-    let pad_x = 10. * s;
+    let gap = PILL_GAP * s;
+    let pad_x = PILL_PAD_X * s;
     let line_height = text_size * 1.4;
     let height = line_height + 8. * s;
-    let mark_size = 16. * s;
+    let mark_size = PILL_MARK * s;
     let text_width: f32 = lines.iter().map(|l| f32::from(l.width)).sum::<f32>()
         + gap * lines.len().saturating_sub(1) as f32;
     let width = pad_x * 2. + text_width + if mark.is_some() { mark_size + gap } else { 0. };

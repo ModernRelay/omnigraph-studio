@@ -157,6 +157,9 @@ fn main() {
     );
     cx.allow_parking();
     cx.update(studio::init);
+    // A headless window gets no animation frames, so a glide would be captured at its first
+    // frame: snapshots are stills, taken with motion reduced.
+    cx.update(|cx| cx.set_reduce_motion(true));
     let window = cx
         .open_window(size(px(width), px(height)), studio::build_workspace)
         .expect("open the snapshot window");

@@ -28,8 +28,9 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 
 ## Design
 
-- **Landing:** the schema graph (types as nodes, edge types as lines) laid out by type names
-  only, with counts from `/snapshot` added after layout. Hovering a type highlights its edges.
+- **Landing:** the ontology (types as nodes, edge types as lines), laid out from the schema
+  alone, with counts from `/snapshot` added after layout. Hovering a type highlights its edges
+  and, on an ontology too large to label every line, names them over the chips.
 - **Exploring:** expanding a node adds one hub per relationship group with its count; opening a
   hub adds 8 neighbours, then "+K more". State lives in `Exploration`, shared with the tree.
 - **Rendering:** one custom element. Nodes as quads with labels shown above a zoom threshold;
@@ -72,7 +73,9 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 |---|---|---|---|
 | 2026-10-11 | Layout and edge costs at 1k/10k/50k | research benchmark on this Mac | 2.2/34/254 ms per layout step; 0.14/1.3/8 ms edges per frame |
 | pending | Pan and zoom p95 < 16 ms at 10k nodes, 30k edges | spike S2 | |
-| 2026-10-12 | Schema landing: types on a circle by sorted name, sized by `/snapshot` counts, one arrowed line per edge type, self-loops | offscreen snapshot, `OpenCanvas`, dev graph | Company 25, Person 200, Project 40; Knows drawn as a loop on Person |
+| 2026-10-12 | Schema landing: types on a circle by sorted name, sized by `/snapshot` counts, one arrowed line per edge type, self-loops | offscreen snapshot, `OpenCanvas`, dev graph | Company 25, Person 200, Project 40; Knows drawn as a loop on Person (superseded by the stress layout below) |
+| 2026-10-12 | The ontology reads as a map | `layout` tests (determinism, no overlaps, related types nearer than unrelated by 1.5×, hubs central, landscape, fewer crossings and shorter edges than a ring, unrelated types beside, placed types fixed); a CRM ontology (25 types, 78 relationships) measured locally; the app on that graph | Ring 668 crossings / 78.7k px edges; map 117 / 26.5k; fit shows every type named |
+| 2026-10-12 | The explorer is a compact mind map | `layout` tests (hubs split across the root's sides, neighbours in one column beyond their hub within a chip and a gap, rectangle overlap, drawn columns grow at the bottom with "+K more" last); offscreen snapshots of Goldwasser Labs → WorksAt → Ivan Hopper expanded | One aligned column of nine people and "+1 more"; Ivan's four hubs in a column beside him; nothing drawn moved |
 | 2026-10-12 | Exploring shares the tree's `Exploration`: hubs per group with counts, 8 neighbours then "+K more", each node drawn once, selection mirrored | snapshot Company `company-00000` with 103 incoming `WorksAt` | "← WorksAt · 103", eight people, "+95 more"; the tree's selected row is the ringed node |
 | 2026-10-12 | Canvas actions change the shared state | snapshot: tree `ShowOnCanvas` (G) on Frances Lovelace, then `canvas::ExpandNode` | Frances gets four hubs on the canvas and is expanded in the tree |
 | 2026-10-12 | Layout off the main thread is deterministic, keeps drawn nodes in place, and bounds cost at the cap | `cargo test -p graph_canvas` (`layout::tests`) | 1,999 nodes in 464 ms in an unoptimized debug build, Apple M5 Pro; same input gives the same positions |
@@ -84,10 +87,34 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 
 ## Corrections
 
-- **Layout.** A deterministic radial seed (each node fanned away from where the walk came from)
-  plus 60 iterations of grid-based overlap relaxation, on `cx.background_spawn`; not `fjadra`.
-  Nodes already drawn never move, so expanding does not reshuffle the view. Revisit with spike
-  S2 if larger neighbourhoods need a force layout.
+- **Ontology layout (2026-10-12).** Types on a circle by name gave position no meaning: on a
+  25-type, 78-relationship CRM ontology it drew 668 crossings. The ontology is now laid out by
+  stress majorization (Gansner, Koren and North 2004; Graphviz neato's model): every pair of
+  types as far apart as their graph distance, so related types sit together and hubs in the
+  middle, from a classical-MDS start (deterministic). Each relationship is as long as its two
+  chips and, when every label is shown (16 or fewer), its label. Several relationships between
+  two types pull them closer. Chips are pushed apart until none overlap, a squarish map is
+  widened towards 16:10 (at most 1.4×), and types with no relationship stand in columns beside
+  it. Placed types anchor the rest. On the CRM ontology: 117 crossings, a third of the edge
+  length, about 9 ms. Widths are measured with the UI font from the chip's own text
+  (`paint::chip_text`), with room for a six-digit count, so a count never moves a type.
+  Several relationships between the same two types fan out as bowed lines with their own
+  labels; several loops on one type nest.
+- **Explorer layout (2026-10-12).** Radial rings put neighbours ~450 px from their node: chips
+  are wide and short, and a ring spaces them by width. The explorer is now a mind map: a node's
+  hubs stand in a column beside it (a root's split across both sides), a hub's neighbours in a
+  column beyond it, each further step outward on the same side, columns aligned on their near
+  edge and as tall as what hangs off them; branches are curves leaving and arriving level.
+  About a third of the old distances. Drawn nodes never move; new members join the bottom of a
+  drawn column, and "+K more" ends its column. Overlap relaxation treats chips as rectangles.
+- **Motion (2026-10-12).** `studio_ui::motion` (after `gpui-animation`'s design: easing curves,
+  `Lerp`, a retargetable `Tween`; no registry or tick thread, a view asks for frames while a
+  tween runs). New nodes grow out of the node they hang off and a reset glides nodes to their
+  new places (220 ms, ease-out); Fit, F, zoom buttons and centring glide the camera (ease
+  in-out, zoom on a log scale). Wheel, pinch and drags are immediate and stop a glide where it
+  is. Off when the system asks for reduced motion (and in offscreen snapshots).
+- **Fit** waits for the canvas's own bounds and fits again when they change (a dock opening),
+  until the person moves the view by hand; Fit hands the camera back to fitting.
 - **Hit-testing** is a linear scan over at most the node cap (2,000 by default), not an
   R-tree.
 - **Hub labels** sit between the hub and its node, on a backdrop, so they never cover the fan
