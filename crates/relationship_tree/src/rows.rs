@@ -197,6 +197,19 @@ pub fn edge_summary(edge: &[(String, Value)]) -> String {
         .join(" · ")
 }
 
+/// The first edge property as a short hint at the end of a row, when it fits whole
+/// (`role lead`); none when it would be cut.
+pub fn edge_hint(edge: &[(String, Value)]) -> Option<String> {
+    const LONGEST: usize = 18;
+    let (name, value) = edge.first()?;
+    let value = match value {
+        Value::String(text) => text.clone(),
+        other => studio_ui::format_value(other),
+    };
+    let hint = format!("{name} {value}");
+    (hint.chars().count() <= LONGEST).then_some(hint)
+}
+
 /// A grouping value as its row shows it: text as written, other values formatted, and
 /// "No value" for neighbours without one.
 pub fn bucket_text(value: &BucketValue) -> String {
@@ -404,6 +417,19 @@ mod tests {
             "role lead · hours 12"
         );
         assert_eq!(more_label(50, Some(418), 50), "Show 50 more of 368");
+        assert_eq!(
+            edge_hint(&[("role".into(), json!("lead")), ("hours".into(), json!(12))]),
+            Some("role lead".into())
+        );
+        assert_eq!(
+            edge_hint(&[("since".into(), json!("2021-01-02"))]),
+            Some("since 2021-01-02".into())
+        );
+        assert_eq!(
+            edge_hint(&[("note".into(), json!("a longer note here"))]),
+            None
+        );
+        assert_eq!(edge_hint(&[]), None);
         assert_eq!(more_label(50, Some(60), 50), "Show 10 more of 10");
         assert_eq!(more_label(50, None, 50), "Show 50 more");
         assert_eq!(more_label(20, Some(418), 20), "Show 20 more of 398");

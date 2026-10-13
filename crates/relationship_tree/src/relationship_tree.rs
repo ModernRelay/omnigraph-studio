@@ -42,7 +42,7 @@ pub use rows::{RowId, RowTag};
 
 /// The tree's panel id in the left dock.
 const EXPLORE_PANEL: &str = "explore";
-const ROW_HEIGHT: f32 = 24.;
+const ROW_HEIGHT: f32 = studio_ui::ds::size::SIDEBAR_ROW;
 const INDENT: f32 = 12.;
 const LEFT_PAD: f32 = 8.;
 const DISCLOSURE: f32 = 12.;
@@ -64,6 +64,8 @@ pub fn init(cx: &mut App) {
             tree.clone().into(),
             cx,
         );
+        let actions = cx.new(|cx| ExploreActions::new(&tree, cx));
+        workspace.set_panel_actions(EXPLORE_PANEL, actions.into(), cx);
         workspace.register_action(move |workspace, action: &OpenNode, window, cx| {
             if let Some(session) = workspace.session().cloned() {
                 workspace.activate_panel(EXPLORE_PANEL, cx);
@@ -650,42 +652,45 @@ impl RelationshipTree {
 
         let content: AnyElement = match &entry.kind {
             EntryKind::Node { node, via, .. } => {
+                let root = entry.path.is_root();
                 let label = state.label(node).map(str::to_owned);
-                let edge = via
-                    .as_ref()
-                    .map(|via| rows::edge_summary(&via.edge))
-                    .filter(|summary| !summary.is_empty());
+                // The key shows on the root and the selected row; elsewhere the tooltip has it.
+                let key = (label.is_some() && (root || selected)).then(|| node.id.clone());
+                // One short edge value, right-aligned like a count; the tooltip has them all.
+                let hint = via.as_ref().and_then(|via| rows::edge_hint(&via.edge));
                 h_flex()
                     .min_w_0()
                     .flex_1()
                     .gap_1p5()
-                    .child(type_swatch(&node.type_name))
+                    // The root carries the type's mark; below it a dot, since each
+                    // relationship already names the type it leads to.
+                    .child(if root {
+                        type_swatch(&node.type_name)
+                    } else {
+                        studio_ui::ds::type_dot(&node.type_name)
+                    })
                     .child(
-                        // The label keeps its width first; the key and edge properties give
-                        // way, and the key keeps its distinctive end.
-                        div().min_w_0().flex_shrink_0().max_w(rems(9.)).child(
-                            Label::new(label.clone().unwrap_or_else(|| node.id.clone()))
+                        div().min_w_0().flex_shrink(1.).child(
+                            Label::new(label.unwrap_or_else(|| node.id.clone()))
                                 .size(LabelSize::Small)
+                                .when(root, |label| label.weight(gpui::FontWeight::MEDIUM))
                                 .truncate(),
                         ),
                     )
-                    .when(label.is_some(), |d| {
-                        d.child(
-                            div().min_w(rems(2.5)).flex_shrink(1.).child(
-                                Label::new(node.id.clone())
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .truncate_start(),
-                            ),
-                        )
-                    })
-                    .children(edge.map(|edge| {
-                        div().min_w_0().flex_shrink(1.).child(
-                            Label::new(edge)
+                    .children(key.map(|key| {
+                        div().min_w(rems(2.5)).flex_shrink(1.).child(
+                            Label::new(key)
                                 .size(LabelSize::XSmall)
-                                .color(Color::Disabled)
-                                .truncate(),
+                                .color(Color::Muted)
+                                .truncate_start(),
                         )
+                    }))
+                    .child(div().flex_1())
+                    .children(hint.map(|hint| {
+                        Label::new(hint)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .single_line()
                     }))
                     .into_any_element()
             }
@@ -776,7 +781,6 @@ impl RelationshipTree {
                                 .truncate(),
                         ),
                     )
-                    .child(type_swatch(&key.group.other_type).when(empty, |d| d.opacity(0.4)))
                     .child(
                         div().min_w_0().flex_shrink(1.).child(
                             Label::new(key.group.other_type.clone())
@@ -907,8 +911,13 @@ impl RelationshipTree {
         };
 
         let tooltip = match &entry.kind {
-            EntryKind::Node { via: Some(via), .. } if !via.edge.is_empty() => {
-                Some(SharedString::from(rows::edge_summary(&via.edge)))
+            EntryKind::Node { node, via, .. } => {
+                let mut text = format!("{} · {}", node.type_name, node.id);
+                if let Some(via) = via.as_ref().filter(|via| !via.edge.is_empty()) {
+                    text.push('\n');
+                    text.push_str(&rows::edge_summary(&via.edge));
+                }
+                Some(SharedString::from(text))
             }
             _ => None,
         };
@@ -1069,66 +1078,28 @@ impl RelationshipTree {
             .collect();
         state.root.as_ref()?;
         let filter = self.filter.clone();
-        let hide_empty = self.hide_empty;
-        // The toggle shows only when it changes something: an empty group, or hiding on.
-        let any_empty = self.entries.iter().any(|entry| {
-            matches!(
-                entry.kind,
-                EntryKind::Group {
-                    count: Loadable::Loaded(0),
-                    ..
-                }
-            )
-        });
-        if breadcrumb.is_empty() && !newer && filter.is_empty() && !hide_empty && !any_empty {
+        if breadcrumb.is_empty() && !newer && filter.is_empty() {
             return None;
         }
-        let toggle = IconButton::new(
-            "toggle-empty-groups",
-            if hide_empty {
-                IconName::EyeOff
-            } else {
-                IconName::Eye
-            },
-        )
-        .icon_size(IconSize::XSmall)
-        .toggle_state(hide_empty)
-        .tooltip(move |_, cx| {
-            Tooltip::for_action(
-                if hide_empty {
-                    "Show relationships with none"
-                } else {
-                    "Hide relationships with none"
-                },
-                &ToggleEmptyGroups,
-                cx,
-            )
-        })
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.toggle_empty_groups(&ToggleEmptyGroups, window, cx)
-        }));
+        let field = studio_ui::ds::surface::sunken(cx);
         Some(
             v_flex()
                 .px_2()
                 .pb_1()
                 .gap_1()
-                .child(
-                    h_flex()
-                        .gap_0p5()
-                        .child(
-                            h_flex().flex_1().min_w_0().flex_wrap().gap_0p5().children(
-                            breadcrumb.into_iter().map(|(index, text)| {
-                                studio_ui::ds::button(("crumb", index), format!("{text} ›"))
-                                    .label_size(LabelSize::XSmall)
-                                    .style(ButtonStyle::Subtle)
-                                    .tooltip(Tooltip::text("Explore from here again"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.with_exploration(cx, |e, cx| e.back_to(index, cx));
-                                    }))
-                            }),
-                        ))
-                        .when(hide_empty || any_empty, |row| row.child(toggle)),
-                )
+                .when(!breadcrumb.is_empty(), |d| {
+                    d.child(h_flex().min_w_0().flex_wrap().gap_0p5().children(
+                        breadcrumb.into_iter().map(|(index, text)| {
+                            studio_ui::ds::button(("crumb", index), format!("{text} ›"))
+                                .label_size(LabelSize::XSmall)
+                                .style(ButtonStyle::Subtle)
+                                .tooltip(Tooltip::text("Explore from here again"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.with_exploration(cx, |e, cx| e.back_to(index, cx));
+                                }))
+                        }),
+                    ))
+                })
                 .when(newer, |d| {
                     d.child(
                         studio_ui::ds::button("newer", "Newer data · Refresh")
@@ -1142,18 +1113,29 @@ impl RelationshipTree {
                             })),
                     )
                 })
+                // What is typed filters the rows; it reads as a field so it is not taken for
+                // a row.
                 .when(!filter.is_empty(), |d| {
                     d.child(
                         h_flex()
-                            .gap_1()
+                            .h(px(ROW_HEIGHT))
+                            .px_2()
+                            .gap_1p5()
+                            .rounded_md()
+                            .bg(field)
                             .child(
                                 Icon::new(IconName::MagnifyingGlass)
                                     .size(IconSize::XSmall)
                                     .color(Color::Muted),
                             )
-                            .child(Label::new(filter).size(LabelSize::XSmall))
                             .child(
-                                Label::new("esc clears")
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .child(Label::new(filter).size(LabelSize::Small).truncate()),
+                            )
+                            .child(
+                                Label::new("esc")
                                     .size(LabelSize::XSmall)
                                     .color(Color::Disabled),
                             ),
@@ -1161,6 +1143,28 @@ impl RelationshipTree {
                 })
                 .into_any_element(),
         )
+    }
+
+    /// Whether some relationship group shown has no relationships.
+    fn has_empty_groups(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(
+                entry.kind,
+                EntryKind::Group {
+                    count: Loadable::Loaded(0),
+                    ..
+                }
+            )
+        })
+    }
+
+    /// Closes everything below the root.
+    fn collapse_to_root(&mut self, cx: &mut Context<Self>) {
+        let root = graph_store::ExplorePath::root();
+        self.with_exploration(cx, |e, cx| {
+            e.collapse_subtree(&root, cx);
+            e.expand(&root, cx);
+        });
     }
 
     fn render_list(
@@ -1287,5 +1291,88 @@ impl Render for RelationshipTree {
         let height = (window.viewport_size().height - chrome).max(px(200.));
         let list = self.render_list(height, window, cx);
         root.children(header).child(list).into_any_element()
+    }
+}
+
+/// The Explore panel's title-row actions: hide relationships with none, and close everything
+/// below the root.
+pub struct ExploreActions {
+    tree: gpui::WeakEntity<RelationshipTree>,
+    _observe: Subscription,
+}
+
+impl ExploreActions {
+    fn new(tree: &Entity<RelationshipTree>, cx: &mut Context<Self>) -> Self {
+        Self {
+            tree: tree.downgrade(),
+            _observe: cx.observe(tree, |_, _, cx| cx.notify()),
+        }
+    }
+}
+
+impl Render for ExploreActions {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(tree) = self.tree.upgrade() else {
+            return h_flex();
+        };
+        let (rooted, hide_empty, any_empty) = {
+            let tree = tree.read(cx);
+            (
+                tree.exploration
+                    .as_ref()
+                    .is_some_and(|e| e.read(cx).root().is_some()),
+                tree.hide_empty,
+                tree.has_empty_groups(),
+            )
+        };
+        let weak = self.tree.clone();
+        h_flex()
+            .gap_0p5()
+            // The toggle shows only when it changes something: an empty group, or hiding on.
+            .when(hide_empty || any_empty, |row| {
+                let tree = weak.clone();
+                row.child(
+                    IconButton::new(
+                        "toggle-empty-groups",
+                        if hide_empty {
+                            IconName::EyeOff
+                        } else {
+                            IconName::Eye
+                        },
+                    )
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .toggle_state(hide_empty)
+                    .tooltip(move |_, cx| {
+                        Tooltip::for_action(
+                            if hide_empty {
+                                "Show relationships with none"
+                            } else {
+                                "Hide relationships with none"
+                            },
+                            &ToggleEmptyGroups,
+                            cx,
+                        )
+                    })
+                    .on_click(move |_, window, cx| {
+                        tree.update(cx, |tree, cx| {
+                            tree.toggle_empty_groups(&ToggleEmptyGroups, window, cx)
+                        })
+                        .ok();
+                    }),
+                )
+            })
+            .when(rooted, |row| {
+                let tree = weak.clone();
+                row.child(
+                    IconButton::new("collapse-to-root", IconName::ListCollapse)
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Collapse all"))
+                        .on_click(move |_, _, cx| {
+                            tree.update(cx, |tree, cx| tree.collapse_to_root(cx)).ok();
+                        }),
+                )
+            })
     }
 }

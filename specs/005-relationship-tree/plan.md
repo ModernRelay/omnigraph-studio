@@ -30,14 +30,19 @@ II (the tree reads one commit), V (rows do not jump), VIII (keyboard), IX (paged
 
 | Row | Shows | Opens to |
 |---|---|---|
-| Node | type color dot, label property, key; in review mode `+ ~ −` | its relationship groups |
-| Relationship group | `→` or `←`, edge name, other type, count; zero-count groups dimmed or hidden (toggle) | neighbour nodes, 50 at a time |
+| Node | type colour dot, label property; one short edge value at the end ("role lead") when it fits whole; the key on the root and the selected row; in review mode `+ ~ −` | its relationship groups |
+| Relationship group | `→` or `←`, edge name, other type (muted), count; zero-count groups dimmed or hidden (toggle) | neighbour nodes, 50 at a time |
 | Field | an edge with cardinality at most one, shown on its node as `manager → Charles` | nothing (Enter follows it) |
 | Value | one value of the property the group is grouped by, and how many neighbours have it; "No value" last | the neighbours with that value, paged like a group |
 | More | "Show 50 more of 418 · Filter…" | the next page; a filter box appears above 50 |
 | Cycle | a node already on its own path, "↺ already above" | Enter jumps to the ancestor |
 
-Edge properties appear muted on the neighbour row ("since 2021"); hover shows all of them.
+Edge properties: the first one shows at the end of the neighbour row when it fits whole
+("hours 291"); hover shows the type, key and all of them. Only the root carries a lettered type
+mark: each relationship already names the type it leads to, so its nodes carry a small dot in
+the type's colour. Rows are the sidebar row height (`ds::size::SIDEBAR_ROW`, 26 px). The
+panel's title row holds its actions: hide relationships with none (shown when some are empty)
+and Collapse all. Typed filter text shows as a field above the rows, with `esc` to clear.
 
 ### Keys (context `Tree`)
 
@@ -111,6 +116,7 @@ on the canvas. Typing filters the visible rows.
 | 2026-10-12 | Flattening, cycle detection, filtering with ancestors, paging state | `cargo test -p graph_store -p relationship_tree` | 9 + 4 unit tests pass |
 | 2026-10-12 | ⌘↵ on a group opens the related table | offscreen snapshot: `OpenNode` person-000000, ↓, ⌘↵ | The left dock switched to Explore; Project opened with "← contributes person-000000", 1 of 40 (project-00036, as the tree shows) |
 | 2026-10-12 | Group search reads the server | `gq_language` `relationship_queries_compile_in_both_directions` with a search; `rows` tests keep the "Show more" row under a kept group and hide empty groups | Pass |
+| 2026-10-12 | A calmer tree: one type mark, names first, no clipped text | offscreen snapshots before and after: Radia Knuth with every group open, Sammet Systems three levels deep, and filtering by "ed" | Before: a lettered badge on every row, keys and edge properties cut mid-word ("…t-00036 hours…"), the eye toggle and the filter on two loose lines. After: dots, labels, "hours 291" and "role lead" at the row ends, the key only on the selected root, one filter field, actions in the title row |
 | 2026-10-12 | Grouped counts by a node or edge property, nulls as their own group | HTTP probe on the dev server: `company-00000`'s ← WorksAt by `$m.title` and by `$e.role`, `person-000000`'s Knows by `$m.born` | Rows such as `{"value": "Engineer", "n": 2}`; neighbours without a value come back as one row with no `value` |
 | 2026-10-12 | Group by: values with counts, a value opens to its neighbours, "No value" last; ending it closes the values and keeps the selection on the group | `gq_language` `neighbours_group_by_a_property_of_either_end_and_narrow_to_one_value` (every choice of every dev relationship compiles, with and without a value); `graph_store` `a_grouped_relationship_lists_its_values_and_each_opens_to_its_neighbours`; offscreen snapshots: Sammet Systems → ← WorksAt → group-by menu → title, then the canvas | Menu: No grouping, Person (name, title, email, born), WorksAt (role, since). Rows: Engineer 2, Designer 1, Manager 1, Researcher 1, No value 2; Engineer and Designer opened to their people; the canvas hub showed the three open people and "+4 more" |
 

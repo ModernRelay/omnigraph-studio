@@ -239,6 +239,24 @@ pub enum Status {
 }
 
 /// A status dot.
+/// A node type's colour as a small dot, centred in the width of a type mark so rows with
+/// either line up: for rows whose context already names the type, where a lettered mark would
+/// repeat it.
+pub fn type_dot(type_name: &str) -> Div {
+    div()
+        .size(px(16.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .size(px(7.))
+                .rounded_full()
+                .bg(studio_theme::type_color(type_name)),
+        )
+}
+
 pub fn status_dot(status: Status) -> Div {
     div()
         .size(px(7.))
