@@ -27,6 +27,7 @@ use serde_json::Value;
 use studio_actions::table::{
     AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyCell, DeleteRow, EditCell, ExploreRow,
     FilterBySelection, InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp, PeekRow, RefreshTable,
+    SaveDrafts, StageEdit,
 };
 use studio_ui::ROW_HEIGHT;
 use studio_workspace::{
@@ -83,6 +84,26 @@ struct FilterDraft {
     property: String,
     op: FilterOp,
     error: Option<String>,
+}
+
+/// The table's drafts as a whole: whether they are being saved, what came of the last try,
+/// and whether Discard is waiting for its second click.
+#[derive(Default)]
+struct DraftsBar {
+    saving: bool,
+    notice: Option<Notice>,
+    confirm_discard: bool,
+}
+
+/// One draft being saved: the cell, the value it showed (the save is bound to it), the new
+/// value, and the text to put back if the save does not land.
+#[derive(Debug, Clone)]
+struct DraftEdit {
+    row_id: String,
+    column: String,
+    old: Value,
+    new: Value,
+    text: String,
 }
 
 /// A bulk set being written: the property, and what came of the last try.
@@ -166,6 +187,7 @@ pub struct TypeTable {
     selection_anchor: Option<usize>,
     bulk: BulkDraft,
     bulk_editor: Entity<Editor>,
+    drafts: DraftsBar,
     cursor: Option<Cursor>,
     editing: Option<Editing>,
     cell_editor: Entity<Editor>,
@@ -359,6 +381,7 @@ impl TypeTable {
             selection: Vec::new(),
             selection_anchor: None,
             bulk: BulkDraft::default(),
+            drafts: DraftsBar::default(),
             bulk_editor,
             cursor: None,
             editing: None,
@@ -1725,6 +1748,9 @@ impl TypeTable {
         window.focus(&self.focus_handle, cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
+        // The footer's key hints read the bindings of the frame drawn before, which still had
+        // the editor focused; draw once more so they show the table's keys again.
+        cx.on_next_frame(window, |_, window, _| window.refresh());
     }
 
     fn property_of(&self, column: &str) -> Option<Property> {
@@ -1852,6 +1878,463 @@ impl TypeTable {
         }
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
+    }
+
+    /// ⌥↵: keeps the open edit as a draft on its cell, to save with the others in one commit.
+    /// Returns false when the text does not parse, leaving the editor open with the reason.
+    fn stage_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(editing) = self.editing.as_ref() else {
+            return true;
+        };
+        let key = (editing.row_id.clone(), editing.column.clone());
+        let old = editing.old.clone();
+        let Some(property) = self.property_of(&key.1) else {
+            self.finish_editing(window, cx);
+            return true;
+        };
+        let text = self.cell_editor.read(cx).text(cx);
+        match parse_input(&property, &text) {
+            Err(message) => {
+                if let Some(editing) = &mut self.editing {
+                    editing.notice = Some(Notice::new(Tone::Invalid, message));
+                }
+                cx.notify();
+                return false;
+            }
+            Ok(new) if same_value(&new, &old) => {
+                self.cells.remove(&key);
+            }
+            Ok(_) => {
+                self.cells
+                    .insert(key, CellState::Draft { text, notice: None });
+                self.drafts.confirm_discard = false;
+            }
+        }
+        self.finish_editing(window, cx);
+        true
+    }
+
+    /// The cells holding a draft, in table order: row, then column.
+    fn draft_keys(&self) -> Vec<(String, String)> {
+        let mut keys: Vec<(String, String)> = self
+            .cells
+            .iter()
+            .filter(|(_, state)| matches!(state, CellState::Draft { .. }))
+            .map(|(key, _)| key.clone())
+            .collect();
+        keys.sort_by_key(|(row, column)| {
+            (
+                self.row_index(row).unwrap_or(usize::MAX),
+                self.column_index(column).unwrap_or(usize::MAX),
+            )
+        });
+        keys
+    }
+
+    /// ⌘S: saves every draft as one mutation of one statement per row, each bound to the values
+    /// the row shows, so one commit. A draft that does not parse opens instead, and nothing is
+    /// sent.
+    fn save_drafts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.drafts.saving || self.kind != TableKind::Node || self.at_commit.is_some() {
+            return;
+        }
+        if self.editing.is_some() && !self.stage_edit(window, cx) {
+            return;
+        }
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        let mut edits = Vec::new();
+        let mut unseen = 0;
+        for key in self.draft_keys() {
+            let Some(CellState::Draft { text, .. }) = self.cells.get(&key).cloned() else {
+                continue;
+            };
+            let (Some(row), Some(col), Some(property)) = (
+                self.row_index(&key.0),
+                self.column_index(&key.1),
+                self.property_of(&key.1),
+            ) else {
+                unseen += 1;
+                continue;
+            };
+            let old = self.rows[row].value(&key.1).clone();
+            match parse_input(&property, &text) {
+                Err(message) => {
+                    self.cells.insert(
+                        key,
+                        CellState::Draft {
+                            text,
+                            notice: Some(Notice::new(Tone::Invalid, message)),
+                        },
+                    );
+                    let cursor = Cursor { row, col };
+                    self.set_cursor(cursor, window, cx);
+                    self.start_edit(cursor, window, cx);
+                    return;
+                }
+                Ok(new) if same_value(&new, &old) => {
+                    self.cells.remove(&key);
+                }
+                Ok(new) => edits.push(DraftEdit {
+                    row_id: key.0,
+                    column: key.1,
+                    old,
+                    new,
+                    text,
+                }),
+            }
+        }
+        self.drafts.confirm_discard = false;
+        self.drafts.notice = (unseen > 0).then(|| {
+            Notice::new(
+                Tone::Conflict,
+                format!("{unseen} drafts are on rows the table no longer shows; they wait."),
+            )
+        });
+        if edits.is_empty() {
+            cx.emit(ItemEvent::UpdateTab);
+            cx.notify();
+            return;
+        }
+        let mut rows: Vec<builder::RowEdit> = Vec::new();
+        for edit in &edits {
+            let cell = (edit.column.clone(), edit.old.clone(), edit.new.clone());
+            match rows.iter_mut().find(|row| row.id == edit.row_id) {
+                Some(row) => row.cells.push(cell),
+                None => rows.push(builder::RowEdit {
+                    id: edit.row_id.clone(),
+                    cells: vec![cell],
+                }),
+            }
+        }
+        let query = match builder::update_rows(&schema, &self.type_name, &rows) {
+            Ok(query) => query,
+            Err(error) => {
+                self.drafts.notice = Some(Notice::new(Tone::Invalid, error.to_string()));
+                cx.notify();
+                return;
+            }
+        };
+        // Show the new values with an amber dot while the save is out.
+        for edit in &edits {
+            if let Some(ix) = self.row_index(&edit.row_id) {
+                set_value(&mut self.rows[ix], &edit.column, edit.new.clone());
+            }
+            self.cells.insert(
+                (edit.row_id.clone(), edit.column.clone()),
+                CellState::Saving,
+            );
+        }
+        let description = format!(
+            "Save {} on {} {} {}",
+            plural(edits.len(), "change", "changes"),
+            rows.len(),
+            self.type_name,
+            if rows.len() == 1 { "row" } else { "rows" },
+        );
+        let write = self.session.update(cx, |session, cx| {
+            session.write(&query, None, description, cx)
+        });
+        self.drafts.saving = true;
+        self.saves_in_flight += 1;
+        cx.notify();
+        let branch = self.branch.clone();
+        let row_count = rows.len();
+        // Detached: a write is never cancelled by closing the tab.
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = write.await;
+            this.update_in(cx, |this, window, cx| {
+                this.finish_drafts(outcome, row_count, edits, &branch, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn finish_drafts(
+        &mut self,
+        outcome: graph_client::WriteOutcome<graph_client::api::ChangeOutput>,
+        row_count: usize,
+        edits: Vec<DraftEdit>,
+        branch: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.saves_in_flight = self.saves_in_flight.saturating_sub(1);
+        self.drafts.saving = false;
+        match &outcome {
+            graph_client::WriteOutcome::Committed(output) => {
+                if let Some(commit) = output.commit.as_ref()
+                    && self.paging.advance_for_own_commit(
+                        commit.parent_commit_id.as_deref(),
+                        &commit.graph_commit_id,
+                    )
+                {
+                    self.newer = true;
+                }
+                let changed = output.affected_nodes as usize;
+                if output.commit.is_some() && changed == row_count {
+                    for edit in &edits {
+                        self.cells
+                            .remove(&(edit.row_id.clone(), edit.column.clone()));
+                    }
+                    self.refresh_dimmed(&edits);
+                } else {
+                    // A row whose shown values changed elsewhere was left alone, whole. Read
+                    // the rows at the head to tell which drafts landed.
+                    let left = row_count.saturating_sub(changed);
+                    self.drafts.notice = Some(Notice::new(
+                        Tone::Conflict,
+                        format!(
+                            "{} changed elsewhere; {} kept",
+                            plural(left, "row", "rows"),
+                            if left == 1 {
+                                "its drafts are"
+                            } else {
+                                "their drafts are"
+                            },
+                        ),
+                    ));
+                    self.reread_drafts(edits, window, cx);
+                }
+            }
+            _ => {
+                if let SaveResult::Refused(notice) | SaveResult::Unknown(notice) =
+                    save_result(&outcome, branch)
+                {
+                    for edit in edits {
+                        if let Some(ix) = self.row_index(&edit.row_id) {
+                            set_value(&mut self.rows[ix], &edit.column, edit.old);
+                        }
+                        self.cells.insert(
+                            (edit.row_id, edit.column),
+                            CellState::Draft {
+                                text: edit.text,
+                                notice: Some(notice.clone()),
+                            },
+                        );
+                    }
+                    self.drafts.notice = Some(notice);
+                }
+            }
+        }
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    fn refresh_dimmed(&mut self, edits: &[DraftEdit]) {
+        for edit in edits {
+            if let Some(ix) = self.row_index(&edit.row_id) {
+                let matches = row_matches(&self.filters, &self.rows[ix].values);
+                self.rows[ix].dimmed = !matches;
+            }
+        }
+    }
+
+    /// Reads each row of a short batch at the head: a draft whose value is there landed; any
+    /// other is kept, with what the cell holds now.
+    fn reread_drafts(
+        &mut self,
+        edits: Vec<DraftEdit>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        let mut ids: Vec<String> = edits.iter().map(|edit| edit.row_id.clone()).collect();
+        ids.dedup();
+        for id in ids {
+            let row_edits: Vec<DraftEdit> = edits
+                .iter()
+                .filter(|edit| edit.row_id == id)
+                .cloned()
+                .collect();
+            let Ok(query) = builder::node_by_id(&schema, &self.type_name, &id) else {
+                continue;
+            };
+            let read = self
+                .session
+                .update(cx, |session, cx| session.read(&query, None, cx));
+            self.saves_in_flight += 1;
+            cx.spawn_in(window, async move |this, cx| {
+                let result = read.await;
+                this.update_in(cx, |this, _window, cx| {
+                    this.saves_in_flight = this.saves_in_flight.saturating_sub(1);
+                    let now = result
+                        .ok()
+                        .map(|output| node_rows(&output.rows).into_iter().next());
+                    for edit in row_edits {
+                        let key = (edit.row_id.clone(), edit.column.clone());
+                        let property = this.property_of(&edit.column);
+                        let ix = this.row_index(&edit.row_id);
+                        let notice = match &now {
+                            Some(Some(row)) => {
+                                let value = row.value(&edit.column).clone();
+                                if same_value(&value, &edit.new) {
+                                    this.cells.remove(&key);
+                                    continue;
+                                }
+                                if let Some(ix) = ix {
+                                    set_value(&mut this.rows[ix], &edit.column, value.clone());
+                                }
+                                changed_elsewhere(property.as_ref(), Some(&value))
+                            }
+                            Some(None) => {
+                                if let Some(ix) = ix {
+                                    set_value(&mut this.rows[ix], &edit.column, edit.old);
+                                    this.rows[ix].dimmed = true;
+                                }
+                                changed_elsewhere(property.as_ref(), None)
+                            }
+                            None => {
+                                if let Some(ix) = ix {
+                                    set_value(&mut this.rows[ix], &edit.column, edit.old);
+                                }
+                                Notice::new(
+                                    Tone::Unknown,
+                                    "The row could not be read to check this change. \
+                                     Check History before trying again; your change is kept.",
+                                )
+                            }
+                        };
+                        this.cells.insert(
+                            key,
+                            CellState::Draft {
+                                text: edit.text,
+                                notice: Some(notice),
+                            },
+                        );
+                    }
+                    // The table now shows values newer than its pin.
+                    this.newer = true;
+                    cx.emit(ItemEvent::UpdateTab);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    /// Drops every draft, on the second click of Discard.
+    fn discard_drafts(&mut self, cx: &mut Context<Self>) {
+        if !self.drafts.confirm_discard {
+            self.drafts.confirm_discard = true;
+            cx.notify();
+            return;
+        }
+        self.cells
+            .retain(|_, state| !matches!(state, CellState::Draft { .. }));
+        self.drafts = DraftsBar::default();
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// The pill floating over the bottom of the table while cells hold drafts: how many,
+    /// Discard, and saving them all as one commit. It floats, so rows never move when it shows.
+    fn render_drafts_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.kind != TableKind::Node || self.at_commit.is_some() {
+            return None;
+        }
+        let count = self
+            .cells
+            .values()
+            .filter(|state| matches!(state, CellState::Draft { .. }))
+            .count();
+        if count == 0 && !self.drafts.saving {
+            return None;
+        }
+        let colors = cx.theme().colors();
+        let (border, fill) = (
+            colors.border_variant,
+            if cx.theme().appearance.is_light() {
+                gpui::white()
+            } else {
+                colors.elevated_surface_background
+            },
+        );
+        let saving = self.drafts.saving;
+        let focus = self.focus_handle.clone();
+        let save_tooltip = format!(
+            "One commit to {}; each row is bound to the values it shows",
+            self.branch
+        );
+        let pill = h_flex()
+            .id("drafts-bar")
+            .occlude()
+            .max_w(px(720.))
+            .pl_3()
+            .pr_1p5()
+            .py_1()
+            .gap_2()
+            .items_center()
+            .rounded(px(studio_ui::ds::radius::LG))
+            .bg(fill)
+            .border_1()
+            .border_color(border)
+            .shadow(studio_ui::ds::elevation::float())
+            .child(Indicator::dot().color(Color::Accent))
+            .child(
+                Label::new(if saving {
+                    "Saving drafts…".to_owned()
+                } else {
+                    format!("{} not saved", plural(count, "draft", "drafts"))
+                })
+                .size(LabelSize::Small)
+                .weight(gpui::FontWeight::MEDIUM),
+            )
+            .children(self.drafts.notice.clone().map(|notice| {
+                div().min_w_0().flex_shrink(1.).child(
+                    Label::new(notice.message)
+                        .size(LabelSize::Small)
+                        .color(match notice.tone {
+                            Tone::Refused | Tone::Invalid => Color::Error,
+                            Tone::Conflict | Tone::Unknown => Color::Warning,
+                        })
+                        .truncate(),
+                )
+            }))
+            .when(count > 0 && !saving, |bar| {
+                bar.child(
+                    studio_ui::ds::button(
+                        "drafts-discard",
+                        if self.drafts.confirm_discard {
+                            format!("Discard {}", plural(count, "draft", "drafts"))
+                        } else {
+                            "Discard".to_owned()
+                        },
+                    )
+                    .style(if self.drafts.confirm_discard {
+                        ButtonStyle::Tinted(TintColor::Error)
+                    } else {
+                        ButtonStyle::Subtle
+                    })
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| this.discard_drafts(cx))),
+                )
+                .child(
+                    studio_ui::ds::button("drafts-save", "Save as one commit")
+                        .style(ButtonStyle::Tinted(TintColor::Accent))
+                        .label_size(LabelSize::Small)
+                        .tooltip(move |_, cx| {
+                            Tooltip::for_action_in(save_tooltip.clone(), &SaveDrafts, &focus, cx)
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| this.save_drafts(window, cx))),
+                )
+            });
+        Some(
+            h_flex()
+                .absolute()
+                .bottom_3()
+                .left_0()
+                .right_0()
+                .px_3()
+                .justify_center()
+                .child(pill)
+                .into_any_element(),
+        )
     }
 
     fn reread_conflict(
@@ -3134,7 +3617,26 @@ impl TypeTable {
                 }))
                 .into_any_element();
         }
+        // A draft shows what was typed, so a row of drafts reads as it will once saved.
+        let draft = match state {
+            Some(CellState::Draft { text, .. }) => Some(text.clone()),
+            _ => None,
+        };
         let content: AnyElement = match column.property() {
+            _ if draft.is_some() => {
+                let text = draft.clone().unwrap_or_default();
+                let empty = text.trim().is_empty();
+                Label::new(if empty { "—".to_owned() } else { text })
+                    .size(LabelSize::Small)
+                    .color(if empty {
+                        Color::Disabled
+                    } else {
+                        Color::Default
+                    })
+                    .single_line()
+                    .truncate()
+                    .into_any_element()
+            }
             Some(property) if property.kind == ScalarKind::Blob => {
                 self.render_blob_cell(row, property)
             }
@@ -3171,10 +3673,19 @@ impl TypeTable {
                     .as_ref()
                     .map(|n| format!("{}\n", n.message))
                     .unwrap_or_default();
+                let held = if value.is_null() {
+                    "The cell is empty.".to_owned()
+                } else {
+                    format!(
+                        "The cell holds “{}”.",
+                        display_value(column.property(), value)
+                    )
+                };
                 (
                     Some(color),
                     Some(format!(
-                        "{message}Your edit “{text}” is kept. Press ↵ to reopen it."
+                        "{message}Not saved: “{text}”. {held} \
+                         Reopen it to edit; Save as one commit saves every draft together."
                     )),
                 )
             }
@@ -3360,6 +3871,12 @@ impl TypeTable {
             }
             (true, _) => hints
                 .child(studio_ui::ds::key_hint(&ConfirmEdit, "Save", &focus, cx))
+                .child(studio_ui::ds::key_hint(
+                    &StageEdit,
+                    "Keep as draft",
+                    &focus,
+                    cx,
+                ))
                 .child(studio_ui::ds::key_hint(&Cancel, "Cancel", &focus, cx)),
             (false, TableKind::Node) => hints
                 .child(studio_ui::ds::key_hint(&EditCell, "Edit", &focus, cx))
@@ -3387,6 +3904,11 @@ fn filter_placeholder(op: FilterOp) -> &'static str {
     }
 }
 
+/// "1 draft", "3 drafts".
+fn plural(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+
 fn set_value(row: &mut Row, column: &str, value: Value) {
     if value.is_null() {
         row.values.remove(column);
@@ -3408,6 +3930,7 @@ impl Render for TypeTable {
         let toolbar = self.render_toolbar(cx);
         let filter_bar = self.render_filter_bar(cx);
         let bulk_bar = self.render_bulk_bar(cx);
+        let drafts_bar = self.render_drafts_bar(cx);
         let body = self.render_body(cx);
         v_flex()
             .key_context(context)
@@ -3436,6 +3959,10 @@ impl Render for TypeTable {
             .on_action(
                 cx.listener(|this, _: &ConfirmEdit, window, cx| this.confirm_edit(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &StageEdit, window, cx| {
+                this.stage_edit(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SaveDrafts, window, cx| this.save_drafts(window, cx)))
             .on_action(cx.listener(Self::on_cancel))
             .on_action(cx.listener(Self::on_peek))
             .on_action(cx.listener(Self::on_explore))
@@ -3453,6 +3980,13 @@ impl Render for TypeTable {
             .child(toolbar)
             .children(filter_bar)
             .children(bulk_bar)
-            .child(div().flex_1().min_h_0().child(body))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(body)
+                    .children(drafts_bar),
+            )
     }
 }

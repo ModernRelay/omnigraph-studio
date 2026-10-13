@@ -274,6 +274,10 @@ pub mod table {
             EditCell,
             /// Save the cell being edited.
             ConfirmEdit,
+            /// Keep the cell being edited as a draft, to save with the others in one commit.
+            StageEdit,
+            /// Save every draft in the table as one commit.
+            SaveDrafts,
             /// Cancel the edit, or step back one level.
             Cancel,
             /// Show the selected row in the inspector.

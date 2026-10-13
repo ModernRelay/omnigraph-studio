@@ -158,13 +158,15 @@
   {
     "context": "TypeTable && editing",
     "bindings": {
-      "enter": "studio_table::ConfirmEdit"
+      "enter": "studio_table::ConfirmEdit",
+      "alt-enter": "studio_table::StageEdit"
     }
   },
   {
     "context": "TypeTable",
     "bindings": {
       "escape": "studio_table::Cancel",
+      "cmd-s": "studio_table::SaveDrafts",
       "cmd-r": "studio_table::RefreshTable",
       "cmd-n": "studio_table::InsertRow",
       "cmd-f": "studio_table::AddFilter",

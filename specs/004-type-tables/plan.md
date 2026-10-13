@@ -147,6 +147,16 @@ stay put), IX (paged, virtualized).
   already hold the value are left out. A short `affected_nodes` means some rows changed
   elsewhere: they were left alone, the bar says how many and the table reads the head. Esc or
   Clear drops the selection.
+  Built (drafts): ⌥↵ keeps an edit as a draft instead of saving it, as clicking away already
+  did; a draft cell shows the typed text with a dot, and its tooltip says what the cell holds.
+  While drafts exist a pill floats over the bottom of the table ("3 drafts not saved ·
+  Discard · Save as one commit"; it floats so no row moves when it appears). Save (or ⌘S)
+  sends one mutation of one `update` per row (`builder::update_rows`) setting every drafted
+  property, bound to every value the row shows, so one commit; a draft that does not parse
+  opens instead and nothing is sent. A short `affected_nodes` means some rows changed
+  elsewhere and were left alone whole: those rows are read at the head, the drafts that landed
+  clear, and the others stay with "Changed elsewhere to “X”". A refused or lost write puts
+  every draft back with the reason. Discard asks for a second click.
 - Insert: a form generated from the node shape (required properties, key, enums, ranges).
 - Delete: type the row's key to confirm; uses `/mutate/if-graph-commit` with the pinned commit.
 - Every editing surface shows `write · <branch>`. A 403 shows "Your token cannot change
@@ -176,8 +186,7 @@ opens the branch's recent commits.
   - R2 unpublished commits: staged edits as a reviewable proposal only when the server
     advertises `cluster_publishCommit`.
 - Group-by (Tower 084) until filters and editing ship.
-- Multi-row edits of different values staged as one draft (bulk set covers one value across
-  rows). Views do not hold column state: columns are fixed. The preview tab is built (spec 002).
+- Views do not hold column state: columns are fixed. The preview tab is built (spec 002).
 - Per-row history beyond the commits that the change feed can cheaply return.
 
 ## Validation log
@@ -207,6 +216,7 @@ opens the branch's recent commits.
 | 2026-10-12 | Saved views | `studio_settings` `views_are_saved_per_graph_and_type_and_replaced_by_name`; `gq_language` `filter_operators_round_trip_through_their_keys`; offscreen snapshots with `click:` and `type:` steps: a seeded "Founders" applied from the Views menu, then sorted by email and saved as "Founders by email" | "title is Founder", name ascending, "25 of 200", and the button read "Founders"; `settings.json` held both views |
 | 2026-10-12 | Spike S1: several rows in one commit | on a scratch branch of the dev server: `update Person set { title: $v } where @id in $ids` (3 rows), and one mutation of two `update` statements | Both publish one commit; multi-statement mutations are the mechanism, so merge-mode NDJSON was not needed |
 | 2026-10-12 | Bulk set | `gq_language` `a_bulk_set_is_one_mutation_bound_row_by_row`; offscreen snapshots with `click:…,cmd` and `click:…,shift` on Project at branch `bulk-test`: three rows picked, status set to paused | One commit; `project-00001`, already paused, was left out ("Set status on 2 Project rows"); the rows updated in place and the selection cleared |
+| 2026-10-12 | Drafts of different values on several rows save as one commit, each row bound to what it showed | `gq_language` `edits_of_different_values_are_one_mutation_bound_row_by_row` (one statement per row, lists unbound, compiles); offscreen snapshots on branch `drafts-test`: ⌥↵ on Person 0 title "CTO", Person 2 title "Lead Designer" and born 1990-01-02, then ⌘S; then again with Person 0's title changed by another client (`wait:` step) between staging and saving | First run: the branch went from 5 to 6 commits and both rows read back with the new values; the drafts cleared. Second run: "Design Lead" landed, Person 0 kept its draft with "Changed elsewhere to “Acting CTO”", and the pill read "1 draft not saved" |
 | 2026-10-12 | A Blob value saves whole or not at all | `type_table` tests `a_save_lands_whole_or_not_at_all`, `a_saved_value_is_named_for_its_row_property_and_kind`; an offscreen snapshot of a note with a 12 KB text attachment | "Save…" at the end of the attachment's line; a save writes `<name>.part`, appends each range, and renames it into place only at the value's full size (a short value or a stop removes the part); the name is `<id>-<property>` with the kind's extension. The native save dialog cannot be driven offscreen |
 | 2026-10-12 | A Blob value opens in a tab of its own, shown for its kind | `type_table` tests `values_are_told_apart_by_their_bytes`, `a_pdf_is_drawn_page_by_page`, `a_page_is_drawn_to_scale_on_white_with_its_marks`, `the_open_folder_keeps_a_day`; offscreen snapshots of four notes on the dev `notes` graph with attachments set through a `Blob` parameter | A 960 × 600 transparent PNG fitted at 100% on the checkerboard ("PNG · 960 × 600 · 8.8 KB"); a two-page PDF drawn sharp ("PDF · 2 pages · 1.2 KB"); a 12 KB text in the read-only editor with line numbers; 3 KB of a binary as sixteen-byte hex lines. The first PDF test failed until the context was scaled before drawing: CoreGraphics' page transform never enlarges a page |
 
@@ -242,6 +252,11 @@ opens the branch's recent commits.
   selection; `TypeTable && editing`: ↵ save; `TypeTable`: esc, ⌘R refresh, ⌘N row, ⌘F filter,
   ⌘⌥⌫ clear filters). They move to `assets/keymaps/` when the keymap files take feature
   bindings. New actions: `studio_table::AddFilter`, `FilterBySelection`, `ClearFilters`.
+- 2026-10-12 · The footer's key hints read the bindings of the frame drawn before, so after an
+  edit closed they showed no keys until something else redrew; ending an edit now redraws once
+  more on the next frame.
+- 2026-10-12 · A drafts save that lands only in part still toasts its description ("Save 2
+  changes on 2 Person rows · committed"); the pill and the kept drafts say which did not land.
 - 2026-10-12 · A mutation that matched nothing used to toast "committed"; the workspace now
   shows no toast for it and the status line says nothing was written (constitution VII).
 - 2026-10-12 · The branch-head check is a one-row read at the head every 30 s while the table is

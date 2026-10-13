@@ -1133,6 +1133,73 @@ pub fn update_cell(
     })
 }
 
+/// One row's edits in a batch: its id, and per property the value the row showed and the new
+/// value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowEdit {
+    pub id: String,
+    pub cells: Vec<(String, Value, Value)>,
+}
+
+/// Saves edits of different values on several rows in one mutation, so they publish as one
+/// commit (spec 004, drafts). Each row is one statement setting all its edited properties, bound
+/// to every value the row showed: a row changed elsewhere is left alone whole, and
+/// `affected_nodes` comes back short by it.
+pub fn update_rows(
+    schema: &SchemaModel,
+    type_name: &str,
+    rows: &[RowEdit],
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, type_name)?;
+    let mut params = Params::new();
+    let mut statements = Vec::new();
+    for (r, row) in rows.iter().enumerate() {
+        let id = params.add(&format!("id{r}"), "String", Value::String(row.id.clone()));
+        let mut sets = Vec::new();
+        let mut predicate = format!("@id = {id}");
+        for (c, (name, old, new)) in row.cells.iter().enumerate() {
+            let property = property(node, name)?;
+            if !property.editable_in_cell() {
+                return Err(BuildError::NotEditable(property.name.clone()));
+            }
+            let new = params.add(
+                &format!("new{r}_{c}"),
+                &property.param_type(true),
+                new.clone(),
+            );
+            sets.push(format!("{}: {new}", property.name));
+            if property.list {
+                continue;
+            }
+            if old.is_null() {
+                predicate.push_str(&format!(" and {} is null", property.name));
+            } else {
+                let old = params.add(
+                    &format!("old{r}_{c}"),
+                    &property.param_type(false),
+                    old.clone(),
+                );
+                predicate.push_str(&format!(" and {} = {old}", property.name));
+            }
+        }
+        statements.push(format!(
+            "update {ty} set {{ {sets} }} where {predicate}",
+            ty = node.name,
+            sets = sets.join(", "),
+        ));
+    }
+    let text = format!(
+        "query studio_save_rows({sig}) {{\n  {statements}\n}}\n",
+        sig = params.signature(),
+        statements = statements.join("\n  "),
+    );
+    Ok(BuiltQuery {
+        name: "studio_save_rows".into(),
+        text,
+        params: params.values,
+    })
+}
+
 /// Sets one property on several rows in one mutation, so they publish as one commit (spec 004,
 /// bulk set). Each row's statement is bound to the value the row showed, as a cell edit is: a
 /// row changed elsewhere is left alone, and `affected_nodes` comes back short by it.
@@ -1430,6 +1497,50 @@ mod tests {
         assert_compiles(&query);
         assert!(matches!(
             update_cells(&schema, "Person", "slug", &rows, &Value::Null),
+            Err(BuildError::NotEditable(_))
+        ));
+    }
+
+    #[test]
+    fn edits_of_different_values_are_one_mutation_bound_row_by_row() {
+        let schema = dev();
+        let rows = vec![
+            RowEdit {
+                id: "person-000001".into(),
+                cells: vec![
+                    ("title".into(), json!("Engineer"), json!("Founder")),
+                    ("born".into(), Value::Null, json!("1990-02-03")),
+                ],
+            },
+            RowEdit {
+                id: "person-000006".into(),
+                cells: vec![("tags".into(), json!(["a"]), json!(["a", "b"]))],
+            },
+        ];
+        let query = update_rows(&schema, "Person", &rows).unwrap();
+        assert!(
+            query.text.contains(
+                "update Person set { title: $new0_0, born: $new0_1 } where @id = $id0 \
+                 and title = $old0_0 and born is null"
+            ),
+            "{}",
+            query.text
+        );
+        assert!(
+            query
+                .text
+                .contains("update Person set { tags: $new1_0 } where @id = $id1\n"),
+            "a list is not bound to its old value: {}",
+            query.text
+        );
+        assert_eq!(query.params["new0_1"], "1990-02-03");
+        assert_compiles(&query);
+        let key = vec![RowEdit {
+            id: "x".into(),
+            cells: vec![("slug".into(), json!("x"), json!("y"))],
+        }];
+        assert!(matches!(
+            update_rows(&schema, "Person", &key),
             Err(BuildError::NotEditable(_))
         ));
     }

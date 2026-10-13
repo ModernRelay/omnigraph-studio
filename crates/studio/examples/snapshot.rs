@@ -11,7 +11,8 @@
 //! window pixels (half the PNG's, which is drawn at 2x), with `,cmd` or `,shift` held when
 //! added and `,right` for the secondary button; `hover:<x>,<y>` moves the pointer there and rests; `key:<keystroke>` presses keys as the keymap sees them (`key:tab`, `key:cmd-4`);
 //! `drag:<x1>,<y1>,<x2>,<y2>` presses at
-//! the first point, moves to the second in steps, and releases. `SNAPSHOT_WAIT_MS` (default 1500) is how
+//! the first point, moves to the second in steps, and releases; `wait:<ms>` lets that long pass
+//! (for a write from outside to land between steps). `SNAPSHOT_WAIT_MS` (default 1500) is how
 //! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
 //! 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`.
 
@@ -168,6 +169,13 @@ fn main() {
     settle(&mut cx, wait);
 
     for spec in actions {
+        if let Some(ms) = spec.strip_prefix("wait:") {
+            settle(
+                &mut cx,
+                Duration::from_millis(ms.trim().parse().expect("wait is milliseconds")),
+            );
+            continue;
+        }
         if let Some((x, y)) = spec
             .strip_prefix("hover:")
             .and_then(|at| at.split_once(','))
