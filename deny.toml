@@ -3,12 +3,25 @@
 [graph]
 all-features = false
 
+[advisories]
+# Every ignore names the crate that brings the advisory in. Each one reaches Studio only through
+# Zed's crates at the pinned tag (docs/zed-pin.md) and has no fix within the version Zed allows;
+# drop the entry at the Zed bump that moves past it.
+ignore = [
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.37 in wayland-scanner (build time, reads the protocol XML it ships) and 0.39 in zbus_xml (Linux accessibility); fixed in 0.41, which Zed does not allow yet" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.37 and 0.39, as RUSTSEC-2026-0194" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa in Zed's rpc crate, used for Zed's collaboration-server handshake, which Studio never makes; no fixed rsa release exists" },
+    { id = "RUSTSEC-2025-0052", reason = "async-std is unmaintained; reached through Zed's async-tar fork" },
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained; a build-time proc-macro of the metal crate GPUI uses on macOS" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained; reached through Zed's reqwest fork" },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz is unmaintained; reached through usvg, which GPUI uses for SVG icons" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser is unmaintained; reached through usvg, as rustybuzz" },
+]
+
 [licenses]
 # Studio is GPL-3.0-or-later. Everything linked into it must be GPL-3.0 compatible.
 allow = [
     "GPL-3.0-or-later",
-    "GPL-3.0-only",
-    "LGPL-3.0-or-later",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "MIT",
@@ -18,16 +31,26 @@ allow = [
     "ISC",
     "Zlib",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
     "MPL-2.0",
     "CC0-1.0",
     "BSL-1.0",
-    "OFL-1.1",
     "CDLA-Permissive-2.0",
 ]
 # "BSL-1.0" above is the Boost licence. The Business Source License is not an SPDX identifier
 # cargo-deny allows; review any crate that declares it and refuse it.
 confidence-threshold = 0.9
+
+# Zed's language_core declares no licence field; its LICENSE-GPL is Zed's GPL-3.0-or-later,
+# read by the scanner under the deprecated identifier "GPL-3.0".
+[[licenses.exceptions]]
+crate = "language_core"
+allow = ["GPL-3.0"]
+
+# The bzip2 licence: permissive and GPL compatible. libbz2-rs-sys comes in through Zed's
+# archive handling (async-compression).
+[[licenses.exceptions]]
+crate = "libbz2-rs-sys"
+allow = ["bzip2-1.0.6"]
 
 [bans]
 multiple-versions = "warn"
@@ -54,6 +77,11 @@ allow-git = [
     "https://github.com/zed-industries/reqwest.git",
     "https://github.com/zed-industries/font-kit",
     "https://github.com/zed-industries/xim-rs.git",
-    "https://github.com/zed-industries/scap",
+    "https://github.com/zed-industries/alacritty",
+    "https://github.com/zed-industries/dap-types",
+    "https://github.com/zed-industries/async-tar",
+    "https://github.com/zed-industries/trash-rs",
+    "https://github.com/zed-industries/wasm_thread",
+    "https://github.com/proptest-rs/proptest",
     "https://github.com/zed-industries/lsp-types",
 ]

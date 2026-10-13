@@ -96,7 +96,9 @@ schemars = "1"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+# The maintained continuation of serde_yaml, which is deprecated and pulls in an unmaintained
+# libyaml port.
+serde_norway = "0.9"
 thiserror = "2"
 url = "2"
 

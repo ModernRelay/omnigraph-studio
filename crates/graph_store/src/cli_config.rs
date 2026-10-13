@@ -77,7 +77,7 @@ pub fn load_servers_from(path: &Path) -> Result<Vec<CliServer>, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(format!("could not read {}: {error}", path.display())),
     };
-    let config: OperatorConfig = serde_yaml::from_str(&text)
+    let config: OperatorConfig = serde_norway::from_str(&text)
         .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
     let mut servers: Vec<CliServer> = config
         .servers
