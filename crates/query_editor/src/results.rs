@@ -113,17 +113,28 @@ impl ResultTable {
         serde_json::to_string_pretty(&Value::Object(object)).ok()
     }
 
-    /// A column's width in pixels: wide enough for its title, type and the first rows' values,
-    /// within bounds, so wide values do not push every other column off screen.
+    /// A column's width in pixels: wide enough for its header (the title, then its type beside
+    /// it in smaller text) and the first rows' values, within bounds, so wide values do not push
+    /// every other column off screen.
     pub fn column_width(&self, column: usize) -> f32 {
-        let mut chars = self.columns[column].chars().count();
-        if let Some(Some(ty)) = self.types.get(column) {
-            chars = chars.max(ty.chars().count());
-        }
-        for row in self.rows.iter().take(200) {
-            chars = chars.max(studio_ui::format_value(&row[column]).chars().count());
-        }
-        (chars as f32 * 7.5 + 24.).clamp(72., 360.)
+        const CHAR: f32 = 7.5;
+        const TYPE_CHAR: f32 = 6.6;
+        const GAP: f32 = 6.;
+        const PADDING: f32 = 24.;
+        let title = self.columns[column].chars().count() as f32 * CHAR;
+        let header = match self.types.get(column) {
+            Some(Some(ty)) => title + GAP + ty.chars().count() as f32 * TYPE_CHAR,
+            _ => title,
+        };
+        let values = self
+            .rows
+            .iter()
+            .take(200)
+            .map(|row| studio_ui::format_value(&row[column]).chars().count())
+            .max()
+            .unwrap_or(0) as f32
+            * CHAR;
+        (header.max(values) + PADDING).clamp(72., 360.)
     }
 }
 
@@ -464,6 +475,11 @@ mod tests {
         let table = ResultTable::new(vec!["a".into(), "b".into()], &rows, None);
         assert_eq!(table.column_width(0), 72.);
         assert_eq!(table.column_width(1), 360.);
+        // A narrow value under a title and its type: the header sets the width, so the title is
+        // never cut.
+        let mut counted = ResultTable::new(vec!["friends".into()], &json!([{"friends": 1}]), None);
+        counted.types = vec![Some("BigInt?".into())];
+        assert!(counted.column_width(0) >= 7. * 7.5 + 6. + 7. * 6.6 + 24.);
     }
 
     #[test]
