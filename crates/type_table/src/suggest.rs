@@ -12,6 +12,23 @@ pub struct Suggestion {
 /// How many nodes a "related to" search offers.
 pub const NODE_SUGGESTIONS: u32 = 8;
 
+/// A node search's rows (`builder::node_search`) as offers: the id goes in the field, the label
+/// beside it.
+pub fn from_node_rows(rows: &serde_json::Value) -> Vec<Suggestion> {
+    rows.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let id = row.get("id")?.as_str()?.to_owned();
+            let label = row
+                .get("label")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            Some(Suggestion { value: id, label })
+        })
+        .collect()
+}
+
 /// The part of the field a suggestion completes: all of it, or for a list (`in`) the text after
 /// the last comma.
 pub fn needle(text: &str, list: bool) -> &str {
@@ -82,6 +99,29 @@ mod tests {
 
     fn shown(suggestions: &[Suggestion]) -> Vec<&str> {
         suggestions.iter().map(|s| s.value.as_str()).collect()
+    }
+
+    #[test]
+    fn a_node_search_offers_ids_with_their_labels() {
+        let rows = serde_json::json!([
+            {"id": "person-000000", "label": "Radia Knuth"},
+            {"id": "person-000004"},
+            {"label": "no id"},
+        ]);
+        assert_eq!(
+            from_node_rows(&rows),
+            [
+                Suggestion {
+                    value: "person-000000".into(),
+                    label: Some("Radia Knuth".into()),
+                },
+                Suggestion {
+                    value: "person-000004".into(),
+                    label: None,
+                },
+            ]
+        );
+        assert!(from_node_rows(&serde_json::Value::Null).is_empty());
     }
 
     #[test]

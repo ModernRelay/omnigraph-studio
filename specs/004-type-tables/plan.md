@@ -3,8 +3,8 @@
 Status: in progress · 2026-10-12. `crates/type_table` ships the Types sidebar, node and edge
 tables (keyset pages pinned to one commit, filtered counts, filters, a cell cursor, value-bound
 cell edits with all three outcomes, peek, insert and typed-key delete), sorting by a column,
-Blob cells and previews, relative dates, relationship columns, saved views, bulk set, and
-preview tabs (spec 002). See Deferred for what is left.
+Blob cells and previews, relative dates, relationship columns, saved views, bulk set,
+preview tabs (spec 002), and edge insert and delete. See Deferred for what is left.
 
 ## Problem
 
@@ -293,6 +293,10 @@ kept answers.
 | 2026-10-12 | Drafts of different values on several rows save as one commit, each row bound to what it showed | `gq_language` `edits_of_different_values_are_one_mutation_bound_row_by_row` (one statement per row, lists unbound, compiles); offscreen snapshots on branch `drafts-test`: ⌥↵ on Person 0 title "CTO", Person 2 title "Lead Designer" and born 1990-01-02, then ⌘S; then again with Person 0's title changed by another client (`wait:` step) between staging and saving | First run: the branch went from 5 to 6 commits and both rows read back with the new values; the drafts cleared. Second run: "Design Lead" landed, Person 0 kept its draft with "Changed elsewhere to “Acting CTO”", and the pill read "1 draft not saved" |
 | 2026-10-12 | A Blob value saves whole or not at all | `type_table` tests `a_save_lands_whole_or_not_at_all`, `a_saved_value_is_named_for_its_row_property_and_kind`; an offscreen snapshot of a note with a 12 KB text attachment | "Save…" at the end of the attachment's line; a save writes `<name>.part`, appends each range, and renames it into place only at the value's full size (a short value or a stop removes the part); the name is `<id>-<property>` with the kind's extension. The native save dialog cannot be driven offscreen |
 | 2026-10-12 | A Blob value opens in a tab of its own, shown for its kind | `type_table` tests `values_are_told_apart_by_their_bytes`, `a_pdf_is_drawn_page_by_page`, `a_page_is_drawn_to_scale_on_white_with_its_marks`, `the_open_folder_keeps_a_day`; offscreen snapshots of four notes on the dev `notes` graph with attachments set through a `Blob` parameter | A 960 × 600 transparent PNG fitted at 100% on the checkerboard ("PNG · 960 × 600 · 8.8 KB"); a two-page PDF drawn sharp ("PDF · 2 pages · 1.2 KB"); a 12 KB text in the read-only editor with line numbers; 3 KB of a binary as sixteen-byte hex lines. The first PDF test failed until the context was scaled before drawing: CoreGraphics' page transform never enlarges a page |
+| 2026-10-13 | An edge is added from its table with its endpoints found by search | Offscreen snapshots of `WorksAt` on the dev server: Row, "radia" typed into From; then ↓ ↵, "gold" ↵ in To, "Advisor" ↵ in role; then a CLI read | Six people listed by name with their ids, the first highlighted; ↓ moved the highlight; ↵ put the id in the field and moved on. The edge committed to main ("Insert WorksAt person-000000 → company-00000 · committed to main"), the table showed "Newer data · Refresh", and the CLI read role Advisor |
+| 2026-10-13 | An edge to a missing node is refused and the form stays | Snapshot: From "nobody", To picked, ↵ | "Nothing was written. __src 'nobody' not found in Person" under the form, values kept; the server answered 400 |
+| 2026-10-13 | An edge is deleted from its table, bound to the table's commit | Snapshot of `WorksAt`: ↓, Delete, the dialog, then ↵; CLI counts before and after | "Delete WorksAt person-000175 → company-00012 · This removes this WorksAt from main. Both nodes stay."; ↵ deleted it: the row left the table, 217 → 216, and the CLI found no such edge |
+| 2026-10-13 | ↵ on an offered value types nothing into the field | Snapshot of ↵ on the first offer, before and after the fix | Before: the field read `person-000000\n`; Studio's `move_to_end` after `set_text` only propagates in a single-line editor, so the ↵ reached the field as text too. After: `person-000000`. The table's filter field had the same call |
 | 2026-10-13 | A peek reads only what the table did not | offscreen snapshots through a request-counting proxy: the Person table (four relationship columns), then the peek and ↓ twice | Before: the peek read 4 counts and up to 4 neighbour lists for each row it showed, 22 reads in all; after: none. The peek of Grace Allen read the same before and after (contributes 2 with both projects, knows 0, worksAt 0, known by 2 with both people) |
 
 ## Corrections
@@ -319,6 +323,13 @@ kept answers.
 - 2026-10-12 · Edges are read-only in tables: the engine has no edge update (T16). An edge table
   pins its source column, then the target and the edge's properties; a click peeks the edge,
   whose endpoints open in the inspector. Edge insert and delete wait for a later step.
+- 2026-10-13 · Edge insert and delete landed. Row opens "New <Edge>": From and To search their
+  node types by name or id at the table's commit (↑/↓ and ↵ pick, a click picks), then the
+  edge's properties. The engine assigns an unkeyed edge's id, so the table shows "Newer data"
+  rather than placing the row. Delete shows the edge as "from → to" and is confirmed with the
+  button or ↵, not by typing a key: an edge's id is generated, and deleting it leaves both
+  nodes. Like a node delete it is bound to the table's commit. The toolbar reads "Cells read
+  only" for an edge table at the head.
 - 2026-10-12 · "Properties in schema order" needed a fix in `gq_language`: the compiled shape
   lists them by name. Enum values still read in the compiler's sorted order.
 - 2026-10-12 · A delete is bound to the table's pin, so any commit after the table's read refuses

@@ -163,6 +163,13 @@
     }
   },
   {
+    "context": "EdgeEndpoint > Editor",
+    "bindings": {
+      "up": "studio_table::SelectPreviousSuggestion",
+      "down": "studio_table::SelectNextSuggestion"
+    }
+  },
+  {
     "context": "TypeTable && editing",
     "bindings": {
       "enter": "studio_table::ConfirmEdit",

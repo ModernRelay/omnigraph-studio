@@ -41,7 +41,7 @@ use ui::{
     ResizableColumnsState, Table, TableInteractionState, TableResizeBehavior, TintColor, Tooltip,
 };
 
-use crate::dialogs::{DeleteRowModal, InsertRowModal, SaveViewModal};
+use crate::dialogs::{DeleteRowModal, InsertEdgeModal, InsertRowModal, SaveViewModal};
 use crate::grouping::{GROUP_LIMIT, Grouping, Line, SECTION_FIRST_PAGE};
 use crate::model::{
     ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN, Row, SaveResult,
@@ -1024,7 +1024,7 @@ impl TypeTable {
                     .weight(gpui::FontWeight::MEDIUM),
             );
         if read_only {
-            bar = bar.child(studio_ui::ds::text::muted("Read only"));
+            bar = bar.child(studio_ui::ds::text::muted(self.read_only_label()));
         } else {
             bar = bar
                 .child(
@@ -3449,10 +3449,6 @@ impl TypeTable {
             self.toast(ToastKind::Info, &reason, cx);
             return;
         }
-        if self.kind != TableKind::Node {
-            self.toast(ToastKind::Info, "Edges are added with a query for now.", cx);
-            return;
-        }
         let (Some(schema), Some(workspace)) = (self.schema.clone(), self.workspace.upgrade())
         else {
             return;
@@ -3460,24 +3456,24 @@ impl TypeTable {
         let table = cx.entity().downgrade();
         let session = self.session.clone();
         let type_name = self.type_name.clone();
+        let snapshot = self.paging.pinned.clone();
+        let edge = self.kind == TableKind::Edge;
         workspace.update(cx, |workspace, cx| {
-            workspace.toggle_modal(window, cx, |window, cx| {
-                InsertRowModal::new(table, session, schema, type_name, window, cx)
-            })
+            if edge {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    InsertEdgeModal::new(table, session, schema, type_name, snapshot, window, cx)
+                })
+            } else {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    InsertRowModal::new(table, session, schema, type_name, window, cx)
+                })
+            }
         });
     }
 
     fn on_delete(&mut self, _: &DeleteRow, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(reason) = self.pinned_reason() {
             self.toast(ToastKind::Info, &reason, cx);
-            return;
-        }
-        if self.kind != TableKind::Node {
-            self.toast(
-                ToastKind::Info,
-                "Edges are deleted with a query for now.",
-                cx,
-            );
             return;
         }
         let Some(cursor) = self.cursor else { return };
@@ -3492,10 +3488,22 @@ impl TypeTable {
         let session = self.session.clone();
         let type_name = self.type_name.clone();
         let id = row.id.clone();
+        let endpoints = (self.kind == TableKind::Edge).then(|| {
+            let end = |column: &str| {
+                row.values
+                    .get(column)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            (end(crate::model::FROM_COLUMN), end(crate::model::TO_COLUMN))
+        });
         let if_commit = self.paging.pinned.clone();
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, |window, cx| {
-                DeleteRowModal::new(table, session, schema, type_name, id, if_commit, window, cx)
+                DeleteRowModal::new(
+                    table, session, schema, type_name, id, endpoints, if_commit, window, cx,
+                )
             })
         });
     }
@@ -3510,6 +3518,16 @@ impl TypeTable {
     // ---- filters ----
 
     /// Why nothing can be written here, when the table reads a past commit.
+    /// What the table says when its cells cannot change: an edge table at the head still adds
+    /// and deletes rows.
+    fn read_only_label(&self) -> &'static str {
+        if self.kind == TableKind::Edge && self.at_commit.is_none() {
+            "Cells read only"
+        } else {
+            "Read only"
+        }
+    }
+
     fn pinned_reason(&self) -> Option<String> {
         self.at_commit.as_ref().map(|commit| {
             format!(
@@ -3705,7 +3723,7 @@ impl TypeTable {
                         if draft.suggest_generation != generation {
                             return;
                         }
-                        draft.suggestions = node_suggestions(&output.rows);
+                        draft.suggestions = suggest::from_node_rows(&output.rows);
                         draft.highlighted = (typed && !draft.suggestions.is_empty()).then_some(0);
                         cx.notify();
                     })
@@ -3751,7 +3769,12 @@ impl TypeTable {
         }
         self.filter_editor.update(cx, |editor, cx| {
             editor.set_text(text, window, cx);
-            editor.move_to_end(&editor::actions::MoveToEnd, window, cx);
+            // Not `move_to_end`: in a single-line editor it only propagates, and the ↵ that
+            // picked would then also be typed into the field.
+            let end = editor.buffer().read(cx).read(cx).len();
+            editor.change_selections(Default::default(), window, cx, |s| {
+                s.select_ranges(vec![end..end])
+            });
         });
         if list {
             self.refresh_suggestions(cx);
@@ -3906,10 +3929,15 @@ impl TypeTable {
             _ => None,
         };
         let read_only = self.kind == TableKind::Edge || self.at_commit.is_some();
+        let pinned = self.at_commit.is_some();
         let target_tooltip = if let Some(reason) = self.pinned_reason() {
             reason
         } else if read_only {
-            "Edges cannot be changed in a cell: the engine has no edge update (T16).".to_owned()
+            format!(
+                "Edges are added and deleted here, committing to {}; their cells cannot change: \
+                 the engine has no edge update (T16).",
+                self.branch
+            )
         } else {
             format!("Edits, inserts and deletes here commit to {}", self.branch)
         };
@@ -3942,7 +3970,7 @@ impl TypeTable {
                                 cx,
                             )
                             .into_any_element(),
-                            None => Label::new("Read only")
+                            None => Label::new(self.read_only_label())
                                 .size(LabelSize::XSmall)
                                 .color(Color::Muted)
                                 .into_any_element(),
@@ -3979,10 +4007,10 @@ impl TypeTable {
                     .style(ButtonStyle::Subtle)
                     .label_size(LabelSize::Small)
                     .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
-                    .disabled(read_only)
+                    .disabled(pinned)
                     .tooltip(move |_, cx| {
-                        if read_only {
-                            Tooltip::simple("Edges are added with a query for now", cx)
+                        if pinned {
+                            Tooltip::simple("Read-only at an older commit", cx)
                         } else {
                             Tooltip::for_action("Add a row", &InsertRow, cx)
                         }
@@ -5391,29 +5419,16 @@ impl TypeTable {
                 .child(studio_ui::ds::key_hint(&ExploreRow, "Explore", &focus, cx))
                 .child(studio_ui::ds::key_hint(&InsertRow, "Row", &focus, cx))
                 .child(studio_ui::ds::key_hint(&DeleteRow, "Delete", &focus, cx)),
-            (false, TableKind::Edge) => {
-                hints.child(studio_ui::ds::key_hint(&PeekRow, "Peek", &focus, cx))
-            }
+            (false, TableKind::Edge) => hints
+                .child(studio_ui::ds::key_hint(&PeekRow, "Peek", &focus, cx))
+                .child(studio_ui::ds::key_hint(&InsertRow, "Row", &focus, cx))
+                .child(studio_ui::ds::key_hint(&DeleteRow, "Delete", &focus, cx)),
         };
         ItemFooter {
             start,
             end: vec![hints.into_any_element()],
         }
     }
-}
-
-/// What the value field asks for.
-/// A node search's rows as offers: the id goes in the field, the label beside it.
-fn node_suggestions(rows: &Value) -> Vec<Suggestion> {
-    rows.as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|row| {
-            let id = row.get("id")?.as_str()?.to_owned();
-            let label = row.get("label").and_then(Value::as_str).map(str::to_owned);
-            Some(Suggestion { value: id, label })
-        })
-        .collect()
 }
 
 fn filter_placeholder(op: FilterOp) -> &'static str {

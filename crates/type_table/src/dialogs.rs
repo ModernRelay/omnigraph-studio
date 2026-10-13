@@ -1,13 +1,15 @@
-//! Insert-row and delete-row dialogs (spec 004). Both name the branch they write to; a delete
-//! is confirmed by typing the row's key and is bound to the commit the table was read at
-//! (constitution IV). Neither retries; a refused or unknown outcome keeps the form.
+//! Insert-row and delete-row dialogs (spec 004), for nodes and edges. Each names the branch it
+//! writes to; a node delete is confirmed by typing the row's key, and every delete is bound to
+//! the commit the table was read at (constitution IV). None retries; a refused or unknown
+//! outcome keeps the form.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, Subscription,
-    WeakEntity, Window,
+    Task, WeakEntity, Window,
 };
 use gq_language::{Property, ScalarKind, SchemaModel, builder};
 use graph_store::GraphSession;
@@ -15,7 +17,9 @@ use serde_json::{Map, Value};
 use ui::prelude::*;
 
 use crate::model::{Notice, SaveResult, Tone, parse_input, save_result};
+use crate::suggest::{self, NODE_SUGGESTIONS, Suggestion};
 use crate::table::TypeTable;
+use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 
 struct Field {
     property: Property,
@@ -288,48 +292,51 @@ fn placeholder(property: &Property) -> String {
     }
 }
 
+/// One property's label line, input and error.
+fn render_field(field: &Field, cx: &App) -> AnyElement {
+    let p = &field.property;
+    let required = !p.nullable;
+    v_flex()
+        .gap_1()
+        .child(
+            h_flex()
+                .gap_2()
+                .child(Label::new(p.name.clone()).size(LabelSize::Small))
+                .child(
+                    Label::new(p.display_type())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .when(p.is_key, |d| {
+                    d.child(
+                        Label::new("key")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Accent),
+                    )
+                })
+                .when(required && !p.is_key, |d| {
+                    d.child(
+                        Label::new("required")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                }),
+        )
+        .child(field_box(&field.editor, field.error.is_some(), cx))
+        .children(field.error.clone().map(|error| {
+            Label::new(error)
+                .size(LabelSize::XSmall)
+                .color(Color::Error)
+        }))
+        .into_any_element()
+}
+
 impl Render for InsertRowModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let fields: Vec<AnyElement> = self
             .fields
             .iter()
-            .map(|field| {
-                let p = &field.property;
-                let required = !p.nullable;
-                v_flex()
-                    .gap_1()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .child(Label::new(p.name.clone()).size(LabelSize::Small))
-                            .child(
-                                Label::new(p.display_type())
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .when(p.is_key, |d| {
-                                d.child(
-                                    Label::new("key")
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Accent),
-                                )
-                            })
-                            .when(required && !p.is_key, |d| {
-                                d.child(
-                                    Label::new("required")
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                )
-                            }),
-                    )
-                    .child(field_box(&field.editor, field.error.is_some(), cx))
-                    .children(field.error.clone().map(|error| {
-                        Label::new(error)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Error)
-                    }))
-                    .into_any_element()
-            })
+            .map(|field| render_field(field, cx))
             .collect();
         let saving = self.saving;
         let blocked = self.blocked.clone();
@@ -384,8 +391,551 @@ impl Render for InsertRowModal {
     }
 }
 
-/// Deleting one node: type its key to confirm. Bound to the commit the table was read at, so a
-/// branch that moved meanwhile refuses the delete.
+/// One end of a new edge: a node of `type_name`, searched by id or label while it is typed, at
+/// the commit the table was read at.
+struct Endpoint {
+    type_name: String,
+    editor: Entity<Editor>,
+    suggestions: Vec<Suggestion>,
+    highlighted: Option<usize>,
+    /// The id last picked from the list; typing it again does not search.
+    picked: Option<String>,
+    /// Counts searches, so an answer for older text is dropped.
+    generation: u64,
+    search: Option<Task<()>>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum End {
+    From,
+    To,
+}
+
+/// The form for a new edge: its source and target nodes, picked by search, then its
+/// properties. An unkeyed edge gets its id from the engine, so the table shows it after a read.
+pub struct InsertEdgeModal {
+    table: WeakEntity<TypeTable>,
+    session: Entity<GraphSession>,
+    schema: Arc<SchemaModel>,
+    edge_name: String,
+    branch: String,
+    snapshot: Option<String>,
+    from: Endpoint,
+    to: Endpoint,
+    fields: Vec<Field>,
+    blocked: Option<String>,
+    notice: Option<Notice>,
+    saving: bool,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl EventEmitter<DismissEvent> for InsertEdgeModal {}
+
+impl Focusable for InsertEdgeModal {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.from.editor.focus_handle(cx)
+    }
+}
+
+impl InsertEdgeModal {
+    pub fn new(
+        table: WeakEntity<TypeTable>,
+        session: Entity<GraphSession>,
+        schema: Arc<SchemaModel>,
+        edge_name: String,
+        snapshot: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let branch = session.read(cx).branch.clone();
+        let edge = schema.edge(&edge_name).cloned();
+        let (from_type, to_type) = edge
+            .as_ref()
+            .map(|edge| (edge.from.clone(), edge.to.clone()))
+            .unwrap_or_default();
+        let mut properties: Vec<Property> = edge.map(|edge| edge.properties).unwrap_or_default();
+        let blocked = properties
+            .iter()
+            .find(|p| !p.nullable && !p.projectable())
+            .map(|p| {
+                format!(
+                    "{edge_name} needs a {} value for {}; insert it with a query.",
+                    p.base_type, p.name
+                )
+            });
+        properties.retain(Property::projectable);
+        properties.sort_by_key(|p| p.nullable);
+        let mut subscriptions = Vec::new();
+        let mut endpoint = |end: End, type_name: String, cx: &mut Context<Self>| {
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text(&format!("A {type_name}, by name or id"), window, cx);
+                editor
+            });
+            subscriptions.push(cx.subscribe(
+                &editor,
+                move |this: &mut Self, _, event: &EditorEvent, cx| {
+                    if let EditorEvent::BufferEdited = event {
+                        this.endpoint_mut(end).error = None;
+                        this.search(end, cx);
+                    }
+                },
+            ));
+            Endpoint {
+                type_name,
+                editor,
+                suggestions: Vec::new(),
+                highlighted: None,
+                picked: None,
+                generation: 0,
+                search: None,
+                error: None,
+            }
+        };
+        let from = endpoint(End::From, from_type, cx);
+        let to = endpoint(End::To, to_type, cx);
+        let fields = properties
+            .into_iter()
+            .map(|property| {
+                let editor = cx.new(|cx| {
+                    let mut editor = Editor::single_line(window, cx);
+                    editor.set_placeholder_text(&placeholder(&property), window, cx);
+                    editor
+                });
+                subscriptions.push(cx.subscribe(
+                    &editor,
+                    |this: &mut Self, editor, event: &EditorEvent, cx| {
+                        if let EditorEvent::BufferEdited = event {
+                            for field in &mut this.fields {
+                                if field.editor == editor {
+                                    field.error = None;
+                                }
+                            }
+                            cx.notify();
+                        }
+                    },
+                ));
+                Field {
+                    property,
+                    editor,
+                    error: None,
+                }
+            })
+            .collect();
+        Self {
+            table,
+            session,
+            schema,
+            edge_name,
+            branch,
+            snapshot,
+            from,
+            to,
+            fields,
+            blocked,
+            notice: None,
+            saving: false,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    fn endpoint_mut(&mut self, end: End) -> &mut Endpoint {
+        match end {
+            End::From => &mut self.from,
+            End::To => &mut self.to,
+        }
+    }
+
+    /// The endpoint whose field has focus.
+    fn focused_end(&self, window: &Window, cx: &App) -> Option<End> {
+        [End::From, End::To].into_iter().find(|end| {
+            let endpoint = match end {
+                End::From => &self.from,
+                End::To => &self.to,
+            };
+            endpoint.editor.focus_handle(cx).is_focused(window)
+        })
+    }
+
+    /// Searches the endpoint's type for its text once typing pauses.
+    fn search(&mut self, end: End, cx: &mut Context<Self>) {
+        let schema = self.schema.clone();
+        let session = self.session.clone();
+        let snapshot = self.snapshot.clone();
+        let endpoint = self.endpoint_mut(end);
+        let text = endpoint.editor.read(cx).text(cx).trim().to_owned();
+        endpoint.generation += 1;
+        let generation = endpoint.generation;
+        if text.is_empty() || endpoint.picked.as_deref() == Some(text.as_str()) {
+            endpoint.suggestions.clear();
+            endpoint.highlighted = None;
+            endpoint.search = None;
+            cx.notify();
+            return;
+        }
+        endpoint.picked = None;
+        let type_name = endpoint.type_name.clone();
+        endpoint.search = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            let Ok(query) = builder::node_search(&schema, &type_name, &text, NODE_SUGGESTIONS)
+            else {
+                return;
+            };
+            let read = cx
+                .update(|cx| session.update(cx, |session, cx| session.read(&query, snapshot, cx)));
+            let Ok(output) = read.await else { return };
+            this.update(cx, |this, cx| {
+                let endpoint = this.endpoint_mut(end);
+                if endpoint.generation != generation {
+                    return;
+                }
+                endpoint.suggestions = suggest::from_node_rows(&output.rows);
+                endpoint.highlighted = (!endpoint.suggestions.is_empty()).then_some(0);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// ↑/↓ in an endpoint field: highlights another node.
+    fn move_suggestion(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(end) = self.focused_end(window, cx) else {
+            return;
+        };
+        let endpoint = self.endpoint_mut(end);
+        let count = endpoint.suggestions.len();
+        if count == 0 {
+            return;
+        }
+        endpoint.highlighted = Some(match endpoint.highlighted {
+            None if step > 0 => 0,
+            None => count - 1,
+            Some(at) => (at as isize + step).rem_euclid(count as isize) as usize,
+        });
+        cx.notify();
+    }
+
+    /// Puts a node's id in its endpoint field and moves to the next field.
+    fn pick(&mut self, end: End, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let endpoint = self.endpoint_mut(end);
+        let Some(suggestion) = endpoint.suggestions.get(index).cloned() else {
+            return;
+        };
+        endpoint.picked = Some(suggestion.value.clone());
+        endpoint.suggestions.clear();
+        endpoint.highlighted = None;
+        let editor = endpoint.editor.clone();
+        editor.update(cx, |editor, cx| {
+            editor.set_text(suggestion.value, window, cx);
+            // Not `move_to_end`: in a single-line editor it only propagates, and the ↵ that
+            // picked would then also be typed into the field.
+            let end = editor.buffer().read(cx).read(cx).len();
+            editor.change_selections(Default::default(), window, cx, |s| {
+                s.select_ranges(vec![end..end])
+            });
+        });
+        let next = match end {
+            End::From => Some(self.to.editor.focus_handle(cx)),
+            End::To => self.fields.first().map(|f| f.editor.focus_handle(cx)),
+        };
+        if let Some(next) = next {
+            window.focus(&next, cx);
+        }
+        cx.notify();
+    }
+
+    /// ↵ picks the highlighted node in an endpoint field, and inserts otherwise.
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(end) = self.focused_end(window, cx) {
+            let endpoint = self.endpoint_mut(end);
+            if let Some(index) = endpoint.highlighted {
+                self.pick(end, index, window, cx);
+                return;
+            }
+        }
+        self.submit(window, cx);
+    }
+
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving || self.blocked.is_some() {
+            return;
+        }
+        let mut valid = true;
+        let mut ends = Vec::new();
+        for end in [End::From, End::To] {
+            let endpoint = self.endpoint_mut(end);
+            let id = endpoint.editor.read(cx).text(cx).trim().to_owned();
+            if id.is_empty() {
+                endpoint.error = Some(format!("Pick a {}.", endpoint.type_name));
+                valid = false;
+            }
+            ends.push(id);
+        }
+        let mut values: Vec<(String, Value)> = Vec::new();
+        for field in &mut self.fields {
+            let text = field.editor.read(cx).text(cx);
+            match parse_input(&field.property, &text) {
+                Ok(Value::Null) => {}
+                Ok(value) => values.push((field.property.name.clone(), value)),
+                Err(error) => {
+                    field.error = Some(error);
+                    valid = false;
+                }
+            }
+        }
+        if !valid {
+            cx.notify();
+            return;
+        }
+        let (from, to) = (ends[0].clone(), ends[1].clone());
+        let query = match builder::insert_edge(&self.schema, &self.edge_name, &from, &to, &values) {
+            Ok(query) => query,
+            Err(error) => {
+                self.notice = Some(Notice::new(Tone::Invalid, error.to_string()));
+                cx.notify();
+                return;
+            }
+        };
+        self.saving = true;
+        self.notice = None;
+        cx.notify();
+        let description = format!("Insert {} {from} → {to}", self.edge_name);
+        let write = self.session.update(cx, |session, cx| {
+            session.write(&query, None, description, cx)
+        });
+        let table = self.table.clone();
+        let branch = self.branch.clone();
+        // The write is never cancelled with the dialog: the table hears the outcome even when the
+        // dialog was closed meanwhile.
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = write.await;
+            let result = save_result(&outcome, &branch);
+            if let SaveResult::Saved { commit, parent } = &result {
+                table
+                    .update(cx, |table, cx| {
+                        table.row_inserted(None, Map::new(), commit, parent.as_deref(), cx)
+                    })
+                    .ok();
+            }
+            this.update(cx, |this, cx| {
+                this.saving = false;
+                match result {
+                    SaveResult::Saved { .. } => cx.emit(DismissEvent),
+                    SaveResult::NoMatch => {
+                        this.notice = Some(Notice::new(
+                            Tone::Refused,
+                            "Nothing was inserted: check that both nodes exist on this branch.",
+                        ));
+                    }
+                    SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
+                        this.notice = Some(notice)
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        if !self.saving {
+            cx.emit(DismissEvent);
+        }
+    }
+
+    /// Tab and shift-tab move through the endpoints, then the properties.
+    fn focus_step(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let mut handles = vec![
+            self.from.editor.focus_handle(cx),
+            self.to.editor.focus_handle(cx),
+        ];
+        handles.extend(self.fields.iter().map(|f| f.editor.focus_handle(cx)));
+        let current = handles
+            .iter()
+            .position(|handle| handle.is_focused(window))
+            .unwrap_or(0) as isize;
+        let next = (current + step).rem_euclid(handles.len() as isize) as usize;
+        window.focus(&handles[next], cx);
+    }
+
+    fn render_endpoint(
+        &self,
+        end: End,
+        label: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let endpoint = match end {
+            End::From => &self.from,
+            End::To => &self.to,
+        };
+        let colors = cx.theme().colors();
+        let highlight = colors.element_selected;
+        let focused = endpoint.editor.focus_handle(cx).is_focused(window);
+        let offers = (focused && !endpoint.suggestions.is_empty()).then(|| {
+            v_flex()
+                .id(("endpoint-suggestions", end as usize))
+                .max_h(px(208.))
+                .overflow_y_scroll()
+                .p_1()
+                .rounded_md()
+                .border_1()
+                .border_color(colors.border_variant)
+                .children(
+                    endpoint
+                        .suggestions
+                        .iter()
+                        .enumerate()
+                        .map(|(index, suggestion)| {
+                            // A node reads by its label, with its id after it.
+                            let (primary, secondary) = match &suggestion.label {
+                                Some(label) => (label.clone(), Some(suggestion.value.clone())),
+                                None => (suggestion.value.clone(), None),
+                            };
+                            h_flex()
+                                .id(("endpoint-suggestion", index))
+                                .h(px(26.))
+                                .px_2()
+                                .gap_2()
+                                .rounded_sm()
+                                .cursor_pointer()
+                                .when(endpoint.highlighted == Some(index), |row| row.bg(highlight))
+                                .hover(|row| row.bg(highlight))
+                                .child(
+                                    Label::new(primary)
+                                        .size(LabelSize::Small)
+                                        .single_line()
+                                        .truncate(),
+                                )
+                                .children(secondary.map(|id| {
+                                    Label::new(id)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .single_line()
+                                        .truncate_start()
+                                }))
+                                // On press, before the field loses focus to the click.
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.pick(end, index, window, cx);
+                                    }),
+                                )
+                        }),
+                )
+        });
+        v_flex()
+            .gap_1()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(Label::new(label.to_owned()).size(LabelSize::Small))
+                    .child(
+                        Label::new(endpoint.type_name.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new("required")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(
+                div()
+                    .key_context("EdgeEndpoint")
+                    .on_action(cx.listener(|this, _: &SelectNextSuggestion, window, cx| {
+                        this.move_suggestion(1, window, cx)
+                    }))
+                    .on_action(
+                        cx.listener(|this, _: &SelectPreviousSuggestion, window, cx| {
+                            this.move_suggestion(-1, window, cx)
+                        }),
+                    )
+                    .child(field_box(&endpoint.editor, endpoint.error.is_some(), cx)),
+            )
+            .children(offers)
+            .children(endpoint.error.clone().map(|error| {
+                Label::new(error)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Error)
+            }))
+            .into_any_element()
+    }
+}
+
+impl Render for InsertEdgeModal {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let from = self.render_endpoint(End::From, "From", window, cx);
+        let to = self.render_endpoint(End::To, "To", window, cx);
+        let fields: Vec<AnyElement> = self
+            .fields
+            .iter()
+            .map(|field| render_field(field, cx))
+            .collect();
+        let saving = self.saving;
+        let blocked = self.blocked.clone();
+        frame(cx)
+            .key_context("InsertRowModal")
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.confirm(window, cx)))
+            .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel(cx)))
+            .on_action(
+                cx.listener(|this, _: &menu::SelectNext, window, cx| {
+                    this.focus_step(1, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &menu::SelectPrevious, window, cx| {
+                this.focus_step(-1, window, cx)
+            }))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Headline::new(format!("New {}", self.edge_name)).size(HeadlineSize::Small),
+                    )
+                    .child(div().flex_1())
+                    .child(write_target(&self.branch, cx)),
+            )
+            .child(from)
+            .child(to)
+            .children(fields)
+            .children(blocked.map(|b| Label::new(b).size(LabelSize::Small).color(Color::Error)))
+            .children(self.notice.clone().map(|notice| {
+                Label::new(notice.message)
+                    .size(LabelSize::Small)
+                    .color(notice_color(notice.tone))
+            }))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .justify_end()
+                    .child(
+                        studio_ui::ds::button("cancel-insert-edge", "Cancel")
+                            .disabled(saving)
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
+                    )
+                    .child(
+                        studio_ui::ds::button(
+                            "insert-edge",
+                            if saving { "Inserting…" } else { "Insert" },
+                        )
+                        .style(ButtonStyle::Filled)
+                        .disabled(saving || self.blocked.is_some())
+                        .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
+                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                    ),
+            )
+    }
+}
+
+/// Deleting one node, confirmed by typing its key, or one edge, confirmed with the button: an
+/// edge's id is generated and removing it leaves both nodes. Bound to the commit the table was
+/// read at, so a branch that moved meanwhile refuses the delete.
 pub struct DeleteRowModal {
     table: WeakEntity<TypeTable>,
     session: Entity<GraphSession>,
@@ -393,10 +943,13 @@ pub struct DeleteRowModal {
     type_name: String,
     branch: String,
     id: String,
+    /// An edge's source and target ids; `None` for a node.
+    endpoints: Option<(String, String)>,
     if_commit: Option<String>,
     confirm: Entity<Editor>,
     notice: Option<Notice>,
     saving: bool,
+    focus_handle: FocusHandle,
     _subscription: Subscription,
 }
 
@@ -404,7 +957,10 @@ impl EventEmitter<DismissEvent> for DeleteRowModal {}
 
 impl Focusable for DeleteRowModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.confirm.focus_handle(cx)
+        match self.endpoints {
+            Some(_) => self.focus_handle.clone(),
+            None => self.confirm.focus_handle(cx),
+        }
     }
 }
 
@@ -416,6 +972,7 @@ impl DeleteRowModal {
         schema: Arc<SchemaModel>,
         type_name: String,
         id: String,
+        endpoints: Option<(String, String)>,
         if_commit: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -445,16 +1002,18 @@ impl DeleteRowModal {
             type_name,
             branch,
             id,
+            endpoints,
             if_commit,
             confirm,
             notice: None,
             saving: false,
+            focus_handle: cx.focus_handle(),
             _subscription: subscription,
         }
     }
 
     fn confirmed(&self, cx: &App) -> bool {
-        self.confirm.read(cx).text(cx).trim() == self.id
+        self.endpoints.is_some() || self.confirm.read(cx).text(cx).trim() == self.id
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -469,7 +1028,11 @@ impl DeleteRowModal {
             cx.notify();
             return;
         }
-        let query = match builder::delete_node(&self.schema, &self.type_name, &self.id) {
+        let built = match self.endpoints {
+            Some(_) => builder::delete_edge(&self.schema, &self.type_name, &self.id),
+            None => builder::delete_node(&self.schema, &self.type_name, &self.id),
+        };
+        let query = match built {
             Ok(query) => query,
             Err(error) => {
                 self.notice = Some(Notice::new(Tone::Invalid, error.to_string()));
@@ -480,7 +1043,10 @@ impl DeleteRowModal {
         self.saving = true;
         self.notice = None;
         cx.notify();
-        let description = format!("Delete {} {}", self.type_name, self.id);
+        let description = match &self.endpoints {
+            Some((from, to)) => format!("Delete {} {from} → {to}", self.type_name),
+            None => format!("Delete {} {}", self.type_name, self.id),
+        };
         let if_commit = self.if_commit.clone();
         let write = self.session.update(cx, |session, cx| {
             session.write(&query, if_commit, description, cx)
@@ -509,7 +1075,7 @@ impl DeleteRowModal {
                     SaveResult::NoMatch => {
                         this.notice = Some(Notice::new(
                             Tone::Conflict,
-                            "Nothing was deleted: the row no longer exists at the head of the branch.",
+                            "Nothing was deleted: it no longer exists at the head of the branch.",
                         ));
                     }
                     SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
@@ -534,26 +1100,42 @@ impl Render for DeleteRowModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let confirmed = self.confirmed(cx);
         let saving = self.saving;
+        let (headline, explanation) = match &self.endpoints {
+            Some((from, to)) => (
+                format!("Delete {} {from} → {to}", self.type_name),
+                format!(
+                    "This removes this {} from {}. Both nodes stay.",
+                    self.type_name, self.branch
+                ),
+            ),
+            None => (
+                format!("Delete {}", self.id),
+                format!(
+                    "This removes the {} and its relationships from {}. Type its key to confirm.",
+                    self.type_name, self.branch
+                ),
+            ),
+        };
         frame(cx)
             .key_context("DeleteRowModal")
+            .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.submit(window, cx)))
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel(cx)))
             .child(
                 h_flex()
                     .gap_2()
-                    .child(Headline::new(format!("Delete {}", self.id)).size(HeadlineSize::Small))
+                    .child(Headline::new(headline).size(HeadlineSize::Small))
                     .child(div().flex_1())
                     .child(write_target(&self.branch, cx)),
             )
             .child(
-                Label::new(format!(
-                    "This removes the {} and its relationships from {}. Type its key to confirm.",
-                    self.type_name, self.branch
-                ))
-                .size(LabelSize::Small)
-                .color(Color::Muted),
+                Label::new(explanation)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
             )
-            .child(field_box(&self.confirm, false, cx))
+            .when(self.endpoints.is_none(), |d| {
+                d.child(field_box(&self.confirm, false, cx))
+            })
             .children(self.notice.clone().map(|notice| {
                 Label::new(notice.message)
                     .size(LabelSize::Small)
@@ -575,6 +1157,9 @@ impl Render for DeleteRowModal {
                         )
                         .style(ButtonStyle::Tinted(ui::TintColor::Error))
                         .disabled(saving || !confirmed)
+                        .when(self.endpoints.is_some(), |button| {
+                            button.key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
+                        })
                         .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             )
