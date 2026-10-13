@@ -5,6 +5,7 @@
 //! configuration Zed's `tabular_data_preview` uses: resizable columns, the first column pinned,
 //! rows virtualized by `uniform_list`.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
@@ -113,6 +114,18 @@ struct DraftsBar {
     confirm_discard: bool,
 }
 
+/// How one drawn line of the grid looks.
+#[derive(Debug, Clone, Copy, Default)]
+struct RowLook {
+    picked: bool,
+    dimmed: bool,
+    cursor: bool,
+    header: bool,
+}
+
+/// How long scrolling must pause before the drawn rows' Blob cells are read.
+const BLOB_READ_AFTER: Duration = Duration::from_millis(120);
+
 /// One draft being saved: the cell, the value it showed (the save is bound to it), the new
 /// value, and the text to put back if the save does not land.
 #[derive(Debug, Clone)]
@@ -209,6 +222,11 @@ pub struct TypeTable {
     grouping: Option<Grouping>,
     /// The grouped grid's lines as this frame drew them.
     frame_lines: Option<Rc<Vec<Line>>>,
+    /// How the lines drawn this frame look, filled by the row callback for the row styling.
+    frame_looks: Rc<RefCell<HashMap<usize, RowLook>>>,
+    /// The rows whose Blob cells were last asked for, and the pause before they are read.
+    blob_rows: Option<Range<usize>>,
+    _blob_wait: Option<Task<()>>,
     /// Labels of nodes picked for "related to" filters, so their pills read by name.
     node_labels: HashMap<String, String>,
     /// The filter being written's property and operator menus; the offered values hide while
@@ -428,6 +446,9 @@ impl TypeTable {
             sort: None,
             grouping: None,
             frame_lines: None,
+            frame_looks: Rc::default(),
+            blob_rows: None,
+            _blob_wait: None,
             node_labels: HashMap::new(),
             filter_menus: Default::default(),
             toolbar_menus: Default::default(),
@@ -1544,6 +1565,8 @@ impl TypeTable {
         self.rows.clear();
         self.blobs.clear();
         self.blob_tasks.clear();
+        self.blob_rows = None;
+        self._blob_wait = None;
         self.relations.clear();
         self.relation_tasks.clear();
         self.cursor = None;
@@ -4400,48 +4423,13 @@ impl TypeTable {
             .as_ref()
             .map(|grouping| Rc::new(grouping.lines()));
         self.frame_lines = lines.clone();
-        let selection: HashSet<&str> = self.selection.iter().map(String::as_str).collect();
-        let row_at: Vec<Option<usize>> = match &lines {
-            Some(lines) => lines
-                .iter()
-                .map(|line| match line {
-                    Line::Row(row) => Some(*row),
-                    _ => None,
-                })
-                .collect(),
-            None => (0..self.rows.len()).map(Some).collect(),
-        };
-        let cursor_row = self.cursor.map(|c| c.row);
-        let picked: HashSet<usize> = row_at
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| {
-                row.and_then(|row| self.rows.get(row))
-                    .is_some_and(|row| selection.contains(row.id.as_str()))
-            })
-            .map(|(line, _)| line)
-            .collect();
+        // How each drawn line looks (picked, dimmed, the cursor's, a group header) is worked
+        // out by the row callback for the lines it draws, not for every loaded row.
+        let looks: Rc<RefCell<HashMap<usize, RowLook>>> = Rc::default();
+        self.frame_looks = looks.clone();
         let picked_bg = studio_ui::ds::surface::selected_document(cx).opacity(0.6);
-        let dimmed: HashSet<usize> = row_at
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| {
-                row.and_then(|row| self.rows.get(row))
-                    .is_some_and(|row| row.dimmed)
-            })
-            .map(|(line, _)| line)
-            .collect();
-        let cursor_line =
-            cursor_row.and_then(|cursor| row_at.iter().position(|row| *row == Some(cursor)));
-        let header_lines: HashSet<usize> = lines
-            .iter()
-            .flat_map(|lines| lines.iter())
-            .enumerate()
-            .filter(|(_, line)| matches!(line, Line::Header(_)))
-            .map(|(ix, _)| ix)
-            .collect();
         let header_bg = studio_ui::ds::surface::well(cx);
-        let line_count = row_at.len();
+        let line_count = lines.as_ref().map_or(self.rows.len(), |lines| lines.len());
         let hairline = studio_ui::ds::surface::rule(cx);
         let glass = studio_ui::ds::is_glass(cx);
         // Fixed fitted widths: Zed's resizable columns draw a full-height rule between every
@@ -4455,19 +4443,21 @@ impl TypeTable {
             .hide_row_borders()
             .pin_cols(1)
             .map_row(move |(ix, row), _window, _cx| {
+                let look = looks.borrow().get(&ix).copied().unwrap_or_default();
                 row.border_b_1()
                     .border_color(hairline)
                     .when(glass, |row| row.border_dashed())
-                    .when(header_lines.contains(&ix), |row| row.bg(header_bg))
-                    .when(picked.contains(&ix), |row| row.bg(picked_bg))
-                    .when(cursor_line == Some(ix), |row| row.bg(selected_bg))
-                    .when(dimmed.contains(&ix), |row| row.opacity(0.45))
+                    .when(look.header, |row| row.bg(header_bg))
+                    .when(look.picked, |row| row.bg(picked_bg))
+                    .when(look.cursor, |row| row.bg(selected_bg))
+                    .when(look.dimmed, |row| row.opacity(0.45))
                     .into_any_element()
             })
             .uniform_list(
                 "type-table-rows",
                 line_count,
                 cx.processor(|this, range: Range<usize>, window, cx| {
+                    this.note_looks(range.clone());
                     let Some(lines) = this.frame_lines.clone() else {
                         if this.more_error.is_none()
                             && this
@@ -4476,8 +4466,7 @@ impl TypeTable {
                         {
                             cx.defer_in(window, |this, _, cx| this.load_more(cx));
                         }
-                        let shown = range.clone();
-                        cx.defer_in(window, move |this, _, cx| this.load_blob_metas(shown, cx));
+                        this.want_blob_metas(range.clone(), cx);
                         return range.map(|ix| this.render_row(ix, window, cx)).collect();
                     };
                     let range = range.start.min(lines.len())..range.end.min(lines.len());
@@ -4508,8 +4497,7 @@ impl TypeTable {
                         })
                         .collect();
                     if let (Some(first), Some(last)) = (rows.iter().min(), rows.iter().max()) {
-                        let shown = *first..*last + 1;
-                        cx.defer_in(window, move |this, _, cx| this.load_blob_metas(shown, cx));
+                        this.want_blob_metas(*first..*last + 1, cx);
                     }
                     shown
                         .iter()
@@ -4712,6 +4700,86 @@ impl TypeTable {
         std::iter::once(first)
             .chain((1..self.columns.len()).map(|_| div().h(px(ROW_HEIGHT)).into_any_element()))
             .collect()
+    }
+
+    /// Works out how the lines `range` look, for the row styling of the lines being drawn.
+    fn note_looks(&self, range: Range<usize>) {
+        let lines = self.frame_lines.as_deref();
+        let cursor = self.cursor.map(|c| c.row);
+        let mut looks = self.frame_looks.borrow_mut();
+        for ix in range {
+            let row = match lines {
+                Some(lines) => match lines.get(ix) {
+                    Some(Line::Row(row)) => Some(*row),
+                    Some(Line::Header(_)) => {
+                        looks.insert(
+                            ix,
+                            RowLook {
+                                header: true,
+                                ..RowLook::default()
+                            },
+                        );
+                        continue;
+                    }
+                    _ => None,
+                },
+                None => Some(ix),
+            };
+            let Some((row, data)) = row.and_then(|row| Some((row, self.rows.get(row)?))) else {
+                continue;
+            };
+            looks.insert(
+                ix,
+                RowLook {
+                    picked: self.selection.iter().any(|id| *id == data.id),
+                    dimmed: data.dimmed,
+                    cursor: cursor == Some(row),
+                    header: false,
+                },
+            );
+        }
+    }
+
+    /// Asks for the Blob cells of the rows drawn, once scrolling has paused: a fast scroll
+    /// reads nothing for the rows it passes, and reads still out for rows no longer drawn are
+    /// dropped.
+    fn want_blob_metas(&mut self, rows: Range<usize>, cx: &mut Context<Self>) {
+        if self.blob_rows.as_ref() == Some(&rows) || !self.has_blob_columns() {
+            return;
+        }
+        self.blob_rows = Some(rows.clone());
+        self._blob_wait = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(BLOB_READ_AFTER).await;
+            this.update(cx, |this, cx| {
+                let drawn: HashSet<String> = this
+                    .rows
+                    .get(rows.start..rows.end.min(this.rows.len()))
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|row| row.id.clone())
+                    .collect();
+                // A read for a row scrolled away is dropped and asked again when it returns.
+                let gone: Vec<(String, String)> = this
+                    .blob_tasks
+                    .keys()
+                    .filter(|(id, _)| !drawn.contains(id))
+                    .cloned()
+                    .collect();
+                for key in gone {
+                    this.blob_tasks.remove(&key);
+                    this.blobs.remove(&key);
+                }
+                this.load_blob_metas(rows, cx);
+            })
+            .ok();
+        }));
+    }
+
+    fn has_blob_columns(&self) -> bool {
+        self.columns
+            .iter()
+            .filter_map(ColumnSpec::property)
+            .any(|p| p.kind == ScalarKind::Blob)
     }
 
     /// Reads what the Blob cells of rows `range` hold, once each, at the page's commit. Only

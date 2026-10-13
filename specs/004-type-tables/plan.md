@@ -222,6 +222,14 @@ written." plus the reason. A lost response, a timeout or a response without the 
 unknown, "Check History before trying again; your changes are still here", with a button that
 opens the branch's recent commits.
 
+### Drawing cost
+
+The table is a cached view (spec 002): it is drawn again only when it notifies. When it is, the
+row callback works out how each drawn line looks (picked, dimmed, the cursor's, a group
+header) for the lines it draws, not for every loaded row, and the grouped line list is built
+once a frame. Blob cells are read once scrolling has paused for 120 ms, for the rows then
+drawn; reads still out for rows scrolled away are dropped and asked again when they return.
+
 ## Decisions
 
 | Decision | Rejected alternatives | Why |
