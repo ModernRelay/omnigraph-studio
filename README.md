@@ -1,10 +1,14 @@
 # OmniGraph Studio
 
-A native desktop client for [OmniGraph](https://github.com/ModernRelay/omnigraph) graphs. It
-connects to an OmniGraph server over HTTP and provides a table per node and edge type, a
-relationship explorer, a GQ query editor, branch review and merge, commit history and an agent
-panel. It is written in Rust on [Zed](https://github.com/zed-industries/zed)'s GPUI and UI
-crates.
+A native desktop client for [OmniGraph](https://github.com/ModernRelay/omnigraph) graphs,
+written in Rust. It connects to an OmniGraph server over HTTP and provides a table per node and
+edge type, a relationship explorer, a GQ query editor, branch review and merge, commit history
+and an agent panel.
+
+The UI is built on [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui), the
+GPU-accelerated Rust UI framework [Zed](https://github.com/zed-industries/zed) is written in,
+together with Zed's UI, editor and theme crates. GPUI draws the interface itself; there is no
+web view.
 
 ![Studio opening a person's relationships in the explorer, then the Person table grouped by company](docs/images/explore.gif)
 
@@ -64,8 +68,9 @@ identity is configured; `script/bundle-linux` builds a tarball with a `.desktop`
   against its base row by row and revert single changes; merge, with conflicts listed when the
   server refuses.
 - **History.** Commit lane graph; open any table, query or node at an older commit, read-only.
-- **Agent panel.** Claude or Codex over the Agent Client Protocol. The agent gets an MCP server
-  proxied by Studio, writes only to a branch Studio creates for it, and never receives the token.
+- **Agent panel.** Claude or Codex over the Agent Client Protocol, each started as its own
+  `npx` process. The agent gets an MCP server proxied by Studio, writes only to a branch Studio
+  creates for it, and never receives the token.
 - **Shell.** Command palette (⌘K), go to type or node (⌘P), split panes, several windows
   restored on launch, the schema's `.pg` source, a storage inspector, and `omnigraph-studio://`
   links that open a graph, node or query without running anything. `?` lists every binding.
@@ -95,7 +100,9 @@ Studio is a client of the OmniGraph HTTP API and nothing else. These rules are i
 
 ## Architecture
 
-A crate depends only on crates in lower layers, and feature crates never depend on each other.
+Studio is a Cargo workspace (Rust 2024 edition) of 20 crates: 18 for the app and 2 for the
+tree-sitter grammars. A crate depends only on crates in lower layers, and feature crates never
+depend on each other.
 `script/check-layers.py` enforces this in CI.
 
 | Layer | Crates |
