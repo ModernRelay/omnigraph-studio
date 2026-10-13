@@ -20,6 +20,7 @@ use ui::prelude::*;
 use ui::{ContextMenu, ContextMenuEntry, Tooltip, right_click_menu};
 
 use crate::view::open_review;
+use studio_workspace::ModalView;
 
 /// Branches whose last commit is read for the list.
 const DETAIL_LIMIT: usize = 20;
@@ -347,6 +348,13 @@ pub struct CreateBranchModal {
 
 impl EventEmitter<DismissEvent> for CreateBranchModal {}
 
+impl ModalView for CreateBranchModal {
+    /// A write still running keeps the dialog open: its outcome shows here.
+    fn on_before_dismiss(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        !self.running
+    }
+}
+
 impl Focusable for CreateBranchModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.name.focus_handle(cx)
@@ -489,6 +497,13 @@ pub struct DeleteBranchModal {
 }
 
 impl EventEmitter<DismissEvent> for DeleteBranchModal {}
+
+impl ModalView for DeleteBranchModal {
+    /// A write still running keeps the dialog open: its outcome shows here.
+    fn on_before_dismiss(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        !self.running
+    }
+}
 
 impl Focusable for DeleteBranchModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {

@@ -37,6 +37,7 @@ use ui::{HighlightedLabel, ListItem, ListItemSpacing};
 use found::{Answers, Found};
 use matching::{Candidate, Group, Ranked, rank};
 pub use matching::{humanize_action_name, normalize_query};
+use studio_workspace::ModalView;
 
 /// Registers the palette with every new workspace and binds ⌘K and ⌘⇧P (Ctrl elsewhere) unless
 /// the keymap already does.
@@ -309,6 +310,8 @@ pub struct CommandPalette {
 }
 
 impl EventEmitter<DismissEvent> for CommandPalette {}
+
+impl ModalView for CommandPalette {}
 
 impl Focusable for CommandPalette {
     fn focus_handle(&self, cx: &App) -> FocusHandle {

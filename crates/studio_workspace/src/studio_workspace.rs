@@ -44,14 +44,24 @@ pub use persistence::{
     register_item_kind, restore_enabled, saved_window_bounds,
 };
 
-/// A modal: dismissing it emits [`DismissEvent`].
-pub trait ModalView: Render + Focusable + EventEmitter<DismissEvent> {}
+/// A modal: dismissing it emits [`DismissEvent`]. Following Zed's modal layer, the workspace
+/// asks [`ModalView::on_before_dismiss`] before every close.
+pub trait ModalView: Render + Focusable + EventEmitter<DismissEvent> {
+    /// Whether the modal may close now: asked on ⎋, a click outside, the same command again,
+    /// and the modal's own dismissal. A dialog with a write running says no, since closing it
+    /// would lose the outcome it shows.
+    fn on_before_dismiss(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        true
+    }
+}
 
-impl<T: Render + Focusable + EventEmitter<DismissEvent>> ModalView for T {}
+/// Asks the open modal [`ModalView::on_before_dismiss`].
+type BeforeDismiss = Box<dyn Fn(&mut Window, &mut App) -> bool>;
 
 struct ActiveModal {
     view: AnyView,
     previous_focus: Option<FocusHandle>,
+    before_dismiss: BeforeDismiss,
     _subscription: Subscription,
 }
 
@@ -214,6 +224,24 @@ impl Workspace {
         let settings_subscription =
             cx.observe_global::<StudioSettings>(|this, cx| this.show_settings_error(cx));
         let window_slot = persistence::window_opened(window, cx);
+        // A window with a write still running stays open until the write ends.
+        let this = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |_, cx| {
+            this.update(cx, |workspace, cx| match workspace.running_write(cx) {
+                Some(graph) => {
+                    workspace.show_toast(
+                        ToastKind::Error,
+                        format!(
+                            "A write to {graph} is still running. Close the window when it finishes."
+                        ),
+                        cx,
+                    );
+                    false
+                }
+                None => true,
+            })
+            .unwrap_or(true)
+        });
         let bounds_subscription = cx.observe_window_bounds(window, move |this, window, cx| {
             let bounds = window.bounds();
             this._save_bounds = Some(cx.spawn(async move |_, cx| {
@@ -633,6 +661,17 @@ impl Workspace {
             order[(position + order.len() - 1) % order.len()]
         };
         self.show_graph(next, window, cx);
+    }
+
+    /// A graph of this window, shown or parked, with a write still running: closing the window
+    /// or quitting would drop the write's outcome.
+    pub fn running_write(&self, cx: &App) -> Option<SharedString> {
+        self.session
+            .iter()
+            .chain(self.parked.iter().map(|parked| &parked.session))
+            .map(|session| session.read(cx))
+            .find(|session| session.writes_in_flight > 0)
+            .map(|session| session.graph_id.clone().into())
     }
 
     /// Closes the shown graph's tabs in this window and shows the graph opened before it. Its
@@ -1244,16 +1283,28 @@ impl Workspace {
                 this.hide_modal(window, cx);
             });
         let focus = view.focus_handle(cx);
+        let asked = view.clone();
+        let before_dismiss = Box::new(move |window: &mut Window, cx: &mut App| {
+            asked.update(cx, |modal, cx| modal.on_before_dismiss(window, cx))
+        });
         self.modal = Some(ActiveModal {
             view: view.into(),
             previous_focus,
+            before_dismiss,
             _subscription: subscription,
         });
         window.focus(&focus, cx);
         cx.notify();
     }
 
-    pub fn hide_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Closes the modal if it agrees ([`ModalView::on_before_dismiss`]); returns whether no
+    /// modal is open now.
+    pub fn hide_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Some(modal) = &self.modal
+            && !(modal.before_dismiss)(window, cx)
+        {
+            return false;
+        }
         if let Some(modal) = self.modal.take() {
             match modal.previous_focus {
                 Some(focus) => window.focus(&focus, cx),
@@ -1265,6 +1316,7 @@ impl Workspace {
             }
             cx.notify();
         }
+        true
     }
 
     pub fn has_modal(&self) -> bool {
@@ -2600,7 +2652,9 @@ impl Render for Workspace {
                     .occlude()
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _, window, cx| this.hide_modal(window, cx)),
+                        cx.listener(|this, _, window, cx| {
+                            this.hide_modal(window, cx);
+                        }),
                     )
                     .child(
                         div()
@@ -2849,6 +2903,8 @@ struct ConfirmClose {
 
 impl EventEmitter<DismissEvent> for ConfirmClose {}
 
+impl ModalView for ConfirmClose {}
+
 impl Focusable for ConfirmClose {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -2910,4 +2966,84 @@ impl Render for ConfirmClose {
 /// The workspace that owns a window, if any.
 pub fn workspace_for(window: &Window) -> Option<Entity<Workspace>> {
     window.root::<Workspace>().flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A modal standing in for a dialog whose write may be running.
+    struct Busy {
+        busy: bool,
+        focus_handle: FocusHandle,
+    }
+
+    impl EventEmitter<DismissEvent> for Busy {}
+
+    impl Focusable for Busy {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for Busy {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().track_focus(&self.focus_handle)
+        }
+    }
+
+    impl ModalView for Busy {
+        fn on_before_dismiss(&mut self, _: &mut Window, _: &mut Context<Self>) -> bool {
+            !self.busy
+        }
+    }
+
+    #[gpui::test]
+    fn a_busy_modal_stays_open_until_it_agrees(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_settings_store(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let window = cx.add_window(Workspace::new);
+        let open = |busy: bool, cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |workspace, window, cx| {
+                    workspace.toggle_modal(window, cx, |_, cx| Busy {
+                        busy,
+                        focus_handle: cx.focus_handle(),
+                    });
+                })
+                .unwrap();
+        };
+        let hide = |cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |workspace, window, cx| workspace.hide_modal(window, cx))
+                .unwrap()
+        };
+        let open_now = |cx: &mut gpui::TestAppContext| {
+            window
+                .read_with(cx, |workspace, _| workspace.has_modal())
+                .unwrap()
+        };
+
+        open(true, cx);
+        assert!(!hide(cx), "a busy modal refuses to close");
+        assert!(open_now(cx));
+        // The same command again asks too.
+        open(true, cx);
+        assert!(open_now(cx));
+        // Once the write is over it closes.
+        window
+            .update(cx, |workspace, _, cx| {
+                let modal = workspace.modal.as_ref().unwrap().view.clone();
+                modal
+                    .downcast::<Busy>()
+                    .unwrap()
+                    .update(cx, |busy, _| busy.busy = false);
+            })
+            .unwrap();
+        assert!(hide(cx));
+        assert!(!open_now(cx));
+    }
 }

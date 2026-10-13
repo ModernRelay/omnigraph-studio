@@ -14,6 +14,7 @@ use studio_ui::ds;
 use ui::prelude::*;
 
 use crate::view::ReviewView;
+use studio_workspace::ModalView;
 
 struct Field {
     property: Property,
@@ -33,6 +34,8 @@ pub(crate) struct EditModal {
 }
 
 impl EventEmitter<DismissEvent> for EditModal {}
+
+impl ModalView for EditModal {}
 
 impl Focusable for EditModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {

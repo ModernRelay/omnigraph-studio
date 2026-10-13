@@ -50,7 +50,32 @@ pub fn init(cx: &mut App) {
     studio_workspace::register_item_kind(cx, "settings", |_, workspace, window, cx| {
         open_settings(workspace, window, cx);
     });
-    cx.on_action(|_: &Quit, cx| cx.quit());
+    // A write still running keeps Studio open: quitting would lose its outcome (spec 002). The
+    // window that holds it comes forward with a toast saying so.
+    cx.on_action(|_: &Quit, cx| {
+        for handle in cx.windows() {
+            let Some(handle) = handle.downcast::<Workspace>() else {
+                continue;
+            };
+            let running = handle
+                .update(cx, |workspace, window, cx| {
+                    let graph = workspace.running_write(cx)?;
+                    workspace.show_toast(
+                        ToastKind::Error,
+                        format!("A write to {graph} is still running. Quit when it finishes."),
+                        cx,
+                    );
+                    window.activate_window();
+                    Some(())
+                })
+                .ok()
+                .flatten();
+            if running.is_some() {
+                return;
+            }
+        }
+        cx.quit();
+    });
     // The file when it exists; a run from a terminal logs to its output, so then the folder.
     cx.on_action(|_: &RevealLog, cx| {
         let file = logging::log_file();

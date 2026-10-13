@@ -31,6 +31,7 @@ use ui::{
 use crate::connection::{self, AgentConnection};
 use crate::host::AgentLaunch;
 use crate::sessions::{AgentSessions, Live, SessionRecord, graph_cwd};
+use studio_workspace::ModalView;
 
 pub const PANEL_ID: &str = "agent-conversations";
 
@@ -718,6 +719,8 @@ impl DeleteConversation {
 }
 
 impl EventEmitter<DismissEvent> for DeleteConversation {}
+
+impl ModalView for DeleteConversation {}
 
 impl Focusable for DeleteConversation {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {

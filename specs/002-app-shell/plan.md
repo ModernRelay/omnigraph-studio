@@ -67,7 +67,9 @@ tabs and back/forward trail, saved first; the sidebar footer is the switcher ("O
 window", the shown graph checked, Open Another Graph…, Close Graph) and reads "+N graphs" when
 more are open; ⌃⌘] and ⌃⌘[ step through them. Closing a graph saves its tabs (opening it
 again brings them back) and shows the one opened before; a graph with a write still running
-stays open, so the write's outcome is never dropped. Toasts follow the shown graph; a parked
+stays open, so the write's outcome is never dropped. The same holds for its window and for
+Studio: closing a window or quitting while one of its graphs has a write running is refused
+with a toast in that window, which comes forward. Toasts follow the shown graph; a parked
 graph's writes still land in its activity log. Each window's graphs (server URL, graph,
 branch, and the one shown) and bounds are written to the owner-only `session.json` as they
 change, in the order the windows opened. The next start reopens every window that has a graph
@@ -172,6 +174,14 @@ second line shows it (`omnigraph branch create feature-x --from main`).
     shared one. Views read the values in effect through `GraphSession::options`.
 - `studio_theme` implements `theme::ThemeSettingsProvider` from these settings: UI font,
   buffer font, sizes, density.
+
+### Modals
+
+A modal is a `ModalView`. As in Zed's modal layer, the workspace asks its
+`on_before_dismiss` before every close: ⎋, a click outside, the same command again, and the
+modal's own dismissal. A dialog with a write running (insert or delete a row or an edge,
+create or delete a branch) says no, so the outcome it shows is not lost and the task that
+waits for it is not dropped.
 
 ### Files, logs and the data directory
 
@@ -330,6 +340,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-13 | Files are replaced in one step and unreadable ones kept | `studio_settings` `files` tests: the whole file replaced with no temporary file left, owner-only and kept modes, a link written through, a failed rename keeping the old file, an unreadable file set aside | All pass |
 | 2026-10-13 | A development run uses its own data directory | `studio_settings` test `a_build_directory_binary_is_a_development_run_and_a_bundle_is_not`; the snapshot tool run without `OMNIGRAPH_STUDIO_DATA` | `target/debug`, `target/release-fast`, `examples` and `deps` binaries are development runs; an `.app` (also under `target/bundle`) and installed paths are not. The snapshot printed `snapshot data: …/omnigraph-studio-snapshot-<pid>` |
 | 2026-10-13 | A refused connection reads as its cause | `graph_client` test `a_transport_error_names_its_cause_and_never_the_url`; the snapshot tool against `http://127.0.0.1:9` | "Studio could not read the schema. Could not reach the server: the connection was refused"; before, the message was the client's "error sending request for url (…)" with the full URL |
+| 2026-10-13 | A busy modal stays open until it agrees | `studio_workspace` GPUI test `a_busy_modal_stays_open_until_it_agrees` (a real `Workspace` in a test window, Zed's base theme) | `hide_modal` and the same command again leave it open while busy; it closes once not. Before the change, every close went straight through |
 | 2026-10-13 | A panic message loses quoted text | `studio` test `a_panic_message_loses_the_text_it_quotes` | ``'é'`` and `` `Ada Lovelace's notes` `` become `'…'` and `` `…` ``; messages over 300 characters are cut |
 
 ## Corrections
@@ -341,6 +352,11 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
   used the person's data directory and overwrote that graph's tabs. Studio had no log, so a
   panic after a Finder launch left no trace. All four are fixed (see "Files, logs and the data
   directory").
+- 2026-10-13 · A click outside a modal, or its command again, closed it without asking, even
+  while its write ran: "New branch" then dropped the task that switches to the branch it
+  created. Quitting and closing a window did not check for running writes, although closing a
+  graph did. Modals now say whether they may close, and quitting and window closes check every
+  graph of the window.
 
 - 2026-10-12 · After a graph switch the next action went nowhere: the Open Graph modal handed
   the focus back to a tab of the graph just parked, which is no longer drawn. Parking clears the

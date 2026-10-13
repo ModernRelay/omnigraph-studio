@@ -9858,7 +9858,9 @@ dependencies = [
  "serde_json",
  "studio_actions",
  "studio_settings",
+ "studio_theme",
  "studio_ui",
+ "theme",
  "theme_settings",
  "ui",
 ]

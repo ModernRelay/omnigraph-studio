@@ -22,6 +22,8 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+studio_theme = { workspace = true }
+theme = { workspace = true }
 
 [lints]
 workspace = true

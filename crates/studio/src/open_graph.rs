@@ -10,6 +10,7 @@ use graph_store::{
     Connection, ConnectionEvent, ConnectionRegistry, ConnectionState, GraphListing, ServerSource,
     open_session,
 };
+use studio_workspace::ModalView;
 use studio_workspace::Workspace;
 use ui::prelude::*;
 use ui::{Indicator, ListItem, ListItemSpacing};
@@ -30,6 +31,8 @@ pub struct OpenGraphModal {
 }
 
 impl EventEmitter<DismissEvent> for OpenGraphModal {}
+
+impl ModalView for OpenGraphModal {}
 
 impl Focusable for OpenGraphModal {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {

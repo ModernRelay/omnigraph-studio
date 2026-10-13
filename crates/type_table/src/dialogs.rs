@@ -20,6 +20,7 @@ use crate::model::{Notice, SaveResult, Tone, parse_input, save_result};
 use crate::suggest::{self, NODE_SUGGESTIONS, Suggestion};
 use crate::table::TypeTable;
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
+use studio_workspace::ModalView;
 
 struct Field {
     property: Property,
@@ -95,6 +96,13 @@ pub struct InsertRowModal {
 }
 
 impl EventEmitter<DismissEvent> for InsertRowModal {}
+
+impl ModalView for InsertRowModal {
+    /// A write still running keeps the dialog open: its outcome shows here.
+    fn on_before_dismiss(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        !self.saving
+    }
+}
 
 impl Focusable for InsertRowModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -433,6 +441,13 @@ pub struct InsertEdgeModal {
 }
 
 impl EventEmitter<DismissEvent> for InsertEdgeModal {}
+
+impl ModalView for InsertEdgeModal {
+    /// A write still running keeps the dialog open: its outcome shows here.
+    fn on_before_dismiss(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        !self.saving
+    }
+}
 
 impl Focusable for InsertEdgeModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -885,7 +900,7 @@ impl Render for InsertEdgeModal {
         let saving = self.saving;
         let blocked = self.blocked.clone();
         frame(cx)
-            .key_context("InsertRowModal")
+            .key_context("InsertEdgeModal")
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.confirm(window, cx)))
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel(cx)))
             .on_action(
@@ -958,6 +973,13 @@ pub struct DeleteRowModal {
 }
 
 impl EventEmitter<DismissEvent> for DeleteRowModal {}
+
+impl ModalView for DeleteRowModal {
+    /// A write still running keeps the dialog open: its outcome shows here.
+    fn on_before_dismiss(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        !self.saving
+    }
+}
 
 impl Focusable for DeleteRowModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -1183,6 +1205,8 @@ pub struct SaveViewModal {
 }
 
 impl EventEmitter<DismissEvent> for SaveViewModal {}
+
+impl ModalView for SaveViewModal {}
 
 impl Focusable for SaveViewModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {

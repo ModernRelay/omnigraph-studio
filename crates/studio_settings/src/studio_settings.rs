@@ -533,6 +533,10 @@ pub fn update(cx: &mut App, f: impl FnOnce(&mut StudioSettings)) {
             "{} could not be read, so the change was not saved. Fix the file and try again.",
             path.display()
         ));
+        // The same settings again, so whatever shows the file's problem (the workspace's
+        // toast) hears of it.
+        let unchanged = StudioSettings::get(cx).clone();
+        cx.set_global(unchanged);
         cx.refresh_windows();
         return;
     }
