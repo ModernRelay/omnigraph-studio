@@ -136,6 +136,8 @@ enum Entry {
         id: String,
         title: String,
         status: ToolCallStatus,
+        /// The arguments the agent called it with, as it reported them.
+        input: Option<Value>,
     },
     Plan(Vec<(String, PlanEntryStatus)>),
     Permission(PermissionCard),
@@ -188,6 +190,8 @@ pub struct AgentPanel {
     usage: Option<Usage>,
     /// Runs of tool calls and thoughts opened to their steps, by the run's first entry.
     expanded_activity: std::collections::HashSet<usize>,
+    /// Query calls whose card is folded away, by entry.
+    folded_queries: std::collections::HashSet<usize>,
 }
 
 impl EventEmitter<ItemEvent> for AgentPanel {}
@@ -308,6 +312,7 @@ impl AgentPanel {
             setting_option: None,
             usage: None,
             expanded_activity: std::collections::HashSet::new(),
+            folded_queries: std::collections::HashSet::new(),
         };
         panel.sync_setup_state(cx);
         panel
@@ -485,6 +490,7 @@ impl AgentPanel {
         self.entries.clear();
         self.markdown.clear();
         self.expanded_activity.clear();
+        self.folded_queries.clear();
         self.usage = None;
         self.start_fresh = true;
         self.start(cx);
@@ -616,6 +622,7 @@ impl AgentPanel {
                     id: call.tool_call_id.to_string(),
                     title: call.title,
                     status: call.status,
+                    input: call.raw_input,
                 });
             }
             SessionUpdate::ToolCallUpdate(update) => {
@@ -625,6 +632,7 @@ impl AgentPanel {
                         id: existing,
                         title,
                         status,
+                        input,
                     } = entry
                         && *existing == id
                     {
@@ -633,6 +641,9 @@ impl AgentPanel {
                         }
                         if let Some(new_status) = update.fields.status {
                             *status = new_status;
+                        }
+                        if let Some(new_input) = update.fields.raw_input.clone() {
+                            *input = Some(new_input);
                         }
                         break;
                     }
@@ -1576,6 +1587,44 @@ fn gutter_row(icon: Option<Icon>, content: impl IntoElement) -> Div {
 }
 
 /// A short verb for one of Studio's tools, as Delta labels activity ("Edit", "Read").
+/// A query call the thread shows with its text: the query, and its parameters as one line
+/// ("id: p-1 · title: CTO"), when the agent reported them.
+fn shown_query(entry: &Entry) -> Option<(String, String)> {
+    let Entry::Tool { title, input, .. } = entry else {
+        return None;
+    };
+    if ToolKind::of(title) != ToolKind::Query {
+        return None;
+    }
+    let input = input.as_ref()?;
+    let text = input.get("query")?.as_str()?.to_owned();
+    let params = input
+        .get("params")
+        .and_then(Value::as_object)
+        .map(|params| {
+            params
+                .iter()
+                .map(|(name, value)| match value {
+                    Value::String(text) => format!("{name}: {text}"),
+                    other => format!("{name}: {other}"),
+                })
+                .collect::<Vec<_>>()
+                .join(" · ")
+        })
+        .unwrap_or_default();
+    Some((text, params))
+}
+
+/// Whether an entry folds into a run's summary line: thoughts, and tool calls other than the
+/// queries shown with their text.
+fn is_folded_step(entry: &Entry) -> bool {
+    match entry {
+        Entry::Thought(_) => true,
+        Entry::Tool { .. } => shown_query(entry).is_none(),
+        _ => false,
+    }
+}
+
 /// What a tool call did, for a run's summary line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolKind {
@@ -1883,11 +1932,15 @@ impl AgentPanel {
         while index < self.entries.len() {
             let entry = &self.entries[index];
             match entry {
+                Entry::Tool { .. } if shown_query(entry).is_some() => {
+                    thread = thread.child(self.render_query_call(index, entry, !marked, cx));
+                    marked = true;
+                    index += 1;
+                    continue;
+                }
                 Entry::Tool { .. } | Entry::Thought(_) => {
                     let start = index;
-                    while index < self.entries.len()
-                        && matches!(self.entries[index], Entry::Tool { .. } | Entry::Thought(_))
-                    {
+                    while index < self.entries.len() && is_folded_step(&self.entries[index]) {
                         index += 1;
                     }
                     thread = thread.child(self.render_activity(start..index, !marked, cx));
@@ -2010,6 +2063,100 @@ impl AgentPanel {
                 gutter_row(None, self.render_proposal(index, proposal, cx)).into_any_element()
             }
         }
+    }
+
+    /// A query the agent ran, as Delta shows an edit: "Query people" over the query in a code
+    /// card with the editor's colours, and its parameters under it. The line folds the card.
+    fn render_query_call(
+        &self,
+        index: usize,
+        entry: &Entry,
+        lead: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Entry::Tool { status, .. } = entry else {
+            return div().into_any_element();
+        };
+        let Some((text, params)) = shown_query(entry) else {
+            return div().into_any_element();
+        };
+        let tokens = gq_language::tokenize(&text);
+        let name = tokens
+            .iter()
+            .find(|token| token.kind == gq_language::TokenKind::QueryName)
+            .map(|token| text[token.range.clone()].to_owned());
+        let running = matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
+        let failed = matches!(status, ToolCallStatus::Failed);
+        let folded = self.folded_queries.contains(&index);
+        let header = h_flex()
+            .id(("query-call", index))
+            .gap(px(ds::space::XS))
+            .items_center()
+            .cursor_pointer()
+            .child(
+                Label::new(if running { "Running" } else { "Query" })
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .children(name.map(|name| {
+                Label::new(name)
+                    .size(LabelSize::Small)
+                    .color(Color::Default)
+                    .buffer_font(cx)
+            }))
+            .when(failed, |row| {
+                row.child(
+                    Label::new("· failed")
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
+                )
+            })
+            .child(if running {
+                Icon::new(IconName::ArrowCircle)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted)
+                    .with_rotate_animation(2)
+                    .into_any_element()
+            } else {
+                Icon::new(if folded {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element()
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.folded_queries.remove(&index) {
+                    this.folded_queries.insert(index);
+                }
+                cx.notify();
+            }));
+        let highlights = tokens.into_iter().filter_map(|token| {
+            token
+                .kind
+                .syntax_name()
+                .map(|name| (token.range.clone(), name))
+        });
+        let card = ds::code_block_highlighted(text.trim_end().to_owned(), highlights, cx);
+        gutter_row(
+            lead.then(|| {
+                Icon::new(IconName::ZedAssistant)
+                    .size(IconSize::Small)
+                    .color(Color::Muted)
+            }),
+            v_flex()
+                .w_full()
+                .gap(px(ds::space::SM))
+                .child(header)
+                .when(!folded, |column| {
+                    column.child(card).when(!params.is_empty(), |column| {
+                        column.child(ds::text::meta(params))
+                    })
+                }),
+        )
+        .into_any_element()
     }
 
     /// A run of tool calls and thoughts as one muted line ("Thought 1 time, ran 2 queries"),

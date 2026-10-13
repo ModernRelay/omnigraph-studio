@@ -129,7 +129,11 @@ tool calls and thoughts folded into one muted line that says what happened ("Tho
 read the schema, ran 2 queries", then "· 1 failed" in the error colour when a call failed), with
 a turning arrow while a step runs and a chevron that opens the steps under a hairline: each
 call by name, with no mark when it went well, a turning arrow while it runs and "… failed" in
-the error colour, and each thought's text; the plan as a list with each entry's status. Steps
+the error colour, and each thought's text. A query the agent runs is not folded: as Delta
+shows an edit, a line "Query people" (the declared name in the code font, "Running" while it
+runs, "· failed" when it failed) stands over the query in a code card with the query editor's
+colours (`TokenKind::syntax_name`, shared with spec 007's editor), with its parameters on one
+muted line under it, taken from the call's `rawInput`; the line folds the card; the plan as a list with each entry's status. Steps
 of a turn sit 12 px apart and a new question opens 16 px more. Other updates are ignored. A
 banner above the composer shows "`agent/<stamp>` · N changes · **Review**" after the first
 committed change; Review switches the session to the agent branch and opens spec 008's review.
@@ -242,6 +246,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 | 2026-10-12 | Zed's agent offers the model through ACP session options and shows context from `usage_update` | Read `agent_ui/src/config_options.rs`, `agent_servers/src/acp.rs` (`set_config_option`) and `thread_view.rs` (`render_token_usage`) at `v1.23.2`, and `SessionConfigOption`, `UsageUpdate` in `agent-client-protocol-schema` 1.9.1 | One picker per option in the agent's order, the current value's name with a chevron; the response to `session/set_config_option` replaces every option; a 16 px ring, warning colour from 85 %, used, size and cost on hover |
 | 2026-10-12 | The footer shows the agent's options and how full its context is | Offscreen snapshots with the test agent (now offering a mode and a grouped model, taking `session/set_config_option`, reporting usage after each turn): ask, open the model menu, pick Claude Opus, ↻, hover the ring | "Ask before changes ▾", "Claude Sonnet ▾", then a ring with "21%"; the menu showed the Claude and Local groups with Sonnet checked; after ↻ the new session showed Claude Opus and no ring; the tooltip read "21% of the context window · 42k of 200k tokens · 0.14 USD so far"; `preferences.json` held `"model": "opus"`, mode `0600` |
 | 2026-10-12 | The footer and thread read like Delta's | Offscreen snapshots with the test agent offering Claude's five options: two questions, open a run, open ⋯ | Footer: ring, "Ask before changes", "High", ⋯, "Claude Opus" with the Anthropic mark, ↻, send (filled with text in the composer); ⋯ held Fast mode and Agent (Default checked); each turn showed one agent mark and "Read the schema ›", "Ran 1 query ›", the first opening to "Read the schema" |
+| 2026-10-12 | A query the agent runs shows as code | Offscreen snapshot with the test agent reporting `rawInput` for its count query | "Query people ⌄" over the four-line query in a card, keywords, the query name and `Person` in the theme's syntax colours; the schema read stayed folded as "Read the schema ›" |
 
 ## Corrections
 

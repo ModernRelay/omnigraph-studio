@@ -51,16 +51,17 @@ const SYNTAX_KEY: usize = 0x6751_0000;
 const DIAGNOSTIC_KEY: usize = 0x6751_0100;
 /// The parts of the query the hovered plan operator stands for.
 const PLAN_KEY: usize = 0x6751_0200;
-const SYNTAX: [(TokenKind, &str); 9] = [
-    (TokenKind::Keyword, "keyword"),
-    (TokenKind::Variable, "variable"),
-    (TokenKind::Type, "type"),
-    (TokenKind::Property, "property"),
-    (TokenKind::Annotation, "attribute"),
-    (TokenKind::QueryName, "function"),
-    (TokenKind::String, "string"),
-    (TokenKind::Number, "number"),
-    (TokenKind::Comment, "comment"),
+/// The token kinds that take a syntax colour (`TokenKind::syntax_name`), one highlight key each.
+const SYNTAX: [TokenKind; 9] = [
+    TokenKind::Keyword,
+    TokenKind::Variable,
+    TokenKind::Type,
+    TokenKind::Property,
+    TokenKind::Annotation,
+    TokenKind::QueryName,
+    TokenKind::String,
+    TokenKind::Number,
+    TokenKind::Comment,
 ];
 
 /// A run that is ready to send.
@@ -679,9 +680,12 @@ impl QueryEditor {
             let text = editor.text(cx);
             let tokens = gq_language::tokenize(&text);
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            for (index, (kind, name)) in SYNTAX.iter().enumerate() {
+            for (index, kind) in SYNTAX.iter().enumerate() {
                 let key = HighlightKey::ConsoleAnsiHighlight(SYNTAX_KEY + index);
-                let Some(style) = theme.syntax().style_for_name(name) else {
+                let Some(style) = kind
+                    .syntax_name()
+                    .and_then(|name| theme.syntax().style_for_name(name))
+                else {
                     continue;
                 };
                 let ranges: Vec<_> = tokens

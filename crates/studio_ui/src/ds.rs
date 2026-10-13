@@ -763,6 +763,25 @@ pub fn key_hint(
 
 /// A bordered block of code or a command, as Delta draws edits and commands in a thread.
 pub fn code_block(code: impl Into<SharedString>, cx: &App) -> Div {
+    code_frame(cx).child(code.into())
+}
+
+/// [`code_block`] with syntax colours: each range takes the theme's style of that name
+/// ("keyword", "string", …), as the editor colours the same text.
+pub fn code_block_highlighted(
+    code: impl Into<SharedString>,
+    highlights: impl IntoIterator<Item = (std::ops::Range<usize>, &'static str)>,
+    cx: &App,
+) -> Div {
+    let syntax = cx.theme().syntax();
+    let highlights: Vec<_> = highlights
+        .into_iter()
+        .filter_map(|(range, name)| Some((range, syntax.style_for_name(name)?)))
+        .collect();
+    code_frame(cx).child(gpui::StyledText::new(code.into()).with_highlights(highlights))
+}
+
+fn code_frame(cx: &App) -> Div {
     let block = div()
         .w_full()
         .px(px(space::LG))
@@ -783,7 +802,6 @@ pub fn code_block(code: impl Into<SharedString>, cx: &App) -> Div {
         .font_buffer(cx)
         .text_xs()
         .text_color(cx.theme().colors().text)
-        .child(code.into())
 }
 
 /// A group of [`field`]s: rows close together, so the group reads as one block.

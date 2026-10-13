@@ -35,7 +35,7 @@ use smol::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use smol::process::{Command, Stdio as ProcessStdio};
 use smol::stream::StreamExt as _;
 
-const COUNT: &str = "query people() { match { $p: Person } return { count($p) as n } }";
+const COUNT: &str = "query people() {\n  match { $p: Person }\n  return { count($p) as n }\n}";
 const FIRST: &str =
     "query first() { match { $p: Person } return { $p } order { $p.@id asc } limit 1 }";
 const RETITLE: &str = "query retitle($id: String, $title: String) {\n  update Person set { title: $title } where @id = $id\n}";
@@ -357,15 +357,21 @@ fn say(connection: &ConnectionTo<Client>, session: &SessionId, text: &str) {
         .ok();
 }
 
+/// Reports a tool call: its start with the arguments it was called with, or its new status.
 fn tool_status(
     connection: &ConnectionTo<Client>,
     session: &SessionId,
     id: &str,
     title: &str,
     status: ToolCallStatus,
+    input: Option<Value>,
 ) {
     let update = if status == ToolCallStatus::InProgress {
-        SessionUpdate::ToolCall(ToolCall::new(id.to_owned(), title).status(status))
+        SessionUpdate::ToolCall(
+            ToolCall::new(id.to_owned(), title)
+                .status(status)
+                .raw_input(input),
+        )
     } else {
         SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
             id.to_owned(),
@@ -401,6 +407,7 @@ async fn turn(
         "schema",
         "omnigraph_schema",
         ToolCallStatus::InProgress,
+        Some(json!({})),
     );
     let (schema, _) = mcp.call("omnigraph_schema", json!({})).await?;
     tool_status(
@@ -409,6 +416,7 @@ async fn turn(
         "schema",
         "omnigraph_schema",
         ToolCallStatus::Completed,
+        None,
     );
     let types = schema
         .lines()
@@ -426,6 +434,7 @@ async fn turn(
         "count",
         "omnigraph_query",
         ToolCallStatus::InProgress,
+        Some(json!({ "query": COUNT })),
     );
     let (count, error) = mcp
         .call("omnigraph_query", json!({ "query": COUNT }))
@@ -440,6 +449,7 @@ async fn turn(
         } else {
             ToolCallStatus::Completed
         },
+        None,
     );
     let n = serde_json::from_str::<Value>(&count)
         .ok()
@@ -478,6 +488,7 @@ async fn turn(
             "propose",
             "omnigraph_propose_change",
             ToolCallStatus::InProgress,
+            None,
         );
         let (outcome, error) = mcp
             .call(
@@ -499,6 +510,7 @@ async fn turn(
             } else {
                 ToolCallStatus::Completed
             },
+            None,
         );
         say(connection, session, &format!("\n\nChange: {outcome}"));
     }
