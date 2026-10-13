@@ -9,6 +9,7 @@ publish.workspace = true
 path = "src/graph_store.rs"
 
 [dependencies]
+futures = { workspace = true }
 gpui = { workspace = true }
 graph_client = { workspace = true }
 gq_language = { workspace = true }

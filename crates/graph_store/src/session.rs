@@ -4,6 +4,8 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use futures::channel::oneshot;
+use futures::future::{Either, select};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task};
 use gq_language::{BuiltQuery, SchemaModel};
 use graph_client::api::{
@@ -306,18 +308,68 @@ impl GraphSession {
     ) -> Task<Result<ReadOutput, ReadError>> {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
+        self.counted_read(async move { client.query(&graph, &request).await }, cx)
+    }
+
+    /// Runs a read counted in [`Self::reads_in_flight`] for exactly as long as it runs. A read
+    /// nobody waits for any more (its task dropped, as a search does when the text changes)
+    /// stops, and is counted out either way: a count that only came down on an answer would
+    /// leave "queries running" up for reads that no longer exist.
+    fn counted_read<T: 'static>(
+        &mut self,
+        request: impl Future<Output = Result<T, ReadError>> + 'static,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<T, ReadError>> {
         self.reads_in_flight += 1;
         cx.emit(SessionEvent::ActivityChanged);
+        let (answer_tx, answer_rx) = oneshot::channel();
+        // Held by the caller's task: dropping that task drops this, which stops the read.
+        let (waiting_tx, waiting_rx) = oneshot::channel::<std::convert::Infallible>();
         cx.spawn(async move |this, cx| {
-            let result = client.query(&graph, &request).await;
+            let result = match select(std::pin::pin!(request), waiting_rx).await {
+                Either::Left((result, _)) => Some(result),
+                Either::Right(_) => None,
+            };
             this.update(cx, |this, cx| {
-                this.note_read(&result, cx);
+                if let Some(result) = &result {
+                    this.note_read(result, cx);
+                }
                 this.reads_in_flight = this.reads_in_flight.saturating_sub(1);
                 cx.emit(SessionEvent::ActivityChanged);
                 cx.notify();
             })
             .ok();
-            result
+            if let Some(result) = result {
+                answer_tx.send(result).ok();
+            }
+        })
+        .detach();
+        cx.spawn(async move |_, _| {
+            let _waiting = waiting_tx;
+            answer_rx.await.unwrap_or_else(|_| {
+                Err(ReadError::Transport(
+                    "Studio stopped before the server answered".into(),
+                ))
+            })
+        })
+    }
+
+    /// Runs a write to its outcome whether or not anyone still waits for it. Dropping the
+    /// caller's task must not cut a mutation off mid-flight: its outcome would go unlogged
+    /// and its count would never come down, and nothing may resend it.
+    fn to_outcome<T: 'static>(
+        work: Task<WriteOutcome<T>>,
+        cx: &mut Context<Self>,
+    ) -> Task<WriteOutcome<T>> {
+        let (outcome_tx, outcome_rx) = oneshot::channel();
+        cx.spawn(async move |_, _| {
+            outcome_tx.send(work.await).ok();
+        })
+        .detach();
+        cx.spawn(async move |_, _| {
+            outcome_rx.await.unwrap_or_else(|_| WriteOutcome::Unknown {
+                reason: "Studio stopped before the server answered".into(),
+            })
         })
     }
 
@@ -354,22 +406,16 @@ impl GraphSession {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let branch = self.branch.clone();
-        self.reads_in_flight += 1;
-        cx.emit(SessionEvent::ActivityChanged);
-        cx.spawn(async move |this, cx| {
-            let at = match &snapshot {
-                Some(commit) => BlobAt::Snapshot(commit),
-                None => BlobAt::Branch(&branch),
-            };
-            let result = client.blob_bytes(&graph, &cell, at, range).await;
-            this.update(cx, |this, cx| {
-                this.note_read(&result, cx);
-                this.reads_in_flight = this.reads_in_flight.saturating_sub(1);
-                cx.emit(SessionEvent::ActivityChanged);
-            })
-            .ok();
-            result
-        })
+        self.counted_read(
+            async move {
+                let at = match &snapshot {
+                    Some(commit) => BlobAt::Snapshot(commit),
+                    None => BlobAt::Branch(&branch),
+                };
+                client.blob_bytes(&graph, &cell, at, range).await
+            },
+            cx,
+        )
     }
 
     /// Runs a mutation on the session's branch. `if_commit` binds it to the commit it was read
@@ -405,7 +451,7 @@ impl GraphSession {
             .unwrap_or_else(|| self.branch.clone());
         self.writes_in_flight += 1;
         cx.emit(SessionEvent::ActivityChanged);
-        cx.spawn(async move |this, cx| {
+        let work = cx.spawn(async move |this, cx| {
             let outcome = client.mutate(&graph, &request, if_commit.as_deref()).await;
             let kind = match &outcome {
                 WriteOutcome::Committed(output) => OutcomeKind::Committed {
@@ -423,7 +469,8 @@ impl GraphSession {
             })
             .ok();
             outcome
-        })
+        });
+        Self::to_outcome(work, cx)
     }
 
     fn finish_write(
@@ -460,7 +507,8 @@ impl GraphSession {
         let description = format!("Create branch {name}");
         let branch = name.clone();
         self.writes_in_flight += 1;
-        cx.spawn(async move |this, cx| {
+        cx.emit(SessionEvent::ActivityChanged);
+        let work = cx.spawn(async move |this, cx| {
             let outcome = client
                 .create_branch(&graph, &BranchCreateRequest { name, from })
                 .await;
@@ -471,7 +519,8 @@ impl GraphSession {
             })
             .ok();
             outcome
-        })
+        });
+        Self::to_outcome(work, cx)
     }
 
     pub fn delete_branch(
@@ -483,7 +532,8 @@ impl GraphSession {
         let graph = self.graph_id.clone();
         let description = format!("Delete branch {name}");
         self.writes_in_flight += 1;
-        cx.spawn(async move |this, cx| {
+        cx.emit(SessionEvent::ActivityChanged);
+        let work = cx.spawn(async move |this, cx| {
             let outcome = client.delete_branch(&graph, &name).await;
             let kind = outcome_kind(&outcome, |_| None);
             this.update(cx, |this, cx| {
@@ -495,7 +545,8 @@ impl GraphSession {
             })
             .ok();
             outcome
-        })
+        });
+        Self::to_outcome(work, cx)
     }
 
     pub fn merge(
@@ -513,7 +564,8 @@ impl GraphSession {
             delete_branch: false,
         };
         self.writes_in_flight += 1;
-        cx.spawn(async move |this, cx| {
+        cx.emit(SessionEvent::ActivityChanged);
+        let work = cx.spawn(async move |this, cx| {
             let outcome = client.merge(&graph, &request).await;
             let kind = outcome_kind(&outcome, |output: &BranchMergeOutput| {
                 output.commit.as_ref().map(|c| c.graph_commit_id.clone())
@@ -523,7 +575,8 @@ impl GraphSession {
             })
             .ok();
             outcome
-        })
+        });
+        Self::to_outcome(work, cx)
     }
 }
 
@@ -617,6 +670,95 @@ mod tests {
                 session.branches.loaded().cloned(),
                 Some(vec!["main".to_owned()])
             );
+        });
+    }
+
+    /// The command palette's search drops its reads when the text changes; the count must come
+    /// down with them. A write whose task is dropped still reaches its outcome and is logged.
+    #[gpui::test]
+    async fn dropped_reads_are_counted_out_and_dropped_writes_still_finish(
+        cx: &mut TestAppContext,
+    ) {
+        let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mutations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (queries_seen, mutations_seen) = (queries.clone(), mutations.clone());
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let queries = queries_seen.clone();
+            let mutations = mutations_seen.clone();
+            async move {
+                if path.ends_with("/query") {
+                    // A read that never answers, like a slow search.
+                    queries.fetch_add(1, Ordering::SeqCst);
+                    futures::future::pending::<()>().await;
+                }
+                let body = if path.ends_with("/mutate") {
+                    mutations.fetch_add(1, Ordering::SeqCst);
+                    r#"{"error":"refused for the test"}"#
+                } else {
+                    r#"{"branches":["main"]}"#
+                };
+                let status = if path.ends_with("/mutate") { 400 } else { 200 };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+
+        let request = || QueryRequest {
+            query: "query q() { match { $p: Person } return { $p } }".into(),
+            name: Some("q".into()),
+            params: None,
+            branch: Some("main".into()),
+            snapshot: None,
+        };
+        let reads: Vec<_> = session.update(cx, |session, cx| {
+            (0..3)
+                .map(|_| session.read_request(request(), cx))
+                .collect()
+        });
+        cx.run_until_parked();
+        assert_eq!(queries.load(Ordering::SeqCst), 3);
+        session.read_with(cx, |session, _| assert_eq!(session.reads_in_flight, 3));
+        drop(reads);
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| assert_eq!(session.reads_in_flight, 0));
+
+        let write = session.update(cx, |session, cx| {
+            session.write_request(
+                ChangeRequest {
+                    query: "query w() { delete Person where @id = \"p\" }".into(),
+                    name: Some("w".into()),
+                    params: None,
+                    branch: Some("main".into()),
+                },
+                None,
+                "Delete p".into(),
+                cx,
+            )
+        });
+        drop(write);
+        cx.run_until_parked();
+        assert_eq!(mutations.load(Ordering::SeqCst), 1);
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.writes_in_flight, 0);
+            assert_eq!(session.outcomes.len(), 1);
+            assert!(matches!(
+                session.outcomes[0].outcome,
+                OutcomeKind::Refused { .. }
+            ));
         });
     }
 }

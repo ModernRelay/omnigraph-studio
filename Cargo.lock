@@ -4168,6 +4168,7 @@ name = "graph_store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "gpui",
  "gq_language",
  "graph_client",

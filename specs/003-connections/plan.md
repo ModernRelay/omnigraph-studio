@@ -78,6 +78,10 @@ from the served document).
 - Error bodies are parsed into the typed `ErrorOutput` (code, diagnostic, merge conflicts,
   precondition failure, resource limit, …) and surfaced as such.
 - Tokens, query text and row data are never logged.
+- The footer's "N queries running" and "Writing…" count requests actually in flight. A read
+  whose caller stops waiting (a search superseded by the next keystroke, a closed tab) is
+  stopped and counted out. A write runs to its outcome whoever still waits for it, and the
+  outcome is logged.
 
 ## Decisions
 
@@ -105,9 +109,16 @@ from the served document).
 | 2026-10-11 | CLI token resolution | `git show v0.13.0:crates/omnigraph-cli/src/operator.rs` | env `OMNIGRAPH_TOKEN_<NAME>`, then credentials file section; refuses over-permissive file |
 | 2026-10-12 | 429 honours `Retry-After` for reads only | `graph_client` tests `a_rate_limited_read_waits_and_goes_again_a_bounded_number_of_times`, `a_rate_limited_write_is_never_sent_again` (counted requests) | A read waits as told (≤ 30 s, 1 s when unnamed) and goes again at most twice; a write is sent once |
 | 2026-10-12 | A 503 graph is unavailable until it answers | `graph_store` test `a_graph_that_answers_503_is_unavailable_until_it_answers_again` (simulated clock) | Marked with the server's reason; asked again after 5 s, doubling to 60 s; any answer clears it. The document footer shows an amber dot by the graph with the reason |
+| 2026-10-12 | Abandoned reads leave the running count; abandoned writes still finish | `graph_store` test `dropped_reads_are_counted_out_and_dropped_writes_still_finish` (three reads that never answer, dropped; a write whose task is dropped before it ran); the same test against the earlier session code | Count back to 0 and the write sent once with its refusal logged; the earlier code left the count at 3, as the app showed "100 queries running" after four node searches over crm's 25 types |
 | 2026-10-12 | A refused token can be replaced in place | offscreen snapshot with a wrong `OMNIGRAPH_STUDIO_TOKEN`, Open Graph | "The server refused the token" with a masked field and Update token; the connection reconnects with it. A Studio server keeps it in the keychain; a CLI server for this run only. Retry when unreachable, Cancel while connecting |
 
 ## Corrections
+
+- 2026-10-12 · A read or write counted itself out only when it answered, inside the task its
+  caller held. The palette's node search drops one read per node type at each keystroke, so
+  the footer climbed to "100 queries running" on crm and stayed there; a write dropped the
+  same way would have been cut off with its outcome unlogged. Reads now stop and are counted
+  out when dropped, and writes run detached to their outcome.
 
 - 2026-10-12 · The client followed redirects: reqwest's default follows up to ten, and nothing
   overrode it. Every request now sets `RedirectPolicy::NoFollow`, so a Blob's external
