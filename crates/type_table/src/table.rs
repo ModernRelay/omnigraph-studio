@@ -50,7 +50,7 @@ use crate::model::{
     node_rows, parse_filter_list, parse_filter_value, parse_input, preset_start, relation_sample,
     row_matches, same_value, save_result, short_commit,
 };
-use crate::peek::{NodePeek, PeekSubject};
+use crate::peek::{KnownRelation, NEIGHBOUR_LIMIT, Neighbour, NodePeek, PeekSubject};
 use crate::suggest::{self, NODE_SUGGESTIONS, Suggestion};
 
 /// How often an open, visible table asks whether its branch moved (constitution II: offer
@@ -160,10 +160,13 @@ fn property_icon(property: &Property) -> IconName {
     }
 }
 
-/// One row's neighbours through one relationship: how many, and the first few.
+/// One row's neighbours through one relationship: how many, and the first few by id (as many
+/// as the peek shows; the cell shows `RELATION_CHIPS_SHOWN`). `whole` when the row's whole list
+/// was read, so these are its first ones and the peek needs no read.
 struct Relation {
     count: Result<i64, String>,
     neighbours: Vec<(String, Option<String>)>,
+    whole: bool,
 }
 
 /// `id → n` from a `page_degrees` result.
@@ -2081,10 +2084,11 @@ impl TypeTable {
                 };
                 this.update(cx, |this, cx| {
                     let mut shown: HashMap<String, Vec<(String, Option<String>)>> = HashMap::new();
+                    let read_whole = matches!(&neighbours, Some(Ok(_)));
                     if let Some(Ok(output)) = &neighbours {
                         for (id, other, label) in relation_samples(&output.rows) {
                             let list = shown.entry(id).or_default();
-                            if list.len() < RELATION_CHIPS_SHOWN {
+                            if list.len() < NEIGHBOUR_LIMIT as usize {
                                 list.push((other, label));
                             }
                         }
@@ -2096,6 +2100,7 @@ impl TypeTable {
                                 Some(error) => Err(error.clone()),
                                 None => Ok(counts.get(&id).copied().unwrap_or(0)),
                             },
+                            whole: read_whole && sampled.contains(&id),
                             neighbours: shown.remove(&id).unwrap_or_default(),
                         };
                         this.relations.insert((id, key.clone()), relation);
@@ -2525,8 +2530,40 @@ impl TypeTable {
         let id = row.id.clone();
         let session = self.session.clone();
         let snapshot = self.paging.pinned.clone();
-        let peek =
-            cx.new(|cx| NodePeek::new(session, subject, Some(values), snapshot, debounce, cx));
+        // The row's relationships as this table read them at the same commit.
+        let known: HashMap<String, KnownRelation> = match snapshot {
+            Some(_) => self
+                .relations
+                .iter()
+                .filter(|((row_id, _), _)| *row_id == id)
+                .filter_map(|((_, key), relation)| {
+                    let count = *relation.count.as_ref().ok()?;
+                    let first = relation.whole.then(|| {
+                        relation
+                            .neighbours
+                            .iter()
+                            .map(|(id, label)| Neighbour {
+                                id: id.clone(),
+                                label: label.clone(),
+                            })
+                            .collect()
+                    });
+                    Some((key.clone(), KnownRelation { count, first }))
+                })
+                .collect(),
+            None => HashMap::new(),
+        };
+        let peek = cx.new(|cx| {
+            NodePeek::new(
+                session,
+                subject,
+                Some(values),
+                snapshot,
+                known,
+                debounce,
+                cx,
+            )
+        });
         if let Some(workspace) = self.workspace.upgrade() {
             let view = peek.clone();
             workspace.update(cx, |workspace, cx| {
@@ -4746,7 +4783,7 @@ impl TypeTable {
             looks.insert(
                 ix,
                 RowLook {
-                    picked: self.selection.iter().any(|id| *id == data.id),
+                    picked: self.selection.contains(&data.id),
                     dimmed: data.dimmed,
                     cursor: cursor == Some(row),
                     header: false,
@@ -4892,6 +4929,7 @@ impl TypeTable {
         let labels: Vec<&str> = relation
             .neighbours
             .iter()
+            .take(RELATION_CHIPS_SHOWN)
             .map(|(id, label)| label.as_deref().unwrap_or(id))
             .collect();
         let fit = chips_that_fit(&labels, count, available);

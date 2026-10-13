@@ -2,6 +2,7 @@
 //! relationship groups with counts and first neighbours. Every read is pinned to the commit the
 //! row was read at, or to the first read when the node was opened by id (constitution II).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -61,6 +62,17 @@ pub struct Neighbour {
     pub label: Option<String>,
 }
 
+/// What the table already read about one of the row's relationship groups, at the peek's
+/// commit: the count, and the first neighbours when it read the row's whole list. The peek
+/// shows them rather than reading them again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KnownRelation {
+    pub count: i64,
+    /// The first `min(count, NEIGHBOUR_LIMIT)` neighbours by id, as the peek's own read
+    /// orders them; `None` when the table did not read them all.
+    pub first: Option<Vec<Neighbour>>,
+}
+
 struct Group {
     group: RelationshipGroup,
     count: Loadable<i64>,
@@ -97,6 +109,8 @@ pub struct NodePeek {
     snapshot: Option<String>,
     values: Loadable<Map<String, Value>>,
     groups: Vec<Group>,
+    /// The table's relationship reads for this row, by `builder::relationship_key`.
+    known: HashMap<String, KnownRelation>,
     copied: Option<String>,
     /// Studio committed to the peek's branch since it read: what it shows may be older.
     newer: bool,
@@ -106,13 +120,15 @@ pub struct NodePeek {
 
 impl NodePeek {
     /// A peek of a row the caller already holds (`values`) read at `snapshot`, or of a node
-    /// opened by id (`values` is `None`), which is read first. `debounce` delays the
-    /// relationship counts, for a peek that follows a moving cursor.
+    /// opened by id (`values` is `None`), which is read first. `known` holds what the caller
+    /// read about the row's relationships at `snapshot`; the rest is read. `debounce` delays
+    /// the relationship counts, for a peek that follows a moving cursor.
     pub fn new(
         session: Entity<GraphSession>,
         subject: PeekSubject,
         values: Option<Map<String, Value>>,
         snapshot: Option<String>,
+        known: HashMap<String, KnownRelation>,
         debounce: bool,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -134,6 +150,7 @@ impl NodePeek {
             snapshot,
             values: Loadable::NotLoaded,
             groups: Vec::new(),
+            known,
             copied: None,
             newer: false,
             _tasks: Vec::new(),
@@ -158,6 +175,8 @@ impl NodePeek {
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.newer = false;
         self.snapshot = None;
+        // What the table read belongs to the old commit.
+        self.known.clear();
         self.groups.clear();
         self._tasks.clear();
         self.load_node(cx);
@@ -556,6 +575,19 @@ impl NodePeek {
             })
             .collect();
         for index in 0..self.groups.len() {
+            let key = builder::relationship_key(&self.groups[index].group);
+            if let Some(known) = self.known.get(&key).cloned() {
+                let group = &mut self.groups[index];
+                group.count = Loadable::Loaded(known.count);
+                if let Some(first) = known.first {
+                    group.neighbours = Loadable::Loaded(first);
+                }
+                // A small group shows its neighbours without a click, as below.
+                if known.count > 0 && known.count <= i64::from(NEIGHBOUR_LIMIT) {
+                    self.toggle_group(index, cx);
+                }
+                continue;
+            }
             let query = match builder::degree(&schema, &type_name, &self.groups[index].group, &id) {
                 Ok(query) => query,
                 Err(error) => {

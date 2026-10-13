@@ -218,7 +218,8 @@ fn open_node(workspace: &mut Workspace, action: &OpenNode, cx: &mut Context<Work
         type_name: action.type_name.clone(),
         id: action.id.clone(),
     };
-    let peek = cx.new(|cx| NodePeek::new(session, subject, None, None, false, cx));
+    let peek =
+        cx.new(|cx| NodePeek::new(session, subject, None, None, Default::default(), false, cx));
     workspace.set_inspector(Some(peek.into()), cx);
 }
 
