@@ -663,17 +663,46 @@ pub fn explore_positions(nodes: &[LayoutNode]) -> Vec<Vec2> {
             }
             let direction = if side == 0 { 1. } else { -1. };
             let total = stacked_height(members, &height);
+            let xs: Vec<f32> = members
+                .iter()
+                .map(|&child| {
+                    let gap = match nodes[child].kind {
+                        LayoutKind::Hub => EXPLORE_HUB_GAP,
+                        LayoutKind::Node | LayoutKind::More => EXPLORE_NODE_GAP,
+                    };
+                    position[index].x + direction * (nodes[index].space + gap + nodes[child].space)
+                })
+                .collect();
+            let span = members.iter().zip(&xs).fold(
+                (f32::MAX, f32::MIN),
+                |(left, right), (&child, &x)| {
+                    (
+                        left.min(x - nodes[child].space),
+                        right.max(x + nodes[child].space),
+                    )
+                },
+            );
+            // Beside its parent, or under the column it joins; moved to the nearest room when
+            // a chip already placed (drawn earlier, or another column of this layout) is in
+            // the way. A column opened later beside one that reaches past its parent would
+            // otherwise land on it, and drawn chips never move.
+            let taken: Vec<[f32; 4]> = (0..count)
+                .filter(|j| placed[*j])
+                .map(|j| {
+                    let p = position[j];
+                    [
+                        p.x - nodes[j].space - GAP / 2.,
+                        p.x + nodes[j].space + GAP / 2.,
+                        p.y - CHIP_HALF_HEIGHT - GAP / 2.,
+                        p.y + CHIP_HALF_HEIGHT + GAP / 2.,
+                    ]
+                })
+                .collect();
             let mut top = match drawn_bottom[side] {
-                Some(bottom) => bottom,
-                None => position[index].y - total / 2.,
+                Some(bottom) => free_top(bottom, total, span, &taken, true),
+                None => free_top(position[index].y - total / 2., total, span, &taken, false),
             };
-            for &child in members {
-                let gap = match nodes[child].kind {
-                    LayoutKind::Hub => EXPLORE_HUB_GAP,
-                    LayoutKind::Node | LayoutKind::More => EXPLORE_NODE_GAP,
-                };
-                let x =
-                    position[index].x + direction * (nodes[index].space + gap + nodes[child].space);
+            for (&child, &x) in members.iter().zip(&xs) {
                 position[child] = Vec2::new(x, top + height[child] / 2.);
                 placed[child] = true;
                 top += height[child] + sibling_gap(height[child]);
@@ -682,6 +711,32 @@ pub fn explore_positions(nodes: &[LayoutNode]) -> Vec<Vec2> {
     }
     relax(nodes, &mut position, &fixed);
     position
+}
+
+/// Where a column `total` tall starts: at `ideal` when no chip in `taken` (left, right, top,
+/// bottom) crosses it within `span` (the column's left and right), else at the nearest start
+/// that no chip crosses. A column that only grows (`downward`) starts no higher than `ideal`.
+/// Below every chip always fits, so there is always an answer.
+fn free_top(ideal: f32, total: f32, span: (f32, f32), taken: &[[f32; 4]], downward: bool) -> f32 {
+    let blocks: Vec<(f32, f32)> = taken
+        .iter()
+        .filter(|[left, right, _, _]| *left < span.1 && *right > span.0)
+        .map(|[_, _, top, bottom]| (*top, *bottom))
+        .collect();
+    let fits = |start: f32| {
+        blocks
+            .iter()
+            .all(|(top, bottom)| start + total <= *top || start >= *bottom)
+    };
+    if fits(ideal) {
+        return ideal;
+    }
+    blocks
+        .iter()
+        .flat_map(|(top, bottom)| [*bottom, *top - total])
+        .filter(|start| (!downward || *start >= ideal) && fits(*start))
+        .min_by(|a, b| (a - ideal).abs().total_cmp(&(b - ideal).abs()))
+        .unwrap_or(ideal)
 }
 
 /// One row of an exploration column: a chip and the room under it.
@@ -919,10 +974,7 @@ mod tests {
         assert!(more.y > b.y, "+K more ends the column");
     }
 
-    #[test]
-    fn exploration_chips_do_not_overlap() {
-        let nodes = star(6, 8);
-        let positions = explore_positions(&nodes);
+    fn assert_apart(nodes: &[LayoutNode], positions: &[Vec2]) {
         for i in 0..nodes.len() {
             for j in i + 1..nodes.len() {
                 let d = positions[j] - positions[i];
@@ -931,6 +983,45 @@ mod tests {
                 assert!(apart_x || apart_y, "{i} and {j} overlap: {positions:?}");
             }
         }
+    }
+
+    #[test]
+    fn exploration_chips_do_not_overlap() {
+        let nodes = star(6, 8);
+        assert_apart(&nodes, &explore_positions(&nodes));
+
+        // Opened one at a time, as a person clicks: a column added later under a hub whose
+        // neighbour's column already reaches past it finds room rather than landing on a drawn
+        // chip (a person's four acquaintances, then the one who knows them).
+        let chip = |parent: Option<usize>, kind: LayoutKind, space: f32| LayoutNode {
+            parent,
+            kind,
+            space,
+            previous: None,
+        };
+        let mut nodes = vec![chip(None, LayoutKind::Node, 70.)];
+        for _ in 0..4 {
+            nodes.push(chip(Some(0), LayoutKind::Hub, 50.));
+        }
+        let settle = |nodes: &mut Vec<LayoutNode>| {
+            let positions = explore_positions(nodes);
+            assert_apart(nodes, &positions);
+            for (node, at) in nodes.iter_mut().zip(&positions) {
+                node.previous = Some(*at);
+            }
+        };
+        settle(&mut nodes);
+        let same_side: Vec<usize> = (2..5)
+            .filter(|hub| {
+                (nodes[*hub].previous.unwrap().x > 0.) == (nodes[1].previous.unwrap().x > 0.)
+            })
+            .collect();
+        for _ in 0..4 {
+            nodes.push(chip(Some(1), LayoutKind::Node, 80.));
+        }
+        settle(&mut nodes);
+        nodes.push(chip(Some(same_side[0]), LayoutKind::Node, 80.));
+        settle(&mut nodes);
     }
 
     #[test]

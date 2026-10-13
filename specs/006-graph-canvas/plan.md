@@ -112,6 +112,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | 2026-10-12 | Schema landing: types on a circle by sorted name, sized by `/snapshot` counts, one arrowed line per edge type, self-loops | offscreen snapshot, `OpenCanvas`, dev graph | Company 25, Person 200, Project 40; Knows drawn as a loop on Person (superseded by the stress layout below) |
 | 2026-10-12 | The ontology reads as a map | `layout` tests (determinism, no overlaps, related types nearer than unrelated by 1.5×, hubs central, landscape, fewer crossings and shorter edges than a ring, unrelated types beside, placed types fixed); a CRM ontology (25 types, 78 relationships) measured locally; the app on that graph | Ring 668 crossings / 78.7k px edges; map 117 / 26.5k; fit shows every type named |
 | 2026-10-12 | The explorer is a compact mind map | `layout` tests (hubs split across the root's sides, neighbours in one column beyond their hub within a chip and a gap, rectangle overlap, drawn columns grow at the bottom with "+K more" last); offscreen snapshots of Goldwasser Labs → WorksAt → Ivan Hopper expanded | One aligned column of nine people and "+1 more"; Ivan's four hubs in a column beside him; nothing drawn moved |
+| 2026-10-13 | A column opened later finds room | `layout` `exploration_chips_do_not_overlap` (a root's four hubs drawn, four neighbours under one, then one under the next hub on the same side; it overlapped before the fix); offscreen snapshots of Radia Knuth opening → Knows 4, ← Knows 1, → Contributes 1 and → WorksAt 1 in turn | Jean Shannon under Leslie Dahl, the nearest free row to "← Knows"; Ole Lamarr visible; nothing drawn moved |
 | 2026-10-12 | Exploring shares the tree's `Exploration`: hubs per group with counts, 8 neighbours then "+K more", each node drawn once, selection mirrored | snapshot Company `company-00000` with 103 incoming `WorksAt` | "← WorksAt · 103", eight people, "+95 more"; the tree's selected row is the ringed node |
 | 2026-10-12 | Canvas actions change the shared state | snapshot: tree `ShowOnCanvas` (G) on Frances Lovelace, then `canvas::ExpandNode` | Frances gets four hubs on the canvas and is expanded in the tree |
 | 2026-10-12 | Layout off the main thread is deterministic, keeps drawn nodes in place, and bounds cost at the cap | `cargo test -p graph_canvas` (`layout::tests`) | 1,999 nodes in 464 ms in an unoptimized debug build, Apple M5 Pro; same input gives the same positions |
@@ -156,6 +157,12 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   edge and as tall as what hangs off them; branches are curves leaving and arriving level.
   About a third of the old distances. Drawn nodes never move; new members join the bottom of a
   drawn column, and "+K more" ends its column. Overlap relaxation treats chips as rectangles.
+- **Columns opened later landed on drawn chips (2026-10-13).** A new column stood centred on its
+  hub whatever was already drawn there. On Radia Knuth, opening "→ Knows 4" and then "← Knows 1"
+  put Jean Shannon on Ole Lamarr: the first column reached past the second hub, and relaxation
+  could not part them, since drawn chips never move and the column had no room. A new column now
+  starts at the nearest height where no chip already placed crosses its span (a column it joins
+  only grows downward); below everything always fits.
 - **Motion (2026-10-12).** `studio_ui::motion` (after `gpui-animation`'s design: easing curves,
   `Lerp`, a retargetable `Tween`; no registry or tick thread, a view asks for frames while a
   tween runs). New nodes grow out of the node they hang off and a reset glides nodes to their
