@@ -1,10 +1,11 @@
 //! A scripted ACP agent for testing the agent panel without a model or network (spec 011).
 //!
 //! It speaks ACP v1 on stdio, starts the MCP server Studio names in `session/new` (Studio's
-//! `mcp-proxy`), and on every prompt reads the schema and counts `Person` nodes. When the prompt
-//! contains "change", it also proposes retitling the first person and reports the outcome. When
-//! it contains "cli", it asks Studio for the conversation's omnigraph CLI and retitles a person
-//! on its own branch with it (spec 013).
+//! `mcp-proxy`), and on every prompt reads the schema and counts `Person` nodes with the
+//! conversation's omnigraph CLI through Studio's `omnigraph_run` tool, as an agent whose shell has
+//! no network does (spec 013). When the prompt contains "change", it also creates its branch and
+//! retitles a person there. When it contains "cli", it runs the CLI in its own shell by the path
+//! `omnigraph_cli` gives.
 //!
 //! One process serves every session Studio opens with it. It keeps each session's transcript in
 //! the session's working directory and supports `session/load` (replaying the messages),
@@ -44,9 +45,7 @@ use smol::process::{Command, Stdio as ProcessStdio};
 use smol::stream::StreamExt as _;
 
 const COUNT: &str = "query people() {\n  match { $p: Person }\n  return { count($p) as n }\n}";
-const FIRST: &str =
-    "query first() { match { $p: Person } return { $p } order { $p.@id asc } limit 1 }";
-const RETITLE: &str = "query retitle($id: String, $title: String) {\n  update Person set { title: $title } where @id = $id\n}";
+const RETITLE: &str = "query retitle() {\n  update Person set { title: \"Retitled by the test agent\" } where @id = \"person-000000\"\n}";
 
 /// What the agent keeps about one open session. One process serves every session Studio opens
 /// with it, as Claude's ACP agent does.
@@ -493,6 +492,44 @@ fn say(connection: &ConnectionTo<Client>, session: &SessionId, text: &str) {
 }
 
 /// Reports a tool call: its start with the arguments it was called with, or its new status.
+/// Runs the CLI through `omnigraph_run`, reporting the call as a tool call with its arguments.
+/// Returns the output after the exit line, and whether it failed.
+async fn run_cli(
+    mcp: &mut Mcp,
+    connection: &ConnectionTo<Client>,
+    session: &SessionId,
+    id: &str,
+    args: Value,
+) -> Result<(String, bool), String> {
+    let input = json!({ "args": args });
+    tool_status(
+        connection,
+        session,
+        id,
+        "omnigraph_run",
+        ToolCallStatus::InProgress,
+        Some(input.clone()),
+    );
+    let (text, error) = mcp.call("omnigraph_run", input).await?;
+    tool_status(
+        connection,
+        session,
+        id,
+        "omnigraph_run",
+        if error {
+            ToolCallStatus::Failed
+        } else {
+            ToolCallStatus::Completed
+        },
+        None,
+    );
+    let output = text
+        .split_once('\n')
+        .map(|(_, rest)| rest.to_owned())
+        .unwrap_or_default();
+    Ok((if error { text } else { output }, error))
+}
+
 fn tool_status(
     connection: &ConnectionTo<Client>,
     session: &SessionId,
@@ -540,23 +577,16 @@ async fn turn(
     let server = server.ok_or("Studio offered no MCP server")?;
     let mut mcp = Mcp::start(&server).await?;
 
-    tool_status(
+    // Every step runs the conversation's omnigraph CLI through Studio's omnigraph_run tool, as
+    // an agent whose shell has no network does (spec 013).
+    let (schema, _) = run_cli(
+        &mut mcp,
         connection,
         session,
         "schema",
-        "omnigraph_schema",
-        ToolCallStatus::InProgress,
-        Some(json!({})),
-    );
-    let (schema, _) = mcp.call("omnigraph_schema", json!({})).await?;
-    tool_status(
-        connection,
-        session,
-        "schema",
-        "omnigraph_schema",
-        ToolCallStatus::Completed,
-        None,
-    );
+        json!(["schema", "show"]),
+    )
+    .await?;
     let types = schema
         .lines()
         .filter(|line| line.starts_with("node "))
@@ -566,30 +596,14 @@ async fn turn(
         session,
         &format!("The graph has {types} node types. "),
     );
-
-    tool_status(
+    let (count, _) = run_cli(
+        &mut mcp,
         connection,
         session,
         "count",
-        "omnigraph_query",
-        ToolCallStatus::InProgress,
-        Some(json!({ "query": COUNT })),
-    );
-    let (count, error) = mcp
-        .call("omnigraph_query", json!({ "query": COUNT }))
-        .await?;
-    tool_status(
-        connection,
-        session,
-        "count",
-        "omnigraph_query",
-        if error {
-            ToolCallStatus::Failed
-        } else {
-            ToolCallStatus::Completed
-        },
-        None,
-    );
+        json!(["query", "-e", COUNT, "--json"]),
+    )
+    .await?;
     let n = serde_json::from_str::<Value>(&count)
         .ok()
         .and_then(|value| value["rows"][0]["n"].as_i64());
@@ -609,49 +623,40 @@ async fn turn(
         );
     }
 
+    // "change" creates the agent's branch and retitles the first person on it.
     if prompt.contains("change") {
-        let (first, _) = mcp
-            .call("omnigraph_query", json!({ "query": FIRST }))
-            .await?;
-        let first: Value = serde_json::from_str(&first).map_err(|e| e.to_string())?;
-        let row = &first["rows"][0];
-        let id = row["p"]["@id"]
-            .as_str()
-            .or_else(|| row["@id"].as_str())
-            .or_else(|| row["p.@id"].as_str())
-            .ok_or_else(|| format!("no id in {row}"))?
-            .to_owned();
-        tool_status(
+        let (info, _) = mcp.call("omnigraph_cli", json!({})).await?;
+        let after = |marker: &str, end: &[char]| -> Option<String> {
+            let rest = info.split(marker).nth(1)?;
+            Some(rest.split(end).next()?.trim().to_owned())
+        };
+        let branch = after("Write only to your branch, ", &[':']).ok_or("no branch")?;
+        let base = after("--from ", &[' ']).ok_or("no base")?;
+        let (created, _) = run_cli(
+            &mut mcp,
             connection,
             session,
-            "propose",
-            "omnigraph_propose_change",
-            ToolCallStatus::InProgress,
-            None,
-        );
-        let (outcome, error) = mcp
-            .call(
-                "omnigraph_propose_change",
-                json!({
-                    "query": RETITLE,
-                    "params": { "id": id, "title": "Retitled by the test agent" },
-                    "summary": format!("Retitle {id}"),
-                }),
-            )
-            .await?;
-        tool_status(
+            "branch",
+            json!(["branch", "create", branch, "--from", base]),
+        )
+        .await?;
+        let (changed, _) = run_cli(
+            &mut mcp,
             connection,
             session,
-            "propose",
-            "omnigraph_propose_change",
-            if error {
-                ToolCallStatus::Failed
-            } else {
-                ToolCallStatus::Completed
-            },
-            None,
+            "retitle",
+            json!(["mutate", "--branch", branch, "-e", RETITLE]),
+        )
+        .await?;
+        say(
+            connection,
+            session,
+            &format!(
+                "\n\nChange: created {branch}: {}; retitled: {}",
+                created.lines().next().unwrap_or(""),
+                changed.lines().next().unwrap_or("")
+            ),
         );
-        say(connection, session, &format!("\n\nChange: {outcome}"));
     }
 
     // "cli" uses the conversation's omnigraph CLI (spec 013): it asks Studio for the command,

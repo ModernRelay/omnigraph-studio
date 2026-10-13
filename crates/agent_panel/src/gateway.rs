@@ -1074,6 +1074,31 @@ mod end_to_end {
             run(&home, &args)
         };
 
+        // The same CLI run from Studio for a sandboxed agent (`omnigraph_run`): a read returned
+        // whole, and one saved to a file in the working directory.
+        let read = [
+            "query",
+            "-e",
+            "query q() { match { $p: Person } return { count($p) as n } }",
+            "--json",
+        ]
+        .map(str::to_owned);
+        let checked = cli_home::check_run_args(&read, &cwd, &graph).unwrap();
+        let (text, failed) = smol::block_on(cli_home::run(&home, &cwd, checked.clone(), None));
+        assert!(
+            !failed && text.starts_with("exit 0") && text.contains("\"rows\""),
+            "{text}"
+        );
+        let saved = cli_home::within(&cwd, "count.json", true).unwrap();
+        let (text, failed) =
+            smol::block_on(cli_home::run(&home, &cwd, checked, Some(saved.clone())));
+        assert!(!failed && text.contains("output saved to"), "{text}");
+        assert!(
+            std::fs::read_to_string(&saved)
+                .unwrap()
+                .contains("\"rows\"")
+        );
+
         // A read on main.
         let (ok, out, err) = call(with(&[
             "query",

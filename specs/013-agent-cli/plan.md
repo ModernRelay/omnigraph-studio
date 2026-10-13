@@ -1,6 +1,6 @@
 # 013: The agent uses the OmniGraph CLI
 
-Status: first slice implemented · 2026-10-13
+Status: implemented; the CLI is the only graph tool · 2026-10-13
 
 ## Problem
 
@@ -207,18 +207,45 @@ session (the workspace's "Agent CLI: … committed" notice) and the agent branch
   card with Allow (⌘Y), Always on this branch (⌘⌥Y) and Reject (⌘⌥N). The CLI waits, since it has
   no timeout. Reject answers 403 and nothing is sent.
 
-### Codex
+### An agent whose shell has no network
 
 Codex's default sandbox blocks loopback, so its CLI calls fail with "server discovery connection
-failed". `AGENTS.md` tells the agent what that means: tell the person, and use the graph tools.
-Giving Codex network access (a codex-acp mode with network) lets it through, and opens all
-network, so it stays the person's choice. E24 would let the sandbox allow one socket instead.
+failed". For that agent Studio runs the CLI itself: `omnigraph_run` takes the arguments after
+`omnigraph` as a list, runs the conversation's wrapper with them (no shell, the agent's working
+directory, killed with the call), and returns the exit code, standard output and standard error.
+The same gateway, rules and cards apply, because the wrapper still speaks to the gateway.
+
+- Studio adds `--server studio` and `--graph <graph>` unless the arguments name them, and
+  refuses `--server`, `--store`, `--uri`, `--cluster`, `--profile`, `--direct`, `--managed`,
+  `--api` and `--as`, so a call cannot leave the gateway.
+- Commands: `query`, `mutate`, `load`, `branch`, `snapshot`, `export`, `blob`, `commit`,
+  `changes`, `schema show`, `graphs list`, `version`. Anything else is refused before running.
+- Files given to `--query`, `--data`, `--params-file`, `--file` and `--out`, and `save_to`, must
+  resolve inside the working directory, so the agent can process them in its own sandbox.
+- Output over 100 KB is cut with a note to use `save_to`; standard output is bounded at 64 MiB,
+  and a run at 30 minutes.
+- A call made before Studio has chosen a CLI waits for that choice instead of failing.
+
+Giving Codex network access (a codex-acp mode with network) lets its shell reach the gateway
+too, and opens all network, so it stays the person's choice. E24 would let the sandbox allow one
+socket instead.
 
 ### The MCP tools
 
-The tools of spec 011 stay: they are the path for agents without network, and
-`omnigraph_cli` is new. When every supported agent reaches the gateway, the query and propose
-tools and the `mcp-proxy` subcommand can go.
+The CLI is the agent's one way to the graph. Studio's MCP server offers two tools:
+`omnigraph_cli` (the command path, flags, branch and rules) and `omnigraph_run`. The graph tools
+of spec 011 (`omnigraph_schema`, `omnigraph_branches`, `omnigraph_query`,
+`omnigraph_propose_change`) are gone: every one of them is a CLI command, and two ways to the
+same write would split the cards and the rules.
+
+- The server's instructions reach the model; Claude Code keeps the first 2,048 characters, so the
+  server's and the conversation's instructions together stay under that (tested with a long
+  data directory).
+- A tool call that sends nothing for 30 minutes is aborted by Claude Code. A write held for
+  approval can wait that long, so Studio sends `notifications/progress` every 60 seconds while a
+  call runs, when the client gave a progress token.
+- The thread shows an `omnigraph_run` call with an inline query as a query card titled by its
+  subcommand ("Query", "Mutate"), and other calls as tool rows ("Run omnigraph").
 
 ## Decisions
 
@@ -234,6 +261,9 @@ tools and the `mcp-proxy` subcommand can go.
 | The gateway passes the upstream contract through and refuses a CLI that speaks another | Translate between contracts | The contract is an exact-match safety property. A translation layer would be a second API that drifts |
 | Studio tests each CLI once against the gateway | Map package versions to contracts | The package version does not determine the contract; a real request does, until E23 |
 | Codex gets network only when the person allows it | Always enable it; always refuse the CLI to Codex | Enabling it opens all network; refusing it gives up the CLI where the person accepts the risk |
+| The CLI is the only graph tool; `omnigraph_run` runs it for agents without network | Keep spec 011's schema, query and propose tools beside the CLI | The CLI covers every served route and composes; the old tools were a subset with their own write path. One path keeps one set of rules and cards |
+| `omnigraph_run` takes an argument list and runs the wrapper without a shell | A command string run by a shell | A list cannot smuggle a second command or a redirect, and the allowlist and file checks read the same arguments the CLI gets |
+| Long calls report MCP progress | Raise the agent's timeout | A timeout is the agent's setting and differs by agent; progress works wherever the client sends a token |
 
 ## Deferred
 
@@ -277,6 +307,12 @@ CLI is the one they trust).
 | 2026-10-13 | A conversation's home holds its config, token and wrapper | `agent_panel` `a_conversation_home_holds_its_config_token_and_wrapper` | Modes `0700`/`0600`; the wrapper unsets other OmniGraph tokens, prefixes `NO_PROXY`, sets `OMNIGRAPH_HOME`, quotes paths; the token is removed with the conversation |
 | 2026-10-13 | The agent starts without OmniGraph credentials | `agent_panel` `the_agent_starts_without_omnigraph_credentials` | OmniGraph tokens, profile, home and Studio's token are removed unless `agent.env` sets them; `ANTHROPIC_API_KEY` and `AWS_PROFILE` stay |
 | 2026-10-13 | The stock CLI reads and writes its branch through the real gateway | `agent_panel` `the_stock_cli_reads_and_writes_its_branch_through_the_gateway` (ignored; run with `STUDIO_GATEWAY_E2E_*` against `script/dev-server` and `~/.local/bin/omnigraph` 0.13.0) | Passed: a read on main; mutate on main and a branch statement refused; branch create, a mutation (1 node) and a load on the agent branch; a merge into main refused; the branch deleted |
+| 2026-10-13 | Claude Code's MCP and shell behave as the design assumes | A minimal ACP client running claude-agent-acp 0.90.0 (Claude Code 2.1.296) with a stub stdio MCP server, plus the package source | Server instructions reach the model, cut at 2,048 characters. `AGENTS.md` loads when no `CLAUDE.md` is in the working directory or above it. Bash and MCP servers inherit the agent's environment; the sandbox is off by default. A silent stdio tool call is aborted after the 30-minute idle timeout; progress notifications reset it. Every MCP tool call asks the client unless pre-allowed. An ACP `mcpServers` entry with `"type": "stdio"` is dropped |
+| 2026-10-13 | `omnigraph_run` checks its arguments | `agent_panel` `run_arguments_stay_on_the_gateway_and_in_the_working_directory` | `--server studio` and the graph added; other servers, stores, profiles, `--as` and unknown commands refused; files outside the working directory refused, including through `..` and symlinks |
+| 2026-10-13 | `omnigraph_run` reads and writes through the real gateway | The ignored end-to-end test, extended to call `cli_home::run` | A query inline and with `save_to`, the file in the working directory |
+| 2026-10-13 | A long call reports progress until it answers | `agent_panel` `a_long_call_reports_growing_progress_until_it_answers` | Progress notifications with the client's token and growing values, then the answer |
+| 2026-10-13 | The instructions fit Claude Code's cut | `a_conversation_home_holds_its_config_token_and_wrapper` | Server and conversation instructions within 2,048 characters for a CLI found, not yet found and missing, with a 120-character data directory |
+| 2026-10-13 | The panel shows `omnigraph_run` calls | Offscreen snapshot, the test agent using only `omnigraph_run` on "change please" | Schema and query rows, "Create agent/… from main · new", a "Mutate" card on the agent branch with its query, the "Agent CLI: Mutation · committed" notice and the branch banner with Review |
 | 2026-10-13 | The panel shows the agent's CLI writes | Offscreen snapshots with the test agent, which now uses `omnigraph_cli` and the real CLI on "cli" | "Create agent/… from main · Branch created", "Mutation · Committed" with the commit and 1 change, the refusal on main ending "Nothing was sent", the workspace's "Agent CLI: Mutation · committed" notice and the branch banner with Review. With `ask_before_writes`, each card waited with Allow, Always and Reject, and committed after Allow |
 
 ## Corrections
@@ -289,5 +325,8 @@ CLI is the one they trust).
   environment. An agent may need them for its model provider, so only OmniGraph's variables are
   removed.
 - 2026-10-13 · The draft made "Ask before writes" a footer toggle and dropped the query tools once
-  the CLI answered. The first slice has a setting, and keeps every tool; MCP has no way to drop a
+  the CLI answered. The first slice has a setting, and kept every tool; MCP has no way to drop a
   tool mid-session without `listChanged`.
+- 2026-10-13 · The first slice told an agent without network to fall back to the graph tools.
+  Codex's default sandbox is such an agent, so the person lost the CLI there. `omnigraph_run`
+  now runs the CLI for it, and the graph tools are removed: the CLI is the one path.

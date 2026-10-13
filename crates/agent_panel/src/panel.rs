@@ -18,9 +18,6 @@ use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
     ListAlignment, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
 };
-use gq_language::QueryInfo;
-use graph_client::WriteOutcome;
-use graph_client::api::{ChangeOutput, ChangeRequest, QueryRequest};
 use graph_store::{GraphSession, OutcomeKind};
 use serde_json::{Map, Value};
 use studio_actions::agent::{Allow, AllowAlways, ClearQueue, Reject, Restart, Send, SendNow, Stop};
@@ -40,7 +37,7 @@ use crate::gateway_rules::{Sandbox, WriteSummary};
 use crate::host::{AgentLaunch, HostCommand, HostEvent, Opened, SessionLaunch};
 use crate::sessions::{AgentSessions, Live, SessionRecord};
 use crate::socket::{ToolRequest, ToolSocket};
-use crate::tools::{self, ToolCall};
+use crate::tools::ToolCall;
 
 /// Presets offered when no agent is set: the ACP crate's own preset commands.
 pub const PRESETS: &[(&str, &[&str])] = &[
@@ -414,6 +411,8 @@ pub struct AgentPanel {
     /// Whether a CLI that speaks the graph's API was found for this conversation (spec 013);
     /// `None` while Studio looks.
     cli_ready: Option<bool>,
+    /// `omnigraph_run` calls made while Studio looks, answered once it knows.
+    cli_waiting: Vec<oneshot::Sender<()>>,
     /// The card of each write the gateway forwards, by the gateway's id: the entry, whether
     /// the write creates the agent's branch, and its summary.
     gateway_cards: std::collections::HashMap<u64, (usize, bool, String)>,
@@ -601,6 +600,7 @@ impl AgentPanel {
             folded_queries: std::collections::HashSet::new(),
             queue: MessageQueue::default(),
             cli_ready: None,
+            cli_waiting: Vec::new(),
             gateway_cards: std::collections::HashMap::new(),
         };
         panel.sync_setup_state(cx);
@@ -706,6 +706,7 @@ impl AgentPanel {
         let graph = self.session.read(cx).graph_id.clone();
         let (gateway_tx, mut gateway_rx) = mpsc::unbounded::<GatewayEvent>();
         self.cli_ready = None;
+        self.cli_waiting.clear();
         self.gateway_cards.clear();
         let gateway = Gateway::bind().and_then(|mut gateway| {
             let home = CliHome::write(
@@ -735,7 +736,7 @@ impl AgentPanel {
                 self.entries.push(Entry::Notice {
                     text: format!(
                         "Studio could not set up the omnigraph CLI for this conversation \
-                         ({error}). The agent can still use the graph tools."
+                         ({error}), so the agent cannot reach the graph."
                     ),
                     error: true,
                 });
@@ -1430,265 +1431,17 @@ impl AgentPanel {
             arguments,
             reply,
         } = request;
-        let call = match ToolCall::parse(&name, &arguments) {
-            Ok(call) => call,
+        match ToolCall::parse(&name, &arguments) {
+            Ok(ToolCall::Cli) => {
+                reply.send(self.cli_instructions()).ok();
+            }
+            Ok(ToolCall::Run { args, save_to }) => {
+                self.run_cli(&args, save_to.as_deref(), reply, cx);
+            }
             Err(error) => {
                 reply.send((error, true)).ok();
-                return;
-            }
-        };
-        if call == ToolCall::Cli {
-            reply.send(self.cli_instructions()).ok();
-            return;
-        }
-        let session = self.session.read(cx);
-        let Some(schema) = session.schema_model() else {
-            reply
-                .send((
-                    "The schema is still loading; try again in a moment.".into(),
-                    true,
-                ))
-                .ok();
-            return;
-        };
-        let person_branch = session.branch.clone();
-        let agent_branch = self
-            .branch
-            .as_ref()
-            .filter(|branch| branch.created)
-            .map(|branch| branch.name.clone());
-
-        match call {
-            // Answered above, before the schema is needed.
-            ToolCall::Cli => {}
-            ToolCall::Schema => {
-                reply.send((tools::describe_schema(&schema), false)).ok();
-            }
-            ToolCall::Branches => {
-                let Some(branches) = session.branches.loaded().cloned() else {
-                    reply
-                        .send(("The branch list is still loading.".into(), true))
-                        .ok();
-                    return;
-                };
-                let mut text = String::new();
-                for branch in branches {
-                    let mark = if branch == person_branch {
-                        " (the person's branch)"
-                    } else if agent_branch.as_deref() == Some(branch.as_str()) {
-                        " (your branch)"
-                    } else {
-                        ""
-                    };
-                    text.push_str(&format!("{branch}{mark}\n"));
-                }
-                if agent_branch.is_none()
-                    && let Some(branch) = &self.branch
-                {
-                    text.push_str(&format!(
-                        "\nYour branch will be {} once you propose a change.\n",
-                        branch.name
-                    ));
-                }
-                reply.send((text, false)).ok();
-            }
-            ToolCall::Query {
-                query,
-                name,
-                params,
-                branch,
-            } => {
-                let check = gq_language::check(&schema, &query);
-                let info: QueryInfo = match tools::select_query(&check, name.as_deref(), false) {
-                    Ok(info) => info,
-                    Err(error) => {
-                        reply.send((error, true)).ok();
-                        return;
-                    }
-                };
-                let branch = branch.or(agent_branch).unwrap_or(person_branch);
-                let request = QueryRequest {
-                    query,
-                    name: Some(info.name),
-                    params: params.map(Value::Object),
-                    branch: Some(branch.clone()),
-                    snapshot: None,
-                };
-                let read = self
-                    .session
-                    .update(cx, |session, cx| session.read_request(request, cx));
-                cx.spawn(async move |_, _| {
-                    let result = match read.await {
-                        Ok(output) => (
-                            tools::describe_rows(
-                                &branch,
-                                &output.columns,
-                                &output.rows,
-                                output.graph_commit_id.as_deref(),
-                            ),
-                            false,
-                        ),
-                        Err(error) => (format!("The read failed: {error}"), true),
-                    };
-                    reply.send(result).ok();
-                })
-                .detach();
-            }
-            ToolCall::Propose {
-                query,
-                name,
-                params,
-                summary,
-            } => {
-                let check = gq_language::check(&schema, &query);
-                let info = match tools::select_query(&check, name.as_deref(), true) {
-                    Ok(info) => info,
-                    Err(error) => {
-                        reply.send((error, true)).ok();
-                        return;
-                    }
-                };
-                self.propose(query, info.name, params, summary, reply, cx);
             }
         }
-    }
-
-    fn propose(
-        &mut self,
-        query: String,
-        query_name: String,
-        params: Option<Map<String, Value>>,
-        summary: String,
-        reply: oneshot::Sender<(String, bool)>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(branch) = &self.branch else {
-            reply
-                .send(("The agent session has no branch.".into(), true))
-                .ok();
-            return;
-        };
-        let (decide_tx, decide_rx) = oneshot::channel();
-        let index = self.entries.len();
-        self.entries.push(Entry::Proposal(Proposal {
-            summary,
-            query: query.clone(),
-            params: params.clone(),
-            branch: branch.name.clone(),
-            creates_from: (!branch.created).then(|| branch.base.clone()),
-            state: ProposalState::Waiting(decide_tx),
-        }));
-        if self.always_allow {
-            self.decide(index, Decision::Allow, cx);
-        }
-        self.thread.scroll_to_end();
-        cx.notify();
-
-        cx.spawn(async move |this, cx| {
-            let decision = decide_rx.await.unwrap_or(Decision::Reject);
-            if let Decision::Reject = decision {
-                this.update(cx, |this, cx| {
-                    this.set_proposal_state(index, ProposalState::Rejected, cx)
-                })
-                .ok();
-                reply
-                    .send(("The person rejected this change.".into(), true))
-                    .ok();
-                return;
-            }
-
-            // Create the agent's branch on its first approved change.
-            let create = this
-                .update(cx, |this, cx| {
-                    if let Decision::AllowAlways = decision {
-                        this.always_allow = true;
-                    }
-                    let branch = this.branch.as_ref()?;
-                    if branch.created {
-                        return None;
-                    }
-                    let (name, base) = (branch.name.clone(), branch.base.clone());
-                    Some(this.session.update(cx, |session, cx| {
-                        session.create_branch(name, Some(base), cx)
-                    }))
-                })
-                .ok()
-                .flatten();
-            if let Some(create) = create {
-                match create.await {
-                    WriteOutcome::Committed(_) => {
-                        this.update(cx, |this, cx| {
-                            if let Some(branch) = &mut this.branch {
-                                branch.created = true;
-                            }
-                            this.remember_session(cx);
-                        })
-                        .ok();
-                    }
-                    WriteOutcome::Refused(error) => {
-                        let message = format!(
-                            "Studio could not create the agent's branch: {}",
-                            error.body.error
-                        );
-                        this.update(cx, |this, cx| {
-                            this.set_proposal_state(
-                                index,
-                                ProposalState::Refused(message.clone()),
-                                cx,
-                            )
-                        })
-                        .ok();
-                        reply.send((message, true)).ok();
-                        return;
-                    }
-                    WriteOutcome::Unknown { reason } => {
-                        let message = format!(
-                            "Studio could not confirm the agent's branch was created ({reason}). \
-                             Nothing else was sent."
-                        );
-                        this.update(cx, |this, cx| {
-                            this.set_proposal_state(index, ProposalState::Unknown, cx)
-                        })
-                        .ok();
-                        reply.send((message, true)).ok();
-                        return;
-                    }
-                }
-            }
-
-            let write = this
-                .update(cx, |this, cx| {
-                    let branch = this.branch.as_ref()?.name.clone();
-                    let request = ChangeRequest {
-                        query,
-                        name: Some(query_name),
-                        params: params.map(Value::Object),
-                        branch: Some(branch.clone()),
-                    };
-                    Some(this.session.update(cx, |session, cx| {
-                        session.write_request(request, None, "Agent change".to_owned(), cx)
-                    }))
-                })
-                .ok()
-                .flatten();
-            let Some(write) = write else {
-                reply.send(("The agent session ended.".into(), true)).ok();
-                return;
-            };
-            let outcome = write.await;
-            let (state, text, is_error) = describe_outcome(&outcome);
-            let committed =
-                matches!(&outcome, WriteOutcome::Committed(output) if output.commit.is_some());
-            this.update(cx, |this, cx| {
-                if committed && let Some(branch) = &mut this.branch {
-                    branch.changes += 1;
-                }
-                this.set_proposal_state(index, state, cx);
-            })
-            .ok();
-            reply.send((text, is_error)).ok();
-        })
-        .detach();
     }
 
     fn apply_gateway(&mut self, event: GatewayEvent, cx: &mut Context<Self>) {
@@ -1833,18 +1586,88 @@ impl AgentPanel {
     /// Studio found (or did not find) a CLI that speaks the graph's API for this conversation.
     fn cli_chosen(&mut self, chosen: Option<PathBuf>, cx: &mut Context<Self>) {
         self.cli_ready = Some(chosen.is_some());
+        for waiting in self.cli_waiting.drain(..) {
+            waiting.send(()).ok();
+        }
         if chosen.is_none() {
             self.entries.push(Entry::Notice {
                 text: format!(
-                    "No omnigraph CLI here speaks this graph's HTTP API ({}), so the agent uses \
-                     the graph tools. Install a matching omnigraph CLI, or set \
-                     `agent.omnigraph_cli`, to let it use the CLI.",
+                    "No omnigraph CLI here speaks this graph's HTTP API ({}), so the agent \
+                     cannot reach the graph. Install a matching omnigraph CLI, or set \
+                     `agent.omnigraph_cli`.",
                     graph_client::SUPPORTED_CONTRACTS[0]
                 ),
                 error: false,
             });
         }
         cx.notify();
+    }
+
+    /// Runs the conversation's CLI for the agent from Studio (`omnigraph_run`, spec 013), for an
+    /// agent whose sandbox cannot reach the gateway. The arguments are checked first, since the
+    /// CLI then runs outside the agent's sandbox.
+    fn run_cli(
+        &mut self,
+        args: &[String],
+        save_to: Option<&str>,
+        reply: oneshot::Sender<(String, bool)>,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(home), Some(cwd)) = (
+            self.host.as_ref().and_then(|host| host.cli_home.clone()),
+            self.cwd.clone(),
+        ) else {
+            reply.send(self.cli_instructions()).ok();
+            return;
+        };
+        match self.cli_ready {
+            Some(true) => {}
+            None => {
+                // The call waits until Studio has found (or not found) the CLI.
+                let (ready, known) = oneshot::channel();
+                self.cli_waiting.push(ready);
+                let (args, save_to) = (args.to_vec(), save_to.map(str::to_owned));
+                cx.spawn(async move |this, cx| {
+                    if known.await.is_err() {
+                        reply
+                            .send((
+                                "The conversation ended before the command ran.".into(),
+                                true,
+                            ))
+                            .ok();
+                        return;
+                    }
+                    this.update(cx, |this, cx| {
+                        this.run_cli(&args, save_to.as_deref(), reply, cx)
+                    })
+                    .ok();
+                })
+                .detach();
+                return;
+            }
+            Some(false) => {
+                reply.send(self.cli_instructions()).ok();
+                return;
+            }
+        }
+        let checked = cli_home::check_run_args(args, &cwd, &home.graph).and_then(|args| {
+            let save = save_to
+                .map(|path| cli_home::within(&cwd, path, true))
+                .transpose()?;
+            Ok((args, save))
+        });
+        let (args, save) = match checked {
+            Ok(checked) => checked,
+            Err(message) => {
+                reply.send((message, true)).ok();
+                return;
+            }
+        };
+        cx.background_spawn(async move {
+            let answer = cli_home::run(&home, &cwd, args, save).await;
+            reply.send(answer).ok();
+        })
+        .detach();
     }
 
     /// What the `omnigraph_cli` tool answers: this conversation's CLI, or why it has none.
@@ -1855,9 +1678,7 @@ impl AgentPanel {
                 ready => (home.instructions(ready), false),
             },
             None => (
-                "The omnigraph CLI is not available in this conversation. Use the omnigraph_* \
-                 tools."
-                    .into(),
+                "The omnigraph CLI is not available in this conversation; tell the person.".into(),
                 true,
             ),
         }
@@ -1896,37 +1717,6 @@ fn proxy_executable(current: PathBuf) -> PathBuf {
         return PathBuf::from(path);
     }
     current
-}
-
-fn describe_outcome(outcome: &WriteOutcome<ChangeOutput>) -> (ProposalState, String, bool) {
-    match outcome {
-        WriteOutcome::Committed(output) => {
-            let state = ProposalState::Committed {
-                commit: output.commit.as_ref().map(|c| c.graph_commit_id.clone()),
-                nodes: output.affected_nodes,
-                edges: output.affected_edges,
-            };
-            let text = match &output.commit {
-                Some(commit) => format!(
-                    "Committed on {}: commit {}, {} nodes and {} edges changed.",
-                    output.branch,
-                    commit.graph_commit_id,
-                    output.affected_nodes,
-                    output.affected_edges
-                ),
-                None => "Nothing changed: the mutation matched no rows.".to_owned(),
-            };
-            (state, text, false)
-        }
-        WriteOutcome::Refused(error) => {
-            let text = format!(
-                "Refused by the server ({}): {}",
-                error.status, error.body.error
-            );
-            (ProposalState::Refused(text.clone()), text, true)
-        }
-        WriteOutcome::Unknown { .. } => (ProposalState::Unknown, UNKNOWN_OUTCOME.to_owned(), true),
-    }
 }
 
 /// The last eight characters of a graph commit id, as the activity log shows it.
@@ -2284,30 +2074,33 @@ fn gutter_row(icon: Option<Icon>, content: impl IntoElement) -> Div {
 /// A short verb for one of Studio's tools, as Delta labels activity ("Edit", "Read").
 /// A query call the thread shows with its text: the query, and its parameters as one line
 /// ("id: p-1 · title: CTO"), when the agent reported them.
-fn shown_query(entry: &Entry) -> Option<(String, String)> {
+/// An `omnigraph_run` call shown with its query: the subcommand ("query", "mutate"), the
+/// query text given with `-e`, and the other arguments on one line.
+fn shown_query(entry: &Entry) -> Option<(String, String, String)> {
     let Entry::Tool { title, input, .. } = entry else {
         return None;
     };
-    if ToolKind::of(title) != ToolKind::Query {
+    if ToolKind::of(title) != ToolKind::Run {
         return None;
     }
-    let input = input.as_ref()?;
-    let text = input.get("query")?.as_str()?.to_owned();
-    let params = input
-        .get("params")
-        .and_then(Value::as_object)
-        .map(|params| {
-            params
-                .iter()
-                .map(|(name, value)| match value {
-                    Value::String(text) => format!("{name}: {text}"),
-                    other => format!("{name}: {other}"),
-                })
-                .collect::<Vec<_>>()
-                .join(" · ")
-        })
-        .unwrap_or_default();
-    Some((text, params))
+    let args: Vec<&str> = input
+        .as_ref()?
+        .get("args")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let at = args.iter().position(|arg| *arg == "-e")?;
+    let text = (*args.get(at + 1)?).to_owned();
+    let command = (*args.first()?).to_owned();
+    let rest = args
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != 0 && *index != at && *index != at + 1)
+        .map(|(_, arg)| *arg)
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some((command, text, rest))
 }
 
 /// Whether an entry folds into a run's summary line: thoughts, and tool calls other than the
@@ -2323,23 +2116,17 @@ fn is_folded_step(entry: &Entry) -> bool {
 /// What a tool call did, for a run's summary line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolKind {
-    Schema,
-    Branches,
-    Query,
-    Propose,
+    Cli,
+    Run,
     Other,
 }
 
 impl ToolKind {
     fn of(title: &str) -> Self {
-        if title.contains("omnigraph_schema") {
-            Self::Schema
-        } else if title.contains("omnigraph_branches") {
-            Self::Branches
-        } else if title.contains("omnigraph_query") {
-            Self::Query
-        } else if title.contains("omnigraph_propose_change") {
-            Self::Propose
+        if title.contains("omnigraph_cli") {
+            Self::Cli
+        } else if title.contains("omnigraph_run") {
+            Self::Run
         } else {
             Self::Other
         }
@@ -2348,11 +2135,8 @@ impl ToolKind {
     fn phrase(self, count: usize) -> String {
         let plural = |one: &str, many: &str| if count == 1 { one } else { many }.to_owned();
         match self {
-            Self::Schema if count == 1 => "read the schema".into(),
-            Self::Schema => format!("read the schema {count} times"),
-            Self::Branches => "listed branches".into(),
-            Self::Query => format!("ran {count} {}", plural("query", "queries")),
-            Self::Propose => format!("proposed {count} {}", plural("change", "changes")),
+            Self::Cli => "looked up the CLI".into(),
+            Self::Run => format!("ran {count} omnigraph {}", plural("command", "commands")),
             Self::Other => format!("used {count} {}", plural("tool", "tools")),
         }
     }
@@ -2387,16 +2171,10 @@ fn activity_summary(thoughts: usize, tools: &[ToolKind]) -> String {
 }
 
 fn tool_verb(title: &str) -> String {
-    if title.contains("omnigraph_schema") {
-        "Read the schema".into()
-    } else if title.contains("omnigraph_branches") {
-        "List branches".into()
-    } else if title.contains("omnigraph_query") {
-        "Query".into()
-    } else if title.contains("omnigraph_propose_change") {
-        "Propose a change".into()
-    } else {
-        title.to_owned()
+    match ToolKind::of(title) {
+        ToolKind::Cli => "Look up the CLI".into(),
+        ToolKind::Run => "Run omnigraph".into(),
+        ToolKind::Other => title.to_owned(),
     }
 }
 
@@ -2903,7 +2681,7 @@ impl AgentPanel {
         let Entry::Tool { status, .. } = entry else {
             return div().into_any_element();
         };
-        let Some((text, params)) = shown_query(entry) else {
+        let Some((command, text, params)) = shown_query(entry) else {
             return div().into_any_element();
         };
         let tokens = gq_language::tokenize(&text);
@@ -2920,9 +2698,18 @@ impl AgentPanel {
             .items_center()
             .cursor_pointer()
             .child(
-                Label::new(if running { "Running" } else { "Query" })
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
+                Label::new(if running {
+                    "Running".to_owned()
+                } else {
+                    // "Query people", "Mutate retitle": the CLI's subcommand, capitalized.
+                    let mut chars = command.chars();
+                    chars
+                        .next()
+                        .map(|first| first.to_uppercase().chain(chars).collect())
+                        .unwrap_or_default()
+                })
+                .size(LabelSize::Small)
+                .color(Color::Muted),
             )
             .children(name.map(|name| {
                 Label::new(name)
@@ -3712,17 +3499,16 @@ mod tests {
     #[test]
     fn a_run_of_steps_reads_as_one_sentence() {
         use ToolKind::*;
-        assert_eq!(activity_summary(1, &[Query]), "Thought 1 time, ran 1 query");
         assert_eq!(
-            activity_summary(0, &[Schema, Query, Query, Other]),
-            "Read the schema, ran 2 queries, used 1 tool"
+            activity_summary(1, &[Run]),
+            "Thought 1 time, ran 1 omnigraph command"
+        );
+        assert_eq!(
+            activity_summary(0, &[Cli, Run, Run, Other]),
+            "Looked up the CLI, ran 2 omnigraph commands, used 1 tool"
         );
         assert_eq!(activity_summary(2, &[]), "Thought 2 times");
-        assert_eq!(
-            activity_summary(0, &[Propose, Query, Propose]),
-            "Proposed 2 changes, ran 1 query"
-        );
-        assert_eq!(ToolKind::of("mcp__omnigraph__omnigraph_query"), Query);
+        assert_eq!(ToolKind::of("mcp__omnigraph__omnigraph_run"), Run);
     }
 
     #[test]

@@ -103,8 +103,9 @@ impl CliHome {
         let flags = format!("--server studio --graph {}", self.graph);
         match cli_ready {
             Some(false) => format!(
-                "Studio found no omnigraph CLI that speaks this graph's HTTP API, so the CLI is \
-                 not available in this conversation. Use the omnigraph_* tools. Your branch is \
+                "Studio found no omnigraph CLI that speaks this graph's HTTP API, so the graph is \
+                 not available in this conversation. Tell the person: they can install a \
+                 matching omnigraph CLI or set `agent.omnigraph_cli`. Your branch would be \
                  {branch}.",
                 branch = self.branch
             ),
@@ -115,7 +116,9 @@ impl CliHome {
                  `{command} branch create {branch} --from {base} {flags}`, then pass \
                  `--branch {branch}` to mutate and load. Prefer one load of NDJSON to many \
                  mutations. Studio refuses other writes before sending them (\"Nothing was \
-                 sent\"). See AGENTS.md for the rules.",
+                 sent\"). If your shell has no network (\"server discovery connection \
+                 failed\"), run the same commands with the omnigraph_run tool. See AGENTS.md for \
+                 the rules.",
                 branch = self.branch,
                 base = self.base,
             ),
@@ -150,7 +153,11 @@ pub fn write_agents_md(cwd: &Path, graph: &str) -> std::io::Result<()> {
          - `effects: unknown` on a write Studio sent means the server's answer was lost. Check \
          `commit list --branch <your branch>` before trying again; never repeat a write blindly.\n\
          - \"server discovery connection failed\" means your sandbox has no network access. \
-         Tell the person, and use the `omnigraph_*` tools meanwhile.\n"
+         Run the same commands with the `omnigraph_run` MCP tool instead: pass the arguments \
+         after `omnigraph` as a list (Studio adds `--server studio` and the graph), and set \
+         `save_to` to write a large result to a file in your working directory, then process \
+         that file in your shell. Files it reads or writes must be in your working \
+         directory.\n"
     );
     write_file(&cwd.join("AGENTS.md"), &text, 0o644)
 }
@@ -220,6 +227,203 @@ pub async fn choose_cli(home: &CliHome, candidates: Vec<PathBuf>) -> Option<Path
     None
 }
 
+/// Subcommands `omnigraph_run` passes on: the ones that speak to a server, which the gateway
+/// then checks. Storage, cluster, policy and login commands refuse `--server` anyway.
+const RUN_COMMANDS: &[&str] = &[
+    "query", "mutate", "load", "branch", "snapshot", "export", "blob", "commit", "changes",
+    "schema", "graphs", "version",
+];
+/// Flags that would choose another address, credentials or actor than the conversation's.
+const RUN_FORBIDDEN: &[&str] = &[
+    "--server",
+    "--store",
+    "--uri",
+    "--cluster",
+    "--profile",
+    "--direct",
+    "--managed",
+    "--api",
+    "--as",
+];
+/// Flags whose value is a file the CLI reads or writes; it must be in the working directory.
+const RUN_PATH_FLAGS: &[&str] = &["--query", "--data", "--params-file", "--file", "--out"];
+/// The most output `omnigraph_run` returns in its answer; more is cut, with a pointer to
+/// `save_to`, so a large result does not fill the agent's context.
+pub const RUN_INLINE_MAX: usize = 100 * 1024;
+/// The most output `omnigraph_run` reads and saves.
+pub const RUN_OUTPUT_MAX: usize = 64 * 1024 * 1024;
+/// How long one `omnigraph_run` may take; a write held for approval waits within it.
+const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Checks the arguments the agent gave `omnigraph_run` (spec 013): the CLI runs in Studio's
+/// process, outside the agent's sandbox, so it may only speak to this conversation's gateway
+/// and touch files in the conversation's working directory. Returns the arguments to run, with
+/// `--server studio` (and the conversation's graph unless one is named) added.
+pub fn check_run_args(args: &[String], cwd: &Path, graph: &str) -> Result<Vec<String>, String> {
+    let Some(command) = args.first() else {
+        return Err("Pass the omnigraph arguments, for example [\"query\", \"-e\", \"…\"].".into());
+    };
+    if command == "omnigraph" {
+        return Err(
+            "Leave out the program name: start with the subcommand, such as \"query\".".into(),
+        );
+    }
+    if !RUN_COMMANDS.contains(&command.as_str()) {
+        return Err(format!(
+            "omnigraph_run runs {}; `{command}` is not one of them.",
+            RUN_COMMANDS.join(", ")
+        ));
+    }
+    if (command == "schema" && args.get(1).map(String::as_str) != Some("show"))
+        || (command == "graphs" && args.get(1).map(String::as_str) != Some("list"))
+    {
+        return Err(format!("Only `{command} show`/`list` read through Studio."));
+    }
+    let mut checked = Vec::with_capacity(args.len() + 4);
+    let mut has_graph = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => (flag, Some(value.to_owned())),
+            _ => (arg.as_str(), None),
+        };
+        if RUN_FORBIDDEN.contains(&flag) {
+            return Err(format!(
+                "`{flag}` is not passed: this conversation's CLI speaks only to Studio, which adds \
+                 `--server studio` itself."
+            ));
+        }
+        if flag == "--graph" {
+            has_graph = true;
+        }
+        if RUN_PATH_FLAGS.contains(&flag) {
+            let value = match inline {
+                Some(value) => value,
+                None => {
+                    index += 1;
+                    args.get(index)
+                        .cloned()
+                        .ok_or_else(|| format!("`{flag}` needs a path."))?
+                }
+            };
+            let path = within(cwd, &value, flag == "--out")?;
+            checked.push(flag.to_owned());
+            checked.push(path.to_string_lossy().into_owned());
+        } else {
+            checked.push(arg.clone());
+        }
+        index += 1;
+    }
+    checked.extend(["--server".to_owned(), "studio".to_owned()]);
+    if !has_graph {
+        checked.extend(["--graph".to_owned(), graph.to_owned()]);
+    }
+    Ok(checked)
+}
+
+/// `value` as a path inside `cwd`, resolved against it. An existing path is resolved through
+/// its links; a file to be written (`create`) must have an existing parent inside `cwd`.
+pub fn within(cwd: &Path, value: &str, create: bool) -> Result<PathBuf, String> {
+    let root = std::fs::canonicalize(cwd).map_err(|error| error.to_string())?;
+    let path = cwd.join(value);
+    let resolved = if create && !path.exists() {
+        let parent = path.parent().ok_or("no parent directory")?;
+        let parent = std::fs::canonicalize(parent)
+            .map_err(|_| format!("{value}: its directory does not exist"))?;
+        parent.join(path.file_name().ok_or("no file name")?)
+    } else {
+        std::fs::canonicalize(&path).map_err(|_| format!("{value}: no such file"))?
+    };
+    if !resolved.starts_with(&root) {
+        return Err(format!(
+            "{value}: omnigraph_run reads and writes files only in your working directory, {}.",
+            cwd.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Runs this conversation's CLI with checked arguments in `cwd`, with no shell. Returns the
+/// tool's text and whether the command failed. `save_to` writes standard output to a file in
+/// `cwd` instead of returning it.
+pub async fn run(
+    home: &CliHome,
+    cwd: &Path,
+    args: Vec<String>,
+    save_to: Option<PathBuf>,
+) -> (String, bool) {
+    use futures::AsyncReadExt as _;
+    let child = smol::process::Command::new(&home.command)
+        .args(&args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => return (format!("Studio could not run the CLI: {error}"), true),
+    };
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return ("Studio could not read the CLI's output.".into(), true);
+    };
+    let read = async {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let limit = RUN_OUTPUT_MAX as u64 + 1;
+        let (mut stdout, mut stderr) = (stdout.take(limit), stderr.take(limit));
+        let (a, b) = futures::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
+        a.ok();
+        b.ok();
+        let status = child.status().await;
+        (out, err, status)
+    }
+    .fuse();
+    let timeout = smol::Timer::after(RUN_TIMEOUT).fuse();
+    futures::pin_mut!(read, timeout);
+    let (out, err, status) = futures::select! {
+        done = read => done,
+        _ = timeout => return ("The command took longer than 30 minutes and was stopped.".into(), true),
+    };
+    let code = status.ok().and_then(|status| status.code());
+    let failed = code != Some(0);
+    let clip = |bytes: &[u8]| {
+        let mut text =
+            String::from_utf8_lossy(&bytes[..bytes.len().min(RUN_INLINE_MAX)]).into_owned();
+        if bytes.len() > RUN_INLINE_MAX {
+            text.push_str(&format!(
+                "\n[cut at {} KB of {} bytes; run it again with save_to and read the file]",
+                RUN_INLINE_MAX / 1024,
+                bytes.len()
+            ));
+        }
+        text
+    };
+    let mut text = format!(
+        "exit {}\n",
+        code.map_or("signal".into(), |code| code.to_string())
+    );
+    match save_to {
+        Some(path) if !failed => match std::fs::write(&path, &out[..out.len().min(RUN_OUTPUT_MAX)])
+        {
+            Ok(()) => text.push_str(&format!(
+                "output saved to {} ({} bytes)\n",
+                path.display(),
+                out.len().min(RUN_OUTPUT_MAX)
+            )),
+            Err(error) => return (format!("Studio could not save the output: {error}"), true),
+        },
+        _ => text.push_str(&clip(&out)),
+    }
+    if !err.is_empty() {
+        text.push_str("\n[stderr]\n");
+        text.push_str(&clip(&err));
+    }
+    (text, failed)
+}
+
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::metadata(path)
@@ -264,6 +468,77 @@ fn yaml_string(text: &str) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+
+    /// `omnigraph_run` runs outside the agent's sandbox: it speaks only to the conversation's
+    /// gateway and touches files only in the conversation's working directory.
+    #[test]
+    fn run_arguments_stay_on_the_gateway_and_in_the_working_directory() {
+        let cwd = std::env::temp_dir().join(format!("studio-run-args-{}", std::process::id()));
+        std::fs::create_dir_all(cwd.join("data")).unwrap();
+        std::fs::write(cwd.join("data/rows.jsonl"), "{}\n").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", cwd.join("escape")).ok();
+        let cwd = std::fs::canonicalize(&cwd).unwrap();
+        let args = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        let check = |list: &[&str]| check_run_args(&args(list), &cwd, "knowledge");
+
+        assert_eq!(
+            check(&["query", "-e", "query q() { … }", "--json"]).unwrap(),
+            args(&[
+                "query",
+                "-e",
+                "query q() { … }",
+                "--json",
+                "--server",
+                "studio",
+                "--graph",
+                "knowledge"
+            ])
+        );
+        // A graph the agent names stays; a relative file becomes an absolute path inside.
+        assert_eq!(
+            check(&[
+                "load",
+                "--data",
+                "data/rows.jsonl",
+                "--mode",
+                "append",
+                "--graph",
+                "notes"
+            ])
+            .unwrap(),
+            args(&[
+                "load",
+                "--data",
+                &cwd.join("data/rows.jsonl").to_string_lossy(),
+                "--mode",
+                "append",
+                "--graph",
+                "notes",
+                "--server",
+                "studio",
+            ])
+        );
+        let out = check(&["blob", "get", "--out=data/picture.png"]).unwrap();
+        assert_eq!(out[2], "--out");
+        assert_eq!(out[3], cwd.join("data/picture.png").to_string_lossy());
+
+        for refused in [
+            &["init", "--store", "x"][..],
+            &["omnigraph", "query"],
+            &["schema", "apply"],
+            &["query", "--server", "http://elsewhere"],
+            &["query", "--store=file:///tmp/g"],
+            &["mutate", "--as", "someone"],
+            &["load", "--data", "/etc/passwd"],
+            &["load", "--data", "../outside.jsonl"],
+            &["blob", "put", "--file", "escape"],
+            &["blob", "get", "--out", "missing/dir/x"],
+            &[],
+        ] {
+            assert!(check(refused).is_err(), "{refused:?} was let through");
+        }
+        std::fs::remove_dir_all(&cwd).ok();
+    }
 
     #[test]
     fn a_conversation_home_holds_its_config_token_and_wrapper() {
@@ -320,6 +595,23 @@ mod tests {
             env.contains(&format!("OMNIGRAPH_HOME={}", home.dir.display())),
             "{env}"
         );
+
+        // Claude Code keeps the first 2,048 characters of a server's instructions, so the
+        // server's and the conversation's fit, with a long data directory in the command path.
+        let long = cwd
+            .join("d".repeat(120))
+            .join(".studio/agent-20261013-101500");
+        let longest = CliHome {
+            command: long.join("omnigraph"),
+            dir: long,
+            graph: "g".repeat(64),
+            branch: "agent/20261013-101500".into(),
+            base: "b".repeat(64),
+        };
+        for ready in [None, Some(true), Some(false)] {
+            let length = crate::mcp::INSTRUCTIONS.len() + 2 + longest.instructions(ready).len();
+            assert!(length <= 2048, "{length} characters");
+        }
 
         let credentials = home.dir.join("credentials");
         drop(home);

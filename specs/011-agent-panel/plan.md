@@ -1,7 +1,9 @@
 # 011: Agent panel
 
-Status: implemented · 2026-10-12. The agent's graph access is moving to the `omnigraph` CLI
-through a Studio gateway: [spec 013](../013-agent-cli/plan.md), first slice implemented.
+Status: implemented · 2026-10-12. Since 2026-10-13 the agent reaches the graph only through the
+`omnigraph` CLI and a Studio gateway ([spec 013](../013-agent-cli/plan.md)); the tools and
+proposal cards below are replaced by `omnigraph_cli`, `omnigraph_run` and spec 013's write
+cards.
 
 ## Problem
 
@@ -84,6 +86,8 @@ user with mode `0700`, and refuses a socket path longer than 100 bytes. Unix soc
 limited to 104 bytes on macOS.
 
 ### Tools
+
+Replaced on 2026-10-13 by spec 013's `omnigraph_cli` and `omnigraph_run`. As first built:
 
 | Tool | Arguments | Does |
 |---|---|---|

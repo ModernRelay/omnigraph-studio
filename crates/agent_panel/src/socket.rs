@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::channel::{mpsc, oneshot};
-use futures::{AsyncBufReadExt as _, AsyncWriteExt as _, StreamExt as _};
+use futures::{AsyncBufReadExt as _, AsyncWriteExt as _, FutureExt, StreamExt as _};
 use serde_json::Value;
 use smol::io::BufReader;
 use smol::net::unix::{UnixListener, UnixStream};
@@ -39,6 +39,13 @@ impl Drop for ToolSocket {
 }
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// How often a running tool call reports progress.
+const PROGRESS_EVERY: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(50)
+} else {
+    std::time::Duration::from_secs(60)
+};
 
 /// Longest socket path Studio binds: macOS allows 104 bytes including the terminator.
 const MAX_SOCKET_PATH: usize = 100;
@@ -162,6 +169,7 @@ async fn serve_connection(
                 id,
                 name,
                 arguments,
+                progress,
             } => {
                 let (reply, result) = oneshot::channel();
                 if tools
@@ -179,10 +187,24 @@ async fn serve_connection(
                 }
                 let replies_tx = replies_tx.clone();
                 // Each call answers on its own, so a change waiting for approval does not hold
-                // up the agent's reads.
+                // up the agent's reads. A long call reports progress, so the agent does not give
+                // up on it.
                 calls.push(smol::spawn(async move {
-                    let (text, is_error) = result
-                        .await
+                    let mut result = result.fuse();
+                    let mut ticks = 0;
+                    let answer = loop {
+                        let mut tick = FutureExt::fuse(smol::Timer::after(PROGRESS_EVERY));
+                        futures::select! {
+                            answer = result => break answer,
+                            _ = tick => {
+                                ticks += 1;
+                                if let Some(token) = &progress {
+                                    replies_tx.unbounded_send(mcp::progress(token, ticks)).ok();
+                                }
+                            }
+                        }
+                    };
+                    let (text, is_error) = answer
                         .unwrap_or_else(|_| ("Studio closed the agent session.".into(), true));
                     replies_tx
                         .unbounded_send(mcp::tool_reply(id, text, is_error))
@@ -250,6 +272,45 @@ mod tests {
         assert!(path.as_os_str().len() <= MAX_SOCKET_PATH);
         drop(socket);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_long_call_reports_growing_progress_until_it_answers() {
+        smol::block_on(async {
+            let mut socket = ToolSocket::bind(&socket_dir()).expect("bind the tool socket");
+            let (tools_tx, mut tools_rx) = mpsc::unbounded();
+            let _serve = smol::spawn(socket.serve(tools_tx, String::new()));
+            let stream = UnixStream::connect(&socket.path).await.unwrap();
+            let mut writer = stream.clone();
+            let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"omnigraph_run","arguments":{"args":[]},"_meta":{"progressToken":7}}}"#;
+            writer
+                .write_all(format!("{call}\n").as_bytes())
+                .await
+                .unwrap();
+            let request = tools_rx.next().await.unwrap();
+            // The call holds past several ticks, then answers.
+            smol::Timer::after(PROGRESS_EVERY * 3 + PROGRESS_EVERY / 2).await;
+            request.reply.send(("done".into(), false)).ok();
+            let mut lines = BufReader::new(stream).lines();
+            let mut progress = Vec::new();
+            let answer = loop {
+                let line: Value =
+                    serde_json::from_str(&lines.next().await.unwrap().unwrap()).unwrap();
+                if line["method"] == "notifications/progress" {
+                    assert_eq!(line["params"]["progressToken"], 7);
+                    progress.push(line["params"]["progress"].as_u64().unwrap());
+                } else {
+                    break line;
+                }
+            };
+            assert_eq!(answer["id"], 1);
+            assert_eq!(answer["result"]["content"][0]["text"], "done");
+            assert!(progress.len() >= 2, "{progress:?}");
+            assert!(
+                progress.windows(2).all(|pair| pair[0] < pair[1]),
+                "{progress:?}"
+            );
+        });
     }
 
     #[test]

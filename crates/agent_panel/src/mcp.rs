@@ -10,21 +10,23 @@ use crate::tools;
 /// when it is one of these, and offers the newest otherwise.
 pub const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
-const INSTRUCTIONS: &str = "Tools for one OmniGraph graph, served by OmniGraph Studio. Read the \
-schema first. Reads run on the person's branch, or on your branch once you have one. Changes go \
-through omnigraph_propose_change: the person approves each one in Studio, and it lands on a \
-branch of your own, never on theirs.";
+pub(crate) const INSTRUCTIONS: &str = "OmniGraph Studio gives you the omnigraph CLI for one OmniGraph graph. \
+Use it for everything: `schema show` first, then `query`, and `mutate` or `load` on your own \
+branch, which the person reviews before it reaches theirs. Run it in your shell by the path \
+omnigraph_cli gives you, or with omnigraph_run when your shell has no network.";
 
 /// What to do with one incoming line.
 #[derive(Debug, PartialEq)]
 pub enum Incoming {
     /// Send this reply.
     Reply(Value),
-    /// Run a tool and send [`tool_reply`] with the same id.
+    /// Run a tool and send [`tool_reply`] with the same id. `progress` is the client's
+    /// progress token, for [`progress`] notifications while the call runs.
     CallTool {
         id: Value,
         name: String,
         arguments: Value,
+        progress: Option<Value>,
     },
     /// A notification or a response: send nothing.
     Nothing,
@@ -80,6 +82,10 @@ pub fn handle(line: &str, conversation: &str) -> Incoming {
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({})),
+            progress: params
+                .pointer("/_meta/progressToken")
+                .filter(|token| token.is_string() || token.is_number())
+                .cloned(),
         },
         _ => Incoming::Reply(error(id, -32601, "Method not found")),
     }
@@ -92,6 +98,17 @@ pub fn tool_reply(id: Value, text: String, is_error: bool) -> Value {
         id,
         json!({ "content": [{ "type": "text", "text": text }], "isError": is_error }),
     )
+}
+
+/// A progress notification for a call that is still running. Agents abort a tool call that
+/// sends nothing for a while (Claude Code: 30 minutes on stdio), and a write can wait that long
+/// for the person's approval. `progress` must grow with every notification.
+pub fn progress(token: &Value, progress: u64) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": { "progressToken": token, "progress": progress, "message": "Still running" },
+    })
 }
 
 fn result(id: Value, result: Value) -> Value {
@@ -147,25 +164,30 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(
-            names,
-            [
-                "omnigraph_schema",
-                "omnigraph_cli",
-                "omnigraph_branches",
-                "omnigraph_query",
-                "omnigraph_propose_change"
-            ]
-        );
+        assert_eq!(names, ["omnigraph_cli", "omnigraph_run",]);
         assert_eq!(
             handle(
-                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"omnigraph_schema"}}"#,
+                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"omnigraph_run"}}"#,
                 ""
             ),
             Incoming::CallTool {
                 id: json!(7),
-                name: "omnigraph_schema".into(),
+                name: "omnigraph_run".into(),
                 arguments: json!({}),
+                progress: None,
+            }
+        );
+        // The client's progress token comes with the call.
+        assert_eq!(
+            handle(
+                r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"omnigraph_run","arguments":{"args":[]},"_meta":{"progressToken":"p1"}}}"#,
+                ""
+            ),
+            Incoming::CallTool {
+                id: json!(8),
+                name: "omnigraph_run".into(),
+                arguments: json!({"args": []}),
+                progress: Some(json!("p1")),
             }
         );
     }
