@@ -62,6 +62,12 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   `hub:Type/id/out:Edge`). A dragged node carries its pills that were not placed by hand, and
   their "+K more", so they keep their places beside it; "+K more" is never placed alone.
   Reset layout (↺, R) forgets them all. A drag that starts on empty space pans.
+- **Reading ahead:** when the pointer rests on a closed node or relationship pill for 120 ms,
+  what opening it will show is read without opening it (`Exploration::prefetch`): a node's
+  relationship counts and single-target fields, a relationship's first neighbours, or its
+  values when grouped. Reads stay on the exploration's commit, and nothing read or under way is
+  read again, so passing over chips costs nothing and a rested-on chip opens at once. The
+  Explore panel's closed rows do the same.
 - **Marking:** ⇧-drag on empty space draws an area and marks every chip it touches (added to
   those marked); ⇧-click marks or unmarks one chip; ⌘A marks all, Esc unmarks. Marked chips
   carry the selection's warm ring and never fade with the pointed-at neighbourhood. Dragging a
@@ -94,6 +100,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | 2026-10-12 | Layout off the main thread is deterministic, keeps drawn nodes in place, and bounds cost at the cap | `cargo test -p graph_canvas` (`layout::tests`) | 1,999 nodes in 464 ms in an unoptimized debug build, Apple M5 Pro; same input gives the same positions |
 | 2026-10-12 | Errors and loading show in the canvas, not a blank view | snapshot `OpenNode` Person `nobody` then `OpenCanvas` | banner "No Person with key nobody at this commit." · Retry |
 | 2026-10-12 | Keys walk and focus | offscreen snapshot: Allen Labs expanded, → → `[` F Space | `[` returned to Allen Labs, F centred it, Space showed it in the inspector |
+| 2026-10-12 | Resting on a chip reads ahead what it opens | `graph_store` `prefetching_reads_what_opening_would_show_and_nothing_twice`; two offscreen runs each, differing only in where the pointer rests, counting the dev server's read log lines | Resting on the closed "← WorksAt 7" pill: 21 reads against 20 (its first page); resting on a person under it: 25 against 21 (one count per Person relationship) |
 | 2026-10-12 | Pills drag, areas mark, and chips have menus | `graph_canvas` tests (a pill's pin key round trips; an area marks the chips it touches, not unpainted ones); offscreen snapshots on Sammet Systems with the snapshot tool's `drag:…,shift` and `click:…,right`: WorksAt dragged up then the company down; an area over three people; right clicks on a marked person, on WorksAt and on a person | WorksAt stayed where dropped while Owns moved with its company; Edsger, Ada and Grace marked with rings; "3 selected · Expand all · Collapse all · Keep where they are · Clear selection"; "Close · Group by › · Open related table"; "Open · Expand ↵ · Explore from here · Open in table · Copy key" |
 | 2026-10-12 | Placed nodes persist per graph | `graph_canvas` `placed_nodes_round_trip_and_bad_data_reads_as_none`; offscreen snapshot: drag Company on the ontology, then reopen the data directory with restore | The saved canvas holds `{"pinned": {"type:Company": [-174, -275]}}`; after restore Company is where it was dropped, the rest laid out around it, and ↺ (Reset layout, R) shows |
 | 2026-10-12 | The ontology and the explorer are found without the menu | offscreen snapshot of `OpenOntology` (⌘⇧O) | The sidebar's Graph panel opens with Ontology (selected) and Explorer above Types; the tab and the mode switch read Ontology / Explorer |

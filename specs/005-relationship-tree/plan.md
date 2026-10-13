@@ -82,6 +82,8 @@ on the canvas. Typing filters the visible rows.
 - Visible rows are flattened into one list and rendered with `uniform_list`, indent guides, and
   sticky ancestor rows so the path stays visible however deep the walk.
 - Each expansion loads lazily: an inline spinner row, or an error row with Retry.
+- A closed row the pointer rests on for 120 ms reads ahead what it opens to, as the canvas's
+  pills do (spec 006), so it usually opens with its rows already read.
 
 ## Decisions
 
