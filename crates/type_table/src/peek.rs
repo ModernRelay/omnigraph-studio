@@ -1055,8 +1055,11 @@ impl Render for NodePeek {
         let at = self.snapshot.clone();
         let has_properties = !self.property_rows().is_empty();
         let properties = self.render_properties(cx);
-        let relationships =
-            matches!(self.subject, PeekSubject::Node { .. }).then(|| self.render_relationships(cx));
+        // A node's relationships are listed once the node is read: while it loads, or when it
+        // does not exist at this commit, an empty list would say its type has none.
+        let relationships = (matches!(self.subject, PeekSubject::Node { .. })
+            && self.values.loaded().is_some())
+        .then(|| self.render_relationships(cx));
         let endpoints = self.render_endpoints(cx);
         let is_node = matches!(self.subject, PeekSubject::Node { .. });
         v_flex()

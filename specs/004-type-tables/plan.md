@@ -297,6 +297,13 @@ kept answers.
 
 ## Corrections
 
+- 2026-10-13 · A peek of a node missing at its commit read "This type takes part in no
+  relationships" under "This node does not exist at this commit", and a peek still loading
+  showed the same line for a moment: the relationship list is filled only after the node is
+  read, and an empty list read as a type without relationships. The section now shows once the
+  node is read (offscreen snapshots: `company-000001`, which the dev graph does not hold, shows
+  the error alone; `company-00003` lists owns 2 and worksAt 18).
+
 - 2026-10-12 · "Dates relative": a `DateTime` reads relative for two weeks either way ("3 h
   ago", "in 2 days"), then as its date; a `Date` reads Today, Yesterday or Tomorrow, else as
   itself (a birthday as "48 years ago" helps no one). The exact value is the cell's tooltip;
