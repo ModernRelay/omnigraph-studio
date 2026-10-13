@@ -134,7 +134,12 @@ shows an edit, a line "Query people" (the declared name in the code font, "Runni
 runs, "· failed" when it failed) stands over the query in a code card with the query editor's
 colours (`TokenKind::syntax_name`, shared with spec 007's editor), with its parameters on one
 muted line under it, taken from the call's `rawInput`; the line folds the card; the plan as a list with each entry's status. Steps
-of a turn sit 12 px apart and a new question opens 16 px more. Other updates are ignored. A
+of a turn sit 12 px apart and a new question opens 16 px more. Other updates are ignored. The
+thread is a list that lays out only the blocks in view, as Zed's agent thread is: a block is
+measured again only when what it shows changes (or its markdown finishes parsing), so a long
+conversation costs what its visible part costs. It follows the newest reply while it is scrolled
+to its end; a person reading further up stays where they are, and sending a message returns to
+the end. A
 banner above the composer shows "`agent/<stamp>` · N changes · **Review**" after the first
 committed change; Review switches the session to the agent branch and opens spec 008's review.
 
@@ -316,6 +321,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 | 2026-10-12 | Messages sent while the agent works are queued and sent in order | `agent_panel` test `the_queue_sends_in_order_pauses_on_stop_and_lets_send_now_jump_it`; offscreen snapshots with the test agent's slow turn: two messages queued behind it, then the transcript the agent kept; then one queued and one sent with ⌘⇧↩ | The card read "2 queued messages", the next one dotted with Send now; the agent received the three in order; with ⌘⇧↩ it received the urgent one second and the queued one third |
 | 2026-10-12 | One agent process serves every conversation; the list renames, searches, deletes and imports | `agent_panel` tests `updates_go_to_their_session_and_early_ones_wait`, `conversations_are_kept_per_graph_newest_first` (rename, remove, import), `each_graph_has_a_directory_of_its_own`; offscreen snapshots with the test agent (one process for every session, `session/list`, `session/delete`, `session/close`), counting its processes | Two conversations ran on one test-agent process, each with its own tools, in `agent/graphs/environment-knowledge-2998657d`; with two records dropped, Import brought both back ("Imported 2 conversations."); Rename showed "Best-connected people"; "people" left two rows; Delete… asked, removed the row, and the agent deleted its transcript (6 to 5); a session the agent did not know left "Removed here; the agent did not delete it" |
 | 2026-10-12 | The Conversations panel reads clean | Offscreen snapshots after "looks messy": a pinned, three recent and an archived conversation; Search open with "comp"; a hovered row | Search, More and + on the title line; one text edge for every row; no times on rows (the tooltip read "you last wrote 12m ago"); "Archived 1 ›" at the end; the search field framed on the rows' edge |
+| 2026-10-13 | The thread lays out only what shows and follows the newest reply | Read `gpui/src/elements/list.rs` (`ListState::splice`, `remeasure_items`, `FollowMode::Tail`, `scroll_to_end`) at `v1.23.2`; offscreen snapshots with the test agent: three questions in a 1300×800 window, then an empty conversation | The view stood at the end of the third reply, its markdown at full height (lists, inline code and the code block), the earlier turns above it; the empty conversation still showed "Ask about the graph" |
 
 ## Corrections
 

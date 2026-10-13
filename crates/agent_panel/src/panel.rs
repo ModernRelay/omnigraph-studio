@@ -15,8 +15,8 @@ use editor::Editor;
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Render,
-    ScrollHandle, SharedString, Task, WeakEntity, Window,
+    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
+    ListAlignment, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
 };
 use gq_language::QueryInfo;
 use graph_client::WriteOutcome;
@@ -204,6 +204,91 @@ enum Entry {
     },
 }
 
+/// One item of the thread's list: an entry, a query the agent ran, a run of steps folded to
+/// one line, or the callout of an agent that stopped. `lead` carries the agent's mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Block {
+    Entry {
+        index: usize,
+        lead: bool,
+    },
+    Query {
+        index: usize,
+        lead: bool,
+    },
+    Activity {
+        start: usize,
+        end: usize,
+        lead: bool,
+    },
+    Exited,
+}
+
+/// Feeds what an entry shows to `hasher` (`AgentPanel::fingerprint`).
+fn hash_entry(entry: &Entry, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    std::mem::discriminant(entry).hash(hasher);
+    match entry {
+        Entry::User(text) | Entry::Agent(text) | Entry::Thought(text) => text.hash(hasher),
+        Entry::Tool {
+            title,
+            status,
+            input,
+            ..
+        } => {
+            title.hash(hasher);
+            format!("{status:?}").hash(hasher);
+            input.as_ref().map(Value::to_string).hash(hasher);
+        }
+        Entry::Plan(items) => {
+            for (content, status) in items {
+                content.hash(hasher);
+                format!("{status:?}").hash(hasher);
+            }
+        }
+        Entry::Permission(card) => {
+            card.title.hash(hasher);
+            card.options.len().hash(hasher);
+            card.answer.hash(hasher);
+        }
+        Entry::Proposal(proposal) => {
+            proposal.summary.hash(hasher);
+            proposal.query.hash(hasher);
+            proposal.branch.hash(hasher);
+            proposal.creates_from.hash(hasher);
+            proposal
+                .params
+                .as_ref()
+                .map(|params| Value::Object(params.clone()).to_string())
+                .hash(hasher);
+            match &proposal.state {
+                ProposalState::Waiting(_) => 0u8.hash(hasher),
+                ProposalState::Running => 1u8.hash(hasher),
+                ProposalState::Committed {
+                    commit,
+                    nodes,
+                    edges,
+                } => {
+                    2u8.hash(hasher);
+                    commit.hash(hasher);
+                    nodes.hash(hasher);
+                    edges.hash(hasher);
+                }
+                ProposalState::Refused(reason) => {
+                    3u8.hash(hasher);
+                    reason.hash(hasher);
+                }
+                ProposalState::Unknown => 4u8.hash(hasher),
+                ProposalState::Rejected => 5u8.hash(hasher),
+            }
+        }
+        Entry::Notice { text, error } => {
+            text.hash(hasher);
+            error.hash(hasher);
+        }
+    }
+}
+
 /// How full the agent's context window is, and what the session has cost so far, as the agent
 /// last reported them.
 struct Usage {
@@ -282,7 +367,13 @@ pub struct AgentPanel {
     focus_handle: FocusHandle,
     composer: Entity<Editor>,
     custom_command: Entity<Editor>,
-    scroll: ScrollHandle,
+    /// The thread as a list that lays out only what shows (as Zed's agent thread does), and
+    /// the blocks it last drew with their fingerprints, to remeasure only what changed.
+    thread: ListState,
+    shown_blocks: Vec<(Block, u64)>,
+    /// Each reply's markdown is watched: its parse finishes after the text arrives, and the
+    /// block grows then.
+    _markdown_watch: std::collections::HashMap<usize, Subscription>,
     state: State,
     entries: Vec<Entry>,
     branch: Option<AgentBranch>,
@@ -468,7 +559,13 @@ impl AgentPanel {
             focus_handle,
             composer,
             custom_command,
-            scroll: ScrollHandle::new(),
+            thread: {
+                let thread = ListState::new(0, ListAlignment::Top, px(800.));
+                thread.set_follow_mode(FollowMode::Tail);
+                thread
+            },
+            shown_blocks: Vec::new(),
+            _markdown_watch: std::collections::HashMap::new(),
             state: State::Setup,
             entries: Vec::new(),
             markdown: std::collections::HashMap::new(),
@@ -835,7 +932,8 @@ impl AgentPanel {
                 self.state = State::Exited { message, stderr };
             }
         }
-        self.scroll.scroll_to_bottom();
+        // The thread follows the newest reply while it is scrolled to its end (the list's tail
+        // mode); a person reading further up is left where they are.
         cx.notify();
     }
 
@@ -1050,7 +1148,7 @@ impl AgentPanel {
             }
             self.entries.push(Entry::User(text));
             self.state = State::Prompting { agent };
-            self.scroll.scroll_to_bottom();
+            self.thread.scroll_to_end();
             cx.notify();
         }
     }
@@ -1379,7 +1477,7 @@ impl AgentPanel {
         if self.always_allow {
             self.decide(index, Decision::Allow, cx);
         }
-        self.scroll.scroll_to_bottom();
+        self.thread.scroll_to_end();
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -2033,6 +2131,7 @@ impl Render for AgentPanel {
             State::Setup => self.render_setup(cx).into_any_element(),
             _ => {
                 self.sync_markdown(cx);
+                self.sync_thread(cx);
                 self.render_thread(window, cx).into_any_element()
             }
         };
@@ -2210,6 +2309,8 @@ impl AgentPanel {
     fn sync_markdown(&mut self, cx: &mut Context<Self>) {
         self.markdown
             .retain(|index, _| matches!(self.entries.get(*index), Some(Entry::Agent(_))));
+        self._markdown_watch
+            .retain(|index, _| self.markdown.contains_key(index));
         for (index, entry) in self.entries.iter().enumerate() {
             let Entry::Agent(text) = entry else { continue };
             match self.markdown.get_mut(&index) {
@@ -2223,41 +2324,32 @@ impl AgentPanel {
                 _ => {
                     let source: SharedString = text.clone().into();
                     let markdown = cx.new(|cx| Markdown::new(source, None, None, cx));
+                    self._markdown_watch.insert(
+                        index,
+                        cx.observe(&markdown, move |this, _, cx| {
+                            this.remeasure_entry(index, cx)
+                        }),
+                    );
                     self.markdown.insert(index, (markdown, text.len()));
                 }
             }
         }
     }
 
-    fn render_thread(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut thread = v_flex()
-            .id("agent-thread")
-            .track_scroll(&self.scroll)
-            .overflow_y_scroll()
-            .flex_1()
-            .min_h_0()
-            .py_4()
-            .pr_4()
-            .pl_2()
-            // Steps of a turn sit close; a new question opens a new group (below).
-            .gap(px(ds::space::LG));
-        if self.entries.is_empty() && !matches!(self.state, State::Exited { .. }) {
-            return thread
-                .child(studio_ui::ds::empty_state(
-                    IconName::ZedAssistant,
-                    "Ask about the graph",
-                ))
-                .into_any_element();
-        }
-        // As in Delta: the agent's mark once per turn, and each run of tool calls and thoughts
-        // as one line that opens to its steps.
+    /// The thread's blocks in order. As in Delta: the agent's mark once per turn, and each run
+    /// of tool calls and thoughts as one line that opens to its steps.
+    fn blocks(&self) -> Vec<Block> {
+        let mut blocks = Vec::new();
         let mut marked = false;
         let mut index = 0;
         while index < self.entries.len() {
             let entry = &self.entries[index];
             match entry {
                 Entry::Tool { .. } if shown_query(entry).is_some() => {
-                    thread = thread.child(self.render_query_call(index, entry, !marked, cx));
+                    blocks.push(Block::Query {
+                        index,
+                        lead: !marked,
+                    });
                     marked = true;
                     index += 1;
                     continue;
@@ -2267,7 +2359,11 @@ impl AgentPanel {
                     while index < self.entries.len() && is_folded_step(&self.entries[index]) {
                         index += 1;
                     }
-                    thread = thread.child(self.render_activity(start..index, !marked, cx));
+                    blocks.push(Block::Activity {
+                        start,
+                        end: index,
+                        lead: !marked,
+                    });
                     marked = true;
                     continue;
                 }
@@ -2278,20 +2374,150 @@ impl AgentPanel {
             if matches!(entry, Entry::Agent(_)) {
                 marked = true;
             }
-            thread = thread.child(self.render_entry(index, entry, lead, window, cx));
+            blocks.push(Block::Entry { index, lead });
             index += 1;
         }
-        if let State::Exited { message, stderr } = &self.state {
-            let mut callout = Callout::new()
-                .severity(Severity::Error)
-                .icon(IconName::XCircle)
-                .title(message.clone());
-            if !stderr.is_empty() {
-                callout = callout.description_slot(studio_ui::ds::code_block(stderr.clone(), cx));
-            }
-            thread = thread.child(gutter_row(None, callout));
+        if matches!(self.state, State::Exited { .. }) {
+            blocks.push(Block::Exited);
         }
-        thread.into_any_element()
+        blocks
+    }
+
+    /// What a block shows, folded to a number: a block whose number is unchanged keeps its
+    /// measured height. Markdown that finishes parsing remeasures its block by itself.
+    fn fingerprint(&self, block: &Block) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        block.hash(&mut hasher);
+        let entries = match *block {
+            Block::Entry { index, .. } => index..index + 1,
+            Block::Query { index, .. } => {
+                self.folded_queries.contains(&index).hash(&mut hasher);
+                index..index + 1
+            }
+            Block::Activity { start, end, .. } => {
+                self.expanded_activity.contains(&start).hash(&mut hasher);
+                start..end
+            }
+            Block::Exited => {
+                if let State::Exited { message, stderr } = &self.state {
+                    message.hash(&mut hasher);
+                    stderr.hash(&mut hasher);
+                }
+                0..0
+            }
+        };
+        for entry in &self.entries[entries] {
+            hash_entry(entry, &mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Brings the list up to the thread: from the first block that differs from what it last
+    /// drew, the blocks are measured again; those above keep their heights and the scroll.
+    fn sync_thread(&mut self, _cx: &mut Context<Self>) {
+        let blocks: Vec<(Block, u64)> = self
+            .blocks()
+            .into_iter()
+            .map(|block| (block, self.fingerprint(&block)))
+            .collect();
+        let same = self
+            .shown_blocks
+            .iter()
+            .zip(&blocks)
+            .take_while(|(shown, now)| shown == now)
+            .count();
+        if same == blocks.len() && same == self.shown_blocks.len() {
+            return;
+        }
+        self.thread
+            .splice(same..self.shown_blocks.len(), blocks.len() - same);
+        self.shown_blocks = blocks;
+    }
+
+    /// Measures again the block that shows entry `index`, whose markdown finished parsing.
+    fn remeasure_entry(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(position) = self.shown_blocks.iter().position(
+            |(block, _)| matches!(block, Block::Entry { index: shown, .. } if *shown == index),
+        ) {
+            self.thread.remeasure_items(position..position + 1);
+        }
+        cx.notify();
+    }
+
+    fn render_thread(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.entries.is_empty() && !matches!(self.state, State::Exited { .. }) {
+            return v_flex()
+                .flex_1()
+                .min_h_0()
+                .py_4()
+                .pr_4()
+                .pl_2()
+                .child(studio_ui::ds::empty_state(
+                    IconName::ZedAssistant,
+                    "Ask about the graph",
+                ))
+                .into_any_element();
+        }
+        list(
+            self.thread.clone(),
+            cx.processor(|this, ix: usize, window, cx| this.render_block(ix, window, cx)),
+        )
+        .flex_1()
+        .min_h_0()
+        .size_full()
+        .into_any_element()
+    }
+
+    /// One block of the thread, as the list asks for it. Steps of a turn sit close; a new
+    /// question opens a new group (`render_entry`).
+    fn render_block(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some((block, _)) = self.shown_blocks.get(ix).copied() else {
+            return div().into_any_element();
+        };
+        let body = match block {
+            Block::Entry { index, lead } => match self.entries.get(index) {
+                Some(entry) => self.render_entry(index, entry, lead, window, cx),
+                None => div().into_any_element(),
+            },
+            Block::Query { index, lead } => match self.entries.get(index) {
+                Some(entry) => self.render_query_call(index, entry, lead, cx),
+                None => div().into_any_element(),
+            },
+            Block::Activity { start, end, lead } => {
+                if end <= self.entries.len() {
+                    self.render_activity(start..end, lead, cx)
+                } else {
+                    div().into_any_element()
+                }
+            }
+            Block::Exited => match &self.state {
+                State::Exited { message, stderr } => {
+                    let mut callout = Callout::new()
+                        .severity(Severity::Error)
+                        .icon(IconName::XCircle)
+                        .title(message.clone());
+                    if !stderr.is_empty() {
+                        callout =
+                            callout.description_slot(studio_ui::ds::code_block(stderr.clone(), cx));
+                    }
+                    gutter_row(None, callout).into_any_element()
+                }
+                _ => div().into_any_element(),
+            },
+        };
+        div()
+            .pl_2()
+            .pr_4()
+            .pb(px(ds::space::LG))
+            .when(ix == 0, |block| block.pt_4())
+            .child(body)
+            .into_any_element()
     }
 
     /// One entry of the thread; `lead` marks the agent's first entry in a turn, which carries

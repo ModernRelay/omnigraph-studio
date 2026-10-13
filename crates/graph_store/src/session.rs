@@ -93,6 +93,9 @@ struct PinnedRead {
 const RECHECK_FIRST: Duration = Duration::from_secs(5);
 const RECHECK_CAP: Duration = Duration::from_secs(60);
 
+/// Answers kept by key, with the read under way shared by everyone who asks meanwhile.
+type ReadMemo<K, V> = Memo<K, V, Shared<Task<Result<V, ReadError>>>>;
+
 pub struct GraphSession {
     pub connection: Entity<Connection>,
     pub graph_id: String,
@@ -108,10 +111,10 @@ pub struct GraphSession {
     pub unavailable: Option<String>,
     recheck_after: Duration,
     /// Answers to reads pinned to a commit, and those under way (they never change).
-    pinned_reads: Memo<PinnedRead, ReadOutput, Shared<Task<Result<ReadOutput, ReadError>>>>,
-    pinned_blobs: Memo<(BlobCell, String), BlobMeta, Shared<Task<Result<BlobMeta, ReadError>>>>,
+    pinned_reads: ReadMemo<PinnedRead, ReadOutput>,
+    pinned_blobs: ReadMemo<(BlobCell, String), BlobMeta>,
     /// Each branch's commit list, read once and shared until a commit lands on that branch.
-    commit_lists: Memo<String, CommitList, Shared<Task<Result<CommitList, ReadError>>>>,
+    commit_lists: ReadMemo<String, CommitList>,
     _recheck: Option<Task<()>>,
     _schema_task: Option<Task<()>>,
     _branches_task: Option<Task<()>>,
