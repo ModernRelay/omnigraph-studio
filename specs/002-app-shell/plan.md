@@ -124,7 +124,13 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   (bound under `CommandPalette > Editor`, so it outranks the editor's) dismisses the palette
   and sends `studio_agent::Ask`; with no agent chosen, the agent tab says the question waits.
   Node search tries the text as typed, lowercase and capitalized, because `contains` is
-  exact on 0.13 ("ada" finds "Ada Turing").
+  exact on 0.13 ("ada" finds "Ada Turing"). GQ has no node alternatives, so a search is one
+  read per node type, five rows each. Typing on is mostly free: when a type's answer came
+  back under five rows and the new text only narrows the old (each spelling of the new text
+  starts with one of the old, `gq_language::builder::search_narrows`), its rows are filtered
+  in the palette by the query's own predicate (`search_matches`); text typed back to after a
+  backspace shows its answer again. The earlier node rows stay, ranked against the new text,
+  until the new answer replaces them.
 - Opens in one frame with no animation (constitution VII).
 - Landed 2026-10-12: ⌘K and ⌘⇧P (Ctrl elsewhere; each bound in `init` only when the keymap
   does not already bind it). Rows are humanized action names (`studio_graph::OpenType` → "Graph:
@@ -291,6 +297,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-12 | Every tab kind comes back after a restart | offscreen snapshots: one run opened a type table, a query with a draft, history, canvas and storage; a second run with `OMNIGRAPH_STUDIO_NO_RESTORE=0` | All five tabs restored in order, the draft intact; the workspace file is `-rw-------` |
 | 2026-10-12 | Cached tabs and docks: a frame redraws only what changed | snapshot example `measure:60` (debug build) on Sammet Systems → WorksAt → Ada open on the canvas, the Explore tree and the inspector showing | Before: 9.6 ms a frame after a workspace notify, the same as a full redraw (nothing was reused). Tabs cached: 8.7 ms. Docks hosted and cached too: 3.2 ms. A full redraw (`refresh`, for a settings change) is 11.9 ms. The docks alone had cost about 7 ms a frame (the inspector 3.4, the tree 1.7) |
 | 2026-10-12 | Every window comes back | `persistence` tests (the older one-window file, opening order, a closed window forgotten, the last one kept until another opens; a GPUI test removing one of two windows); the debug binary with a separate data directory and a `session.json` of three windows, one on an unknown server | Two windows opened at their saved bounds, the third dropped, and the unknown server's graph left out of the other; an older file was rewritten in the new shape on the first start |
+| 2026-10-13 | ⌘P reads only what typing could have changed | `command_palette` test `a_complete_answer_narrows_without_a_read_and_a_full_one_asks_again`, `gq_language` test `longer_search_text_matches_among_what_shorter_text_matched` (a final sigma refuses to narrow); offscreen snapshots through a request-counting proxy on the dev graph's three node types: "ad"; "ad", "a", " l"; "ad", "a", backspace | 3, 5 and 4 `POST /query` (before: 3, 9 and 9); "ada l" showed Ada Lovelace alone. The same run with "ad", "a", " l" had crashed before: typing again cut the node rows after the matches were ranked over them |
 
 ## Corrections
 

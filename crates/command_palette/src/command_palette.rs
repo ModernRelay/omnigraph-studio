@@ -11,6 +11,7 @@
 // restores that focus, then dispatches. Studio does not depend on Zed's `picker`, which needs
 // `project` and `workspace`; the list, matching and persistence are Studio's own.
 
+mod found;
 mod matching;
 mod recent;
 
@@ -33,6 +34,7 @@ use studio_workspace::{ToastKind, Workspace};
 use ui::prelude::*;
 use ui::{HighlightedLabel, ListItem, ListItemSpacing};
 
+use found::{Answers, Found};
 use matching::{Candidate, Group, Ranked, rank};
 pub use matching::{humanize_action_name, normalize_query};
 
@@ -298,6 +300,8 @@ pub struct CommandPalette {
     selected: usize,
     scroll: UniformListScrollHandle,
     node_search: Option<Task<()>>,
+    /// What each node type answered, shown again or narrowed without a read.
+    answers: Answers,
     _subscription: Subscription,
 }
 
@@ -390,6 +394,7 @@ impl CommandPalette {
             selected: 0,
             scroll: UniformListScrollHandle::new(),
             node_search: None,
+            answers: Answers::default(),
             _subscription: subscription,
         };
         palette.update_matches(cx);
@@ -397,57 +402,114 @@ impl CommandPalette {
     }
 
     /// After a pause in typing, looks up nodes of every node type whose id starts with, or
-    /// label contains, the text; replaces the node rows with what comes back.
+    /// label contains, the text; replaces the node rows with what comes back. Until then the
+    /// earlier node rows stay, ranked against the new text like every row (the matches were
+    /// just ranked over them). A type whose earlier answer holds every match is narrowed
+    /// without a read; when every type is, the rows change at once.
     fn schedule_node_search(&mut self, cx: &mut Context<Self>) {
         let text = self.query.read(cx).text(cx).trim().to_owned();
-        self.rows.truncate(self.fixed);
-        self.candidates.truncate(self.fixed);
         let Some(session) = self.session.clone() else {
             return;
         };
         if text.chars().count() < 2 {
             self.node_search = None;
+            self.rows.truncate(self.fixed);
+            self.candidates.truncate(self.fixed);
             self.update_matches(cx);
+            return;
+        }
+        let types: Vec<String> = session
+            .read(cx)
+            .schema_model()
+            .map(|schema| schema.nodes.iter().map(|node| node.name.clone()).collect())
+            .unwrap_or_default();
+        let mut narrowed: Vec<(String, Option<Vec<Found>>)> = types
+            .into_iter()
+            .map(|type_name| {
+                let rows = self.answers.known(&type_name, &text);
+                (type_name, rows)
+            })
+            .collect();
+        if !narrowed.is_empty() && narrowed.iter().all(|(_, rows)| rows.is_some()) {
+            self.node_search = None;
+            let found = narrowed
+                .into_iter()
+                .map(|(type_name, rows)| (type_name, rows.unwrap_or_default()))
+                .collect();
+            self.set_nodes(found, cx);
             return;
         }
         self.node_search = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(NODE_SEARCH_DELAY).await;
-            let reads = session.update(cx, |session, cx| {
+            let pending = session.update(cx, |session, cx| {
                 let Some(schema) = session.schema_model() else {
                     return Vec::new();
                 };
                 schema
                     .nodes
                     .iter()
-                    .filter_map(|node| {
-                        let query = node_search(&schema, &node.name, &text, NODES_PER_TYPE).ok()?;
-                        Some((node.name.clone(), session.read(&query, None, cx)))
+                    .map(|node| {
+                        let known = narrowed
+                            .iter_mut()
+                            .find(|(type_name, _)| *type_name == node.name)
+                            .and_then(|(_, rows)| rows.take());
+                        let read = match known {
+                            Some(_) => None,
+                            None => node_search(&schema, &node.name, &text, NODES_PER_TYPE)
+                                .ok()
+                                .map(|query| session.read(&query, None, cx)),
+                        };
+                        (node.name.clone(), known, read)
                     })
                     .collect::<Vec<_>>()
             });
             let mut found = Vec::new();
-            for (type_name, read) in reads {
+            let mut answered = Vec::new();
+            for (type_name, known, read) in pending {
+                if let Some(rows) = known {
+                    found.push((type_name, rows));
+                    continue;
+                }
                 // A type that fails to answer simply has no rows; the others still show.
-                let Ok(output) = read.await else { continue };
+                let Some(Ok(output)) = (match read {
+                    Some(read) => Some(read.await),
+                    None => None,
+                }) else {
+                    continue;
+                };
                 let Value::Array(rows) = output.rows else {
                     continue;
                 };
-                for row in rows {
-                    let Some(id) = row.get("id").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    let label = row.get("label").and_then(Value::as_str);
-                    found.push((type_name.clone(), id.to_owned(), label.map(str::to_owned)));
-                }
+                let rows: Vec<Found> = rows
+                    .iter()
+                    .filter_map(|row| {
+                        Some(Found {
+                            id: row.get("id")?.as_str()?.to_owned(),
+                            label: row.get("label").and_then(Value::as_str).map(str::to_owned),
+                        })
+                    })
+                    .collect();
+                answered.push((type_name.clone(), rows.clone()));
+                found.push((type_name, rows));
             }
-            this.update(cx, |this, cx| this.set_nodes(found, cx)).ok();
+            this.update(cx, |this, cx| {
+                for (type_name, rows) in answered {
+                    this.answers
+                        .keep(type_name, text.clone(), rows, NODES_PER_TYPE as usize);
+                }
+                this.set_nodes(found, cx);
+            })
+            .ok();
         }));
     }
 
-    fn set_nodes(&mut self, found: Vec<(String, String, Option<String>)>, cx: &mut Context<Self>) {
+    fn set_nodes(&mut self, found: Vec<(String, Vec<Found>)>, cx: &mut Context<Self>) {
         self.rows.truncate(self.fixed);
         self.candidates.truncate(self.fixed);
-        for (type_name, id, label) in found.into_iter().take(NODES_SHOWN) {
+        let found = found.into_iter().flat_map(|(type_name, rows)| {
+            rows.into_iter().map(move |row| (type_name.clone(), row))
+        });
+        for (type_name, Found { id, label }) in found.take(NODES_SHOWN) {
             let shown = match &label {
                 Some(label) if label != &id => format!("{label} · {id}"),
                 _ => id.clone(),

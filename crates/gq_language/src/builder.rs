@@ -1209,6 +1209,31 @@ fn text_match(var: &str, label: Option<&str>, text: &str, params: &mut Params) -
     format!("({})", tests.join(" or "))
 }
 
+/// Whether a node with this id and label answers [`node_search`] for `text`, decided as the
+/// query's predicate decides it (`label` is the search's `label` column).
+pub fn search_matches(id: &str, label: Option<&str>, text: &str) -> bool {
+    spellings(text).iter().any(|spelling| {
+        id.starts_with(spelling.as_str())
+            || label.is_some_and(|label| label.contains(spelling.as_str()))
+    })
+}
+
+/// Whether every node that answers [`node_search`] for `text` also answered it for
+/// `previous`: each spelling `text` is tried in starts with one `previous` was tried in, so
+/// an id starting with it, or a label containing it, matched before. A caller holding every
+/// node that answered `previous` filters them with [`search_matches`] instead of asking again.
+/// Checked rather than assumed from `text` starting with `previous`: lowercasing can change a
+/// letter by what follows it (a final sigma).
+pub fn search_narrows(previous: &str, text: &str) -> bool {
+    let before = spellings(previous);
+    !before.is_empty()
+        && spellings(text).iter().all(|spelling| {
+            before
+                .iter()
+                .any(|earlier| spelling.starts_with(earlier.as_str()))
+        })
+}
+
 /// Sets one property of one node, bound to the value the cell showed (spec 004). Zero affected
 /// nodes means the value changed elsewhere. List properties cannot be compared, so they are
 /// bound to the row only.
@@ -2203,6 +2228,25 @@ mod tests {
             "{}",
             person.text
         );
+    }
+
+    #[test]
+    fn longer_search_text_matches_among_what_shorter_text_matched() {
+        assert!(search_matches("ada-lovelace", None, "ada"));
+        assert!(search_matches("p-1", Some("Ada Lovelace"), "ada lov"));
+        assert!(search_matches("p-1", Some("Ada Lovelace"), "Lovelace"));
+        assert!(!search_matches("p-1", Some("Ada Lovelace"), "grace"));
+        assert!(!search_matches("p-1", None, "ada"));
+
+        assert!(search_narrows("ad", "ada"));
+        assert!(search_narrows("ada", "ada lov"));
+        assert!(search_narrows("Ada", "Ada L"));
+        assert!(!search_narrows("ada", "ad"), "shorter text can match more");
+        assert!(!search_narrows("ada", "grace"));
+        assert!(!search_narrows("", "ada"));
+        // "ΑΣ" lowercases to "ας" but "ΑΣΑ" to "ασα": the lowercase spelling does not grow,
+        // so the narrower search asks again.
+        assert!(!search_narrows("ΑΣ", "ΑΣΑ"));
     }
 
     #[test]
