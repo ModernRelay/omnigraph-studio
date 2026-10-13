@@ -36,6 +36,7 @@ pub fn init(cx: &mut App) {
         if let Some(window) = window {
             let handle = cx.entity().downgrade();
             let list = cx.new(|cx| sessions_panel::SessionsPanel::new(handle, window, cx));
+            let actions = cx.new(|cx| sessions_panel::SessionsActions::new(&list, cx));
             workspace.add_panel(
                 PanelPosition::Left,
                 sessions_panel::PANEL_ID,
@@ -44,6 +45,7 @@ pub fn init(cx: &mut App) {
                 list.into(),
                 cx,
             );
+            workspace.set_panel_actions(sessions_panel::PANEL_ID, actions.into(), cx);
         }
         workspace.register_action(|workspace, _: &OpenAgent, window, cx| {
             panel::open(workspace, window, cx);

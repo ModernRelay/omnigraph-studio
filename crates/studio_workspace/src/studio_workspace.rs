@@ -1063,7 +1063,18 @@ impl Workspace {
             title: title.into(),
             icon,
             view,
+            actions: None,
         });
+        cx.notify();
+    }
+
+    /// Puts small buttons on the right of a panel's title line.
+    pub fn set_panel_actions(&mut self, id: &str, actions: AnyView, cx: &mut Context<Self>) {
+        for dock in [&mut self.left, &mut self.right, &mut self.bottom] {
+            if dock.set_actions(id, actions.clone()) {
+                break;
+            }
+        }
         cx.notify();
     }
 
@@ -1086,6 +1097,7 @@ impl Workspace {
                     title: "Inspector".into(),
                     icon: IconName::Info,
                     view,
+                    actions: None,
                 });
                 // Selection shows the inspector but never reopens a dock the user closed.
                 let open = self.right.open;
@@ -1358,7 +1370,10 @@ impl Workspace {
             .children(self.left.active_panel().map(|panel| {
                 v_flex()
                     .w_full()
-                    .child(studio_ui::ds::section_label(panel.title.clone()))
+                    .child(studio_ui::ds::section_header(
+                        panel.title.clone(),
+                        panel.actions.clone().map(IntoElement::into_any_element),
+                    ))
                     .child(panel.view.clone())
             }));
         let glass = studio_ui::ds::is_glass(cx);

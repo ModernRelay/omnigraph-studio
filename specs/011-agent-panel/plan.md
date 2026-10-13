@@ -212,27 +212,30 @@ and Delta's sidebar.
   it is the graph's conversations. A conversation keeps the directory it started in (recorded
   with it); earlier ones ran in the shared `agent/workspace`.
 - **The Conversations panel** is a tab of the left sidebar (the agent mark;
-  `studio_agent::ShowConversations`), after Delta's threads list: "New conversation", then
-  Pinned and Recent (labels only when something is pinned), each row the title and, at the
-  end, what the conversation is doing (a turning circle while it runs, a warning mark while a
+  `studio_agent::ShowConversations`), after Delta's threads list, every title on one edge. Its
+  title line holds Search, More (Import from the agent) and New conversation. Then Pinned and
+  Recent (labels only when something is pinned), each row the title alone and, at the end,
+  only what the conversation is doing: a turning circle while it runs, a warning mark while a
   change or tool waits for the person, a red cross when the agent stopped with an error, an
-  accent dot when it finished while its tab was not shown, cleared when the tab gains focus)
-  or else when the person last wrote ("now", "5m", "3h", "2d", "12 Oct"). Rows sort by the
-  person's last message, as Zed's sort by the last interaction, so a conversation finishing in
-  the background does not move. The shown tab's row is selected. Hovering a row swaps the time
-  for Pin and Archive; archiving only hides it here (the agent keeps the session, as Zed's
-  archive sends nothing), and Archived folds away at the end with a count, where Undo brings a
-  row back. The tooltip has the title, the agent and the last activity. What a conversation is
-  doing and whether it was seen live in memory only.
+  accent dot when it finished while its tab was not shown (cleared when the tab gains focus).
+  When the person last wrote ("just now", "5m ago", "12 Oct") is in the tooltip with the title
+  and the agent, not on the row, as Delta's rows carry no times. Rows sort by the person's last
+  message, as Zed's sort by the last interaction, so a conversation finishing in the
+  background does not move. The shown tab's row is selected. Hovering a row shows Pin and
+  Archive; archiving only hides it here (the agent keeps the session, as Zed's archive sends
+  nothing), and "Archived 3 ›" folds them away at the end, where Undo brings a row back. What
+  a conversation is doing and whether it was seen live in memory only. How an import or a
+  delete went is a toast, not a line in the list.
 - A right click on a row offers Rename, Pin or Unpin, Archive or Restore, and Delete…. Rename
   edits the title in place (↩ or leaving the field keeps it, ⎋ drops it); the person's title
   wins over the agent's, and an empty one gives the agent's back. Delete… asks first, in a
   dialog: Studio forgets the conversation and its open tab closes, and the agent deletes it with
   `session/delete` when it can (otherwise the note says why); the graph and the agent's branch
-  are not touched. A search field appears once the list holds six conversations; it matches
-  titles and agent names and looks through the archive too. "Import from the agent" asks the
-  agent for its sessions in the graph's directory (`session/list`, every page up to 20) and adds
-  the ones the list lacks, titled and dated as the agent reports; the note says how many.
+  are not touched. Search in the title line opens a field on the rows' edge (⎋ closes it); it
+  matches titles and agent names and looks through the archive too. "Import from the agent"
+  (More) asks the agent for its sessions in the graph's directory (`session/list`, every page up
+  to 20) and adds the ones the list lacks, titled and dated as the agent reports; a toast says
+  how many.
 - A loaded conversation keeps writing to its branch and keeps its own options; a new one starts
   from the options chosen last for the agent.
 
@@ -312,6 +315,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 | 2026-10-12 | Conversations are listed per graph and run side by side | `agent_panel` tests `conversations_are_kept_per_graph_newest_first`, `the_first_format_becomes_records`, `times_read_short`; offscreen snapshots with the test agent (now with a "slow" turn): two and three conversations in tabs, a hovered row, a pin, a slow turn finishing behind another tab, a restart | Tabs titled "How many people are there?" and "List the companies by size"; the shown one selected in the panel with "now"; hover showed pin and archive; the pinned row moved under Pinned; the slow conversation showed a turning circle while running and an accent dot after finishing unseen; after a restart both tabs came back and the shown one replayed |
 | 2026-10-12 | Messages sent while the agent works are queued and sent in order | `agent_panel` test `the_queue_sends_in_order_pauses_on_stop_and_lets_send_now_jump_it`; offscreen snapshots with the test agent's slow turn: two messages queued behind it, then the transcript the agent kept; then one queued and one sent with ⌘⇧↩ | The card read "2 queued messages", the next one dotted with Send now; the agent received the three in order; with ⌘⇧↩ it received the urgent one second and the queued one third |
 | 2026-10-12 | One agent process serves every conversation; the list renames, searches, deletes and imports | `agent_panel` tests `updates_go_to_their_session_and_early_ones_wait`, `conversations_are_kept_per_graph_newest_first` (rename, remove, import), `each_graph_has_a_directory_of_its_own`; offscreen snapshots with the test agent (one process for every session, `session/list`, `session/delete`, `session/close`), counting its processes | Two conversations ran on one test-agent process, each with its own tools, in `agent/graphs/environment-knowledge-2998657d`; with two records dropped, Import brought both back ("Imported 2 conversations."); Rename showed "Best-connected people"; "people" left two rows; Delete… asked, removed the row, and the agent deleted its transcript (6 to 5); a session the agent did not know left "Removed here; the agent did not delete it" |
+| 2026-10-12 | The Conversations panel reads clean | Offscreen snapshots after "looks messy": a pinned, three recent and an archived conversation; Search open with "comp"; a hovered row | Search, More and + on the title line; one text edge for every row; no times on rows (the tooltip read "you last wrote 12m ago"); "Archived 1 ›" at the end; the search field framed on the rows' edge |
 
 ## Corrections
 

@@ -33,6 +33,9 @@ pub struct PanelEntry<V = AnyView> {
     pub title: SharedString,
     pub icon: IconName,
     pub view: V,
+    /// Small buttons on the right of the panel's title line (search, new), as Delta and Zed
+    /// put a list's actions in its header.
+    pub actions: Option<V>,
 }
 
 /// The panels at one position.
@@ -84,10 +87,28 @@ impl<V> Dock<V> {
     }
 
     /// Adds a panel, or replaces the view of the panel with the same id.
-    pub fn insert(&mut self, panel: PanelEntry<V>) {
+    /// Adds a panel, or replaces the one with its id, keeping that one's header actions when
+    /// the new one brings none.
+    pub fn insert(&mut self, mut panel: PanelEntry<V>) {
         match self.position_of(&panel.id) {
-            Some(index) => self.panels[index] = panel,
+            Some(index) => {
+                if panel.actions.is_none() {
+                    panel.actions = self.panels[index].actions.take();
+                }
+                self.panels[index] = panel;
+            }
             None => self.panels.push(panel),
+        }
+    }
+
+    /// Sets the header actions of the panel with `id`; false when there is none.
+    pub fn set_actions(&mut self, id: &str, actions: V) -> bool {
+        match self.position_of(id) {
+            Some(index) => {
+                self.panels[index].actions = Some(actions);
+                true
+            }
+            None => false,
         }
     }
 
@@ -123,6 +144,7 @@ mod tests {
             title: id.to_owned().into(),
             icon: IconName::Table,
             view: (),
+            actions: None,
         }
     }
 

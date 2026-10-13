@@ -309,6 +309,52 @@ pub fn section_label(title: impl Into<SharedString>) -> Div {
         .child(text::meta(title))
 }
 
+/// A section label that folds the rows under it ("Archived 3 ›"), on the same edge as
+/// [`section_label`].
+pub fn section_disclosure(
+    id: impl Into<ElementId>,
+    title: impl Into<SharedString>,
+    count: usize,
+    open: bool,
+) -> Stateful<Div> {
+    h_flex()
+        .id(id.into())
+        .px(px(space::LG))
+        .pt(px(space::BETWEEN))
+        .pb(px(space::SM))
+        .gap(px(space::XS))
+        .items_center()
+        .cursor_pointer()
+        .child(text::meta(title))
+        .child(text::meta(count.to_string()))
+        .child(
+            Icon::new(if open {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            })
+            .size(IconSize::XSmall)
+            .color(Color::Muted),
+        )
+}
+
+/// A panel's title line: its quiet label, and its actions on the right (search, new) when it
+/// has any, on the label's baseline.
+pub fn section_header(title: impl Into<SharedString>, actions: Option<AnyElement>) -> Div {
+    match actions {
+        None => section_label(title),
+        Some(actions) => h_flex()
+            .pl(px(space::LG))
+            .pr(px(space::MD))
+            .pt(px(space::BETWEEN - space::XS))
+            .pb(px(space::XS))
+            .items_center()
+            .child(text::meta(title))
+            .child(div().flex_1())
+            .child(actions),
+    }
+}
+
 type TooltipBuilder = Box<dyn Fn(&mut Window, &mut App) -> gpui::AnyView + 'static>;
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 /// What a setting row's reset button does.

@@ -174,7 +174,10 @@ than styling one-off elements.
   switches panels with icon tabs (Types, Explore, Branches); the right (340 px, the inspector)
   and bottom (the activity log) docks use title tabs and a close button. Selection fills the
   inspector without reopening a dock the user closed. Each dock's open state and active panel
-  are remembered per graph. Documents are tabs in the center, not panels.
+  are remembered per graph. Documents are tabs in the center, not panels. A left panel may put
+  small buttons on its title line, on the label's baseline (`Workspace::set_panel_actions`,
+  drawn by `ds::section_header`), as Delta and Zed put a list's search and "new" there rather
+  than as rows in the list; the Conversations panel does (spec 011).
 - **Footers, after Delta.** The sidebar footer holds the connection: a status dot, the server
   and its state, opening "Open a graph" (Delta's account). The document footer holds where the
   open tab reads and writes, graph / branch with the branch menu (Delta's repo / branch), then

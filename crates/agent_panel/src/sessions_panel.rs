@@ -21,18 +21,18 @@ use gpui::{
 use studio_actions::agent::{NewConversation, OpenConversation};
 use studio_settings::StudioSettings;
 use studio_ui::ds;
-use studio_workspace::Workspace;
+use studio_workspace::{ToastKind, Workspace};
 use ui::prelude::*;
-use ui::{CommonAnimationExt as _, ContextMenu, IconButton, Indicator, Tooltip, right_click_menu};
+use ui::{
+    CommonAnimationExt as _, ContextMenu, IconButton, Indicator, PopoverMenu, Tooltip,
+    right_click_menu,
+};
 
 use crate::connection::{self, AgentConnection};
 use crate::host::AgentLaunch;
 use crate::sessions::{AgentSessions, Live, SessionRecord, graph_cwd};
 
 pub const PANEL_ID: &str = "agent-conversations";
-
-/// The list shows a search field once it holds more conversations than this.
-const SEARCH_FROM: usize = 6;
 
 pub struct SessionsPanel {
     workspace: WeakEntity<Workspace>,
@@ -41,8 +41,8 @@ pub struct SessionsPanel {
     search: Entity<Editor>,
     /// The conversation being renamed, and its title field.
     renaming: Option<(String, Entity<Editor>, Subscription)>,
-    /// What the last import or delete came to.
-    note: Option<SharedString>,
+    /// The search field shows: asked for in the header, or holding text.
+    search_open: bool,
     /// An import or delete at the agent in flight; it holds the agent's process while it runs.
     _agent_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -68,7 +68,8 @@ impl SessionsPanel {
         let sessions = AgentSessions::global(cx);
         let search = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Search conversations", window, cx);
+            editor.set_placeholder_text("Search titles and agents", window, cx);
+            editor.set_text_style_refinement(ds::field_text(cx));
             editor
         });
         let mut subscriptions = vec![
@@ -89,7 +90,7 @@ impl SessionsPanel {
             show_archived: false,
             search,
             renaming: None,
-            note: None,
+            search_open: false,
             _agent_task: None,
             _subscriptions: subscriptions,
         }
@@ -186,25 +187,52 @@ impl SessionsPanel {
             .update(cx, |sessions, cx| sessions.remove(&id, cx));
         let Some(agent) = Self::agent(cx).filter(|agent| agent.command.join(" ") == record.agent)
         else {
-            self.note = Some("Removed here. Another agent holds it, so it stays there.".into());
-            cx.notify();
+            self.toast(
+                ToastKind::Info,
+                "Removed. Another agent holds the conversation, so it stays there.",
+                cx,
+            );
             return;
         };
         let connection = connection::connection(agent, cx);
         let answer = connection.delete(id);
         self._agent_task = Some(cx.spawn(async move |this, cx| {
-            let note = match answer.await {
-                Ok(Ok(())) => "Deleted here and at the agent.".to_owned(),
-                Ok(Err(reason)) => format!("Removed here; the agent did not delete it ({reason})."),
-                Err(_) => "Removed here; the agent stopped before deleting it.".to_owned(),
+            let (kind, note) = match answer.await {
+                Ok(Ok(())) => (
+                    ToastKind::Success,
+                    "Deleted, here and at the agent.".to_owned(),
+                ),
+                Ok(Err(reason)) => (
+                    ToastKind::Info,
+                    format!("Removed here; the agent did not delete it ({reason})."),
+                ),
+                Err(_) => (
+                    ToastKind::Info,
+                    "Removed here; the agent stopped before deleting it.".to_owned(),
+                ),
             };
             drop(connection);
-            this.update(cx, |this, cx| {
-                this.note = Some(note.into());
-                cx.notify();
-            })
-            .ok();
+            this.update(cx, |this, cx| this.toast(kind, note, cx)).ok();
         }));
+    }
+
+    /// Says how an import or a delete went, as Studio reports work that finishes away from where
+    /// it started.
+    fn toast(&self, kind: ToastKind, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let message = message.into();
+        self.workspace
+            .update(cx, |workspace, cx| workspace.show_toast(kind, message, cx))
+            .ok();
+    }
+
+    fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_open = !self.search_open;
+        if self.search_open {
+            window.focus(&self.search.focus_handle(cx), cx);
+        } else {
+            self.search
+                .update(cx, |editor, cx| editor.clear(window, cx));
+        }
         cx.notify();
     }
 
@@ -217,35 +245,38 @@ impl SessionsPanel {
         let agent_name = agent.command.join(" ");
         let connection: Arc<AgentConnection> = connection::connection(agent, cx);
         let answer = connection.list(cwd.clone());
-        self.note = Some("Asking the agent…".into());
         self._agent_task = Some(cx.spawn(async move |this, cx| {
             let result = answer.await;
             drop(connection);
             this.update(cx, |this, cx| {
-                let note = match result {
+                let (kind, note) = match result {
                     Ok(Ok(found)) => {
                         let records = found
                             .into_iter()
                             .map(|info| imported(info, &graph, &agent_name, &cwd))
                             .collect();
-                        match this
+                        let added = this
                             .sessions
-                            .update(cx, |sessions, cx| sessions.import(records, cx))
-                        {
-                            0 => "Nothing new to import.".to_owned(),
-                            1 => "Imported 1 conversation.".to_owned(),
-                            n => format!("Imported {n} conversations."),
-                        }
+                            .update(cx, |sessions, cx| sessions.import(records, cx));
+                        (
+                            ToastKind::Success,
+                            match added {
+                                0 => "No conversations to import: the list has them all.".into(),
+                                1 => "Imported 1 conversation.".into(),
+                                n => format!("Imported {n} conversations."),
+                            },
+                        )
                     }
-                    Ok(Err(reason)) => reason,
-                    Err(_) => "The agent stopped before answering.".to_owned(),
+                    Ok(Err(reason)) => (ToastKind::Info, reason),
+                    Err(_) => (
+                        ToastKind::Info,
+                        "The agent stopped before answering.".to_owned(),
+                    ),
                 };
-                this.note = Some(note.into());
-                cx.notify();
+                this.toast(kind, note, cx);
             })
             .ok();
         }));
-        cx.notify();
     }
 
     // ---- rows ----
@@ -380,16 +411,23 @@ fn conversation_row(
             Indicator::dot().color(Color::Accent).into_any_element(),
             Some("Finished while you were away"),
         ),
-        RowState::Idle(when) => (ds::sidebar_count(when.clone()).into_any_element(), None),
+        // No time on the row, as Delta's threads: it is in the tooltip.
+        RowState::Idle(_) => (div().into_any_element(), None),
     };
-    let mut about = format!(
-        "{} · {} · last active {}",
-        record.shown_title(),
-        agent_name(&record.agent),
-        record
+    let when = match state {
+        RowState::Idle(when) if when == "now" => "just now".to_owned(),
+        RowState::Idle(when) if when.ends_with(['m', 'h', 'd']) => format!("{when} ago"),
+        RowState::Idle(when) => when.clone(),
+        _ => record
             .updated_at
             .with_timezone(&chrono::Local)
-            .format("%-d %b %H:%M"),
+            .format("%-d %b %H:%M")
+            .to_string(),
+    };
+    let mut about = format!(
+        "{} · {} · you last wrote {when}",
+        record.shown_title(),
+        agent_name(&record.agent),
     );
     if let Some(state) = state_text {
         about = format!("{state} · {about}");
@@ -502,7 +540,6 @@ impl Render for SessionsPanel {
         };
         let query = self.search.read(cx).text(cx).trim().to_lowercase();
         let searching = !query.is_empty();
-        let show_search = searching || listed.len() + archived.len() >= SEARCH_FROM;
         let matches = |record: &SessionRecord| {
             query.is_empty()
                 || record.shown_title().to_lowercase().contains(&query)
@@ -515,54 +552,36 @@ impl Render for SessionsPanel {
         let archived: Vec<_> = archived.into_iter().filter(|r| matches(r)).collect();
         let is_shown = |record: &SessionRecord| shown.as_deref() == Some(record.session.as_str());
 
-        let mut list = v_flex().w_full().child(
-            ds::SidebarRow::new("new-conversation", "New conversation")
-                .start(
-                    Icon::new(IconName::Plus)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                )
-                .muted(true)
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(NewConversation), cx)),
-        );
-        if show_search {
+        let mut list = v_flex().w_full();
+        if self.search_open || searching {
+            // The field's text sits on the rows' edge, as their titles do; ⎋ closes it.
             list = list.child(
                 h_flex()
                     .h(px(ds::size::SIDEBAR_ROW))
                     .mx(px(ds::space::SM))
+                    .mb(px(ds::space::XS))
                     .px(px(ds::space::SM))
-                    .gap(px(ds::space::MD))
                     .items_center()
-                    .child(
-                        Icon::new(IconName::MagnifyingGlass)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(div().flex_1().text_sm().child(self.search.clone())),
+                    .rounded(px(ds::radius::SM))
+                    .bg(ds::surface::sunken(cx))
+                    .key_context("ConversationSearch")
+                    .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                        this.search_open = true;
+                        this.toggle_search(window, cx);
+                    }))
+                    .child(div().flex_1().child(self.search.clone())),
             );
         }
-        if let Some(note) = self.note.clone() {
-            list = list.child(ds::sidebar_note(note));
-        }
         if pinned.is_empty() && recent.is_empty() && archived.is_empty() {
-            list = list.child(if searching {
-                ds::sidebar_placeholder(
-                    "no-matches",
-                    IconName::MagnifyingGlass,
-                    "No conversation matches",
-                    "Titles and agents are searched",
-                )
+            list = list.child(ds::sidebar_note(if searching {
+                "No conversation matches."
             } else {
-                ds::sidebar_placeholder(
-                    "no-conversations",
-                    IconName::ZedAssistant,
-                    "No conversations yet",
-                    "Ask the agent from the Agent tab (⌘⇧A); each conversation is listed here",
-                )
-            });
+                "No conversations yet. Ask the agent from the Agent tab (⌘⇧A)."
+            }));
         }
         if !pinned.is_empty() {
-            list = list.child(ds::section_label("Pinned"));
+            // The first label sits under the panel's own title, not a section's gap below it.
+            list = list.child(ds::section_label("Pinned").pt(px(ds::space::XS)));
             for record in &pinned {
                 let row = self.row(record, is_shown(record), now, cx);
                 list = list.child(row);
@@ -579,22 +598,12 @@ impl Render for SessionsPanel {
             // A search looks through the archive too.
             let open = self.show_archived || searching;
             list = list.child(
-                ds::SidebarRow::new("archived", "Archived")
-                    .muted(true)
-                    .start(
-                        Icon::new(if open {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                    )
-                    .end(ds::sidebar_count(archived.len().to_string()))
-                    .on_click(cx.listener(|this, _, _, cx| {
+                ds::section_disclosure("archived", "Archived", archived.len(), open).on_click(
+                    cx.listener(|this, _, _, cx| {
                         this.show_archived = !this.show_archived;
                         cx.notify();
-                    })),
+                    }),
+                ),
             );
             if open {
                 for record in &archived {
@@ -603,22 +612,78 @@ impl Render for SessionsPanel {
                 }
             }
         }
-        if Self::agent(cx).is_some() {
-            list = list.child(
-                ds::SidebarRow::new("import-conversations", "Import from the agent")
-                    .start(
-                        Icon::new(IconName::Download)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .muted(true)
-                    .tooltip(
-                        "Add the agent's own conversations on this graph that are not listed here",
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| this.import(cx))),
-            );
-        }
         list.child(div().h(px(ds::space::SM))).into_any_element()
+    }
+}
+
+/// The Conversations panel's header buttons: search, More (import), and a new conversation.
+pub struct SessionsActions {
+    panel: WeakEntity<SessionsPanel>,
+    _observe: Subscription,
+}
+
+impl SessionsActions {
+    pub fn new(panel: &Entity<SessionsPanel>, cx: &mut Context<Self>) -> Self {
+        Self {
+            panel: panel.downgrade(),
+            _observe: cx.observe(panel, |_, _, cx| cx.notify()),
+        }
+    }
+}
+
+impl Render for SessionsActions {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let searching = self
+            .panel
+            .upgrade()
+            .is_some_and(|panel| panel.read(cx).search_open);
+        let has_agent = SessionsPanel::agent(cx).is_some();
+        let panel = self.panel.clone();
+        h_flex()
+            .gap(px(ds::space::XXS))
+            .child({
+                let panel = panel.clone();
+                IconButton::new("search-conversations", IconName::MagnifyingGlass)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .toggle_state(searching)
+                    .tooltip(Tooltip::text("Search conversations"))
+                    .on_click(move |_, window, cx| {
+                        panel
+                            .update(cx, |panel, cx| panel.toggle_search(window, cx))
+                            .ok();
+                    })
+            })
+            .when(has_agent, |row| {
+                let panel = panel.clone();
+                row.child(
+                    PopoverMenu::new("conversations-more")
+                        .trigger(
+                            IconButton::new("conversations-more-button", IconName::Ellipsis)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("More")),
+                        )
+                        .menu(move |window, cx| {
+                            let panel = panel.clone();
+                            Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                                menu.entry("Import from the agent", None, move |_, cx| {
+                                    panel.update(cx, |panel, cx| panel.import(cx)).ok();
+                                })
+                            }))
+                        })
+                        .anchor(gpui::Anchor::TopRight),
+                )
+            })
+            .child(
+                IconButton::new("new-conversation", IconName::Plus)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("New conversation"))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(NewConversation), cx)
+                    }),
+            )
     }
 }
 
