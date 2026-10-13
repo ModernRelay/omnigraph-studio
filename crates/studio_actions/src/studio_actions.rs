@@ -196,6 +196,19 @@ pub mod graph {
         pub type_name: String,
     }
 
+    /// Open a Blob value in a tab of its own, read at a commit or the branch head.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct OpenBlob {
+        pub type_name: String,
+        pub id: String,
+        pub property: String,
+        #[serde(default)]
+        pub edge: bool,
+        #[serde(default)]
+        pub at_commit: Option<String>,
+    }
+
     /// Show one node in the inspector without revealing it in the tree.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
@@ -391,6 +404,8 @@ pub mod canvas {
             ZoomIn,
             /// Zoom out.
             ZoomOut,
+            /// Show an image at its own size, one image pixel to one screen point.
+            ActualSize,
             /// Expand the selected node.
             ExpandNode,
             /// Collapse the selected node.

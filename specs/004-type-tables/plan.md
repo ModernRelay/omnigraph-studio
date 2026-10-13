@@ -54,6 +54,19 @@ stay put), IX (paged, virtualized).
   announce), the value is read in ranges at the peek's commit into `<file>.part` beside it, off
   the main thread, and renamed into place only when whole; the line shows how far it got, then
   "Show in Finder".
+- "Open" shows a stored value in a tab of its own (`studio_graph::OpenBlob`), read whole at the
+  peek's commit (up to 64 MB; a larger value says so and offers Save and the default app), and
+  shown for what its bytes are, as Zed shows an image: an image fitted to the tab (never past its
+  own size) on a checkerboard with a hairline, ⌘-scroll or `=`/`-` zooming about the pointer,
+  `1` its actual size, `0` fit again, a drag to pan; an SVG fitted; a PDF's pages drawn by the
+  system (CoreGraphics on macOS, twice the width shown, the first 100 pages) and stacked to
+  scroll; UTF-8 text in a read-only editor (⌘F searches it); anything else as a hex dump of its
+  first 64 KB, sixteen bytes a line. The footer gives the kind, the pixel size or page count,
+  the size and the commit; zoom (−, the percentage, +, Fit) for an image or a PDF; Save…; and
+  "Open in default app", which writes the value to an owner-only folder in Studio's data
+  directory, emptied of anything a day old, and hands it to the system. The tab comes back after
+  a restart with the same value at the same commit. Elsewhere than macOS, a PDF opens in the
+  system's viewer.
 
 ### Reading
 
@@ -195,6 +208,7 @@ opens the branch's recent commits.
 | 2026-10-12 | Spike S1: several rows in one commit | on a scratch branch of the dev server: `update Person set { title: $v } where @id in $ids` (3 rows), and one mutation of two `update` statements | Both publish one commit; multi-statement mutations are the mechanism, so merge-mode NDJSON was not needed |
 | 2026-10-12 | Bulk set | `gq_language` `a_bulk_set_is_one_mutation_bound_row_by_row`; offscreen snapshots with `click:…,cmd` and `click:…,shift` on Project at branch `bulk-test`: three rows picked, status set to paused | One commit; `project-00001`, already paused, was left out ("Set status on 2 Project rows"); the rows updated in place and the selection cleared |
 | 2026-10-12 | A Blob value saves whole or not at all | `type_table` tests `a_save_lands_whole_or_not_at_all`, `a_saved_value_is_named_for_its_row_property_and_kind`; an offscreen snapshot of a note with a 12 KB text attachment | "Save…" at the end of the attachment's line; a save writes `<name>.part`, appends each range, and renames it into place only at the value's full size (a short value or a stop removes the part); the name is `<id>-<property>` with the kind's extension. The native save dialog cannot be driven offscreen |
+| 2026-10-12 | A Blob value opens in a tab of its own, shown for its kind | `type_table` tests `values_are_told_apart_by_their_bytes`, `a_pdf_is_drawn_page_by_page`, `a_page_is_drawn_to_scale_on_white_with_its_marks`, `the_open_folder_keeps_a_day`; offscreen snapshots of four notes on the dev `notes` graph with attachments set through a `Blob` parameter | A 960 × 600 transparent PNG fitted at 100% on the checkerboard ("PNG · 960 × 600 · 8.8 KB"); a two-page PDF drawn sharp ("PDF · 2 pages · 1.2 KB"); a 12 KB text in the read-only editor with line numbers; 3 KB of a binary as sixteen-byte hex lines. The first PDF test failed until the context was scaled before drawing: CoreGraphics' page transform never enlarges a page |
 
 ## Corrections
 

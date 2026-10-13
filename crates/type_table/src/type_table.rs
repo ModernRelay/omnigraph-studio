@@ -4,9 +4,11 @@
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/004-type-tables/plan.md`.
 
 mod blob;
+mod blob_view;
 mod dialogs;
 pub mod model;
 mod nodes_panel;
+mod pdf;
 mod peek;
 mod table;
 mod types_list;
@@ -14,10 +16,11 @@ mod types_list;
 use gpui::{App, AppContext as _, Context, Entity, Window};
 use gq_language::{Filter, FilterOp};
 use serde_json::Value;
-use studio_actions::graph::{BrowseType, OpenNode, OpenType, PeekNode};
+use studio_actions::graph::{BrowseType, OpenBlob, OpenNode, OpenType, PeekNode};
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
 
+pub use blob_view::BlobView;
 pub use dialogs::{DeleteRowModal, InsertRowModal};
 pub use peek::{NodePeek, PeekSubject};
 pub use table::{Cursor, TypeTable};
@@ -26,6 +29,22 @@ pub use types_list::TypesList;
 /// Registers this surface with every new workspace: the left dock's Types panel, `OpenType`,
 /// and `OpenNode`. Its keys are in `assets/keymaps/` (`TypeTable`, `TypeTable && editing`).
 pub fn init(cx: &mut App) {
+    // A Blob tab comes back with the value it showed, at the same commit.
+    studio_workspace::register_item_kind(cx, "blob", |data, workspace, window, cx| {
+        let text = |key: &str| data.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+        if let (Some(type_name), Some(id), Some(property)) =
+            (text("type_name"), text("id"), text("property"))
+        {
+            let action = OpenBlob {
+                type_name,
+                id,
+                property,
+                edge: data.get("edge").and_then(|v| v.as_bool()).unwrap_or(false),
+                at_commit: text("at_commit"),
+            };
+            open_blob(workspace, &action, window, cx);
+        }
+    });
     studio_workspace::register_item_kind(cx, "type_table", |data, workspace, window, cx| {
         if let Some(type_name) = data.get("type_name").and_then(|name| name.as_str()) {
             let at_commit = data
@@ -57,6 +76,9 @@ pub fn init(cx: &mut App) {
             types.into(),
             cx,
         );
+        workspace.register_action(|workspace, action: &OpenBlob, window, cx| {
+            open_blob(workspace, action, window, cx);
+        });
         workspace.register_action(|workspace, action: &OpenType, window, cx| {
             let table = open_type(
                 workspace,
@@ -170,4 +192,25 @@ fn open_node(workspace: &mut Workspace, action: &OpenNode, cx: &mut Context<Work
     };
     let peek = cx.new(|cx| NodePeek::new(session, subject, None, None, false, cx));
     workspace.set_inspector(Some(peek.into()), cx);
+}
+
+/// Opens a Blob value in a tab of its own, or shows the tab it is in.
+pub fn open_blob(
+    workspace: &mut Workspace,
+    action: &OpenBlob,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Option<Entity<BlobView>> {
+    let session = workspace.session()?.clone();
+    let cell = graph_client::BlobCell {
+        edge: action.edge,
+        type_name: action.type_name.clone(),
+        id: action.id.clone(),
+        property: action.property.clone(),
+    };
+    let snapshot = action.at_commit.clone();
+    let key = BlobView::key(&cell, snapshot.as_deref());
+    workspace.open_item(key, window, cx, move |window, cx| {
+        BlobView::new(session, cell, snapshot, window, cx)
+    })
 }

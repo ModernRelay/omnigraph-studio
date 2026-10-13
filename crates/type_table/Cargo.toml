@@ -22,6 +22,11 @@ graph_store = { workspace = true }
 gq_language = { workspace = true }
 chrono = { workspace = true }
 serde_json = { workspace = true }
+image = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { workspace = true }
+objc2-core-graphics = { workspace = true }
 
 [lints]
 workspace = true

@@ -2,10 +2,12 @@
 //! draws from a value's first bytes. A Blob is never projected by a query; each cell is read on
 //! its own through the server's Blob route, at the commit the row was read at.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{Image, ImageFormat};
-use graph_client::BlobMeta;
+use gpui::{AppContext as _, AsyncApp, Image, ImageFormat, WeakEntity};
+use graph_client::{BlobCell, BlobMeta};
+use graph_store::GraphSession;
 
 /// How much of a value the peek reads to decide how to show it.
 pub const PREVIEW_PREFIX: u64 = 64 * 1024;
@@ -131,6 +133,104 @@ impl RangeSave {
     }
 }
 
+/// Reads a managed value whole, in ranges at `snapshot`, telling `progress` how far it got.
+pub async fn read_value(
+    session: WeakEntity<GraphSession>,
+    cell: BlobCell,
+    snapshot: Option<String>,
+    size: u64,
+    cx: &mut AsyncApp,
+    mut progress: impl FnMut(u64, &mut AsyncApp),
+) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::with_capacity(size as usize);
+    while (bytes.len() as u64) < size {
+        let from = bytes.len() as u64;
+        let read = session
+            .update(cx, |session, cx| {
+                session.blob_bytes(cell.clone(), snapshot.clone(), from..size, cx)
+            })
+            .map_err(|_| "The graph closed.".to_owned())?;
+        match read.await {
+            Ok(chunk) if !chunk.is_empty() => bytes.extend(chunk),
+            Ok(_) => break,
+            Err(error) => return Err(error.to_string()),
+        }
+        progress(bytes.len() as u64, cx);
+    }
+    if bytes.len() as u64 != size {
+        return Err("The value ended before its size.".into());
+    }
+    Ok(bytes)
+}
+
+/// Saves a managed value to `path` without holding it whole: each range read at `snapshot` is
+/// written off the main thread to a [`RangeSave`], moved into place when complete.
+pub async fn save_value(
+    session: WeakEntity<GraphSession>,
+    cell: BlobCell,
+    snapshot: Option<String>,
+    size: u64,
+    path: PathBuf,
+    cx: &mut AsyncApp,
+    mut progress: impl FnMut(u64, &mut AsyncApp),
+) -> Result<PathBuf, String> {
+    let mut save = cx
+        .background_spawn(async move { RangeSave::begin(path, size) })
+        .await
+        .map_err(|error| format!("Could not write: {error}"))?;
+    while save.written() < size {
+        let from = save.written();
+        let read = match session.update(cx, |session, cx| {
+            session.blob_bytes(cell.clone(), snapshot.clone(), from..size, cx)
+        }) {
+            Ok(read) => read,
+            Err(_) => {
+                save.abandon();
+                return Err("The graph closed.".into());
+            }
+        };
+        let chunk = match read.await {
+            Ok(chunk) if !chunk.is_empty() => chunk,
+            Ok(_) => break,
+            Err(error) => {
+                save.abandon();
+                return Err(error.to_string());
+            }
+        };
+        let (returned, written) = cx
+            .background_spawn(async move {
+                let written = save.append(&chunk);
+                (save, written)
+            })
+            .await;
+        save = returned;
+        if let Err(error) = written {
+            save.abandon();
+            return Err(format!("Could not write: {error}"));
+        }
+        progress(save.written(), cx);
+    }
+    cx.background_spawn(async move { save.finish() }).await
+}
+
+/// Writes bytes already read to `path`, the same way: whole or not at all.
+pub async fn save_bytes(
+    bytes: Arc<Vec<u8>>,
+    path: PathBuf,
+    cx: &AsyncApp,
+) -> Result<PathBuf, String> {
+    cx.background_spawn(async move {
+        let mut save = RangeSave::begin(path, bytes.len() as u64)
+            .map_err(|error| format!("Could not write: {error}"))?;
+        if let Err(error) = save.append(&bytes) {
+            save.abandon();
+            return Err(format!("Could not write: {error}"));
+        }
+        save.finish()
+    })
+    .await
+}
+
 /// How many bytes to read for a preview of a value of `size` bytes whose first bytes are
 /// `prefix`: the whole value for an image that fits, else nothing more.
 pub fn bytes_wanted(prefix: &[u8], size: u64) -> u64 {
@@ -178,8 +278,13 @@ pub fn preview(bytes: Vec<u8>, size: u64) -> Preview {
 
 /// Eight bytes a line: offset, hex, and the printable ASCII.
 pub fn hex_dump(bytes: &[u8]) -> String {
+    hex_dump_lines(bytes, HEX_LINE)
+}
+
+/// [`hex_dump`] with `per_line` bytes a line: eight fit the inspector, sixteen a tab.
+pub fn hex_dump_lines(bytes: &[u8], per_line: usize) -> String {
     bytes
-        .chunks(HEX_LINE)
+        .chunks(per_line)
         .enumerate()
         .map(|(line, chunk)| {
             let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
@@ -195,9 +300,9 @@ pub fn hex_dump(bytes: &[u8]) -> String {
                 .collect();
             format!(
                 "{:04x}  {:<width$}  {ascii}",
-                line * HEX_LINE,
+                line * per_line,
                 hex.join(" "),
-                width = HEX_LINE * 3 - 1
+                width = per_line * 3 - 1
             )
         })
         .collect::<Vec<_>>()

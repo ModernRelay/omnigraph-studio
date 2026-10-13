@@ -9,12 +9,12 @@ use gpui::{App, ClipboardItem, Context, Entity, Render, SharedString, Task, Wind
 use gq_language::{Direction, RelationshipGroup, SchemaModel, builder};
 use graph_store::{GraphSession, Loadable};
 use serde_json::{Map, Value};
-use studio_actions::graph::OpenNode;
+use studio_actions::graph::{OpenBlob, OpenNode};
 use ui::Tooltip;
 use ui::prelude::*;
 
 use crate::blob::{
-    IMAGE_MAX, PREVIEW_PREFIX, Preview, RangeSave, bytes_wanted, preview, suggested_file_name,
+    IMAGE_MAX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, save_value, suggested_file_name,
 };
 use crate::model::{FROM_COLUMN, TO_COLUMN, display_value, format_count, node_rows, short_commit};
 use graph_client::{BlobCell, BlobMeta};
@@ -303,7 +303,7 @@ impl NodePeek {
     /// Saves a managed value to a file the person picks: read in ranges at the peek's commit and
     /// written to a file beside it, renamed into place when complete, so memory holds one range
     /// and a stopped save leaves no partial file under the chosen name.
-    fn save_blob(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn save_blob(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(slot) = self.blobs.get(index) else {
             return;
         };
@@ -325,11 +325,11 @@ impl NodePeek {
         };
         let session = self.session.downgrade();
         let snapshot = self.snapshot.clone();
-        self.blobs[index]._save = Some(cx.spawn_in(window, async move |this, cx| {
+        self.blobs[index]._save = Some(cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(path))) = chosen.await else {
                 return;
             };
-            let set = |state: SaveState, cx: &mut gpui::AsyncWindowContext| {
+            let set = |state: SaveState, cx: &mut gpui::AsyncApp| {
                 this.update(cx, |this, cx| {
                     if let Some(slot) = this.blobs.get_mut(index) {
                         slot.save = Some(state);
@@ -339,57 +339,12 @@ impl NodePeek {
                 .ok();
             };
             set(SaveState::Saving { done: 0, of: size }, cx);
-            let begun = cx
-                .background_spawn(async move { RangeSave::begin(path, size) })
-                .await;
-            let mut save = match begun {
-                Ok(save) => save,
-                Err(error) => {
-                    set(SaveState::Failed(format!("Could not write: {error}")), cx);
-                    return;
-                }
-            };
-            while save.written() < size {
-                let from = save.written();
-                let Ok(read) = session.update(cx, |session, cx| {
-                    session.blob_bytes(cell.clone(), snapshot.clone(), from..size, cx)
-                }) else {
-                    save.abandon();
-                    return;
-                };
-                let chunk = match read.await {
-                    Ok(chunk) if !chunk.is_empty() => chunk,
-                    Ok(_) => break,
-                    Err(error) => {
-                        save.abandon();
-                        set(SaveState::Failed(error.to_string()), cx);
-                        return;
-                    }
-                };
-                // Files are written off the main thread, one range at a time.
-                let (returned, written) = cx
-                    .background_spawn(async move {
-                        let written = save.append(&chunk);
-                        (save, written)
-                    })
-                    .await;
-                save = returned;
-                if let Err(error) = written {
-                    save.abandon();
-                    set(SaveState::Failed(format!("Could not write: {error}")), cx);
-                    return;
-                }
-                set(
-                    SaveState::Saving {
-                        done: save.written(),
-                        of: size,
-                    },
-                    cx,
-                );
-            }
-            let finished = cx.background_spawn(async move { save.finish() }).await;
+            let saved = save_value(session, cell, snapshot, size, path, cx, |done, cx| {
+                set(SaveState::Saving { done, of: size }, cx)
+            })
+            .await;
             set(
-                match finished {
+                match saved {
                     Ok(path) => SaveState::Saved(path),
                     Err(error) => SaveState::Failed(error),
                 },
@@ -479,43 +434,64 @@ impl NodePeek {
                     _ => None,
                 };
                 let managed = matches!(slot.meta, Loadable::Loaded(BlobMeta::Managed { .. }));
-                let save: Option<AnyElement> = match &slot.save {
-                    Some(SaveState::Saving { done, of }) => Some(
-                        studio_ui::ds::text::meta(format!(
-                            "Saving {}%",
-                            (*done * 100).checked_div(*of).unwrap_or(100)
-                        ))
-                        .into_any_element(),
-                    ),
-                    Some(SaveState::Saved(path)) => {
-                        let path = path.clone();
-                        Some(
-                            studio_ui::ds::button(("show-saved", index), "Show in Finder")
-                                .style(ButtonStyle::Subtle)
-                                .color(Color::Muted)
-                                .tooltip(Tooltip::text(format!("Saved to {}", path.display())))
-                                .on_click(move |_, _, cx| cx.reveal_path(&path))
+                let save: Option<AnyElement> =
+                    match &slot.save {
+                        Some(SaveState::Saving { done, of }) => Some(
+                            studio_ui::ds::text::meta(format!(
+                                "Saving {}%",
+                                (*done * 100).checked_div(*of).unwrap_or(100)
+                            ))
+                            .into_any_element(),
+                        ),
+                        Some(SaveState::Saved(path)) => {
+                            let path = path.clone();
+                            Some(
+                                studio_ui::ds::button(("show-saved", index), "Show in Finder")
+                                    .style(ButtonStyle::Subtle)
+                                    .color(Color::Muted)
+                                    .tooltip(Tooltip::text(format!("Saved to {}", path.display())))
+                                    .on_click(move |_, _, cx| cx.reveal_path(&path))
+                                    .into_any_element(),
+                            )
+                        }
+                        Some(SaveState::Failed(error)) => Some(
+                            Label::new(error.clone())
+                                .size(LabelSize::XSmall)
+                                .color(Color::Error)
                                 .into_any_element(),
-                        )
-                    }
-                    Some(SaveState::Failed(error)) => Some(
-                        Label::new(error.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Error)
-                            .into_any_element(),
-                    ),
-                    None if managed => Some(
-                        studio_ui::ds::button(("save-blob", index), "Save…")
-                            .style(ButtonStyle::Subtle)
-                            .color(Color::Muted)
-                            .tooltip(Tooltip::text("Save the whole value to a file"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.save_blob(index, window, cx)
-                            }))
-                            .into_any_element(),
-                    ),
-                    None => None,
-                };
+                        ),
+                        None if managed => Some(
+                            h_flex()
+                                .gap(px(studio_ui::ds::space::XXS))
+                                .child({
+                                    let open = OpenBlob {
+                                        type_name: self.subject.type_name().to_owned(),
+                                        id: self.subject.id().to_owned(),
+                                        property: slot.property.clone(),
+                                        edge: matches!(self.subject, PeekSubject::Edge { .. }),
+                                        at_commit: self.snapshot.clone(),
+                                    };
+                                    studio_ui::ds::button(("open-blob", index), "Open")
+                                        .style(ButtonStyle::Subtle)
+                                        .color(Color::Muted)
+                                        .tooltip(Tooltip::text("Show the whole value in a tab"))
+                                        .on_click(move |_, window, cx| {
+                                            window.dispatch_action(Box::new(open.clone()), cx)
+                                        })
+                                })
+                                .child(
+                                    studio_ui::ds::button(("save-blob", index), "Save…")
+                                        .style(ButtonStyle::Subtle)
+                                        .color(Color::Muted)
+                                        .tooltip(Tooltip::text("Save the whole value to a file"))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.save_blob(index, cx)
+                                        })),
+                                )
+                                .into_any_element(),
+                        ),
+                        None => None,
+                    };
                 v_flex()
                     .gap_1()
                     .child(

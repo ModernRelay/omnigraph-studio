@@ -30,6 +30,9 @@ publish = false
 repository = "https://github.com/ModernRelay/omnigraph-studio"
 
 [workspace.dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFData", "CFCGTypes"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGAffineTransform", "CGBitmapContext", "CGColorSpace", "CGContext", "CGDataProvider", "CGImage", "CGPDFDocument", "CGPDFPage"] }
 # Studio crates
 studio_actions = { path = "crates/studio_actions" }
 studio_settings = { path = "crates/studio_settings" }

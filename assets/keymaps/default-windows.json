@@ -47,6 +47,19 @@
     }
   },
   {
+    "context": "BlobView",
+    "bindings": {
+      "0": "studio_canvas::FitToWindow",
+      "1": "studio_canvas::ActualSize",
+      "=": "studio_canvas::ZoomIn",
+      "+": "studio_canvas::ZoomIn",
+      "-": "studio_canvas::ZoomOut",
+      "ctrl-0": "studio_canvas::FitToWindow",
+      "ctrl-=": "studio_canvas::ZoomIn",
+      "ctrl--": "studio_canvas::ZoomOut"
+    }
+  },
+  {
     "context": "AgentComposer > Editor",
     "bindings": {
       "enter": "studio_agent::Send",
