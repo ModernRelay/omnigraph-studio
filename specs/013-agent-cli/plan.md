@@ -62,9 +62,9 @@ OmniGraph at `d8d2e3a8` (main), and the released 0.13.0 binaries at `~/.local/bi
   - `schema plan|apply` have no HTTP path and refuse `--server` (`planes.rs:279-296`).
 - `--store`, the direct-storage commands and `cluster` without `--server` never go through
   HTTP (`planes.rs:152-153`).
-- Policy branch scopes are `any`, `protected`, `unprotected`; "protected" is exact membership
-  in `protected_branches` (`crates/omnigraph-policy/src/lib.rs:213-217, 592-593`). A commit
-  records the actor resolved from the bearer token (`handlers.rs:415-437`).
+- Policy branch scopes are `any`, `protected`, `unprotected`
+  (`crates/omnigraph-policy/src/lib.rs:213-217`). A commit records the actor resolved from the
+  bearer token (`handlers.rs:415-437`).
 - `omnigraph --version` and `omnigraph version` report the package and storage versions, never
   the HTTP contract, and have no JSON form (`main.rs:152-158, 612-620`; `cli.rs:428`).
 - On this Mac, `~/.local/bin/omnigraph` is 0.13.0 (contract 0.13) and
