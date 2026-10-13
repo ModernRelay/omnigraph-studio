@@ -265,6 +265,8 @@ pub mod table {
             Cancel,
             /// Show the selected row in the inspector.
             PeekRow,
+            /// Explore the graph from the row under the cursor, on the canvas.
+            ExploreRow,
             /// Reload the table from the branch head.
             RefreshTable,
             /// Add a row.

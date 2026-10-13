@@ -25,8 +25,8 @@ use graph_client::{BlobCell, BlobMeta, ReadError};
 use graph_store::{GraphSession, Loadable, SessionEvent};
 use serde_json::Value;
 use studio_actions::table::{
-    AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyCell, DeleteRow, EditCell, FilterBySelection,
-    InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp, PeekRow, RefreshTable,
+    AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyCell, DeleteRow, EditCell, ExploreRow,
+    FilterBySelection, InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp, PeekRow, RefreshTable,
 };
 use studio_ui::ROW_HEIGHT;
 use studio_workspace::{
@@ -2011,6 +2011,24 @@ impl TypeTable {
         self.start_edit(cursor, window, cx);
     }
 
+    /// G: the row's node on the explorer, rooted there (spec 006: from a table into the graph).
+    fn on_explore(&mut self, _: &ExploreRow, window: &mut Window, cx: &mut Context<Self>) {
+        if self.kind != TableKind::Node {
+            return;
+        }
+        let row = self.cursor.map_or(0, |c| c.row);
+        let Some(id) = self.rows.get(row).map(|r| r.id.clone()) else {
+            return;
+        };
+        window.dispatch_action(
+            Box::new(studio_actions::graph::ShowNodeOnCanvas {
+                type_name: self.type_name.clone(),
+                id,
+            }),
+            cx,
+        );
+    }
+
     fn on_peek(&mut self, _: &PeekRow, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(cursor) = self
             .cursor
@@ -3346,6 +3364,7 @@ impl TypeTable {
             (false, TableKind::Node) => hints
                 .child(studio_ui::ds::key_hint(&EditCell, "Edit", &focus, cx))
                 .child(studio_ui::ds::key_hint(&PeekRow, "Peek", &focus, cx))
+                .child(studio_ui::ds::key_hint(&ExploreRow, "Explore", &focus, cx))
                 .child(studio_ui::ds::key_hint(&InsertRow, "Row", &focus, cx))
                 .child(studio_ui::ds::key_hint(&DeleteRow, "Delete", &focus, cx)),
             (false, TableKind::Edge) => {
@@ -3419,6 +3438,7 @@ impl Render for TypeTable {
             )
             .on_action(cx.listener(Self::on_cancel))
             .on_action(cx.listener(Self::on_peek))
+            .on_action(cx.listener(Self::on_explore))
             .on_action(cx.listener(|this, _: &RefreshTable, window, cx| this.refresh(window, cx)))
             .on_action(cx.listener(Self::on_insert))
             .on_action(cx.listener(Self::on_delete))

@@ -128,6 +128,7 @@
       "right": "studio_table::MoveRight",
       "enter": "studio_table::EditCell",
       "space": "studio_table::PeekRow",
+      "g": "studio_table::ExploreRow",
       "ctrl-c": "studio_table::CopyCell",
       "ctrl-backspace": "studio_table::DeleteRow",
       "ctrl-alt-f": "studio_table::FilterBySelection"

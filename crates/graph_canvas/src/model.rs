@@ -334,6 +334,9 @@ pub fn explore_scene(
                 push_edge(&mut scene, owner, hub);
                 placed[index] = Some(hub);
             }
+            // A relationship with at most one target is a hub like any other on the canvas, so
+            // expanding a node shows its relationships first; opening the hub shows the one
+            // node it reaches. (The tree shows it inline, as a field.)
             EntryKind::Field {
                 key,
                 target: Some(target),
@@ -342,6 +345,41 @@ pub fn explore_scene(
                 let Some(owner) = parent_scene else {
                     continue;
                 };
+                let open = state.is_expanded(&entry.path);
+                let hub_id = SceneId::Hub(key.clone());
+                let hub = match by_id.get(&hub_id).copied() {
+                    Some(existing) => existing,
+                    None if scene.nodes.len() < cap => {
+                        let arrow = match key.group.direction {
+                            Direction::Outgoing => "→",
+                            Direction::Incoming => "←",
+                        };
+                        let hub = add(
+                            &mut scene,
+                            &mut by_id,
+                            SceneNode {
+                                id: hub_id,
+                                kind: SceneKind::Hub {
+                                    key: key.clone(),
+                                    count: Some(1),
+                                    open,
+                                },
+                                label: format!("{arrow} {} · 1", key.group.edge),
+                                color_key: key.group.edge.clone(),
+                                parent: Some(owner),
+                                path: Some(entry.path.clone()),
+                                radius: HUB_RADIUS,
+                            },
+                        );
+                        push_edge(&mut scene, owner, hub);
+                        hub
+                    }
+                    None => continue,
+                };
+                placed[index] = Some(hub);
+                if !open {
+                    continue;
+                }
                 let id = SceneId::Node(target.node.clone());
                 let to = match by_id.get(&id).copied() {
                     Some(existing) => existing,
@@ -357,19 +395,14 @@ pub fn explore_scene(
                             },
                             label: label_of(&target.node),
                             color_key: target.node.type_name.clone(),
-                            parent: Some(owner),
+                            parent: Some(hub),
                             path: None,
                             radius: NODE_RADIUS,
                         },
                     ),
                     None => continue,
                 };
-                scene.edges.push(SceneEdge {
-                    from: owner,
-                    to,
-                    color_key: key.group.edge.clone(),
-                    label: Some(key.group.edge.clone()),
-                });
+                push_edge(&mut scene, hub, to);
             }
             EntryKind::Cycle { node, .. } => {
                 if let (Some(hub), Some(existing)) = (
@@ -549,6 +582,71 @@ mod tests {
             },
         );
         (schema, state)
+    }
+
+    #[test]
+    fn a_single_target_relationship_is_a_hub_that_opens_to_its_node() {
+        let schema = SchemaModel::parse(&format!(
+            "{SCHEMA}edge Employer: Person -> Company @card(0..1)\n"
+        ))
+        .unwrap();
+        let mut state = ExploreState::rooted(person("ada"));
+        state.root_status = Loadable::Loaded(());
+        let employer = schema
+            .relationships_of("Person")
+            .into_iter()
+            .find(|g| g.edge == "Employer")
+            .unwrap();
+        let key = GroupKey {
+            node: person("ada"),
+            group: employer.clone(),
+        };
+        let acme = NodeRef::new("Company", "acme");
+        state.neighbours.insert(
+            key.clone(),
+            NeighbourList {
+                rows: vec![Neighbour {
+                    node: acme.clone(),
+                    label: None,
+                    edge: Vec::new(),
+                }],
+                exhausted: true,
+                ..Default::default()
+            },
+        );
+        // Expanding Ada shows the relationship, not the company it reaches.
+        let closed = explore_scene(
+            &state.entries(&schema),
+            &state,
+            &schema,
+            &HashMap::new(),
+            NODE_CAP,
+        );
+        let hub = closed
+            .index_of(&SceneId::Hub(key.clone()))
+            .expect("a hub for the relationship");
+        assert!(matches!(
+            closed.nodes[hub].kind,
+            SceneKind::Hub { open: false, .. }
+        ));
+        assert!(closed.index_of(&SceneId::Node(acme.clone())).is_none());
+        // Opening the hub shows the one company, hanging off the hub.
+        state
+            .expanded
+            .insert(ExplorePath::root().child_group(&employer));
+        let open = explore_scene(
+            &state.entries(&schema),
+            &state,
+            &schema,
+            &HashMap::new(),
+            NODE_CAP,
+        );
+        let hub = open.index_of(&SceneId::Hub(key)).unwrap();
+        let company = open
+            .index_of(&SceneId::Node(acme))
+            .expect("the company once open");
+        assert_eq!(open.nodes[company].parent, Some(hub));
+        assert!(open.edges.iter().any(|e| e.from == hub && e.to == company));
     }
 
     #[test]

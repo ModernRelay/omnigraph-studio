@@ -872,6 +872,7 @@ impl Render for NodePeek {
         let relationships =
             matches!(self.subject, PeekSubject::Node { .. }).then(|| self.render_relationships(cx));
         let endpoints = self.render_endpoints(cx);
+        let is_node = matches!(self.subject, PeekSubject::Node { .. });
         v_flex()
             .id("node-peek")
             .w_full()
@@ -885,7 +886,27 @@ impl Render for NodePeek {
                         Label::new(type_name.clone())
                             .size(LabelSize::Small)
                             .color(Color::Muted),
-                    ),
+                    )
+                    .child(div().flex_1())
+                    .when(is_node, |header| {
+                        let explore = studio_actions::graph::ShowNodeOnCanvas {
+                            type_name: type_name.clone(),
+                            id: id.clone(),
+                        };
+                        header.child(
+                            studio_ui::ds::button("peek-explore", "Explore")
+                                .style(ButtonStyle::Subtle)
+                                .start_icon(
+                                    Icon::new(IconName::Crosshair)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .tooltip(Tooltip::text("Walk the graph from this node"))
+                                .on_click(move |_, window, cx| {
+                                    window.dispatch_action(Box::new(explore.clone()), cx)
+                                }),
+                        )
+                    }),
             )
             .child(
                 Label::new(label.unwrap_or_else(|| id.clone()))

@@ -113,6 +113,16 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   new places (220 ms, ease-out); Fit, F, zoom buttons and centring glide the camera (ease
   in-out, zoom on a log scale). Wheel, pinch and drags are immediate and stop a glide where it
   is. Off when the system asks for reduced motion (and in offscreen snapshots).
+- **From the ontology to the explorer (2026-10-12).** The Explorer face is always available;
+  before a node is chosen it says how to start: Search nodes (⌘P, which roots the exploration
+  at the node picked) or G on a row in any table (`studio_table::ExploreRow`, also in the Nodes
+  panel a type click opens from the ontology, and in its footer hints). The inspector's node
+  header has an Explore button. The face shown is saved with the tab (`"ontology": bool`); a
+  new canvas shows the ontology. The face switch is `ds::segmented`, and the search and zoom
+  panels share its height and radius.
+- **Relationships first.** A relationship with at most one target is a hub on the canvas like
+  any other ("→ WorksAt · 1"), so expanding a node shows its relationships before the nodes
+  they reach; the tree still shows it inline, as a field.
 - **Fit** waits for the canvas's own bounds and fits again when they change (a dock opening),
   until the person moves the view by hand; Fit hands the camera back to fitting.
 - **Hit-testing** is a linear scan over at most the node cap (2,000 by default), not an

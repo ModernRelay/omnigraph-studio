@@ -52,8 +52,16 @@ const ZOOM_STEP: f32 = 1.25;
 pub fn init(cx: &mut App) {
     studio_workspace::register_item_kind(cx, "canvas", |data, workspace, window, cx| {
         let pinned = pins_from_json(data);
+        // A canvas saved before the face was kept shows the ontology, as it did.
+        let ontology = data
+            .get("ontology")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
         if let Some(canvas) = open_canvas(workspace, window, cx) {
-            canvas.update(cx, |canvas, cx| canvas.restore_pins(pinned, cx));
+            canvas.update(cx, |canvas, cx| {
+                canvas.set_ontology(ontology, cx);
+                canvas.restore_pins(pinned, cx);
+            });
         }
     });
     cx.observe_new(|workspace: &mut Workspace, window, _cx| {
@@ -274,10 +282,10 @@ impl Item for GraphCanvas {
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
         self.results.is_none().then(|| SavedItem {
             kind: "canvas".into(),
-            data: if self.pinned.is_empty() {
-                serde_json::Value::Null
-            } else {
-                pins_to_json(&self.pinned)
+            data: {
+                let mut data = pins_to_json(&self.pinned);
+                data["ontology"] = serde_json::Value::Bool(self.show_schema);
+                data
             },
         })
     }
@@ -312,7 +320,7 @@ impl GraphCanvas {
             exploration,
             results: None,
             focus_handle: cx.focus_handle(),
-            show_schema: false,
+            show_schema: true,
             mode: Mode::Schema,
             scene: Arc::default(),
             positions: Arc::default(),
@@ -410,10 +418,11 @@ impl GraphCanvas {
         }
         let exploration = self.exploration.read(cx);
         let root = exploration.root().cloned();
-        let mode = if root.is_some() && !self.show_schema {
-            Mode::Explore
-        } else {
+        // The face chosen, even before a node is: an explorer with no node says how to start.
+        let mode = if self.show_schema {
             Mode::Schema
+        } else {
+            Mode::Explore
         };
         let key = (mode, root.clone().filter(|_| mode == Mode::Explore));
         if self.layout_key.as_ref() != Some(&key) {
@@ -1170,6 +1179,27 @@ impl GraphCanvas {
         .size_full()
     }
 
+    /// The explorer before any node: how to start, as one action and one key.
+    fn render_explore_start(&self, cx: &mut Context<Self>) -> AnyElement {
+        studio_ui::ds::empty_state(IconName::Crosshair, "Explore from a node")
+            .child(
+                studio_ui::ds::button("explore-search", "Search nodes")
+                    .style(ButtonStyle::Filled)
+                    .start_icon(Icon::new(IconName::MagnifyingGlass).size(IconSize::Small))
+                    .key_binding(ui::KeyBinding::for_action(
+                        &studio_actions::workspace::GoTo,
+                        cx,
+                    ))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(studio_actions::workspace::GoTo), cx)
+                    }),
+            )
+            .child(studio_ui::ds::text::muted(
+                "or press G on a row in any table, or click a type in the ontology to pick one",
+            ))
+            .into_any_element()
+    }
+
     /// Tower's caption, bottom left: what is drawn, and what a click does.
     fn render_caption(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
@@ -1179,7 +1209,7 @@ impl GraphCanvas {
                 let types = schema.as_ref().map_or(0, |s| s.nodes.len());
                 let edges = schema.as_ref().map_or(0, |s| s.edges.len());
                 format!(
-                    "{types} {} · {edges} {} · click a type to browse it",
+                    "{types} {} · {edges} {} · click a type to browse it, G on a row explores it",
                     if types == 1 { "type" } else { "types" },
                     if edges == 1 {
                         "relationship"
@@ -1281,14 +1311,16 @@ impl GraphCanvas {
         };
         let border = cx.theme().colors().border_variant;
         // Tower's floating pills: round, a hairline, a soft float shadow.
+        // The canvas's floating controls share the segmented control's shape: 28 px tall, its
+        // radius, its inset, so the mode switch, search and zoom read as one family.
         let panel = |id: &'static str| {
             h_flex()
                 .id(id)
-                .h(px(32.))
-                .gap_0p5()
-                .px_1()
+                .h(px(28.))
+                .gap(px(studio_ui::ds::space::XXS))
+                .px(px(studio_ui::ds::space::XXS))
                 .items_center()
-                .rounded_full()
+                .rounded(px(studio_ui::ds::radius::SM + studio_ui::ds::space::XXS))
                 .bg(surface)
                 .border_1()
                 .border_color(border)
@@ -1307,34 +1339,10 @@ impl GraphCanvas {
                     .w_full()
                     .gap_2()
                     .child(
-                        panel("canvas-mode")
-                            .when(mode != Mode::Results, |panel| {
-                                panel
-                                    .child(
-                                        studio_ui::ds::button("mode-schema", "Ontology")
-                                            .label_size(LabelSize::Small)
-                                            .toggle_state(mode == Mode::Schema)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.set_ontology(true, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        studio_ui::ds::button("mode-explore", "Explorer")
-                                            .label_size(LabelSize::Small)
-                                            .toggle_state(mode == Mode::Explore)
-                                            .disabled(!has_root)
-                                            .tooltip(Tooltip::text(if has_root {
-                                                "The nodes walked in the tree and here"
-                                            } else {
-                                                "Open a node first: ↵ on a table row or tree row"
-                                            }))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.set_ontology(false, cx)
-                                            })),
-                                    )
-                            })
-                            .when(mode == Mode::Results, |panel| {
-                                panel.child(
+                        // The face switch is the design system's segmented control, floating.
+                        if mode == Mode::Results {
+                            panel("canvas-mode")
+                                .child(
                                     div().px_2().child(
                                         Label::new(summary.clone())
                                             .size(LabelSize::Small)
@@ -1342,7 +1350,42 @@ impl GraphCanvas {
                                             .single_line(),
                                     ),
                                 )
-                            }),
+                                .into_any_element()
+                        } else {
+                            studio_ui::ds::segmented(cx)
+                                .id("canvas-mode")
+                                .shadow(studio_ui::ds::elevation::float())
+                                .occlude()
+                                .child(
+                                    studio_ui::ds::segment(
+                                        "mode-schema",
+                                        "Ontology",
+                                        mode == Mode::Schema,
+                                        cx,
+                                    )
+                                    .tooltip(Tooltip::text("The types and their relationships"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_ontology(true, cx)
+                                    })),
+                                )
+                                .child(
+                                    studio_ui::ds::segment(
+                                        "mode-explore",
+                                        "Explorer",
+                                        mode == Mode::Explore,
+                                        cx,
+                                    )
+                                    .tooltip(Tooltip::text(if has_root {
+                                        "The nodes walked from a node, here and in the tree"
+                                    } else {
+                                        "Walk the graph from a node: search for one, or G on a table row"
+                                    }))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_ontology(false, cx)
+                                    })),
+                                )
+                                .into_any_element()
+                        },
                     )
                     .when(newer && mode != Mode::Results, |d| {
                         d.child(
@@ -1390,6 +1433,7 @@ impl GraphCanvas {
                                 panel.child(
                                     studio_ui::ds::icon_button("reset-layout", IconName::RotateCcw)
                                         .icon_size(IconSize::Small)
+                                    .size(ui::ButtonSize::Default)
                                         .tooltip(|_window, cx| {
                                             Tooltip::for_action(
                                                 "Reset the layout: forget the nodes you placed",
@@ -1405,6 +1449,7 @@ impl GraphCanvas {
                             .child(
                                 studio_ui::ds::icon_button("zoom-out", IconName::Dash)
                                     .icon_size(IconSize::Small)
+                                    .size(ui::ButtonSize::Default)
                                     .tooltip(|_window, cx| {
                                         Tooltip::for_action("Zoom out", &ZoomOut, cx)
                                     })
@@ -1415,6 +1460,7 @@ impl GraphCanvas {
                             .child(
                                 studio_ui::ds::button("zoom-fit", "Fit")
                                     .label_size(LabelSize::Small)
+                                    .size(ui::ButtonSize::Default)
                                     .tooltip(|_window, cx| {
                                         Tooltip::for_action("Fit to window", &FitToWindow, cx)
                                     })
@@ -1425,6 +1471,7 @@ impl GraphCanvas {
                             .child(
                                 studio_ui::ds::icon_button("zoom-in", IconName::Plus)
                                     .icon_size(IconSize::Small)
+                                    .size(ui::ButtonSize::Default)
                                     .tooltip(|_window, cx| {
                                         Tooltip::for_action("Zoom in", &ZoomIn, cx)
                                     })
@@ -1570,6 +1617,11 @@ impl Render for GraphCanvas {
                 empty_state("Studio could not read the schema", Some(message.into()))
                     .into_any_element(),
             ),
+            Loadable::Loaded(_)
+                if self.mode == Mode::Explore && self.exploration.read(cx).root().is_none() =>
+            {
+                Some(self.render_explore_start(cx))
+            }
             Loadable::Loaded(_) if self.scene.nodes.is_empty() => Some(
                 empty_state(
                     match self.mode {
@@ -1648,7 +1700,10 @@ impl Render for GraphCanvas {
             .child(canvas)
             .children(body.map(|body| div().absolute().size_full().top_0().left_0().child(body)))
             .child(overlay)
-            .child(self.render_caption(cx))
+            // Nothing drawn yet: the start state says it all.
+            .when(!self.scene.nodes.is_empty(), |canvas| {
+                canvas.child(self.render_caption(cx))
+            })
     }
 }
 
