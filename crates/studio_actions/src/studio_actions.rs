@@ -437,8 +437,12 @@ pub mod agent {
             AllowAlways,
             /// Reject the change or request the agent is waiting on.
             Reject,
-            /// Start the agent again after it stopped.
+            /// Start the agent again on this conversation after it stopped.
             Restart,
+            /// Start a new conversation with the agent in a tab of its own.
+            NewConversation,
+            /// Show the graph's agent conversations in the sidebar.
+            ShowConversations,
         ]
     );
 
@@ -447,5 +451,12 @@ pub mod agent {
     #[action(namespace = studio_agent)]
     pub struct Ask {
         pub text: String,
+    }
+
+    /// Open one of the graph's agent conversations.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_agent)]
+    pub struct OpenConversation {
+        pub session: String,
     }
 }

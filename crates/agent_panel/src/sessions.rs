@@ -1,30 +1,281 @@
-//! The agent conversations Studio can come back to (spec 011): for each graph and agent command,
-//! the last session's id and the branch its changes go to, in an owner-only file beside the
-//! workspaces. Ids only: the conversation itself stays with the agent, which replays it when
-//! Studio loads the session.
+//! The agent conversations of each graph (spec 011), as Zed keeps its threads: Studio's own
+//! index, because every graph's agent works in the same directory and the agent's own
+//! `session/list` cannot tell graphs apart. Per conversation: the agent's session id, its title,
+//! when it started and was last active, the branch its changes go to, and whether it is pinned
+//! or archived. Ids and titles only: the conversation stays with the agent, which replays it
+//! when Studio loads the session. Kept in an owner-only file beside the workspaces.
+//!
+//! What each conversation is doing right now (running, waiting for the person, stopped with an
+//! error) and whether it finished unseen live here too, in memory only.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use serde_json::{Map, Value, json};
+use chrono::{DateTime, Utc};
+use gpui::{App, AppContext as _, Context, Entity, Global};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
-/// The conversation to come back to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SavedSession {
+/// One conversation with an agent on a graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRecord {
+    /// The agent's session id.
     pub session: String,
+    /// The graph, as its settings key (`server/graph`).
+    pub graph: String,
+    /// The agent command, joined with spaces: a session belongs to the agent that made it.
+    pub agent: String,
+    /// The agent's title for it, else the start of the first message.
+    #[serde(default)]
+    pub title: Option<String>,
+    pub created_at: DateTime<Utc>,
+    /// The last message the person sent. The list sorts by it, as Zed's sorts by the last
+    /// interaction, so a conversation finishing in the background does not move its row.
+    pub updated_at: DateTime<Utc>,
     /// The agent's branch, and whether it was created yet.
     pub branch: String,
+    #[serde(default)]
     pub branch_created: bool,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub archived: bool,
 }
 
-fn path() -> PathBuf {
-    studio_settings::data_dir()
-        .join("agent")
-        .join("sessions.json")
+impl SessionRecord {
+    /// The title to show.
+    pub fn shown_title(&self) -> &str {
+        self.title.as_deref().unwrap_or("New conversation")
+    }
 }
 
-/// One record per graph and agent: a session belongs to the agent that made it.
-fn key(graph: &str, command: &[String]) -> String {
-    format!("{graph}\n{}", command.join(" "))
+/// What a conversation is doing, while its tab is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Live {
+    Running,
+    /// A change or a tool waits for the person's answer.
+    Waiting,
+    /// The agent stopped with an error.
+    Failed,
+}
+
+/// The index, shared by every agent tab and the Agent sidebar panel.
+pub struct AgentSessions {
+    path: PathBuf,
+    records: Vec<SessionRecord>,
+    live: HashMap<String, Live>,
+    /// Conversations whose turn ended while their tab was not the one shown.
+    unread: HashSet<String>,
+}
+
+struct GlobalSessions(Entity<AgentSessions>);
+
+impl Global for GlobalSessions {}
+
+impl AgentSessions {
+    /// The one index of this run of Studio.
+    pub fn global(cx: &mut App) -> Entity<AgentSessions> {
+        if let Some(global) = cx.try_global::<GlobalSessions>() {
+            return global.0.clone();
+        }
+        let path = studio_settings::data_dir()
+            .join("agent")
+            .join("sessions.json");
+        let sessions = cx.new(|_| AgentSessions::load(path));
+        cx.set_global(GlobalSessions(sessions.clone()));
+        sessions
+    }
+
+    fn load(path: PathBuf) -> Self {
+        let records = read_records(&path);
+        Self {
+            path,
+            records,
+            live: HashMap::new(),
+            unread: HashSet::new(),
+        }
+    }
+
+    fn save(&self) {
+        let value = serde_json::json!({ "version": 2, "sessions": self.records });
+        write(&self.path, &value);
+    }
+
+    /// A graph's conversations that are not archived, most recently active first.
+    pub fn for_graph(&self, graph: &str) -> Vec<&SessionRecord> {
+        self.sorted(graph, false)
+    }
+
+    pub fn archived(&self, graph: &str) -> Vec<&SessionRecord> {
+        self.sorted(graph, true)
+    }
+
+    fn sorted(&self, graph: &str, archived: bool) -> Vec<&SessionRecord> {
+        let mut records: Vec<_> = self
+            .records
+            .iter()
+            .filter(|record| record.graph == graph && record.archived == archived)
+            .collect();
+        records.sort_by_key(|record| std::cmp::Reverse(record.updated_at));
+        records
+    }
+
+    pub fn get(&self, session: &str) -> Option<&SessionRecord> {
+        self.records.iter().find(|record| record.session == session)
+    }
+
+    /// The graph's last active conversation with this agent, to come back to.
+    pub fn latest(&self, graph: &str, agent: &str) -> Option<&SessionRecord> {
+        self.for_graph(graph)
+            .into_iter()
+            .find(|record| record.agent == agent)
+    }
+
+    /// Records a conversation, or updates its branch, keeping its title, times and marks.
+    pub fn upsert(&mut self, record: SessionRecord, cx: &mut Context<Self>) {
+        match self
+            .records
+            .iter_mut()
+            .find(|existing| existing.session == record.session)
+        {
+            Some(existing) => {
+                existing.branch = record.branch;
+                existing.branch_created = record.branch_created;
+                existing.archived = false;
+            }
+            None => self.records.push(record),
+        }
+        self.save();
+        cx.notify();
+    }
+
+    fn update(
+        &mut self,
+        session: &str,
+        change: impl FnOnce(&mut SessionRecord),
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(record) = self.records.iter_mut().find(|r| r.session == session) {
+            change(record);
+            self.save();
+            cx.notify();
+        }
+    }
+
+    /// The agent's title, which replaces any earlier one.
+    pub fn set_title(&mut self, session: &str, title: String, cx: &mut Context<Self>) {
+        self.update(session, |record| record.title = Some(title), cx);
+    }
+
+    /// The start of the first message, until the agent names the conversation.
+    pub fn suggest_title(&mut self, session: &str, message: &str, cx: &mut Context<Self>) {
+        let Some(title) = provisional_title(message) else {
+            return;
+        };
+        self.update(
+            session,
+            |record| {
+                record.title.get_or_insert(title);
+            },
+            cx,
+        );
+    }
+
+    pub fn touch(&mut self, session: &str, cx: &mut Context<Self>) {
+        self.update(session, |record| record.updated_at = Utc::now(), cx);
+    }
+
+    pub fn set_pinned(&mut self, session: &str, pinned: bool, cx: &mut Context<Self>) {
+        self.update(session, |record| record.pinned = pinned, cx);
+    }
+
+    /// Archiving only hides it here; the agent keeps the session.
+    pub fn set_archived(&mut self, session: &str, archived: bool, cx: &mut Context<Self>) {
+        self.update(session, |record| record.archived = archived, cx);
+    }
+
+    pub fn live(&self, session: &str) -> Option<Live> {
+        self.live.get(session).copied()
+    }
+
+    pub fn set_live(&mut self, session: &str, live: Option<Live>, cx: &mut Context<Self>) {
+        let changed = match live {
+            Some(live) => self.live.insert(session.to_owned(), live) != Some(live),
+            None => self.live.remove(session).is_some(),
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    pub fn is_unread(&self, session: &str) -> bool {
+        self.unread.contains(session)
+    }
+
+    pub fn mark_unread(&mut self, session: &str, cx: &mut Context<Self>) {
+        if self.unread.insert(session.to_owned()) {
+            cx.notify();
+        }
+    }
+
+    pub fn mark_read(&mut self, session: &str, cx: &mut Context<Self>) {
+        if self.unread.remove(session) {
+            cx.notify();
+        }
+    }
+}
+
+/// The first line of a message, cut to a title's length on a character.
+fn provisional_title(message: &str) -> Option<String> {
+    const TITLE_CHARS: usize = 80;
+    let line = message
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    Some(if line.chars().count() > TITLE_CHARS {
+        let kept: String = line.chars().take(TITLE_CHARS - 1).collect();
+        format!("{}…", kept.trim_end())
+    } else {
+        line.to_owned()
+    })
+}
+
+/// The records on disk. The first format kept one session per graph and agent, keyed
+/// `"{graph}\n{agent}"`; those become records of their own, dated now.
+fn read_records(path: &Path) -> Vec<SessionRecord> {
+    let Some(value) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+    else {
+        return Vec::new();
+    };
+    if let Some(sessions) = value.get("sessions") {
+        return serde_json::from_value(sessions.clone()).unwrap_or_default();
+    }
+    let now = Utc::now();
+    value
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, record)| {
+            let (graph, agent) = key.split_once('\n')?;
+            Some(SessionRecord {
+                session: record.get("session")?.as_str()?.to_owned(),
+                graph: graph.to_owned(),
+                agent: agent.to_owned(),
+                title: None,
+                created_at: now,
+                updated_at: now,
+                branch: record.get("branch")?.as_str()?.to_owned(),
+                branch_created: record
+                    .get("branch_created")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                pinned: false,
+                archived: false,
+            })
+        })
+        .collect()
 }
 
 fn read(path: &Path) -> Map<String, Value> {
@@ -35,13 +286,13 @@ fn read(path: &Path) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
-fn write(path: &Path, records: &Map<String, Value>) {
+fn write(path: &Path, value: &Value) {
     if let Some(dir) = path.parent()
         && std::fs::create_dir_all(dir).is_err()
     {
         return;
     }
-    let Ok(text) = serde_json::to_string_pretty(&Value::Object(records.clone())) else {
+    let Ok(text) = serde_json::to_string_pretty(value) else {
         return;
     };
     let mut options = std::fs::OpenOptions::new();
@@ -51,48 +302,6 @@ fn write(path: &Path, records: &Map<String, Value>) {
     if let Ok(mut file) = options.open(path) {
         std::io::Write::write_all(&mut file, text.as_bytes()).ok();
     }
-}
-
-pub fn load(graph: &str, command: &[String]) -> Option<SavedSession> {
-    load_from(&path(), graph, command)
-}
-
-pub fn save(graph: &str, command: &[String], saved: &SavedSession) {
-    save_to(&path(), graph, command, saved);
-}
-
-pub fn forget(graph: &str, command: &[String]) {
-    let path = path();
-    let mut records = read(&path);
-    if records.remove(&key(graph, command)).is_some() {
-        write(&path, &records);
-    }
-}
-
-fn load_from(path: &Path, graph: &str, command: &[String]) -> Option<SavedSession> {
-    let records = read(path);
-    let record = records.get(&key(graph, command))?;
-    Some(SavedSession {
-        session: record.get("session")?.as_str()?.to_owned(),
-        branch: record.get("branch")?.as_str()?.to_owned(),
-        branch_created: record
-            .get("branch_created")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    })
-}
-
-fn save_to(path: &Path, graph: &str, command: &[String], saved: &SavedSession) {
-    let mut records = read(path);
-    records.insert(
-        key(graph, command),
-        json!({
-            "session": saved.session,
-            "branch": saved.branch,
-            "branch_created": saved.branch_created,
-        }),
-    );
-    write(path, &records);
 }
 
 /// The option values the person last chose for an agent (its model, mode, reasoning level),
@@ -127,30 +336,62 @@ fn prefer_to(path: &Path, command: &[String], option: &str, value: Value) {
     if let Some(agent) = agent.as_object_mut() {
         agent.insert(option.to_owned(), value);
     }
-    write(path, &records);
+    write(path, &Value::Object(records));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    #[test]
-    fn a_session_is_kept_per_graph_and_agent() {
+    fn record(session: &str, graph: &str, agent: &str, minutes_ago: i64) -> SessionRecord {
+        let at = Utc::now() - chrono::Duration::minutes(minutes_ago);
+        SessionRecord {
+            session: session.into(),
+            graph: graph.into(),
+            agent: agent.into(),
+            title: None,
+            created_at: at,
+            updated_at: at,
+            branch: format!("agent/{session}"),
+            branch_created: false,
+            pinned: false,
+            archived: false,
+        }
+    }
+
+    #[gpui::test]
+    fn conversations_are_kept_per_graph_newest_first(cx: &mut gpui::TestAppContext) {
         let dir =
             std::env::temp_dir().join(format!("studio-agent-sessions-{}", std::process::id()));
         let path = dir.join("sessions.json");
-        let claude = vec!["claude-code-acp".to_owned()];
-        let other = vec!["other-agent".to_owned()];
-        let saved = SavedSession {
-            session: "s-1".into(),
-            branch: "agent/20261012-101010".into(),
-            branch_created: true,
-        };
-        save_to(&path, "server/crm", &claude, &saved);
-        assert_eq!(load_from(&path, "server/crm", &claude), Some(saved));
-        // Another graph, or another agent, has no session to resume.
-        assert_eq!(load_from(&path, "server/notes", &claude), None);
-        assert_eq!(load_from(&path, "server/crm", &other), None);
+        let store = cx.new(|_| AgentSessions::load(path.clone()));
+        store.update(cx, |store, cx| {
+            store.upsert(record("old", "server/crm", "claude", 60), cx);
+            store.upsert(record("new", "server/crm", "claude", 1), cx);
+            store.upsert(record("codex", "server/crm", "codex", 5), cx);
+            store.upsert(record("notes", "server/notes", "claude", 0), cx);
+            store.suggest_title("old", "\n  How many people?\nmore", cx);
+            store.suggest_title("old", "a later message", cx);
+            store.set_title("new", "Count people".into(), cx);
+            store.set_archived("codex", true, cx);
+        });
+        store.read_with(cx, |store, _| {
+            let ids: Vec<_> = store
+                .for_graph("server/crm")
+                .iter()
+                .map(|r| r.session.as_str())
+                .collect();
+            assert_eq!(ids, ["new", "old"]);
+            assert_eq!(store.archived("server/crm").len(), 1);
+            assert_eq!(store.get("old").unwrap().shown_title(), "How many people?");
+            assert_eq!(store.get("new").unwrap().shown_title(), "Count people");
+            assert_eq!(store.latest("server/crm", "claude").unwrap().session, "new");
+            assert!(store.latest("server/crm", "codex").is_none());
+        });
+        // What was written comes back, owner-only.
+        let reloaded = AgentSessions::load(path.clone());
+        assert_eq!(reloaded.records.len(), 4);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -158,6 +399,35 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_first_format_becomes_records() {
+        let dir = std::env::temp_dir().join(format!("studio-agent-v1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sessions.json");
+        std::fs::write(
+            &path,
+            json!({ "server/crm\nclaude-code-acp": {
+                "session": "s-1", "branch": "agent/x", "branch_created": true
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        let records = read_records(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].graph, "server/crm");
+        assert_eq!(records[0].agent, "claude-code-acp");
+        assert!(records[0].branch_created);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_long_first_line_is_cut_on_a_character() {
+        let long = "word ".repeat(40);
+        let title = provisional_title(&long).unwrap();
+        assert!(title.chars().count() <= 80 && title.ends_with('…'));
+        assert_eq!(provisional_title("  \n "), None);
     }
 
     #[test]

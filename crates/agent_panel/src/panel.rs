@@ -4,6 +4,7 @@
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use std::path::PathBuf;
 
+use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::schema::v1::{
     ContentBlock, PermissionOption, PermissionOptionKind, PlanEntryStatus,
     RequestPermissionOutcome, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
@@ -34,6 +35,7 @@ use ui::{
 };
 
 use crate::host::{self, HostCommand, HostEvent, Launch};
+use crate::sessions::{AgentSessions, Live, SessionRecord};
 use crate::socket::{ToolRequest, ToolSocket};
 use crate::tools::{self, ToolCall};
 
@@ -52,18 +54,72 @@ pub const PRESETS: &[(&str, &[&str])] = &[
 const UNKNOWN_OUTCOME: &str = "The server did not confirm this change. It was not retried; \
 check the branch history before proposing it again.";
 
-/// Opens the panel for the workspace's graph, or activates it.
+/// Opens the agent for the workspace's graph: an agent tab already open (the shown one first),
+/// else the graph's last conversation with the agent, else a new one.
 pub fn open(
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Option<Entity<AgentPanel>> {
+    let shown = workspace
+        .active_item()
+        .and_then(|item| item.to_any().downcast::<AgentPanel>().ok());
+    let open = shown.or_else(|| {
+        workspace
+            .all_items()
+            .find_map(|item| item.to_any().downcast::<AgentPanel>().ok())
+    });
+    if let Some(panel) = open {
+        workspace.activate_item_by_id(panel.entity_id(), window, cx);
+        return Some(panel);
+    }
+    let graph = workspace.session()?.read(cx).settings_key(cx);
+    let agent = StudioSettings::get(cx).agent.command.join(" ");
+    let sessions = AgentSessions::global(cx);
+    let latest = sessions
+        .read(cx)
+        .latest(&graph, &agent)
+        .map(|record| record.session.clone());
+    match latest {
+        Some(id) => open_session(workspace, id, window, cx),
+        None => new_conversation(workspace, window, cx),
+    }
+}
+
+/// Opens one of the graph's conversations in its own tab, or shows the tab it is in; the agent
+/// starts and replays it.
+pub fn open_session(
+    workspace: &mut Workspace,
+    id: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Option<Entity<AgentPanel>> {
     let session = workspace.session()?.clone();
-    let panel = workspace.open_item("agent", window, cx, move |window, cx| {
-        AgentPanel::new(session, window, cx)
+    let handle = cx.entity().downgrade();
+    let panel = workspace.open_item(format!("agent:{id}"), window, cx, move |window, cx| {
+        AgentPanel::new(session, handle, Some(id), window, cx)
     })?;
-    panel.update(cx, |panel, cx| panel.resume_if_saved(cx));
+    panel.update(cx, |panel, cx| panel.start_if_idle(cx));
     Some(panel)
+}
+
+/// Opens a new conversation in a tab of its own; the agent starts when the first message is
+/// sent.
+pub fn new_conversation(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Option<Entity<AgentPanel>> {
+    let session = workspace.session()?.clone();
+    let handle = cx.entity().downgrade();
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let key = format!(
+        "agent:new:{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    workspace.open_item(key, window, cx, move |window, cx| {
+        AgentPanel::new(session, handle, None, window, cx)
+    })
 }
 
 enum State {
@@ -164,6 +220,11 @@ struct Host {
 
 pub struct AgentPanel {
     session: Entity<GraphSession>,
+    workspace: WeakEntity<Workspace>,
+    /// The graph's conversations, which this tab records itself in.
+    sessions: Entity<AgentSessions>,
+    /// The tab's key until the agent names the session.
+    new_key: SharedString,
     /// The agent's replies as rendered markdown, by entry index, with how much of the text each
     /// has taken in; a streaming reply appends its new tail.
     markdown: std::collections::HashMap<usize, (Entity<Markdown>, usize)>,
@@ -178,10 +239,12 @@ pub struct AgentPanel {
     host: Option<Host>,
     /// A prompt sent before the agent was ready, sent once it is.
     queued: Option<String>,
-    /// The open session, remembered to come back to.
+    /// The conversation this tab holds: the one it loads before the agent answers, then the one
+    /// the agent opened. `None` starts a new one.
     session_id: Option<String>,
-    /// The next start begins a new conversation instead of resuming the last.
-    start_fresh: bool,
+    /// The agent stopped with an error.
+    failed: bool,
+    _focus: Option<gpui::Subscription>,
     /// The options the agent offers for this session (its model, mode, reasoning level), in its
     /// order and as it last confirmed them.
     config_options: Vec<SessionConfigOption>,
@@ -203,8 +266,14 @@ impl Focusable for AgentPanel {
 }
 
 impl Item for AgentPanel {
-    fn tab_title(&self, _cx: &App) -> SharedString {
-        "Agent".into()
+    /// The conversation's title, as the sidebar lists it.
+    fn tab_title(&self, cx: &App) -> SharedString {
+        self.session_id
+            .as_ref()
+            .and_then(|id| self.sessions.read(cx).get(id))
+            .and_then(|record| record.title.clone())
+            .map(|title| cut(&title, TAB_TITLE_CHARS).into())
+            .unwrap_or_else(|| "New conversation".into())
     }
 
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
@@ -212,14 +281,20 @@ impl Item for AgentPanel {
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
-        Some("agent".into())
+        Some(match &self.session_id {
+            Some(id) => format!("agent:{id}").into(),
+            None => self.new_key.clone(),
+        })
     }
 
-    /// The tab comes back after a restart; the agent starts again only when a message is sent.
+    /// The tab comes back after a restart with its conversation.
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
         Some(SavedItem {
             kind: "agent".into(),
-            data: Value::Null,
+            data: match &self.session_id {
+                Some(id) => serde_json::json!({ "session": id }),
+                None => Value::Null,
+            },
         })
     }
 
@@ -259,11 +334,11 @@ impl Item for AgentPanel {
         }
         end.extend(self.render_usage(cx));
         end.extend(self.render_options(cx));
-        if matches!(self.state, State::Ready { .. } | State::Exited { .. }) {
+        if matches!(self.state, State::Exited { .. }) {
             end.push(
                 ds::icon_button("restart", IconName::RotateCw)
                     .icon_color(Color::Muted)
-                    .tooltip(|_, cx| Tooltip::for_action("New conversation", &Restart, cx))
+                    .tooltip(|_, cx| Tooltip::for_action("Start the agent again", &Restart, cx))
                     .on_click(cx.listener(|this, _, window, cx| this.restart(&Restart, window, cx)))
                     .into_any_element(),
             );
@@ -277,7 +352,13 @@ impl Item for AgentPanel {
 }
 
 impl AgentPanel {
-    pub fn new(session: Entity<GraphSession>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        session: Entity<GraphSession>,
+        workspace: WeakEntity<Workspace>,
+        session_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let composer = cx.new(|cx| {
             let mut editor = Editor::auto_height(2, 10, window, cx);
             editor.set_placeholder_text("Ask about the graph, or ask for a change…", window, cx);
@@ -293,9 +374,34 @@ impl AgentPanel {
             cx.notify();
         })
         .detach();
+        let sessions = AgentSessions::global(cx);
+        // A tab title follows the conversation's title.
+        cx.observe(&sessions, |_, _, cx| cx.emit(ItemEvent::UpdateTab))
+            .detach();
+        // Whatever changes the conversation (a turn, an approval card, a decision), the graph's
+        // list learns what it is doing now; a closed tab's agent stops with it.
+        cx.observe_self(|this, cx| this.sync_live(cx)).detach();
+        cx.on_release(|this, cx| {
+            if let Some(id) = this.session_id.clone() {
+                this.sessions
+                    .update(cx, |sessions, cx| sessions.set_live(&id, None, cx));
+            }
+        })
+        .detach();
+        let focus_handle = cx.focus_handle();
+        // Seeing a conversation reads what it finished while unseen.
+        let focus = cx.on_focus_in(&focus_handle, window, |this: &mut Self, _, cx| {
+            if let Some(id) = this.session_id.clone() {
+                this.sessions
+                    .update(cx, |sessions, cx| sessions.mark_read(&id, cx));
+            }
+        });
         let mut panel = Self {
             session,
-            focus_handle: cx.focus_handle(),
+            workspace,
+            sessions,
+            new_key: format!("agent:new:{}", cx.entity_id()).into(),
+            focus_handle,
             composer,
             custom_command,
             scroll: ScrollHandle::new(),
@@ -306,8 +412,9 @@ impl AgentPanel {
             always_allow: false,
             host: None,
             queued: None,
-            session_id: None,
-            start_fresh: false,
+            session_id,
+            failed: false,
+            _focus: Some(focus),
             config_options: Vec::new(),
             setting_option: None,
             usage: None,
@@ -333,15 +440,10 @@ impl AgentPanel {
 
     // ---- lifecycle ----
 
-    /// Starts the agent at once when there is a conversation to come back to on this graph, so
-    /// it is on screen without sending anything first.
-    pub fn resume_if_saved(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.state, State::Idle) {
-            return;
-        }
-        let command = Self::command(cx);
-        let graph = self.session.read(cx).settings_key(cx);
-        if crate::sessions::load(&graph, &command).is_some() {
+    /// Starts the agent at once for a conversation to come back to, so it is on screen
+    /// without sending anything first.
+    pub fn start_if_idle(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.state, State::Idle) && self.session_id.is_some() {
             self.start(cx);
         }
     }
@@ -352,16 +454,11 @@ impl AgentPanel {
             self.state = State::Setup;
             return;
         }
-        // The earlier conversation on this graph with this agent, unless a new one was asked
-        // for (spec 011: resuming a session).
-        let graph = self.session.read(cx).settings_key(cx);
-        let saved = if self.start_fresh {
-            self.start_fresh = false;
-            crate::sessions::forget(&graph, &settings.command);
-            None
-        } else {
-            crate::sessions::load(&graph, &settings.command)
-        };
+        // The conversation this tab holds, to load (spec 011: resuming a session).
+        let saved = self
+            .session_id
+            .as_ref()
+            .and_then(|id| self.sessions.read(cx).get(id).cloned());
         let data = studio_settings::data_dir().join("agent");
         let cwd = data.join("workspace");
         if let Err(error) = std::fs::create_dir_all(&cwd) {
@@ -393,6 +490,7 @@ impl AgentPanel {
         };
         let base = self.session.read(cx).branch.clone();
         // A resumed conversation keeps writing to its branch.
+        self.failed = false;
         self.branch = Some(match &saved {
             Some(saved) => AgentBranch {
                 name: saved.branch.clone(),
@@ -418,7 +516,7 @@ impl AgentPanel {
                 crate::PROXY_COMMAND.to_owned(),
                 socket.path.to_string_lossy().into_owned(),
             ],
-            resume: saved.map(|saved| saved.session),
+            resume: self.session_id.clone(),
         };
         let (events_tx, mut events_rx) = mpsc::unbounded();
         let (commands_tx, commands_rx) = mpsc::unbounded();
@@ -484,7 +582,8 @@ impl AgentPanel {
         }
     }
 
-    /// A new conversation: the earlier one is not resumed again.
+    /// Starts the agent again on this conversation, after it stopped: it replays the
+    /// conversation when it can load it, else a new one begins in this tab.
     fn restart(&mut self, _: &Restart, _window: &mut Window, cx: &mut Context<Self>) {
         self.stop_host();
         self.entries.clear();
@@ -492,25 +591,58 @@ impl AgentPanel {
         self.expanded_activity.clear();
         self.folded_queries.clear();
         self.usage = None;
-        self.start_fresh = true;
         self.start(cx);
     }
 
     /// Records the open session, to come back to it at the next start.
-    fn remember_session(&self, cx: &App) {
+    fn remember_session(&self, cx: &mut Context<Self>) {
         let (Some(session), Some(branch)) = (&self.session_id, &self.branch) else {
             return;
         };
-        let command = StudioSettings::get(cx).agent.command.clone();
-        crate::sessions::save(
-            &self.session.read(cx).settings_key(cx),
-            &command,
-            &crate::sessions::SavedSession {
-                session: session.clone(),
-                branch: branch.name.clone(),
-                branch_created: branch.created,
-            },
-        );
+        let now = chrono::Utc::now();
+        let record = SessionRecord {
+            session: session.clone(),
+            graph: self.session.read(cx).settings_key(cx),
+            agent: Self::command(cx).join(" "),
+            title: None,
+            created_at: now,
+            updated_at: now,
+            branch: branch.name.clone(),
+            branch_created: branch.created,
+            pinned: false,
+            archived: false,
+        };
+        self.sessions
+            .update(cx, |sessions, cx| sessions.upsert(record, cx));
+    }
+
+    /// Whether this tab is the one the workspace shows.
+    fn is_shown(&self, cx: &Context<Self>) -> bool {
+        let this = cx.entity_id();
+        self.workspace.upgrade().is_some_and(|workspace| {
+            workspace
+                .read(cx)
+                .active_item()
+                .is_some_and(|item| item.item_id() == this)
+        })
+    }
+
+    /// Tells the graph's list what this conversation is doing.
+    fn sync_live(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.session_id.clone() else {
+            return;
+        };
+        let live = if self.pending_index().is_some() {
+            Some(Live::Waiting)
+        } else if matches!(self.state, State::Prompting { .. }) {
+            Some(Live::Running)
+        } else if self.failed {
+            Some(Live::Failed)
+        } else {
+            None
+        };
+        self.sessions
+            .update(cx, |sessions, cx| sessions.set_live(&id, live, cx));
     }
 
     fn apply_event(&mut self, event: HostEvent, cx: &mut Context<Self>) {
@@ -522,14 +654,10 @@ impl AgentPanel {
             } => {
                 self.session_id = Some(session);
                 self.remember_session(cx);
-                if resumed {
-                    self.entries.push(Entry::Notice {
-                        text: "Resumed the last conversation; ↻ starts a new one.".into(),
-                        error: false,
-                    });
-                } else {
-                    // A resumed session keeps its own options; a new one starts from the ones
-                    // chosen last for this agent.
+                cx.emit(ItemEvent::UpdateTab);
+                // A loaded conversation replays itself and keeps its own options; a new one
+                // starts from the ones chosen last for this agent.
+                if !resumed {
                     self.apply_preferences(cx);
                 }
                 self.state = State::Ready { agent };
@@ -537,7 +665,7 @@ impl AgentPanel {
                     self.prompt(text, cx);
                 }
             }
-            HostEvent::Update(update) => self.apply_update(update),
+            HostEvent::Update(update) => self.apply_update(update, cx),
             HostEvent::ConfigOptions(options) => {
                 self.config_options = options;
                 self.setting_option = None;
@@ -568,6 +696,12 @@ impl AgentPanel {
                         agent: agent.clone(),
                     };
                 }
+                if let Some(id) = self.session_id.clone()
+                    && !self.is_shown(cx)
+                {
+                    self.sessions
+                        .update(cx, |sessions, cx| sessions.mark_unread(&id, cx));
+                }
                 match stop {
                     Ok(StopReason::EndTurn) => {}
                     Ok(StopReason::Cancelled) => self.entries.push(Entry::Notice {
@@ -584,8 +718,13 @@ impl AgentPanel {
                     }),
                 }
             }
-            HostEvent::Exited { message, stderr } => {
+            HostEvent::Exited {
+                message,
+                stderr,
+                failed,
+            } => {
                 self.stop_host();
+                self.failed = failed;
                 self.state = State::Exited { message, stderr };
             }
         }
@@ -593,8 +732,18 @@ impl AgentPanel {
         cx.notify();
     }
 
-    fn apply_update(&mut self, update: SessionUpdate) {
+    fn apply_update(&mut self, update: SessionUpdate, cx: &mut Context<Self>) {
         match update {
+            // The agent's own title for the conversation.
+            SessionUpdate::SessionInfoUpdate(info) => {
+                if let (MaybeUndefined::Value(title), Some(id)) = (info.title, &self.session_id)
+                    && !title.trim().is_empty()
+                {
+                    let id = id.clone();
+                    self.sessions
+                        .update(cx, |sessions, cx| sessions.set_title(&id, title, cx));
+                }
+            }
             // A resumed session replays the person's own messages too.
             SessionUpdate::UserMessageChunk(chunk) => {
                 let text = content_text(&chunk.content);
@@ -784,6 +933,12 @@ impl AgentPanel {
             .unbounded_send(HostCommand::Prompt(text.clone()))
             .is_ok()
         {
+            if let Some(id) = self.session_id.clone() {
+                self.sessions.update(cx, |sessions, cx| {
+                    sessions.suggest_title(&id, &text, cx);
+                    sessions.touch(&id, cx);
+                });
+            }
             self.entries.push(Entry::User(text));
             self.state = State::Prompting { agent };
             self.scroll.scroll_to_bottom();
@@ -1452,13 +1607,11 @@ fn option_picker(
                     menu = menu
                         .separator()
                         .header(agent)
-                        .entry("New conversation", None, {
-                            let panel = panel.clone();
-                            move |window, cx| {
-                                panel
-                                    .update(cx, |panel, cx| panel.restart(&Restart, window, cx))
-                                    .ok();
-                            }
+                        .entry("New conversation", None, |window, cx| {
+                            window.dispatch_action(
+                                Box::new(studio_actions::agent::NewConversation),
+                                cx,
+                            )
                         })
                         .entry("Choose another agent…", None, |window, cx| {
                             window.dispatch_action(
@@ -1511,6 +1664,8 @@ fn select_values(
 
 /// The longest value name a footer picker shows before it is cut.
 const OPTION_NAME_CHARS: usize = 32;
+/// The longest conversation title a tab shows.
+const TAB_TITLE_CHARS: usize = 28;
 
 fn cut(name: &str, chars: usize) -> String {
     if name.chars().count() <= chars {

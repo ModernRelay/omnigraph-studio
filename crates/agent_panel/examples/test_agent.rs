@@ -398,6 +398,10 @@ async fn turn(
         })
         .collect();
     record("user", &prompt);
+    // "slow" holds the turn for two seconds, to see a conversation finish in the background.
+    if prompt.contains("slow") {
+        smol::Timer::after(std::time::Duration::from_secs(2)).await;
+    }
     let server = server.ok_or("Studio offered no MCP server")?;
     let mut mcp = Mcp::start(&server).await?;
 

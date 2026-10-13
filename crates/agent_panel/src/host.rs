@@ -70,10 +70,11 @@ pub enum HostEvent {
     TurnEnded {
         stop: Result<StopReason, String>,
     },
-    /// The agent stopped or could not start.
+    /// The agent stopped or could not start; `failed` unless the session simply ended.
     Exited {
         message: String,
         stderr: String,
+        failed: bool,
     },
 }
 
@@ -96,6 +97,7 @@ pub async fn run(
 ) {
     let stderr = Arc::new(Mutex::new(VecDeque::<String>::new()));
     let result = connect(launch, events.clone(), commands, stderr.clone()).await;
+    let failed = result.is_err();
     let message = match result {
         Ok(()) => "The agent session ended.".to_owned(),
         Err(error) => format!("The agent stopped: {error}"),
@@ -105,7 +107,11 @@ pub async fn run(
         .map(|lines| lines.iter().cloned().collect::<Vec<_>>().join("\n"))
         .unwrap_or_default();
     events
-        .unbounded_send(HostEvent::Exited { message, stderr })
+        .unbounded_send(HostEvent::Exited {
+            message,
+            stderr,
+            failed,
+        })
         .ok();
 }
 

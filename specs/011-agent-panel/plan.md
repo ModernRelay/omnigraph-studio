@@ -177,16 +177,46 @@ Query text, parameters, rows, tokens and prompt text. Agent stderr is shown only
 | Approval is Studio's, not the agent's permission prompt | Rely on the agent asking | Agents differ in whether and how they ask; the guarantee has to hold for every agent |
 | One agent branch per agent session | Write to the person's branch; one branch per proposal | Review works per branch (spec 008), and one branch keeps a session's changes together |
 
-## Resuming a conversation
+## Conversations
 
-- Studio keeps, per graph and agent command, the last session's id and the agent branch its
-  changes go to (`agent/sessions.json` in the data directory, owner-only; ids only, the
-  conversation stays with the agent). When the agent advertises `loadSession`, starting the
-  panel loads that session with `session/load`; the agent replays it as updates (the person's
-  messages as `user_message_chunk`), and a note says it was resumed. A session the agent no
-  longer knows starts a new one. Opening the Agent tab, or restoring it, starts the agent at
-  once when there is a conversation to come back to. The resumed conversation keeps writing to
-  its branch. ↻ (Restart) starts a new conversation and forgets the saved one.
+Checked against Zed's thread sidebar at `v1.23.2` (`sidebar`, `agent_ui/src/thread_metadata_store.rs`)
+and Delta's sidebar.
+
+- **Studio's own index.** Like Zed's metadata store, Studio keeps the list itself
+  (`agent/sessions.json` in the data directory, owner-only, format 2): per conversation, the
+  agent's session id, the graph, the agent command, its title, when it started, the last
+  message the person sent, the agent branch its changes go to, and whether it is pinned or
+  archived. Ids and titles only; the conversation stays with the agent. The agent's own
+  `session/list` is not the source: every graph's agent works in the same directory, so it
+  cannot tell graphs apart. The first format (one session per graph and agent) is read as
+  records of their own.
+- **Titles.** The agent's `session_info_update` title wins; until it sends one, the first line
+  of the first message (cut at 80 characters); "New conversation" before that.
+- **One tab per conversation.** Each conversation is its own Agent tab, titled after it, and
+  keeps running while another is shown, so two can sit side by side. Opening one that has a
+  tab shows that tab; otherwise the agent starts and replays it with `session/load` (a
+  conversation it no longer knows starts anew in that tab). A tab comes back after a restart
+  with its conversation. ⌘⇧A shows an open agent tab, else the graph's last conversation with
+  the agent, else a new one. New conversation (sidebar, model menu, `studio_agent::NewConversation`)
+  opens a new tab and leaves the earlier conversation where it is. ↻ appears only after the
+  agent stopped and starts it again on the same conversation. Each tab runs its own agent
+  process; one process serving every conversation (ACP allows several sessions per connection)
+  is deferred.
+- **The Conversations panel** is a tab of the left sidebar (the agent mark;
+  `studio_agent::ShowConversations`), after Delta's threads list: "New conversation", then
+  Pinned and Recent (labels only when something is pinned), each row the title and, at the
+  end, what the conversation is doing (a turning circle while it runs, a warning mark while a
+  change or tool waits for the person, a red cross when the agent stopped with an error, an
+  accent dot when it finished while its tab was not shown, cleared when the tab gains focus)
+  or else when the person last wrote ("now", "5m", "3h", "2d", "12 Oct"). Rows sort by the
+  person's last message, as Zed's sort by the last interaction, so a conversation finishing in
+  the background does not move. The shown tab's row is selected. Hovering a row swaps the time
+  for Pin and Archive; archiving only hides it here (the agent keeps the session, as Zed's
+  archive sends nothing), and Archived folds away at the end with a count, where Undo brings a
+  row back. The tooltip has the title, the agent and the last activity. What a conversation is
+  doing and whether it was seen live in memory only.
+- A loaded conversation keeps writing to its branch and keeps its own options; a new one starts
+  from the options chosen last for the agent.
 
 ## Session options and context usage
 
@@ -228,6 +258,11 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 - Windows: the proxy uses Unix sockets. Windows support waits for a named-pipe transport.
 - Agent-attributed commits: commits are recorded under the person's actor. Recording "on
   behalf of an agent" needs an engine change, E20 in `docs/deferred-engine-changes.md`.
+- One agent process for every conversation of an agent: today each tab starts its own.
+- Renaming a conversation, deleting it at the agent (`session/delete`), importing the agent's
+  sessions (`session/list`), and searching the list; Zed has all four.
+- Queuing messages while the agent works, and sending one at once by cancelling the turn, as
+  Zed does on the client side; ACP itself has neither, nor steering.
 
 ## Validation log
 
@@ -247,6 +282,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 | 2026-10-12 | The footer shows the agent's options and how full its context is | Offscreen snapshots with the test agent (now offering a mode and a grouped model, taking `session/set_config_option`, reporting usage after each turn): ask, open the model menu, pick Claude Opus, ↻, hover the ring | "Ask before changes ▾", "Claude Sonnet ▾", then a ring with "21%"; the menu showed the Claude and Local groups with Sonnet checked; after ↻ the new session showed Claude Opus and no ring; the tooltip read "21% of the context window · 42k of 200k tokens · 0.14 USD so far"; `preferences.json` held `"model": "opus"`, mode `0600` |
 | 2026-10-12 | The footer and thread read like Delta's | Offscreen snapshots with the test agent offering Claude's five options: two questions, open a run, open ⋯ | Footer: ring, "Ask before changes", "High", ⋯, "Claude Opus" with the Anthropic mark, ↻, send (filled with text in the composer); ⋯ held Fast mode and Agent (Default checked); each turn showed one agent mark and "Read the schema ›", "Ran 1 query ›", the first opening to "Read the schema" |
 | 2026-10-12 | A query the agent runs shows as code | Offscreen snapshot with the test agent reporting `rawInput` for its count query | "Query people ⌄" over the four-line query in a card, keywords, the query name and `Person` in the theme's syntax colours; the schema read stayed folded as "Read the schema ›" |
+| 2026-10-12 | Conversations are listed per graph and run side by side | `agent_panel` tests `conversations_are_kept_per_graph_newest_first`, `the_first_format_becomes_records`, `times_read_short`; offscreen snapshots with the test agent (now with a "slow" turn): two and three conversations in tabs, a hovered row, a pin, a slow turn finishing behind another tab, a restart | Tabs titled "How many people are there?" and "List the companies by size"; the shown one selected in the panel with "now"; hover showed pin and archive; the pinned row moved under Pinned; the slow conversation showed a turning circle while running and an accent dot after finishing unseen; after a restart both tabs came back and the shown one replayed |
 
 ## Corrections
 

@@ -323,10 +323,15 @@ pub struct SidebarRow {
     label: SharedString,
     label_color: Color,
     end: Option<AnyElement>,
+    /// Shown in place of `end` while the row is hovered: pin, archive.
+    actions: Option<AnyElement>,
     selected: bool,
     tooltip: Option<TooltipBuilder>,
     on_click: Option<ClickHandler>,
 }
+
+/// The hover group of a sidebar row, for its actions.
+const SIDEBAR_ROW_GROUP: &str = "sidebar-row";
 
 impl SidebarRow {
     pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
@@ -336,10 +341,17 @@ impl SidebarRow {
             label: label.into(),
             label_color: Color::Default,
             end: None,
+            actions: None,
             selected: false,
             tooltip: None,
             on_click: None,
         }
+    }
+
+    /// Small buttons that take the trailing value's place while the row is hovered.
+    pub fn actions(mut self, actions: impl IntoElement) -> Self {
+        self.actions = Some(actions.into_any_element());
+        self
     }
 
     pub fn start(mut self, start: impl IntoElement) -> Self {
@@ -396,6 +408,7 @@ impl RenderOnce for SidebarRow {
         );
         h_flex()
             .id(self.id)
+            .relative()
             .h(px(size::SIDEBAR_ROW))
             .mx(px(space::SM))
             .px(px(space::SM))
@@ -420,7 +433,27 @@ impl RenderOnce for SidebarRow {
                     .truncate(),
             )
             .child(div().flex_1())
-            .children(self.end)
+            .map(|row| match self.actions {
+                Some(actions) => row
+                    .group(SIDEBAR_ROW_GROUP)
+                    .children(self.end.map(|end| {
+                        div()
+                            .flex_none()
+                            .group_hover(SIDEBAR_ROW_GROUP, |style| style.invisible())
+                            .child(end)
+                    }))
+                    .child(
+                        h_flex()
+                            .absolute()
+                            .right(px(space::XS))
+                            .top_0()
+                            .bottom_0()
+                            .items_center()
+                            .visible_on_hover(SIDEBAR_ROW_GROUP)
+                            .child(actions),
+                    ),
+                None => row.children(self.end),
+            })
             .when_some(self.on_click, |row, handler| row.on_click(handler))
     }
 }
