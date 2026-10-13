@@ -736,11 +736,27 @@
       "required": false,
       "types": [
         {
+          "type": "binary_expression",
+          "named": true
+        },
+        {
           "type": "boolean",
           "named": true
         },
         {
+          "type": "call",
+          "named": true
+        },
+        {
+          "type": "comparison",
+          "named": true
+        },
+        {
           "type": "float",
+          "named": true
+        },
+        {
+          "type": "identifier",
           "named": true
         },
         {
@@ -752,7 +768,35 @@
           "named": true
         },
         {
+          "type": "membership",
+          "named": true
+        },
+        {
+          "type": "meta_field",
+          "named": true
+        },
+        {
+          "type": "not_expression",
+          "named": true
+        },
+        {
+          "type": "null_test",
+          "named": true
+        },
+        {
+          "type": "parenthesized",
+          "named": true
+        },
+        {
+          "type": "property_access",
+          "named": true
+        },
+        {
           "type": "string",
+          "named": true
+        },
+        {
+          "type": "variable",
           "named": true
         }
       ]

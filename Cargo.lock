@@ -7970,6 +7970,8 @@ dependencies = [
  "studio_settings",
  "studio_ui",
  "studio_workspace",
+ "tree-sitter",
+ "tree-sitter-gq",
  "ui",
 ]
 
@@ -10737,6 +10739,15 @@ dependencies = [
  "streaming-iterator",
  "tree-sitter-language",
  "wasmtime-c-api-impl",
+]
+
+[[package]]
+name = "tree-sitter-gq"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "tree-sitter",
+ "tree-sitter-language",
 ]
 
 [[package]]

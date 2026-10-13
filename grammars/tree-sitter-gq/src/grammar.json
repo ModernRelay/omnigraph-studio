@@ -1941,7 +1941,7 @@
               "members": [
                 {
                   "type": "SYMBOL",
-                  "name": "_literal"
+                  "name": "_expression"
                 },
                 {
                   "type": "REPEAT",
@@ -1954,7 +1954,7 @@
                       },
                       {
                         "type": "SYMBOL",
-                        "name": "_literal"
+                        "name": "_expression"
                       }
                     ]
                   }

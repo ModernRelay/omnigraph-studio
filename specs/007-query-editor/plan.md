@@ -66,8 +66,13 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 - `NewQuery` (⌘N) opens "Query 1", "Query 2", …, starting with a read over the schema's first
   node type (`gq_language::example_read`).
-- Highlighting is lexical (`gq_language::tokenize`), applied as editor text highlights with the
-  theme's syntax colors; no tree-sitter grammar yet.
+- Highlighting follows the syntax tree: the editor's buffer has the GQ language
+  (`query_editor::gq_syntax`), the tree-sitter grammar in `grammars/tree-sitter-gq` with its
+  highlight, bracket, indent and outline queries, so brackets match and auto-close, new lines
+  indent inside a block and folds end where the block does. Read-only views of a query keep the
+  lexical colouring (`gq_language::tokenize`); both use the same theme names. If the grammar's
+  queries failed to compile the editor would fall back to the lexical colouring (a test keeps
+  them compiling).
 - After typing pauses (150 ms) the source is checked off the main thread (`analysis.rs`): the
   whole file for problems, each declaration on its own for mutation/read, parameters and result
   columns, so one broken declaration does not hide its siblings. Problems are underlined and
@@ -121,7 +126,7 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 ## Deferred
 
-- Tree-sitter highlighting, folding and outline (`grammars/tree-sitter-gq`).
+- A schema grammar (`tree-sitter-pg`): no Studio surface edits a schema yet.
 - A row cap: the result shows every row the server returns, so the query's own `limit` is the
   cap today (constitution IX). The example query carries `limit 50`.
 - A write from the editor sends no `Omnigraph-If-Graph-Commit`: it is not based on a read, and
@@ -136,6 +141,7 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-12 | The GQ grammar parses OmniGraph's queries and the editor uses it | `tree-sitter parse --stat` over the 1,390 `--- query`/`--- mutate` steps of the v0.13.0 `.gqt` corpus that expect no error, and the two `.gq` files: all parse with no error node; `tree-sitter-gq` tests (every clause kind, recovery around a broken clause, queries compile, outline names both declarations); `query_editor` `the_language_builds_with_every_query`; offscreen snapshot of a new query tab | Traversals (edge binding, `<a \| b>`, `(a \| b)`, hop bounds), filters, subquery predicates and negations come out as their own nodes; the editor colours keywords, names, types, properties, strings, numbers and edges from the tree and highlights the matching bracket |
 | 2026-10-11 | Compiler APIs above exist | `git show v0.13.0:crates/omnigraph-compiler/src/lib.rs` | All exported |
 | 2026-10-12 | Zed's editor works with no project: completion provider, text highlights, placeholder | `editor/src/completions.rs` (`CompletionProvider`, `set_completion_provider`, no `project` needed outside snippets), `keymap_editor/src/action_completion_provider.rs` (a project-less provider), `editor/src/display_map.rs` (`HighlightKey`) at `v1.23.2`; offscreen snapshots of completion and underlines | Works. `HighlightKey` is a closed enum; `ConsoleAnsiHighlight(n)` is the one numbered key, used for syntax classes and diagnostics |
 | 2026-10-12 | Diagnostics within S4's 100 ms after typing stops on a 500-line file | `analysis_time_on_a_500_line_source` (ignored instrument), debug build, Apple M5 Pro, 48 GB, 504 lines / 63 queries | 12.6 ms per analysis. With the 150 ms debounce the underline lands about 163 ms after the last key, over S4's 100 ms; the debounce, not the check, is the cost (see Corrections) |

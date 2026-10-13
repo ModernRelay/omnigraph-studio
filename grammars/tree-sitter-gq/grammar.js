@@ -298,7 +298,8 @@ module.exports = grammar({
 
     _literal: ($) => choice($.list, $.string, $.float, $.integer, $.boolean),
 
-    list: ($) => seq('[', commaSep($._literal), ']'),
+    // pest admits literals here, `date("…")` among them; any expression reads the same.
+    list: ($) => seq('[', commaSep($._expression), ']'),
 
     string: (_) => token(seq('"', repeat(choice(/[^"\\]/, /\\./)), '"')),
 

@@ -5,6 +5,7 @@
 
 mod analysis;
 mod completion;
+mod gq_syntax;
 mod hover;
 mod queries_panel;
 mod results;
