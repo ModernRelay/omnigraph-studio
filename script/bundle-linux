@@ -6,13 +6,19 @@
 #     share/applications/omnigraph-studio.desktop
 #     share/icons/hicolor/512x512/apps/omnigraph-studio.png
 #     LICENSE
+#     THIRD-PARTY-NOTICES.md
 #
 #   script/bundle-linux            # release build
 #   script/bundle-linux --debug    # the debug build, to check the layout quickly
 #
 # Unpack anywhere and run bin/omnigraph-studio; copy share/ into ~/.local/share to list it,
 # with its icon, in a launcher. An AppImage is not built yet.
+#
+# A release runs on glibc 2.35 (`GLIBC_FLOOR`: Ubuntu 22.04, Debian 12) and later, so it is built
+# on Ubuntu 22.04: a binary that needs a newer glibc is refused here rather than shipped.
 set -euo pipefail
+
+GLIBC_FLOOR=2.35
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
@@ -35,6 +41,12 @@ name="omnigraph-studio-$version-linux-$arch"
 
 if [[ "$profile" == release ]]; then
   cargo build --locked --release -p studio --bin omnigraph-studio
+  needed=$(objdump -T target/release/omnigraph-studio | grep -o 'GLIBC_[0-9.]*' |
+    sed 's/GLIBC_//' | sort -t. -k1,1n -k2,2n | tail -1)
+  if [[ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$needed" | sort -t. -k1,1n -k2,2n | tail -1)" != "$GLIBC_FLOOR" ]]; then
+    echo "bundle-linux: the build needs glibc $needed, newer than $GLIBC_FLOOR; build on Ubuntu 22.04" >&2
+    exit 1
+  fi
 else
   cargo build --locked -p studio --bin omnigraph-studio
 fi
@@ -49,6 +61,11 @@ cp resources/linux/omnigraph-studio.desktop.in "$dir/share/applications/omnigrap
 # The icon the .desktop entry names (script/make-icon.py draws it).
 cp resources/linux/omnigraph-studio.png "$dir/share/icons/hicolor/512x512/apps/omnigraph-studio.png"
 cp LICENSE "$dir/"
+# Third-party notices (script/generate-licenses): a release needs them; a debug bundle has them
+# when cargo-about is installed.
+if [[ "$profile" == release ]] || cargo about --version >/dev/null 2>&1; then
+  script/generate-licenses "$dir/THIRD-PARTY-NOTICES.md" >/dev/null
+fi
 
 mkdir -p "$out"
 tar -czf "$out/$name.tar.gz" -C "$staging" "$name"

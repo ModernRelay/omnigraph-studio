@@ -38,7 +38,16 @@ name="OmniGraph Studio"
 arch=$(uname -m)
 
 if [[ "$profile" == release ]]; then
-  cargo build --locked --release -p studio --bin omnigraph-studio
+  # GPUI's Metal shaders are compiled into the build when Xcode's Metal compiler is here
+  # (`--no-default-features` drops `runtime-shaders`), so no window compiles them, or fails
+  # to, as it opens. With only the Command Line Tools they compile when Studio starts.
+  features=""
+  if xcrun -sdk macosx -f metal >/dev/null 2>&1; then
+    features="--no-default-features"
+  else
+    echo "bundle-mac: no Metal compiler (it comes with Xcode); shaders will compile at launch" >&2
+  fi
+  cargo build --locked --release -p studio --bin omnigraph-studio $features
 else
   cargo build --locked -p studio --bin omnigraph-studio
 fi
@@ -100,6 +109,11 @@ cat > "$app/Contents/Info.plist" <<PLIST
 PLIST
 plutil -lint "$app/Contents/Info.plist" >/dev/null
 cp LICENSE* "$app/Contents/Resources/" 2>/dev/null || true
+# Third-party notices (script/generate-licenses): a release needs them; a debug bundle, built to
+# run on this Mac, has them when cargo-about is installed.
+if [[ "$profile" == release ]] || cargo about --version >/dev/null 2>&1; then
+  script/generate-licenses "$app/Contents/Resources/THIRD-PARTY-NOTICES.md" >/dev/null
+fi
 # The icon (script/make-icon.py draws it).
 cp resources/macos/AppIcon.icns "$app/Contents/Resources/AppIcon.icns"
 

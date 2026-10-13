@@ -85,15 +85,28 @@ Linux. CI caches `~/.cargo/git` and `target/` keyed on `Cargo.lock`.
   are only the JIT pair Zed's wasmtime needs. Signing needs a ModernRelay Apple Developer
   account. The icon is the Modern Relay mark (from ModernRelay/brand) in white on a black
   macOS-shaped tile; `script/make-icon.py` draws it into `resources/macos/AppIcon.icns` and
-  `resources/linux/omnigraph-studio.png`, which the bundle scripts install.
+  `resources/linux/omnigraph-studio.png`, which the bundle scripts install. A release build
+  compiles GPUI's Metal shaders at build time (`--no-default-features` drops the
+  `runtime-shaders` default) when Xcode's Metal compiler is present; with only the Command Line
+  Tools they compile when Studio starts, as in a debug build.
 - Linux: `script/bundle-linux` builds a tarball (`bin/`, a `.desktop` entry, `LICENSE`).
-  AppImage later. Windows: later.
+  A release runs on glibc 2.35 (Ubuntu 22.04, Debian 12) and later: it is built on Ubuntu 22.04,
+  and the script refuses a binary that needs a newer glibc. AppImage later. Windows: later.
+- Every bundle carries `THIRD-PARTY-NOTICES.md` beside `LICENSE`: the licences of the fonts,
+  icons and themes Studio embeds from Zed's assets, then every crate linked into the app on the
+  three shipped targets. `script/generate-licenses` writes it with cargo-about 0.9.2, accepting
+  the licences `deny.toml` allows; a crate whose licence cannot be read fails the run
+  (`script/licenses/about.toml` clarifies `language_core`, which declares none). A release
+  bundle needs it; a debug bundle has it when cargo-about is installed. CI's `deny` job
+  generates it on every change.
 - CI bundles the debug build on both systems so the scripts keep working.
 - Releases: pushing a tag `v<version>` that names the workspace version runs
   `.github/workflows/release.yml`. It bundles release builds for macOS (Apple silicon) and Linux
   (x86_64 and arm64) and publishes a GitHub Release with the files, `SHA256SUMS` and install
   notes; 0.x releases are marked pre-release. The macOS build is signed and notarized when the
-  workflow's Apple secrets are set, and signed ad hoc otherwise.
+  workflow's Apple secrets are set, and signed ad hoc otherwise. Run by hand
+  (`workflow_dispatch`), the workflow builds the same files and publishes nothing, to check a
+  release before it is tagged.
 - Homebrew cask in a ModernRelay tap. Updates: a polling updater modelled on Zed's
   `auto_update`, later.
 
@@ -151,4 +164,9 @@ None yet.
 
 ## Corrections
 
-None yet.
+- 2026-10-13 · The first v0.1.0 release (built from `f7f4ba6`) published three defects, and
+  was deleted with no downloads. Its Linux builds needed glibc 2.39 (built on Ubuntu 24.04;
+  `pidfd_spawnp` and `pidfd_getpid` are versioned `GLIBC_2.39` and not weak), so they would not
+  start on Ubuntu 22.04 or Debian 12. Its macOS build kept the `runtime-shaders` default, though
+  the comment on the feature said releases drop it. No download carried notices for the
+  third-party licences. Each is now handled in the bundle scripts and the workflow, as above.

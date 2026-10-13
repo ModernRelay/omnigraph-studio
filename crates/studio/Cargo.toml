@@ -16,8 +16,9 @@ path = "src/main.rs"
 [features]
 default = ["runtime-shaders"]
 # Compile GPUI's Metal shaders when the app starts instead of at build time, so a build needs
-# only the Command Line Tools, not full Xcode. Release builds use `--no-default-features` on a
-# machine with Xcode to precompile them (specs/001-foundation/plan.md).
+# only the Command Line Tools, not full Xcode. `script/bundle-mac` builds a release with
+# `--no-default-features` when Xcode's Metal compiler is present, compiling them at build time
+# (specs/001-foundation/plan.md, Shipping).
 runtime-shaders = ["gpui_platform/runtime_shaders"]
 
 [dependencies]

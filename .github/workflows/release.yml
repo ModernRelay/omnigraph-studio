@@ -4,6 +4,9 @@ name: Release
 #
 #   git tag v0.1.0 && git push origin v0.1.0
 #
+# Run it by hand (`gh workflow run release.yml --ref main`) to build the same files without
+# publishing them, to check a release before tagging it.
+#
 # macOS builds are signed and notarized when the Apple secrets below are set, and signed ad hoc
 # otherwise. Linux builds are tarballs.
 #
@@ -17,6 +20,7 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -34,9 +38,10 @@ jobs:
         include:
           - os: macos-15
             target: macos-arm64
-          - os: ubuntu-24.04
+          # Ubuntu 22.04's glibc (2.35) is the oldest a Linux build runs on (bundle-linux checks).
+          - os: ubuntu-22.04
             target: linux-x86_64
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             target: linux-aarch64
     runs-on: ${{ matrix.os }}
     env:
@@ -45,6 +50,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: The tag names the workspace version
+        if: github.event_name == 'push'
         shell: bash
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
@@ -62,6 +68,16 @@ jobs:
 
       - name: Rust toolchain from rust-toolchain.toml
         run: rustup show
+
+      # The third-party notices every bundle ships (script/generate-licenses).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
+
+      # A release compiles GPUI's Metal shaders at build time, which needs Xcode's compiler.
+      - name: Metal compiler
+        if: runner.os == 'macOS'
+        run: xcrun -sdk macosx -f metal
 
       - name: Signing and notarization credentials
         if: runner.os == 'macOS' && env.SIGNED == 'true'
@@ -109,6 +125,7 @@ jobs:
   publish:
     name: Publish
     needs: build
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
@@ -139,10 +156,10 @@ jobs:
           | File | Platform |
           |---|---|
           | \`OmniGraph-Studio-$version-arm64.dmg\` | macOS 11 or later, Apple silicon |
-          | \`omnigraph-studio-$version-linux-x86_64.tar.gz\` | Linux x86_64 (Wayland or X11, Vulkan) |
-          | \`omnigraph-studio-$version-linux-aarch64.tar.gz\` | Linux arm64 (Wayland or X11, Vulkan) |
+          | \`omnigraph-studio-$version-linux-x86_64.tar.gz\` | Linux x86_64, glibc 2.35 or later (Ubuntu 22.04, Debian 12 and later); Wayland or X11, Vulkan |
+          | \`omnigraph-studio-$version-linux-aarch64.tar.gz\` | Linux arm64, glibc 2.35 or later; Wayland or X11, Vulkan |
 
-          \`SHA256SUMS\` lists every file's checksum.
+          \`SHA256SUMS\` lists every file's checksum. Each download carries \`LICENSE\` (GPL-3.0-or-later) and \`THIRD-PARTY-NOTICES.md\`, the licences of the crates, fonts, icons and themes it includes.
 
           $mac
 

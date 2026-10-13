@@ -1,0 +1,20 @@
+# cargo-about settings for script/generate-licenses. The licences it accepts are not listed here:
+# the script takes them from deny.toml, where cargo-deny decides which licences Studio may use.
+
+# The crates in the shipped bundles: macOS on Apple silicon and Linux on x86_64 and arm64.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+# Only what is linked into the app: tests and build scripts are not shipped.
+ignore-dev-dependencies = true
+ignore-build-dependencies = true
+
+# Zed's language_core declares no licence field; its LICENSE-GPL is Zed's GPL-3.0-or-later (as
+# in deny.toml). The checksum pins the file the licence was read from.
+[language_core.clarify]
+license = "GPL-3.0-or-later"
+[[language_core.clarify.files]]
+path = "LICENSE-GPL"
+checksum = "0aa0322ea494da441088e4d9144c6720bf99d9e2e1eefcd29d1f58b19b5c4246"
