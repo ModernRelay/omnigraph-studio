@@ -2575,6 +2575,8 @@ impl Render for Workspace {
         };
         if self.traffic_lights != Some(lights) {
             self.traffic_lights = Some(lights);
+            // Only macOS draws traffic lights; GPUI has the call on macOS alone.
+            #[cfg(target_os = "macos")]
             window.set_traffic_light_position(lights);
         }
         let footer = self
