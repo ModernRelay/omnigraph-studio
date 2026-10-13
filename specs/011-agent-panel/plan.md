@@ -1,6 +1,7 @@
 # 011: Agent panel
 
-Status: implemented · 2026-10-12
+Status: implemented · 2026-10-12. The agent's graph access is moving to the `omnigraph` CLI
+through a Studio gateway: [spec 013](../013-agent-cli/plan.md), draft.
 
 ## Problem
 

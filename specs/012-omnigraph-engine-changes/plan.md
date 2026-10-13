@@ -51,7 +51,8 @@ Each change names the Studio spec that waits on it and Studio's behavior until t
 
 ### Launch and local graphs
 
-**E1. `omnigraph studio` CLI command.**
+**E1. `omnigraph studio` CLI command.** Filed with E4 as
+[ModernRelay/omnigraph#980](https://github.com/ModernRelay/omnigraph/issues/980).
 Resolve the target the way other commands do (`--store`, `--cluster --graph`, `--server
 --graph`, profile). For a local target, serve it in-process on loopback (E2); for a server
 target, pass the server through. Mint a per-launch token tied to `operator.actor` and a
@@ -120,13 +121,37 @@ at 0.13. *Waits:* 001. *Today:* git dependency on tag `v0.13.0`.
 
 ### Agent identity
 
-**E20. Commits made on behalf of an agent.** Spec 011 runs agent writes through the person's
+**E20. Commits made on behalf of an agent.** Filed as delegated, branch-scoped credentials,
+[ModernRelay/omnigraph#978](https://github.com/ModernRelay/omnigraph/issues/978) (RFC needed):
+the credential also limits the agent's writes to its own branches, which spec 013's gateway does
+on Studio's side until then. Spec 011 runs agent writes through the person's
 token, so the commit records the person's actor. Recording an agent beside the actor (for
 example an `on_behalf_of` field set by the server from a token the person scoped for the agent)
 would let history and review say which changes an agent made. Engine rule: the server resolves
 both identities from bearer tokens at the boundary (invariant 10); a client never asserts the
 agent identity. Studio today: agent writes go only to a branch named `agent/<stamp>`, so the
 branch name says who made them.
+
+### The agent's CLI (spec 013)
+
+**E22. A refused write is reported as not started.**
+[ModernRelay/omnigraph#976](https://github.com/ModernRelay/omnigraph/issues/976). After a write
+is sent, the 0.13 CLI reports every failure except a typed 429 and a verified 412 as `effects:
+unknown, action: reconcile`, including 401, 403 and the contract 400
+(`crates/omnigraph-cli/src/command_outcome.rs:165-258` at `d8d2e3a8`). These refusals happen
+before effects. Engine rule: confirm each code is produced only before staging. *Waits:* 013.
+*Today:* `AGENTS.md` tells the agent that a Studio refusal wrote nothing.
+
+**E23. `omnigraph version --json` with the HTTP contract.**
+[ModernRelay/omnigraph#977](https://github.com/ModernRelay/omnigraph/issues/977). No command
+reports the contract a binary speaks (`main.rs:152-158, 612-620`; `cli.rs:428`). *Waits:* 013.
+*Today:* Studio tests each installed CLI once against the gateway.
+
+**E24. Unix-socket transport for `--server`.**
+[ModernRelay/omnigraph#979](https://github.com/ModernRelay/omnigraph/issues/979). The CLI speaks
+only http(s), and a `unix://` value falls through to storage resolution. Codex's sandbox can
+allow one Unix socket but blocks loopback TCP. *Waits:* 013. *Today:* Codex reaches the gateway
+only when the person gives the conversation network access.
 
 ### Branching
 
@@ -151,11 +176,15 @@ proposal and to preview a merge. Used only when the server advertises
 
 ## Order if picked up
 
-1. E11 typed columns and E10 paged commits: small, additive, used everywhere.
-2. E9 branch details, E7 merge base, E6 diff: the review surface.
-3. E1–E5 launcher: the one-command local experience.
-4. E8 merge preview, E16 neighbourhood counts, E15 whoami.
-5. E12, E13, E14, E17, E18, E19 as the matching Studio work starts.
+1. E22 refused-write outcomes and E23 `version --json`: small CLI changes the agent's CLI needs
+   (spec 013); started 2026-10-13.
+2. E11 typed columns and E10 paged commits: small, additive, used everywhere.
+3. E9 branch details, E7 merge base, E6 diff: the review surface.
+4. E1–E5 launcher: the one-command local experience.
+5. E20 delegated credentials (an RFC) and E24 Unix sockets, which retire spec 013's gateway
+   rules and let sandboxed agents in.
+6. E8 merge preview, E16 neighbourhood counts, E15 whoami.
+7. E12, E13, E14, E17, E18, E19 as the matching Studio work starts.
 
 ## Decisions
 

@@ -7,7 +7,7 @@ one is picked up it goes through OmniGraph's own RFC process.
 
 | ID | Change | Waiting spec | Studio does today |
 |---|---|---|---|
-| E1 | `omnigraph studio` CLI command: resolve the target, serve locally on loopback, single-use code handoff | 003 | Connects to running servers from `~/.omnigraph/config.yaml` or added by URL; local graphs served with `omnigraph-server --cluster <dir>` first |
+| E1 | `omnigraph studio` CLI command: resolve the target, serve locally on loopback, single-use code handoff ([#980](https://github.com/ModernRelay/omnigraph/issues/980)) | 003, 013 | Connects to running servers from `~/.omnigraph/config.yaml` or added by URL; local graphs served with `omnigraph-server --cluster <dir>` first |
 | E2 | Supported local embedding API in `omnigraph-server`, with a read-only mode | E1 | — |
 | E3 | Loopback guard (Host allowlist, Origin check, no CORS) in the launcher | E1 | — |
 | E4 | Owner discovery for a graph root (discovery, not fencing) | E1 | — |
@@ -26,7 +26,10 @@ one is picked up it goes through OmniGraph's own RFC process.
 | E17 | `omnigraph lsp` language server | 007 | `gq_language` calls `omnigraph-compiler` in-process |
 | E18 | Tree-sitter grammars and a Zed extension in the OmniGraph repository | E17 | Grammars in this repository under `grammars/` |
 | E19 | Publish `omnigraph-compiler` to crates.io again (stops at 0.8.0) | 001 | Git dependency on tag `v0.13.0` |
-| E20 | Record commits made on behalf of an agent (agent identity beside the actor) | 011 | Agent commits are recorded under the person's actor, on a branch named `agent/<stamp>` |
+| E20 | Delegated, branch-scoped credentials for agents, recorded in history beside the actor ([#978](https://github.com/ModernRelay/omnigraph/issues/978)) | 011, 013 | Agent commits are recorded under the person's actor, on a branch named `agent/<stamp>`; Studio's gateway keeps the agent's writes on that branch |
+| E22 | The CLI reports a write refused at authentication, policy or the contract as not started ([#976](https://github.com/ModernRelay/omnigraph/issues/976)) | 013 | `AGENTS.md` says a Studio refusal wrote nothing |
+| E23 | `omnigraph version --json` with the HTTP contract ([#977](https://github.com/ModernRelay/omnigraph/issues/977)) | 013 | Each installed CLI is tested once against the gateway |
+| E24 | Unix-socket transport for `--server` ([#979](https://github.com/ModernRelay/omnigraph/issues/979)) | 013 | Codex reaches the gateway only with network access the person grants |
 
 Already on OmniGraph main but not in 0.13.0, used only when a server advertises them:
 
