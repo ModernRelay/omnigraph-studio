@@ -51,6 +51,9 @@ const DASH: f32 = 2.;
 const GAP: f32 = 3.;
 /// Dashes per path: each is a short straight stroke of a few vertices.
 const DASHES_PER_PATH: usize = 6_000;
+/// The most dashes one straight piece of a dotted line is cut into (half a million pixels); a
+/// longer piece is drawn solid.
+const DASHES_PER_LINE: usize = 100_000;
 
 /// How a line runs between its two ends.
 #[derive(Clone, Copy)]
@@ -599,35 +602,47 @@ fn flatten(from: Point<Pixels>, to: Point<Pixels>, curve: Curve) -> Vec<Point<Pi
 }
 
 /// The dashes of a dotted line through `points`, as straight pieces: `DASH` on, `GAP` off,
-/// continuing across the line's bends.
+/// continuing across the line's bends. Dash `k` covers `[k·period, k·period + DASH]` of the
+/// distance along the whole line, in f64 and stepped by `k`, so the walk always ends: a walk
+/// that carried its place in the pattern from piece to piece in f32 stopped advancing when
+/// the step left was below the resolution of the distance walked, and pushed empty dashes
+/// until memory ran out. A piece longer than `DASHES_PER_LINE` dashes is drawn solid.
 fn dashes(points: &[Point<Pixels>], out: &mut Vec<Segment>) {
-    let period = DASH + GAP;
-    // Where in the pattern the walk is: below `DASH` is inside a dash.
-    let mut phase = 0.;
+    let period = f64::from(DASH + GAP);
+    let dash = f64::from(DASH);
+    // Distance along the line where the current piece starts.
+    let mut start = 0f64;
     for pair in points.windows(2) {
         let (from, to) = (pair[0], pair[1]);
-        let (dx, dy) = (f32::from(to.x - from.x), f32::from(to.y - from.y));
+        let dx = f64::from(f32::from(to.x - from.x));
+        let dy = f64::from(f32::from(to.y - from.y));
         let length = (dx * dx + dy * dy).sqrt();
-        if length <= f32::EPSILON {
+        if !length.is_finite() {
+            return;
+        }
+        if length <= f64::from(f32::EPSILON) {
             continue;
         }
-        let along = |d: f32| point(from.x + px(dx * d / length), from.y + px(dy * d / length));
-        let mut walked = 0.;
-        while walked < length {
-            if phase < DASH {
-                let end = (walked + DASH - phase).min(length);
-                out.push((along(walked), along(end), Curve::Straight));
-                phase += end - walked;
-                walked = end;
-            } else {
-                let end = (walked + period - phase).min(length);
-                phase += end - walked;
-                walked = end;
-            }
-            if phase >= period {
-                phase -= period;
+        let end = start + length;
+        let first = (start / period).floor();
+        let last = (end / period).ceil();
+        if last - first > DASHES_PER_LINE as f64 {
+            out.push((from, to, Curve::Straight));
+            start = end;
+            continue;
+        }
+        let at = |s: f64| {
+            let d = (s - start) / length;
+            point(from.x + px((dx * d) as f32), from.y + px((dy * d) as f32))
+        };
+        for k in first as u64..last as u64 {
+            let on = (k as f64 * period).max(start);
+            let off = (k as f64 * period + dash).min(end);
+            if off > on {
+                out.push((at(on), at(off), Curve::Straight));
             }
         }
+        start = end;
     }
 }
 
@@ -965,5 +980,68 @@ mod tests {
         assert_eq!(curve.first(), Some(&point(px(0.), px(0.))));
         assert_eq!(curve.last(), Some(&point(px(100.), px(0.))));
         assert!(curve.len() > 4);
+    }
+
+    /// The canvas froze, its memory growing without end, when a dotted line's walk stopped
+    /// advancing: at the second bend of this line the step left in the dash fell below the
+    /// f32 resolution of the distance walked (found by emulating the old walk's f32 steps;
+    /// common on curves, which bend every few pixels). Every line now ends, with a dash count
+    /// set by its length.
+    #[test]
+    fn every_dotted_line_ends_with_dashes_set_by_its_length() {
+        let lines: Vec<Vec<Point<Pixels>>> = vec![
+            vec![
+                point(px(243.6), px(29.3)),
+                point(px(204.8), px(66.0)),
+                point(px(136.8), px(373.3)),
+            ],
+            flatten(
+                point(px(168.45694), px(355.29034)),
+                point(px(160.164), px(355.26978)),
+                Curve::Bowed(point(px(120.), px(300.))),
+            ),
+            flatten(
+                point(px(-300.), px(40.)),
+                point(px(900.), px(700.)),
+                Curve::Level(point(px(100.), px(40.)), point(px(500.), px(700.))),
+            ),
+        ];
+        for points in lines {
+            let length: f32 = points
+                .windows(2)
+                .map(|pair| {
+                    let (dx, dy) = (
+                        f32::from(pair[1].x - pair[0].x),
+                        f32::from(pair[1].y - pair[0].y),
+                    );
+                    (dx * dx + dy * dy).sqrt()
+                })
+                .sum();
+            let mut pieces = Vec::new();
+            dashes(&points, &mut pieces);
+            let most = (length / (DASH + GAP)).ceil() as usize + points.len();
+            assert!(
+                !pieces.is_empty() && pieces.len() <= most,
+                "{} dashes on {length} px",
+                pieces.len()
+            );
+            assert!(pieces.iter().all(|(a, b, _)| {
+                let (dx, dy) = (f32::from(b.x - a.x), f32::from(b.y - a.y));
+                (dx * dx + dy * dy).sqrt() <= DASH + 1e-3
+            }));
+        }
+        // A piece too long to cut is drawn whole; one that is not a number draws nothing.
+        let mut pieces = Vec::new();
+        dashes(
+            &[point(px(0.), px(0.)), point(px(1e7), px(0.))],
+            &mut pieces,
+        );
+        assert_eq!(pieces.len(), 1);
+        let mut pieces = Vec::new();
+        dashes(
+            &[point(px(0.), px(0.)), point(px(f32::INFINITY), px(0.))],
+            &mut pieces,
+        );
+        assert!(pieces.is_empty());
     }
 }

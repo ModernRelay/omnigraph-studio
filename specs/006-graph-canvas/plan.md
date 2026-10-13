@@ -63,7 +63,9 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   their "+K more", so they keep their places beside it; "+K more" is never placed alone.
   Reset layout (↺, R) forgets them all. A drag that starts on empty space pans.
 - **Drawing cost.** Dotted lines are cut into 2-on 3-off dashes by walking each line once, in
-  paths of at most 6,000 dashes; GPUI's own `dash_array` measured the batch's whole path every
+  paths of at most 6,000 dashes, each dash placed at a whole number of periods along the line
+  (in f64, stepped by an integer, so every walk ends; a straight piece of more than 100,000
+  dashes is drawn solid); GPUI's own `dash_array` measured the batch's whole path every
   frame and overflowed a path's 65k-vertex cap, which dropped the batch. A path that still
   overflows is painted in halves. Labels scale in half-pixel text steps while zooming, since
   GPUI keeps a shaped line for one frame only and a smooth zoom reshaped every label every
@@ -116,6 +118,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | 2026-10-12 | Errors and loading show in the canvas, not a blank view | snapshot `OpenNode` Person `nobody` then `OpenCanvas` | banner "No Person with key nobody at this commit." · Retry |
 | 2026-10-12 | Keys walk and focus | offscreen snapshot: Allen Labs expanded, → → `[` F Space | `[` returned to Allen Labs, F centred it, Space showed it in the inspector |
 | 2026-10-12 | Dotted lines, labels and scene building cost less | `graph_canvas` `a_dotted_line_is_cut_into_dashes_across_its_bends`; `graph_store` `only_answers_for_what_is_open_change_what_is_shown`; snapshot `measure:60` (debug) on Sammet Systems → WorksAt → Ada, whose closed relationships draw dotted | A frame after a workspace notify 3.2 → 1.6 ms; a full redraw 11.9 → 7.5 ms; the dotted lines look as before |
+| 2026-10-13 | Every dotted line ends | `graph_canvas` `every_dotted_line_ends_with_dashes_set_by_its_length` (a three-point line on which the old walk never ends, a curve from the frozen frame, a long cubic, a 10⁷ px piece, an infinite one); the snapshot example on Liskov Systems: mark all, Expand all, mark all, Expand all | Before: no frame after the second expansion, 13.8 GB resident and a 159 GB footprint, then killed (HEAD without this session's other changes behaved the same). After: exit 0, 166 MB resident, 220 MB footprint, eight people and two projects drawn with their relationships |
 | 2026-10-12 | A click expands a node; ⇧-click inspects | offscreen snapshots on Sammet Systems → WorksAt: one click on Ada Lovelace; ⇧-click on Hedy Turing | Ada's relationship pills appeared beside her; the inspector showed Hedy Turing, with nothing opened |
 | 2026-10-12 | Resting on a chip reads ahead what it opens | `graph_store` `prefetching_reads_what_opening_would_show_and_nothing_twice`; two offscreen runs each, differing only in where the pointer rests, counting the dev server's read log lines | Resting on the closed "← WorksAt 7" pill: 21 reads against 20 (its first page); resting on a person under it: 25 against 21 (one count per Person relationship) |
 | 2026-10-12 | Pills drag, areas mark, and chips have menus | `graph_canvas` tests (a pill's pin key round trips; an area marks the chips it touches, not unpainted ones); offscreen snapshots on Sammet Systems with the snapshot tool's `drag:…,shift` and `click:…,right`: WorksAt dragged up then the company down; an area over three people; right clicks on a marked person, on WorksAt and on a person | WorksAt stayed where dropped while Owns moved with its company; Edsger, Ada and Grace marked with rings; "3 selected · Expand all · Collapse all · Keep where they are · Clear selection"; "Close · Group by › · Open related table"; "Open · Expand ↵ · Explore from here · Open in table · Copy key" |
@@ -124,6 +127,14 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | 2026-10-12 | Query results as a canvas | `gq_language` `whole_node_columns_carry_their_type`; `query_editor` `node_columns_become_a_graph_of_distinct_nodes_linked_by_row`; snapshot of `return { $p, $c }` | The result offers Canvas; a results canvas draws each node once and links the nodes of a row; it is a tab of its own and is not restored |
 
 ## Corrections
+
+- **Dotted lines froze the canvas (2026-10-13).** The dash walk carried its place in the
+  pattern from piece to piece in f32. When the step left in a dash fell below the resolution
+  of the distance walked (phase 1.9999995 of 2 at 8.14 px into a piece), the walk stopped
+  advancing and pushed empty dashes until memory ran out: expanding 20 marked nodes reached a
+  159 GB footprint before the process was killed. Curves, which bend every few pixels, hit it
+  often (3 of the first 20 random three-point lines in an f32 emulation). Dashes are now
+  placed at whole periods along the line in f64; the same expansion peaks at 220 MB.
 
 - **Ontology layout (2026-10-12).** Types on a circle by name gave position no meaning: on a
   25-type, 78-relationship CRM ontology it drew 668 crossings. The ontology is now laid out by
