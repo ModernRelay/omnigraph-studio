@@ -284,6 +284,9 @@ impl Row {
 }
 
 const ROW_HEIGHT: f32 = 32.;
+/// Space above the first row and below the last. The list's height includes it, so the rows
+/// fit without scrolling and a selected row is never clipped by the edge.
+const LIST_PAD: f32 = 4.;
 const VISIBLE_ROWS: usize = 11;
 
 pub struct CommandPalette {
@@ -934,8 +937,10 @@ impl Render for CommandPalette {
                 cx.processor(|this, range, _window, cx| this.render_rows(range, cx)),
             )
             .track_scroll(&self.scroll)
-            .h(px(ROW_HEIGHT * count.min(VISIBLE_ROWS) as f32))
-            .py_1()
+            .h(px(
+                ROW_HEIGHT * count.min(VISIBLE_ROWS) as f32 + 2. * LIST_PAD
+            ))
+            .py(px(LIST_PAD))
             .into_any_element()
         };
         let description = self.selected_description();
