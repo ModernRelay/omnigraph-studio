@@ -11,6 +11,7 @@ mod pane;
 mod panels;
 mod persistence;
 
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -120,6 +121,9 @@ pub struct Workspace {
     right: Dock,
     bottom: Dock,
     modal: Option<ActiveModal>,
+    /// Each dock panel's scrolling host, by the panel view's entity: the host is cached, so a
+    /// panel is drawn again only when it notifies.
+    dock_hosts: HashMap<EntityId, Entity<DockHost>>,
     toasts: Vec<Toast>,
     next_toast: usize,
     actions: Vec<ActionRegistration>,
@@ -154,6 +158,31 @@ const TRAFFIC_LIGHTS_WIDTH: f32 = 76.;
 const TRAFFIC_LIGHTS_TOP: f32 = (STRIP_HEIGHT - 16.) / 2.;
 /// How many visited tabs ⌘[ remembers.
 const NAV_HISTORY: usize = 100;
+/// A dock panel inside a scrolling host of its own. The host is what is cached (a cached view
+/// needs a definite size, which a panel measured by its content lacks), as Zed caches each dock
+/// and pane: a panel that notifies marks its host dirty and is drawn again; otherwise the frame
+/// replays it.
+struct DockHost {
+    view: AnyView,
+}
+
+impl Render for DockHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("dock-host")
+            .size_full()
+            .pb_2()
+            .overflow_y_scroll()
+            .child(self.view.clone())
+    }
+}
+
+/// The layout of a cached view that fills its area. Caching needs a definite size: the view
+/// is laid out from this style, not measured from its contents.
+fn cached_fill() -> gpui::StyleRefinement {
+    gpui::StyleRefinement::default().v_flex().size_full()
+}
+
 /// The id of the right dock's inspector panel.
 const INSPECTOR_PANEL: &str = "inspector";
 
@@ -200,6 +229,7 @@ impl Workspace {
             right: Dock::new(PanelPosition::Right, true),
             bottom: Dock::new(PanelPosition::Bottom, false),
             modal: None,
+            dock_hosts: HashMap::new(),
             toasts: Vec::new(),
             next_toast: 0,
             actions: Vec::new(),
@@ -1063,6 +1093,7 @@ impl Workspace {
         view: AnyView,
         cx: &mut Context<Self>,
     ) {
+        self.host_for(&view, cx);
         self.dock_mut(position).insert(PanelEntry {
             id: id.into(),
             title: title.into(),
@@ -1071,6 +1102,29 @@ impl Workspace {
             actions: None,
         });
         cx.notify();
+    }
+
+    /// Makes sure a dock panel has its cached host, dropping hosts of panels gone from the
+    /// docks.
+    fn host_for(&mut self, view: &AnyView, cx: &mut Context<Self>) {
+        let live: HashSet<EntityId> = [&self.left, &self.right, &self.bottom]
+            .iter()
+            .flat_map(|dock| dock.panels.iter().map(|panel| panel.view.entity_id()))
+            .chain([view.entity_id()])
+            .collect();
+        self.dock_hosts.retain(|id, _| live.contains(id));
+        let view = view.clone();
+        self.dock_hosts
+            .entry(view.entity_id())
+            .or_insert_with(|| cx.new(|_| DockHost { view }));
+    }
+
+    /// A dock panel's view, cached inside its scrolling host.
+    fn hosted(&self, view: &AnyView) -> AnyElement {
+        match self.dock_hosts.get(&view.entity_id()) {
+            Some(host) => host.clone().cached(cached_fill()).into_any_element(),
+            None => view.clone().into_any_element(),
+        }
     }
 
     /// Puts small buttons on the right of a panel's title line.
@@ -1097,6 +1151,7 @@ impl Workspace {
     pub fn set_inspector(&mut self, view: Option<AnyView>, cx: &mut Context<Self>) {
         match view {
             Some(view) => {
+                self.host_for(&view, cx);
                 self.right.insert(PanelEntry {
                     id: INSPECTOR_PANEL.into(),
                     title: "Inspector".into(),
@@ -1366,21 +1421,21 @@ impl Workspace {
                         )
                     }),
             );
-        let body = v_flex()
-            .id("sidebar-panel")
-            .flex_1()
-            .min_h_0()
-            .pb_2()
-            .overflow_y_scroll()
-            .children(self.left.active_panel().map(|panel| {
-                v_flex()
-                    .w_full()
-                    .child(studio_ui::ds::section_header(
-                        panel.title.clone(),
-                        panel.actions.clone().map(IntoElement::into_any_element),
-                    ))
-                    .child(panel.view.clone())
-            }));
+        // The panel's title stays put; its content scrolls in its cached host.
+        let body =
+            v_flex()
+                .id("sidebar-panel")
+                .flex_1()
+                .min_h_0()
+                .children(self.left.active_panel().map(|panel| {
+                    v_flex()
+                        .size_full()
+                        .child(studio_ui::ds::section_header(
+                            panel.title.clone(),
+                            panel.actions.clone().map(IntoElement::into_any_element),
+                        ))
+                        .child(div().flex_1().min_h_0().child(self.hosted(&panel.view)))
+                }));
         let glass = studio_ui::ds::is_glass(cx);
         let column = if glass {
             studio_ui::ds::sheet(cx)
@@ -1766,11 +1821,13 @@ impl Workspace {
     /// pane.
     fn render_pane(&self, pane_id: PaneId, cx: &mut Context<Self>) -> AnyElement {
         let body = match self.pane(pane_id).and_then(|pane| pane.active_item()) {
+            // Cached, as Zed caches each pane: the tab's view is drawn again only when it
+            // notifies, so a hover or a toast elsewhere replays it from the last frame.
             Some(item) => div()
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()
-                .child(item.to_any())
+                .child(item.to_any().cached(cached_fill()))
                 .into_any_element(),
             None if self.panes.len() == 1 => self.render_empty_center(cx).into_any_element(),
             None => studio_ui::ds::empty_state(IconName::Sparkle, "No tab open").into_any_element(),
@@ -2081,10 +2138,11 @@ impl Workspace {
                                 ),
                         )
                         .child(
-                            div()
-                                .flex_1()
-                                .min_h_0()
-                                .children(self.bottom.active_panel().map(|p| p.view.clone())),
+                            div().flex_1().min_h_0().children(
+                                self.bottom
+                                    .active_panel()
+                                    .map(|p| p.view.clone().cached(cached_fill())),
+                            ),
                         )
                         .child(resize_handle(PanelPosition::Bottom)),
                 )
@@ -2161,7 +2219,7 @@ impl Workspace {
         if !self.right.visible() {
             return None;
         }
-        let panel = self.right.active_panel()?.view.clone();
+        let panel = self.hosted(&self.right.active_panel()?.view);
         let colors = cx.theme().colors();
         let editor_background = colors.editor_background;
         let hairline = studio_ui::ds::surface::rule(cx);
@@ -2198,14 +2256,7 @@ impl Workspace {
                                 }),
                         ),
                 )
-                .child(
-                    div()
-                        .id("right-dock-panel")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .child(panel),
-                ),
+                .child(div().flex_1().min_h_0().child(panel)),
         )
     }
 

@@ -77,6 +77,17 @@ another window opens. Quitting keeps every window. A new window (⌘⇧N) asks f
 opens where the last moved window was. A `session.json` from before held one window's graphs
 and is read as one window.
 
+### Drawing cost
+
+GPUI rebuilds the whole window on every frame that draws, except views marked cached (Zed caches
+each pane and dock). Studio caches the same places: each tab's view, and each dock panel inside
+a scrolling host of its own (a cached view needs a definite size, which a panel measured by its
+content lacks; the host has one and scrolls the panel). A cached view is drawn again only when it
+or a view inside it notifies, or when a setting changes (which redraws every window); otherwise
+the frame replays it. A hover, a toast or an agent's streamed reply therefore redraws only what
+changed. The left panel's title stays put above its scrolling content. The snapshot example's
+`measure:<n>[,refresh]` step times frames after notifying the workspace, or redrawing all.
+
 ### Window chrome
 
 - Transparent title bar with traffic lights; the title area shows
@@ -275,6 +286,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-12 | Two graphs in one window | a second dev graph `notes` (`dev/cluster/notes.pg`, `dev/notes-seed.jsonl`); offscreen snapshots: Person and a query on `knowledge`, Open Graph, `click:` on `notes`, a Note table split in two, the switcher; then ⌃⌘] | The switcher listed both with `notes` checked and "+1 graph" in the footer; stepping back showed `knowledge` with its Person tab and the query draft |
 | 2026-10-12 | Palette scopes and Ask | offscreen snapshots with the new `key:` step: All for "pro", Nodes for "ada", ⌘4 with two query tabs, then Tab on "who knows ada" | Types, nodes and commands under All; five Adas under Nodes; both query tabs under Queries; Tab opened the agent tab with the question waiting. A Tab bound under `CommandPalette` alone lost to a binding at the editor level |
 | 2026-10-12 | Every tab kind comes back after a restart | offscreen snapshots: one run opened a type table, a query with a draft, history, canvas and storage; a second run with `OMNIGRAPH_STUDIO_NO_RESTORE=0` | All five tabs restored in order, the draft intact; the workspace file is `-rw-------` |
+| 2026-10-12 | Cached tabs and docks: a frame redraws only what changed | snapshot example `measure:60` (debug build) on Sammet Systems → WorksAt → Ada open on the canvas, the Explore tree and the inspector showing | Before: 9.6 ms a frame after a workspace notify, the same as a full redraw (nothing was reused). Tabs cached: 8.7 ms. Docks hosted and cached too: 3.2 ms. A full redraw (`refresh`, for a settings change) is 11.9 ms. The docks alone had cost about 7 ms a frame (the inspector 3.4, the tree 1.7) |
 | 2026-10-12 | Every window comes back | `persistence` tests (the older one-window file, opening order, a closed window forgotten, the last one kept until another opens; a GPUI test removing one of two windows); the debug binary with a separate data directory and a `session.json` of three windows, one on an unknown server | Two windows opened at their saved bounds, the third dropped, and the unknown server's graph left out of the other; an older file was rewritten in the new shape on the first start |
 
 ## Corrections

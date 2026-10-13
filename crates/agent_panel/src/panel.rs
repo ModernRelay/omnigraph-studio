@@ -783,6 +783,15 @@ impl AgentPanel {
                 }));
             }
             HostEvent::TurnEnded { stop } => {
+                // A tool still shown running when the turn ends is not running: the turn
+                // finished it, or stopping, failing or leaving cut it short. Either way its
+                // spinner stops, so an idle thread never animates.
+                let finished = matches!(stop, Ok(StopReason::EndTurn));
+                self.settle_open_tools(if finished {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::Failed
+                });
                 if let State::Prompting { agent } = &self.state {
                     self.state = State::Ready {
                         agent: agent.clone(),
@@ -821,12 +830,24 @@ impl AgentPanel {
                 failed,
             } => {
                 self.stop_host();
+                self.settle_open_tools(ToolCallStatus::Failed);
                 self.failed = failed;
                 self.state = State::Exited { message, stderr };
             }
         }
         self.scroll.scroll_to_bottom();
         cx.notify();
+    }
+
+    /// Gives every tool still pending or running the status it ended with.
+    fn settle_open_tools(&mut self, ended: ToolCallStatus) {
+        for entry in &mut self.entries {
+            if let Entry::Tool { status, .. } = entry
+                && matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress)
+            {
+                *status = ended;
+            }
+        }
     }
 
     fn apply_update(&mut self, update: SessionUpdate, cx: &mut Context<Self>) {

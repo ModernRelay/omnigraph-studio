@@ -319,6 +319,10 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 
 ## Corrections
 
+- 2026-10-12 · A tool call the agent never closed kept its spinner turning after the turn
+  ended, which redrew the window at the display's rate while idle. When a turn ends, tools still
+  shown pending or running take Completed (the turn finished) or Failed (it was stopped, failed
+  or the agent left); when the agent exits, Failed.
 - The socket first lived in `<data dir>/agent/`. With a long data directory the path exceeded
   macOS's 104-byte limit and binding failed ("path must be shorter than SUN_LEN"). It now lives
   in the per-user runtime directory described above, with a length check that fails with a

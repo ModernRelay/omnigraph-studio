@@ -12,7 +12,8 @@
 //! added and `,right` for the secondary button; `hover:<x>,<y>` moves the pointer there and rests; `key:<keystroke>` presses keys as the keymap sees them (`key:tab`, `key:cmd-4`);
 //! `drag:<x1>,<y1>,<x2>,<y2>` presses at
 //! the first point, moves to the second in steps, and releases (`,shift` or `,cmd` held); `wait:<ms>` lets that long pass
-//! (for a write from outside to land between steps). `SNAPSHOT_WAIT_MS` (default 1500) is how
+//! (for a write from outside to land between steps); `measure:<n>[,refresh]` draws n frames
+//! after notifying the workspace (or redrawing everything) and prints their times. `SNAPSHOT_WAIT_MS` (default 1500) is how
 //! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
 //! 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`.
 
@@ -170,6 +171,41 @@ fn main() {
     settle(&mut cx, wait);
 
     for spec in actions {
+        // `measure:<n>` draws n frames, each after the workspace (the window's root view) is
+        // notified, as a toast or a hover in the frame would, and prints the draw times;
+        // `measure:<n>,refresh` redraws everything each time, cached views included.
+        if let Some(rest) = spec.strip_prefix("measure:") {
+            let mut parts = rest.split(',').map(str::trim);
+            let frames: usize = parts
+                .next()
+                .and_then(|n| n.parse().ok())
+                .expect("measure:<frames>");
+            let refresh = parts.any(|part| part == "refresh");
+            let mut times = Vec::with_capacity(frames);
+            for _ in 0..frames {
+                cx.update_window(handle, |root, window, cx| {
+                    if refresh {
+                        window.refresh();
+                    } else {
+                        cx.notify(root.entity_id());
+                    }
+                    let start = Instant::now();
+                    window.draw(cx).clear(cx);
+                    times.push(start.elapsed());
+                })
+                .expect("draw a frame");
+            }
+            times.sort();
+            let at = |q: f32| times[((times.len() - 1) as f32 * q) as usize];
+            eprintln!(
+                "measure{}: {frames} frames, median {:.2?}, p90 {:.2?}, max {:.2?}",
+                if refresh { " (refresh)" } else { "" },
+                at(0.5),
+                at(0.9),
+                at(1.)
+            );
+            continue;
+        }
         if let Some(ms) = spec.strip_prefix("wait:") {
             settle(
                 &mut cx,
