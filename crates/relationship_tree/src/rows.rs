@@ -65,10 +65,10 @@ pub fn row_text(entry: &Entry, state: &ExploreState) -> String {
                 .unwrap_or_default()
         ),
         EntryKind::Group { key, .. } => format!("{} {}", key.group.edge, key.group.other_type),
-        EntryKind::Bucket { key, .. } => key
-            .within
-            .as_ref()
-            .map(|within| bucket_text(&within.value))
+        EntryKind::Bucket { key, .. } => state
+            .bucket_label(key)
+            .map(str::to_owned)
+            .or_else(|| key.within.as_ref().map(|within| bucket_text(&within.value)))
             .unwrap_or_default(),
         EntryKind::OtherValues { .. }
         | EntryKind::More { .. }

@@ -759,12 +759,17 @@ impl RelationshipTree {
                             .color(Color::Muted)
                             .single_line(),
                     )
-                    .child(type_swatch(&key.group.other_type))
+                    // The target's dot, as on a neighbour row; none when there is no target.
+                    .when(target.is_some(), |row| {
+                        row.child(studio_ui::ds::type_dot(&key.group.other_type))
+                    })
                     .child(
-                        div()
-                            .min_w_0()
-                            .flex_shrink(1.)
-                            .child(Label::new(value).size(LabelSize::Small).truncate()),
+                        div().min_w_0().flex_shrink(1.).child(
+                            Label::new(value)
+                                .size(LabelSize::Small)
+                                .when(target.is_none(), |label| label.color(Color::Muted))
+                                .truncate(),
+                        ),
                     )
                     .into_any_element()
             }
@@ -788,7 +793,7 @@ impl RelationshipTree {
                 let grouped_by = exploration
                     .read(cx)
                     .grouping(&key.group)
-                    .map(|by| by.property.clone());
+                    .map(GroupBy::label);
                 let group_menu = (!empty)
                     .then(|| self.group_by_menu(row, entry, &key.group, sticky, selected, cx))
                     .flatten();
@@ -838,7 +843,30 @@ impl RelationshipTree {
             EntryKind::Bucket { key, count, .. } => {
                 let value = key.within.as_ref().map(|within| &within.value);
                 let missing = value.is_none_or(|value| value.is_null());
-                let text = value.map(rows::bucket_text).unwrap_or_default();
+                // By a relationship of the neighbours: the related node's label, or "No
+                // Company" for the neighbours related to none.
+                let other = key
+                    .within
+                    .as_ref()
+                    .filter(|within| within.by.on == GroupOn::Relationship)
+                    .and_then(|within| {
+                        let schema = exploration.read(cx).schema(cx)?;
+                        let (direction, edge) =
+                            gq_language::builder::parse_relationship_key(&within.by.property)?;
+                        let edge = schema.edge(edge)?;
+                        Some(match direction {
+                            gq_language::Direction::Outgoing => edge.to.clone(),
+                            gq_language::Direction::Incoming => edge.from.clone(),
+                        })
+                    });
+                let text = match (&other, missing) {
+                    (Some(other), true) => format!("No {other}"),
+                    _ => state
+                        .bucket_label(key)
+                        .map(str::to_owned)
+                        .or_else(|| value.map(rows::bucket_text))
+                        .unwrap_or_default(),
+                };
                 h_flex()
                     .min_w_0()
                     .flex_1()
@@ -1051,8 +1079,8 @@ impl RelationshipTree {
             row,
         );
         let tooltip = match &current {
-            Some(by) => format!("Grouped by {}", by.property),
-            None => "Group by a property".to_owned(),
+            Some(by) => format!("Grouped by {}", by.label()),
+            None => "Group by a property or a relationship".to_owned(),
         };
         let menu = PopoverMenu::new(SharedString::from(format!("{}-{row}", id.0)))
             .trigger(
@@ -1096,6 +1124,10 @@ impl RelationshipTree {
                     for (on, title) in [
                         (GroupOn::Node, group.other_type.clone()),
                         (GroupOn::Edge, group.edge.clone()),
+                        (
+                            GroupOn::Relationship,
+                            format!("{}'s relationships", group.other_type),
+                        ),
                     ] {
                         let section: Vec<&GroupBy> =
                             choices.iter().filter(|by| by.on == on).collect();
@@ -1105,7 +1137,7 @@ impl RelationshipTree {
                         menu = menu.separator().header(title);
                         for by in section {
                             menu = menu.toggleable_entry(
-                                by.property.clone(),
+                                by.label(),
                                 current.as_ref() == Some(by),
                                 IconPosition::Start,
                                 None,

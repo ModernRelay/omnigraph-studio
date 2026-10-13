@@ -74,6 +74,15 @@ on the canvas. Typing filters the visible rows.
   belongs to the relationship (edge, direction, other type), so it applies wherever that
   relationship appears in the tree, survives re-rooting, and ends from the same menu. The canvas
   draws a grouped relationship as its hub, with the open values' neighbours on it.
+- The menu also groups by a relationship of the other type ("people Ada knows, by company"):
+  its last section, "Person's relationships", lists them as `worksAt →`. One read counts the
+  neighbours per node at the other end (`return { $v.@id as value, $v.name as label, count($m)
+  as n }` over the two hops), and a second, at the same commit, counts the neighbours with none
+  (`builder::neighbours_without`). Each value reads as its node's label; the neighbours with none
+  read "No Company", last, and only when there are any. A value opens to its neighbours narrowed
+  with `exists { $v: Company  $m worksAt $v  $v.@id = $value }`, or `not { … }` for none. A
+  neighbour related to two values is under both, so the values' counts can add up to more than
+  the group's.
 - The whole tree reads one commit; when the branch moves, "Newer data · Refresh" appears.
 
 ### Rendering and state
@@ -100,8 +109,8 @@ on the canvas. Typing filters the visible rows.
 
 - Engine change E16 (neighbourhood counts per node), [spec 012](../012-omnigraph-engine-changes/plan.md). Until then, one count query per
   edge type, run concurrently and cached for the pinned commit.
-- Grouping by a relationship of the neighbour ("people by the company they work at"), which needs
-  a two-hop grouped count; grouping by floats and datetimes, which need buckets.
+- Grouping by floats and datetimes, which need buckets: GQ 2.1 has no function that truncates a
+  date or rounds a number, so each bucket would be a read of its own.
 - Showing the same model as columns in wide windows (node | relationships | nodes | …): the
   tree lives in a fixed-width dock panel, and the canvas covers the wide view.
 
@@ -126,6 +135,8 @@ on the canvas. Typing filters the visible rows.
 | 2026-10-12 | Group by: values with counts, a value opens to its neighbours, "No value" last; ending it closes the values and keeps the selection on the group | `gq_language` `neighbours_group_by_a_property_of_either_end_and_narrow_to_one_value` (every choice of every dev relationship compiles, with and without a value); `graph_store` `a_grouped_relationship_lists_its_values_and_each_opens_to_its_neighbours`; offscreen snapshots: Sammet Systems → ← WorksAt → group-by menu → title, then the canvas | Menu: No grouping, Person (name, title, email, born), WorksAt (role, since). Rows: Engineer 2, Designer 1, Manager 1, Researcher 1, No value 2; Engineer and Designer opened to their people; the canvas hub showed the three open people and "+4 more" |
 | 2026-10-12 | Hover cards with every edge property | `relationship_tree` `labels_read_well` (`edge_value`); offscreen snapshot: `OpenNode` person-000000, WorksAt opened, hover on Allen Labs | The card read "Allen Labs · Company", `company-00002`, then "→ WorksAt" with role lead and since 2000-06-09, names aligned |
 | 2026-10-12 | "Newer data · Refresh" after Studio's own write | offscreen snapshot on the scratch branch `drafts-test`: `OpenNode` person-000000, a title edited in the Person table, then the Explore panel | The tree, pinned to its read, showed "Newer data · Refresh" above Radia Knuth |
+| 2026-10-13 | Grouping by a relationship of the neighbour | `gq_language` `neighbours_group_by_a_property_of_either_end_and_narrow_to_one_value` (every relationship choice of every dev relationship compiles: values, none-count, narrowing to a value and to none; a relationship of another type is refused); `graph_store` `neighbours_grouped_by_their_own_relationship_carry_labels_and_skip_an_empty_none`; offscreen snapshots: Radia Knuth's Knows by `worksAt →`, Allen Works opened, then Yukihiro Dijkstra's; the same reads on the dev server | Menu sections Person and "Person's relationships"; Radia's 4 people under 6 companies (two work at two), Allen Works opened to Leslie Dahl; Yukihiro's under Allen Works 1 and "No Company" 3, which opened to Frances Liskov, Tim Hopper and Claude Berners-Lee, as the server answers |
+| 2026-10-13 | At-most-one edges show as fields on their node | a scratch cluster from `dev/cluster` plus `edge ReportsTo: Person -> Person @card(0..1) { since: Date? }`, the dev seed and 170 `ReportsTo` edges, served by `script/dev-server` on another port; offscreen snapshots of `OpenNode` person-000006 and person-000003 | person-000006 read "reportsTo → Donald Dijkstra" (its manager, person-000001) with the type's dot, between the groups; person-000003, who reports to no one, read "reportsTo → —"; the incoming side stayed a group, "← ReportsTo 4" |
 
 ## Corrections
 
@@ -158,5 +169,6 @@ on the canvas. Typing filters the visible rows.
   propagates, so Explore shows and the tree reveals the node. A node row's hover card shows
   its label, type and key, then under the relationship that led to it (`→ WorksAt`) every
   property of that edge, one per line; a row shows only the first, when it fits.
-- **Not seen yet:** fields (at-most-one edges) are covered by unit tests only: the dev schema
-  has none.
+- **Fields seen:** the dev schema has no at-most-one edge, so fields were checked on a scratch
+  copy of it with `edge ReportsTo: Person -> Person @card(0..1)` (validation log). A field with
+  no target reads "—", muted, with no type mark.

@@ -1355,7 +1355,7 @@ impl GraphCanvas {
                             );
                             for by in &choices {
                                 menu = menu.toggleable_entry(
-                                    by.property.clone(),
+                                    by.label(),
                                     current.as_ref() == Some(by),
                                     IconPosition::Start,
                                     None,

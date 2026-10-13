@@ -17,7 +17,7 @@ use gpui::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, Global, Subscription, Task,
     WeakEntity,
 };
-use gq_language::builder::{GroupBy, Narrow};
+use gq_language::builder::{GroupBy, GroupOn, Narrow};
 use gq_language::{BuiltQuery, Direction, RelationshipGroup, SchemaModel, builder};
 use graph_client::ReadError;
 use graph_client::api::ReadOutput;
@@ -216,6 +216,8 @@ impl GroupKey {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Buckets {
     pub values: Vec<(BucketValue, u64)>,
+    /// Grouped by a relationship, each value's node label, when its type has one.
+    pub labels: HashMap<BucketValue, String>,
     /// Every value was read; otherwise only the most common ones were.
     pub complete: bool,
 }
@@ -398,6 +400,19 @@ impl ExploreState {
 
     pub fn label(&self, node: &NodeRef) -> Option<&str> {
         self.labels.get(node).and_then(|label| label.as_deref())
+    }
+
+    /// A bucket's label: grouped by a relationship, the name of the node it stands for.
+    pub fn bucket_label(&self, key: &GroupKey) -> Option<&str> {
+        let within = key.within.as_ref()?;
+        let group = GroupKey {
+            within: None,
+            ..key.clone()
+        };
+        match self.values.get(&(group, within.by.clone()))? {
+            Loadable::Loaded(buckets) => buckets.labels.get(&within.value).map(String::as_str),
+            _ => None,
+        }
     }
 
     pub fn is_expanded(&self, path: &ExplorePath) -> bool {
@@ -982,22 +997,40 @@ impl ExploreState {
     /// Applies the answer to a values read, most common first and neighbours without a value
     /// last. Each value's count is its neighbour list's count.
     pub fn apply_values(&mut self, key: GroupKey, by: GroupBy, output: &ReadOutput, limit: u32) {
+        let mut labels = HashMap::new();
         let mut values: Vec<(BucketValue, u64)> = rows(output)
             .iter()
             .map(|row| {
                 let value = row.get("value").cloned().unwrap_or(Value::Null);
                 let n = row.get("n").and_then(Value::as_u64).unwrap_or(0);
-                (BucketValue::new(&value), n)
+                let value = BucketValue::new(&value);
+                if let Some(label) = row.get("label").and_then(Value::as_str) {
+                    labels.insert(value.clone(), label.to_owned());
+                }
+                (value, n)
             })
+            .filter(|(value, n)| !value.is_null() || *n > 0)
             .collect();
         values.sort_by_key(|(value, _)| value.is_null());
         for (value, n) in &values {
             self.counts
                 .insert(key.with_value(&by, value), Loadable::Loaded(*n));
         }
-        let complete = (values.len() as u32) < limit;
-        self.values
-            .insert((key, by), Loadable::Loaded(Buckets { values, complete }));
+        // The rows the grouped read returned under its limit: by a relationship, the count of
+        // neighbours with none came from a read of its own.
+        let read = rows(output)
+            .iter()
+            .filter(|row| by.on != GroupOn::Relationship || row.get("value").is_some())
+            .count();
+        let complete = (read as u32) < limit;
+        self.values.insert(
+            (key, by),
+            Loadable::Loaded(Buckets {
+                values,
+                labels,
+                complete,
+            }),
+        );
     }
 
     /// Appends one page of neighbours.
@@ -1465,14 +1498,32 @@ impl Exploration {
                 self.state
                     .values
                     .insert((key.clone(), by.clone()), Loadable::Loading);
-                builder::neighbour_values(
+                let values = builder::neighbour_values(
                     &schema,
                     &key.node.type_name,
                     &key.group,
                     &key.node.id,
                     by,
                     VALUES_LIMIT,
-                )
+                );
+                // By a relationship, the neighbours with none are counted by a second read.
+                if by.on == GroupOn::Relationship {
+                    let without = builder::neighbours_without(
+                        &schema,
+                        &key.node.type_name,
+                        &key.group,
+                        &key.node.id,
+                        by,
+                    );
+                    match values.and_then(|values| Ok((values, without?))) {
+                        Ok((values, without)) => {
+                            self.spawn_read_with(target, values, Some(without), cx)
+                        }
+                        Err(error) => self.apply_failure(&target, error.to_string()),
+                    }
+                    return;
+                }
+                values
             }
         };
         match query {
@@ -1482,14 +1533,48 @@ impl Exploration {
     }
 
     fn spawn_read(&mut self, target: LoadTarget, query: BuiltQuery, cx: &mut Context<Self>) {
+        self.spawn_read_with(target, query, None, cx);
+    }
+
+    /// Reads `query`, and then `without` at the same commit: the count of a relationship
+    /// grouping's neighbours with none, added to the values as their "no value" bucket.
+    fn spawn_read_with(
+        &mut self,
+        target: LoadTarget,
+        query: BuiltQuery,
+        without: Option<BuiltQuery>,
+        cx: &mut Context<Self>,
+    ) {
         let snapshot = self.pin.clone();
         let generation = self.generation;
         let read = self
             .session
-            .update(cx, |session, cx| session.read(&query, snapshot, cx));
+            .update(cx, |session, cx| session.read(&query, snapshot.clone(), cx));
         let key = target.clone();
+        let session = self.session.downgrade();
         let task = cx.spawn(async move |this, cx| {
-            let result = read.await;
+            let mut result = read.await;
+            if let (Some(without), Ok(output)) = (without, &result) {
+                let commit = snapshot.or_else(|| output.graph_commit_id.clone());
+                let Ok(read) = session.update(cx, |session, cx| session.read(&without, commit, cx))
+                else {
+                    return;
+                };
+                result = match (result, read.await) {
+                    (Ok(mut output), Ok(none)) => {
+                        let n = rows(&none)
+                            .first()
+                            .and_then(|row| row.get("n"))
+                            .cloned()
+                            .unwrap_or(Value::from(0));
+                        if let Value::Array(rows) = &mut output.rows {
+                            rows.push(serde_json::json!({ "n": n }));
+                        }
+                        Ok(output)
+                    }
+                    (_, Err(error)) | (Err(error), _) => Err(error),
+                };
+            }
             this.update(cx, |this, cx| {
                 if this.generation != generation {
                     return;
@@ -1801,6 +1886,59 @@ mod tests {
                 ..Default::default()
             }
             .has_more(Some(3))
+        );
+    }
+
+    #[test]
+    fn neighbours_grouped_by_their_own_relationship_carry_labels_and_skip_an_empty_none() {
+        let schema = schema();
+        let mut state = loaded_root(&schema);
+        let knows = group(&schema, "Person", "Knows", Direction::Outgoing);
+        let key = GroupKey::new(person("ada"), knows.clone());
+        let by = GroupBy {
+            on: GroupOn::Relationship,
+            property: "out:WorksAt".into(),
+        };
+        state.apply_count(key.clone(), &output(&["n"], json!([{"n": 4}])));
+        state.set_grouping(&knows, Some(by.clone()));
+        state.expand(&ExplorePath::root().child_group(&knows));
+        // The grouped read, then the count of neighbours with no company, added last.
+        state.apply_values(
+            key.clone(),
+            by.clone(),
+            &output(
+                &["value", "label", "n"],
+                json!([{"value": "acme", "label": "Acme", "n": 3}, {"n": 1}]),
+            ),
+            2,
+        );
+        let acme = BucketValue::new(&json!("acme"));
+        assert_eq!(
+            state.bucket_label(&key.with_value(&by, &acme)),
+            Some("Acme")
+        );
+        let none = BucketValue::new(&Value::Null);
+        assert_eq!(state.bucket_label(&key.with_value(&by, &none)), None);
+        let shown = kinds(&state.entries(&schema));
+        assert!(shown.contains(&"    value null 1".to_owned()), "{shown:?}");
+        assert!(
+            !shown.iter().any(|row| row.starts_with("    other")),
+            "one value under a limit of two is all of them: {shown:?}"
+        );
+
+        state.apply_values(
+            key.clone(),
+            by.clone(),
+            &output(
+                &["value", "label", "n"],
+                json!([{"value": "acme", "label": "Acme", "n": 4}, {"n": 0}]),
+            ),
+            2,
+        );
+        let shown = kinds(&state.entries(&schema));
+        assert!(
+            !shown.iter().any(|row| row.contains("value null")),
+            "no bucket for no neighbours: {shown:?}"
         );
     }
 
