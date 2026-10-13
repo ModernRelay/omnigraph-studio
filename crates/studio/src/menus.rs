@@ -10,9 +10,9 @@ use studio_actions::graph::{
 use studio_actions::query::{Save, SaveAs};
 use studio_actions::workspace::{
     ActivateNextPane, ActivatePreviousPane, CloseActiveItem, CloseAllItems, CloseOtherItems,
-    GoBack, GoForward, GoTo, NewWindow, OpenGraph, OpenSettings, Quit, Refresh, ShowKeyBindings,
-    SplitDown, SplitRight, SwitchBranch, ToggleActivity, ToggleCommandPalette, ToggleInspector,
-    TogglePinTab, ToggleSidebar,
+    GoBack, GoForward, GoTo, NewWindow, OpenGraph, OpenSettings, Quit, Refresh, RevealLog,
+    ShowKeyBindings, SplitDown, SplitRight, SwitchBranch, ToggleActivity, ToggleCommandPalette,
+    ToggleInspector, TogglePinTab, ToggleSidebar,
 };
 
 pub fn set(cx: &mut App) {
@@ -83,6 +83,9 @@ pub fn set(cx: &mut App) {
             MenuItem::action("Review Branch", ReviewBranch),
             MenuItem::action("Merge Branch…", MergeBranch),
         ]),
-        Menu::new("Help").items([MenuItem::action("Keyboard Shortcuts", ShowKeyBindings)]),
+        Menu::new("Help").items([
+            MenuItem::action("Keyboard Shortcuts", ShowKeyBindings),
+            MenuItem::action("Reveal Log File", RevealLog),
+        ]),
     ]);
 }

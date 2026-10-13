@@ -21,6 +21,7 @@ fn main() {
         return;
     }
 
+    studio::logging::init();
     let app = gpui_platform::application().with_assets(studio_theme::Assets);
     // `omnigraph-studio://` links arrive outside the app's context, at a start or later; each
     // is passed on to the app, which opens it.

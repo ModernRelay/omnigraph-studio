@@ -23,6 +23,8 @@ runtime-shaders = ["gpui_platform/runtime_shaders"]
 
 [dependencies]
 serde_json = { workspace = true }
+log = { workspace = true }
+zlog = { workspace = true }
 gpui = { workspace = true }
 ui = { workspace = true }
 theme = { workspace = true }

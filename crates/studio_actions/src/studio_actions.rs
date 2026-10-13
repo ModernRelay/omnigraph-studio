@@ -23,6 +23,8 @@ pub mod workspace {
             NewWindow,
             /// Show the keyboard shortcuts.
             ShowKeyBindings,
+            /// Show Studio's log file in the file manager.
+            RevealLog,
             /// Go back to the previous location.
             GoBack,
             /// Go forward to the next location.

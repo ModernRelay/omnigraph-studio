@@ -5,6 +5,7 @@ mod activity;
 pub mod deep_link;
 mod design_gallery;
 mod keymaps;
+pub mod logging;
 mod menus;
 mod open_graph;
 mod settings_view;
@@ -14,7 +15,7 @@ use gpui::{
     point, px, size,
 };
 use graph_store::{ConnectionRegistry, ConnectionState, open_session};
-use studio_actions::workspace::{NewWindow, OpenGraph, OpenLink, OpenSettings, Quit};
+use studio_actions::workspace::{NewWindow, OpenGraph, OpenLink, OpenSettings, Quit, RevealLog};
 use studio_workspace::{SavedWindow, ToastKind, Workspace};
 
 pub use open_graph::OpenGraphModal;
@@ -50,6 +51,17 @@ pub fn init(cx: &mut App) {
         open_settings(workspace, window, cx);
     });
     cx.on_action(|_: &Quit, cx| cx.quit());
+    // The file when it exists; a run from a terminal logs to its output, so then the folder.
+    cx.on_action(|_: &RevealLog, cx| {
+        let file = logging::log_file();
+        if file.exists() {
+            cx.reveal_path(&file);
+        } else if let Some(dir) = file.parent()
+            && std::fs::create_dir_all(dir).is_ok()
+        {
+            cx.open_with_system(dir);
+        }
+    });
     // Deferred: an action reaches here while its window is held for dispatch, and opening the
     // link updates that window.
     cx.on_action(|action: &OpenLink, cx| {

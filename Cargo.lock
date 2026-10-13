@@ -9779,6 +9779,7 @@ dependencies = [
  "history",
  "image",
  "inspectors",
+ "log",
  "menu",
  "query_editor",
  "relationship_tree",
@@ -9796,6 +9797,7 @@ dependencies = [
  "type_table",
  "ui",
  "url",
+ "zlog",
 ]
 
 [[package]]
