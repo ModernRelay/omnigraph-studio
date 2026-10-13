@@ -12,8 +12,9 @@ use agent_client_protocol::schema::v1::{
     SessionUpdate, StopReason, ToolCallStatus,
 };
 use editor::Editor;
-use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
+use futures::future::Shared;
+use futures::{FutureExt as _, StreamExt as _};
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, FollowMode,
     ListAlignment, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
@@ -413,6 +414,11 @@ pub struct AgentPanel {
     cli_ready: Option<bool>,
     /// `omnigraph_run` calls made while Studio looks, answered once it knows.
     cli_waiting: Vec<oneshot::Sender<()>>,
+    /// CLI runs whose outcome has not reached the agent yet, by run number. A run outlives the
+    /// call that started it when it takes longer than `RUN_ANSWER_WITHIN`; dropping it (a new
+    /// session) kills the command.
+    runs: std::collections::HashMap<u64, Shared<Task<(String, bool)>>>,
+    next_run: u64,
     /// The card of each write the gateway forwards, by the gateway's id: the entry, whether
     /// the write creates the agent's branch, and its summary.
     gateway_cards: std::collections::HashMap<u64, (usize, bool, String)>,
@@ -601,6 +607,8 @@ impl AgentPanel {
             queue: MessageQueue::default(),
             cli_ready: None,
             cli_waiting: Vec::new(),
+            runs: std::collections::HashMap::new(),
+            next_run: 1,
             gateway_cards: std::collections::HashMap::new(),
         };
         panel.sync_setup_state(cx);
@@ -707,6 +715,7 @@ impl AgentPanel {
         let (gateway_tx, mut gateway_rx) = mpsc::unbounded::<GatewayEvent>();
         self.cli_ready = None;
         self.cli_waiting.clear();
+        self.runs.clear();
         self.gateway_cards.clear();
         let gateway = Gateway::bind().and_then(|mut gateway| {
             let home = CliHome::write(
@@ -1438,6 +1447,9 @@ impl AgentPanel {
             Ok(ToolCall::Run { args, save_to }) => {
                 self.run_cli(&args, save_to.as_deref(), reply, cx);
             }
+            Ok(ToolCall::Wait { run }) => {
+                self.answer_run(run, reply, cx);
+            }
             Err(error) => {
                 reply.send((error, true)).ok();
             }
@@ -1663,9 +1675,45 @@ impl AgentPanel {
                 return;
             }
         };
-        cx.background_spawn(async move {
-            let answer = cli_home::run(&home, &cwd, args, save).await;
-            reply.send(answer).ok();
+        let run = self.next_run;
+        self.next_run += 1;
+        let task = cx
+            .background_spawn(async move { cli_home::run(&home, &cwd, args, save).await })
+            .shared();
+        self.runs.insert(run, task);
+        self.answer_run(run, reply, cx);
+    }
+
+    /// Answers with run `run`'s outcome once it finishes, or with its number if it is still
+    /// going after `RUN_ANSWER_WITHIN`, so the agent can wait for it again.
+    fn answer_run(
+        &mut self,
+        run: u64,
+        reply: oneshot::Sender<(String, bool)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task) = self.runs.get(&run).cloned() else {
+            reply
+                .send((
+                    format!(
+                        "There is no run {run} waiting in this conversation: its outcome was \
+                         already returned, or the conversation restarted."
+                    ),
+                    true,
+                ))
+                .ok();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            match cli_home::answer_within(task, cli_home::RUN_ANSWER_WITHIN).await {
+                Some(answer) => {
+                    this.update(cx, |this, _| this.runs.remove(&run)).ok();
+                    reply.send(answer).ok();
+                }
+                None => {
+                    reply.send(cli_home::still_running(run)).ok();
+                }
+            }
         })
         .detach();
     }

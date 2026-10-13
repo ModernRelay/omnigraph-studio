@@ -94,10 +94,10 @@ Agents (claude-agent-acp 0.89.1 with Claude Agent SDK 0.3.293; codex-acp 2.2.2 w
   When on, it can allow localhost only as all ports (`allowLocalBinding`).
 - codex-acp's default `agent` mode sends a workspace-write sandbox policy with
   `networkAccess: false` (`codex-acp/dist/index.js:34264-34319`), and Codex's seatbelt sandbox
-  then blocks loopback too (Validation log). Codex's shell-environment filter has default
-  exclude patterns `*KEY*`, `*SECRET*` and `*TOKEN*` (strings in the 0.160.1 binary). Whether
-  they apply by default inside a session was not verified, so the design assumes they do. Its
-  shell snapshot may rewrite PATH.
+  then blocks loopback too (Validation log). Codex's shell-environment filter is off by default
+  (`ignore_default_excludes = true`), so shell commands get the agent's whole environment. Its
+  stdio MCP servers run outside the sandbox with only a fixed set of variables plus the ACP
+  `env` entries. Its shell snapshot may rewrite PATH.
 - Both read `AGENTS.md` in the working directory. Claude reads it when there is no `CLAUDE.md`.
 
 ## Design
@@ -138,8 +138,8 @@ token = <32 random bytes as hex>
 `omnigraph` (`0700`) is a wrapper: it unsets every `OMNIGRAPH_TOKEN_*`,
 `OMNIGRAPH_BEARER_TOKEN`, `OMNIGRAPH_PROFILE` and `OMNIGRAPH_CONTROL_*`, sets `OMNIGRAPH_HOME` to
 the directory, puts `127.0.0.1,localhost` in `NO_PROXY`, and runs the chosen CLI. The agent runs
-it by absolute path, so neither Codex's environment filter (it may drop names like `*TOKEN*`)
-nor a shell snapshot that reorders PATH can change what the CLI reads.
+it by absolute path, so neither an environment filter nor a shell snapshot that reorders PATH
+can change what the CLI reads.
 
 The agent learns the path two ways: the conversation's MCP server adds it to its `initialize`
 instructions, and a new `omnigraph_cli` tool returns it with the branch, its base and the rules.
@@ -225,6 +225,10 @@ The same gateway, rules and cards apply, because the wrapper still speaks to the
 - Output over 100 KB is cut with a note to use `save_to`; standard output is bounded at 64 MiB,
   and a run at 30 minutes.
 - A call made before Studio has chosen a CLI waits for that choice instead of failing.
+- A call answers within four minutes. A command still running then (a large load, or a write
+  waiting for the person) answers with its run number and keeps going; `omnigraph_run` with
+  `wait` set to that number waits for its outcome, again for up to four minutes. A run's
+  outcome is returned once; a new session kills runs still going.
 
 Giving Codex network access (a codex-acp mode with network) lets its shell reach the gateway
 too, and opens all network, so it stays the person's choice. E24 would let the sandbox allow one
@@ -241,9 +245,12 @@ same write would split the cards and the rules.
 - The server's instructions reach the model; Claude Code keeps the first 2,048 characters, so the
   server's and the conversation's instructions together stay under that (tested with a long
   data directory).
-- A tool call that sends nothing for 30 minutes is aborted by Claude Code. A write held for
-  approval can wait that long, so Studio sends `notifications/progress` every 60 seconds while a
-  call runs, when the client gave a progress token.
+- Agents give up on a slow tool call without telling the server. Claude Code aborts a call that
+  sends nothing for 30 minutes, and progress resets that; Studio sends `notifications/progress`
+  every 60 seconds while a call runs, when the client gave a progress token. Codex abandons any
+  call after 300 seconds, ignores progress and sends no cancellation. An agent told its write
+  failed while Studio still holds it might write again, so `omnigraph_run` answers before
+  Codex's limit with a run number to wait on.
 - The thread shows an `omnigraph_run` call with an inline query as a query card titled by its
   subcommand ("Query", "Mutate"), and other calls as tool rows ("Run omnigraph").
 
@@ -254,8 +261,8 @@ same write would split the cards and the rules.
 | The agent uses the stock `omnigraph` CLI against a Studio gateway | A `studio` CLI of Studio's own; MCP tools only | One CLI for people and agents. The CLI already covers every served route; a second CLI would repeat its verbs. MCP tools cannot be composed |
 | Studio holds the person's token; the agent gets a session token for the gateway only | Give the agent the person's token; mint a server token for the agent | The person's token could write `main` and every branch. 0.13 cannot mint a narrower credential: credentials carry no grants, and branch scopes cannot name a branch (E20) |
 | The gateway classifies writes by structured fields and refuses what it cannot classify | Parse statement mutations with `gq_language` | Statement targets live in query text, `commit publish/drop` names no branch, and stored-query mutability is the server's. A second parser of the write language could drift from the engine's. Refusing keeps the gateway closed by default; the agent uses the structured commands instead |
-| Session token in a 0600 file | An environment variable | Codex's environment filter matches names like `*TOKEN*` |
-| A wrapper per conversation, run by absolute path | Environment variables and a PATH entry on the agent process; one `AGENTS.md` naming the command | The agent process and working directory are shared by the graph's conversations, so per-conversation values cannot live there. Codex's shell snapshot may reorder PATH and its filter may drop `*TOKEN*` names |
+| Session token in a 0600 file | An environment variable | The agent process is shared by the graph's conversations, so one variable cannot hold each conversation's token, and both agents pass their whole environment to every shell command |
+| A wrapper per conversation, run by absolute path | Environment variables and a PATH entry on the agent process; one `AGENTS.md` naming the command | The agent process and working directory are shared by the graph's conversations, so per-conversation values cannot live there. Codex's shell snapshot may reorder PATH |
 | Remove only OmniGraph's variables from the agent's environment | Also remove `AWS_*`, `AZURE_*`, Google credentials | The agent may need them for its model provider |
 | Request bodies read whole, at most 64 MiB; answers to reads stream | Stream request bodies too | The rules need small JSON bodies whole; a load larger than 64 MiB is refused before sending, which bounds memory (IX) |
 | The gateway passes the upstream contract through and refuses a CLI that speaks another | Translate between contracts | The contract is an exact-match safety property. A translation layer would be a second API that drifts |
@@ -263,7 +270,7 @@ same write would split the cards and the rules.
 | Codex gets network only when the person allows it | Always enable it; always refuse the CLI to Codex | Enabling it opens all network; refusing it gives up the CLI where the person accepts the risk |
 | The CLI is the only graph tool; `omnigraph_run` runs it for agents without network | Keep spec 011's schema, query and propose tools beside the CLI | The CLI covers every served route and composes; the old tools were a subset with their own write path. One path keeps one set of rules and cards |
 | `omnigraph_run` takes an argument list and runs the wrapper without a shell | A command string run by a shell | A list cannot smuggle a second command or a redirect, and the allowlist and file checks read the same arguments the CLI gets |
-| Long calls report MCP progress | Raise the agent's timeout | A timeout is the agent's setting and differs by agent; progress works wherever the client sends a token |
+| Long calls report MCP progress and answer within four minutes with a run number | Raise the agent's timeout | A timeout is the agent's setting and differs by agent. codex-acp drops a per-server `tool_timeout_sec`; setting it means declaring the server in `CODEX_CONFIG` instead of ACP `mcpServers`. A run number works for every agent |
 
 ## Deferred
 
@@ -308,6 +315,8 @@ CLI is the one they trust).
 | 2026-10-13 | The agent starts without OmniGraph credentials | `agent_panel` `the_agent_starts_without_omnigraph_credentials` | OmniGraph tokens, profile, home and Studio's token are removed unless `agent.env` sets them; `ANTHROPIC_API_KEY` and `AWS_PROFILE` stay |
 | 2026-10-13 | The stock CLI reads and writes its branch through the real gateway | `agent_panel` `the_stock_cli_reads_and_writes_its_branch_through_the_gateway` (ignored; run with `STUDIO_GATEWAY_E2E_*` against `script/dev-server` and `~/.local/bin/omnigraph` 0.13.0) | Passed: a read on main; mutate on main and a branch statement refused; branch create, a mutation (1 node) and a load on the agent branch; a merge into main refused; the branch deleted |
 | 2026-10-13 | Claude Code's MCP and shell behave as the design assumes | A minimal ACP client running claude-agent-acp 0.90.0 (Claude Code 2.1.296) with a stub stdio MCP server, plus the package source | Server instructions reach the model, cut at 2,048 characters. `AGENTS.md` loads when no `CLAUDE.md` is in the working directory or above it. Bash and MCP servers inherit the agent's environment; the sandbox is off by default. A silent stdio tool call is aborted after the 30-minute idle timeout; progress notifications reset it. Every MCP tool call asks the client unless pre-allowed. An ACP `mcpServers` entry with `"type": "stdio"` is dropped |
+| 2026-10-13 | Codex's MCP and shell behave as the design assumes | codex-acp 2.2.2 and Codex 0.160.1 source, plus live runs of the installed codex-acp with a stub client, a fake model server and throwaway `CODEX_HOME`/`HOME` | Stdio MCP servers run outside the seatbelt sandbox and reach loopback; the shell does not. The MCP tool timeout is 300 s (the docs still say 60 s); on timeout Codex sends no cancellation and drops the late reply. codex-acp passes only `command`, `args` and `env`, so a `tool_timeout_sec` for an ACP server is ignored. The shell-environment filter is off by default: a `*TOKEN*` variable reached the shell. MCP servers start with a fixed environment plus ACP `env`. Server instructions reach the model as the tool namespace's description. `AGENTS.md` loads from the cwd, which codex-acp trusts |
+| 2026-10-13 | A slow run answers with its number and finishes later | `agent_panel` `a_slow_run_answers_with_its_number_and_keeps_going` | No outcome within the limit, the number and the `wait` call in the answer, then the outcome on a later wait |
 | 2026-10-13 | `omnigraph_run` checks its arguments | `agent_panel` `run_arguments_stay_on_the_gateway_and_in_the_working_directory` | `--server studio` and the graph added; other servers, stores, profiles, `--as` and unknown commands refused; files outside the working directory refused, including through `..` and symlinks |
 | 2026-10-13 | `omnigraph_run` reads and writes through the real gateway | The ignored end-to-end test, extended to call `cli_home::run` | A query inline and with `save_to`, the file in the working directory |
 | 2026-10-13 | A long call reports progress until it answers | `agent_panel` `a_long_call_reports_growing_progress_until_it_answers` | Progress notifications with the client's token and growing values, then the answer |
@@ -327,6 +336,10 @@ CLI is the one they trust).
 - 2026-10-13 · The draft made "Ask before writes" a footer toggle and dropped the query tools once
   the CLI answered. The first slice has a setting, and kept every tool; MCP has no way to drop a
   tool mid-session without `listChanged`.
+- 2026-10-13 · The first slice assumed Codex strips variables named like `*TOKEN*` from its shell.
+  Its filter is off by default; the token file was still the right choice, for the reason the
+  Decisions table now gives. It also assumed Codex's MCP timeout was 60 seconds and could be
+  set per server; it is 300 seconds, and codex-acp drops the setting.
 - 2026-10-13 · The first slice told an agent without network to fall back to the graph tools.
   Codex's default sandbox is such an agent, so the person lost the CLI there. `omnigraph_run`
   now runs the CLI for it, and the graph tools are removed: the CLI is the one path.

@@ -14,14 +14,14 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "omnigraph_run",
-            "description": "Run this conversation's omnigraph CLI from Studio, outside your sandbox. Use it when your shell cannot reach Studio (\"server discovery connection failed\"). `args` are the arguments after `omnigraph`, for example [\"schema\", \"show\"] or [\"query\", \"-e\", \"query q() { match { $p: Person } return { count($p) as n } }\", \"--json\"]; Studio adds `--server studio` and the graph. Files given to --query, --data, --params-file, --file and --out, and `save_to`, must be in your working directory. Returns the exit code, the output (at most 100 KB; use `save_to` for more) and the error text.",
+            "description": "Run this conversation's omnigraph CLI from Studio, outside your sandbox. Use it when your shell cannot reach Studio (\"server discovery connection failed\"). `args` are the arguments after `omnigraph`, for example [\"schema\", \"show\"] or [\"query\", \"-e\", \"query q() { match { $p: Person } return { count($p) as n } }\", \"--json\"]; Studio adds `--server studio` and the graph. Files given to --query, --data, --params-file, --file and --out, and `save_to`, must be in your working directory. Returns the exit code, the output (at most 100 KB; use `save_to` for more) and the error text. A command still running after four minutes comes back as a run number: never repeat the command, call omnigraph_run with `wait` set to that number for its outcome.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "args": { "type": "array", "items": { "type": "string" } },
                     "save_to": { "type": "string", "description": "Write standard output to this file in your working directory instead of returning it." },
+                    "wait": { "type": "integer", "description": "Instead of running a command, wait for the outcome of this earlier run." },
                 },
-                "required": ["args"],
                 "additionalProperties": false,
             },
         }),
@@ -36,6 +36,10 @@ pub enum ToolCall {
         args: Vec<String>,
         save_to: Option<String>,
     },
+    /// Wait for an earlier run that was still going when its call answered.
+    Wait {
+        run: u64,
+    },
 }
 
 impl ToolCall {
@@ -45,6 +49,16 @@ impl ToolCall {
             .ok_or_else(|| "Arguments must be an object.".to_owned())?;
         match name {
             "omnigraph_cli" => Ok(Self::Cli),
+            "omnigraph_run" if arguments.contains_key("wait") => {
+                if arguments.contains_key("args") || arguments.contains_key("save_to") {
+                    return Err("Pass either `wait` or `args`, not both.".into());
+                }
+                let run = arguments
+                    .get("wait")
+                    .and_then(Value::as_u64)
+                    .ok_or("`wait` must be a run number.")?;
+                Ok(Self::Wait { run })
+            }
             "omnigraph_run" => {
                 let args = arguments
                     .get("args")
@@ -97,6 +111,12 @@ mod tests {
             Ok(ToolCall::Cli)
         );
         assert!(ToolCall::parse("omnigraph_run", &json!({})).is_err());
+        assert_eq!(
+            ToolCall::parse("omnigraph_run", &json!({"wait": 3})),
+            Ok(ToolCall::Wait { run: 3 })
+        );
+        assert!(ToolCall::parse("omnigraph_run", &json!({"wait": "3"})).is_err());
+        assert!(ToolCall::parse("omnigraph_run", &json!({"wait": 3, "args": []})).is_err());
         assert!(ToolCall::parse("omnigraph_run", &json!({"args": ["query", 3]})).is_err());
         assert!(ToolCall::parse("omnigraph_run", &json!({"args": [], "save_to": 1})).is_err());
         assert!(ToolCall::parse("omnigraph_query", &json!({"query": "q"})).is_err());

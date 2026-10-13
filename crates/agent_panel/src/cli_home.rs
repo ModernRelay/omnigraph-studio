@@ -255,6 +255,39 @@ pub const RUN_OUTPUT_MAX: usize = 64 * 1024 * 1024;
 /// How long one `omnigraph_run` may take; a write held for approval waits within it.
 const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+/// How long an `omnigraph_run` call waits before it answers with the run's number instead.
+/// Agents give up on a tool call without telling Studio (Codex after 300 seconds), and a write
+/// waiting for the person can take longer; an agent that thought it failed might repeat it.
+pub const RUN_ANSWER_WITHIN: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(240)
+};
+
+/// The answer to a call whose run is still going.
+pub fn still_running(run: u64) -> (String, bool) {
+    (
+        format!(
+            "Still running in Studio as run {run}; nothing about its outcome is known yet. Do not \
+             run the command again. Call omnigraph_run with {{\"wait\": {run}}} for its outcome."
+        ),
+        false,
+    )
+}
+
+/// `run`'s answer if it finishes within `within`, else `None` (the run keeps going).
+pub async fn answer_within<F>(run: F, within: Duration) -> Option<(String, bool)>
+where
+    F: Future<Output = (String, bool)> + Unpin,
+{
+    let mut timer = futures::FutureExt::fuse(smol::Timer::after(within));
+    let mut run = futures::FutureExt::fuse(run);
+    futures::select! {
+        answer = run => Some(answer),
+        _ = timer => None,
+    }
+}
+
 /// Checks the arguments the agent gave `omnigraph_run` (spec 013): the CLI runs in Studio's
 /// process, outside the agent's sandbox, so it may only speak to this conversation's gateway
 /// and touch files in the conversation's working directory. Returns the arguments to run, with
@@ -538,6 +571,31 @@ mod tests {
             assert!(check(refused).is_err(), "{refused:?} was let through");
         }
         std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    #[test]
+    fn a_slow_run_answers_with_its_number_and_keeps_going() {
+        smol::block_on(async {
+            let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
+            let run = futures::FutureExt::shared(Box::pin(async move {
+                done_rx.await.ok();
+                ("exit 0\nrows".to_owned(), false)
+            }));
+            // Still going when the call answers: the number, not an outcome.
+            assert_eq!(answer_within(run.clone(), RUN_ANSWER_WITHIN).await, None);
+            let (text, error) = still_running(4);
+            assert!(!error);
+            assert!(
+                text.contains("run 4") && text.contains(r#"{"wait": 4}"#),
+                "{text}"
+            );
+            // A later wait gets the outcome once the run finishes.
+            done_tx.send(()).ok();
+            assert_eq!(
+                answer_within(run, RUN_ANSWER_WITHIN).await,
+                Some(("exit 0\nrows".to_owned(), false))
+            );
+        });
     }
 
     #[test]
