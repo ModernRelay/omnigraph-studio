@@ -7,27 +7,30 @@
 //! It keeps each session's transcript in its working directory and supports `session/load`:
 //! loading a session replays its messages, so a restarted Studio can come back to it.
 //!
-//! It offers two session options, a mode and a model (grouped by family), takes
-//! `session/set_config_option`, and reports a growing context window and cost after each turn.
+//! It offers the session options Claude's ACP agent does (a mode, a model grouped by family, an
+//! effort level, Fast mode as a switch when the client takes switches, and an agent profile),
+//! takes `session/set_config_option`, and reports a growing context window and cost after each
+//! turn.
 //!
 //!     cargo build -p agent_panel --example test_agent
 //!     # then set the agent command to target/debug/examples/test_agent
 
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, ContentBlock, ContentChunk, Cost, Implementation, InitializeRequest,
     InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpServer, McpServerStdio,
     NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption, SessionId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    SetSessionConfigOptionResponse, StopReason, TextContent, ToolCall, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectGroup,
+    SessionConfigSelectOption, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
+    ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Stdio};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use smol::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use smol::process::{Command, Stdio as ProcessStdio};
 use smol::stream::StreamExt as _;
@@ -37,9 +40,11 @@ const FIRST: &str =
     "query first() { match { $p: Person } return { $p } order { $p.@id asc } limit 1 }";
 const RETITLE: &str = "query retitle($id: String, $title: String) {\n  update Person set { title: $title } where @id = $id\n}";
 
-/// The session's options as the person last set them: `(mode, model)`, kept beside the
-/// transcript so a loaded session comes back with its own.
-static OPTIONS: Mutex<(String, String)> = Mutex::new((String::new(), String::new()));
+/// The session's options as the person last set them, by option id, kept beside the
+/// transcript so a loaded session comes back with its own. Unset options take their defaults.
+static OPTIONS: Mutex<Option<Map<String, Value>>> = Mutex::new(None);
+/// Whether the client takes on/off options as switches; otherwise Fast mode is an On/Off menu.
+static BOOLEANS: AtomicBool = AtomicBool::new(false);
 
 fn options_path() -> Option<PathBuf> {
     let transcript = TRANSCRIPT.lock().unwrap().clone()?;
@@ -47,9 +52,9 @@ fn options_path() -> Option<PathBuf> {
 }
 
 fn save_options() {
-    let (mode, model) = OPTIONS.lock().unwrap().clone();
+    let options = OPTIONS.lock().unwrap().clone().unwrap_or_default();
     if let Some(path) = options_path() {
-        std::fs::write(path, json!({ "mode": mode, "model": model }).to_string()).ok();
+        std::fs::write(path, Value::Object(options).to_string()).ok();
     }
 }
 
@@ -57,27 +62,49 @@ fn load_options() {
     let saved = options_path()
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .unwrap_or_default();
-    let field = |name: &str| saved[name].as_str().unwrap_or_default().to_owned();
-    *OPTIONS.lock().unwrap() = (field("mode"), field("model"));
+        .and_then(|value| value.as_object().cloned());
+    *OPTIONS.lock().unwrap() = saved;
 }
-/// Tokens in the context window and the cost so far.
-static USAGE: Mutex<(u64, f64)> = Mutex::new((0, 0.));
-const WINDOW: u64 = 200_000;
 
+fn chosen(id: &str, default: &str) -> String {
+    OPTIONS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|options| options.get(id)?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| default.to_owned())
+}
+
+fn fast() -> bool {
+    OPTIONS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|options| options.get("fast")?.as_bool())
+        .unwrap_or(false)
+}
+
+/// The options Claude's ACP agent offers, in its order: mode, model, effort, Fast mode and the
+/// agent profile.
 fn config_options() -> Vec<SessionConfigOption> {
-    let (mode, model) = OPTIONS.lock().unwrap().clone();
-    let mode = if mode.is_empty() { "ask".into() } else { mode };
-    let model = if model.is_empty() {
-        "sonnet".into()
+    let fast_mode = if BOOLEANS.load(Ordering::SeqCst) {
+        SessionConfigOption::boolean("fast", "Fast mode", fast())
     } else {
-        model
+        SessionConfigOption::select(
+            "fast",
+            "Fast mode",
+            if fast() { "on" } else { "off" },
+            vec![
+                SessionConfigSelectOption::new("on", "On"),
+                SessionConfigSelectOption::new("off", "Off"),
+            ],
+        )
     };
     vec![
         SessionConfigOption::select(
             "mode",
             "Mode",
-            mode,
+            chosen("mode", "ask"),
             vec![
                 SessionConfigSelectOption::new("ask", "Ask before changes"),
                 SessionConfigSelectOption::new("plan", "Plan only"),
@@ -88,7 +115,7 @@ fn config_options() -> Vec<SessionConfigOption> {
         SessionConfigOption::select(
             "model",
             "Model",
-            model,
+            chosen("model", "sonnet"),
             vec![
                 SessionConfigSelectGroup::new(
                     "claude",
@@ -107,8 +134,36 @@ fn config_options() -> Vec<SessionConfigOption> {
             ],
         )
         .category(SessionConfigOptionCategory::Model),
+        SessionConfigOption::select(
+            "effort",
+            "Effort",
+            chosen("effort", "high"),
+            vec![
+                SessionConfigSelectOption::new("low", "Low"),
+                SessionConfigSelectOption::new("medium", "Medium"),
+                SessionConfigSelectOption::new("high", "High"),
+            ],
+        )
+        .description("How long the model thinks")
+        .category(SessionConfigOptionCategory::ThoughtLevel),
+        fast_mode
+            .description("Faster output from the same model")
+            .category(SessionConfigOptionCategory::ModelConfig),
+        SessionConfigOption::select(
+            "agent",
+            "Agent",
+            chosen("agent", "default"),
+            vec![
+                SessionConfigSelectOption::new("default", "Default"),
+                SessionConfigSelectOption::new("reviewer", "Reviewer"),
+            ],
+        ),
     ]
 }
+
+/// Tokens in the context window and the cost so far.
+static USAGE: Mutex<(u64, f64)> = Mutex::new((0, 0.));
+const WINDOW: u64 = 200_000;
 
 /// Where the current session's messages are written, one JSON line each.
 static TRANSCRIPT: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -147,6 +202,13 @@ fn main() -> agent_client_protocol::Result<()> {
             .name("studio-test-agent")
             .on_receive_request(
                 async move |request: InitializeRequest, responder, _connection| {
+                    let booleans = request
+                        .client_capabilities
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.config_options.as_ref())
+                        .is_some_and(|options| options.boolean.is_some());
+                    BOOLEANS.store(booleans, Ordering::SeqCst);
                     responder.respond(
                         InitializeResponse::new(request.protocol_version)
                             .agent_info(Implementation::new("Studio test agent", "0.1.0"))
@@ -165,7 +227,7 @@ fn main() -> agent_client_protocol::Result<()> {
                     let id = format!("test-{nanos}");
                     *TRANSCRIPT.lock().unwrap() = Some(transcript_path(&request.cwd, &id));
                     *USAGE.lock().unwrap() = (0, 0.);
-                    *OPTIONS.lock().unwrap() = Default::default();
+                    *OPTIONS.lock().unwrap() = None;
                     responder.respond(
                         NewSessionResponse::new(SessionId::new(id))
                             .config_options(config_options()),
@@ -212,26 +274,32 @@ fn main() -> agent_client_protocol::Result<()> {
             )
             .on_receive_request(
                 async move |request: SetSessionConfigOptionRequest, responder, _connection| {
-                    let Some(value) = request.value.as_value_id() else {
-                        return responder.respond_with_error(
-                            agent_client_protocol::Error::invalid_params().data("not a value id"),
-                        );
-                    };
-                    let value = value.0.to_string();
-                    {
-                        let mut options = OPTIONS.lock().unwrap();
-                        match request.config_id.0.as_ref() {
-                            "mode" => options.0 = value,
-                            "model" => options.1 = value,
-                            _ => {
-                                drop(options);
-                                return responder.respond_with_error(
-                                    agent_client_protocol::Error::invalid_params()
-                                        .data("no such option"),
-                                );
-                            }
+                    let id = request.config_id.0.to_string();
+                    let value = match (&request.value, request.value.as_value_id()) {
+                        (SessionConfigOptionValue::Boolean { value }, _) => Value::Bool(*value),
+                        // An On/Off menu sets Fast mode as a value id.
+                        (_, Some(value)) if id == "fast" => Value::Bool(value.0.as_ref() == "on"),
+                        (_, Some(value)) => Value::String(value.0.to_string()),
+                        _ => {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data("unknown value"),
+                            );
                         }
+                    };
+                    if !config_options()
+                        .iter()
+                        .any(|option| option.id.0.as_ref() == id)
+                    {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params().data("no such option"),
+                        );
                     }
+                    OPTIONS
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(Map::new)
+                        .insert(id, value);
                     save_options();
                     responder.respond(SetSessionConfigOptionResponse::new(config_options()))
                 },

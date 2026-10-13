@@ -7,15 +7,15 @@ use std::path::PathBuf;
 use agent_client_protocol::schema::v1::{
     ContentBlock, PermissionOption, PermissionOptionKind, PlanEntryStatus,
     RequestPermissionOutcome, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionValue, SessionConfigSelectOptions, SessionUpdate, StopReason,
-    ToolCallStatus,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOptions,
+    SessionUpdate, StopReason, ToolCallStatus,
 };
 use editor::Editor;
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Render,
-    ScrollHandle, SharedString, Task, Window,
+    ScrollHandle, SharedString, Task, WeakEntity, Window,
 };
 use gq_language::QueryInfo;
 use graph_client::WriteOutcome;
@@ -30,7 +30,7 @@ use studio_workspace::{Item, ItemEvent, ItemFooter, SavedItem, Workspace};
 use ui::prelude::*;
 use ui::{
     Callout, CircularProgress, CommonAnimationExt as _, ContextMenu, Indicator, KeyBinding,
-    PopoverMenu, Severity, Switch, SwitchLabelPosition, Tooltip,
+    PopoverMenu, Severity, Tooltip,
 };
 
 use crate::host::{self, HostCommand, HostEvent, Launch};
@@ -186,6 +186,8 @@ pub struct AgentPanel {
     /// A value chosen and sent but not yet confirmed, shown in the meantime.
     setting_option: Option<(String, SessionConfigOptionValue)>,
     usage: Option<Usage>,
+    /// Runs of tool calls and thoughts opened to their steps, by the run's first entry.
+    expanded_activity: std::collections::HashSet<usize>,
 }
 
 impl EventEmitter<ItemEvent> for AgentPanel {}
@@ -217,53 +219,25 @@ impl Item for AgentPanel {
         })
     }
 
-    /// Delta's composer footer: the agent at work, how full its context is, its options (model,
-    /// mode), the agent, then send or stop.
+    /// Delta's composer footer, borderless and quiet: the agent at work, how full its context
+    /// is, its options (mode, effort, more), the model it runs, a new conversation, then send or
+    /// stop. Send fills in only when there is something to send.
     fn footer(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<ItemFooter> {
         let running = matches!(self.state, State::Prompting { .. });
         let can_send = matches!(
             self.state,
             State::Ready { .. } | State::Idle | State::Exited { .. } | State::Starting
-        );
+        ) && !self.composer.read(cx).text(cx).trim().is_empty();
         let send_or_stop = if running {
             ds::round_button("stop", IconName::Stop, false, cx)
                 .tooltip(|_, cx| Tooltip::for_action("Stop", &Stop, cx))
                 .on_click(cx.listener(|this, _, window, cx| this.stop(&Stop, window, cx)))
         } else {
-            ds::round_button("send", IconName::ArrowUp, can_send, cx)
-                .when(!can_send, |button| button.opacity(0.4))
+            ds::round_button("send", IconName::Send, can_send, cx)
                 .tooltip(|_, cx| Tooltip::for_action("Send", &Send, cx))
                 .on_click(cx.listener(|this, _, window, cx| this.send(&Send, window, cx)))
         };
-        let (agent_name, dot, state) = self.status();
-        let command = Self::command(cx).join(" ");
-        let about = if command.is_empty() {
-            format!("{state}. Choose the agent in Settings.")
-        } else {
-            format!("{state} · {command}. Choose the agent in Settings.")
-        };
-        let agent_pill = ds::pill("agent-pill", cx)
-            .tooltip(Tooltip::text(about))
-            .child(Indicator::dot().color(dot))
-            .child(ds::text::body(agent_name))
-            .child(
-                Icon::new(IconName::ChevronDown)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .on_click(|_, window, cx| {
-                window.dispatch_action(Box::new(studio_actions::workspace::OpenSettings), cx)
-            });
         let mut end = Vec::new();
-        if matches!(self.state, State::Ready { .. } | State::Exited { .. }) {
-            end.push(
-                studio_ui::ds::icon_button("restart", IconName::RotateCw)
-                    .icon_size(IconSize::Small)
-                    .tooltip(|_, cx| Tooltip::for_action("New agent session", &Restart, cx))
-                    .on_click(cx.listener(|this, _, window, cx| this.restart(&Restart, window, cx)))
-                    .into_any_element(),
-            );
-        }
         if running {
             end.push(
                 h_flex()
@@ -281,14 +255,16 @@ impl Item for AgentPanel {
         }
         end.extend(self.render_usage(cx));
         end.extend(self.render_options(cx));
-        end.push(
-            h_flex()
-                .gap(px(ds::space::SM))
-                .items_center()
-                .child(agent_pill)
-                .child(send_or_stop)
-                .into_any_element(),
-        );
+        if matches!(self.state, State::Ready { .. } | State::Exited { .. }) {
+            end.push(
+                ds::icon_button("restart", IconName::RotateCw)
+                    .icon_color(Color::Muted)
+                    .tooltip(|_, cx| Tooltip::for_action("New conversation", &Restart, cx))
+                    .on_click(cx.listener(|this, _, window, cx| this.restart(&Restart, window, cx)))
+                    .into_any_element(),
+            );
+        }
+        end.push(send_or_stop.into_any_element());
         Some(ItemFooter {
             start: Vec::new(),
             end,
@@ -331,6 +307,7 @@ impl AgentPanel {
             config_options: Vec::new(),
             setting_option: None,
             usage: None,
+            expanded_activity: std::collections::HashSet::new(),
         };
         panel.sync_setup_state(cx);
         panel
@@ -507,6 +484,7 @@ impl AgentPanel {
         self.stop_host();
         self.entries.clear();
         self.markdown.clear();
+        self.expanded_activity.clear();
         self.usage = None;
         self.start_fresh = true;
         self.start(cx);
@@ -1246,6 +1224,260 @@ fn describe_outcome(outcome: &WriteOutcome<ChangeOutput>) -> (ProposalState, Str
 }
 
 /// The last eight characters of a graph commit id, as the activity log shows it.
+/// One of the agent's session options as the footer shows it, with a value chosen but not yet
+/// confirmed standing in for the agent's.
+#[derive(Clone)]
+struct OptionView {
+    id: String,
+    name: String,
+    description: Option<SharedString>,
+    category: Option<SessionConfigOptionCategory>,
+    /// A choice was sent and the agent has not answered yet.
+    pending: bool,
+    choice: Choice,
+}
+
+#[derive(Clone)]
+enum Choice {
+    /// The current value, its name, and the menu's sections: the agent's groups, or one
+    /// section under the option's name.
+    Select {
+        current: String,
+        current_name: String,
+        sections: Vec<(String, Vec<(String, String)>)>,
+    },
+    Switch(bool),
+}
+
+impl OptionView {
+    fn new(
+        option: &SessionConfigOption,
+        setting: Option<&(String, SessionConfigOptionValue)>,
+    ) -> Option<Self> {
+        let id = option.id.0.to_string();
+        let pending = setting
+            .filter(|(pending, _)| *pending == id)
+            .map(|(_, value)| value);
+        let choice = match &option.kind {
+            SessionConfigKind::Select(select) => {
+                let current = pending
+                    .and_then(SessionConfigOptionValue::as_value_id)
+                    .map(|value| value.0.to_string())
+                    .unwrap_or_else(|| select.current_value.0.to_string());
+                let current_name = select_values(&select.options)
+                    .find(|(value, _)| *value == current)
+                    .map(|(_, name)| name.to_owned())
+                    .unwrap_or_else(|| current.clone());
+                let sections = match &select.options {
+                    SessionConfigSelectOptions::Grouped(groups) => groups
+                        .iter()
+                        .map(|group| {
+                            (
+                                group.name.clone(),
+                                group
+                                    .options
+                                    .iter()
+                                    .map(|o| (o.value.0.to_string(), o.name.clone()))
+                                    .collect(),
+                            )
+                        })
+                        .collect(),
+                    options => vec![(
+                        option.name.clone(),
+                        select_values(options)
+                            .map(|(value, name)| (value.to_owned(), name.to_owned()))
+                            .collect(),
+                    )],
+                };
+                Choice::Select {
+                    current,
+                    current_name,
+                    sections,
+                }
+            }
+            SessionConfigKind::Boolean(boolean) => Choice::Switch(match pending {
+                Some(SessionConfigOptionValue::Boolean { value }) => *value,
+                _ => boolean.current_value,
+            }),
+            _ => return None,
+        };
+        Some(Self {
+            id,
+            name: option.name.clone(),
+            description: option.description.clone().map(SharedString::from),
+            category: option.category.clone(),
+            pending: pending.is_some(),
+            choice,
+        })
+    }
+
+    /// The icon a footer picker shows before the value, or `None` for an option that belongs
+    /// under More options. The model's icon is its provider's, chosen by the caller.
+    fn footer_icon(&self) -> Option<IconName> {
+        let Choice::Select { .. } = &self.choice else {
+            return None;
+        };
+        match self.category.as_ref()? {
+            SessionConfigOptionCategory::Mode => Some(IconName::UserCheck),
+            SessionConfigOptionCategory::Model => Some(IconName::ZedAssistant),
+            SessionConfigOptionCategory::ThoughtLevel => Some(IconName::ThinkingMode),
+            _ => None,
+        }
+    }
+
+    fn is_model(&self) -> bool {
+        matches!(self.category, Some(SessionConfigOptionCategory::Model))
+    }
+
+    fn current_name(&self) -> String {
+        match &self.choice {
+            Choice::Select { current_name, .. } => current_name.clone(),
+            Choice::Switch(on) => if *on { "On" } else { "Off" }.to_owned(),
+        }
+    }
+
+    /// "Fast mode: Off", for tooltips.
+    fn summary(&self) -> String {
+        format!("{}: {}", self.name, self.current_name())
+    }
+
+    /// The option's entries in a menu: its values with the current one checked, or one entry
+    /// that switches it.
+    fn add_to(&self, mut menu: ContextMenu, panel: &WeakEntity<AgentPanel>) -> ContextMenu {
+        match &self.choice {
+            Choice::Select {
+                current, sections, ..
+            } => {
+                for (index, (header, values)) in sections.iter().enumerate() {
+                    if index > 0 {
+                        menu = menu.separator();
+                    }
+                    menu = menu.header(header.clone());
+                    for (value, name) in values {
+                        let checked = value == current;
+                        let (panel, id, value) = (panel.clone(), self.id.clone(), value.clone());
+                        menu = menu.toggleable_entry(
+                            name.clone(),
+                            checked,
+                            IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                if checked {
+                                    return;
+                                }
+                                panel
+                                    .update(cx, |panel, cx| {
+                                        panel.set_option(
+                                            id.clone(),
+                                            SessionConfigOptionValue::value_id(value.clone()),
+                                            cx,
+                                        )
+                                    })
+                                    .ok();
+                            },
+                        );
+                    }
+                }
+                menu
+            }
+            Choice::Switch(on) => {
+                let (panel, id, next) = (panel.clone(), self.id.clone(), !on);
+                menu.toggleable_entry(
+                    self.name.clone(),
+                    *on,
+                    IconPosition::Start,
+                    None,
+                    move |_, cx| {
+                        panel
+                            .update(cx, |panel, cx| {
+                                panel.set_option(
+                                    id.clone(),
+                                    SessionConfigOptionValue::boolean(next),
+                                    cx,
+                                )
+                            })
+                            .ok();
+                    },
+                )
+            }
+        }
+    }
+}
+
+/// A footer picker: the option's icon and current value, borderless, opening its values. The
+/// model's menu also holds the agent: a new conversation, and choosing another agent.
+fn option_picker(
+    option: OptionView,
+    icon: Icon,
+    panel: &WeakEntity<AgentPanel>,
+    agent: Option<String>,
+) -> AnyElement {
+    let id = option.id.clone();
+    let title = option.summary();
+    let meta = option.description.clone();
+    let panel = panel.clone();
+    PopoverMenu::new(SharedString::from(format!("option-{id}")))
+        .trigger(
+            ds::button(
+                SharedString::from(format!("option-{id}-button")),
+                cut(&option.current_name(), OPTION_NAME_CHARS),
+            )
+            .style(ButtonStyle::Subtle)
+            .color(Color::Muted)
+            .disabled(option.pending)
+            .start_icon(icon.size(IconSize::XSmall).color(Color::Muted))
+            .tooltip(move |_, cx| match &meta {
+                Some(meta) => Tooltip::with_meta(title.clone(), None, meta.clone(), cx),
+                None => Tooltip::simple(title.clone(), cx),
+            }),
+        )
+        .menu(move |window, cx| {
+            let option = option.clone();
+            let panel = panel.clone();
+            let agent = agent.clone();
+            Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                let mut menu = option.add_to(menu, &panel);
+                if let Some(agent) = agent {
+                    menu = menu
+                        .separator()
+                        .header(agent)
+                        .entry("New conversation", None, {
+                            let panel = panel.clone();
+                            move |window, cx| {
+                                panel
+                                    .update(cx, |panel, cx| panel.restart(&Restart, window, cx))
+                                    .ok();
+                            }
+                        })
+                        .entry("Choose another agent…", None, |window, cx| {
+                            window.dispatch_action(
+                                Box::new(studio_actions::workspace::OpenSettings),
+                                cx,
+                            )
+                        });
+                }
+                menu
+            }))
+        })
+        .anchor(gpui::Anchor::BottomRight)
+        .into_any_element()
+}
+
+/// The model provider's mark, when the agent or model names one.
+fn provider_icon(names: &str) -> Option<IconName> {
+    let names = names.to_lowercase();
+    let any = |words: &[&str]| words.iter().any(|word| names.contains(word));
+    if any(&["claude", "anthropic", "opus", "sonnet", "haiku"]) {
+        Some(IconName::AiAnthropic)
+    } else if any(&["codex", "openai", "gpt"]) {
+        Some(IconName::AiOpenAi)
+    } else if any(&["gemini"]) {
+        Some(IconName::AiGemini)
+    } else {
+        None
+    }
+}
+
 /// A select option's values and names, across its groups.
 fn select_values(
     options: &SessionConfigSelectOptions,
@@ -1344,6 +1576,72 @@ fn gutter_row(icon: Option<Icon>, content: impl IntoElement) -> Div {
 }
 
 /// A short verb for one of Studio's tools, as Delta labels activity ("Edit", "Read").
+/// What a tool call did, for a run's summary line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolKind {
+    Schema,
+    Branches,
+    Query,
+    Propose,
+    Other,
+}
+
+impl ToolKind {
+    fn of(title: &str) -> Self {
+        if title.contains("omnigraph_schema") {
+            Self::Schema
+        } else if title.contains("omnigraph_branches") {
+            Self::Branches
+        } else if title.contains("omnigraph_query") {
+            Self::Query
+        } else if title.contains("omnigraph_propose_change") {
+            Self::Propose
+        } else {
+            Self::Other
+        }
+    }
+
+    fn phrase(self, count: usize) -> String {
+        let plural = |one: &str, many: &str| if count == 1 { one } else { many }.to_owned();
+        match self {
+            Self::Schema if count == 1 => "read the schema".into(),
+            Self::Schema => format!("read the schema {count} times"),
+            Self::Branches => "listed branches".into(),
+            Self::Query => format!("ran {count} {}", plural("query", "queries")),
+            Self::Propose => format!("proposed {count} {}", plural("change", "changes")),
+            Self::Other => format!("used {count} {}", plural("tool", "tools")),
+        }
+    }
+}
+
+/// A run's summary, as Delta writes it: "Thought 1 time, read the schema, ran 2 queries", kinds
+/// in the order they first ran.
+fn activity_summary(thoughts: usize, tools: &[ToolKind]) -> String {
+    let mut parts = Vec::new();
+    if thoughts > 0 {
+        parts.push(format!(
+            "thought {thoughts} {}",
+            if thoughts == 1 { "time" } else { "times" }
+        ));
+    }
+    let mut seen: Vec<ToolKind> = Vec::new();
+    for kind in tools {
+        if !seen.contains(kind) {
+            seen.push(*kind);
+        }
+    }
+    for kind in seen {
+        let count = tools.iter().filter(|other| **other == kind).count();
+        parts.push(kind.phrase(count));
+    }
+    let text = parts.join(", ");
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => text,
+    }
+}
+
 fn tool_verb(title: &str) -> String {
     if title.contains("omnigraph_schema") {
         "Read the schema".into()
@@ -1568,7 +1866,8 @@ impl AgentPanel {
             .py_4()
             .pr_4()
             .pl_2()
-            .gap_5();
+            // Steps of a turn sit close; a new question opens a new group (below).
+            .gap(px(ds::space::LG));
         if self.entries.is_empty() && !matches!(self.state, State::Exited { .. }) {
             return thread
                 .child(studio_ui::ds::empty_state(
@@ -1577,8 +1876,33 @@ impl AgentPanel {
                 ))
                 .into_any_element();
         }
-        for (index, entry) in self.entries.iter().enumerate() {
-            thread = thread.child(self.render_entry(index, entry, window, cx));
+        // As in Delta: the agent's mark once per turn, and each run of tool calls and thoughts
+        // as one line that opens to its steps.
+        let mut marked = false;
+        let mut index = 0;
+        while index < self.entries.len() {
+            let entry = &self.entries[index];
+            match entry {
+                Entry::Tool { .. } | Entry::Thought(_) => {
+                    let start = index;
+                    while index < self.entries.len()
+                        && matches!(self.entries[index], Entry::Tool { .. } | Entry::Thought(_))
+                    {
+                        index += 1;
+                    }
+                    thread = thread.child(self.render_activity(start..index, !marked, cx));
+                    marked = true;
+                    continue;
+                }
+                Entry::User(_) => marked = false,
+                _ => {}
+            }
+            let lead = matches!(entry, Entry::Agent(_)) && !marked;
+            if matches!(entry, Entry::Agent(_)) {
+                marked = true;
+            }
+            thread = thread.child(self.render_entry(index, entry, lead, window, cx));
+            index += 1;
         }
         if let State::Exited { message, stderr } = &self.state {
             let mut callout = Callout::new()
@@ -1593,14 +1917,16 @@ impl AgentPanel {
         thread.into_any_element()
     }
 
+    /// One entry of the thread; `lead` marks the agent's first entry in a turn, which carries
+    /// its mark.
     fn render_entry(
         &self,
         index: usize,
         entry: &Entry,
+        lead: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let text_muted = cx.theme().colors().text_muted;
         match entry {
             Entry::User(text) => gutter_row(
                 Some(
@@ -1610,13 +1936,14 @@ impl AgentPanel {
                 ),
                 div().text_sm().child(text.clone()),
             )
+            .when(index > 0, |row| row.mt(px(ds::space::XL)))
             .into_any_element(),
             Entry::Agent(text) => gutter_row(
-                Some(
+                lead.then(|| {
                     Icon::new(IconName::ZedAssistant)
                         .size(IconSize::Small)
-                        .color(Color::Muted),
-                ),
+                        .color(Color::Muted)
+                }),
                 match self.markdown.get(&index) {
                     // Zed's markdown, as Zed's agent panel renders a reply.
                     Some((markdown, _)) => div()
@@ -1633,50 +1960,8 @@ impl AgentPanel {
                 },
             )
             .into_any_element(),
-            Entry::Thought(text) => gutter_row(
-                None,
-                h_flex()
-                    .id(("thought", index))
-                    .gap_1()
-                    .tooltip(Tooltip::text(text.clone()))
-                    .child(
-                        Icon::new(IconName::Sparkle)
-                            .size(IconSize::XSmall)
-                            .color(Color::Disabled),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(text_muted)
-                            .truncate()
-                            .child(text.lines().next().unwrap_or_default().to_owned()),
-                    ),
-            )
-            .into_any_element(),
-            Entry::Tool { title, status, .. } => {
-                let icon = match status {
-                    ToolCallStatus::Pending => Icon::new(IconName::Circle).color(Color::Disabled),
-                    ToolCallStatus::InProgress => {
-                        Icon::new(IconName::ArrowCircle).color(Color::Accent)
-                    }
-                    ToolCallStatus::Completed => Icon::new(IconName::Check).color(Color::Success),
-                    ToolCallStatus::Failed => Icon::new(IconName::XCircle).color(Color::Error),
-                    _ => Icon::new(IconName::Circle).color(Color::Disabled),
-                };
-                gutter_row(
-                    Some(icon.size(IconSize::XSmall)),
-                    h_flex()
-                        .id(("tool", index))
-                        .tooltip(Tooltip::text(title.clone()))
-                        .child(
-                            Label::new(tool_verb(title))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted)
-                                .single_line()
-                                .truncate(),
-                        ),
-                )
-                .into_any_element()
+            Entry::Thought(_) | Entry::Tool { .. } => {
+                gutter_row(None, self.activity_step(index, entry, cx)).into_any_element()
             }
             Entry::Plan(items) => gutter_row(
                 Some(
@@ -1724,6 +2009,149 @@ impl AgentPanel {
             Entry::Proposal(proposal) => {
                 gutter_row(None, self.render_proposal(index, proposal, cx)).into_any_element()
             }
+        }
+    }
+
+    /// A run of tool calls and thoughts as one muted line ("Thought 1 time, ran 2 queries"),
+    /// with a turning arrow while a step runs and the failures named; it opens to the steps.
+    fn render_activity(
+        &self,
+        range: std::ops::Range<usize>,
+        lead: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let start = range.start;
+        let steps = &self.entries[range.clone()];
+        let thoughts = steps
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Thought(_)))
+            .count();
+        let tools: Vec<(ToolKind, &ToolCallStatus)> = steps
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Tool { title, status, .. } => Some((ToolKind::of(title), status)),
+                _ => None,
+            })
+            .collect();
+        let kinds: Vec<ToolKind> = tools.iter().map(|(kind, _)| *kind).collect();
+        let running = tools.iter().any(|(_, status)| {
+            matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress)
+        });
+        let failed = tools
+            .iter()
+            .filter(|(_, status)| matches!(status, ToolCallStatus::Failed))
+            .count();
+        let expanded = self.expanded_activity.contains(&start);
+        let header = h_flex()
+            .id(("activity", start))
+            .gap(px(ds::space::XS))
+            .items_center()
+            .cursor_pointer()
+            .child(
+                Label::new(activity_summary(thoughts, &kinds))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .when(failed > 0, |row| {
+                row.child(
+                    Label::new(format!("· {failed} failed"))
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
+                )
+            })
+            .child(if running {
+                Icon::new(IconName::ArrowCircle)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted)
+                    .with_rotate_animation(2)
+                    .into_any_element()
+            } else {
+                Icon::new(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element()
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.expanded_activity.remove(&start) {
+                    this.expanded_activity.insert(start);
+                }
+                cx.notify();
+            }));
+        gutter_row(
+            lead.then(|| {
+                Icon::new(IconName::ZedAssistant)
+                    .size(IconSize::Small)
+                    .color(Color::Muted)
+            }),
+            v_flex()
+                .gap(px(ds::space::XS))
+                .child(header)
+                .when(expanded, |list| {
+                    list.child(
+                        v_flex()
+                            .gap(px(ds::space::XS))
+                            .pl(px(ds::space::SM))
+                            .border_l_1()
+                            .border_color(ds::surface::rule(cx))
+                            .children(
+                                range.map(|index| {
+                                    self.activity_step(index, &self.entries[index], cx)
+                                }),
+                            ),
+                    )
+                }),
+        )
+        .into_any_element()
+    }
+
+    /// One step of a run: a tool call with its state, or a thought.
+    fn activity_step(&self, index: usize, entry: &Entry, cx: &App) -> AnyElement {
+        match entry {
+            Entry::Thought(text) => h_flex()
+                .id(("thought", index))
+                .gap_1()
+                .items_start()
+                .child(
+                    Icon::new(IconName::Sparkle)
+                        .size(IconSize::XSmall)
+                        .color(Color::Disabled),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().colors().text_muted)
+                        .child(text.trim().to_owned()),
+                )
+                .into_any_element(),
+            Entry::Tool { title, status, .. } => {
+                let icon = match status {
+                    ToolCallStatus::Pending => Icon::new(IconName::Circle).color(Color::Disabled),
+                    ToolCallStatus::InProgress => {
+                        Icon::new(IconName::ArrowCircle).color(Color::Accent)
+                    }
+                    ToolCallStatus::Completed => Icon::new(IconName::Check).color(Color::Muted),
+                    ToolCallStatus::Failed => Icon::new(IconName::XCircle).color(Color::Error),
+                    _ => Icon::new(IconName::Circle).color(Color::Disabled),
+                };
+                h_flex()
+                    .id(("tool", index))
+                    .gap_1()
+                    .tooltip(Tooltip::text(title.clone()))
+                    .child(icon.size(IconSize::XSmall))
+                    .child(
+                        Label::new(tool_verb(title))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .single_line()
+                            .truncate(),
+                    )
+                    .into_any_element()
+            }
+            _ => div().into_any_element(),
         }
     }
 
@@ -1947,168 +2375,113 @@ impl AgentPanel {
             .into_any_element()
     }
 
-    /// The agent's options as footer pickers, in the agent's order (spec 011): a menu for a
-    /// choice of values, a switch for on and off. Only while the session runs.
+    /// The agent's options in the footer (spec 011), as icon and value with no chrome: its mode
+    /// and reasoning level in the agent's order, then everything else (switches, profiles)
+    /// behind one More options menu, then the model, last as in Delta, whose menu also holds
+    /// the agent. Before the agent offers a model, the agent's name and state stand there.
     fn render_options(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        if self.host.is_none() {
-            return Vec::new();
-        }
         let panel = cx.entity().downgrade();
-        let mut pickers = Vec::new();
-        for option in &self.config_options {
-            let id = option.id.0.to_string();
-            let pending = self
-                .setting_option
-                .as_ref()
-                .filter(|(pending, _)| *pending == id)
-                .map(|(_, value)| value);
-            let about: SharedString = match &option.description {
-                Some(description) => format!("{}: {description}", option.name).into(),
-                None => option.name.clone().into(),
-            };
-            match &option.kind {
-                SessionConfigKind::Select(select) => {
-                    let current = pending
-                        .and_then(SessionConfigOptionValue::as_value_id)
-                        .map(|value| value.0.to_string())
-                        .unwrap_or_else(|| select.current_value.0.to_string());
-                    let name = select_values(&select.options)
-                        .find(|(value, _)| *value == current)
-                        .map(|(_, name)| name.to_owned())
-                        .unwrap_or_else(|| current.clone());
-                    // The menu's sections: the agent's groups, or the option's own name.
-                    let sections: Vec<(String, Vec<(String, String)>)> = match &select.options {
-                        SessionConfigSelectOptions::Grouped(groups) => groups
-                            .iter()
-                            .map(|group| {
-                                (
-                                    group.name.clone(),
-                                    group
-                                        .options
-                                        .iter()
-                                        .map(|o| (o.value.0.to_string(), o.name.clone()))
-                                        .collect(),
-                                )
-                            })
-                            .collect(),
-                        options => vec![(
-                            option.name.clone(),
-                            select_values(options)
-                                .map(|(value, name)| (value.to_owned(), name.to_owned()))
-                                .collect(),
-                        )],
-                    };
-                    let panel = panel.clone();
-                    let menu_id = id.clone();
-                    pickers.push(
-                        PopoverMenu::new(SharedString::from(format!("option-{id}")))
-                            .trigger(
-                                ds::button(
-                                    SharedString::from(format!("option-{id}-button")),
-                                    cut(&name, OPTION_NAME_CHARS),
-                                )
-                                .style(ButtonStyle::Subtle)
-                                .color(Color::Muted)
-                                .disabled(pending.is_some())
-                                .end_icon(
-                                    Icon::new(IconName::ChevronDown)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Muted),
-                                )
-                                .tooltip(Tooltip::text(about)),
+        let options: Vec<OptionView> = if self.host.is_some() {
+            self.config_options
+                .iter()
+                .filter_map(|option| OptionView::new(option, self.setting_option.as_ref()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let (shown, more): (Vec<_>, Vec<_>) = options
+            .into_iter()
+            .partition(|option| option.footer_icon().is_some());
+        let (models, shown): (Vec<_>, Vec<_>) = shown.into_iter().partition(OptionView::is_model);
+        let (agent_name, dot, state) = self.status();
+
+        let mut pickers: Vec<AnyElement> = shown
+            .into_iter()
+            .map(|option| {
+                let icon = option.footer_icon().unwrap_or(IconName::Circle);
+                option_picker(option, Icon::new(icon), &panel, None)
+            })
+            .collect();
+        if !more.is_empty() {
+            let summary = more
+                .iter()
+                .map(OptionView::summary)
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let panel = panel.clone();
+            pickers.push(
+                PopoverMenu::new("more-options")
+                    .trigger(
+                        ds::icon_button("more-options-button", IconName::Ellipsis)
+                            .icon_color(Color::Muted)
+                            .tooltip(move |_, cx| {
+                                Tooltip::with_meta("More options", None, summary.clone(), cx)
+                            }),
+                    )
+                    .menu(move |window, cx| {
+                        let more = more.clone();
+                        let panel = panel.clone();
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            for (index, option) in more.iter().enumerate() {
+                                if index > 0 {
+                                    menu = menu.separator();
+                                }
+                                menu = option.add_to(menu, &panel);
+                            }
+                            menu
+                        }))
+                    })
+                    .anchor(gpui::Anchor::BottomRight)
+                    .into_any_element(),
+            );
+        }
+        match models.into_iter().next() {
+            Some(model) => {
+                let icon = match provider_icon(&format!("{agent_name} {}", model.current_name())) {
+                    Some(icon) => Icon::new(icon),
+                    None => Icon::new(IconName::ZedAssistant),
+                };
+                pickers.push(option_picker(model, icon, &panel, Some(agent_name)));
+            }
+            None => {
+                let command = Self::command(cx).join(" ");
+                let about = if command.is_empty() {
+                    format!("{state}. Choose the agent in Settings.")
+                } else {
+                    format!("{state} · {command}. Choose the agent in Settings.")
+                };
+                pickers.push(
+                    h_flex()
+                        .id("agent")
+                        .h(px(ds::size::ROW))
+                        .px(px(ds::space::SM))
+                        .gap(px(ds::space::XS))
+                        .items_center()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                        .tooltip(Tooltip::text(about))
+                        .child(Indicator::dot().color(dot))
+                        .child(
+                            Label::new(agent_name)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(
+                                Box::new(studio_actions::workspace::OpenSettings),
+                                cx,
                             )
-                            .menu(move |window, cx| {
-                                let sections = sections.clone();
-                                let current = current.clone();
-                                let id = menu_id.clone();
-                                let panel = panel.clone();
-                                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                                    for (index, (header, values)) in
-                                        sections.into_iter().enumerate()
-                                    {
-                                        if index > 0 {
-                                            menu = menu.separator();
-                                        }
-                                        menu = menu.header(header);
-                                        for (value, name) in values {
-                                            let checked = value == current;
-                                            let panel = panel.clone();
-                                            let id = id.clone();
-                                            menu = menu.toggleable_entry(
-                                                name,
-                                                checked,
-                                                IconPosition::Start,
-                                                None,
-                                                move |_, cx| {
-                                                    if checked {
-                                                        return;
-                                                    }
-                                                    panel
-                                                        .update(cx, |panel, cx| {
-                                                            panel.set_option(
-                                                                id.clone(),
-                                                                SessionConfigOptionValue::value_id(
-                                                                    value.clone(),
-                                                                ),
-                                                                cx,
-                                                            )
-                                                        })
-                                                        .ok();
-                                                },
-                                            );
-                                        }
-                                    }
-                                    menu
-                                }))
-                            })
-                            .anchor(gpui::Anchor::BottomRight)
-                            .into_any_element(),
-                    );
-                }
-                SessionConfigKind::Boolean(boolean) => {
-                    let on = match pending {
-                        Some(SessionConfigOptionValue::Boolean { value }) => *value,
-                        _ => boolean.current_value,
-                    };
-                    let panel = panel.clone();
-                    pickers.push(
-                        h_flex()
-                            .id(SharedString::from(format!("option-{id}")))
-                            .tooltip(Tooltip::text(about))
-                            .child(
-                                Switch::new(
-                                    SharedString::from(format!("option-{id}-switch")),
-                                    on.into(),
-                                )
-                                .label(option.name.clone())
-                                .label_position(SwitchLabelPosition::Start)
-                                .label_size(LabelSize::Small)
-                                .label_color(Color::Muted)
-                                .disabled(pending.is_some())
-                                .on_click(move |state, _, cx| {
-                                    let next = matches!(state, ToggleState::Selected);
-                                    panel
-                                        .update(cx, |panel, cx| {
-                                            panel.set_option(
-                                                id.clone(),
-                                                SessionConfigOptionValue::boolean(next),
-                                                cx,
-                                            )
-                                        })
-                                        .ok();
-                                }),
-                            )
-                            .into_any_element(),
-                    );
-                }
-                _ => {}
+                        })
+                        .into_any_element(),
+                );
             }
         }
         pickers
     }
 
-    /// How full the context window is, as a ring and a percentage that turn to the warning
-    /// colour near the end; the token counts and the cost so far on hover.
+    /// How full the context window is, as a ring that turns to the warning colour near the end,
+    /// with the percentage then; the share, token counts and cost so far on hover.
     fn render_usage(&self, cx: &App) -> Option<AnyElement> {
         let usage = self.usage.as_ref().filter(|usage| usage.size > 0)?;
         let ratio = (usage.used as f32 / usage.size as f32).clamp(0., 1.);
@@ -2137,12 +2510,14 @@ impl AgentPanel {
                 .child(
                     CircularProgress::new(usage.used as f32, usage.size as f32, px(14.), cx)
                         .stroke_width(px(2.))
+                        // A visible track, so the ring reads as a gauge, not a spinner.
+                        .bg_color(cx.theme().colors().border)
                         .progress_color(color),
                 )
-                // The number too: a ring alone reads as a spinner.
-                .child(
-                    ds::text::meta(percent).when(nearly_full, |label| label.color(Color::Warning)),
-                )
+                // The number only when it matters.
+                .when(nearly_full, |row| {
+                    row.child(ds::text::meta(percent).color(Color::Warning))
+                })
                 .tooltip(move |_, cx| Tooltip::with_meta(title.clone(), None, meta.clone(), cx))
                 .into_any_element(),
         )
@@ -2202,6 +2577,22 @@ mod tests {
         assert_eq!(format_cost(0.0042, "USD"), "0.0042 USD");
         assert_eq!(format_cost(0.411, "USD"), "0.41 USD");
         assert_eq!(format_cost(0., "USD"), "0.00 USD");
+    }
+
+    #[test]
+    fn a_run_of_steps_reads_as_one_sentence() {
+        use ToolKind::*;
+        assert_eq!(activity_summary(1, &[Query]), "Thought 1 time, ran 1 query");
+        assert_eq!(
+            activity_summary(0, &[Schema, Query, Query, Other]),
+            "Read the schema, ran 2 queries, used 1 tool"
+        );
+        assert_eq!(activity_summary(2, &[]), "Thought 2 times");
+        assert_eq!(
+            activity_summary(0, &[Propose, Query, Propose]),
+            "Proposed 2 changes, ran 1 query"
+        );
+        assert_eq!(ToolKind::of("mcp__omnigraph__omnigraph_query"), Query);
     }
 
     #[test]

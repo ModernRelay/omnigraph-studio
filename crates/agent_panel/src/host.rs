@@ -11,12 +11,13 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, Implementation, InitializeRequest, LoadSessionRequest,
+    BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities,
+    ClientSessionCapabilities, ContentBlock, Implementation, InitializeRequest, LoadSessionRequest,
     McpServer, McpServerStdio, NewSessionRequest, PermissionOptionKind, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigId, SessionConfigOption, SessionConfigOptionValue,
-    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
-    TextContent,
+    SessionConfigOptionsCapabilities, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, StopReason, TextContent,
 };
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo, LineDirection};
 use futures::StreamExt as _;
@@ -184,9 +185,22 @@ async fn connect(
         )
         .connect_with(agent, async move |connection: ConnectionTo<Agent>| {
             let initialized = connection
-                .send_request(InitializeRequest::new(ProtocolVersion::V1).client_info(
-                    Implementation::new("omnigraph-studio", env!("CARGO_PKG_VERSION")),
-                ))
+                .send_request(
+                    InitializeRequest::new(ProtocolVersion::V1)
+                        .client_info(Implementation::new(
+                            "omnigraph-studio",
+                            env!("CARGO_PKG_VERSION"),
+                        ))
+                        // On/off options come as switches rather than On/Off menus.
+                        .client_capabilities(
+                            ClientCapabilities::new().session(
+                                ClientSessionCapabilities::new().config_options(
+                                    SessionConfigOptionsCapabilities::new()
+                                        .boolean(BooleanConfigOptionCapabilities::new()),
+                                ),
+                            ),
+                        ),
+                )
                 .block_task()
                 .await?;
             let agent_name = initialized
