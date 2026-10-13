@@ -8,7 +8,7 @@ use futures::FutureExt as _;
 use futures::channel::oneshot;
 use futures::future::{Either, Shared, select};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task};
-use gq_language::{BuiltQuery, SchemaModel};
+use gq_language::{BuiltQuery, RelationshipGroup, SchemaModel, builder};
 use graph_client::api::{
     BranchCreateOutput, BranchCreateRequest, BranchMergeOutput, BranchMergeRequest, ChangeOutput,
     ChangeRequest, CommitOutput, QueryRequest, ReadOutput, SnapshotDatasetOutput,
@@ -16,6 +16,7 @@ use graph_client::api::{
 use graph_client::{BlobAt, BlobCell, BlobMeta, GraphClient, ReadError, WriteOutcome};
 
 use crate::connection::Connection;
+use crate::degrees::{DEGREE_BATCH, DegreeBatchKey, DegreeBatches, page_counts};
 use crate::memo::{Held, Memo};
 
 /// A value that loads from the server.
@@ -117,6 +118,8 @@ pub struct GraphSession {
     commit_lists: ReadMemo<String, CommitList>,
     /// The branch list has been read once; reading it again forgets the commit lists.
     branches_read: bool,
+    /// Relationship counts asked for this turn, read together when it ends.
+    degrees: DegreeBatches,
     _recheck: Option<Task<()>>,
     _schema_task: Option<Task<()>>,
     _branches_task: Option<Task<()>>,
@@ -148,6 +151,7 @@ impl GraphSession {
             pinned_blobs: Memo::new(PINNED_BLOBS),
             commit_lists: Memo::new(COMMIT_LISTS),
             branches_read: false,
+            degrees: DegreeBatches::default(),
             _recheck: None,
             _schema_task: None,
             _branches_task: None,
@@ -536,6 +540,98 @@ impl GraphSession {
         })
     }
 
+    /// How many neighbours `id` has through `group`, at `snapshot` (the branch head when
+    /// `None`). Counts asked for in the same turn for one node type, relationship and commit
+    /// are read together, as `builder::page_degrees` reads of up to a hundred nodes in id
+    /// order (`crate::degrees`); an asker that stops waiting is left out, and a read nobody
+    /// waits for any more is stopped.
+    pub fn degree(
+        &mut self,
+        type_name: &str,
+        group: &RelationshipGroup,
+        id: &str,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<u64, String>> {
+        let (tx, rx) = oneshot::channel();
+        let key = DegreeBatchKey {
+            type_name: type_name.to_owned(),
+            group: group.clone(),
+            snapshot,
+        };
+        if self.degrees.add(key, id.to_owned(), tx) {
+            let session = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                session
+                    .update(cx, |session, cx| session.flush_degrees(cx))
+                    .ok();
+            });
+        }
+        cx.background_spawn(async move {
+            rx.await
+                .unwrap_or_else(|_| Err("The count was not read.".to_owned()))
+        })
+    }
+
+    fn flush_degrees(&mut self, cx: &mut Context<Self>) {
+        let schema = self.schema_model();
+        for (key, mut nodes) in self.degrees.take(DEGREE_BATCH) {
+            nodes.retain_mut(|(_, waiters)| {
+                waiters.retain(|waiter| !waiter.is_canceled());
+                !waiters.is_empty()
+            });
+            if nodes.is_empty() {
+                continue;
+            }
+            let ids: Vec<String> = nodes.iter().map(|(id, _)| id.clone()).collect();
+            let query = match &schema {
+                Some(schema) => builder::page_degrees(schema, &key.type_name, &key.group, &ids)
+                    .map_err(|error| error.to_string()),
+                None => Err("The schema is still loading.".to_owned()),
+            };
+            let query = match query {
+                Ok(query) => query,
+                Err(error) => {
+                    for (_, waiters) in nodes {
+                        for waiter in waiters {
+                            waiter.send(Err(error.clone())).ok();
+                        }
+                    }
+                    continue;
+                }
+            };
+            let read = self.read(&query, key.snapshot.clone(), cx);
+            cx.background_spawn(async move {
+                // Dropping the read when every asker has stopped waiting stops it.
+                let result = {
+                    let gone = futures::future::join_all(
+                        nodes
+                            .iter_mut()
+                            .flat_map(|(_, waiters)| waiters.iter_mut())
+                            .map(|waiter| waiter.cancellation()),
+                    );
+                    match select(read, std::pin::pin!(gone)).await {
+                        Either::Left((result, _)) => result,
+                        Either::Right(_) => return,
+                    }
+                };
+                let answer = result
+                    .map(|output| page_counts(&output.rows))
+                    .map_err(|error| error.to_string());
+                for (id, waiters) in nodes {
+                    let count = answer
+                        .as_ref()
+                        .map(|counts| counts.get(&id).copied().unwrap_or(0))
+                        .map_err(Clone::clone);
+                    for waiter in waiters {
+                        waiter.send(count.clone()).ok();
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
     /// Bytes `range` of a managed Blob value, for a preview.
     pub fn blob_bytes(
         &mut self,
@@ -898,6 +994,107 @@ mod tests {
             4,
             "the branch head moves: every read is sent"
         );
+    }
+
+    /// Counts asked for one at a time in the same turn go out as one read per node type and
+    /// relationship; asked again at the commit, they are answered from memory.
+    #[gpui::test]
+    async fn counts_asked_together_are_read_together(cx: &mut TestAppContext) {
+        use futures::AsyncReadExt as _;
+        use serde_json::Value;
+        let reads: Arc<std::sync::Mutex<Vec<(String, Value)>>> = Arc::default();
+        let seen = reads.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let seen = seen.clone();
+            async move {
+                let mut bytes = Vec::new();
+                request.into_body().read_to_end(&mut bytes).await.ok();
+                let body = if path.ends_with("/schema") {
+                    serde_json::json!({ "schema_source": "node Person {\n  slug: String @key\n}\nnode Company {\n  slug: String @key\n}\nedge Knows: Person -> Person\nedge WorksAt: Person -> Company\n" })
+                } else if path.ends_with("/query") {
+                    let request: Value = serde_json::from_slice(&bytes).unwrap();
+                    let name = request["name"].as_str().unwrap_or_default().to_owned();
+                    let ids = request["params"]["ids"].clone();
+                    seen.lock().unwrap().push((name, ids.clone()));
+                    // Every node but p-2 has as many neighbours as its id's last digit.
+                    let rows: Vec<Value> = ids
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .filter(|id| *id != "p-2")
+                        .map(|id| {
+                            let n = id[2..].parse::<u64>().unwrap();
+                            serde_json::json!({ "id": id, "n": n })
+                        })
+                        .collect();
+                    serde_json::json!({ "query_name": "studio_page_degrees", "target": { "snapshot": "c1" }, "row_count": rows.len(), "columns": ["id", "n"], "rows": rows, "graph_commit_id": "c1" })
+                } else {
+                    serde_json::json!({ "branches": ["main"] })
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        assert!(session.read_with(cx, |session, _| session.schema_model().is_some()));
+        let group = |edge: &str, other: &str| RelationshipGroup {
+            edge: edge.into(),
+            direction: gq_language::Direction::Outgoing,
+            other_type: other.into(),
+        };
+        let ask = |cx: &mut TestAppContext, edge: &str, other: &str, ids: &[&str]| {
+            let group = group(edge, other);
+            session.update(cx, |session, cx| {
+                ids.iter()
+                    .map(|id| session.degree("Person", &group, id, Some("c1".into()), cx))
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        // Three nodes' Knows and two nodes' WorksAt, asked one by one: two reads.
+        let knows = ask(cx, "Knows", "Person", &["p-3", "p-1", "p-2"]);
+        let works = ask(cx, "WorksAt", "Company", &["p-1", "p-3"]);
+        let mut counts = Vec::new();
+        for count in knows.into_iter().chain(works) {
+            counts.push(count.await.unwrap());
+        }
+        assert_eq!(counts, vec![3, 1, 0, 1, 3], "a node without a row has none");
+        let mut sent = reads.lock().unwrap().clone();
+        sent.sort_by_key(|(_, ids)| ids.to_string());
+        assert_eq!(
+            sent,
+            vec![
+                (
+                    "studio_page_degrees".into(),
+                    serde_json::json!(["p-1", "p-2", "p-3"])
+                ),
+                (
+                    "studio_page_degrees".into(),
+                    serde_json::json!(["p-1", "p-3"])
+                ),
+            ]
+        );
+
+        // The same counts at the same commit: from memory.
+        let again = ask(cx, "Knows", "Person", &["p-2", "p-1", "p-3"]);
+        for count in again {
+            count.await.unwrap();
+        }
+        assert_eq!(reads.lock().unwrap().len(), 2);
     }
 
     /// A branch's commit list is read once for every view that shows it, and again only after

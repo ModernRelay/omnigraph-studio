@@ -6,6 +6,7 @@
 pub mod changes;
 pub mod cli_config;
 mod connection;
+pub mod degrees;
 mod exploration;
 pub mod fixes;
 mod memo;

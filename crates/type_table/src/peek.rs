@@ -588,32 +588,27 @@ impl NodePeek {
                 }
                 continue;
             }
-            let query = match builder::degree(&schema, &type_name, &self.groups[index].group, &id) {
-                Ok(query) => query,
-                Err(error) => {
-                    self.groups[index].count = Loadable::Failed(error.to_string());
-                    continue;
-                }
-            };
+            // The session's batched counts, which the explorer asks the same way: a node
+            // open in both is read once at the commit.
             let session = self.session.downgrade();
             let snapshot = self.snapshot.clone();
+            let relationship = self.groups[index].group.clone();
+            let (type_name, id) = (type_name.clone(), id.clone());
             self.groups[index]._task = Some(cx.spawn(async move |this, cx| {
                 if debounce {
                     cx.background_executor().timer(COUNT_DELAY).await;
                 }
-                let Ok(read) = session.update(cx, |session, cx| session.read(&query, snapshot, cx))
-                else {
+                let Ok(count) = session.update(cx, |session, cx| {
+                    session.degree(&type_name, &relationship, &id, snapshot, cx)
+                }) else {
                     return;
                 };
-                let result = read.await;
+                let result = count.await;
                 this.update(cx, |this, cx| {
                     if let Some(group) = this.groups.get_mut(index) {
                         group.count = match result {
-                            Ok(output) => match crate::model::count_of(&output.rows) {
-                                Some(n) => Loadable::Loaded(n),
-                                None => Loadable::Failed("No count in the response".into()),
-                            },
-                            Err(error) => Loadable::Failed(error.to_string()),
+                            Ok(n) => Loadable::Loaded(i64::try_from(n).unwrap_or(i64::MAX)),
+                            Err(error) => Loadable::Failed(error),
                         };
                         // A small group shows its neighbours without a click.
                         let small = matches!(group.count, Loadable::Loaded(n)

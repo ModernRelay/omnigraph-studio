@@ -4,8 +4,10 @@
 //!
 //! Every read is pinned to the commit the first read returned (constitution II). A commit on
 //! the session's branch raises [`Exploration::newer_available`] and changes nothing until
-//! [`Exploration::refresh`]. Counts come from one `builder::degree` query per relationship
-//! group, run concurrently (engine change E16 would replace them); neighbours come in keyset
+//! [`Exploration::refresh`]. Counts come from the session's batched counts
+//! ([`GraphSession::degree`]): every count asked for in one turn (several nodes expanded,
+//! a refresh) is one `builder::page_degrees` read per node type and relationship group (engine
+//! change E16 would replace them); neighbours come in keyset
 //! pages from `builder::neighbours`, as many as the graph's `tree_page_size` setting. A
 //! relationship grouped by a property shows one row per value, from
 //! `builder::neighbour_values`, each opening to the neighbours with that value.
@@ -985,12 +987,7 @@ impl ExploreState {
     }
 
     /// Applies the answer to a count read.
-    pub fn apply_count(&mut self, key: GroupKey, output: &ReadOutput) {
-        let count = rows(output)
-            .first()
-            .and_then(|row| row.get("n"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+    pub fn apply_count(&mut self, key: GroupKey, count: u64) {
         self.counts.insert(key, Loadable::Loaded(count));
     }
 
@@ -1468,7 +1465,12 @@ impl Exploration {
             }
             LoadTarget::Count(key) => {
                 self.state.counts.insert(key.clone(), Loadable::Loading);
-                builder::degree(&schema, &key.node.type_name, &key.group, &key.node.id)
+                let snapshot = self.pin.clone();
+                let count = self.session.update(cx, |session, cx| {
+                    session.degree(&key.node.type_name, &key.group, &key.node.id, snapshot, cx)
+                });
+                self.spawn_count(target.clone(), count, cx);
+                return;
             }
             LoadTarget::Page(key) => {
                 let page_size = self.page_size(cx);
@@ -1580,19 +1582,53 @@ impl Exploration {
                     return;
                 }
                 this.apply(&key, result);
-                this.request_missing(cx);
-                // An answer read ahead for something closed shows nothing yet: nothing to draw.
-                let shows = this
-                    .schema(cx)
-                    .is_some_and(|schema| this.state.shows(&schema, &key));
-                if shows {
-                    cx.emit(ExplorationEvent::Loaded);
-                    cx.notify();
-                }
+                this.loaded(&key, cx);
             })
             .ok();
         });
         self.tasks.insert(target, task);
+    }
+
+    /// Waits for a count the session reads together with the others asked for this turn.
+    fn spawn_count(
+        &mut self,
+        target: LoadTarget,
+        count: Task<Result<u64, String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self.generation;
+        let key = target.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let count = count.await;
+            this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                match (&key, count) {
+                    (LoadTarget::Count(group), Ok(count)) => {
+                        this.state.apply_count(group.clone(), count)
+                    }
+                    (_, Ok(_)) => {}
+                    (_, Err(message)) => this.apply_failure(&key, message),
+                }
+                this.loaded(&key, cx);
+            })
+            .ok();
+        });
+        self.tasks.insert(target, task);
+    }
+
+    /// After an answer: reads what it made visible, and redraws when it shows.
+    fn loaded(&mut self, key: &LoadTarget, cx: &mut Context<Self>) {
+        self.request_missing(cx);
+        // An answer read ahead for something closed shows nothing yet: nothing to draw.
+        let shows = self
+            .schema(cx)
+            .is_some_and(|schema| self.state.shows(&schema, key));
+        if shows {
+            cx.emit(ExplorationEvent::Loaded);
+            cx.notify();
+        }
     }
 
     fn apply(&mut self, target: &LoadTarget, result: Result<ReadOutput, ReadError>) {
@@ -1608,7 +1644,14 @@ impl Exploration {
         }
         match target {
             LoadTarget::Root => self.state.apply_root(&output),
-            LoadTarget::Count(key) => self.state.apply_count(key.clone(), &output),
+            LoadTarget::Count(key) => {
+                let count = rows(&output)
+                    .first()
+                    .and_then(|row| row.get("n"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                self.state.apply_count(key.clone(), count)
+            }
             LoadTarget::Values(key, by) => {
                 self.state
                     .apply_values(key.clone(), by.clone(), &output, VALUES_LIMIT)
@@ -1779,9 +1822,9 @@ mod tests {
         let ada = person("ada");
         let key =
             |node: &NodeRef, group: &RelationshipGroup| GroupKey::new(node.clone(), group.clone());
-        state.apply_count(key(&ada, &works), &output(&["n"], json!([{"n": 0}])));
-        state.apply_count(key(&ada, &knows_out), &output(&["n"], json!([{"n": 2}])));
-        state.apply_count(key(&ada, &knows_in), &output(&["n"], json!([{"n": 1}])));
+        state.apply_count(key(&ada, &works), 0);
+        state.apply_count(key(&ada, &knows_out), 2);
+        state.apply_count(key(&ada, &knows_in), 1);
         state.apply_page(
             key(&ada, &manager),
             &output(&["id", "label"], json!([{"id": "bob", "label": "Bob"}])),
@@ -1855,7 +1898,7 @@ mod tests {
         let mut state = loaded_root(&schema);
         let knows = group(&schema, "Person", "Knows", Direction::Outgoing);
         let key = GroupKey::new(person("ada"), knows.clone());
-        state.apply_count(key.clone(), &output(&["n"], json!([{"n": 3}])));
+        state.apply_count(key.clone(), 3);
         state.expand(&ExplorePath::root().child_group(&knows));
         assert!(
             state
@@ -1899,7 +1942,7 @@ mod tests {
             on: GroupOn::Relationship,
             property: "out:WorksAt".into(),
         };
-        state.apply_count(key.clone(), &output(&["n"], json!([{"n": 4}])));
+        state.apply_count(key.clone(), 4);
         state.set_grouping(&knows, Some(by.clone()));
         state.expand(&ExplorePath::root().child_group(&knows));
         // The grouped read, then the count of neighbours with no company, added last.
@@ -1953,7 +1996,7 @@ mod tests {
             property: "role".into(),
         };
         let group_path = ExplorePath::root().child_group(&works_at);
-        state.apply_count(key.clone(), &output(&["n"], json!([{"n": 7}])));
+        state.apply_count(key.clone(), 7);
         state.set_grouping(&works_at, Some(by.clone()));
         state.expand(&group_path);
         let missing = state.missing_loads(&schema);
@@ -2064,7 +2107,7 @@ mod tests {
             state.prefetch_targets(&schema, &group_path),
             [LoadTarget::Page(key.clone())]
         );
-        state.apply_count(key.clone(), &output(&["n"], json!([{"n": 0}])));
+        state.apply_count(key.clone(), 0);
         assert!(state.prefetch_targets(&schema, &group_path).is_empty());
         // Grouped, its values instead.
         let mut state = loaded_root(&schema);

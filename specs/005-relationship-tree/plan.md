@@ -53,8 +53,12 @@ on the canvas. Typing filters the visible rows.
 
 ### Data
 
-- Group counts: one count query per relationship of the node's type, run concurrently, pinned to
-  the tree's snapshot and cached for it. Sketch:
+- Group counts: one count per relationship of the node's type, pinned to the tree's snapshot
+  and cached for it. Counts asked for in the same turn (several nodes expanded at once, a
+  refresh, a restored exploration) go out together: one `builder::page_degrees` read per node
+  type and relationship for up to 100 nodes, sorted by id (`graph_store::degrees`,
+  `GraphSession::degree`), so a node's peek and the tree share the read at the commit. GQ has
+  no single query that counts several relationship groups. Sketch of one count:
 
   ```
   query n($id: String) {
@@ -107,8 +111,8 @@ on the canvas. Typing filters the visible rows.
 
 ## Deferred
 
-- Engine change E16 (neighbourhood counts per node), [spec 012](../012-omnigraph-engine-changes/plan.md). Until then, one count query per
-  edge type, run concurrently and cached for the pinned commit.
+- Engine change E16 (neighbourhood counts per node), [spec 012](../012-omnigraph-engine-changes/plan.md). Until then, one count read per
+  edge type for the nodes asked for together, cached for the pinned commit.
 - Grouping by floats and datetimes, which need buckets: GQ 2.1 has no function that truncates a
   date or rounds a number, so each bucket would be a read of its own.
 - Showing the same model as columns in wide windows (node | relationships | nodes | …): the
@@ -119,6 +123,7 @@ on the canvas. Typing filters the visible rows.
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-10-11 | Tree primitives exist in Zed `ui` | `git ls-tree -r v1.23.2 crates/ui/src/components` | `tree_view_item.rs`, `indent_guides.rs`, `sticky_items.rs` |
+| 2026-10-13 | Counts asked for together are read together | `graph_store` `counts_asked_together_are_read_together` (three nodes' Knows and two nodes' WorksAt asked one by one: two reads, a node without a row counts 0, asked again at the commit: none), `askers_gather_by_type_relationship_and_commit_in_id_order`; offscreen snapshots through a request-counting proxy on Liskov Systems' canvas: mark all, Expand all (its 2 projects and the first 8 of 18 people), mark all, Expand all | The second expansion read 4 `studio_page_degrees` of 8 people and 2 of 2 projects, 6 reads for 36 counts that were one `studio_degree` read each; opening a node still reads its 4 counts once for the tree and the peek together |
 | 2026-10-13 | Count queries per edge type stay under 100 ms on a 1M-edge graph | `script/dev-seed.py --people 230000` (305k nodes, 1.08M edges: Knows 460k, Contributes 346k, WorksAt 230k, Owns 46k) loaded into a second `script/dev-server` (0.13, local file store, Apple M5 Pro); each `studio_degree` query six times, the first cold; the table's `studio_page_degrees` for a 100-row page the same way | Tree counts: 17–39 ms warm, 23–38 ms cold, for out and in groups of Person, Company and Project. A page's relationship column: 34–91 ms warm median, 112 ms worst, for `knows`. A full `count` over Knows: 334 ms |
 | 2026-10-12 | `builder::degree`, `builder::neighbours` and the new `builder::node_label` run on 0.13 and a later read accepts `snapshot` | HTTP probe against `script/dev-server` (0.13, port 8802); `cargo test -p gq_language` type-checks every builder | `count($m) as n` returns one row (0 when empty); null edge properties are omitted from rows; `snapshot` reads echo `target.snapshot` |
 | 2026-10-12 | Rows: root, groups with counts, zero-count groups dimmed and closed, neighbours with edge properties, indent guides | offscreen snapshot, Person `person-000000` and Company `company-00000` | Contributes 1, Knows 4, WorksAt 1, ← Knows 1; `Contributes 0` dimmed without a chevron |
