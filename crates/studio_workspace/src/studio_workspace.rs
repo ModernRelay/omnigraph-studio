@@ -39,7 +39,7 @@ pub use item::{Item, ItemEvent, ItemFooter, ItemHandle};
 pub use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};
 pub use panels::{Dock, PanelEntry, PanelPosition};
 pub use persistence::{
-    SavedGraph, SavedItem, SavedPane, SavedSession, SavedWorkspace, load_session,
+    SavedGraph, SavedItem, SavedPane, SavedSession, SavedWindow, SavedWorkspace, load_windows,
     register_item_kind, restore_enabled, saved_window_bounds,
 };
 
@@ -102,8 +102,10 @@ pub struct Workspace {
     /// were opened (the switcher's order).
     parked: Vec<ParkedGraph>,
     graph_order: Vec<EntityId>,
-    /// The open graphs as last written for the next start.
+    /// The open graphs as last written for the next start, and this window's place among the
+    /// windows reopened then.
     saved_session: Option<SavedSession>,
+    window_slot: u64,
     /// The document area: panes of tabs in a tree of splits (spec 002, "Frame").
     panes: Vec<Pane<Box<dyn ItemHandle>>>,
     center: Member,
@@ -174,11 +176,13 @@ impl Workspace {
         // A settings file that cannot be read is named in a toast that stays until dismissed.
         let settings_subscription =
             cx.observe_global::<StudioSettings>(|this, cx| this.show_settings_error(cx));
-        let bounds_subscription = cx.observe_window_bounds(window, |this, window, cx| {
+        let window_slot = persistence::window_opened(window, cx);
+        let bounds_subscription = cx.observe_window_bounds(window, move |this, window, cx| {
             let bounds = window.bounds();
             this._save_bounds = Some(cx.spawn(async move |_, cx| {
                 cx.background_executor().timer(SAVE_DELAY).await;
                 persistence::save_window_bounds(bounds);
+                cx.update(|cx| persistence::window_moved(window_slot, bounds, cx));
             }));
         });
         Self {
@@ -186,6 +190,7 @@ impl Workspace {
             parked: Vec::new(),
             graph_order: Vec::new(),
             saved_session: None,
+            window_slot,
             panes: vec![Pane::new(0)],
             center: Member::Pane(0),
             active_pane: 0,
@@ -290,7 +295,7 @@ impl Workspace {
         if persistence::restore_enabled() {
             let open = self.session_snapshot(cx);
             if self.saved_session.as_ref() != Some(&open) {
-                persistence::save_session(&open);
+                persistence::window_graphs_changed(self.window_slot, &open, cx);
                 self.saved_session = Some(open);
             }
         }

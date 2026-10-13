@@ -14,7 +14,7 @@ use gpui::{
 };
 use graph_store::{ConnectionRegistry, ConnectionState, open_session};
 use studio_actions::workspace::{NewWindow, OpenGraph, OpenSettings, Quit};
-use studio_workspace::Workspace;
+use studio_workspace::{SavedWindow, Workspace};
 
 pub use open_graph::OpenGraphModal;
 
@@ -50,7 +50,12 @@ pub fn init(cx: &mut App) {
     });
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &NewWindow, cx| {
-        cx.open_window(window_options(cx), build_workspace).ok();
+        cx.open_window(window_options(None, cx), |window, cx| {
+            let workspace = new_workspace(window, cx);
+            ask_for_graph(&workspace, window, cx);
+            workspace
+        })
+        .ok();
     });
     menus::set(cx);
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
@@ -93,8 +98,10 @@ fn open_settings(workspace: &mut Workspace, window: &mut Window, cx: &mut Contex
     });
 }
 
-pub fn window_options(cx: &App) -> WindowOptions {
-    let bounds = studio_workspace::saved_window_bounds(cx)
+/// A window's options, at `bounds` or else where the last moved window was.
+pub fn window_options(bounds: Option<gpui::Bounds<gpui::Pixels>>, cx: &App) -> WindowOptions {
+    let bounds = bounds
+        .or_else(|| studio_workspace::saved_window_bounds(cx))
         .unwrap_or_else(|| gpui::Bounds::centered(None, size(px(1440.), px(900.)), cx));
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -108,27 +115,85 @@ pub fn window_options(cx: &App) -> WindowOptions {
     }
 }
 
-/// Builds the root view of a window.
+/// Opens Studio's windows: one for `OMNIGRAPH_STUDIO_GRAPH` when it is set, else every window
+/// the last run had open with a graph on a server still known, each where it was, else one
+/// window asking for a graph.
+pub fn open_windows(cx: &mut App) {
+    let saved = if environment_graph(cx).is_some() {
+        Vec::new()
+    } else {
+        reopenable_windows(cx)
+    };
+    if saved.is_empty() {
+        cx.open_window(window_options(None, cx), build_workspace)
+            .ok();
+        return;
+    }
+    for saved in saved {
+        let bounds = saved.bounds(cx);
+        cx.open_window(window_options(bounds, cx), move |window, cx| {
+            let workspace = new_workspace(window, cx);
+            reopen_window(&workspace, &saved, window, cx);
+            workspace
+        })
+        .ok();
+    }
+}
+
+/// Builds the root view of a window and opens its first graph: the environment's, else the
+/// first window the last run had open, else none, asking for one.
 pub fn build_workspace(window: &mut Window, cx: &mut App) -> Entity<Workspace> {
+    let workspace = new_workspace(window, cx);
+    open_initial_graph(&workspace, window, cx);
+    workspace
+}
+
+fn new_workspace(window: &mut Window, cx: &mut App) -> Entity<Workspace> {
     let workspace = cx.new(|cx| Workspace::new(window, cx));
     // Actions dispatch along the focus path; until something inside the workspace has focus they
     // stop at the window root and never reach the workspace's handlers.
     let focus = workspace.read(cx).focus_handle(cx);
     window.focus(&focus, cx);
-    open_initial_graph(&workspace, window, cx);
     workspace
 }
 
-/// Reopens the graphs the last window had open, on servers still known, showing the one it
-/// showed. Returns whether any graph was reopened.
-fn reopen_last_session(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) -> bool {
-    let Some(saved) = studio_workspace::load_session() else {
-        return false;
+/// The saved windows that still have a graph on a known server, with only those graphs.
+fn reopenable_windows(cx: &App) -> Vec<SavedWindow> {
+    let registry = ConnectionRegistry::global(cx);
+    let known = |url: &str| {
+        registry
+            .read(cx)
+            .connections
+            .iter()
+            .any(|connection| connection.read(cx).server.url == url)
     };
+    studio_workspace::load_windows()
+        .into_iter()
+        .filter_map(|mut window| {
+            let shown = window.session.graphs.get(window.session.shown).cloned();
+            window
+                .session
+                .graphs
+                .retain(|graph| known(&graph.server_url));
+            window.session.shown = shown
+                .and_then(|shown| window.session.graphs.iter().position(|g| *g == shown))
+                .unwrap_or(0);
+            (!window.session.graphs.is_empty()).then_some(window)
+        })
+        .collect()
+}
+
+/// Reopens a saved window's graphs, showing the one it showed.
+fn reopen_window(
+    workspace: &Entity<Workspace>,
+    saved: &SavedWindow,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let registry = ConnectionRegistry::global(cx);
     let connections = registry.read(cx).connections.clone();
     let mut shown = None;
-    for (index, graph) in saved.graphs.iter().enumerate() {
+    for (index, graph) in saved.session.graphs.iter().enumerate() {
         let Some(connection) = connections
             .iter()
             .find(|c| c.read(cx).server.url == graph.server_url)
@@ -140,48 +205,56 @@ fn reopen_last_session(workspace: &Entity<Workspace>, window: &mut Window, cx: &
             connection.update(cx, |connection, cx| connection.connect(cx));
         }
         let session = open_session(connection, graph.graph.clone(), graph.branch.clone(), cx);
-        if index == saved.shown {
+        if index == saved.session.shown {
             shown = Some(session.entity_id());
         }
         workspace.update(cx, |workspace, cx| {
             workspace.set_session(session, window, cx)
         });
     }
-    let opened = !workspace.read(cx).open_graphs().is_empty();
     if let Some(id) = shown {
         workspace.update(cx, |workspace, cx| workspace.show_graph(id, window, cx));
     }
-    opened
 }
 
-/// Opens `OMNIGRAPH_STUDIO_GRAPH` on the environment server when both are set, else the graphs
-/// open at the last quit, else shows the "Open a graph" modal.
-fn open_initial_graph(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
+/// The environment server and `OMNIGRAPH_STUDIO_GRAPH`, when both are set.
+fn environment_graph(cx: &App) -> Option<(Entity<graph_store::Connection>, String)> {
+    let graph = std::env::var("OMNIGRAPH_STUDIO_GRAPH").ok()?;
+    let connection = ConnectionRegistry::global(cx)
+        .read(cx)
+        .find("environment", cx)?;
+    Some((connection, graph))
+}
+
+/// Connects to every known server and shows "Open a graph".
+fn ask_for_graph(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
     let registry = ConnectionRegistry::global(cx);
-    let graph = std::env::var("OMNIGRAPH_STUDIO_GRAPH").ok();
-    let environment = registry.read(cx).find("environment", cx);
-    match (environment, graph) {
-        (Some(connection), Some(graph)) => {
+    for connection in registry.read(cx).connections.clone() {
+        if connection.read(cx).state == ConnectionState::Idle {
             connection.update(cx, |connection, cx| connection.connect(cx));
-            let branch = std::env::var("OMNIGRAPH_STUDIO_BRANCH").unwrap_or_else(|_| "main".into());
-            let session = open_session(connection, graph, branch, cx);
-            workspace.update(cx, |workspace, cx| {
-                workspace.set_session(session, window, cx)
-            });
         }
-        _ if reopen_last_session(workspace, window, cx) => {}
-        _ => {
-            for connection in registry.read(cx).connections.clone() {
-                if connection.read(cx).state == ConnectionState::Idle {
-                    connection.update(cx, |connection, cx| connection.connect(cx));
-                }
-            }
-            let handle = workspace.downgrade();
-            workspace.update(cx, |workspace, cx| {
-                workspace.toggle_modal(window, cx, |window, cx| {
-                    OpenGraphModal::new(handle, window, cx)
-                });
-            });
-        }
+    }
+    let handle = workspace.downgrade();
+    workspace.update(cx, |workspace, cx| {
+        workspace.toggle_modal(window, cx, |window, cx| {
+            OpenGraphModal::new(handle, window, cx)
+        });
+    });
+}
+
+/// Opens `OMNIGRAPH_STUDIO_GRAPH` on the environment server when both are set, else the first
+/// window the last run had open, else shows "Open a graph".
+fn open_initial_graph(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
+    if let Some((connection, graph)) = environment_graph(cx) {
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        let branch = std::env::var("OMNIGRAPH_STUDIO_BRANCH").unwrap_or_else(|_| "main".into());
+        let session = open_session(connection, graph, branch, cx);
+        workspace.update(cx, |workspace, cx| {
+            workspace.set_session(session, window, cx)
+        });
+    } else if let Some(saved) = reopenable_windows(cx).first() {
+        reopen_window(workspace, saved, window, cx);
+    } else {
+        ask_for_graph(workspace, window, cx);
     }
 }

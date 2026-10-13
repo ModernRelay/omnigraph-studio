@@ -8,7 +8,10 @@ fn main() {
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref() == Some(std::ffi::OsStr::new(agent_panel::PROXY_COMMAND)) {
         let Some(socket) = args.next() else {
-            eprintln!("usage: omnigraph-studio {} <socket>", agent_panel::PROXY_COMMAND);
+            eprintln!(
+                "usage: omnigraph-studio {} <socket>",
+                agent_panel::PROXY_COMMAND
+            );
             std::process::exit(2);
         };
         if let Err(error) = agent_panel::proxy(std::path::Path::new(&socket)) {
@@ -18,14 +21,18 @@ fn main() {
         return;
     }
 
-    gpui_platform::application()
-        .with_assets(studio_theme::Assets)
-        .run(|cx: &mut App| {
-            studio::init(cx);
-            cx.open_window(studio::window_options(cx), |window, cx| {
-                studio::build_workspace(window, cx)
-            })
-            .expect("open the main window");
+    let app = gpui_platform::application().with_assets(studio_theme::Assets);
+    // On macOS the app outlives its last window; a click on the Dock icon then reopens the
+    // windows that were open, as at a start.
+    app.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            studio::open_windows(cx);
             cx.activate(true);
-        });
+        }
+    });
+    app.run(|cx: &mut App| {
+        studio::init(cx);
+        studio::open_windows(cx);
+        cx.activate(true);
+    });
 }

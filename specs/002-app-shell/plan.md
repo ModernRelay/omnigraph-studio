@@ -67,10 +67,15 @@ window", the shown graph checked, Open Another Graph…, Close Graph) and reads 
 more are open; ⌃⌘] and ⌃⌘[ step through them. Closing a graph saves its tabs (opening it
 again brings them back) and shows the one opened before; a graph with a write still running
 stays open, so the write's outcome is never dropped. Toasts follow the shown graph; a parked
-graph's writes still land in its activity log. Which graphs the window had open (server URL,
-graph, branch, and the one shown) is written to the owner-only `session.json` as it changes,
-and the next start reopens them, on servers still known, showing the one shown; with none to
-reopen it shows "Open a graph". Only the last window's graphs come back (see Deferred).
+graph's writes still land in its activity log. Each window's graphs (server URL, graph,
+branch, and the one shown) and bounds are written to the owner-only `session.json` as they
+change, in the order the windows opened. The next start reopens every window that has a graph
+on a server still known, where it was, showing the graph it showed; with none it opens one
+window asking for a graph. Closing a window forgets it, unless it was the last one open: that
+one comes back at the next start, or when the Dock icon is clicked with no window open, until
+another window opens. Quitting keeps every window. A new window (⌘⇧N) asks for a graph; it
+opens where the last moved window was. A `session.json` from before held one window's graphs
+and is read as one window.
 
 ### Window chrome
 
@@ -237,7 +242,6 @@ Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks ente
 
 ## Deferred
 
-- Multi-window session restore across launches beyond the last window.
 - A URL scheme (`omnigraph-studio://`) for deep links, until the launcher (E1) needs it. Deep
   links will fill a query tab and never run it.
 - Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
@@ -259,6 +263,7 @@ Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks ente
 | 2026-10-12 | Two graphs in one window | a second dev graph `notes` (`dev/cluster/notes.pg`, `dev/notes-seed.jsonl`); offscreen snapshots: Person and a query on `knowledge`, Open Graph, `click:` on `notes`, a Note table split in two, the switcher; then ⌃⌘] | The switcher listed both with `notes` checked and "+1 graph" in the footer; stepping back showed `knowledge` with its Person tab and the query draft |
 | 2026-10-12 | Palette scopes and Ask | offscreen snapshots with the new `key:` step: All for "pro", Nodes for "ada", ⌘4 with two query tabs, then Tab on "who knows ada" | Types, nodes and commands under All; five Adas under Nodes; both query tabs under Queries; Tab opened the agent tab with the question waiting. A Tab bound under `CommandPalette` alone lost to a binding at the editor level |
 | 2026-10-12 | Every tab kind comes back after a restart | offscreen snapshots: one run opened a type table, a query with a draft, history, canvas and storage; a second run with `OMNIGRAPH_STUDIO_NO_RESTORE=0` | All five tabs restored in order, the draft intact; the workspace file is `-rw-------` |
+| 2026-10-12 | Every window comes back | `persistence` tests (the older one-window file, opening order, a closed window forgotten, the last one kept until another opens; a GPUI test removing one of two windows); the debug binary with a separate data directory and a `session.json` of three windows, one on an unknown server | Two windows opened at their saved bounds, the third dropped, and the unknown server's graph left out of the other; an older file was rewritten in the new shape on the first start |
 
 ## Corrections
 
