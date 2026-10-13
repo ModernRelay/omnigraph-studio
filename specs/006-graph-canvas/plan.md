@@ -62,6 +62,15 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   `hub:Type/id/out:Edge`). A dragged node carries its pills that were not placed by hand, and
   their "+K more", so they keep their places beside it; "+K more" is never placed alone.
   Reset layout (↺, R) forgets them all. A drag that starts on empty space pans.
+- **Drawing cost.** Dotted lines are cut into 2-on 3-off dashes by walking each line once, in
+  paths of at most 6,000 dashes; GPUI's own `dash_array` measured the batch's whole path every
+  frame and overflowed a path's 65k-vertex cap, which dropped the batch. A path that still
+  overflows is painted in halves. Labels scale in half-pixel text steps while zooming, since
+  GPUI keeps a shaped line for one frame only and a smooth zoom reshaped every label every
+  frame. Chip widths come from character widths kept per canvas (GPUI's app-level
+  `layout_width` shapes each character anew). Reads that finish together (a node's counts)
+  arrive as one `ExplorationEvent::Loaded` within 8 ms and are laid out once; answers for
+  closed relationships (read ahead on hover) lay out nothing.
 - **Reading ahead:** when the pointer rests on a closed node or relationship pill for 120 ms,
   what opening it will show is read without opening it (`Exploration::prefetch`): a node's
   relationship counts and single-target fields, a relationship's first neighbours, or its
@@ -106,6 +115,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | 2026-10-12 | Layout off the main thread is deterministic, keeps drawn nodes in place, and bounds cost at the cap | `cargo test -p graph_canvas` (`layout::tests`) | 1,999 nodes in 464 ms in an unoptimized debug build, Apple M5 Pro; same input gives the same positions |
 | 2026-10-12 | Errors and loading show in the canvas, not a blank view | snapshot `OpenNode` Person `nobody` then `OpenCanvas` | banner "No Person with key nobody at this commit." · Retry |
 | 2026-10-12 | Keys walk and focus | offscreen snapshot: Allen Labs expanded, → → `[` F Space | `[` returned to Allen Labs, F centred it, Space showed it in the inspector |
+| 2026-10-12 | Dotted lines, labels and scene building cost less | `graph_canvas` `a_dotted_line_is_cut_into_dashes_across_its_bends`; `graph_store` `only_answers_for_what_is_open_change_what_is_shown`; snapshot `measure:60` (debug) on Sammet Systems → WorksAt → Ada, whose closed relationships draw dotted | A frame after a workspace notify 3.2 → 1.6 ms; a full redraw 11.9 → 7.5 ms; the dotted lines look as before |
 | 2026-10-12 | A click expands a node; ⇧-click inspects | offscreen snapshots on Sammet Systems → WorksAt: one click on Ada Lovelace; ⇧-click on Hedy Turing | Ada's relationship pills appeared beside her; the inspector showed Hedy Turing, with nothing opened |
 | 2026-10-12 | Resting on a chip reads ahead what it opens | `graph_store` `prefetching_reads_what_opening_would_show_and_nothing_twice`; two offscreen runs each, differing only in where the pointer rests, counting the dev server's read log lines | Resting on the closed "← WorksAt 7" pill: 21 reads against 20 (its first page); resting on a person under it: 25 against 21 (one count per Person relationship) |
 | 2026-10-12 | Pills drag, areas mark, and chips have menus | `graph_canvas` tests (a pill's pin key round trips; an area marks the chips it touches, not unpainted ones); offscreen snapshots on Sammet Systems with the snapshot tool's `drag:…,shift` and `click:…,right`: WorksAt dragged up then the company down; an area over three people; right clicks on a marked person, on WorksAt and on a person | WorksAt stayed where dropped while Owns moved with its company; Edsger, Ada and Grace marked with rings; "3 selected · Expand all · Collapse all · Keep where they are · Clear selection"; "Close · Group by › · Open related table"; "Open · Expand ↵ · Explore from here · Open in table · Copy key" |

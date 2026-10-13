@@ -265,6 +265,9 @@ pub struct GraphCanvas {
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     /// The read ahead for the chip the pointer rests on, once it has rested.
     _prefetch: Option<Task<()>>,
+    /// A rebuild waiting for reads that finish together.
+    _loaded: Option<Task<()>>,
+    char_widths: CharWidths,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Each node's chip on screen as last painted, for hit testing.
     chips: Rc<RefCell<Vec<Bounds<Pixels>>>>,
@@ -322,8 +325,23 @@ impl GraphCanvas {
         let subscriptions = vec![
             cx.subscribe(&exploration, |this, _, event, cx| match event {
                 ExplorationEvent::Changed => {
+                    this._loaded = None;
                     cx.emit(ItemEvent::UpdateTab);
                     this.rebuild(cx);
+                }
+                // Reads that finish together (a node's counts) are laid out in one go.
+                ExplorationEvent::Loaded => {
+                    if this._loaded.is_none() {
+                        this._loaded = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(COALESCE_LOADS).await;
+                            this.update(cx, |this, cx| {
+                                this._loaded = None;
+                                cx.emit(ItemEvent::UpdateTab);
+                                this.rebuild(cx);
+                            })
+                            .ok();
+                        }));
+                    }
                 }
                 ExplorationEvent::SelectionChanged => this.follow_selection(cx),
             }),
@@ -369,6 +387,8 @@ impl GraphCanvas {
             area: None,
             context_menu: None,
             _prefetch: None,
+            _loaded: None,
+            char_widths: CharWidths::default(),
             bounds: Rc::new(Cell::new(None)),
             chips: Rc::new(RefCell::new(Vec::new())),
             _subscriptions: subscriptions,
@@ -464,7 +484,7 @@ impl GraphCanvas {
             Mode::Schema => {
                 let session = self.session.read(cx);
                 let scene = model::schema_scene(&schema, |name| session.count_of(name));
-                let measure = measurer(cx);
+                let measure = measurer(cx, &self.char_widths);
                 let widths = half_widths(&scene, &measure);
                 // From the schema and the placed types only: each type is laid out with room
                 // for a six-digit count, whatever its count, so a count never moves a type.
@@ -518,7 +538,7 @@ impl GraphCanvas {
                     &self.hub_limits,
                     self.node_cap(cx),
                 );
-                let widths = half_widths(&scene, &measurer(cx));
+                let widths = half_widths(&scene, &measurer(cx, &self.char_widths));
                 let nodes: Vec<LayoutNode> = scene
                     .nodes
                     .iter()
@@ -578,7 +598,7 @@ impl GraphCanvas {
         for (node, parent) in scene.nodes.iter_mut().zip(&parent) {
             node.parent = *parent;
         }
-        let widths = half_widths(&scene, &measurer(cx));
+        let widths = half_widths(&scene, &measurer(cx, &self.char_widths));
         let nodes: Vec<LayoutNode> = scene
             .nodes
             .iter()
@@ -2140,19 +2160,41 @@ impl GraphCanvas {
 /// The room a node needs in layout: about half its chip's width at zoom 1 (a mark, the label
 /// at about seven pixels a character, a count, and the padding).
 /// Measures text with the UI font, as the painter shapes chip text, for the layout.
-fn measurer(cx: &App) -> impl Fn(&str, f32, gpui::FontWeight) -> f32 + use<> {
+///
+/// GPUI's app-level `layout_width` shapes each character with CoreText and keeps nothing, so
+/// widths are kept here, per character, size and weight, for as long as the canvas lives.
+fn measurer(cx: &App, widths: &CharWidths) -> impl Fn(&str, f32, gpui::FontWeight) -> f32 + use<> {
     let system = cx.text_system().clone();
     let font = theme::theme_settings(cx).ui_font(cx).clone();
+    let widths = widths.clone();
     move |text, size, weight| {
-        let id = system.resolve_font(&gpui::Font {
-            weight,
-            ..font.clone()
-        });
+        let mut widths = widths.borrow_mut();
+        // The font changes with the theme settings: a new font starts afresh.
+        if widths.0 != font.family {
+            *widths = (font.family.clone(), HashMap::new());
+        }
+        let mut id = None;
         text.chars()
-            .map(|ch| f32::from(system.layout_width(id, px(size), ch)))
+            .map(|ch| {
+                *widths
+                    .1
+                    .entry((ch, size.to_bits(), weight.0.to_bits()))
+                    .or_insert_with(|| {
+                        let id = *id.get_or_insert_with(|| {
+                            system.resolve_font(&gpui::Font {
+                                weight,
+                                ..font.clone()
+                            })
+                        });
+                        f32::from(system.layout_width(id, px(size), ch))
+                    })
+            })
             .sum()
     }
 }
+
+/// Character widths measured so far, by character, size and weight, for one font family.
+type CharWidths = Rc<RefCell<(SharedString, HashMap<(char, u32, u32), f32>)>>;
 
 /// Half of each node's chip width at zoom 1, measured as the painter draws it.
 fn half_widths(scene: &Scene, measure: &impl Fn(&str, f32, gpui::FontWeight) -> f32) -> Vec<f32> {
@@ -2162,6 +2204,9 @@ fn half_widths(scene: &Scene, measure: &impl Fn(&str, f32, gpui::FontWeight) -> 
         .map(|node| paint::chip_width(&paint::chip_text(node), measure) / 2.)
         .collect()
 }
+
+/// How long finished reads are gathered before the canvas is laid out again: about a frame.
+const COALESCE_LOADS: std::time::Duration = std::time::Duration::from_millis(8);
 
 /// How long the pointer rests on a chip before what it opens is read ahead.
 const PREFETCH_AFTER: std::time::Duration = std::time::Duration::from_millis(120);

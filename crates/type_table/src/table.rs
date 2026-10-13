@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -196,6 +197,8 @@ pub struct TypeTable {
     sort: Option<Sort>,
     /// Rows grouped by one property: sections by value, each read on its own.
     grouping: Option<Grouping>,
+    /// The grouped grid's lines as this frame drew them.
+    frame_lines: Option<Rc<Vec<Line>>>,
     /// Labels of nodes picked for "related to" filters, so their pills read by name.
     node_labels: HashMap<String, String>,
     /// The filter being written's property and operator menus; the offered values hide while
@@ -406,6 +409,7 @@ impl TypeTable {
             filters: Vec::new(),
             sort: None,
             grouping: None,
+            frame_lines: None,
             node_labels: HashMap::new(),
             filter_menus: Default::default(),
             filter_draft: None,
@@ -3922,7 +3926,14 @@ impl TypeTable {
             .collect();
         // Grouped, the grid draws lines (headers, rows, read-more lines); otherwise one line
         // per row. Per line: the row it shows, if any.
-        let lines: Option<Vec<Line>> = self.grouping.as_ref().map(Grouping::lines);
+        // The lines are worked out once a frame and shared with the row callback, which the
+        // list calls more than once a frame.
+        let lines: Option<Rc<Vec<Line>>> = self
+            .grouping
+            .as_ref()
+            .map(|grouping| Rc::new(grouping.lines()));
+        self.frame_lines = lines.clone();
+        let selection: HashSet<&str> = self.selection.iter().map(String::as_str).collect();
         let row_at: Vec<Option<usize>> = match &lines {
             Some(lines) => lines
                 .iter()
@@ -3939,7 +3950,7 @@ impl TypeTable {
             .enumerate()
             .filter(|(_, row)| {
                 row.and_then(|row| self.rows.get(row))
-                    .is_some_and(|row| self.selection.contains(&row.id))
+                    .is_some_and(|row| selection.contains(row.id.as_str()))
             })
             .map(|(line, _)| line)
             .collect();
@@ -3957,7 +3968,7 @@ impl TypeTable {
             cursor_row.and_then(|cursor| row_at.iter().position(|row| *row == Some(cursor)));
         let header_lines: HashSet<usize> = lines
             .iter()
-            .flatten()
+            .flat_map(|lines| lines.iter())
             .enumerate()
             .filter(|(_, line)| matches!(line, Line::Header(_)))
             .map(|(ix, _)| ix)
@@ -3990,7 +4001,7 @@ impl TypeTable {
                 "type-table-rows",
                 line_count,
                 cx.processor(|this, range: Range<usize>, window, cx| {
-                    let Some(lines) = this.grouping.as_ref().map(Grouping::lines) else {
+                    let Some(lines) = this.frame_lines.clone() else {
                         if this.more_error.is_none()
                             && this
                                 .paging

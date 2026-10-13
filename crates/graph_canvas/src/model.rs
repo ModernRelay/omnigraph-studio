@@ -2,7 +2,7 @@
 //! exploration as nodes, hubs (one per opened relationship group) and "+K more" chips, each
 //! node drawn once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gq_language::{Direction, SchemaModel};
 use graph_store::{Entry, EntryKind, ExplorePath, ExploreState, GroupKey, Loadable, NodeRef};
@@ -201,6 +201,8 @@ pub fn explore_scene(
     let mut placed: Vec<Option<usize>> = vec![None; entries.len()];
     let mut skipped = vec![false; entries.len()];
     let mut shown_per_hub: HashMap<usize, usize> = HashMap::new();
+    // The lines drawn so far, so a line is drawn once without searching every line.
+    let mut lines: HashSet<(usize, usize)> = HashSet::new();
     let mut hidden: HashMap<String, usize> = HashMap::new();
     let label_of = |node: &NodeRef| {
         state
@@ -240,7 +242,7 @@ pub fn explore_scene(
                 if let Some(existing) = by_id.get(&id).copied() {
                     // Drawn once: another path to it adds an edge only.
                     if let Some(hub) = parent_scene {
-                        push_edge(&mut scene, hub, existing);
+                        push_edge(&mut scene, &mut lines, hub, existing);
                     }
                     placed[index] = Some(existing);
                     if *expanded
@@ -274,7 +276,7 @@ pub fn explore_scene(
                     },
                 );
                 if let Some(hub) = parent_scene {
-                    push_edge(&mut scene, hub, new);
+                    push_edge(&mut scene, &mut lines, hub, new);
                 }
                 placed[index] = Some(new);
             }
@@ -331,7 +333,7 @@ pub fn explore_scene(
                         radius: HUB_RADIUS,
                     },
                 );
-                push_edge(&mut scene, owner, hub);
+                push_edge(&mut scene, &mut lines, owner, hub);
                 placed[index] = Some(hub);
             }
             // A relationship with at most one target is a hub like any other on the canvas, so
@@ -371,7 +373,7 @@ pub fn explore_scene(
                                 radius: HUB_RADIUS,
                             },
                         );
-                        push_edge(&mut scene, owner, hub);
+                        push_edge(&mut scene, &mut lines, owner, hub);
                         hub
                     }
                     None => continue,
@@ -402,14 +404,14 @@ pub fn explore_scene(
                     ),
                     None => continue,
                 };
-                push_edge(&mut scene, hub, to);
+                push_edge(&mut scene, &mut lines, hub, to);
             }
             EntryKind::Cycle { node, .. } => {
                 if let (Some(hub), Some(existing)) = (
                     parent_scene,
                     by_id.get(&SceneId::Node(node.clone())).copied(),
                 ) {
-                    push_edge(&mut scene, hub, existing);
+                    push_edge(&mut scene, &mut lines, hub, existing);
                 }
             }
             // The canvas draws a grouped relationship as its hub: a value's neighbours hang
@@ -427,15 +429,15 @@ pub fn explore_scene(
     let hubs: Vec<usize> = (0..scene.nodes.len())
         .filter(|ix| matches!(scene.nodes[*ix].kind, SceneKind::Hub { open: true, .. }))
         .collect();
+    let mut drawn_from: HashMap<usize, u64> = HashMap::new();
+    for edge in scene.edges.iter().filter(|edge| edge.label.is_none()) {
+        *drawn_from.entry(edge.from).or_default() += 1;
+    }
     for hub in hubs {
         let SceneKind::Hub { key, count, .. } = scene.nodes[hub].kind.clone() else {
             continue;
         };
-        let drawn = scene
-            .edges
-            .iter()
-            .filter(|edge| edge.from == hub && edge.label.is_none())
-            .count() as u64;
+        let drawn = drawn_from.get(&hub).copied().unwrap_or(0);
         let total = count.unwrap_or(0);
         if total > drawn && scene.nodes.len() < cap {
             let more = SceneNode {
@@ -451,7 +453,7 @@ pub fn explore_scene(
                 radius: MORE_RADIUS,
             };
             let index = add(&mut scene, &mut by_id, more);
-            push_edge(&mut scene, hub, index);
+            push_edge(&mut scene, &mut lines, hub, index);
         }
     }
 
@@ -475,18 +477,14 @@ fn hub_limit(hub: &SceneNode, limits: &HashMap<GroupKey, usize>) -> usize {
 }
 
 /// An unlabelled edge, in the color of the relationship: the hub's, whichever end it is.
-fn push_edge(scene: &mut Scene, from: usize, to: usize) {
+fn push_edge(scene: &mut Scene, lines: &mut HashSet<(usize, usize)>, from: usize, to: usize) {
     let hub_end = if matches!(scene.nodes[to].kind, SceneKind::Hub { .. }) {
         to
     } else {
         from
     };
     let color_key = scene.nodes[hub_end].color_key.clone();
-    if !scene
-        .edges
-        .iter()
-        .any(|edge| edge.from == from && edge.to == to)
-    {
+    if lines.insert((from, to)) {
         scene.edges.push(SceneEdge {
             from,
             to,

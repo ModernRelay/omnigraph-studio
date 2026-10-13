@@ -129,6 +129,8 @@ pub struct RelationshipTree {
     _workspace_subscription: Subscription,
     /// The read ahead for the row the pointer rests on, once it has rested.
     _prefetch: Option<gpui::Task<()>>,
+    /// A rebuild waiting for reads that finish together.
+    _loaded: Option<gpui::Task<()>>,
 }
 
 impl Focusable for RelationshipTree {
@@ -171,6 +173,7 @@ impl RelationshipTree {
             exploration_subscriptions: Vec::new(),
             _workspace_subscription: workspace_subscription,
             _prefetch: None,
+            _loaded: None,
         };
         if session.is_some() && window.focused(cx).is_none() {
             window.focus(&tree.focus_handle, cx);
@@ -195,7 +198,25 @@ impl RelationshipTree {
         if let (Some(exploration), Some(session)) = (&exploration, &session) {
             self.exploration_subscriptions
                 .push(cx.subscribe(exploration, |this, _, event, cx| match event {
-                    ExplorationEvent::Changed => this.rebuild(cx),
+                    ExplorationEvent::Changed => {
+                        this._loaded = None;
+                        this.rebuild(cx);
+                    }
+                    // Reads that finish together (a node's counts) are shown in one go.
+                    ExplorationEvent::Loaded => {
+                        if this._loaded.is_none() {
+                            this._loaded = Some(cx.spawn(async move |this, cx| {
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_millis(8))
+                                    .await;
+                                this.update(cx, |this, cx| {
+                                    this._loaded = None;
+                                    this.rebuild(cx);
+                                })
+                                .ok();
+                            }));
+                        }
+                    }
                     ExplorationEvent::SelectionChanged => this.follow_selection(cx),
                 }));
             self.exploration_subscriptions.push(cx.subscribe(

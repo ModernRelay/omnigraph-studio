@@ -43,8 +43,14 @@ const DOT_STEP: f32 = 22.;
 pub(crate) const ALWAYS_LABEL: usize = 16;
 /// The warm ring that marks where you are (Tower's `CHIP_FOCUS`).
 const WARM: u32 = 0xf2b48f;
-/// Segments per path: GPUI caps one path near 65k vertices.
+/// Segments per path: GPUI caps one path near 65k vertices. A batch that still needs more is
+/// painted in halves (`stroke_lines`), never dropped.
 const SEGMENTS_PER_PATH: usize = 2_000;
+/// A dotted line's pattern in screen pixels: a dash, then a gap.
+const DASH: f32 = 2.;
+const GAP: f32 = 3.;
+/// Dashes per path: each is a short straight stroke of a few vertices.
+const DASHES_PER_PATH: usize = 6_000;
 
 /// How a line runs between its two ends.
 #[derive(Clone, Copy)]
@@ -264,8 +270,10 @@ pub(crate) fn paint(
     if screen.len() != scene.nodes.len() {
         return;
     }
-    // Chips grow with the view up to their size at zoom 1, as Tower's do (13-pixel text).
-    let scale = zoom.clamp(0.3, 1.);
+    // Chips grow with the view up to their size at zoom 1, as Tower's do (13-pixel text), in
+    // half-pixel text steps: a label is shaped again only when its size changes, and GPUI keeps
+    // a shaped line for one frame, so a smooth zoom would reshape every label on every frame.
+    let scale = (zoom.clamp(0.3, 1.) * CHIP_TEXT * 2.).round() / (CHIP_TEXT * 2.);
     let visible = |p: Point<Pixels>, margin: f32| {
         p.x >= bounds.left() - px(margin)
             && p.x <= bounds.right() + px(margin)
@@ -354,23 +362,20 @@ pub(crate) fn paint(
     window.paint_layer(bounds, |window| {
         for (tone, segments) in &batches {
             let color = palette.text.opacity(f32::from(tone.alpha) / 1000.);
-            for chunk in segments.chunks(SEGMENTS_PER_PATH) {
-                let mut builder = PathBuilder::stroke(px(1.));
-                if tone.dotted {
-                    builder = builder.dash_array(&[px(2.), px(3.)]);
+            if tone.dotted {
+                // Dotted lines are cut into dashes here, by walking each line once. GPUI's
+                // `dash_array` measures the batch's whole path on every frame, and its dashes
+                // overflow a path's vertex cap, which would drop the batch.
+                let mut pieces = Vec::new();
+                for (from, to, curve) in segments {
+                    dashes(&flatten(*from, *to, *curve), &mut pieces);
                 }
-                for (from, to, curve) in chunk {
-                    builder.move_to(*from);
-                    match curve {
-                        Curve::Straight => builder.line_to(*to),
-                        Curve::Bowed(control) => builder.curve_to(*to, *control),
-                        Curve::Level(first, second) => {
-                            builder.cubic_bezier_to(*to, *first, *second)
-                        }
-                    }
+                for chunk in pieces.chunks(DASHES_PER_PATH) {
+                    stroke_lines(window, chunk, color);
                 }
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, color);
+            } else {
+                for chunk in segments.chunks(SEGMENTS_PER_PATH) {
+                    stroke_lines(window, chunk, color);
                 }
             }
         }
@@ -527,6 +532,105 @@ pub(crate) fn paint(
 }
 
 /// Tower's dot grid: the foreground at 7%, a 1.2-pixel dot every 22 pixels, fixed to the screen.
+/// Strokes lines as one path. Lines that need more vertices than a path holds are painted in
+/// halves, so a batch is never dropped.
+fn stroke_lines(window: &mut Window, lines: &[Segment], color: Hsla) {
+    let mut builder = PathBuilder::stroke(px(1.));
+    for (from, to, curve) in lines {
+        builder.move_to(*from);
+        match curve {
+            Curve::Straight => builder.line_to(*to),
+            Curve::Bowed(control) => builder.curve_to(*to, *control),
+            Curve::Level(first, second) => builder.cubic_bezier_to(*to, *first, *second),
+        }
+    }
+    match builder.build() {
+        Ok(path) => window.paint_path(path, color),
+        Err(_) if lines.len() > 1 => {
+            let (first, second) = lines.split_at(lines.len() / 2);
+            stroke_lines(window, first, color);
+            stroke_lines(window, second, color);
+        }
+        Err(_) => {}
+    }
+}
+
+/// Points along a line, close enough that the straight pieces between them follow its curve.
+fn flatten(from: Point<Pixels>, to: Point<Pixels>, curve: Curve) -> Vec<Point<Pixels>> {
+    let at = |p: Point<Pixels>| (f32::from(p.x), f32::from(p.y));
+    let (a, b) = (at(from), at(to));
+    let controls: Vec<(f32, f32)> = match curve {
+        Curve::Straight => return vec![from, to],
+        Curve::Bowed(control) => vec![at(control)],
+        Curve::Level(first, second) => vec![at(first), at(second)],
+    };
+    // The control polygon is at least as long as the curve: a piece every 6 px or so.
+    let mut polygon = 0.;
+    let mut previous = a;
+    for p in controls.iter().copied().chain([b]) {
+        polygon += ((p.0 - previous.0).powi(2) + (p.1 - previous.1).powi(2)).sqrt();
+        previous = p;
+    }
+    let steps = ((polygon / 6.).ceil() as usize).clamp(4, 96);
+    (0..=steps)
+        .map(|i| {
+            let t = i as f32 / steps as f32;
+            let u = 1. - t;
+            let (x, y) = match controls.as_slice() {
+                [c] => (
+                    u * u * a.0 + 2. * u * t * c.0 + t * t * b.0,
+                    u * u * a.1 + 2. * u * t * c.1 + t * t * b.1,
+                ),
+                [c1, c2] => (
+                    u * u * u * a.0
+                        + 3. * u * u * t * c1.0
+                        + 3. * u * t * t * c2.0
+                        + t * t * t * b.0,
+                    u * u * u * a.1
+                        + 3. * u * u * t * c1.1
+                        + 3. * u * t * t * c2.1
+                        + t * t * t * b.1,
+                ),
+                _ => (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t),
+            };
+            point(px(x), px(y))
+        })
+        .collect()
+}
+
+/// The dashes of a dotted line through `points`, as straight pieces: `DASH` on, `GAP` off,
+/// continuing across the line's bends.
+fn dashes(points: &[Point<Pixels>], out: &mut Vec<Segment>) {
+    let period = DASH + GAP;
+    // Where in the pattern the walk is: below `DASH` is inside a dash.
+    let mut phase = 0.;
+    for pair in points.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        let (dx, dy) = (f32::from(to.x - from.x), f32::from(to.y - from.y));
+        let length = (dx * dx + dy * dy).sqrt();
+        if length <= f32::EPSILON {
+            continue;
+        }
+        let along = |d: f32| point(from.x + px(dx * d / length), from.y + px(dy * d / length));
+        let mut walked = 0.;
+        while walked < length {
+            if phase < DASH {
+                let end = (walked + DASH - phase).min(length);
+                out.push((along(walked), along(end), Curve::Straight));
+                phase += end - walked;
+                walked = end;
+            } else {
+                let end = (walked + period - phase).min(length);
+                phase += end - walked;
+                walked = end;
+            }
+            if phase >= period {
+                phase -= period;
+            }
+        }
+    }
+}
+
 fn paint_dots(bounds: Bounds<Pixels>, palette: &Palette, window: &mut Window) {
     let color = palette.text.opacity(0.07);
     let left = f32::from(bounds.left());
@@ -815,4 +919,51 @@ pub(crate) fn format_count(count: i64) -> String {
         out.push(c);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dotted_line_is_cut_into_dashes_across_its_bends() {
+        let mut pieces = Vec::new();
+        dashes(
+            &[point(px(0.), px(0.)), point(px(50.), px(0.))],
+            &mut pieces,
+        );
+        assert_eq!(pieces.len(), 10, "a dash every 5 px");
+        assert!(
+            pieces
+                .iter()
+                .all(|(a, b, _)| (f32::from(b.x - a.x) - DASH).abs() < 1e-3)
+        );
+        // A bend in the middle of a dash continues it on the next piece.
+        let mut bent = Vec::new();
+        dashes(
+            &[
+                point(px(0.), px(0.)),
+                point(px(6.), px(0.)),
+                point(px(6.), px(10.)),
+            ],
+            &mut bent,
+        );
+        let drawn: f32 = bent
+            .iter()
+            .map(|(a, b, _)| f32::from(b.x - a.x).abs() + f32::from(b.y - a.y).abs())
+            .sum();
+        assert!(
+            (drawn - 7.).abs() < 1e-3,
+            "16 px of line, 7 px of dashes: {drawn}"
+        );
+        // A curve is followed from end to end.
+        let curve = flatten(
+            point(px(0.), px(0.)),
+            point(px(100.), px(0.)),
+            Curve::Bowed(point(px(50.), px(50.))),
+        );
+        assert_eq!(curve.first(), Some(&point(px(0.), px(0.))));
+        assert_eq!(curve.last(), Some(&point(px(100.), px(0.))));
+        assert!(curve.len() > 4);
+    }
 }

@@ -833,6 +833,33 @@ impl ExploreState {
         }
     }
 
+    /// Whether an answer to `target` can change what is shown: the relationship it reads is
+    /// open, or (for counts and single-target fields) the node it belongs to is. An answer read
+    /// ahead for something closed shows nothing until that opens, and opening it redraws.
+    pub fn shows(&self, schema: &SchemaModel, target: &LoadTarget) -> bool {
+        let Some(root) = &self.root else {
+            return false;
+        };
+        let node_open = |node: &NodeRef| {
+            self.expanded
+                .iter()
+                .any(|path| path.ends_at_node() && path.node(root) == node)
+        };
+        let group_open = |key: &GroupKey| {
+            self.expanded
+                .iter()
+                .any(|path| self.group_key(path).as_ref() == Some(key))
+        };
+        match target {
+            LoadTarget::Root => true,
+            LoadTarget::Count(key) => node_open(&key.node),
+            LoadTarget::Page(key) if key.within.is_none() && is_field(schema, &key.group) => {
+                node_open(&key.node)
+            }
+            LoadTarget::Page(key) | LoadTarget::Values(key, _) => group_open(key),
+        }
+    }
+
     /// The reads opening `path` would need that are not made yet: a node's relationship
     /// counts (and its single-target fields), or a relationship's first neighbours, or its
     /// values when it is grouped. A relationship known to be empty needs none.
@@ -1030,8 +1057,11 @@ fn rows(output: &ReadOutput) -> Vec<serde_json::Map<String, Value>> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExplorationEvent {
-    /// The root, expansions or loaded data changed.
+    /// The root or the expansions changed: what is shown changed now.
     Changed,
+    /// Reads finished whose answers change what is shown. Several often finish together (one
+    /// count per relationship of a node), so a view may draw them in one go.
+    Loaded,
     /// The selected path changed.
     SelectionChanged,
 }
@@ -1466,7 +1496,14 @@ impl Exploration {
                 }
                 this.apply(&key, result);
                 this.request_missing(cx);
-                this.changed(cx);
+                // An answer read ahead for something closed shows nothing yet: nothing to draw.
+                let shows = this
+                    .schema(cx)
+                    .is_some_and(|schema| this.state.shows(&schema, &key));
+                if shows {
+                    cx.emit(ExplorationEvent::Loaded);
+                    cx.notify();
+                }
             })
             .ok();
         });
@@ -1907,6 +1944,37 @@ mod tests {
         );
         state.apply_values(key, by, &output(&["value", "n"], json!([])), 100);
         assert!(state.prefetch_targets(&schema, &path).is_empty());
+    }
+
+    #[test]
+    fn only_answers_for_what_is_open_change_what_is_shown() {
+        let schema = schema();
+        let mut state = loaded_root(&schema);
+        let knows = group(&schema, "Person", "Knows", Direction::Outgoing);
+        let manager = group(&schema, "Person", "Manager", Direction::Outgoing);
+        let bob = person("bob");
+        let bob_knows = GroupKey::new(bob.clone(), knows.clone());
+        // Bob is a neighbour of the open root, not open himself.
+        assert!(state.shows(&schema, &LoadTarget::Root));
+        assert!(state.shows(
+            &schema,
+            &LoadTarget::Count(GroupKey::new(person("ada"), knows.clone()))
+        ));
+        assert!(!state.shows(&schema, &LoadTarget::Count(bob_knows.clone())));
+        assert!(!state.shows(&schema, &LoadTarget::Page(bob_knows.clone())));
+        let bob_path = ExplorePath::root().child_group(&knows).child_node(&bob);
+        state.expand(&bob_path);
+        assert!(state.shows(&schema, &LoadTarget::Count(bob_knows.clone())));
+        assert!(
+            state.shows(
+                &schema,
+                &LoadTarget::Page(GroupKey::new(bob.clone(), manager))
+            ),
+            "a single-target field shows on its open node"
+        );
+        assert!(!state.shows(&schema, &LoadTarget::Page(bob_knows.clone())));
+        state.expand(&bob_path.child_group(&knows));
+        assert!(state.shows(&schema, &LoadTarget::Page(bob_knows)));
     }
 
     #[test]
