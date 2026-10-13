@@ -83,7 +83,9 @@ Linux. CI caches `~/.cargo/git` and `target/` keyed on `Cargo.lock`.
   a secure timestamp; with `STUDIO_NOTARY_PROFILE` it notarizes with `notarytool` and staples.
   Without them the app is signed ad hoc. Entitlements (`resources/macos/studio.entitlements`)
   are only the JIT pair Zed's wasmtime needs. Signing needs a ModernRelay Apple Developer
-  account. The app has no icon yet.
+  account. The icon is the Modern Relay mark (from ModernRelay/brand) in white on a black
+  macOS-shaped tile; `script/make-icon.py` draws it into `resources/macos/AppIcon.icns` and
+  `resources/linux/omnigraph-studio.png`, which the bundle scripts install.
 - Linux: `script/bundle-linux` builds a tarball (`bin/`, a `.desktop` entry, `LICENSE`).
   AppImage later. Windows: later.
 - CI bundles the debug build on both systems so the scripts keep working.

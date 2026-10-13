@@ -4,13 +4,14 @@
 #   omnigraph-studio-<version>-linux-<arch>/
 #     bin/omnigraph-studio
 #     share/applications/omnigraph-studio.desktop
+#     share/icons/hicolor/512x512/apps/omnigraph-studio.png
 #     LICENSE
 #
 #   script/bundle-linux            # release build
 #   script/bundle-linux --debug    # the debug build, to check the layout quickly
 #
-# Unpack anywhere and run bin/omnigraph-studio; copy the .desktop file into
-# ~/.local/share/applications to list it in a launcher. An AppImage is not built yet.
+# Unpack anywhere and run bin/omnigraph-studio; copy share/ into ~/.local/share to list it,
+# with its icon, in a launcher. An AppImage is not built yet.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -42,9 +43,11 @@ out="$ROOT/target/bundle"
 staging=$(mktemp -d)
 trap 'rm -rf "$staging"' EXIT
 dir="$staging/$name"
-mkdir -p "$dir/bin" "$dir/share/applications"
+mkdir -p "$dir/bin" "$dir/share/applications" "$dir/share/icons/hicolor/512x512/apps"
 cp "target/$profile/omnigraph-studio" "$dir/bin/omnigraph-studio"
 cp resources/linux/omnigraph-studio.desktop.in "$dir/share/applications/omnigraph-studio.desktop"
+# The icon the .desktop entry names (script/make-icon.py draws it).
+cp resources/linux/omnigraph-studio.png "$dir/share/icons/hicolor/512x512/apps/omnigraph-studio.png"
 cp LICENSE "$dir/"
 
 mkdir -p "$out"
