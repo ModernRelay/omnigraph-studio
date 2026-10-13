@@ -115,6 +115,8 @@ pub struct GraphSession {
     pinned_blobs: ReadMemo<(BlobCell, String), BlobMeta>,
     /// Each branch's commit list, read once and shared until a commit lands on that branch.
     commit_lists: ReadMemo<String, CommitList>,
+    /// The branch list has been read once; reading it again forgets the commit lists.
+    branches_read: bool,
     _recheck: Option<Task<()>>,
     _schema_task: Option<Task<()>>,
     _branches_task: Option<Task<()>>,
@@ -145,6 +147,7 @@ impl GraphSession {
             pinned_reads: Memo::new(PINNED_READS),
             pinned_blobs: Memo::new(PINNED_BLOBS),
             commit_lists: Memo::new(COMMIT_LISTS),
+            branches_read: false,
             _recheck: None,
             _schema_task: None,
             _branches_task: None,
@@ -252,9 +255,14 @@ impl GraphSession {
                 Err(error) => Loadable::Failed(error.to_string()),
             };
             this.update(cx, |this, cx| {
+                // A branch deleted and made again under its name has another history. The first
+                // list changes nothing read before it: lists asked for meanwhile (main's, as the
+                // window opens) stay, rather than being read twice.
+                if this.branches_read {
+                    this.commit_lists.clear();
+                }
+                this.branches_read |= matches!(result, Loadable::Loaded(_));
                 this.branches = result;
-                // A branch deleted and made again under its name has another history.
-                this.commit_lists.clear();
                 cx.emit(SessionEvent::BranchesChanged);
                 cx.notify();
             })
@@ -893,7 +901,7 @@ mod tests {
     }
 
     /// A branch's commit list is read once for every view that shows it, and again only after
-    /// a commit lands on that branch.
+    /// a commit lands on that branch or the branch list is read again.
     #[gpui::test]
     async fn commit_lists_are_read_again_only_for_the_branch_a_commit_lands_on(
         cx: &mut TestAppContext,
@@ -929,7 +937,20 @@ mod tests {
         let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
         let session =
             cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        // As the window opens: main's list is asked for while the branch list is read, and the
+        // branches panel asks again when the branches arrive.
+        let _panel = cx.update(|cx| {
+            cx.subscribe(&session, |session, event: &SessionEvent, cx| {
+                if matches!(event, SessionEvent::BranchesChanged) {
+                    session
+                        .update(cx, |session, cx| session.commits("main", false, cx))
+                        .detach();
+                }
+            })
+        });
+        let early = session.update(cx, |session, cx| session.commits("main", false, cx));
         cx.run_until_parked();
+        early.await.unwrap();
         let reads_of = |branch: &str| {
             lists
                 .lock()
@@ -938,6 +959,12 @@ mod tests {
                 .filter(|query| query.contains(&format!("branch={branch}")))
                 .count()
         };
+
+        assert_eq!(
+            reads_of("main"),
+            1,
+            "the first branch list keeps what was asked for meanwhile"
+        );
 
         // The history and the branches panel ask together: one read.
         let (a, b) = session.update(cx, |session, cx| {
@@ -978,6 +1005,14 @@ mod tests {
         let fresh = session.update(cx, |session, cx| session.commits("feature", true, cx));
         fresh.await.unwrap();
         assert_eq!(reads_of("feature"), 2);
+
+        // The branch list read again (a branch made or deleted): every list is read again.
+        drop(_panel);
+        session.update(cx, |session, cx| session.reload_branches(cx));
+        cx.run_until_parked();
+        let read = session.update(cx, |session, cx| session.commits("feature", false, cx));
+        read.await.unwrap();
+        assert_eq!(reads_of("feature"), 3);
     }
 
     /// The command palette's search drops its reads when the text changes; the count must come

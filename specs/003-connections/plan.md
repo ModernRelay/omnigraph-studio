@@ -95,9 +95,12 @@ from the served document).
   cells, least recently used out first) and an identical read under way is shared, since a
   commit never changes. Failures are not kept, and reads at the branch head always go out.
 - Each branch's commit list is read once and shared by the views that show it (the history,
-  the branches panel); a commit Studio makes on a branch drops that branch's list, a change to
-  the branch list drops them all, and Refresh reads its branch again. A write used to set off
-  one full commit list per branch in each of those views, one after another.
+  the branches panel, every query tab's snapshot picker); a commit Studio makes on a branch
+  drops that branch's list, reading the branch list again drops them all (its first read, as
+  the window opens, keeps what was asked for meanwhile), and Refresh reads its branch again. A
+  write used to set off one full commit list per branch in each of those views, one after
+  another. Review and merge checks read their branches' heads themselves, since they decide on
+  the live head.
 - The footer's "N queries running" and "Writing…" count requests actually in flight. A read
   whose caller stops waiting (a search superseded by the next keystroke, a closed tab) is
   stopped and counted out. A write runs to its outcome whoever still waits for it, and the
@@ -133,6 +136,7 @@ from the served document).
 | 2026-10-12 | Abandoned reads leave the running count; abandoned writes still finish | `graph_store` test `dropped_reads_are_counted_out_and_dropped_writes_still_finish` (three reads that never answer, dropped; a write whose task is dropped before it ran); the same test against the earlier session code | Count back to 0 and the write sent once with its refusal logged; the earlier code left the count at 3, as the app showed "100 queries running" after four node searches over crm's 25 types |
 | 2026-10-12 | A connection keeps a bounded number of reads on the wire | `graph_client` test `a_connection_keeps_a_bounded_number_of_reads_on_the_wire` (40 reads through two clones against a server that holds each 5 ms) | At most 8 at once, all answered. Seen before the fix in the app on a person with dozens of relationship types: "read ingress count cap 64 exceeded" with Retry on several rows |
 | 2026-10-12 | A refused token can be replaced in place | offscreen snapshot with a wrong `OMNIGRAPH_STUDIO_TOKEN`, Open Graph | "The server refused the token" with a masked field and Update token; the connection reconnects with it. A Studio server keeps it in the keychain; a CLI server for this run only. Retry when unreachable, Cancel while connecting |
+| 2026-10-13 | Opening a window reads each branch's commit list once | `graph_store` test `commit_lists_are_read_again_only_for_the_branch_a_commit_lands_on` (main asked for while the branch list loads, the branches panel asking again on its arrival: one read; it read twice before the fix); offscreen snapshots through a request-counting proxy on the dev graph's four branches: an empty window; three new queries and the history | `GET /commits` 4 times in both, once per branch (before: 5 for the empty window, main twice, and one more per query tab) |
 
 ## Corrections
 

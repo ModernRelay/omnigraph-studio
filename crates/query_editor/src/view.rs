@@ -348,9 +348,14 @@ impl QueryEditor {
                         this.set_example(window, cx);
                         this.schedule_check(window, cx);
                     }
-                    SessionEvent::BranchChanged => {
+                    SessionEvent::BranchChanged | SessionEvent::BranchesChanged => {
                         this.load_commits(cx);
                         cx.notify()
+                    }
+                    SessionEvent::Committed { branch }
+                        if *branch == this.session.read(cx).branch =>
+                    {
+                        this.load_commits(cx)
                     }
                     _ => {}
                 },
@@ -404,22 +409,21 @@ impl QueryEditor {
         }
     }
 
-    /// Reads the branch's latest commits for the snapshot picker.
+    /// The branch's latest commits for the snapshot picker, from the session's commit list
+    /// (shared with every query tab, the history and the branches panel, and read again after a
+    /// commit lands on the branch).
     fn load_commits(&mut self, cx: &mut Context<Self>) {
-        let session = self.session.read(cx);
-        let (client, graph, branch) = (
-            session.client(cx),
-            session.graph_id.clone(),
-            session.branch.clone(),
-        );
+        let read = self.session.update(cx, |session, cx| {
+            let branch = session.branch.clone();
+            session.commits(&branch, false, cx)
+        });
         self.commits_task = Some(cx.spawn(async move |this, cx| {
-            let Ok(list) = client.commits(&graph, &branch).await else {
+            let Ok(list) = read.await else {
                 return;
             };
             let mut commits: Vec<(String, i64, Option<String>)> = list
-                .commits
-                .into_iter()
-                .map(|c| (c.graph_commit_id, c.created_at, c.actor_id))
+                .iter()
+                .map(|c| (c.graph_commit_id.clone(), c.created_at, c.actor_id.clone()))
                 .collect();
             commits.sort_by_key(|commit| std::cmp::Reverse(commit.1));
             commits.truncate(PICKER_COMMITS);
