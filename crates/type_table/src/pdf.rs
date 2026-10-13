@@ -91,6 +91,7 @@ pub fn render(_bytes: &[u8], _width: u32, _max_pages: usize) -> Result<(Vec<Page
     Err("Studio draws PDFs on macOS only; open it in the system's viewer.".into())
 }
 
+#[cfg(target_os = "macos")]
 fn encode_png(rgba: Vec<u8>, width: u32, height: u32) -> Result<Vec<u8>, String> {
     use image::ImageEncoder as _;
     let mut png = Vec::new();
