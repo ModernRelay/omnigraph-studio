@@ -50,7 +50,8 @@
     "context": "AgentComposer > Editor",
     "bindings": {
       "enter": "studio_agent::Send",
-      "shift-enter": "editor::Newline"
+      "shift-enter": "editor::Newline",
+      "ctrl-shift-enter": "studio_agent::SendNow"
     }
   },
   {

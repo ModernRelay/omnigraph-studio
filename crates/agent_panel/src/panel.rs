@@ -23,7 +23,7 @@ use graph_client::WriteOutcome;
 use graph_client::api::{ChangeOutput, ChangeRequest, QueryRequest};
 use graph_store::GraphSession;
 use serde_json::{Map, Value};
-use studio_actions::agent::{Allow, AllowAlways, Reject, Restart, Send, Stop};
+use studio_actions::agent::{Allow, AllowAlways, ClearQueue, Reject, Restart, Send, SendNow, Stop};
 use studio_actions::graph::ReviewBranch;
 use studio_settings::StudioSettings;
 use studio_ui::ds;
@@ -212,6 +212,55 @@ struct Usage {
     cost: Option<(f64, String)>,
 }
 
+/// A message sent while the agent was working, waiting for its turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Queued {
+    id: usize,
+    text: String,
+}
+
+/// Messages sent while the agent works (spec 011), as Zed queues them on the client: ACP runs one
+/// turn at a time and has no queue of its own. The first goes out as each turn ends; Stop
+/// pauses the queue until the person sends again; "Send now" stops the turn and sends one at
+/// once, without the queue going on by itself.
+#[derive(Debug, Default)]
+struct MessageQueue {
+    entries: Vec<Queued>,
+    next_id: usize,
+    paused: bool,
+    /// Sent when the stopped turn ends, ahead of the queue.
+    after_cancel: Option<String>,
+}
+
+impl MessageQueue {
+    fn push(&mut self, text: String) {
+        self.entries.push(Queued {
+            id: self.next_id,
+            text,
+        });
+        self.next_id += 1;
+        // Queuing is the person engaging again.
+        self.paused = false;
+    }
+
+    fn take(&mut self, id: usize) -> Option<String> {
+        let index = self.entries.iter().position(|entry| entry.id == id)?;
+        Some(self.entries.remove(index).text)
+    }
+
+    /// What to send now that a turn ended: the message "Send now" stopped it for, else the
+    /// next in line unless the queue is paused.
+    fn on_turn_ended(&mut self) -> Option<String> {
+        if let Some(text) = self.after_cancel.take() {
+            return Some(text);
+        }
+        if self.paused || self.entries.is_empty() {
+            return None;
+        }
+        Some(self.entries.remove(0).text)
+    }
+}
+
 struct Host {
     commands: mpsc::UnboundedSender<HostCommand>,
     _socket: ToolSocket,
@@ -255,6 +304,7 @@ pub struct AgentPanel {
     expanded_activity: std::collections::HashSet<usize>,
     /// Query calls whose card is folded away, by entry.
     folded_queries: std::collections::HashSet<usize>,
+    queue: MessageQueue,
 }
 
 impl EventEmitter<ItemEvent> for AgentPanel {}
@@ -420,6 +470,7 @@ impl AgentPanel {
             usage: None,
             expanded_activity: std::collections::HashSet::new(),
             folded_queries: std::collections::HashSet::new(),
+            queue: MessageQueue::default(),
         };
         panel.sync_setup_state(cx);
         panel
@@ -704,6 +755,8 @@ impl AgentPanel {
                 }
                 match stop {
                     Ok(StopReason::EndTurn) => {}
+                    // "Send now" stopped it; the next message says why.
+                    Ok(StopReason::Cancelled) if self.queue.after_cancel.is_some() => {}
                     Ok(StopReason::Cancelled) => self.entries.push(Entry::Notice {
                         text: "Stopped.".into(),
                         error: false,
@@ -716,6 +769,9 @@ impl AgentPanel {
                         text: format!("The turn failed: {error}"),
                         error: true,
                     }),
+                }
+                if let Some(next) = self.queue.on_turn_ended() {
+                    self.prompt(next, cx);
                 }
             }
             HostEvent::Exited {
@@ -895,17 +951,8 @@ impl AgentPanel {
         }
         match &self.state {
             State::Ready { .. } => self.prompt(text, cx),
-            State::Prompting { .. } => {
-                let notice = "The agent is still working. Stop it first, or wait.";
-                // One note, however often Enter is pressed.
-                if !matches!(self.entries.last(), Some(Entry::Notice { text, .. }) if text == notice)
-                {
-                    self.entries.push(Entry::Notice {
-                        text: notice.into(),
-                        error: false,
-                    });
-                }
-            }
+            // While the agent works the message waits its turn.
+            State::Prompting { .. } => self.queue.push(text),
             State::Starting => self.queued = Some(text),
             State::Setup => {
                 self.queued = Some(text);
@@ -951,19 +998,76 @@ impl AgentPanel {
         if text.trim().is_empty() {
             return;
         }
-        // While the agent works the message stays in the composer, to send once it is done.
-        if matches!(self.state, State::Prompting { .. }) {
-            self.send_text(text, window, cx);
+        self.composer
+            .update(cx, |editor, cx| editor.clear(window, cx));
+        // Sending is the person engaging again: a paused queue goes on.
+        self.queue.paused = false;
+        self.send_text(text, window, cx);
+    }
+
+    /// Stops the turn and sends the composer's message as soon as it has stopped.
+    fn send_now(&mut self, _: &SendNow, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.composer.read(cx).text(cx).trim().to_owned();
+        if text.is_empty() {
             return;
         }
         self.composer
             .update(cx, |editor, cx| editor.clear(window, cx));
-        self.send_text(text, window, cx);
+        self.send_at_once(text, window, cx);
     }
 
-    fn stop(&mut self, _: &Stop, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn send_at_once(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.state, State::Prompting { .. })
+            && let Some(host) = &self.host
+        {
+            self.queue.after_cancel = Some(text);
+            host.commands.unbounded_send(HostCommand::Cancel).ok();
+            cx.notify();
+        } else {
+            self.queue.paused = false;
+            self.send_text(text, window, cx);
+        }
+    }
+
+    /// Sends a queued message at once, stopping the turn if one runs.
+    fn send_queued_now(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.queue.take(id) {
+            self.send_at_once(text, window, cx);
+        }
+    }
+
+    /// Puts a queued message back in the composer to edit, ahead of what is there.
+    fn edit_queued(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.queue.take(id) else {
+            return;
+        };
+        self.composer.update(cx, |editor, cx| {
+            let draft = editor.text(cx);
+            let text = if draft.trim().is_empty() {
+                text
+            } else {
+                format!("{text}\n{draft}")
+            };
+            editor.set_text(text, window, cx);
+            editor.move_to_end(&Default::default(), window, cx);
+        });
+        window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn clear_queue(&mut self, _: &ClearQueue, _window: &mut Window, cx: &mut Context<Self>) {
+        self.queue.entries.clear();
+        cx.notify();
+    }
+
+    /// Stops the turn; the queue waits until the person sends again.
+    fn stop(&mut self, _: &Stop, _window: &mut Window, cx: &mut Context<Self>) {
         if let Some(host) = &self.host {
             host.commands.unbounded_send(HostCommand::Cancel).ok();
+            if !self.queue.entries.is_empty() {
+                self.queue.paused = true;
+                cx.notify();
+            }
         }
     }
 
@@ -1891,6 +1995,7 @@ impl Render for AgentPanel {
             .tooltip(Tooltip::text(format!(
                 "The agent reads {graph} at {branch}; its changes go to a branch of its own"
             )))
+            .children(self.render_queue(cx))
             .child(gutter_row(
                 Some(
                     Icon::new(IconName::Person)
@@ -1904,6 +2009,8 @@ impl Render for AgentPanel {
             .key_context("AgentPanel")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::send))
+            .on_action(cx.listener(Self::send_now))
+            .on_action(cx.listener(Self::clear_queue))
             .on_action(cx.listener(Self::stop))
             .on_action(cx.listener(Self::allow))
             .on_action(cx.listener(Self::allow_always))
@@ -2822,6 +2929,134 @@ impl AgentPanel {
         )
     }
 
+    /// The messages waiting for the agent, above the composer as Zed shows its queue: how many
+    /// and whether the queue is paused, Clear all, then one line each, the next one marked;
+    /// Remove and Edit on hover, Send now always on the next one and on hover on the rest.
+    fn render_queue(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.queue.entries.is_empty() {
+            return None;
+        }
+        let count = self.queue.entries.len();
+        let mut summary = if count == 1 {
+            "1 queued message".to_owned()
+        } else {
+            format!("{count} queued messages")
+        };
+        if self.queue.paused {
+            summary.push_str(" · paused until you send");
+        }
+        let focus = self.focus_handle.clone();
+        let header = h_flex()
+            .h(px(ds::size::ROW))
+            .px(px(ds::space::MD))
+            .gap(px(ds::space::SM))
+            .items_center()
+            .child(ds::text::meta(summary))
+            .child(div().flex_1())
+            .child(
+                ds::button("clear-queue", "Clear all")
+                    .style(ButtonStyle::Subtle)
+                    .color(Color::Muted)
+                    .tooltip(move |_, cx| {
+                        Tooltip::for_action_in("Drop the queued messages", &ClearQueue, &focus, cx)
+                    })
+                    .on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.clear_queue(&ClearQueue, window, cx)
+                        }),
+                    ),
+            );
+        let border = cx.theme().colors().border_variant;
+        let rows: Vec<AnyElement> = self
+            .queue
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let id = entry.id;
+                let next = index == 0;
+                let line = entry.text.lines().next().unwrap_or_default().to_owned();
+                h_flex()
+                    .id(("queued", id))
+                    .group("queued")
+                    .h(px(ds::size::ROW))
+                    .px(px(ds::space::MD))
+                    .gap(px(ds::space::SM))
+                    .items_center()
+                    .border_t_1()
+                    .border_color(border)
+                    .tooltip(Tooltip::text(entry.text.clone()))
+                    .child(Indicator::dot().color(if next { Color::Accent } else { Color::Muted }))
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(line)
+                                .size(LabelSize::Small)
+                                .color(if next { Color::Default } else { Color::Muted })
+                                .single_line()
+                                .truncate(),
+                        ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap(px(ds::space::XXS))
+                            .items_center()
+                            .visible_on_hover("queued")
+                            .child(
+                                IconButton::new(("remove-queued", id), IconName::Trash)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Remove from the queue"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.queue.take(id);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                IconButton::new(("edit-queued", id), IconName::Pencil)
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .tooltip(Tooltip::text("Edit in the composer"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.edit_queued(id, window, cx)
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .when(!next, |send| send.visible_on_hover("queued"))
+                            .child(
+                                ds::button(("send-queued", id), "Send now")
+                                    .style(if next {
+                                        ButtonStyle::Outlined
+                                    } else {
+                                        ButtonStyle::Subtle
+                                    })
+                                    .tooltip(Tooltip::text(
+                                        "Stop the agent's turn and send this at once",
+                                    ))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.send_queued_now(id, window, cx)
+                                    })),
+                            ),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        Some(
+            v_flex()
+                .mb(px(ds::space::MD))
+                .ml(px(ds::space::SM))
+                .rounded(px(ds::radius::SM))
+                .border_1()
+                .border_color(border)
+                .bg(ds::surface::sunken(cx))
+                .overflow_hidden()
+                .child(header)
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
     fn render_branch_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let branch = self
             .branch
@@ -2876,6 +3111,30 @@ mod tests {
         assert_eq!(format_cost(0.0042, "USD"), "0.0042 USD");
         assert_eq!(format_cost(0.411, "USD"), "0.41 USD");
         assert_eq!(format_cost(0., "USD"), "0.00 USD");
+    }
+
+    #[test]
+    fn the_queue_sends_in_order_pauses_on_stop_and_lets_send_now_jump_it() {
+        let mut queue = MessageQueue::default();
+        queue.push("first".into());
+        queue.push("second".into());
+        assert_eq!(queue.on_turn_ended().as_deref(), Some("first"));
+        // Stop pauses it; queuing again counts as sending again and resumes it.
+        queue.paused = true;
+        assert_eq!(queue.on_turn_ended(), None);
+        queue.push("third".into());
+        assert_eq!(queue.on_turn_ended().as_deref(), Some("second"));
+        // "Send now" goes ahead of the line, once.
+        queue.after_cancel = Some("urgent".into());
+        assert_eq!(queue.on_turn_ended().as_deref(), Some("urgent"));
+        assert_eq!(queue.on_turn_ended().as_deref(), Some("third"));
+        assert_eq!(queue.on_turn_ended(), None);
+        // Taking one out by id leaves the rest in order.
+        queue.push("a".into());
+        queue.push("b".into());
+        let b = queue.entries[1].id;
+        assert_eq!(queue.take(b).as_deref(), Some("b"));
+        assert_eq!(queue.entries.len(), 1);
     }
 
     #[test]

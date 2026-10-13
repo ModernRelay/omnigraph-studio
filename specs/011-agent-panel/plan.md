@@ -218,6 +218,18 @@ and Delta's sidebar.
 - A loaded conversation keeps writing to its branch and keeps its own options; a new one starts
   from the options chosen last for the agent.
 
+## Queued messages
+
+ACP runs one turn at a time and has no queue; Zed queues on the client
+(`agent_ui/src/conversation_view/message_queue.rs` at `v1.23.2`), and so does Studio. A message
+sent while the agent works waits in a card above the composer ("2 queued messages", Clear all),
+one line each with the next marked by an accent dot; Remove and Edit (back into the composer,
+ahead of a draft) on hover, Send now on the next one always and on the rest on hover. When a turn
+ends the next message is sent. Stop pauses the queue ("paused until you send") until the person
+sends or queues again. Send now (a row's button, or ⌘⇧↩ / Ctrl+Shift+Enter in the composer)
+cancels the running turn and sends that message as soon as it ends, ahead of the queue, without
+a "Stopped." note. The queue is per tab and in memory, as Zed's.
+
 ## Session options and context usage
 
 As in Zed's agent panel (checked in `agent_ui` at `v1.23.2`), and only through stable ACP v1:
@@ -261,8 +273,8 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 - One agent process for every conversation of an agent: today each tab starts its own.
 - Renaming a conversation, deleting it at the agent (`session/delete`), importing the agent's
   sessions (`session/list`), and searching the list; Zed has all four.
-- Queuing messages while the agent works, and sending one at once by cancelling the turn, as
-  Zed does on the client side; ACP itself has neither, nor steering.
+- Steering (ending a turn at the next tool boundary for a queued message): Zed does it only for
+  its own agent; ACP cannot express it.
 
 ## Validation log
 
@@ -283,6 +295,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 | 2026-10-12 | The footer and thread read like Delta's | Offscreen snapshots with the test agent offering Claude's five options: two questions, open a run, open ⋯ | Footer: ring, "Ask before changes", "High", ⋯, "Claude Opus" with the Anthropic mark, ↻, send (filled with text in the composer); ⋯ held Fast mode and Agent (Default checked); each turn showed one agent mark and "Read the schema ›", "Ran 1 query ›", the first opening to "Read the schema" |
 | 2026-10-12 | A query the agent runs shows as code | Offscreen snapshot with the test agent reporting `rawInput` for its count query | "Query people ⌄" over the four-line query in a card, keywords, the query name and `Person` in the theme's syntax colours; the schema read stayed folded as "Read the schema ›" |
 | 2026-10-12 | Conversations are listed per graph and run side by side | `agent_panel` tests `conversations_are_kept_per_graph_newest_first`, `the_first_format_becomes_records`, `times_read_short`; offscreen snapshots with the test agent (now with a "slow" turn): two and three conversations in tabs, a hovered row, a pin, a slow turn finishing behind another tab, a restart | Tabs titled "How many people are there?" and "List the companies by size"; the shown one selected in the panel with "now"; hover showed pin and archive; the pinned row moved under Pinned; the slow conversation showed a turning circle while running and an accent dot after finishing unseen; after a restart both tabs came back and the shown one replayed |
+| 2026-10-12 | Messages sent while the agent works are queued and sent in order | `agent_panel` test `the_queue_sends_in_order_pauses_on_stop_and_lets_send_now_jump_it`; offscreen snapshots with the test agent's slow turn: two messages queued behind it, then the transcript the agent kept; then one queued and one sent with ⌘⇧↩ | The card read "2 queued messages", the next one dotted with Send now; the agent received the three in order; with ⌘⇧↩ it received the urgent one second and the queued one third |
 
 ## Corrections
 

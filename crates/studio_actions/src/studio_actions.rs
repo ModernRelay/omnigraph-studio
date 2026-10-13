@@ -427,8 +427,12 @@ pub mod agent {
         [
             /// Open the agent panel.
             OpenAgent,
-            /// Send the message in the agent composer.
+            /// Send the message in the agent composer; while the agent works, queue it.
             Send,
+            /// Stop the agent's turn and send the message in the composer at once.
+            SendNow,
+            /// Drop every message waiting in the agent's queue.
+            ClearQueue,
             /// Stop the agent's current turn.
             Stop,
             /// Allow the change or request the agent is waiting on.
