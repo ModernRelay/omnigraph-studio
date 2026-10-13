@@ -21,7 +21,7 @@ use gpui::{
     SharedString, Stateful, Subscription, Task, WeakEntity, Window, WindowControlArea, deferred,
     div, point,
 };
-use graph_store::{ConnectionState, GraphSession, OutcomeKind, SessionEvent};
+use graph_store::{ConnectionRegistry, ConnectionState, GraphSession, OutcomeKind, SessionEvent};
 use studio_actions::graph::{OpenCommit, OpenHistory};
 use studio_actions::workspace::{
     ActivateItem, ActivateLastItem, ActivateNextGraph, ActivateNextItem, ActivateNextPane,
@@ -138,6 +138,8 @@ pub struct Workspace {
     forward: Vec<EntityId>,
     /// The settings file problem last shown, so a toast appears once per problem.
     settings_error: Option<String>,
+    /// What the CLI's files could not give, as last shown.
+    cli_errors: Vec<String>,
     _settings_subscription: Subscription,
     /// What was last written for this graph, so unchanged state is not rewritten.
     saved: Option<SavedWorkspace>,
@@ -147,6 +149,7 @@ pub struct Workspace {
     _save_bounds: Option<Task<()>>,
     _bounds_subscription: Subscription,
     _activation_subscription: Subscription,
+    _registry_subscription: Option<Subscription>,
     _session_subscription: Option<Subscription>,
     _item_subscriptions: Vec<(gpui::EntityId, Subscription)>,
 }
@@ -219,6 +222,13 @@ impl Workspace {
                 cx.update(|cx| persistence::window_moved(window_slot, bounds, cx));
             }));
         });
+        // So are the CLI's files when they cannot be read (servers read before stand meanwhile).
+        let registry = ConnectionRegistry::try_global(cx);
+        let registry_subscription = registry.as_ref().map(|registry| {
+            cx.observe(registry, |this, registry, cx| {
+                this.show_cli_errors(&registry, cx)
+            })
+        });
         // The window's graphs ask after their branch heads at once when it becomes active and a
         // poll came while no window was.
         let activation_subscription = cx.observe_window_activation(window, |this, window, cx| {
@@ -235,7 +245,7 @@ impl Workspace {
                 session.update(cx, |session, cx| session.window_activated(cx));
             }
         });
-        Self {
+        let mut this = Self {
             session: None,
             parked: Vec::new(),
             graph_order: Vec::new(),
@@ -260,6 +270,7 @@ impl Workspace {
             back: Vec::new(),
             forward: Vec::new(),
             settings_error: None,
+            cli_errors: Vec::new(),
             _settings_subscription: settings_subscription,
             saved: None,
             _save: None,
@@ -267,9 +278,14 @@ impl Workspace {
             _save_bounds: None,
             _bounds_subscription: bounds_subscription,
             _activation_subscription: activation_subscription,
+            _registry_subscription: registry_subscription,
             _session_subscription: None,
             _item_subscriptions: Vec::new(),
+        };
+        if let Some(registry) = registry {
+            this.show_cli_errors(&registry, cx);
         }
+        this
     }
 
     /// The server URL and graph id the open session belongs to.
@@ -1291,6 +1307,21 @@ impl Workspace {
                 cx,
             );
         }
+    }
+
+    /// Names each new error from the CLI's files in a toast that stays until dismissed.
+    fn show_cli_errors(&mut self, registry: &Entity<ConnectionRegistry>, cx: &mut Context<Self>) {
+        let errors = registry.read(cx).cli_errors().to_vec();
+        for error in &errors {
+            if !self.cli_errors.contains(error) {
+                self.show_toast(
+                    ToastKind::Error,
+                    format!("OmniGraph CLI config: {error}"),
+                    cx,
+                );
+            }
+        }
+        self.cli_errors = errors;
     }
 
     fn push_toast(

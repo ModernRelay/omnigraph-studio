@@ -37,7 +37,16 @@ from the served document).
 ### Sources of servers
 
 1. Every server in the operator config, labelled with its config name. Tokens are resolved
-   exactly as the CLI does; Studio never writes the CLI's files.
+   exactly as the CLI does; Studio never writes the CLI's files. It reads them again when
+   `config.yaml` or `credentials` changes (their modification time and size, checked every
+   2 s off the main thread): a server added there joins the list, one removed leaves it (a
+   window open on it keeps its connection), one at a new address is a new connection, a
+   profile's graph is added, and a token changed there (`omnigraph login`) replaces the
+   connection's, which a connection in use checks at once. A token typed into Studio for a
+   CLI server lasts until the files change that server's token. Files that cannot be read
+   keep every server as it was and are named in a toast that stays until dismissed, as a
+   settings file's are. A token from `OMNIGRAPH_TOKEN_<NAME>` or `OMNIGRAPH_BEARER_TOKEN` is
+   the one Studio started with, as for the CLI.
 2. Servers added in Studio (URL, optional token). Tokens go to the OS keychain through GPUI's
    credentials API; the server list goes to Studio's settings.
    An address is made a server root before it is used (`graph_client::server_root`): trimmed,
@@ -150,6 +159,7 @@ from the served document).
 | 2026-10-12 | Abandoned reads leave the running count; abandoned writes still finish | `graph_store` test `dropped_reads_are_counted_out_and_dropped_writes_still_finish` (three reads that never answer, dropped; a write whose task is dropped before it ran); the same test against the earlier session code | Count back to 0 and the write sent once with its refusal logged; the earlier code left the count at 3, as the app showed "100 queries running" after four node searches over crm's 25 types |
 | 2026-10-12 | A connection keeps a bounded number of reads on the wire | `graph_client` test `a_connection_keeps_a_bounded_number_of_reads_on_the_wire` (40 reads through two clones against a server that holds each 5 ms) | At most 8 at once, all answered. Seen before the fix in the app on a person with dozens of relationship types: "read ingress count cap 64 exceeded" with Retry on several rows |
 | 2026-10-12 | A refused token can be replaced in place | offscreen snapshot with a wrong `OMNIGRAPH_STUDIO_TOKEN`, Open Graph | "The server refused the token" with a masked field and Update token; the connection reconnects with it. A Studio server keeps it in the keychain; a CLI server for this run only. Retry when unreachable, Cancel while connecting |
+| 2026-10-13 | The CLI's files are read again when they change | `graph_store` tests `reads_servers_with_their_tokens_and_stamps_the_files` (a rewritten file changes the stamp; open permissions refuse the token once; a config that does not parse keeps the servers) and `cli_servers_follow_the_cli_files` (a changed token reaches the same connection's next request, a typed one stays, a new address is a new connection, servers come and go); offscreen snapshots with a scratch `OMNIGRAPH_HOME`: a server added to `config.yaml` 6 s after launch; a token written to `credentials` while the Open dialog said the server refused the token; a `config.yaml` broken while running | `scratch-beta` listed under CLI config; `scratch-alpha` turned ready and listed `knowledge` and `notes`; a toast "OmniGraph CLI config: could not parse …: servers: invalid type … at line 1 column 10" with `scratch-alpha` still listed. Before, the files were read once at launch and their errors were kept but never shown |
 | 2026-10-13 | The session watches heads and the branch list | `graph_store` test `the_head_watch_sees_other_writers_commits_while_a_window_is_active` (simulated clock): the head once the schema loads; no request at a poll with no window active; one at activation, none at the next; a watched branch asked with the session's own; a dropped watch forgotten; a branch added elsewhere listed at the poll; Studio's own commit the head with no request | Each as stated; an unchanged branch list emitted nothing |
 | 2026-10-13 | The head probe answers with the head and no rows on 0.13 | `POST /graphs/knowledge/query` with `studio_head` on the dev server, three times | `row_count` 0, `graph_commit_id` the head; 2-17 ms |
 | 2026-10-13 | A branch made outside Studio appears | offscreen snapshot on the dev server: the Branches panel, then `POST /branches` `head-watch-check` from curl 25 s in, then 40 s more | The panel listed `main` and `head-watch-check`; before, the list was read only when the window opened and after Studio's own branch writes |

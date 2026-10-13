@@ -156,8 +156,9 @@ impl Connection {
         }
     }
 
-    /// Replaces the token after the server refused the old one (spec 003); requests made after
-    /// this use it, and the connection checks again.
+    /// Replaces the token: typed in after the server refused the old one, or changed in the
+    /// CLI's files (spec 003). Requests made after this use it, and a connection in use checks
+    /// again; one not yet used connects when it is.
     pub fn set_token(
         &mut self,
         token: Option<String>,
@@ -165,7 +166,9 @@ impl Connection {
     ) -> anyhow::Result<()> {
         self.client = GraphClient::new(&self.server.url, token.clone(), self.http.clone())?;
         self.has_token = token.is_some();
-        self.connect(cx);
+        if self.state != ConnectionState::Idle {
+            self.connect(cx);
+        }
         Ok(())
     }
 
