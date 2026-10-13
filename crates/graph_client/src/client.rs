@@ -295,7 +295,7 @@ impl GraphClient {
             .http
             .send(request)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| describe_transport(&error))?;
         let status = response.status();
         let contract = response
             .headers()
@@ -314,7 +314,7 @@ impl GraphClient {
             .into_body()
             .read_to_end(&mut bytes)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| describe_transport(&error.into()))?;
         Ok(RawResponse {
             status,
             contract,
@@ -539,7 +539,7 @@ impl GraphClient {
             .http
             .send(request)
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| describe_transport(&error))?;
         let status = response.status();
         let headers = response.headers().clone();
         Ok(ForwardResponse {
@@ -854,6 +854,63 @@ fn operation_ids(document: &Value) -> BTreeSet<String> {
         }
     }
     ids
+}
+
+/// What went wrong reaching the server, in words: a class (refused, timed out, name not found,
+/// TLS, connection closed) or else the innermost cause, with any URL removed. The client's own
+/// text names the whole request URL, which can hold a Blob row's key, and its outer layer
+/// ("error sending request") hides the reason; the cause is what helps.
+fn describe_transport(error: &anyhow::Error) -> String {
+    let layers: Vec<String> = error
+        .chain()
+        .map(|layer| without_urls(&layer.to_string()))
+        .collect();
+    let all = layers.join(" ").to_lowercase();
+    let class = if all.contains("timed out") || all.contains("timeout") {
+        Some("the request timed out")
+    } else if all.contains("connection refused") {
+        Some("the connection was refused")
+    } else if all.contains("dns error")
+        || all.contains("lookup address")
+        || all.contains("nodename nor servname")
+        || all.contains("name or service not known")
+    {
+        Some("the server's name could not be resolved")
+    } else if all.contains("certificate") || all.contains("tls") || all.contains("ssl") {
+        Some("the secure connection failed")
+    } else if all.contains("connection reset")
+        || all.contains("broken pipe")
+        || all.contains("connection closed")
+        || all.contains("unexpected eof")
+    {
+        Some("the connection was closed")
+    } else {
+        None
+    };
+    match class {
+        Some(class) => class.to_owned(),
+        None => {
+            let cause = layers.last().cloned().unwrap_or_default();
+            if cause.chars().count() > 200 {
+                cause.chars().take(199).chain(['…']).collect()
+            } else {
+                cause
+            }
+        }
+    }
+}
+
+/// `text` without `for url (…)` and with every URL replaced by `…`.
+fn without_urls(text: &str) -> String {
+    let mut text = text.to_owned();
+    while let Some(at) = text.find(" for url (") {
+        let end = text[at..].find(')').map_or(text.len(), |end| at + end + 1);
+        text.replace_range(at..end, "");
+    }
+    text.split_whitespace()
+        .map(|word| if word.contains("://") { "…" } else { word })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -1271,6 +1328,33 @@ mod tests {
         assert!(server_root("").is_err());
         assert!(server_root("ftp://graph.example.com").is_err());
         assert!(server_root("mailto:someone@example.com").is_err());
+    }
+
+    #[test]
+    fn a_transport_error_names_its_cause_and_never_the_url() {
+        let refused = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "Connection refused (os error 61)",
+        ))
+        .context("tcp connect error")
+        .context(
+            "error sending request for url (http://127.0.0.1:8787/graphs/knowledge/blob?type=Person&id=person-000123&property=photo)",
+        );
+        let described = describe_transport(&refused);
+        assert_eq!(described, "the connection was refused");
+        let other = anyhow::anyhow!(
+            "odd failure talking to https://graph.example.com/graphs/g/blob?id=row-9"
+        )
+        .context(
+            "error sending request for url (https://graph.example.com/graphs/g/blob?id=row-9)",
+        );
+        let described = describe_transport(&other);
+        assert_eq!(described, "odd failure talking to …");
+        assert!(!described.contains("row-9"));
+        assert_eq!(
+            ReadError::Transport(describe_transport(&refused)).to_string(),
+            "Could not reach the server: the connection was refused"
+        );
     }
 
     #[test]
