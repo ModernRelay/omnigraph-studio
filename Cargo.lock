@@ -7972,6 +7972,7 @@ dependencies = [
  "studio_workspace",
  "tree-sitter",
  "tree-sitter-gq",
+ "tree-sitter-pg",
  "ui",
 ]
 
@@ -10766,6 +10767,15 @@ dependencies = [
 name = "tree-sitter-language"
 version = "0.1.8"
 source = "git+https://github.com/tree-sitter/tree-sitter?rev=43623ec9bf0eaaf7113285c46e8a09018f181b18#43623ec9bf0eaaf7113285c46e8a09018f181b18"
+
+[[package]]
+name = "tree-sitter-pg"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "tree-sitter",
+ "tree-sitter-language",
+]
 
 [[package]]
 name = "try-lock"

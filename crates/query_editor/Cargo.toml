@@ -27,6 +27,7 @@ graph_client = { workspace = true }
 graph_store = { workspace = true }
 gq_language = { workspace = true }
 tree-sitter-gq = { workspace = true }
+tree-sitter-pg = { workspace = true }
 # The same revision `language` builds; it turns the grammar into a `tree_sitter::Language`.
 tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }
 studio_settings = { workspace = true }

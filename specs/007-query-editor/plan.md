@@ -67,12 +67,22 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 - `NewQuery` (⌘N) opens "Query 1", "Query 2", …, starting with a read over the schema's first
   node type (`gq_language::example_read`).
 - Highlighting follows the syntax tree: the editor's buffer has the GQ language
-  (`query_editor::gq_syntax`), the tree-sitter grammar in `grammars/tree-sitter-gq` with its
+  (`query_editor::syntax`), the tree-sitter grammar in `grammars/tree-sitter-gq` with its
   highlight, bracket, indent and outline queries, so brackets match and auto-close, new lines
   indent inside a block and folds end where the block does. Read-only views of a query keep the
   lexical colouring (`gq_language::tokenize`); both use the same theme names. If the grammar's
   queries failed to compile the editor would fall back to the lexical colouring (a test keeps
   them compiling).
+- The schema's source has a read-only tab, "Schema" (`studio_graph::OpenSchema`, the Graph
+  menu, and a row under Ontology and Explorer in the sidebar; `query_editor::schema_view`). It
+  is the `.pg` text the server holds for the graph (`GET /schema`), parsed with
+  `grammars/tree-sitter-pg`: coloured with the GQ grammar's theme names, folded by declaration,
+  selectable and copyable. It follows the session, so a branch switch or a refresh that brings
+  another schema shows it; the same text keeps the scroll position. `OpenSchema` with a type
+  selects that type's name in its `node`, `edge` or `interface` line. The footer counts the
+  types and relationships and says the view is read-only: a schema changes by deployment
+  (`omnigraph cluster apply`), never from Studio (spec 012, E14). The tab comes back after a
+  restart.
 - After typing pauses (150 ms) the source is checked off the main thread (`analysis.rs`): the
   whole file for problems, each declaration on its own for mutation/read, parameters and result
   columns, so one broken declaration does not hide its siblings. Problems are underlined and
@@ -126,7 +136,8 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 ## Deferred
 
-- A schema grammar (`tree-sitter-pg`): no Studio surface edits a schema yet.
+- Editing a schema: the schema view is read-only. Schema changes stay with
+  `omnigraph cluster apply`; E14 would add a read-only migration plan, not an apply.
 - A row cap: the result shows every row the server returns, so the query's own `limit` is the
   cap today (constitution IX). The example query carries `limit 50`.
 - A write from the editor sends no `Omnigraph-If-Graph-Commit`: it is not based on a read, and
@@ -141,6 +152,7 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-12 | The schema grammar parses OmniGraph's schemas and the Schema tab uses it | `tree-sitter parse --stat` over the 269 schemas at v0.13.0 (the `.pg` files and the `.gqt` corpus's `--- schema` sections): all parse with no error node; `tree-sitter-pg` tests (every construct, recovery after a broken declaration, queries compile, outline names every declaration); `query_editor` `both_languages_build_with_every_query` and `a_type_is_found_at_its_declaration_and_not_in_a_comment_or_a_longer_name`; offscreen snapshot of `OpenSchema {"type_name":"Person"}` on the development graph | The tab reads "Schema", the sidebar row is selected, `Person` is selected in `node Person`; keywords, types, properties, annotations, enum values and numbers are coloured from the tree, declarations fold, and the footer reads "3 types · 4 relationships" and "Read-only" |
 | 2026-10-12 | The GQ grammar parses OmniGraph's queries and the editor uses it | `tree-sitter parse --stat` over the 1,390 `--- query`/`--- mutate` steps of the v0.13.0 `.gqt` corpus that expect no error, and the two `.gq` files: all parse with no error node; `tree-sitter-gq` tests (every clause kind, recovery around a broken clause, queries compile, outline names both declarations); `query_editor` `the_language_builds_with_every_query`; offscreen snapshot of a new query tab | Traversals (edge binding, `<a \| b>`, `(a \| b)`, hop bounds), filters, subquery predicates and negations come out as their own nodes; the editor colours keywords, names, types, properties, strings, numbers and edges from the tree and highlights the matching bracket |
 | 2026-10-11 | Compiler APIs above exist | `git show v0.13.0:crates/omnigraph-compiler/src/lib.rs` | All exported |
 | 2026-10-12 | Zed's editor works with no project: completion provider, text highlights, placeholder | `editor/src/completions.rs` (`CompletionProvider`, `set_completion_provider`, no `project` needed outside snippets), `keymap_editor/src/action_completion_provider.rs` (a project-less provider), `editor/src/display_map.rs` (`HighlightKey`) at `v1.23.2`; offscreen snapshots of completion and underlines | Works. `HighlightKey` is a closed enum; `ConsoleAnsiHighlight(n)` is the one numbered key, used for syntax classes and diagnostics |

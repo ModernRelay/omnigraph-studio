@@ -3,7 +3,7 @@
 
 use gpui::{Context, Entity, Render, SharedString, Subscription, WeakEntity, Window};
 use graph_store::{GraphSession, Loadable, SessionEvent};
-use studio_actions::graph::{OpenCanvas, OpenOntology, OpenType};
+use studio_actions::graph::{OpenCanvas, OpenOntology, OpenSchema, OpenType};
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::Tooltip;
 use ui::prelude::*;
@@ -139,7 +139,7 @@ impl Render for TypesList {
             )
             .collect();
         let first_edge = entries.iter().position(|(_, _, edge)| *edge);
-        // The graph as a whole first: its ontology and the explorer, then its types.
+        // The graph as a whole first: its ontology, the explorer and the schema, then its types.
         let canvas_open = active
             .as_deref()
             .is_some_and(|key| key.starts_with("canvas:"));
@@ -172,6 +172,20 @@ impl Render for TypesList {
                         )
                     })
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenCanvas), cx)),
+            )
+            .child(
+                view_row("view-schema", "Schema", IconName::Code)
+                    .selected(active.as_deref() == Some("schema"))
+                    .tooltip_fn(|_, cx| {
+                        Tooltip::for_action(
+                            "The schema's source, read-only",
+                            &OpenSchema::default(),
+                            cx,
+                        )
+                    })
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(OpenSchema::default()), cx)
+                    }),
             )
             .child(studio_ui::ds::section_label("Types").pt_3());
         for (index, (name, count, is_edge)) in entries.into_iter().enumerate() {

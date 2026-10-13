@@ -5,19 +5,21 @@
 
 mod analysis;
 mod completion;
-mod gq_syntax;
 mod hover;
 mod queries_panel;
 mod results;
+mod schema_view;
+mod syntax;
 mod view;
 
 use std::path::PathBuf;
 
 use gpui::{App, AppContext as _, Context, Global, PathPromptOptions, Window};
-use studio_actions::graph::{NewQuery, NewQueryWithText, OpenQueryAt, OpenQueryFile};
+use studio_actions::graph::{NewQuery, NewQueryWithText, OpenQueryAt, OpenQueryFile, OpenSchema};
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
 
+pub use schema_view::SchemaView;
 pub use view::QueryEditor;
 
 /// Bumped whenever a query file is written, so lists of saved queries read the folder again.
@@ -65,6 +67,31 @@ fn open_file(
     });
 }
 
+/// Opens the schema tab, or activates it; with a type, shows its declaration.
+fn open_schema(
+    workspace: &mut Workspace,
+    type_name: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(session) = workspace.session().cloned() else {
+        workspace.show_toast(
+            ToastKind::Info,
+            "Open a graph first to read its schema.",
+            cx,
+        );
+        return;
+    };
+    let view = workspace.open_item(schema_view::SCHEMA_KEY, window, cx, |window, cx| {
+        SchemaView::new(session, window, cx)
+    });
+    if let Some(type_name) = type_name
+        && let Some(view) = view
+    {
+        view.update(cx, |view, cx| view.reveal(type_name, window, cx));
+    }
+}
+
 /// Registers `NewQuery` with every new workspace and binds the editor's keys.
 pub fn init(cx: &mut App) {
     studio_workspace::register_item_kind(cx, "query", |data, workspace, window, cx| {
@@ -94,6 +121,13 @@ pub fn init(cx: &mut App) {
             editor
         });
     });
+    studio_workspace::register_item_kind(
+        cx,
+        schema_view::SCHEMA_KEY,
+        |_, workspace, window, cx| {
+            open_schema(workspace, None, window, cx);
+        },
+    );
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         if let Some(window) = window {
             let handle = cx.entity().downgrade();
@@ -158,6 +192,9 @@ pub fn init(cx: &mut App) {
                 editor.set_text(&text, window, cx);
                 editor
             });
+        });
+        workspace.register_action(|workspace, action: &OpenSchema, window, cx| {
+            open_schema(workspace, action.type_name.clone(), window, cx);
         });
         workspace.register_action(|workspace, _: &NewQuery, window, cx| {
             let Some(session) = workspace.session().cloned() else {

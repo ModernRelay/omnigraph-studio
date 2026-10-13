@@ -1,0 +1,21 @@
+[package]
+name = "tree-sitter-pg"
+description = "Tree-sitter grammar for OmniGraph schemas (.pg), for Studio's schema view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "bindings/rust/build.rs"
+include = ["bindings/rust/*", "grammar.js", "queries/*", "src/*"]
+
+[lib]
+path = "bindings/rust/lib.rs"
+
+[dependencies]
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+tree-sitter = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }

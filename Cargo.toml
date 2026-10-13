@@ -20,6 +20,7 @@ members = [
     "crates/inspectors",
     "crates/agent_panel",
     "grammars/tree-sitter-gq",
+    "grammars/tree-sitter-pg",
 ]
 default-members = ["crates/studio"]
 
@@ -36,6 +37,7 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGAffineTransform", "CGBitmapContext", "CGColorSpace", "CGContext", "CGDataProvider", "CGImage", "CGPDFDocument", "CGPDFPage"] }
 # Studio crates
 tree-sitter-gq = { path = "grammars/tree-sitter-gq" }
+tree-sitter-pg = { path = "grammars/tree-sitter-pg" }
 studio_actions = { path = "crates/studio_actions" }
 studio_settings = { path = "crates/studio_settings" }
 studio_theme = { path = "crates/studio_theme" }

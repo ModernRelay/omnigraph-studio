@@ -229,7 +229,7 @@ pub struct QueryEditor {
     /// Reads run at this commit and writes are refused (spec 009); `None` uses the branch.
     at_commit: Option<String>,
     editor: Entity<Editor>,
-    /// The buffer parses as GQ (`gq_syntax`): colours, brackets, indents and folds follow the
+    /// The buffer parses as GQ (`syntax`): colours, brackets, indents and folds follow the
     /// syntax tree. Without it, words are coloured lexically.
     parsed: bool,
     /// The latest check; it lags the text by `CHECK_DELAY`.
@@ -394,7 +394,7 @@ impl QueryEditor {
 
     /// Gives the editor's buffer the GQ language, so it is parsed with the tree-sitter grammar.
     fn parse_as_gq(&mut self, cx: &mut Context<Self>) {
-        let Some(language) = crate::gq_syntax::language(cx) else {
+        let Some(language) = crate::syntax::language(crate::syntax::Syntax::Gq, cx) else {
             return;
         };
         let buffer = self.editor.read(cx).buffer().read(cx).as_singleton();
@@ -2172,7 +2172,7 @@ impl Render for QueryEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Recolours the language when the theme has changed since it last coloured it.
         if self.parsed {
-            crate::gq_syntax::language(cx);
+            crate::syntax::language(crate::syntax::Syntax::Gq, cx);
         }
         let border = cx.theme().colors().border;
         let toolbar = self.render_toolbar(cx).into_any_element();

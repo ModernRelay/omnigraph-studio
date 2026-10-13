@@ -176,6 +176,14 @@ pub mod graph {
         pub preview: bool,
     }
 
+    /// Open the schema's source, read-only; with a type, at its declaration (spec 007).
+    #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct OpenSchema {
+        #[serde(default)]
+        pub type_name: Option<String>,
+    }
+
     /// One node of a query result, for [`ShowResultsOnCanvas`].
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema)]
     pub struct ResultNode {
