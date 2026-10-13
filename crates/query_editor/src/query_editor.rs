@@ -14,7 +14,7 @@ mod view;
 use std::path::PathBuf;
 
 use gpui::{App, AppContext as _, Context, Global, PathPromptOptions, Window};
-use studio_actions::graph::{NewQuery, OpenQueryAt, OpenQueryFile};
+use studio_actions::graph::{NewQuery, NewQueryWithText, OpenQueryAt, OpenQueryFile};
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
 
@@ -144,6 +144,18 @@ pub fn init(cx: &mut App) {
             workspace.open_item(format!("query:{number}"), window, cx, |window, cx| {
                 let mut editor = QueryEditor::new(number, session, window, cx);
                 editor.pin_to(commit, cx);
+                editor
+            });
+        });
+        workspace.register_action(|workspace, action: &NewQueryWithText, window, cx| {
+            let Some(session) = workspace.session().cloned() else {
+                return;
+            };
+            let number = view::next_number();
+            let text = action.text.clone();
+            workspace.open_item(format!("query:{number}"), window, cx, |window, cx| {
+                let mut editor = QueryEditor::new(number, session, window, cx);
+                editor.set_text(&text, window, cx);
                 editor
             });
         });

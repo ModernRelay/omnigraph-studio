@@ -48,6 +48,14 @@ pub mod workspace {
         ]
     );
 
+    /// Open an `omnigraph-studio://` link: a graph, a node, or a query to read. A link never
+    /// runs a query or adds a server.
+    #[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
+    #[action(namespace = studio)]
+    pub struct OpenLink {
+        pub url: String,
+    }
+
     /// Show a panel in its dock: `explore`, `types`, `branches`, `inspector`, `activity`,
     /// `history`.
     #[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
@@ -223,6 +231,13 @@ pub mod graph {
     pub struct OpenNode {
         pub type_name: String,
         pub id: String,
+    }
+
+    /// Open a new query tab with this text. It is not run.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct NewQueryWithText {
+        pub text: String,
     }
 
     /// Open a `.gq` file in a query tab; without a path, choose one.

@@ -240,10 +240,21 @@ Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks ente
 | Panels in docks, one active panel per dock | Stacked sidebar sections | Zed's and Obsidian's model; every panel gets the same bounded chrome and the sidebar stays short |
 | Settings rows from a JSON schema (`schemars`) of the settings types | A hand-written row list; Zed's `settings_ui` page macros | One source: the field, its doc comment and attributes. The same schema can later validate `settings.json` in an editor |
 
+### Links
+
+Built: `omnigraph-studio://` links (`studio::deep_link`), registered with macOS in the bundle's
+`Info.plist`. `graph?server=…&graph=…[&branch=…]` opens a graph; `node?…&type=…&id=…` opens it
+and shows the node in Explore and the inspector; `query?…&text=…` opens it with a new query tab
+holding the text, which is not run (at most 64 KB). A link opens in the window that already has
+that graph on that branch, else in the active window, else in a new one. It never runs a query,
+writes, adds a server or carries a token: the server must already be known (compared after
+`graph_client::server_root`, so `127.0.0.1:8787` matches `http://127.0.0.1:8787`), and an unknown
+one is refused with the reason. `studio::OpenLink { url }` opens a link from inside Studio.
+
 ## Deferred
 
-- A URL scheme (`omnigraph-studio://`) for deep links, until the launcher (E1) needs it. Deep
-  links will fill a query tab and never run it.
+- `omnigraph-studio://connect?code=…`, the launcher's single-use code (engine change E1): a link
+  of that kind is refused with a note until OmniGraph has `omnigraph studio`.
 - Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
   - E9 branch details: the branch menu derives head and fork from `GET /commits?branch=` until then.
   - E15 who am I: every action stays visible; a 403 is shown as a denial and the draft stays.
@@ -252,6 +263,7 @@ Palette, J/K, cell cursor and tab switches never animate. Dialogs and peeks ente
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-12 | Links open a graph, a node or a query without running anything | `studio` `deep_link` tests (each route, missing parts, other schemes, unknown routes, text over 64 KB); offscreen snapshots through `studio::OpenLink`: a query link to `notes`, a node link with a scheme-less server, a link to an unknown server | `notes` opened beside `knowledge` with a Query 1 tab holding the text and no rows; Donald Dijkstra in Explore and the inspector; "Studio does not know the server https://elsewhere.example…" and nothing opened |
 | 2026-10-11 | Fork sources exist at the tag | `git ls-tree v1.23.2 crates/workspace/src crates/picker/src crates/command_palette/src` | Present, as listed above |
 | 2026-10-11 | `ui` components needed by the frame exist | `git ls-tree -r v1.23.2 crates/ui/src/components` | Present, as listed above |
 | 2026-10-12 | The palette's rows come from where the person was | `gpui/src/window.rs` `available_actions` (the focused node in the rendered frame, plus global listeners) and `dispatch_action` (captures focus when called) at `v1.23.2` | The list is built before the modal takes focus; on ↵ focus is restored, the modal dismissed, then the action dispatched |

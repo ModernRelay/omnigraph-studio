@@ -9779,6 +9779,7 @@ dependencies = [
  "review",
  "serde_json",
  "settings",
+ "smol",
  "studio_actions",
  "studio_settings",
  "studio_theme",
@@ -9787,6 +9788,7 @@ dependencies = [
  "theme",
  "type_table",
  "ui",
+ "url",
 ]
 
 [[package]]

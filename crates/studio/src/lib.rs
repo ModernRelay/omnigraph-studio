@@ -2,6 +2,7 @@
 //! (`docs/architecture.md`). `main.rs` runs it; the snapshot example renders it offscreen.
 
 mod activity;
+pub mod deep_link;
 mod design_gallery;
 mod keymaps;
 mod menus;
@@ -13,8 +14,8 @@ use gpui::{
     point, px, size,
 };
 use graph_store::{ConnectionRegistry, ConnectionState, open_session};
-use studio_actions::workspace::{NewWindow, OpenGraph, OpenSettings, Quit};
-use studio_workspace::{SavedWindow, Workspace};
+use studio_actions::workspace::{NewWindow, OpenGraph, OpenLink, OpenSettings, Quit};
+use studio_workspace::{SavedWindow, ToastKind, Workspace};
 
 pub use open_graph::OpenGraphModal;
 
@@ -49,6 +50,12 @@ pub fn init(cx: &mut App) {
         open_settings(workspace, window, cx);
     });
     cx.on_action(|_: &Quit, cx| cx.quit());
+    // Deferred: an action reaches here while its window is held for dispatch, and opening the
+    // link updates that window.
+    cx.on_action(|action: &OpenLink, cx| {
+        let url = action.url.clone();
+        cx.defer(move |cx| open_link(&url, cx));
+    });
     cx.on_action(|_: &NewWindow, cx| {
         cx.open_window(window_options(None, cx), |window, cx| {
             let workspace = new_workspace(window, cx);
@@ -256,5 +263,143 @@ fn open_initial_graph(workspace: &Entity<Workspace>, window: &mut Window, cx: &m
         reopen_window(workspace, saved, window, cx);
     } else {
         ask_for_graph(workspace, window, cx);
+    }
+}
+
+/// Opens an `omnigraph-studio://` link (`deep_link`): in the window that already has its graph
+/// open, else in the active window, else in a new one. What the link names is shown, never run;
+/// a server Studio does not know is refused rather than added.
+pub fn open_link(link: &str, cx: &mut App) {
+    let link = match deep_link::parse(link) {
+        Ok(link) => link,
+        Err(message) => return tell(cx, ToastKind::Error, message),
+    };
+    let Some(target) = link.target().cloned() else {
+        return tell(
+            cx,
+            ToastKind::Info,
+            "This link comes from `omnigraph studio`, which needs a later OmniGraph. Open the graph \
+             from “Open a graph” instead."
+                .into(),
+        );
+    };
+    let wanted = graph_client::server_root(&target.server).unwrap_or(target.server.clone());
+    let connection = ConnectionRegistry::global(cx)
+        .read(cx)
+        .connections
+        .iter()
+        .find(|connection| {
+            let url = &connection.read(cx).server.url;
+            graph_client::server_root(url).as_deref().unwrap_or(url) == wanted
+        })
+        .cloned();
+    let Some(connection) = connection else {
+        return tell(
+            cx,
+            ToastKind::Error,
+            format!(
+                "Studio does not know the server {}. Add it under “Open a graph” first; a link \
+                 never adds a server.",
+                target.server
+            ),
+        );
+    };
+    let branch = target.branch.clone().unwrap_or_else(|| "main".into());
+    let open_in = move |workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App| {
+        // The graph on this branch, if the window has it open; else open it here.
+        let open = workspace
+            .read(cx)
+            .open_graphs()
+            .into_iter()
+            .find(|(session, _)| {
+                let session = session.read(cx);
+                session.graph_id == target.graph
+                    && session.branch == branch
+                    && session.connection == connection
+            });
+        match open {
+            Some((session, _)) => workspace.update(cx, |workspace, cx| {
+                workspace.show_graph(session.entity_id(), window, cx)
+            }),
+            None => {
+                if connection.read(cx).state == ConnectionState::Idle {
+                    connection.update(cx, |connection, cx| connection.connect(cx));
+                }
+                let session =
+                    open_session(connection.clone(), target.graph.clone(), branch.clone(), cx);
+                workspace.update(cx, |workspace, cx| {
+                    workspace.set_session(session, window, cx)
+                });
+            }
+        }
+        let focus = workspace.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        match &link {
+            DeepLink::Node { type_name, id, .. } => window.dispatch_action(
+                Box::new(studio_actions::graph::OpenNode {
+                    type_name: type_name.clone(),
+                    id: id.clone(),
+                }),
+                cx,
+            ),
+            DeepLink::Query { text, .. } => window.dispatch_action(
+                Box::new(studio_actions::graph::NewQueryWithText { text: text.clone() }),
+                cx,
+            ),
+            DeepLink::Graph(_) | DeepLink::Connect => {}
+        }
+        window.activate_window();
+    };
+    match link_window(cx) {
+        // Through the untyped handle, so the workspace is not held while it is opened into.
+        Some(handle) => {
+            cx.update_window(handle, |root, window, cx| {
+                if let Ok(workspace) = root.downcast::<Workspace>() {
+                    open_in(&workspace, window, cx);
+                }
+            })
+            .ok();
+        }
+        None => {
+            cx.open_window(window_options(None, cx), move |window, cx| {
+                let workspace = new_workspace(window, cx);
+                open_in(&workspace, window, cx);
+                workspace
+            })
+            .ok();
+        }
+    }
+    cx.activate(true);
+}
+
+use deep_link::DeepLink;
+
+/// The workspace window a link opens in: the active one, else any.
+fn link_window(cx: &App) -> Option<gpui::AnyWindowHandle> {
+    let is_workspace = |window: &gpui::AnyWindowHandle| window.downcast::<Workspace>().is_some();
+    cx.active_window()
+        .filter(is_workspace)
+        .or_else(|| cx.windows().into_iter().find(is_workspace))
+}
+
+/// Says why a link did not open, in a window if there is one.
+fn tell(cx: &mut App, kind: ToastKind, message: String) {
+    match link_window(cx) {
+        Some(handle) => {
+            cx.update_window(handle, |root, _, cx| {
+                if let Ok(workspace) = root.downcast::<Workspace>() {
+                    workspace.update(cx, |workspace, cx| workspace.show_toast(kind, message, cx));
+                }
+            })
+            .ok();
+        }
+        None => {
+            cx.open_window(window_options(None, cx), move |window, cx| {
+                let workspace = new_workspace(window, cx);
+                workspace.update(cx, |workspace, cx| workspace.show_toast(kind, message, cx));
+                workspace
+            })
+            .ok();
+        }
     }
 }
