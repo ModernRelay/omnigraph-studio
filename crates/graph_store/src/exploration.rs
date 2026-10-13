@@ -2,9 +2,10 @@
 //! root node, the paths a person expanded from it, and the group counts and neighbour pages
 //! those paths show.
 //!
-//! Every read is pinned to the commit the first read returned (constitution II). A commit on
-//! the session's branch raises [`Exploration::newer_available`] and changes nothing until
-//! [`Exploration::refresh`]. Counts come from the session's batched counts
+//! Every read is pinned to the commit the first read returned (constitution II). When the
+//! session sees its branch's head at another commit ([`SessionEvent::HeadMoved`]: Studio's own
+//! commit, or another writer's), [`Exploration::newer_available`] is raised and nothing changes
+//! until [`Exploration::refresh`]. Counts come from the session's batched counts
 //! ([`GraphSession::degree`]): every count asked for in one turn (several nodes expanded,
 //! a refresh) is one `builder::page_degrees` read per node type and relationship group (engine
 //! change E16 would replace them); neighbours come in keyset
@@ -1147,8 +1148,10 @@ impl Exploration {
                     this.root_at(root, cx);
                 }
             }
-            SessionEvent::Committed { branch }
-                if this.pin.is_some() && *branch == session.read(cx).branch =>
+            SessionEvent::HeadMoved { branch, head }
+                if *branch == session.read(cx).branch
+                    && this.pin.as_deref().is_some_and(|pin| pin != head)
+                    && !this.newer_available =>
             {
                 this.newer_available = true;
                 cx.emit(ExplorationEvent::Changed);

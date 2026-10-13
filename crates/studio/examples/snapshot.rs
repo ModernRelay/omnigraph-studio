@@ -168,6 +168,10 @@ fn main() {
         .open_window(size(px(width), px(height)), studio::build_workspace)
         .expect("open the snapshot window");
     let handle: AnyWindowHandle = window.into();
+    // The window is the one in front, as Studio's is while someone uses it: views that only work
+    // while a window is active (the branch-head poll) run.
+    cx.update_window(handle, |_, window, _| window.activate_window())
+        .expect("activate the snapshot window");
     settle(&mut cx, wait);
 
     for spec in actions {

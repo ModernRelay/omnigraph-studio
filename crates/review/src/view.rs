@@ -16,7 +16,7 @@ use graph_client::api::{
 use graph_client::{GraphClient, WriteOutcome};
 use graph_store::fixes::compose;
 use graph_store::{
-    ChangeFold, FoldedChange, FoldedChanges, GraphSession, NetChange, REVIEW_CHANGE_CAP,
+    ChangeFold, FoldedChange, FoldedChanges, GraphSession, HeadWatch, NetChange, REVIEW_CHANGE_CAP,
     SessionEvent, TypeCounts, commits_since, contains_merge_of, fork_point, revert_query,
     summary_sentence,
 };
@@ -132,6 +132,11 @@ pub struct ReviewView {
     /// Someone else wrote to the branch after this review was read.
     newer: bool,
     fixes_running: usize,
+    /// The session saw the branch's head move while a fix or the merge was out; compared once
+    /// they are back, since each moves the bound head itself.
+    head_moved_while_writing: bool,
+    /// The session asks after the reviewed branch's head while the review is open.
+    _head_watch: HeadWatch,
     _load_task: Option<Task<()>>,
     _merge_task: Option<Task<()>>,
     _fix_tasks: Vec<Task<()>>,
@@ -194,20 +199,15 @@ impl ReviewView {
                 this.apply_search(cx);
             }
         });
-        let subscription = cx.subscribe(&session, |this, _, event: &SessionEvent, cx| {
-            match event {
-                SessionEvent::Committed { branch } if *branch == this.branch => {
-                    // Studio's own fixes also commit; only another writer makes the view stale.
-                    if this.fixes_running == 0 && !matches!(this.merge, MergeState::Merging) {
-                        this.newer = true;
-                        cx.emit(ItemEvent::UpdateTab);
-                        cx.notify();
-                    }
+        let subscription =
+            cx.subscribe(&session, |this, _, event: &SessionEvent, cx| match event {
+                SessionEvent::HeadMoved { branch, .. } if *branch == this.branch => {
+                    this.compare_head(cx)
                 }
                 SessionEvent::SchemaChanged => cx.notify(),
                 _ => {}
-            }
-        });
+            });
+        let head_watch = session.update(cx, |session, cx| session.watch_head(&branch, cx));
         let mut view = Self {
             session,
             branch,
@@ -228,6 +228,8 @@ impl ReviewView {
             show_conflicts: false,
             newer: false,
             fixes_running: 0,
+            head_moved_while_writing: false,
+            _head_watch: head_watch,
             _load_task: None,
             _merge_task: None,
             _fix_tasks: Vec::new(),
@@ -599,8 +601,44 @@ impl ReviewView {
             }
             card.fix = fix;
         }
+        self.writes_settled(cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
+    }
+
+    /// Offers Refresh when the session saw the branch's head at another commit than the one
+    /// fixes and the merge bind to. Studio's own fixes move that head themselves, so a head seen
+    /// while a fix or the merge is out is compared once they are back.
+    fn compare_head(&mut self, cx: &mut Context<Self>) {
+        if self.fixes_running > 0 || matches!(self.merge, MergeState::Merging) {
+            self.head_moved_while_writing = true;
+            return;
+        }
+        if self.newer {
+            return;
+        }
+        let Some(bound) = self.bound_head.as_deref() else {
+            return;
+        };
+        if self
+            .session
+            .read(cx)
+            .head(&self.branch)
+            .is_some_and(|head| head != bound)
+        {
+            self.newer = true;
+            cx.emit(ItemEvent::UpdateTab);
+            cx.notify();
+        }
+    }
+
+    fn writes_settled(&mut self, cx: &mut Context<Self>) {
+        if self.fixes_running == 0
+            && !matches!(self.merge, MergeState::Merging)
+            && std::mem::take(&mut self.head_moved_while_writing)
+        {
+            self.compare_head(cx);
+        }
     }
 
     /// Merges the branch into the target after checking the branch still sits at the head this
@@ -708,6 +746,7 @@ impl ReviewView {
             this.update(cx, |this, cx| {
                 this.show_conflicts = matches!(state, MergeState::Conflicts(_));
                 this.merge = state;
+                this.writes_settled(cx);
                 this.session.update(cx, |s, cx| s.reload_branches(cx));
                 cx.emit(ItemEvent::UpdateTab);
                 cx.notify();

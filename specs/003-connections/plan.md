@@ -96,6 +96,18 @@ from the served document).
 - A read at a commit is answered once per session: the answer is kept (256 reads, 2,048 Blob
   cells, least recently used out first) and an identical read under way is shared, since a
   commit never changes. Failures are not kept, and reads at the branch head always go out.
+- A session watches branch heads for the views pinned to them: its own branch always, and any
+  branch a view holds a `HeadWatch` for (a review's). Every `HEAD_POLL` (30 s) while a Studio
+  window is active, and when a window becomes active after a poll came while none was, it reads
+  each watched head with a query that returns no rows (`builder::head_probe`, `limit 0` over
+  the schema's first node type: the answer's `graph_commit_id` is the head), at most one under
+  way per branch, and reads the branch list again. Studio's own commits set the head without
+  asking and drop any head read still under way for that branch, whose answer could name the
+  commit before. A head move emits `HeadMoved`; a move from a head already seen that is not
+  Studio's own is another writer's commit and emits `Committed`, so commit lists and counts are
+  read again as after Studio's own. A changed branch list emits `BranchesChanged`, so a branch
+  made or deleted outside Studio appears; an unchanged one says nothing. No poll goes out while
+  no window is active or while the graph is unavailable.
 - Each branch's commit list is read once and shared by the views that show it (the history,
   the branches panel, every query tab's snapshot picker); a commit Studio makes on a branch
   drops that branch's list, reading the branch list again drops them all (its first read, as
@@ -138,6 +150,9 @@ from the served document).
 | 2026-10-12 | Abandoned reads leave the running count; abandoned writes still finish | `graph_store` test `dropped_reads_are_counted_out_and_dropped_writes_still_finish` (three reads that never answer, dropped; a write whose task is dropped before it ran); the same test against the earlier session code | Count back to 0 and the write sent once with its refusal logged; the earlier code left the count at 3, as the app showed "100 queries running" after four node searches over crm's 25 types |
 | 2026-10-12 | A connection keeps a bounded number of reads on the wire | `graph_client` test `a_connection_keeps_a_bounded_number_of_reads_on_the_wire` (40 reads through two clones against a server that holds each 5 ms) | At most 8 at once, all answered. Seen before the fix in the app on a person with dozens of relationship types: "read ingress count cap 64 exceeded" with Retry on several rows |
 | 2026-10-12 | A refused token can be replaced in place | offscreen snapshot with a wrong `OMNIGRAPH_STUDIO_TOKEN`, Open Graph | "The server refused the token" with a masked field and Update token; the connection reconnects with it. A Studio server keeps it in the keychain; a CLI server for this run only. Retry when unreachable, Cancel while connecting |
+| 2026-10-13 | The session watches heads and the branch list | `graph_store` test `the_head_watch_sees_other_writers_commits_while_a_window_is_active` (simulated clock): the head once the schema loads; no request at a poll with no window active; one at activation, none at the next; a watched branch asked with the session's own; a dropped watch forgotten; a branch added elsewhere listed at the poll; Studio's own commit the head with no request | Each as stated; an unchanged branch list emitted nothing |
+| 2026-10-13 | The head probe answers with the head and no rows on 0.13 | `POST /graphs/knowledge/query` with `studio_head` on the dev server, three times | `row_count` 0, `graph_commit_id` the head; 2-17 ms |
+| 2026-10-13 | A branch made outside Studio appears | offscreen snapshot on the dev server: the Branches panel, then `POST /branches` `head-watch-check` from curl 25 s in, then 40 s more | The panel listed `main` and `head-watch-check`; before, the list was read only when the window opened and after Studio's own branch writes |
 | 2026-10-13 | Opening a window reads each branch's commit list once | `graph_store` test `commit_lists_are_read_again_only_for_the_branch_a_commit_lands_on` (main asked for while the branch list loads, the branches panel asking again on its arrival: one read; it read twice before the fix); offscreen snapshots through a request-counting proxy on the dev graph's four branches: an empty window; three new queries and the history | `GET /commits` 4 times in both, once per branch (before: 5 for the empty window, main twice, and one more per query tab) |
 
 ## Corrections

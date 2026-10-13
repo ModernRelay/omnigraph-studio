@@ -53,9 +53,10 @@ stay put), IX (paged, virtualized).
   "Save…": the person picks a file (named `<id>-<property>` with the extension its first bytes
   announce), the value is read in ranges at the peek's commit into `<file>.part` beside it, off
   the main thread, and renamed into place only when whole; the line shows how far it got, then
-  "Show in Finder". The peek reads at one commit; once Studio commits to its branch, a node's
-  peek shows "Newer data · Refresh" beside that commit, and Refresh reads the node, its
-  relationships and its Blobs again at the head. A peek opened from the table reads no
+  "Show in Finder". The peek reads at one commit; once the session sees its branch's head
+  elsewhere (spec 003, Studio's commit or another writer's), a node's peek shows "Newer data ·
+  Refresh" beside that commit, and Refresh reads the node, its relationships and its Blobs again
+  at the head. A peek from a table opened at a commit holds that commit and offers no Refresh. A peek opened from the table reads no
   relationship the table already read at the same commit: the table's relationship columns
   read every row's count and, for rows of up to 200 neighbours, the whole list (keeping the
   first eight, the cell showing two), so the peek takes the count and its first neighbours from
@@ -298,6 +299,7 @@ kept answers.
 | 2026-10-13 | An edge is deleted from its table, bound to the table's commit | Snapshot of `WorksAt`: ↓, Delete, the dialog, then ↵; CLI counts before and after | "Delete WorksAt person-000175 → company-00012 · This removes this WorksAt from main. Both nodes stay."; ↵ deleted it: the row left the table, 217 → 216, and the CLI found no such edge |
 | 2026-10-13 | ↵ on an offered value types nothing into the field | Snapshot of ↵ on the first offer, before and after the fix | Before: the field read `person-000000\n`; Studio's `move_to_end` after `set_text` only propagates in a single-line editor, so the ↵ reached the field as text too. After: `person-000000`. The table's filter field had the same call |
 | 2026-10-13 | A peek reads only what the table did not | offscreen snapshots through a request-counting proxy: the Person table (four relationship columns), then the peek and ↓ twice | Before: the peek read 4 counts and up to 4 neighbour lists for each row it showed, 22 reads in all; after: none. The peek of Grace Allen read the same before and after (contributes 2 with both projects, knows 0, worksAt 0, known by 2 with both people) |
+| 2026-10-13 | Another writer's commit shows "Newer data" within a poll | offscreen snapshots on the dev server: the Person table, then a title set from curl 25 s in, then 40 s more; and a control with the write before the table's first read | The table kept its commit's title and showed "Newer data · Refresh" with the tab's dot; in the control it read the new title and showed nothing |
 
 ## Corrections
 
@@ -355,3 +357,10 @@ kept answers.
 - 2026-10-12 · The branch-head check is a one-row read at the head every 30 s while the table is
   the active tab, and after any Studio write to the same branch. Offscreen snapshots do not run
   GPUI timers, so the poll and the peek debounce are not visible there.
+- 2026-10-13 · The table no longer asks after its head itself: the session's head watch (spec
+  003) reads it every 30 s while a window is active, for every view at once, and the table
+  compares its pin with the head it saw. The insert and delete dialogs write on the table's
+  behalf, so they tell it a write is out (`save_started`, `save_finished`); a head seen while a
+  write is out is compared once its outcome moved the pin. Offscreen snapshots do run timers
+  (`wait:` advances the simulated clock), and the snapshot window is now active, so the poll
+  shows there.

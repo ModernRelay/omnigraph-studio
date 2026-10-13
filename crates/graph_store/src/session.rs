@@ -1,6 +1,8 @@
 //! One open graph on one server and branch: schema, branches, type counts, and every read and
 //! write Studio sends for it (spec 003, 004, 008).
 
+use std::collections::HashMap;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -63,9 +65,16 @@ pub enum SessionEvent {
     BranchChanged,
     BranchesChanged,
     CountsChanged,
-    /// A write on `branch` committed; views reading that branch may offer Refresh.
+    /// A commit landed on `branch`: one of Studio's writes, or another writer's that the head
+    /// watch saw. The branch's commit list is read again.
     Committed {
         branch: String,
+    },
+    /// `branch`'s head is now `head` ([`GraphSession::head`]), seen for the first time or
+    /// moved. A view pinned to another commit of the branch may offer Refresh.
+    HeadMoved {
+        branch: String,
+        head: String,
     },
     ActivityChanged,
     /// The graph became unavailable (503) or answered again.
@@ -78,6 +87,16 @@ const PINNED_BLOBS: usize = 2_048;
 
 /// How many branches' commit lists a session keeps.
 const COMMIT_LISTS: usize = 64;
+
+/// How often a session asks after the heads of the branches its views show, while a window of
+/// Studio's is active.
+pub const HEAD_POLL: Duration = Duration::from_secs(30);
+
+/// A view's interest in a branch's head: the session asks after the branch while one is held.
+/// The session's own branch is always asked after.
+pub struct HeadWatch {
+    _alive: Rc<()>,
+}
 
 /// A branch's commits, newest first, shared by the views that show them.
 pub type CommitList = Arc<Vec<CommitOutput>>;
@@ -120,6 +139,18 @@ pub struct GraphSession {
     branches_read: bool,
     /// Relationship counts asked for this turn, read together when it ends.
     degrees: DegreeBatches,
+    /// The commit each watched branch's head was last seen at, by the head watch or as one of
+    /// Studio's own commits.
+    heads: HashMap<String, String>,
+    /// Branches views asked after besides the session's own, while their watch is held.
+    head_watches: Vec<(String, Weak<()>)>,
+    /// Head reads under way, by branch.
+    head_reads: HashMap<String, Task<()>>,
+    /// The branch list read again by the head watch, while under way.
+    branch_recheck: Option<Task<()>>,
+    /// A poll came while no window was active; the next activation asks at once.
+    head_check_missed: bool,
+    _head_poll: Option<Task<()>>,
     _recheck: Option<Task<()>>,
     _schema_task: Option<Task<()>>,
     _branches_task: Option<Task<()>>,
@@ -152,11 +183,34 @@ impl GraphSession {
             commit_lists: Memo::new(COMMIT_LISTS),
             branches_read: false,
             degrees: DegreeBatches::default(),
+            heads: HashMap::new(),
+            head_watches: Vec::new(),
+            head_reads: HashMap::new(),
+            branch_recheck: None,
+            head_check_missed: false,
+            _head_poll: None,
             _recheck: None,
             _schema_task: None,
             _branches_task: None,
             _datasets_task: None,
         };
+        session._head_poll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(HEAD_POLL).await;
+                let alive = this
+                    .update(cx, |this, cx| {
+                        if cx.active_window().is_some() {
+                            this.check_heads(cx);
+                        } else {
+                            this.head_check_missed = true;
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        }));
         session.reload(cx);
         session
     }
@@ -238,6 +292,7 @@ impl GraphSession {
                 this.schema = result;
                 cx.emit(SessionEvent::SchemaChanged);
                 cx.notify();
+                this.check_heads(cx);
             })
             .ok();
         }));
@@ -251,11 +306,7 @@ impl GraphSession {
             let read = client.branches(&graph).await;
             this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
             let result = match read {
-                Ok(output) => {
-                    let mut branches = output.branches;
-                    branches.sort_by(|a, b| (a != "main").cmp(&(b != "main")).then(a.cmp(b)));
-                    Loadable::Loaded(branches)
-                }
+                Ok(output) => Loadable::Loaded(branch_order(output.branches)),
                 Err(error) => Loadable::Failed(error.to_string()),
             };
             this.update(cx, |this, cx| {
@@ -327,6 +378,151 @@ impl GraphSession {
         self.reload_counts(cx);
         cx.emit(SessionEvent::BranchChanged);
         cx.notify();
+        self.check_heads(cx);
+    }
+
+    /// The commit `branch`'s head was last seen at, once a watched branch has been asked after
+    /// or Studio committed to it.
+    pub fn head(&self, branch: &str) -> Option<&str> {
+        self.heads.get(branch).map(String::as_str)
+    }
+
+    /// Asks after `branch`'s head while the returned watch is held.
+    pub fn watch_head(&mut self, branch: &str, cx: &mut Context<Self>) -> HeadWatch {
+        let alive = Rc::new(());
+        let new = !self
+            .watched_branches()
+            .iter()
+            .any(|watched| watched == branch);
+        self.head_watches
+            .push((branch.to_owned(), Rc::downgrade(&alive)));
+        if new {
+            self.check_heads(cx);
+        }
+        HeadWatch { _alive: alive }
+    }
+
+    /// A window became active: asks after the heads at once when a poll came while none was.
+    pub fn window_activated(&mut self, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.head_check_missed) {
+            self.check_heads(cx);
+        }
+    }
+
+    /// The session's branch, then every branch a held watch names.
+    fn watched_branches(&self) -> Vec<String> {
+        let mut branches = vec![self.branch.clone()];
+        for (branch, alive) in &self.head_watches {
+            if alive.strong_count() > 0 && !branches.contains(branch) {
+                branches.push(branch.clone());
+            }
+        }
+        branches
+    }
+
+    /// Reads each watched branch's head with a read that returns no rows, unless one is under
+    /// way, and the branch list. Heads of branches no longer watched are forgotten.
+    pub fn check_heads(&mut self, cx: &mut Context<Self>) {
+        self.head_watches
+            .retain(|(_, alive)| alive.strong_count() > 0);
+        let watched = self.watched_branches();
+        self.heads.retain(|branch, _| watched.contains(branch));
+        if self.unavailable.is_some() {
+            return;
+        }
+        self.recheck_branches(cx);
+        let Some(probe) = self
+            .schema_model()
+            .and_then(|schema| builder::head_probe(&schema))
+        else {
+            return;
+        };
+        for branch in watched {
+            if self.head_reads.contains_key(&branch) {
+                continue;
+            }
+            let request = QueryRequest {
+                query: probe.text.clone(),
+                name: Some(probe.name.clone()),
+                params: None,
+                branch: Some(branch.clone()),
+                snapshot: None,
+            };
+            let client = self.client(cx);
+            let graph = self.graph_id.clone();
+            let key = branch.clone();
+            let read = cx.spawn(async move |this, cx| {
+                let read = client.query(&graph, &request).await;
+                this.update(cx, |this, cx| {
+                    this.head_reads.remove(&branch);
+                    this.note_read(&read, cx);
+                    if let Ok(ReadOutput {
+                        graph_commit_id: Some(head),
+                        ..
+                    }) = read
+                    {
+                        this.saw_head(branch, head, false, cx);
+                    }
+                })
+                .ok();
+            });
+            self.head_reads.insert(key, read);
+        }
+    }
+
+    /// Reads the branch list again once it has been read, so a branch made or deleted elsewhere
+    /// (the CLI, an agent, another window) appears; an unchanged list changes nothing.
+    fn recheck_branches(&mut self, cx: &mut Context<Self>) {
+        if self.branch_recheck.is_some() || !matches!(self.branches, Loadable::Loaded(_)) {
+            return;
+        }
+        let client = self.client(cx);
+        let graph = self.graph_id.clone();
+        self.branch_recheck = Some(cx.spawn(async move |this, cx| {
+            let read = client.branches(&graph).await;
+            this.update(cx, |this, cx| {
+                this.branch_recheck = None;
+                this.note_read(&read, cx);
+                let Ok(output) = read else {
+                    return;
+                };
+                let branches = branch_order(output.branches);
+                if this.branches.loaded() == Some(&branches) {
+                    return;
+                }
+                // As after any branch list read: a branch deleted and made again under its
+                // name has another history.
+                this.commit_lists.clear();
+                this.branches = Loadable::Loaded(branches);
+                cx.emit(SessionEvent::BranchesChanged);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Records `branch`'s head. A move from a head already seen that is not one of Studio's own
+    /// commits (`own`) is another writer's commit: the branch's commit list and counts are read
+    /// again, as after Studio's own.
+    fn saw_head(&mut self, branch: String, head: String, own: bool, cx: &mut Context<Self>) {
+        if own {
+            // A head read sent before this commit could answer with the head before it.
+            self.head_reads.remove(&branch);
+        }
+        let previous = self.heads.insert(branch.clone(), head.clone());
+        if previous.as_deref() == Some(head.as_str()) {
+            return;
+        }
+        if previous.is_some() && !own {
+            self.commit_lists.forget(&branch);
+            if branch == self.branch {
+                self.reload_counts(cx);
+            }
+            cx.emit(SessionEvent::Committed {
+                branch: branch.clone(),
+            });
+        }
+        cx.emit(SessionEvent::HeadMoved { branch, head });
     }
 
     /// Runs a read on the session's branch, or at `snapshot` when given (constitution II). A
@@ -722,17 +918,18 @@ impl GraphSession {
         branch_created: bool,
         cx: &mut Context<Self>,
     ) {
-        let committed = matches!(&outcome, OutcomeKind::Committed { commit: Some(_) });
+        let commit = match &outcome {
+            OutcomeKind::Committed { commit } => commit.clone(),
+            _ => None,
+        };
         self.outcomes.push(OutcomeEntry {
             at: SystemTime::now(),
             branch: branch.clone(),
             description,
             outcome,
         });
-        if committed {
-            self.reload_counts(cx);
-            self.commit_lists.forget(&branch);
-            cx.emit(SessionEvent::Committed { branch });
+        if let Some(commit) = commit {
+            self.committed(branch, commit, cx);
         }
         if branch_created {
             self.reload_branches(cx);
@@ -749,20 +946,31 @@ impl GraphSession {
         cx: &mut Context<Self>,
     ) {
         self.writes_in_flight = self.writes_in_flight.saturating_sub(1);
-        let committed = matches!(outcome, OutcomeKind::Committed { commit: Some(_) });
+        let commit = match &outcome {
+            OutcomeKind::Committed { commit } => commit.clone(),
+            _ => None,
+        };
         self.outcomes.push(OutcomeEntry {
             at: SystemTime::now(),
             branch: branch.clone(),
             description,
             outcome,
         });
-        if committed {
-            self.reload_counts(cx);
-            self.commit_lists.forget(&branch);
-            cx.emit(SessionEvent::Committed { branch });
+        if let Some(commit) = commit {
+            self.committed(branch, commit, cx);
         }
         cx.emit(SessionEvent::ActivityChanged);
         cx.notify();
+    }
+
+    /// One of Studio's writes committed `commit` on `branch`: it is the branch's head.
+    fn committed(&mut self, branch: String, commit: String, cx: &mut Context<Self>) {
+        self.reload_counts(cx);
+        self.commit_lists.forget(&branch);
+        cx.emit(SessionEvent::Committed {
+            branch: branch.clone(),
+        });
+        self.saw_head(branch, commit, true, cx);
     }
 
     pub fn create_branch(
@@ -864,6 +1072,12 @@ fn outcome_kind<T>(
             reason: reason.clone(),
         },
     }
+}
+
+/// Branches as Studio lists them: `main` first, then by name.
+fn branch_order(mut branches: Vec<String>) -> Vec<String> {
+    branches.sort_by(|a, b| (a != "main").cmp(&(b != "main")).then(a.cmp(b)));
+    branches
 }
 
 /// Opens a session on a graph.
@@ -1047,7 +1261,9 @@ mod tests {
                     let request: Value = serde_json::from_slice(&bytes).unwrap();
                     let name = request["name"].as_str().unwrap_or_default().to_owned();
                     let ids = request["params"]["ids"].clone();
-                    seen.lock().unwrap().push((name, ids.clone()));
+                    if name != "studio_head" {
+                        seen.lock().unwrap().push((name, ids.clone()));
+                    }
                     // Every node but p-2 has as many neighbours as its id's last digit.
                     let rows: Vec<Value> = ids
                         .as_array()
@@ -1126,6 +1342,162 @@ mod tests {
             count.await.unwrap();
         }
         assert_eq!(reads.lock().unwrap().len(), 2);
+    }
+
+    /// The session asks after its branch's head, and each watched branch's, once the schema
+    /// loads, at every poll while a window is active, and when a window becomes active after a
+    /// poll came while none was. Another writer's commit lands like Studio's own; Studio's own
+    /// commit is the head without asking. Each poll reads the branch list too, so a branch made
+    /// elsewhere appears.
+    #[gpui::test]
+    async fn the_head_watch_sees_other_writers_commits_while_a_window_is_active(
+        cx: &mut TestAppContext,
+    ) {
+        use futures::AsyncReadExt as _;
+        use serde_json::Value;
+        let heads: Arc<std::sync::Mutex<HashMap<String, String>>> = Arc::new(
+            [("main", "c1"), ("feature", "f1")]
+                .map(|(branch, head)| (branch.to_owned(), head.to_owned()))
+                .into_iter()
+                .collect::<HashMap<_, _>>()
+                .into(),
+        );
+        let probes: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let listed: Arc<std::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(vec!["main", "feature"].into());
+        let (known, asked, branch_list) = (heads.clone(), probes.clone(), listed.clone());
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let (known, asked, branch_list) = (known.clone(), asked.clone(), branch_list.clone());
+            async move {
+                let mut bytes = Vec::new();
+                request.into_body().read_to_end(&mut bytes).await.ok();
+                let body = if path.ends_with("/schema") {
+                    serde_json::json!({ "schema_source": "node Person {\n  slug: String @key\n}\n" })
+                } else if path.ends_with("/query") {
+                    let request: Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(request["name"], "studio_head");
+                    let branch = request["branch"].as_str().unwrap().to_owned();
+                    let head = known.lock().unwrap()[&branch].clone();
+                    asked.lock().unwrap().push(branch);
+                    serde_json::json!({ "query_name": "studio_head", "target": { "branch": "main" }, "row_count": 0, "rows": [], "graph_commit_id": head })
+                } else if path.ends_with("/mutate") {
+                    serde_json::json!({ "branch": "main", "query_name": "m", "affected_nodes": 1, "affected_edges": 0, "commit": { "graph_commit_id": "c9", "graph_branch": "main", "graph_manifest_version": 9, "created_at": 9, "parent_commit_id": "c2" } })
+                } else {
+                    serde_json::json!({ "branches": *branch_list.lock().unwrap() })
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        let events: Rc<std::cell::RefCell<Vec<SessionEvent>>> = Rc::default();
+        let seen = events.clone();
+        let _events = cx.update(|cx| {
+            cx.subscribe(&session, move |_, event: &SessionEvent, _| {
+                if matches!(
+                    event,
+                    SessionEvent::Committed { .. }
+                        | SessionEvent::HeadMoved { .. }
+                        | SessionEvent::BranchesChanged
+                ) {
+                    seen.borrow_mut().push(event.clone());
+                }
+            })
+        });
+        let head_of = |cx: &mut TestAppContext, branch: &str| {
+            session.read_with(cx, |session, _| session.head(branch).map(str::to_owned))
+        };
+        let moved = |branch: &str, head: &str| SessionEvent::HeadMoved {
+            branch: branch.into(),
+            head: head.into(),
+        };
+        let landed = |branch: &str| SessionEvent::Committed {
+            branch: branch.into(),
+        };
+        cx.run_until_parked();
+        assert_eq!(head_of(cx, "main").as_deref(), Some("c1"));
+        events
+            .borrow_mut()
+            .retain(|event| *event != SessionEvent::BranchesChanged);
+        assert_eq!(
+            events.take(),
+            vec![moved("main", "c1")],
+            "a head seen first is no commit"
+        );
+
+        // Another writer commits while no window is active: the poll asks nothing.
+        heads.lock().unwrap().insert("main".into(), "c2".into());
+        cx.executor().advance_clock(HEAD_POLL);
+        cx.run_until_parked();
+        assert_eq!(probes.lock().unwrap().len(), 1);
+        assert_eq!(head_of(cx, "main").as_deref(), Some("c1"));
+
+        // A window becomes active: asked at once; a second activation asks nothing more. The
+        // branch list read again is unchanged: nothing is said about it.
+        for _ in 0..2 {
+            session.update(cx, |session, cx| session.window_activated(cx));
+            cx.run_until_parked();
+        }
+        assert_eq!(probes.lock().unwrap().len(), 2);
+        assert_eq!(events.take(), vec![landed("main"), moved("main", "c2")]);
+
+        // A watched branch is asked after at once, then with the session's own at each poll. A
+        // branch made elsewhere appears at the poll.
+        let watch = session.update(cx, |session, cx| session.watch_head("feature", cx));
+        cx.run_until_parked();
+        assert_eq!(head_of(cx, "feature").as_deref(), Some("f1"));
+        cx.add_empty_window()
+            .update(|window, _| window.activate_window());
+        heads.lock().unwrap().insert("feature".into(), "f2".into());
+        listed.lock().unwrap().push("spike");
+        probes.lock().unwrap().clear();
+        cx.executor().advance_clock(HEAD_POLL);
+        cx.run_until_parked();
+        let mut asked = probes.lock().unwrap().clone();
+        asked.sort();
+        assert_eq!(asked, vec!["feature", "main"]);
+        assert_eq!(head_of(cx, "feature").as_deref(), Some("f2"));
+        assert!(events.take().contains(&SessionEvent::BranchesChanged));
+        assert_eq!(
+            session.read_with(cx, |session, _| session.branches.loaded().cloned()),
+            Some(vec!["main".into(), "feature".into(), "spike".into()])
+        );
+
+        // The watch dropped: the branch is no longer asked after, and its head is forgotten.
+        drop(watch);
+        probes.lock().unwrap().clear();
+        cx.executor().advance_clock(HEAD_POLL);
+        cx.run_until_parked();
+        assert_eq!(*probes.lock().unwrap(), vec!["main"]);
+        assert_eq!(head_of(cx, "feature"), None);
+
+        // Studio's own commit: the head without asking, landing once.
+        let query = BuiltQuery {
+            name: "m".into(),
+            text: "query m() { update Person set { slug: \"x\" } where @id = \"p\" }".into(),
+            params: Default::default(),
+        };
+        probes.lock().unwrap().clear();
+        let write = session.update(cx, |session, cx| {
+            session.write(&query, None, "Set slug".into(), cx)
+        });
+        write.await;
+        cx.run_until_parked();
+        assert!(probes.lock().unwrap().is_empty());
+        assert_eq!(head_of(cx, "main").as_deref(), Some("c9"));
+        assert_eq!(events.take(), vec![landed("main"), moved("main", "c9")]);
     }
 
     /// A branch's commit list is read once for every view that shows it, and again only after

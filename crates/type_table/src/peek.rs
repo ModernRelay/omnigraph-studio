@@ -112,8 +112,10 @@ pub struct NodePeek {
     /// The table's relationship reads for this row, by `builder::relationship_key`.
     known: HashMap<String, KnownRelation>,
     copied: Option<String>,
-    /// Studio committed to the peek's branch since it read: what it shows may be older.
+    /// The branch's head moved past the commit the peek read: what it shows may be older.
     newer: bool,
+    /// The peek shows a commit chosen on purpose (a table opened at a commit), not the head.
+    holds_commit: bool,
     _tasks: Vec<Task<()>>,
     _subscription: Subscription,
 }
@@ -134,9 +136,10 @@ impl NodePeek {
     ) -> Self {
         let schema = session.read(cx).schema_model();
         let subscription = cx.subscribe(&session, |this: &mut Self, session, event, cx| {
-            if let SessionEvent::Committed { branch } = event
+            if let SessionEvent::HeadMoved { branch, head } = event
                 && *branch == session.read(cx).branch
-                && this.snapshot.is_some()
+                && !this.holds_commit
+                && this.snapshot.as_ref().is_some_and(|pin| pin != head)
             {
                 this.newer = true;
                 cx.notify();
@@ -153,6 +156,7 @@ impl NodePeek {
             known,
             copied: None,
             newer: false,
+            holds_commit: false,
             _tasks: Vec::new(),
             _subscription: subscription,
         };
@@ -169,6 +173,12 @@ impl NodePeek {
 
     pub fn subject(&self) -> &PeekSubject {
         &self.subject
+    }
+
+    /// The peek shows the commit it was given whatever the branch does: no Refresh is offered.
+    pub fn hold_commit(&mut self) {
+        self.holds_commit = true;
+        self.newer = false;
     }
 
     /// Reads a node again at the branch head, with its relationships and Blobs.

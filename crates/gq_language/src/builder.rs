@@ -591,6 +591,21 @@ pub fn node_by_id(
     })
 }
 
+/// A read that returns no rows, sent only for the commit its answer names: a branch's head
+/// when it is read at the branch. `None` when the schema has no node type to match.
+pub fn head_probe(schema: &SchemaModel) -> Option<BuiltQuery> {
+    let node = schema.nodes.first()?;
+    let text = format!(
+        "query studio_head() {{\n  match {{\n    $n: {ty}\n  }}\n  return {{ $n.@id }}\n  limit 0\n}}\n",
+        ty = node.name,
+    );
+    Some(BuiltQuery {
+        name: "studio_head".into(),
+        text,
+        params: Map::new(),
+    })
+}
+
 fn edge<'a>(schema: &'a SchemaModel, name: &str) -> Result<&'a EdgeType, BuildError> {
     schema
         .edge(name)
@@ -2106,6 +2121,14 @@ mod tests {
         let query = node_by_id(&schema, "Person", "person-000000").unwrap();
         assert_compiles(&query);
         assert_eq!(query.params["id"], json!("person-000000"));
+    }
+
+    #[test]
+    fn the_head_probe_compiles_and_reads_no_rows() {
+        let query = head_probe(&dev()).unwrap();
+        assert_compiles(&query);
+        assert!(query.text.contains("limit 0"), "{}", query.text);
+        assert!(query.params.is_empty());
     }
 
     #[test]

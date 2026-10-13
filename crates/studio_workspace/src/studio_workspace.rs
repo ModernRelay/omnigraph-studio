@@ -146,6 +146,7 @@ pub struct Workspace {
     _save_check: Option<Task<()>>,
     _save_bounds: Option<Task<()>>,
     _bounds_subscription: Subscription,
+    _activation_subscription: Subscription,
     _session_subscription: Option<Subscription>,
     _item_subscriptions: Vec<(gpui::EntityId, Subscription)>,
 }
@@ -218,6 +219,22 @@ impl Workspace {
                 cx.update(|cx| persistence::window_moved(window_slot, bounds, cx));
             }));
         });
+        // The window's graphs ask after their branch heads at once when it becomes active and a
+        // poll came while no window was.
+        let activation_subscription = cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                return;
+            }
+            let sessions: Vec<_> = this
+                .session
+                .iter()
+                .cloned()
+                .chain(this.parked.iter().map(|parked| parked.session.clone()))
+                .collect();
+            for session in sessions {
+                session.update(cx, |session, cx| session.window_activated(cx));
+            }
+        });
         Self {
             session: None,
             parked: Vec::new(),
@@ -249,6 +266,7 @@ impl Workspace {
             _save_check: None,
             _save_bounds: None,
             _bounds_subscription: bounds_subscription,
+            _activation_subscription: activation_subscription,
             _session_subscription: None,
             _item_subscriptions: Vec::new(),
         }

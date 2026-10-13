@@ -220,6 +220,7 @@ impl InsertRowModal {
             session.write(&query, None, description, cx)
         });
         let table = self.table.clone();
+        table.update(cx, |table, _| table.save_started()).ok();
         let branch = self.branch.clone();
         let values: Map<String, Value> = values.into_iter().collect();
         // The write is never cancelled with the dialog: the table hears the outcome even when the
@@ -227,13 +228,14 @@ impl InsertRowModal {
         cx.spawn_in(window, async move |this, cx| {
             let outcome = write.await;
             let result = save_result(&outcome, &branch);
-            if let SaveResult::Saved { commit, parent } = &result {
-                table
-                    .update(cx, |table, cx| {
-                        table.row_inserted(key.clone(), values, commit, parent.as_deref(), cx)
-                    })
-                    .ok();
-            }
+            table
+                .update(cx, |table, cx| {
+                    if let SaveResult::Saved { commit, parent } = &result {
+                        table.row_inserted(key.clone(), values, commit, parent.as_deref(), cx);
+                    }
+                    table.save_finished(cx);
+                })
+                .ok();
             this.update(cx, |this, cx| {
                 this.saving = false;
                 match result {
@@ -707,19 +709,21 @@ impl InsertEdgeModal {
             session.write(&query, None, description, cx)
         });
         let table = self.table.clone();
+        table.update(cx, |table, _| table.save_started()).ok();
         let branch = self.branch.clone();
         // The write is never cancelled with the dialog: the table hears the outcome even when the
         // dialog was closed meanwhile.
         cx.spawn_in(window, async move |this, cx| {
             let outcome = write.await;
             let result = save_result(&outcome, &branch);
-            if let SaveResult::Saved { commit, parent } = &result {
-                table
-                    .update(cx, |table, cx| {
-                        table.row_inserted(None, Map::new(), commit, parent.as_deref(), cx)
-                    })
-                    .ok();
-            }
+            table
+                .update(cx, |table, cx| {
+                    if let SaveResult::Saved { commit, parent } = &result {
+                        table.row_inserted(None, Map::new(), commit, parent.as_deref(), cx);
+                    }
+                    table.save_finished(cx);
+                })
+                .ok();
             this.update(cx, |this, cx| {
                 this.saving = false;
                 match result {
@@ -1052,6 +1056,7 @@ impl DeleteRowModal {
             session.write(&query, if_commit, description, cx)
         });
         let table = self.table.clone();
+        table.update(cx, |table, _| table.save_started()).ok();
         let branch = self.branch.clone();
         let id = self.id.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -1059,15 +1064,16 @@ impl DeleteRowModal {
             let result = save_result(&outcome, &branch);
             let moved = matches!(&outcome, graph_client::WriteOutcome::Refused(error)
                 if error.status == 412 || error.body.precondition_failure.is_some());
-            if let SaveResult::Saved { commit, parent } = &result {
-                table
-                    .update(cx, |table, cx| {
-                        table.row_deleted(&id, commit, parent.as_deref(), cx)
-                    })
-                    .ok();
-            } else if moved {
-                table.update(cx, |table, cx| table.branch_moved(cx)).ok();
-            }
+            table
+                .update(cx, |table, cx| {
+                    if let SaveResult::Saved { commit, parent } = &result {
+                        table.row_deleted(&id, commit, parent.as_deref(), cx);
+                    } else if moved {
+                        table.branch_moved(cx);
+                    }
+                    table.save_finished(cx);
+                })
+                .ok();
             this.update(cx, |this, cx| {
                 this.saving = false;
                 match result {

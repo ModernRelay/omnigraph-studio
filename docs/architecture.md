@@ -52,9 +52,13 @@ view (layer 5) ──reads──▶ entity in graph_store ──calls──▶ g
 ### Snapshot pins
 
 A view's first read returns `graph_commit_id`. Later reads in that view pass it as `snapshot`.
-When a cheap poll of `GET /commits?branch=` (or the change feed) shows a newer head, the view
-shows "Newer data · Refresh" and changes nothing until the person refreshes (constitution II,
-V). Writes use `POST /mutate/if-graph-commit` with the pinned id; a 412 reopens the draft.
+The `GraphSession` watches branch heads for every view: every 30 s while a Studio window is
+active, and at once when a window becomes active after a missed poll, it reads each watched
+branch's head with a query that returns no rows (`limit 0`; its answer names the head commit),
+and it reads the branch list. Studio's own commits set the head without asking. A view whose
+pin is not the head shows "Newer data · Refresh" and changes nothing until the person
+refreshes (constitution II, V). Writes use `POST /mutate/if-graph-commit` with the pinned id;
+a 412 reopens the draft.
 
 ## The window frame
 

@@ -87,7 +87,8 @@ on the canvas. Typing filters the visible rows.
   with `exists { $v: Company  $m worksAt $v  $v.@id = $value }`, or `not { … }` for none. A
   neighbour related to two values is under both, so the values' counts can add up to more than
   the group's.
-- The whole tree reads one commit; when the branch moves, "Newer data · Refresh" appears.
+- The whole tree reads one commit; when the session sees the branch's head elsewhere (spec 003:
+  Studio's commit, or another writer's at the next poll), "Newer data · Refresh" appears.
 
 ### Rendering and state
 

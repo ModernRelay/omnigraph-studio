@@ -53,9 +53,6 @@ use crate::model::{
 use crate::peek::{KnownRelation, NEIGHBOUR_LIMIT, Neighbour, NodePeek, PeekSubject};
 use crate::suggest::{self, NODE_SUGGESTIONS, Suggestion};
 
-/// How often an open, visible table asks whether its branch moved (constitution II: offer
-/// Refresh, never change under the reader).
-const HEAD_POLL: Duration = Duration::from_secs(30);
 /// Rows per neighbour read when a relationship column comes into view: a page's worth, as the
 /// page reads do.
 const RELATION_READ_CHUNK: usize = 100;
@@ -260,15 +257,17 @@ pub struct TypeTable {
     relation_tasks: Vec<Task<()>>,
     peek: Option<(String, Entity<NodePeek>)>,
     newer: bool,
+    /// Writes out for this table: its own saves and the dialogs' inserts and deletes. Each moves
+    /// the pin itself when it lands, so a head the session sees meanwhile waits for them.
     saves_in_flight: usize,
+    /// The session saw the head move while a save was out; compared once they are all back.
+    head_moved_while_saving: bool,
     focus_handle: FocusHandle,
     table_state: Entity<TableInteractionState>,
     widths: Entity<ResizableColumnsState>,
     page_task: Option<Task<()>>,
     count_task: Option<Task<()>>,
     total_task: Option<Task<()>>,
-    head_task: Option<Task<()>>,
-    _poll_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -410,21 +409,6 @@ impl TypeTable {
         let widths = cx.new(|_| {
             ResizableColumnsState::new(1, vec![px(160.)], vec![TableResizeBehavior::Resizable])
         });
-        let poll = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(HEAD_POLL).await;
-                let alive = this
-                    .update(cx, |this, cx| {
-                        if this.is_active(cx) {
-                            this.check_head(cx);
-                        }
-                    })
-                    .is_ok();
-                if !alive {
-                    break;
-                }
-            }
-        });
         let mut this = Self {
             workspace,
             session,
@@ -473,14 +457,13 @@ impl TypeTable {
             peek: None,
             newer: false,
             saves_in_flight: 0,
+            head_moved_while_saving: false,
             focus_handle: cx.focus_handle(),
             table_state,
             widths,
             page_task: None,
             count_task: None,
             total_task: None,
-            head_task: None,
-            _poll_task: Some(poll),
             _subscriptions: subscriptions,
         };
         this.load_schema(cx);
@@ -489,16 +472,6 @@ impl TypeTable {
 
     pub fn type_name(&self) -> &str {
         &self.type_name
-    }
-
-    fn is_active(&self, cx: &Context<Self>) -> bool {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return false;
-        };
-        workspace
-            .read(cx)
-            .active_item()
-            .is_some_and(|item| item.item_id() == cx.entity_id())
     }
 
     // ---- session ----
@@ -513,7 +486,7 @@ impl TypeTable {
         match event {
             SessionEvent::SchemaChanged => self.load_schema(cx),
             // A table pinned to a commit reads that commit whatever the branch does.
-            SessionEvent::BranchChanged | SessionEvent::Committed { .. }
+            SessionEvent::BranchChanged | SessionEvent::HeadMoved { .. }
                 if self.at_commit.is_some() => {}
             SessionEvent::BranchChanged => {
                 self.branch = self.session.read(cx).branch.clone();
@@ -521,11 +494,9 @@ impl TypeTable {
                 self.editing = None;
                 self.reload(false, cx);
             }
-            SessionEvent::Committed { branch }
-                // Our own saves settle the pin themselves; anything else may have moved the head.
-                if *branch == self.branch && self.saves_in_flight == 0 => {
-                    self.check_head(cx);
-                }
+            SessionEvent::HeadMoved { branch, .. } if *branch == self.branch => {
+                self.compare_head(cx)
+            }
             _ => {}
         }
     }
@@ -983,6 +954,7 @@ impl TypeTable {
                 }
             }
         }
+        self.saves_settled(cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
@@ -2165,43 +2137,47 @@ impl TypeTable {
         }))
     }
 
-    /// Asks the branch head for its commit with the cheapest read there is (one row), and offers
-    /// Refresh when it moved past the pin.
-    fn check_head(&mut self, cx: &mut Context<Self>) {
-        if self.newer
-            || self.at_commit.is_some()
-            || self.paging.pinned.is_none()
-            || self.schema.is_none()
-            || self.missing
-        {
+    /// Offers Refresh when the branch head the session last saw is not the commit the table
+    /// shows. While the table's own writes are out it waits for them: each moves the pin itself.
+    fn compare_head(&mut self, cx: &mut Context<Self>) {
+        if self.saves_in_flight > 0 {
+            self.head_moved_while_saving = true;
             return;
         }
-        // One row of the plain key order is enough to learn the head's commit.
-        let saved_filters = std::mem::take(&mut self.filters);
-        let saved_sort = self.sort.take();
-        let query = self.page_query(&PageStart::First, 1, None);
-        self.filters = saved_filters;
-        self.sort = saved_sort;
-        let Ok(query) = query else { return };
-        let read = self
+        if self.newer || self.at_commit.is_some() {
+            return;
+        }
+        let Some(pin) = self.paging.pinned.as_deref() else {
+            return;
+        };
+        if self
             .session
-            .update(cx, |session, cx| session.read(&query, None, cx));
-        self.head_task = Some(cx.spawn(async move |this, cx| {
-            let Ok(output) = read.await else { return };
-            this.update(cx, |this, cx| {
-                let Some(head) = output.graph_commit_id else {
-                    return;
-                };
-                if this.saves_in_flight == 0
-                    && this.paging.pinned.as_deref().is_some_and(|pin| pin != head)
-                {
-                    this.newer = true;
-                    cx.emit(ItemEvent::UpdateTab);
-                    cx.notify();
-                }
-            })
-            .ok();
-        }));
+            .read(cx)
+            .head(&self.branch)
+            .is_some_and(|head| head != pin)
+        {
+            self.newer = true;
+            cx.emit(ItemEvent::UpdateTab);
+            cx.notify();
+        }
+    }
+
+    /// A write on the table's behalf is going out (a dialog's insert or delete).
+    pub fn save_started(&mut self) {
+        self.saves_in_flight += 1;
+    }
+
+    /// A write on the table's behalf came back and its outcome is applied.
+    pub fn save_finished(&mut self, cx: &mut Context<Self>) {
+        self.saves_in_flight = self.saves_in_flight.saturating_sub(1);
+        self.saves_settled(cx);
+    }
+
+    /// Once every write is back, a head the session saw while they were out is compared.
+    fn saves_settled(&mut self, cx: &mut Context<Self>) {
+        if self.saves_in_flight == 0 && std::mem::take(&mut self.head_moved_while_saving) {
+            self.compare_head(cx);
+        }
     }
 
     /// A write bound to the pin was refused because the branch moved: offer Refresh.
@@ -2553,8 +2529,9 @@ impl TypeTable {
                 .collect(),
             None => HashMap::new(),
         };
+        let holds_commit = self.at_commit.is_some();
         let peek = cx.new(|cx| {
-            NodePeek::new(
+            let mut peek = NodePeek::new(
                 session,
                 subject,
                 Some(values),
@@ -2562,7 +2539,11 @@ impl TypeTable {
                 known,
                 debounce,
                 cx,
-            )
+            );
+            if holds_commit {
+                peek.hold_commit();
+            }
+            peek
         });
         if let Some(workspace) = self.workspace.upgrade() {
             let view = peek.clone();
@@ -2783,6 +2764,7 @@ impl TypeTable {
                 self.reopen(row_id, column, text, notice, window, cx);
             }
         }
+        self.saves_settled(cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
@@ -3026,6 +3008,7 @@ impl TypeTable {
                 }
             }
         }
+        self.saves_settled(cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
@@ -3115,6 +3098,7 @@ impl TypeTable {
                     }
                     // The table now shows values newer than its pin.
                     this.newer = true;
+                    this.saves_settled(cx);
                     cx.emit(ItemEvent::UpdateTab);
                     cx.notify();
                 })
@@ -3307,6 +3291,7 @@ impl TypeTable {
                 };
                 // The table now shows a value newer than its pin.
                 this.newer = true;
+                this.saves_settled(cx);
                 cx.emit(ItemEvent::UpdateTab);
                 this.reopen(row_id, column, text, notice, window, cx);
             })
