@@ -253,6 +253,7 @@ pub(crate) fn paint(
     bounds: Bounds<Pixels>,
     zoom: f32,
     selected: Option<usize>,
+    marked: &HashSet<usize>,
     hovered: Option<usize>,
     palette: &Palette,
     chips: &RefCell<Vec<Bounds<Pixels>>>,
@@ -448,9 +449,10 @@ pub(crate) fn paint(
         if !visible(p, 300.) {
             continue;
         }
-        let focus = selected == Some(index);
+        // A marked chip is drawn as the selected one is.
+        let focus = selected == Some(index) || marked.contains(&index);
         let pointed = hovered == Some(index);
-        let dim = near.as_ref().is_some_and(|n| !n.contains(&index));
+        let dim = !marked.contains(&index) && near.as_ref().is_some_and(|n| !n.contains(&index));
         let alpha = if dim { 0.3 } else { 1. };
         let root = matches!(node.kind, SceneKind::Node { root: true, .. });
         // From afar a node is its mark alone, and a closed hub a dot on its line. A type keeps

@@ -225,7 +225,9 @@
       "f": "studio_canvas::FocusSelected",
       "[": "studio_canvas::WalkBack",
       "]": "studio_canvas::WalkForward",
-      "r": "studio_canvas::ResetLayout"
+      "r": "studio_canvas::ResetLayout",
+      "cmd-a": "studio_canvas::SelectAll",
+      "escape": "studio_canvas::ClearSelection"
     }
   },
   {

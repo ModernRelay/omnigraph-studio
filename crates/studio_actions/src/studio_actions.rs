@@ -434,6 +434,10 @@ pub mod canvas {
             WalkBack,
             /// Go back down the path walked with WalkBack.
             WalkForward,
+            /// Mark every chip on the canvas.
+            SelectAll,
+            /// Unmark the marked chips.
+            ClearSelection,
             /// Let the layout place every node again, forgetting where nodes were dragged.
             ResetLayout,
         ]

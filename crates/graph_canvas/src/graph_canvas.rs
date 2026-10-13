@@ -13,7 +13,7 @@ mod model;
 mod paint;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,24 +21,25 @@ use std::time::Instant;
 use gpui::{
     App, AppContext as _, Bounds, ContentMask, Context, Entity, EventEmitter, FocusHandle,
     Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels,
-    Point, Render, ScrollWheelEvent, SharedString, Size, Subscription, Task, Window, canvas, point,
-    px,
+    Point, Render, ScrollWheelEvent, SharedString, Size, Subscription, Task, Window, anchored,
+    canvas, deferred, point, px,
 };
 use graph_store::{
     Exploration, ExplorationEvent, ExplorePath, GraphSession, GroupKey, Loadable, NodeRef,
     PageStatus, SessionEvent,
 };
 use studio_actions::canvas::{
-    CollapseNode, ExpandNode, FitToWindow, FocusSelected, MoveDown, MoveLeft, MoveRight, MoveUp,
-    PeekSelected, ResetLayout, WalkBack, WalkForward, ZoomIn, ZoomOut,
+    ClearSelection, CollapseNode, ExpandNode, FitToWindow, FocusSelected, MoveDown, MoveLeft,
+    MoveRight, MoveUp, PeekSelected, ResetLayout, SelectAll, WalkBack, WalkForward, ZoomIn,
+    ZoomOut,
 };
 use studio_actions::graph::{
     OpenCanvas, OpenNode, OpenOntology, OpenType, PeekNode, ShowNodeOnCanvas, ShowResultsOnCanvas,
 };
 use studio_ui::empty_state;
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
-use ui::Tooltip;
 use ui::prelude::*;
+use ui::{ContextMenu, Tooltip};
 
 use layout::{LayoutKind, LayoutNode, OntologyEdge, OntologyNode, Vec2};
 use model::{HUB_STEP, Scene, SceneId, SceneKind};
@@ -160,17 +161,29 @@ struct Drag {
     start: Point<Pixels>,
     center: Vec2,
     moved: bool,
-    /// A drag that began on a node moves the node (from where it was) instead of the view.
+    /// A drag that began on a node or a relationship pill moves it (from where it was)
+    /// instead of the view.
     node: Option<(usize, Vec2)>,
+    /// What moves with it: a node's pills not placed by hand, and their "+K more"; with
+    /// several chips marked, the other marked chips too.
+    followers: Vec<(usize, Vec2)>,
+    /// A drag begun with ⇧ on empty space draws an area instead of moving the view.
+    area: bool,
 }
 
-/// The key a placed node is remembered by: a type on the schema canvas, a node while
-/// exploring. Hubs and "+K more" follow their node and are never placed by hand.
+/// The key a placed chip is remembered by: a type on the schema canvas, a node or a
+/// relationship pill while exploring. "+K more" follows its pill and is never placed by hand.
 fn pin_key(id: &SceneId) -> Option<String> {
     match id {
         SceneId::Type(name) => Some(format!("type:{name}")),
         SceneId::Node(node) => Some(format!("node:{}/{}", node.type_name, node.id)),
-        SceneId::Hub(_) | SceneId::More(_) => None,
+        SceneId::Hub(key) => Some(format!(
+            "hub:{}/{}/{}",
+            key.node.type_name,
+            key.node.id,
+            gq_language::builder::relationship_key(&key.group)
+        )),
+        SceneId::More(_) => None,
     }
 }
 
@@ -244,6 +257,12 @@ pub struct GraphCanvas {
     walked: Vec<SceneId>,
     hovered: Option<usize>,
     drag: Option<Drag>,
+    /// Chips marked together: by an area drawn with ⇧-drag, ⇧-click, or ⌘A.
+    marked: HashSet<SceneId>,
+    /// The area being drawn, from where the drag began to the pointer, in window pixels.
+    area: Option<(Point<Pixels>, Point<Pixels>)>,
+    /// The right-click menu and where it opened.
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// Each node's chip on screen as last painted, for hit testing.
     chips: Rc<RefCell<Vec<Bounds<Pixels>>>>,
@@ -344,6 +363,9 @@ impl GraphCanvas {
             walked: Vec::new(),
             hovered: None,
             drag: None,
+            marked: HashSet::new(),
+            area: None,
+            context_menu: None,
             bounds: Rc::new(Cell::new(None)),
             chips: Rc::new(RefCell::new(Vec::new())),
             _subscriptions: subscriptions,
@@ -868,35 +890,116 @@ impl GraphCanvas {
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle, cx);
+        self.context_menu = None;
         self.settle_camera();
-        let node = self
-            .hit(event.position, window)
+        let hit = self.hit(event.position, window);
+        let node = hit
             .filter(|index| pin_key(&self.scene.nodes[*index].id).is_some())
             .and_then(|index| Some((index, *self.positions.get(index)?)));
+        // A marked chip moves with every other marked chip; any chip moves with its pills.
+        let followers = match node {
+            Some((index, _)) if self.is_marked(index) && self.marked.len() > 1 => {
+                let mut moving: Vec<usize> = self.marked_indices();
+                moving.retain(|other| *other != index);
+                let mut followers: Vec<(usize, Vec2)> = moving
+                    .iter()
+                    .filter_map(|ix| Some((*ix, *self.positions.get(*ix)?)))
+                    .collect();
+                for ix in std::iter::once(index).chain(moving) {
+                    for follower in self.followers(ix) {
+                        if !followers.iter().any(|(f, _)| *f == follower.0) {
+                            followers.push(follower);
+                        }
+                    }
+                }
+                followers
+            }
+            Some((index, _)) => self.followers(index),
+            None => Vec::new(),
+        };
         self.drag = Some(Drag {
             start: event.position,
             center: self.center,
             moved: false,
             node,
+            followers,
+            area: hit.is_none() && event.modifiers.shift,
         });
+    }
+
+    fn is_marked(&self, index: usize) -> bool {
+        self.scene
+            .nodes
+            .get(index)
+            .is_some_and(|node| self.marked.contains(&node.id))
+    }
+
+    /// The marked chips that are drawn, in scene order.
+    fn marked_indices(&self) -> Vec<usize> {
+        self.scene
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| self.marked.contains(&node.id))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// The chips that move with a dragged one, from where they are: a node's relationship
+    /// pills, unless placed by hand, and each pill's "+K more".
+    fn followers(&self, index: usize) -> Vec<(usize, Vec2)> {
+        let mut out = Vec::new();
+        let mut stack = vec![index];
+        while let Some(owner) = stack.pop() {
+            for (child, node) in self.scene.nodes.iter().enumerate() {
+                if node.parent != Some(owner) {
+                    continue;
+                }
+                let follows = match node.kind {
+                    SceneKind::Hub { .. } => {
+                        pin_key(&node.id).is_none_or(|key| !self.pinned.contains_key(&key))
+                    }
+                    SceneKind::More { .. } => true,
+                    _ => false,
+                };
+                if follows && let Some(at) = self.positions.get(child) {
+                    out.push((child, *at));
+                    stack.push(child);
+                }
+            }
+        }
+        out
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         if let (Some(drag), true) = (&mut self.drag, event.dragging()) {
             let dx = f32::from(event.position.x - drag.start.x);
             let dy = f32::from(event.position.y - drag.start.y);
+            if drag.area {
+                if drag.moved || dx.abs() + dy.abs() > 3. {
+                    drag.moved = true;
+                    self.area = Some((drag.start, event.position));
+                    cx.notify();
+                }
+                return;
+            }
             if drag.moved || dx.abs() + dy.abs() > 3. {
                 drag.moved = true;
                 let delta = Vec2::new(dx, dy) * (1. / self.zoom);
                 match drag.node {
                     Some((index, from)) => {
-                        self.appear.remove(&index);
-                        let at = from + delta;
-                        if let Some(position) = Arc::make_mut(&mut self.positions).get_mut(index) {
-                            *position = at;
+                        let moved = std::iter::once((index, from)).chain(drag.followers.clone());
+                        for (index, from) in moved {
+                            self.appear.remove(&index);
+                            let at = from + delta;
+                            if let Some(position) =
+                                Arc::make_mut(&mut self.positions).get_mut(index)
+                            {
+                                *position = at;
+                            }
+                            let id = self.scene.nodes[index].id.clone();
+                            self.known.insert(id, at);
                         }
-                        let id = self.scene.nodes[index].id.clone();
-                        self.known.insert(id, at);
                     }
                     None => {
                         self.center = drag.center - delta;
@@ -918,18 +1021,60 @@ impl GraphCanvas {
         let Some(drag) = self.drag.take() else {
             return;
         };
+        if drag.area {
+            // The chips the area touches are marked, added to those marked before.
+            if let Some((from, to)) = self.area.take() {
+                let area = Bounds::from_corners(
+                    point(from.x.min(to.x), from.y.min(to.y)),
+                    point(from.x.max(to.x), from.y.max(to.y)),
+                );
+                let inside = chips_in(area, &self.chips.borrow());
+                for index in inside {
+                    if let Some(node) = self.scene.nodes.get(index) {
+                        self.marked.insert(node.id.clone());
+                    }
+                }
+                cx.notify();
+            }
+            return;
+        }
         if drag.moved {
-            // A dragged node stays where it was dropped, and is remembered there.
-            if let Some((index, _)) = drag.node
-                && let Some(key) = pin_key(&self.scene.nodes[index].id)
-                && let Some(at) = self.positions.get(index)
-            {
-                self.pinned.insert(key, *at);
+            // A dragged node or pill stays where it was dropped, and is remembered there, as
+            // does each marked chip that moved with it; the pills that moved with a node keep
+            // their new places without being pinned.
+            if let Some((index, _)) = drag.node {
+                let mut placed = vec![index];
+                if self.is_marked(index) {
+                    placed.extend(drag.followers.iter().map(|(ix, _)| *ix));
+                    placed.retain(|ix| self.is_marked(*ix));
+                }
+                for ix in placed {
+                    if let (Some(key), Some(at)) =
+                        (pin_key(&self.scene.nodes[ix].id), self.positions.get(ix))
+                    {
+                        self.pinned.insert(key, *at);
+                    }
+                }
                 cx.emit(ItemEvent::UpdateTab);
             }
             return;
         }
         let hit = self.hit(event.position, window);
+        // ⇧-click marks a chip, or unmarks it.
+        if event.modifiers.shift {
+            if let Some(index) = hit {
+                let id = self.scene.nodes[index].id.clone();
+                if !self.marked.remove(&id) {
+                    self.marked.insert(id);
+                }
+                cx.notify();
+            }
+            return;
+        }
+        if !self.marked.is_empty() {
+            self.marked.clear();
+            cx.notify();
+        }
         self.select(hit, cx);
         if let Some(index) = hit {
             // A click on a type browses its rows under the canvas, as Tower's does.
@@ -954,8 +1099,396 @@ impl GraphCanvas {
         }
     }
 
-    fn mouse_up_out(&mut self, _: &MouseUpEvent, _: &mut Window, _: &mut Context<Self>) {
+    fn mouse_up_out(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.drag = None;
+        if self.area.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    // ---- the right-click menu ----
+
+    /// A right click: the menu for the marked chips when it lands on one of them, else for the
+    /// chip under it (selected first), else for the canvas.
+    fn secondary_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        self.settle_camera();
+        let hit = self.hit(event.position, window);
+        let group = hit.is_some_and(|index| self.is_marked(index)) && self.marked.len() > 1;
+        if let Some(index) = hit
+            && !group
+        {
+            self.marked.clear();
+            self.select(Some(index), cx);
+        }
+        let menu = if group {
+            self.marked_menu(window, cx)
+        } else {
+            match hit {
+                Some(index) => self.chip_menu(index, window, cx),
+                None => self.canvas_menu(window, cx),
+            }
+        };
+        let subscription = cx.subscribe_in(
+            &menu,
+            window,
+            |this, _, _: &gpui::DismissEvent, window, cx| {
+                this.context_menu = None;
+                window.focus(&this.focus_handle, cx);
+                cx.notify();
+            },
+        );
+        window.focus(&menu.focus_handle(cx), cx);
+        self.context_menu = Some((menu, event.position, subscription));
+        cx.notify();
+    }
+
+    /// Runs `f` on this canvas from a menu entry.
+    fn on_menu(
+        this: &gpui::WeakEntity<Self>,
+        f: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl Fn(&mut Window, &mut App) + 'static {
+        let this = this.clone();
+        move |window, cx| {
+            this.update(cx, |canvas, cx| f(canvas, window, cx)).ok();
+        }
+    }
+
+    fn chip_menu(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<ContextMenu> {
+        let this = cx.entity().downgrade();
+        let node = self.scene.nodes[index].clone();
+        let pinned = pin_key(&node.id).is_some_and(|key| self.pinned.contains_key(&key));
+        let exploring = self.mode == Mode::Explore;
+        let schema = self.session.read(cx).schema_model();
+        let grouping = match &node.kind {
+            SceneKind::Hub { key, .. } => self.exploration.read(cx).grouping(&key.group).cloned(),
+            _ => None,
+        };
+        ContextMenu::build(window, cx, move |mut menu, _, _| {
+            let id = node.id.clone();
+            match &node.kind {
+                SceneKind::Node {
+                    node: graph_node,
+                    expanded,
+                    ..
+                } => {
+                    let (type_name, key) = (graph_node.type_name.clone(), graph_node.id.clone());
+                    menu = menu
+                        .entry(
+                            "Open",
+                            None,
+                            open_action(OpenNode {
+                                type_name: type_name.clone(),
+                                id: key.clone(),
+                            }),
+                        )
+                        .when(node.path.is_some(), |menu| {
+                            let path = node.path.clone();
+                            if *expanded {
+                                menu.entry(
+                                    "Collapse",
+                                    Some(Box::new(CollapseNode)),
+                                    Self::on_menu(&this, move |canvas, _, cx| {
+                                        if let Some(path) = &path {
+                                            canvas
+                                                .exploration
+                                                .update(cx, |e, cx| e.collapse(path, cx));
+                                        }
+                                    }),
+                                )
+                            } else {
+                                menu.entry(
+                                    "Expand",
+                                    Some(Box::new(ExpandNode)),
+                                    Self::on_menu(&this, move |canvas, window, cx| {
+                                        if let Some(index) = canvas.scene.index_of(&id) {
+                                            canvas.activate(index, true, window, cx);
+                                        }
+                                    }),
+                                )
+                            }
+                        })
+                        .entry(
+                            "Explore from here",
+                            None,
+                            open_action(ShowNodeOnCanvas {
+                                type_name: type_name.clone(),
+                                id: key.clone(),
+                            }),
+                        )
+                        .entry(
+                            "Open in table",
+                            None,
+                            open_action(OpenType {
+                                type_name: type_name.clone(),
+                                at_commit: None,
+                                filter_id: Some(key.clone()),
+                                via: None,
+                                preview: false,
+                            }),
+                        )
+                        .separator()
+                        .entry("Copy key", None, move |_, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(key.clone()));
+                        });
+                }
+                SceneKind::Hub { key, open, .. } => {
+                    let group = key.group.clone();
+                    let owner = key.node.clone();
+                    menu = menu.entry(
+                        if *open { "Close" } else { "Open" },
+                        None,
+                        Self::on_menu(&this, {
+                            let id = id.clone();
+                            move |canvas, window, cx| {
+                                if let Some(index) = canvas.scene.index_of(&id) {
+                                    canvas.activate(index, false, window, cx);
+                                }
+                            }
+                        }),
+                    );
+                    let choices = schema
+                        .as_ref()
+                        .map(|schema| gq_language::builder::GroupBy::choices(schema, &group))
+                        .unwrap_or_default();
+                    if exploring && !choices.is_empty() {
+                        let (this, path, current) =
+                            (this.clone(), node.path.clone(), grouping.clone());
+                        let group = group.clone();
+                        menu = menu.submenu("Group by", move |mut menu, _, _| {
+                            let set = |by: Option<gq_language::builder::GroupBy>| {
+                                let (group, path) = (group.clone(), path.clone());
+                                Self::on_menu(&this, move |canvas, _, cx| {
+                                    canvas.exploration.update(cx, |e, cx| {
+                                        e.set_grouping(&group, by.clone(), cx);
+                                        if let (true, Some(path)) = (by.is_some(), &path) {
+                                            e.expand(path, cx);
+                                        }
+                                    });
+                                })
+                            };
+                            menu = menu.toggleable_entry(
+                                "No grouping",
+                                current.is_none(),
+                                IconPosition::Start,
+                                None,
+                                set(None),
+                            );
+                            for by in &choices {
+                                menu = menu.toggleable_entry(
+                                    by.property.clone(),
+                                    current.as_ref() == Some(by),
+                                    IconPosition::Start,
+                                    None,
+                                    set(Some(by.clone())),
+                                );
+                            }
+                            menu
+                        });
+                    }
+                    let back = gq_language::builder::reversed(&group, &owner.type_name);
+                    menu = menu.entry(
+                        "Open related table",
+                        None,
+                        open_action(OpenType {
+                            type_name: group.other_type.clone(),
+                            at_commit: None,
+                            filter_id: Some(owner.id.clone()),
+                            via: Some(gq_language::builder::relationship_key(&back)),
+                            preview: false,
+                        }),
+                    );
+                }
+                SceneKind::More { key, .. } => {
+                    let key = key.clone();
+                    menu = menu.entry(
+                        "Show more",
+                        None,
+                        Self::on_menu(&this, move |canvas, _, cx| {
+                            canvas.show_more(key.clone(), cx)
+                        }),
+                    );
+                }
+                SceneKind::Type { .. } => {
+                    let type_name = node.label.clone();
+                    menu = menu
+                        .entry(
+                            "Browse rows",
+                            None,
+                            open_action(studio_actions::graph::BrowseType {
+                                type_name: type_name.clone(),
+                            }),
+                        )
+                        .entry(
+                            "Open table",
+                            None,
+                            open_action(OpenType {
+                                type_name,
+                                at_commit: None,
+                                filter_id: None,
+                                via: None,
+                                preview: false,
+                            }),
+                        );
+                }
+            }
+            if pinned {
+                let id = node.id.clone();
+                menu = menu.separator().entry(
+                    "Let the layout place it",
+                    None,
+                    Self::on_menu(&this, move |canvas, _, cx| {
+                        canvas.unpin(std::slice::from_ref(&id), cx)
+                    }),
+                );
+            }
+            menu
+        })
+    }
+
+    /// The menu for several marked chips at once.
+    fn marked_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<ContextMenu> {
+        let this = cx.entity().downgrade();
+        let marked: Vec<SceneId> = self.marked.iter().cloned().collect();
+        let count = self.marked_indices().len();
+        let any_pinned = marked
+            .iter()
+            .any(|id| pin_key(id).is_some_and(|key| self.pinned.contains_key(&key)));
+        let exploring = self.mode == Mode::Explore;
+        ContextMenu::build(window, cx, move |menu, _, _| {
+            let ids = marked.clone();
+            menu.header(format!("{count} selected"))
+                .when(exploring, |menu| {
+                    let (expand, collapse) = (ids.clone(), ids.clone());
+                    menu.entry(
+                        "Expand all",
+                        None,
+                        Self::on_menu(&this, move |canvas, _, cx| {
+                            canvas.expand_marked(&expand, true, cx)
+                        }),
+                    )
+                    .entry(
+                        "Collapse all",
+                        None,
+                        Self::on_menu(&this, move |canvas, _, cx| {
+                            canvas.expand_marked(&collapse, false, cx)
+                        }),
+                    )
+                })
+                .entry("Keep where they are", None, {
+                    let ids = ids.clone();
+                    Self::on_menu(&this, move |canvas, _, cx| canvas.pin_marked(&ids, cx))
+                })
+                .when(any_pinned, |menu| {
+                    let ids = ids.clone();
+                    menu.entry(
+                        "Let the layout place them",
+                        None,
+                        Self::on_menu(&this, move |canvas, _, cx| canvas.unpin(&ids, cx)),
+                    )
+                })
+                .separator()
+                .entry(
+                    "Clear selection",
+                    Some(Box::new(ClearSelection)),
+                    Self::on_menu(&this, |canvas, _, cx| {
+                        canvas.marked.clear();
+                        cx.notify();
+                    }),
+                )
+        })
+    }
+
+    fn canvas_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<ContextMenu> {
+        let any_pinned = !self.pinned.is_empty();
+        let empty = self.scene.nodes.is_empty();
+        ContextMenu::build(window, cx, move |menu, _, _| {
+            menu.when(!empty, |menu| {
+                menu.action("Fit to window", Box::new(FitToWindow))
+                    .action("Select all", Box::new(SelectAll))
+            })
+            .when(any_pinned, |menu| {
+                menu.action("Reset layout", Box::new(ResetLayout))
+            })
+        })
+    }
+
+    /// Opens or closes every marked node and relationship.
+    fn expand_marked(&mut self, ids: &[SceneId], open: bool, cx: &mut Context<Self>) {
+        let paths: Vec<ExplorePath> = ids
+            .iter()
+            .filter_map(|id| self.scene.index_of(id))
+            .filter_map(|index| {
+                let node = &self.scene.nodes[index];
+                match node.kind {
+                    SceneKind::Node { .. } | SceneKind::Hub { .. } => node.path.clone(),
+                    _ => None,
+                }
+            })
+            .collect();
+        self.exploration.update(cx, |e, cx| {
+            for path in &paths {
+                if open {
+                    e.expand(path, cx);
+                } else {
+                    e.collapse(path, cx);
+                }
+            }
+        });
+    }
+
+    /// Keeps the marked chips where they are drawn now.
+    fn pin_marked(&mut self, ids: &[SceneId], cx: &mut Context<Self>) {
+        for id in ids {
+            if let (Some(key), Some(index)) = (pin_key(id), self.scene.index_of(id))
+                && let Some(at) = self.positions.get(index)
+            {
+                self.pinned.insert(key, *at);
+            }
+        }
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// Lets the layout place chips again.
+    fn unpin(&mut self, ids: &[SceneId], cx: &mut Context<Self>) {
+        for id in ids {
+            if let Some(key) = pin_key(id) {
+                self.pinned.remove(&key);
+            }
+            self.known.remove(id);
+        }
+        cx.emit(ItemEvent::UpdateTab);
+        self.rebuild(cx);
+    }
+
+    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.marked = self
+            .scene
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect();
+        cx.notify();
+    }
+
+    fn clear_selection(&mut self, _: &ClearSelection, _: &mut Window, cx: &mut Context<Self>) {
+        if self.marked.is_empty() {
+            cx.propagate();
+            return;
+        }
+        self.marked.clear();
+        cx.notify();
     }
 
     fn scroll(&mut self, event: &ScrollWheelEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1150,6 +1683,7 @@ impl GraphCanvas {
         let moving = self.glide.as_ref().is_some_and(|g| g.is_running(now))
             || self.appear.values().any(|t| t.is_running(now));
         let selected = self.selected_index();
+        let marked: HashSet<usize> = self.marked_indices().into_iter().collect();
         let hovered = self.hovered;
         let bounds_cell = self.bounds.clone();
         let chips = self.chips.clone();
@@ -1170,8 +1704,8 @@ impl GraphCanvas {
                         .map(|world| to_screen(*world, bounds, center, zoom))
                         .collect();
                     paint::paint(
-                        &scene, &screen, bounds, zoom, selected, hovered, &palette, &chips, window,
-                        cx,
+                        &scene, &screen, bounds, zoom, selected, &marked, hovered, &palette,
+                        &chips, window, cx,
                     );
                 });
             },
@@ -1580,6 +2114,21 @@ fn half_widths(scene: &Scene, measure: &impl Fn(&str, f32, gpui::FontWeight) -> 
         .collect()
 }
 
+/// A menu entry that dispatches `action` from the window.
+fn open_action<A: gpui::Action + Clone>(action: A) -> impl Fn(&mut Window, &mut App) + 'static {
+    move |window, cx| window.dispatch_action(Box::new(action.clone()), cx)
+}
+
+/// The chips an area touches, by their bounds as last painted.
+fn chips_in(area: Bounds<Pixels>, chips: &[Bounds<Pixels>]) -> Vec<usize> {
+    chips
+        .iter()
+        .enumerate()
+        .filter(|(_, chip)| chip.size.width > px(0.) && chip.intersects(&area))
+        .map(|(index, _)| index)
+        .collect()
+}
+
 fn scene_id_of(path: &ExplorePath, root: &NodeRef) -> SceneId {
     // A value of a grouped relationship is drawn as the relationship's hub.
     match path.group_step() {
@@ -1655,6 +2204,23 @@ impl Render for GraphCanvas {
         let background = cx.theme().colors().editor_background;
         let canvas = self.render_canvas(window, cx).into_any_element();
         let overlay = self.render_overlay(cx).into_any_element();
+        // The area being drawn: a tinted rectangle from where the drag began to the pointer.
+        let area = self
+            .area
+            .zip(self.bounds.get())
+            .map(|((from, to), bounds)| {
+                let accent = cx.theme().colors().text_accent;
+                div()
+                    .absolute()
+                    .left(from.x.min(to.x) - bounds.origin.x)
+                    .top(from.y.min(to.y) - bounds.origin.y)
+                    .w((to.x - from.x).abs())
+                    .h((to.y - from.y).abs())
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(accent.opacity(0.6))
+                    .bg(accent.opacity(0.08))
+            });
         div()
             .id("graph-canvas")
             .key_context("Canvas")
@@ -1673,6 +2239,8 @@ impl Render for GraphCanvas {
             .on_action(cx.listener(Self::walk_forward))
             .on_action(cx.listener(Self::peek_selected))
             .on_action(cx.listener(Self::focus_selected))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::clear_selection))
             .on_action(
                 cx.listener(|this, _: &MoveLeft, _, cx| {
                     this.move_selection(Vec2::new(-1., 0.), cx)
@@ -1690,14 +2258,26 @@ impl Render for GraphCanvas {
                 cx.listener(|this, _: &MoveDown, _, cx| this.move_selection(Vec2::new(0., 1.), cx)),
             )
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::secondary_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up_out))
             .on_scroll_wheel(cx.listener(Self::scroll))
             .on_pinch(cx.listener(Self::pinch))
             .child(canvas)
+            .children(area)
             .children(body.map(|body| div().absolute().size_full().top_0().left_0().child(body)))
             .child(overlay)
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .anchor(gpui::Anchor::TopLeft)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(menu.clone()),
+                )
+                .with_priority(1)
+            }))
             // Nothing drawn yet: the start state says it all.
             .when(!self.scene.nodes.is_empty(), |canvas| {
                 canvas.child(self.render_caption(cx))
@@ -1708,6 +2288,22 @@ impl Render for GraphCanvas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_area_marks_the_chips_it_touches() {
+        let chip = |x: f32, y: f32| Bounds::new(point(px(x), px(y)), gpui::size(px(80.), px(24.)));
+        let chips = vec![
+            chip(0., 0.),
+            chip(200., 0.),
+            chip(100., 100.),
+            // A chip not painted this frame (off screen) has no width and is never marked.
+            Bounds::default(),
+        ];
+        let area = Bounds::from_corners(point(px(60.), px(-10.)), point(px(150.), px(110.)));
+        assert_eq!(chips_in(area, &chips), [0, 2], "touching is enough");
+        let nothing = Bounds::from_corners(point(px(500.), px(500.)), point(px(600.), px(600.)));
+        assert!(chips_in(nothing, &chips).is_empty());
+    }
 
     #[test]
     fn placed_nodes_round_trip_and_bad_data_reads_as_none() {
@@ -1726,7 +2322,7 @@ mod tests {
         assert_eq!(back.len(), 2);
         assert_eq!(back["type:Person"], Vec2::new(12., -31.));
         assert_eq!(back["node:Person/person-000001"], Vec2::new(-5., 7.));
-        // Hubs follow their node; they are never placed by hand.
+        // A relationship pill is placed by hand like a node; "+K more" follows its pill.
         let hub = SceneId::Hub(GroupKey::new(
             NodeRef {
                 type_name: "Person".into(),
@@ -1738,7 +2334,15 @@ mod tests {
                 other_type: "Person".into(),
             },
         ));
-        assert_eq!(pin_key(&hub), None);
+        assert_eq!(
+            pin_key(&hub).as_deref(),
+            Some("hub:Person/person-000001/out:Knows")
+        );
+        pinned.insert(pin_key(&hub).unwrap(), Vec2::new(40., 2.));
+        assert_eq!(
+            pins_from_json(&pins_to_json(&pinned))["hub:Person/person-000001/out:Knows"],
+            Vec2::new(40., 2.)
+        );
         assert!(pins_from_json(&serde_json::Value::Null).is_empty());
         assert!(
             pins_from_json(&serde_json::json!({"pinned": {"a": [1, "x"], "b": [1]}})).is_empty()

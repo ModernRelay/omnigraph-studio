@@ -56,10 +56,23 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   and relationships, `studio_graph::OpenOntology`, ⌘⇧O) and the **Explorer** (the nodes walked
   from a root, `studio_graph::OpenCanvas`, ⌘⇧E). Both are rows at the top of the sidebar's
   Graph panel, above Types, and items of the Graph menu; the tab is titled by the face shown.
-- Dragging a type or a node places it: it stays where it was dropped through every later
-  layout, and the canvas tab saves the placed nodes with the graph's tabs (`{"pinned": {key:
-  [x, y]}}`, keys `type:Name` and `node:Type/id`). Hubs and "+K more" follow their node.
-  Reset layout (↺, R) forgets them. A drag that starts on empty space pans.
+- Dragging a type, a node or a relationship pill places it: it stays where it was dropped
+  through every later layout, and the canvas tab saves the placed chips with the graph's tabs
+  (`{"pinned": {key: [x, y]}}`, keys `type:Name`, `node:Type/id` and
+  `hub:Type/id/out:Edge`). A dragged node carries its pills that were not placed by hand, and
+  their "+K more", so they keep their places beside it; "+K more" is never placed alone.
+  Reset layout (↺, R) forgets them all. A drag that starts on empty space pans.
+- **Marking:** ⇧-drag on empty space draws an area and marks every chip it touches (added to
+  those marked); ⇧-click marks or unmarks one chip; ⌘A marks all, Esc unmarks. Marked chips
+  carry the selection's warm ring and never fade with the pointed-at neighbourhood. Dragging a
+  marked chip moves every marked chip, and each stays where it was dropped. A plain click
+  unmarks them.
+- **Right-click menus.** A node: Open, Expand or Collapse, Explore from here, Open in table,
+  Copy key. A relationship pill: Open or Close, Group by ▸ (the tree's grouping, spec 005),
+  Open related table. "+K more": Show more. A type on the ontology: Browse rows, Open table.
+  A chip placed by hand adds "Let the layout place it". A right click on a marked chip, with
+  several marked, acts on all of them: Expand all, Collapse all, Keep where they are, Let the
+  layout place them, Clear selection. On empty space: Fit to window, Select all, Reset layout.
 
 ## Deferred
 
@@ -81,6 +94,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | 2026-10-12 | Layout off the main thread is deterministic, keeps drawn nodes in place, and bounds cost at the cap | `cargo test -p graph_canvas` (`layout::tests`) | 1,999 nodes in 464 ms in an unoptimized debug build, Apple M5 Pro; same input gives the same positions |
 | 2026-10-12 | Errors and loading show in the canvas, not a blank view | snapshot `OpenNode` Person `nobody` then `OpenCanvas` | banner "No Person with key nobody at this commit." · Retry |
 | 2026-10-12 | Keys walk and focus | offscreen snapshot: Allen Labs expanded, → → `[` F Space | `[` returned to Allen Labs, F centred it, Space showed it in the inspector |
+| 2026-10-12 | Pills drag, areas mark, and chips have menus | `graph_canvas` tests (a pill's pin key round trips; an area marks the chips it touches, not unpainted ones); offscreen snapshots on Sammet Systems with the snapshot tool's `drag:…,shift` and `click:…,right`: WorksAt dragged up then the company down; an area over three people; right clicks on a marked person, on WorksAt and on a person | WorksAt stayed where dropped while Owns moved with its company; Edsger, Ada and Grace marked with rings; "3 selected · Expand all · Collapse all · Keep where they are · Clear selection"; "Close · Group by › · Open related table"; "Open · Expand ↵ · Explore from here · Open in table · Copy key" |
 | 2026-10-12 | Placed nodes persist per graph | `graph_canvas` `placed_nodes_round_trip_and_bad_data_reads_as_none`; offscreen snapshot: drag Company on the ontology, then reopen the data directory with restore | The saved canvas holds `{"pinned": {"type:Company": [-174, -275]}}`; after restore Company is where it was dropped, the rest laid out around it, and ↺ (Reset layout, R) shows |
 | 2026-10-12 | The ontology and the explorer are found without the menu | offscreen snapshot of `OpenOntology` (⌘⇧O) | The sidebar's Graph panel opens with Ontology (selected) and Explorer above Types; the tab and the mode switch read Ontology / Explorer |
 | 2026-10-12 | Query results as a canvas | `gq_language` `whole_node_columns_carry_their_type`; `query_editor` `node_columns_become_a_graph_of_distinct_nodes_linked_by_row`; snapshot of `return { $p, $c }` | The result offers Canvas; a results canvas draws each node once and links the nodes of a row; it is a tab of its own and is not restored |

@@ -11,7 +11,7 @@
 //! window pixels (half the PNG's, which is drawn at 2x), with `,cmd` or `,shift` held when
 //! added and `,right` for the secondary button; `hover:<x>,<y>` moves the pointer there and rests; `key:<keystroke>` presses keys as the keymap sees them (`key:tab`, `key:cmd-4`);
 //! `drag:<x1>,<y1>,<x2>,<y2>` presses at
-//! the first point, moves to the second in steps, and releases; `wait:<ms>` lets that long pass
+//! the first point, moves to the second in steps, and releases (`,shift` or `,cmd` held); `wait:<ms>` lets that long pass
 //! (for a write from outside to land between steps). `SNAPSHOT_WAIT_MS` (default 1500) is how
 //! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
 //! 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`.
@@ -30,17 +30,18 @@ fn drag(
     handle: AnyWindowHandle,
     from: gpui::Point<gpui::Pixels>,
     to: gpui::Point<gpui::Pixels>,
+    modifiers: Modifiers,
 ) {
     let mut events = vec![
         PlatformInput::MouseMove(MouseMoveEvent {
             position: from,
             pressed_button: None,
-            modifiers: Modifiers::default(),
+            modifiers,
         }),
         PlatformInput::MouseDown(MouseDownEvent {
             button: MouseButton::Left,
             position: from,
-            modifiers: Modifiers::default(),
+            modifiers,
             click_count: 1,
             first_mouse: false,
         }),
@@ -50,13 +51,13 @@ fn drag(
         events.push(PlatformInput::MouseMove(MouseMoveEvent {
             position: point(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t),
             pressed_button: Some(MouseButton::Left),
-            modifiers: Modifiers::default(),
+            modifiers,
         }));
     }
     events.push(PlatformInput::MouseUp(MouseUpEvent {
         button: MouseButton::Left,
         position: to,
-        modifiers: Modifiers::default(),
+        modifiers,
         click_count: 1,
     }));
     for event in events {
@@ -211,18 +212,22 @@ fn main() {
             continue;
         }
         if let Some(points) = spec.strip_prefix("drag:") {
-            let n: Vec<f32> = points
-                .split(',')
-                .map(|v| v.trim().parse().expect("drag points are numbers"))
-                .collect();
+            let parts: Vec<&str> = points.split(',').map(str::trim).collect();
+            let n: Vec<f32> = parts.iter().filter_map(|v| v.parse().ok()).collect();
             let [x1, y1, x2, y2] = n[..] else {
-                panic!("drag:<x1>,<y1>,<x2>,<y2>")
+                panic!("drag:<x1>,<y1>,<x2>,<y2>[,shift]")
+            };
+            let modifiers = Modifiers {
+                shift: parts.contains(&"shift"),
+                platform: parts.contains(&"cmd"),
+                ..Modifiers::default()
             };
             drag(
                 &mut cx,
                 handle,
                 point(px(x1), px(y1)),
                 point(px(x2), px(y2)),
+                modifiers,
             );
             settle(&mut cx, wait);
             continue;
