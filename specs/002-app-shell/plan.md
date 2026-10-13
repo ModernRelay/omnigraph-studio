@@ -182,7 +182,7 @@ second line shows it (`omnigraph branch create feature-x --from main`).
 ### Visual language
 
 Delta's window, measured from the mock on delta.dev (its CSS uses Zed's One Light tokens and
-IBM Plex Sans, as Studio does), with Tower's quiet rules. Tokens and components live in
+IBM Plex Sans, as Studio does), kept quiet: few colours, hairlines, space over lines. Tokens and components live in
 `studio_ui::ds` (spacing, radii, sizes, surfaces, elevation, text roles, and the rows, cards,
 strips and states built from them); the "Design system" tab (`studio::OpenDesignSystem`) renders
 every specimen in the current theme and window style. Features compose `ds` components rather

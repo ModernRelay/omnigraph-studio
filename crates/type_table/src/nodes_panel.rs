@@ -1,4 +1,4 @@
-//! The Nodes panel (spec 004, after Tower's explore view): one type's table in the bottom dock,
+//! The Nodes panel (spec 004): one type's table in the bottom dock,
 //! under the canvas. A click on a type in the canvas browses it here; the table is the ordinary
 //! type table, editing included.
 

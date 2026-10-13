@@ -21,7 +21,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 - Measured on an Apple Silicon Mac (research benchmark, fjadra force layout and edge
   tessellation): 1k nodes 2.2 ms per layout step and 0.14 ms per frame of edges; 10k 34 ms and
   1.3 ms; 50k 254 ms and 8 ms.
-- Tower's canvas (its spec 081): schema landing; hubs per edge × direction × other type with
+- An earlier web client's canvas: schema landing; hubs per edge × direction × other type with
   counts; 8 neighbours then "+K more"; each node drawn once; cap at 600 chips with "Too many
   nodes to draw" and a way out; zoom ×1.25 steps clamped to [min(0.2, 0.8 × fit), 2]; arrow keys
   move to the nearest node in a 45° cone, scored `along + 2 × across`.
@@ -187,18 +187,17 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   of neighbours.
 - **Mode.** "Schema" and "Exploration" toggle in the canvas; the schema view never clears the
   shared exploration.
-- **Look (2026-10-12), after Tower's explore canvas** (`apps/console` `chip-canvas.tsx`,
-  `ontology-graph.tsx`, `subgraph-graph.tsx`): every type, node, hub and "+K more" is a chip,
-  a white pill with a hairline and a soft contact shadow, with Tower's letter mark (the label's
-  initial in white on one of Tower's eight muted tints, chosen by the same hash) and a muted
+- **Look (2026-10-12):** every type, node, hub and "+K more" is a chip, a white pill with a
+  hairline and a soft contact shadow, with a letter mark (the label's initial in white on one of
+  eight muted tints, chosen by a hash of the type's name) and a muted
   count; lines are 1-pixel greys (schema 15%, a pointed type's 40% and the rest 5%; hub lines
   20% and dotted while the hub is closed); pointing at a chip fades what it does not reach to
-  30%; the selection carries Tower's warm ring; a faint dot grid lies behind; a schema with up
+  30%; the selection carries a warm ring; a faint dot grid lies behind; a schema with up
   to 16 relationships labels every line. Chips grow with the view to their size at zoom 1 and
   become marks alone from afar. Overlay: the mode switch, a "Search nodes…" pill (⌘P) and the
   zoom controls on top, the caption bottom left. Colour is kept to node types: relationships
   show a neutral arrow wherever a type is listed. A click on a type chip browses its rows in
-  the Nodes panel of the bottom dock (`studio_graph::BrowseType`), under the canvas as in Tower;
+  the Nodes panel of the bottom dock (`studio_graph::BrowseType`), under the canvas;
   a double click opens its table as a tab.
 - **Keys:** ←↑→↓ (`canvas::MoveLeft` …, nearest node in a 45° cone, `along + 2 × across`),
   `0`, `=`/`+`, `-`, ↵ expand, ⌫ collapse, Space peek, F focus on the selected node's

@@ -153,8 +153,8 @@ pub fn type_swatch(type_name: &str) -> Div {
     type_mark(type_name, type_name)
 }
 
-/// A node type's tinted mark, or for a relationship a neutral arrow: in Tower a relationship is
-/// a line, not a thing, so only node types carry a colour.
+/// A node type's tinted mark, or for a relationship a neutral arrow: a relationship is a line,
+/// not a thing, so only node types carry a colour.
 pub fn kind_swatch(type_name: &str, is_edge: bool) -> Div {
     if is_edge {
         div()
@@ -173,7 +173,7 @@ pub fn kind_swatch(type_name: &str, is_edge: bool) -> Div {
     }
 }
 
-/// Tower's type mark: the initial of `label` (a node's label, or the type's name) in white on
+/// The type mark: the initial of `label` (a node's label, or the type's name) in white on
 /// the type's tint, a 16-pixel rounded square. The tint says what kind of thing it is, the
 /// letter which one.
 pub fn type_mark(type_name: &str, label: &str) -> Div {

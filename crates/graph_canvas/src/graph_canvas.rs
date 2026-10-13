@@ -767,7 +767,7 @@ impl GraphCanvas {
         let height = f32::from(viewport.size.height).max(1.);
         let zoom = ((width - 80.) / (max.x - min.x).max(1.))
             .min((height - 120.) / (max.y - min.y).max(1.))
-            // Tower's ontology never zooms a fit past 1.1.
+            // A fit never zooms the ontology past 1.1.
             .clamp(0.05, 1.1);
         self.zoom = zoom;
         self.fit_zoom = zoom;
@@ -1126,7 +1126,7 @@ impl GraphCanvas {
             return;
         }
         match self.scene.nodes[index].kind {
-            // A click on a type browses its rows under the canvas, as Tower's does.
+            // A click on a type browses its rows under the canvas.
             SceneKind::Type { .. } if event.click_count < 2 => {
                 window.dispatch_action(
                     Box::new(studio_actions::graph::BrowseType {
@@ -1727,7 +1727,7 @@ impl GraphCanvas {
         let palette = paint::Palette {
             text: colors.text,
             muted: colors.text_muted,
-            // Tower's chips are white cards in the light theme.
+            // Chips are white cards in the light theme.
             card: if cx.theme().appearance.is_light() {
                 gpui::white()
             } else {
@@ -1803,7 +1803,7 @@ impl GraphCanvas {
             .into_any_element()
     }
 
-    /// Tower's caption, bottom left: what is drawn, and what a click does.
+    /// The caption, bottom left: what is drawn, and what a click does.
     fn render_caption(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let text = match self.mode {
@@ -1906,14 +1906,14 @@ impl GraphCanvas {
         };
         let capped = self.scene.capped.clone();
         let cap = self.node_cap(cx);
-        // Tower's floating pills are white cards in the light theme, like its chips.
+        // Floating pills are white cards in the light theme, like the chips.
         let surface = if cx.theme().appearance.is_light() {
             gpui::white()
         } else {
             cx.theme().colors().elevated_surface_background
         };
         let border = cx.theme().colors().border_variant;
-        // Tower's floating pills: round, a hairline, a soft float shadow.
+        // Floating pills: round, a hairline, a soft float shadow.
         // The canvas's floating controls share the segmented control's shape: 28 px tall, its
         // radius, its inset, so the mode switch, search and zoom read as one family.
         let panel = |id: &'static str| {

@@ -4,8 +4,8 @@ One numbered folder per feature, each with a `plan.md`. Add `validation.md` when
 log grows long. Keep folders after they land; they are the record of why Studio is the way it
 is.
 
-This is the lean form of GitHub Spec Kit that ModernRelay's Tower converged on: of Tower's 64
-spec folders, 6 use Spec Kit's full spec/plan/tasks flow and 58 are one plan in the shape below.
+This is a lean form of GitHub Spec Kit: most features need one plan in the shape below, and only
+large ones add Spec Kit's tasks, contracts or data-model files.
 Spec Kit's layout is kept, so its commands still work: the constitution is in
 `.specify/memory/constitution.md` and the plan template in `.specify/templates/`.
 

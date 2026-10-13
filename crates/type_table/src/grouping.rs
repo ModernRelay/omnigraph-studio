@@ -1,4 +1,4 @@
-//! A table grouped by one property (spec 004, group-by, after Tower 084): one section per value,
+//! A table grouped by one property (spec 004, group-by): one section per value,
 //! with its count from one grouped read under the table's filters, and each open section reading
 //! its own keyset pages narrowed to its value. A closed section reads nothing.
 //!

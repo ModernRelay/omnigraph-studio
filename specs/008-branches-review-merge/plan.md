@@ -26,7 +26,7 @@ place), X (designed on 0.13; the better routes are deferred).
   (one commit against its first parent). `GET /commits?branch=` lists commits with parents.
 - Not in 0.13.0: merge `as_commit`, commit publish and drop, a branch-to-branch diff, a merge
   preview, branch details (all in `docs/deferred-engine-changes.md`).
-- Tower's review (its spec 088): one summary sentence; changes to existing data first; groups
+- An earlier web client's review: one summary sentence; changes to existing data first; groups
   of an entity plus the relationships created with it; fixes bound to the reviewed head and never
   retried.
 - Zed `v1.23.2` `crates/git_ui/src/`: `project_diff.rs`, `commit_view.rs`, `conflict_view.rs`;
@@ -79,15 +79,15 @@ place), X (designed on 0.13; the better routes are deferred).
   branches", "Deleted on main, changed here", "Relationship points to a deleted node"), the
   entity, and the message. Resolution happens on the source branch with ordinary edits; then
   merge again.
-- After merging, Studio confirms the target's history contains the merge (Tower's "verified
-  merge").
+- After merging, Studio confirms the target's history contains the merge (a verified
+  merge).
 
 ## Decisions
 
 | Decision | Rejected alternatives | Why |
 |---|---|---|
 | Review from the change feed | Wait for a diff route | Works on 0.13; the route is deferred |
-| Stat cards removed from the header | Tower's first design | "Read as cluttered" in Tower 088 |
+| Stat cards removed from the header | Stat cards above the changes | They read as cluttered in an earlier design |
 | Conflicts resolved by editing the source branch | Ours/theirs buttons | 0.13 has no resolution API; edits are ordinary writes |
 
 ## Deferred

@@ -2328,7 +2328,7 @@ impl Workspace {
                     .rounded(px(studio_ui::ds::radius::MD))
                     .map(|toast| {
                         if studio_ui::ds::is_glass(cx) {
-                            // A small floating glass surface, as Tower floats its pills.
+                            // A small floating glass surface, like the canvas's pills.
                             toast
                                 .bg(gpui::rgba(0xfcfbfce6))
                                 .shadow(studio_ui::ds::elevation::float())

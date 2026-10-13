@@ -204,8 +204,7 @@ pub mod graph {
         pub links: Vec<(usize, usize)>,
     }
 
-    /// Browse a type's rows in the Nodes panel under the canvas (Tower's "click a type to browse
-    /// it").
+    /// Browse a type's rows in the Nodes panel under the canvas.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
     pub struct BrowseType {

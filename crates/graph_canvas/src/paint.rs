@@ -1,5 +1,4 @@
-//! How the canvas looks (spec 006), in Tower's language (`apps/console` `chip-canvas.tsx`,
-//! `ontology-graph.tsx`, `subgraph-graph.tsx`): a faint dot grid; hairline grey lines; every node,
+//! How the canvas looks (spec 006): a faint dot grid; hairline grey lines; every node,
 //! type, hub and "+K more" a chip, a white pill with a hairline and a soft contact shadow, with
 //! the type's letter mark and a muted count. Pointing at a chip lights its lines and fades the
 //! rest; the selected chip carries a warm ring. Colour is kept to the small type marks.
@@ -18,9 +17,9 @@ use crate::model::{Scene, SceneKind, SceneNode};
 pub(crate) struct Palette {
     pub text: Hsla,
     pub muted: Hsla,
-    /// The chip fill (Tower's `bg-card`).
+    /// The chip fill.
     pub card: Hsla,
-    /// The chip hairline (Tower's `border`).
+    /// The chip hairline.
     pub border: Hsla,
     pub font: Font,
 }
@@ -39,9 +38,9 @@ const MARK_ONLY_BELOW: f32 = 8.5;
 const TYPE_MARK_ONLY_BELOW: f32 = 6.;
 /// The dot grid's spacing, in screen pixels.
 const DOT_STEP: f32 = 22.;
-/// Up to this many relationships, the schema labels every line (Tower's `ALWAYS_LABEL`).
+/// Up to this many relationships, the schema labels every line.
 pub(crate) const ALWAYS_LABEL: usize = 16;
-/// The warm ring that marks where you are (Tower's `CHIP_FOCUS`).
+/// The warm ring that marks where you are.
 const WARM: u32 = 0xf2b48f;
 /// Segments per path: GPUI caps one path near 65k vertices. A batch that still needs more is
 /// painted in halves (`stroke_lines`), never dropped.
@@ -273,7 +272,7 @@ pub(crate) fn paint(
     if screen.len() != scene.nodes.len() {
         return;
     }
-    // Chips grow with the view up to their size at zoom 1, as Tower's do (13-pixel text), in
+    // Chips grow with the view up to their size at zoom 1 (13-pixel text), in
     // half-pixel text steps: a label is shaped again only when its size changes, and GPUI keeps
     // a shaped line for one frame, so a smooth zoom would reshape every label on every frame.
     let scale = (zoom.clamp(0.3, 1.) * CHIP_TEXT * 2.).round() / (CHIP_TEXT * 2.);
@@ -534,7 +533,7 @@ pub(crate) fn paint(
     }
 }
 
-/// Tower's dot grid: the foreground at 7%, a 1.2-pixel dot every 22 pixels, fixed to the screen.
+/// The dot grid: the foreground at 7%, a 1.2-pixel dot every 22 pixels, fixed to the screen.
 /// Strokes lines as one path. Lines that need more vertices than a path holds are painted in
 /// halves, so a batch is never dropped.
 fn stroke_lines(window: &mut Window, lines: &[Segment], color: Hsla) {
@@ -671,7 +670,7 @@ fn paint_dots(bounds: Bounds<Pixels>, palette: &Palette, window: &mut Window) {
 struct PillStyle {
     fill: Hsla,
     border: Hsla,
-    /// Tower's soft contact shadow.
+    /// A soft contact shadow.
     shadow: bool,
     /// The focus ring's glow.
     ring: Option<Hsla>,
@@ -823,7 +822,7 @@ fn paint_mark(
     )
 }
 
-/// Tower's `TypeMark`: the initial in white on the type's tint, a rounded square.
+/// The type mark: the initial in white on the type's tint, a rounded square.
 #[allow(clippy::too_many_arguments)]
 fn paint_letter_mark(
     center: Point<Pixels>,
@@ -894,8 +893,8 @@ fn paint_dot(at: Point<Pixels>, radius: f32, color: Hsla, window: &mut Window) -
     rect
 }
 
-/// Whether a hub–node line joins a hub to one of the neighbours it shows (Tower's "member"
-/// lines), rather than the hub to the node it belongs to.
+/// Whether a hub–node line joins a hub to one of the neighbours it shows (a "member" line),
+/// rather than the hub to the node it belongs to.
 fn edge_is_member(scene: &Scene, from: usize, to: usize) -> bool {
     let (hub, node) = match (&scene.nodes[from].kind, &scene.nodes[to].kind) {
         (SceneKind::Hub { .. }, _) => (from, to),

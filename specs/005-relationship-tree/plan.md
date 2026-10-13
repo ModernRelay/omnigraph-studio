@@ -21,7 +21,7 @@ II (the tree reads one commit), V (rows do not jump), VIII (keyboard), IX (paged
 - Edge shapes from `compile_schema_shape`: name, from type, to type, cardinality, properties.
 - Zed `v1.23.2` `ui` components: `tree_view_item.rs`, `indent_guides.rs`, `sticky_items.rs`;
   rows rendered by GPUI's `uniform_list`.
-- Tower's canvas exploration (its spec 081): hubs per edge × direction × other type with counts,
+- An earlier web client's canvas exploration: hubs per edge × direction × other type with counts,
   8 neighbours then "+K more", each node drawn once.
 
 ## Design

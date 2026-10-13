@@ -65,7 +65,7 @@ python3 script/check-layers.py   # crate layer rule; keep its table in step with
 
 ## Specs
 
-Specs follow the lean shape Tower converged on; see `specs/README.md`. One numbered folder per
+Specs follow a lean Spec Kit shape; see `specs/README.md`. One numbered folder per
 feature with a `plan.md`; add `validation.md` when the log grows long. Keep folders after they
 land.
 

@@ -191,7 +191,7 @@ proposal and to preview a merge. Used only when the server advertises
 | Decision | Rejected alternatives | Why |
 |---|---|---|
 | Defer every engine change | Change the engine alongside Studio | Ragnor, 2026-10-11: build Studio on the released contract first |
-| Routes added to the server proper | A Studio-only side channel | Served deployments and Tower gain them too; one access path |
+| Routes added to the server proper | A Studio-only side channel | Every client of a served deployment gains them too; one access path |
 | Loopback guard in the launcher | In `omnigraph-server` | Deployed servers must not gain a browser mode by accident |
 
 ## Validation log

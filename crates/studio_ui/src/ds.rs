@@ -3,9 +3,9 @@
 //! colours. The gallery tab (`studio::OpenDesignSystem`) renders every piece in both window
 //! styles, and changes are judged there first.
 //!
-//! Sources: Delta's window (measured from the mock on delta.dev), Zed's `ui` components, and
-//! Tower's quiet rules; layout and polish rules from the `better-layout` and `better-ui`
-//! skills (group with space, not lines; concentric radii; shadows for elevation).
+//! Sources: Delta's window (measured from the mock on delta.dev) and Zed's `ui` components;
+//! layout and polish rules: group with space, not lines; concentric radii; shadows for
+//! elevation.
 
 use gpui::{
     AnyElement, App, Background, BoxShadow, ClickEvent, Div, ElementId, Hsla, SharedString,
@@ -49,7 +49,7 @@ pub mod radius {
     pub const XS: f32 = 4.;
     /// Rows, buttons, fields.
     pub const SM: f32 = 6.;
-    /// Cards (Tower's card frames are 16px at its density).
+    /// Cards.
     pub const MD: f32 = 10.;
     /// Glass sheets: a card inset by `space::XS` inside one uses `MD`.
     pub const LG: f32 = 14.;
@@ -89,7 +89,7 @@ pub fn is_glass(cx: &App) -> bool {
 pub mod surface {
     use super::*;
 
-    /// The rule between regions and rows: a hairline when flat; on glass Tower's dotted rule,
+    /// The rule between regions and rows: a hairline when flat; on glass a dotted rule,
     /// 14% ink, which lands at about half a solid line's weight.
     pub fn rule(cx: &App) -> Hsla {
         if is_glass(cx) {
@@ -124,7 +124,7 @@ pub mod surface {
         cx.theme().colors().ghost_element_hover.opacity(0.7)
     }
 
-    /// A selected row on chrome (the sidebar): Tower's pressed pill, 5% ink, in both styles.
+    /// A selected row on chrome (the sidebar): a pressed pill, 5% ink, in both styles.
     pub fn selected_chrome(cx: &App) -> Hsla {
         if is_glass(cx) {
             gpui::black().opacity(0.05)
@@ -148,7 +148,7 @@ pub mod surface {
         }
     }
 
-    /// Tower's status dots: failed, running, done, idle.
+    /// Status dots: failed, running, done, idle.
     pub fn status(status: super::Status) -> Hsla {
         let rgb = match status {
             super::Status::Failed => 0xff5e1a,
@@ -200,12 +200,12 @@ pub mod elevation {
         }
     }
 
-    /// A solid item on glass: only a contact shadow (Tower's `raised`).
+    /// A solid item on glass: only a contact shadow.
     pub fn raised() -> Vec<BoxShadow> {
         vec![shadow(0.04, 1., 2., 0.)]
     }
 
-    /// A glass sheet: Tower's inner rim and soft downward shadow.
+    /// A glass sheet: an inner rim and a soft downward shadow.
     pub fn sheet() -> Vec<BoxShadow> {
         vec![
             rim(0.7),
@@ -229,7 +229,7 @@ pub mod elevation {
     }
 }
 
-/// A row's state, drawn as one of Tower's status dots.
+/// A row's state, drawn as a status dot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Failed,
@@ -267,8 +267,8 @@ pub fn status_dot(status: Status) -> Div {
 
 /// The glass window's wash, painted once behind everything: three soft fields of colour (warm
 /// at the top right, green at the bottom left, blue at the bottom right), low enough to tint the
-/// glass over them rather than colour the page. Tower paints these as radial gradients; GPUI
-/// has linear ones, so each field fades from its corner.
+/// glass over them rather than colour the page. They would be radial gradients; GPUI has
+/// linear ones, so each field fades from its corner.
 pub fn wash() -> Div {
     let field = |angle: f32, color: Hsla| {
         div().absolute().inset_0().bg(gpui::linear_gradient(
@@ -671,7 +671,7 @@ pub fn field_text(cx: &App) -> gpui::TextStyleRefinement {
 }
 
 /// An applied filter as a segmented pill: the field with its icon, the test, the value, and a
-/// remove button, split by hairlines, as Tower's filter chips read.
+/// remove button, split by hairlines.
 pub fn filter_pill(
     id: impl Into<ElementId>,
     icon: IconName,
@@ -950,7 +950,7 @@ pub fn card(cx: &App) -> Div {
         .bg(cx.theme().colors().editor_background)
         .overflow_hidden();
     if is_glass(cx) {
-        // A solid item on glass: Tower's `raised`.
+        // A solid item on glass: raised.
         card.border_color(surface::raised_border(cx))
             .shadow(elevation::raised())
     } else {
@@ -1010,8 +1010,7 @@ pub fn sheet(_cx: &App) -> Div {
         .shadow(elevation::sheet())
 }
 
-/// The rule under a list row: a hairline, dotted on glass (Tower: "lists are split by dotted
-/// rules").
+/// The rule under a list row: a hairline, dotted on glass.
 pub fn row_rule(row: Div, cx: &App) -> Div {
     let row = row.border_b_1().border_color(surface::rule(cx));
     if is_glass(cx) {
@@ -1092,7 +1091,7 @@ impl ActivityRow {
 
 impl RenderOnce for ActivityRow {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        // Tower's object link: a faint underline, 15% ink.
+        // An object link: a faint underline, 15% ink.
         let underline = cx.theme().colors().text.opacity(0.15);
         let row = h_flex()
             .w_full()
@@ -1181,7 +1180,7 @@ pub fn section_rule(title: impl Into<SharedString>, cx: &App) -> Div {
         )
 }
 
-/// A count in a soft tinted pill: Tower's pale status tints, keyed by a hue so the same type
+/// A count in a soft tinted pill: pale status tints, keyed by a hue so the same type
 /// gets the same colour everywhere.
 pub fn number_badge(value: impl Into<SharedString>, hue: f32) -> Div {
     div()

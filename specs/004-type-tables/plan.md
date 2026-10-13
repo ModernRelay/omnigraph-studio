@@ -9,8 +9,8 @@ preview tabs (spec 002). See Deferred for what is left.
 ## Problem
 
 The everyday surface: one table per node and edge type, fast at any size, filterable and
-sortable, with a peek, and editable without fear. Tower's data pages (its specs 066, 070, 073,
-084) proved the model on real graphs; Studio rebuilds it natively without Tower's browser limits.
+sortable, with a peek, and editable without fear. An earlier web client proved the model on
+real graphs; Studio rebuilds it natively, without a browser's limits.
 
 ## Principles
 
@@ -118,8 +118,8 @@ stay put), IX (paged, virtualized).
 - Filter chips per column: equals, not equals, greater or less, contains, in list, is empty, is
   not empty; dates as Today, This week, Last 30 days, or a range, through `now()`.
 - Relationship filters: "has any", "has none", "related to …" through `exists { }`, `not { }`,
-  and a bound endpoint. Measure "has none" on a large type before shipping it (Tower could not,
-  on an older engine).
+  and a bound endpoint. Measure "has none" on a large type before shipping it (it was too
+  slow on an older engine).
 - The value field offers what it can take: an enum's values (or `true` and `false`), narrowed
   as text is typed with matches at the start first, and for "related to" the other type's
   nodes, searched on the server by id or label (`builder::node_search`, 8 at a time, at the
@@ -241,9 +241,9 @@ kept answers.
 
 | Decision | Rejected alternatives | Why |
 |---|---|---|
-| Value-bound cell saves | `if-graph-commit` on every cell | Any unrelated commit would refuse the save (Tower 073 moved away from it) |
-| Engine-side filter, sort and count | Filtering loaded rows | Correct at any size; Tower rejected client-side grouping and filtering |
-| No row cap | Tower's 1,000-row DOM cap | GPUI virtualizes; the cap existed only because the browser rendered every row |
+| Value-bound cell saves | `if-graph-commit` on every cell | Any unrelated commit would refuse the save |
+| Engine-side filter, sort and count | Filtering loaded rows | Correct at any size; grouping and filtering loaded rows is wrong once a type outgrows a page |
+| No row cap | A 1,000-row cap, as a web table needs | GPUI virtualizes; such a cap exists only because a browser renders every row |
 | Fork Zed's CSV preview renderer and selection model | GPUI Kit's table | One GPUI lineage (constitution XI) |
 
 ## Deferred

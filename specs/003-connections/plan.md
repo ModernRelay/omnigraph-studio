@@ -113,7 +113,7 @@ from the served document).
 | Decision | Rejected alternatives | Why |
 |---|---|---|
 | Read the CLI's config and credentials | Ask for every token again | The CLI is how people already reach their servers |
-| Capabilities from `/openapi.json` | Compare version strings | A server on main serves routes 0.13.0 lacks; Tower learned the same (its spec 051) |
+| Capabilities from `/openapi.json` | Compare version strings | A server on main serves routes 0.13.0 lacks |
 | Never retry writes | Retry with backoff | A lost response may have committed; only history can tell |
 
 ## Deferred
