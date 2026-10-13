@@ -2,6 +2,10 @@
 //! with its count from one grouped read under the table's filters, and each open section reading
 //! its own keyset pages narrowed to its value. A closed section reads nothing.
 //!
+//! A node table can also be grouped by a relationship (`out:WorksAt`): one section per neighbour,
+//! named by its label, and one for the rows with none; a section's pages are narrowed with
+//! "related to" that neighbour, or "has none".
+//!
 //! The table keeps every loaded row in one list, sections in order, so the cursor, editing and
 //! selection keep addressing rows by their position in it; a section knows its slice of the
 //! list. The grid draws [`Line`]s: a header per section, its rows while open, then a line that
@@ -9,7 +13,7 @@
 
 use std::ops::Range;
 
-use gq_language::{Filter, FilterOp};
+use gq_language::{Filter, FilterOp, builder};
 use graph_client::api::ReadOutput;
 use graph_store::Loadable;
 use serde_json::Value;
@@ -24,7 +28,10 @@ pub const SECTION_FIRST_PAGE: u32 = 10;
 /// One value of the grouping property and the rows that hold it.
 #[derive(Debug, Clone)]
 pub struct Section {
+    /// The property's value, or the neighbour's `@id`; null for rows without one.
     pub value: Value,
+    /// The neighbour's label, when grouped by a relationship whose other type has one.
+    pub label: Option<String>,
     /// Rows with this value that match the filters, at the table's commit.
     pub count: u64,
     pub expanded: bool,
@@ -39,6 +46,7 @@ impl Section {
     fn new(value: Value, count: u64) -> Self {
         Self {
             value,
+            label: None,
             count,
             expanded: true,
             paging: Paging::default(),
@@ -120,7 +128,10 @@ impl Grouping {
             .map(|row| {
                 let value = row.get("value").cloned().unwrap_or(Value::Null);
                 let count = row.get("n").and_then(Value::as_u64).unwrap_or(0);
-                Section::new(value, count)
+                Section {
+                    label: row.get("label").and_then(Value::as_str).map(str::to_owned),
+                    ..Section::new(value, count)
+                }
             })
             .collect();
         sections.sort_by_key(|section| section.value.is_null());
@@ -128,9 +139,34 @@ impl Grouping {
         self.sections = Loadable::Loaded(sections);
     }
 
+    /// Whether the rows are grouped by a relationship rather than a property.
+    pub fn by_relationship(&self) -> bool {
+        builder::parse_relationship_key(&self.property).is_some()
+    }
+
+    /// Adds the section of rows with no neighbour, last, when there are any.
+    pub fn add_none_section(&mut self, count: u64) {
+        if let Loadable::Loaded(sections) = &mut self.sections
+            && count > 0
+        {
+            sections.push(Section::new(Value::Null, count));
+        }
+    }
+
     /// The filter that narrows the table's pages to one section.
     pub fn filter_for(&self, index: usize) -> Option<Filter> {
         let section = self.sections().get(index)?;
+        if self.by_relationship() {
+            return Some(Filter {
+                property: self.property.clone(),
+                op: if section.value.is_null() {
+                    FilterOp::HasNone
+                } else {
+                    FilterOp::RelatedTo
+                },
+                value: section.value.clone(),
+            });
+        }
         Some(if section.value.is_null() {
             Filter {
                 property: self.property.clone(),
@@ -364,6 +400,37 @@ mod tests {
             .collect();
         assert_eq!(ranges, [0..3, 3..4, 4..4]);
         assert_eq!(grouping.sections()[1].count, 11);
+    }
+
+    #[test]
+    fn a_relationship_groups_by_neighbour_with_the_unrelated_rows_last() {
+        let mut grouping = Grouping::new("out:WorksAt");
+        grouping.restart();
+        grouping.accept_counts(
+            &counts(json!([
+                {"value": "company-1", "label": "Acme", "n": 4},
+                {"value": "company-2", "n": 2},
+            ])),
+            GROUP_LIMIT,
+        );
+        grouping.add_none_section(3);
+        let sections = grouping.sections();
+        assert_eq!(sections.len(), 3);
+        assert_eq!(sections[0].label.as_deref(), Some("Acme"));
+        assert_eq!(sections[1].label, None);
+        assert!(sections[2].value.is_null());
+        let filter = grouping.filter_for(0).unwrap();
+        assert_eq!(
+            (filter.property.as_str(), filter.op, filter.value),
+            ("out:WorksAt", FilterOp::RelatedTo, json!("company-1"))
+        );
+        assert_eq!(grouping.filter_for(2).unwrap().op, FilterOp::HasNone);
+
+        let mut none = Grouping::new("out:WorksAt");
+        none.restart();
+        none.accept_counts(&counts(json!([])), GROUP_LIMIT);
+        none.add_none_section(0);
+        assert!(none.sections().is_empty(), "no section for no rows");
     }
 
     #[test]

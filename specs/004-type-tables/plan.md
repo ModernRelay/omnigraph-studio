@@ -154,7 +154,20 @@ disclosure). An open section reads its first 10 rows when its line comes into vi
 N more of M" reads a page, all keyset pages narrowed with `title = $value` (or `is null`) and
 pinned to the table's commit, in the table's sort. A closed section reads nothing. Every read
 is engine-side, so the counts are right at any size. Edge tables group by their own properties
-the same way. The grouping is part of the tab and of saved views. The cursor moves over
+the same way.
+
+A node table also groups by a relationship ("people by company"): the Group menu lists the
+table's relationships after its properties, as does a relationship column's header menu. One
+read counts the filtered rows per neighbour (`builder::neighbour_counts`: `return { $g.@id as
+value, $g.name as label, count($n) as n }`, by label then id, at most 200 neighbours), and a
+second, at the same commit, counts the rows with none (`node_count` with "has none"). Each
+neighbour is a section named by its label, with its id beside the label when two neighbours
+share it and in the tooltip; the rows with none come last as "No Company". A section's pages
+are narrowed with "related to" its neighbour, or "has none". A row related to two neighbours
+shows in both sections, and an edit or a delete reaches every copy; a cell edit never dims a
+row out of its section, since it cannot change the row's neighbours.
+
+The grouping is part of the tab and of saved views. The cursor moves over
 headers and past closed sections; ⇧-click picks the rows shown between two rows. A row edited
 out of its section's value stays in place, dimmed, until the next read; a new row goes first in
 its open section.
@@ -223,8 +236,8 @@ opens the branch's recent commits.
   - R1 Blob writes: upload and clear only when the server advertises `cluster_putBlob`.
   - R2 unpublished commits: staged edits as a reviewable proposal only when the server
     advertises `cluster_publishCommit`.
-- Grouping edge tables by a property of an endpoint, and grouping by a relationship ("people
-  by company").
+- Grouping edge tables by a property of an endpoint, and a node table by a property of its
+  neighbour ("people by the city of their company").
 - Column widths set by hand: widths are fitted to each column's type.
 - Per-row history beyond the commits that the change feed can cheaply return.
 
@@ -252,6 +265,7 @@ opens the branch's recent commits.
 | 2026-10-12 | Blob cells and previews | `HEAD`/`GET /graphs/notes/blob` on the 0.13 dev server (`notes.attachment`: a PNG, a query text, 1 KiB of bytes, an empty value, nulls); `graph_client` blob tests; `type_table::blob` tests; offscreen snapshots of the Note table and three peeks | A managed cell answers 200 with `content-length` and an ETag (`0` for empty); a null cell and a missing row both answer 404 `not_found`, so a 404 on a row the table read is null; `Range` answers 206. Cells read "Blob · 690 B · Preview", "Blob · 0 B" and "—", for drawn rows only, at the page's commit; the peek drew the PNG, the query text and a hex dump |
 | 2026-10-12 | Null order and sorted keyset pages on 0.13 | `order { $n.title asc, $n.@id asc }` and `desc` on the dev server; `is not null`; the keyset clause with `or`; `gq_language` `sorted_pages_read_values_then_nulls_and_compile` (text, Date, I32, an edge property); `type_table` paging test; offscreen snapshots of Person by title both ways and Company by city with 25-row pages | Nulls come first ascending and last descending, so the `is null` split is needed; Company by city ran Berlin to Toronto, then the company without a city, across the switch from values to nulls ("25 of 25") |
 | 2026-10-12 | Relationship columns | `gq_language` `page_relationship_reads_compile_for_every_group`; the grouped count and sample on the dev server (`person-000002` with no `knows` has no row); an offscreen snapshot of Person with its five relationship columns | Counts per id, tags in the UI font with "+N" kept in view, "—" for none |
+| 2026-10-12 | Grouping by a relationship | `gq_language` `neighbour_counts_group_filtered_nodes_by_each_relationship` (every relationship of the dev schema, with property and relationship filters, type-checks); `type_table` `a_relationship_groups_by_neighbour_with_the_unrelated_rows_last`; the counts and the "has none" count on the dev server (32 people without a company); offscreen snapshots of Person grouped by `worksAt →` from the Group menu, then two seeded views applied from the Views menu ("Founders by company", "Knuths by company", each hiding email and tags) | Sections by company label with counts; the two "Allen Works" companies read "…pany-00009" and "…pany-00023"; Shafi Thompson showed under both of his companies; "Knuths by company" read 12 of 200 in nine sections summing to 12, "No Company 3" last |
 | 2026-10-12 | Hidden and moved columns | `type_table` `a_layout_hides_and_orders_columns_and_keeps_the_pinned_one_first` and `a_layout_survives_schema_changes`; `studio_settings` `views_are_saved_per_graph_and_type_and_replaced_by_name` with hidden columns; offscreen snapshots of Person: right-click on `email` then Hide column, the Columns menu, a click on `email` in it, and a drag of the `born` header onto `name` | The menu read Sort ascending, Sort descending, Group by this column, Filter…, Move left, Move right, Hide column, aligned; `email` left the grid and the button read "1 hidden"; the Columns menu checked every shown column and stayed open while `email` came back ("Columns", Show all columns disabled); the drag put `born` before `name` and did not sort |
 | 2026-10-12 | Saved views | `studio_settings` `views_are_saved_per_graph_and_type_and_replaced_by_name`; `gq_language` `filter_operators_round_trip_through_their_keys`; offscreen snapshots with `click:` and `type:` steps: a seeded "Founders" applied from the Views menu, then sorted by email and saved as "Founders by email" | "title is Founder", name ascending, "25 of 200", and the button read "Founders"; `settings.json` held both views |
 | 2026-10-12 | Spike S1: several rows in one commit | on a scratch branch of the dev server: `update Person set { title: $v } where @id in $ids` (3 rows), and one mutation of two `update` statements | Both publish one commit; multi-statement mutations are the mechanism, so merge-mode NDJSON was not needed |

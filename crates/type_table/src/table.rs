@@ -769,12 +769,7 @@ impl TypeTable {
         self.grouping = view
             .group_by
             .as_ref()
-            .filter(|name| {
-                self.all_columns
-                    .iter()
-                    .filter_map(ColumnSpec::property)
-                    .any(|p| p.name == **name && builder::GroupBy::allowed(p))
-            })
+            .filter(|key| self.can_group_by(key))
             .map(Grouping::new);
         self.layout = ColumnLayout::new(view.hidden.clone(), view.order.clone());
         self.show_columns(cx);
@@ -926,8 +921,8 @@ impl TypeTable {
                     Some(commit) if changed == rows.len() => {
                         for (id, _) in &rows {
                             if let Some(ix) = self.row_index(id) {
-                                set_value(&mut self.rows[ix], &column, new.clone());
-                                self.rows[ix].dimmed = !self.row_fits(ix);
+                                self.set_cell(ix, &column, new.clone());
+                                self.set_dimmed(ix, !self.row_fits(ix));
                             }
                         }
                         if self.paging.advance_for_own_commit(
@@ -1125,10 +1120,7 @@ impl TypeTable {
             .property()
             .filter(|p| Sort::allowed(p))
             .map(|p| p.name.clone());
-        let groupable = column
-            .property()
-            .filter(|p| builder::GroupBy::allowed(p))
-            .map(|p| p.name.clone());
+        let groupable = self.can_group_by(&key).then(|| key.clone());
         let filterable = !self.ops_for(&key).is_empty();
         let sort = self.sort.clone();
         let grouped = self.grouping.as_ref().map(|g| g.property.clone());
@@ -1320,14 +1312,14 @@ impl TypeTable {
 
     /// The toolbar's Group menu: the properties rows can be grouped by, and No grouping.
     fn render_group_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let choices: Vec<String> = self
-            .all_columns
-            .iter()
-            .filter_map(ColumnSpec::property)
-            .filter(|p| builder::GroupBy::allowed(p))
-            .map(|p| p.name.clone())
-            .collect();
+        let choices = self.group_choices();
         let current = self.grouping.as_ref().map(|g| g.property.clone());
+        let current_label = current.as_ref().map(|key| {
+            choices
+                .iter()
+                .find(|(choice, _)| choice == key)
+                .map_or_else(|| key.clone(), |(_, label)| label.clone())
+        });
         let table = cx.entity().downgrade();
         let open = self.toolbar_menus[2].is_deployed();
         PopoverMenu::new("group-menu")
@@ -1336,8 +1328,8 @@ impl TypeTable {
             .trigger(
                 studio_ui::ds::button(
                     "group",
-                    match &current {
-                        Some(property) => format!("Group: {property}"),
+                    match &current_label {
+                        Some(label) => format!("Group: {label}"),
                         None => "Group".to_owned(),
                     },
                 )
@@ -1346,7 +1338,9 @@ impl TypeTable {
                 .start_icon(Icon::new(IconName::ListTree).size(IconSize::Small))
                 .disabled(choices.is_empty())
                 .when(!open, |button| {
-                    button.tooltip(Tooltip::text("Group the rows by a property"))
+                    button.tooltip(Tooltip::text(
+                        "Group the rows by a property or a relationship",
+                    ))
                 }),
             )
             .menu(move |window, cx| {
@@ -1369,13 +1363,18 @@ impl TypeTable {
                             set(None),
                         )
                         .separator();
-                    for name in &choices {
+                    let mut relationships = false;
+                    for (key, label) in &choices {
+                        if !relationships && builder::parse_relationship_key(key).is_some() {
+                            relationships = true;
+                            menu = menu.separator();
+                        }
                         menu = menu.toggleable_entry(
-                            name.clone(),
-                            current.as_ref() == Some(name),
+                            label.clone(),
+                            current.as_ref() == Some(key),
                             IconPosition::Start,
                             None,
-                            set(Some(name.clone())),
+                            set(Some(key.clone())),
                         );
                     }
                     menu
@@ -1631,14 +1630,31 @@ impl TypeTable {
         cx.notify();
     }
 
-    /// Groups the rows by a property, or stops; the table is read again at the same commit.
+    /// What the rows can be grouped by: each groupable property, then each relationship of a
+    /// node table. Key and how the choice reads.
+    fn group_choices(&self) -> Vec<(String, String)> {
+        let properties = self
+            .all_columns
+            .iter()
+            .filter_map(ColumnSpec::property)
+            .filter(|p| builder::GroupBy::allowed(p))
+            .map(|p| (p.name.clone(), p.name.clone()));
+        let relationships = self
+            .all_columns
+            .iter()
+            .filter(|c| c.relationship().is_some())
+            .map(|c| (c.key.clone(), c.title.clone()));
+        properties.chain(relationships).collect()
+    }
+
+    fn can_group_by(&self, key: &str) -> bool {
+        self.group_choices().iter().any(|(choice, _)| choice == key)
+    }
+
+    /// Groups the rows by a property or a relationship, or stops; the table is read again at
+    /// the same commit.
     pub fn set_grouping(&mut self, property: Option<String>, cx: &mut Context<Self>) {
-        let property = property.filter(|name| {
-            self.all_columns
-                .iter()
-                .filter_map(ColumnSpec::property)
-                .any(|p| p.name == *name && builder::GroupBy::allowed(p))
-        });
+        let property = property.filter(|key| self.can_group_by(key));
         if self.grouping.as_ref().map(|g| &g.property) == property.as_ref() {
             return;
         }
@@ -1653,16 +1669,34 @@ impl TypeTable {
         };
         let generation = grouping.restart();
         let property = grouping.property.clone();
-        let query = builder::value_counts(
-            &schema,
-            &self.type_name,
-            self.kind == TableKind::Edge,
-            &self.resolved_filters(),
-            &property,
-            GROUP_LIMIT,
-        );
-        let query = match query {
-            Ok(query) => query,
+        let filters = self.resolved_filters();
+        // By a relationship: the rows per neighbour, and apart from them the rows with none.
+        let queries = if builder::parse_relationship_key(&property).is_some() {
+            let none = Filter {
+                property: property.clone(),
+                op: FilterOp::HasNone,
+                value: Value::Null,
+            };
+            let mut unrelated = filters.clone();
+            unrelated.push(none);
+            builder::neighbour_counts(&schema, &self.type_name, &filters, &property, GROUP_LIMIT)
+                .and_then(|counts| {
+                    let none = builder::node_count(&schema, &self.type_name, &unrelated)?;
+                    Ok((counts, Some(none)))
+                })
+        } else {
+            builder::value_counts(
+                &schema,
+                &self.type_name,
+                self.kind == TableKind::Edge,
+                &filters,
+                &property,
+                GROUP_LIMIT,
+            )
+            .map(|counts| (counts, None))
+        };
+        let (query, none) = match queries {
+            Ok(queries) => queries,
             Err(error) => {
                 self.first_page = Loadable::Failed(error.to_string());
                 return;
@@ -1671,18 +1705,37 @@ impl TypeTable {
         let snapshot = self.paging.pinned.clone();
         let read = self
             .session
-            .update(cx, |session, cx| session.read(&query, snapshot, cx));
+            .update(cx, |session, cx| session.read(&query, snapshot.clone(), cx));
         self.page_task = Some(cx.spawn(async move |this, cx| {
             let result = read.await;
-            this.update(cx, |this, cx| this.apply_groups(generation, result, cx))
-                .ok();
+            // The rows with none are counted at the commit the groups were read at.
+            let none = match (none, &result) {
+                (Some(none), Ok(output)) => {
+                    let commit = snapshot.or_else(|| output.graph_commit_id.clone());
+                    let Ok(read) = this.update(cx, |this, cx| {
+                        this.session
+                            .update(cx, |session, cx| session.read(&none, commit, cx))
+                    }) else {
+                        return;
+                    };
+                    Some(read.await)
+                }
+                _ => None,
+            };
+            this.update(cx, |this, cx| {
+                this.apply_groups(generation, result, none, cx)
+            })
+            .ok();
         }));
     }
 
+    /// Takes the grouped counts, and when grouped by a relationship the count of rows with no
+    /// neighbour. Either failing fails the grouping.
     fn apply_groups(
         &mut self,
         generation: u64,
         result: Result<ReadOutput, ReadError>,
+        none: Option<Result<ReadOutput, ReadError>>,
         cx: &mut Context<Self>,
     ) {
         let Some(grouping) = self
@@ -1692,12 +1745,22 @@ impl TypeTable {
         else {
             return;
         };
+        let none =
+            none.map(|read| read.map(|output| count_of(&output.rows).unwrap_or(0).max(0) as u64));
+        let result = match (result, none) {
+            (Ok(output), Some(Ok(none))) => Ok((output, Some(none))),
+            (Ok(output), None) => Ok((output, None)),
+            (Err(error), _) | (_, Some(Err(error))) => Err(error),
+        };
         match result {
-            Ok(output) => {
+            Ok((output, none)) => {
                 if self.paging.pinned.is_none() {
                     self.paging.pinned = output.graph_commit_id.clone();
                 }
                 grouping.accept_counts(&output, GROUP_LIMIT);
+                if let Some(none) = none {
+                    grouping.add_none_section(none);
+                }
                 self.first_page = Loadable::Loaded(());
                 self.load_counts(cx);
             }
@@ -1830,6 +1893,27 @@ impl TypeTable {
         }
     }
 
+    /// Sets a cell of the row at `ix`, and of every other copy of that row: grouped by a
+    /// relationship, a row related to two neighbours shows in both sections.
+    fn set_cell(&mut self, ix: usize, column: &str, value: Value) {
+        let Some(id) = self.rows.get(ix).map(|row| row.id.clone()) else {
+            return;
+        };
+        for row in self.rows.iter_mut().filter(|row| row.id == id) {
+            set_value(row, column, value.clone());
+        }
+    }
+
+    /// Dims the row at `ix` and its copies, or shows them plainly again.
+    fn set_dimmed(&mut self, ix: usize, dimmed: bool) {
+        let Some(id) = self.rows.get(ix).map(|row| row.id.clone()) else {
+            return;
+        };
+        for row in self.rows.iter_mut().filter(|row| row.id == id) {
+            row.dimmed = dimmed;
+        }
+    }
+
     /// Whether a row still belongs where it is shown: it matches the filters and, grouped, holds
     /// its section's value.
     fn row_fits(&self, ix: usize) -> bool {
@@ -1840,6 +1924,8 @@ impl TypeTable {
             return false;
         }
         match &self.grouping {
+            // A cell edit cannot move a row to another neighbour.
+            Some(grouping) if grouping.by_relationship() => true,
             Some(grouping) => grouping
                 .section_of(ix)
                 .and_then(|section| grouping.sections().get(section))
@@ -2195,6 +2281,13 @@ impl TypeTable {
             let row = self.rows.remove(index);
             if let Some(grouping) = &mut self.grouping {
                 grouping.removed(index);
+            }
+            // Grouped by a relationship, the row's other copies go too.
+            while let Some(copy) = self.rows.iter().position(|row| row.id == id) {
+                self.rows.remove(copy);
+                if let Some(grouping) = &mut self.grouping {
+                    grouping.removed(copy);
+                }
             }
             if !row.dimmed
                 && let Loadable::Loaded(n) = &mut self.count
@@ -2554,7 +2647,7 @@ impl TypeTable {
             }
         };
         // Show the new value with an amber dot while the save is out.
-        set_value(&mut self.rows[row_ix], &column, new.clone());
+        self.set_cell(row_ix, &column, new.clone());
         self.cells
             .insert((row_id.clone(), column.clone()), CellState::Saving);
         self.saves_in_flight += 1;
@@ -2600,7 +2693,7 @@ impl TypeTable {
                     self.newer = true;
                 }
                 if let Some(ix) = self.row_index(&row_id) {
-                    self.rows[ix].dimmed = !self.row_fits(ix);
+                    self.set_dimmed(ix, !self.row_fits(ix));
                 }
             }
             SaveResult::NoMatch => {
@@ -2610,7 +2703,7 @@ impl TypeTable {
             }
             SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
                 if let Some(ix) = self.row_index(&row_id) {
-                    set_value(&mut self.rows[ix], &column, old);
+                    self.set_cell(ix, &column, old);
                 }
                 self.reopen(row_id, column, text, notice, window, cx);
             }
@@ -2758,7 +2851,7 @@ impl TypeTable {
         // Show the new values with an amber dot while the save is out.
         for edit in &edits {
             if let Some(ix) = self.row_index(&edit.row_id) {
-                set_value(&mut self.rows[ix], &edit.column, edit.new.clone());
+                self.set_cell(ix, &edit.column, edit.new.clone());
             }
             self.cells.insert(
                 (edit.row_id.clone(), edit.column.clone()),
@@ -2844,7 +2937,7 @@ impl TypeTable {
                 {
                     for edit in edits {
                         if let Some(ix) = self.row_index(&edit.row_id) {
-                            set_value(&mut self.rows[ix], &edit.column, edit.old);
+                            self.set_cell(ix, &edit.column, edit.old);
                         }
                         self.cells.insert(
                             (edit.row_id, edit.column),
@@ -2865,7 +2958,7 @@ impl TypeTable {
     fn refresh_dimmed(&mut self, edits: &[DraftEdit]) {
         for edit in edits {
             if let Some(ix) = self.row_index(&edit.row_id) {
-                self.rows[ix].dimmed = !self.row_fits(ix);
+                self.set_dimmed(ix, !self.row_fits(ix));
             }
         }
     }
@@ -2915,20 +3008,20 @@ impl TypeTable {
                                     continue;
                                 }
                                 if let Some(ix) = ix {
-                                    set_value(&mut this.rows[ix], &edit.column, value.clone());
+                                    this.set_cell(ix, &edit.column, value.clone());
                                 }
                                 changed_elsewhere(property.as_ref(), Some(&value))
                             }
                             Some(None) => {
                                 if let Some(ix) = ix {
-                                    set_value(&mut this.rows[ix], &edit.column, edit.old);
-                                    this.rows[ix].dimmed = true;
+                                    this.set_cell(ix, &edit.column, edit.old);
+                                    this.set_dimmed(ix, true);
                                 }
                                 changed_elsewhere(property.as_ref(), None)
                             }
                             None => {
                                 if let Some(ix) = ix {
-                                    set_value(&mut this.rows[ix], &edit.column, edit.old);
+                                    this.set_cell(ix, &edit.column, edit.old);
                                 }
                                 Notice::new(
                                     Tone::Unknown,
@@ -3114,14 +3207,14 @@ impl TypeTable {
                             Some(row) => {
                                 let value = row.value(&column).clone();
                                 if let Some(ix) = ix {
-                                    set_value(&mut this.rows[ix], &column, value.clone());
+                                    this.set_cell(ix, &column, value.clone());
                                 }
                                 changed_elsewhere(property.as_ref(), Some(&value))
                             }
                             None => {
                                 if let Some(ix) = ix {
-                                    set_value(&mut this.rows[ix], &column, old);
-                                    this.rows[ix].dimmed = true;
+                                    this.set_cell(ix, &column, old);
+                                    this.set_dimmed(ix, true);
                                 }
                                 changed_elsewhere(property.as_ref(), None)
                             }
@@ -3129,7 +3222,7 @@ impl TypeTable {
                     }
                     Err(_) => {
                         if let Some(ix) = this.row_index(&row_id) {
-                            set_value(&mut this.rows[ix], &column, old);
+                            this.set_cell(ix, &column, old);
                         }
                         Notice::new(
                             Tone::Conflict,
@@ -4442,11 +4535,32 @@ impl TypeTable {
         };
         let property = self.property_of(&grouping.property);
         let missing = section.value.is_null();
-        let text = if missing {
-            "No value".to_owned()
-        } else {
-            display_value(property.as_ref(), &section.value)
+        // By a relationship: the neighbour's label (its id in the tooltip), or "No Company".
+        let other_type = self
+            .all_columns
+            .iter()
+            .find(|c| c.key == grouping.property)
+            .and_then(ColumnSpec::relationship)
+            .map(|group| group.other_type.clone());
+        let text = match (&other_type, missing) {
+            (Some(other), true) => format!("No {other}"),
+            (None, true) => "No value".to_owned(),
+            (Some(_), false) => section
+                .label
+                .clone()
+                .unwrap_or_else(|| display_value(None, &section.value)),
+            (None, false) => display_value(property.as_ref(), &section.value),
         };
+        let id = (other_type.is_some() && !missing && section.label.is_some())
+            .then(|| display_value(None, &section.value));
+        // Two neighbours with one label are told apart by their ids.
+        let repeated = id.is_some()
+            && grouping
+                .sections()
+                .iter()
+                .filter(|other| other.label == section.label)
+                .count()
+                > 1;
         let first = h_flex()
             .id(("section-header", index))
             .h(px(ROW_HEIGHT))
@@ -4479,12 +4593,25 @@ impl TypeTable {
                         .truncate(),
                 ),
             )
+            // The id gives way first when the cell is narrow, keeping its end, where ids of
+            // one type differ.
+            .when_some(id.clone().filter(|_| repeated), |header, id| {
+                header.child(
+                    div().min_w_0().flex_shrink(1000.).child(
+                        Label::new(id)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .truncate_start(),
+                    ),
+                )
+            })
             .child(
                 Label::new(format_count(section.count as i64))
                     .size(LabelSize::XSmall)
                     .color(Color::Muted)
                     .single_line(),
             )
+            .when_some(id, |header, id| header.tooltip(Tooltip::text(id)))
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(index, cx)))
             .into_any_element();
         self.line_cells(first)

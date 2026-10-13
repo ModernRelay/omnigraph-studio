@@ -749,6 +749,61 @@ pub fn value_counts(
     })
 }
 
+/// How many filtered rows of a node type each neighbour through one relationship has (spec 004,
+/// grouping by a relationship: "people by company"). Columns: `value` (the neighbour's
+/// `@id`), `label` when the neighbour's type has a label other than its key, and `n`. A row
+/// with no neighbour has no group here; [`node_count`] with a "has none" filter counts those. A
+/// row related to two neighbours counts in both.
+pub fn neighbour_counts(
+    schema: &SchemaModel,
+    type_name: &str,
+    filters: &[Filter],
+    key: &str,
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, type_name)?;
+    let (direction, edge_name) =
+        parse_relationship_key(key).ok_or_else(|| BuildError::UnknownEdge(key.to_owned()))?;
+    let edge = edge(schema, edge_name)?;
+    let (other_type, hop) = match direction {
+        Direction::Outgoing => (&edge.to, format!("$n {} $g", edge.traversal())),
+        Direction::Incoming => (&edge.from, format!("$g {} $n", edge.traversal())),
+    };
+    let other = self::node(schema, other_type)?;
+    let mut params = Params::new();
+    let mut clauses = vec![format!("$n: {}", node.name)];
+    clauses.extend(filter_clauses(
+        schema,
+        &node.name,
+        &node.properties,
+        "n",
+        filters,
+        &mut params,
+    )?);
+    clauses.push(format!("$g: {}", other.name));
+    clauses.push(hop);
+    let label = other
+        .label_property()
+        .filter(|label| Some(*label) != other.key.as_deref());
+    let (label_column, order) = match label {
+        Some(label) => (
+            format!(", $g.{label} as label"),
+            "label asc, value asc".to_owned(),
+        ),
+        None => (String::new(), "value asc".to_owned()),
+    };
+    let text = format!(
+        "query studio_value_counts({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ $g.@id as value{label_column}, count($n) as n }}\n  order {{ {order} }}\n  limit {limit}\n}}\n",
+        sig = params.signature(),
+        clauses = clauses.join("\n    "),
+    );
+    Ok(BuiltQuery {
+        name: "studio_value_counts".into(),
+        text,
+        params: params.values,
+    })
+}
+
 fn traversal_clause(group: &RelationshipGroup, edge_var: Option<&str>) -> String {
     let edge = match edge_var {
         Some(var) => format!("${var}:{}", traversal_name(&group.edge)),
@@ -1633,6 +1688,39 @@ mod tests {
         assert!(query.text.contains("count($e.@id) as n"), "{}", query.text);
         assert!(value_counts(&schema, "Person", false, &[], "slug", 10).is_err());
         assert!(value_counts(&schema, "Person", false, &[], "tags", 10).is_err());
+    }
+
+    #[test]
+    fn neighbour_counts_group_filtered_nodes_by_each_relationship() {
+        let schema = dev();
+        let named = Filter {
+            property: "name".into(),
+            op: FilterOp::Contains,
+            value: json!("a"),
+        };
+        let knows = Filter {
+            property: "out:Knows".into(),
+            op: FilterOp::HasAny,
+            value: Value::Null,
+        };
+        for node in ["Person", "Company", "Project"] {
+            let mut filters = vec![named.clone()];
+            if node == "Person" {
+                filters.push(knows.clone());
+            }
+            for group in schema.relationships_of(node) {
+                let key = relationship_key(&group);
+                let query = neighbour_counts(&schema, node, &filters, &key, 200).unwrap();
+                assert_compiles(&query);
+                assert!(query.text.contains("$g.@id as value"), "{}", query.text);
+            }
+        }
+        let query = neighbour_counts(&schema, "Person", &[], "out:WorksAt", 200).unwrap();
+        assert!(query.text.contains("$n worksAt $g"), "{}", query.text);
+        assert!(query.text.contains("$g.name as label"), "{}", query.text);
+        let query = neighbour_counts(&schema, "Company", &[], "in:WorksAt", 200).unwrap();
+        assert!(query.text.contains("$g worksAt $n"), "{}", query.text);
+        assert!(neighbour_counts(&schema, "Person", &[], "name", 10).is_err());
     }
 
     #[test]
