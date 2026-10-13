@@ -687,6 +687,68 @@ pub fn edge_count(
     })
 }
 
+/// How many rows of a node or edge type matching the filters hold each value of a property, by
+/// value (spec 004, group-by). Columns: `value`, absent for rows without one, and `n`. At most
+/// `limit` values.
+pub fn value_counts(
+    schema: &SchemaModel,
+    type_name: &str,
+    edge_table: bool,
+    filters: &[Filter],
+    property_name: &str,
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
+    let mut params = Params::new();
+    let (var, counted, mut clauses, properties, owner) = if edge_table {
+        let edge = edge(schema, type_name)?;
+        (
+            "e",
+            "$e.@id",
+            vec![
+                format!("$a: {}", edge.from),
+                format!("$a $e:{} $b", edge.traversal()),
+            ],
+            edge.properties.as_slice(),
+            edge.name.clone(),
+        )
+    } else {
+        let node = node(schema, type_name)?;
+        (
+            "n",
+            "$n",
+            vec![format!("$n: {}", node.name)],
+            node.properties.as_slice(),
+            node.name.clone(),
+        )
+    };
+    let property = properties
+        .iter()
+        .find(|p| p.name == property_name && GroupBy::allowed(p))
+        .ok_or_else(|| BuildError::UnknownProperty {
+            type_name: owner.clone(),
+            property: property_name.to_owned(),
+        })?;
+    clauses.extend(filter_clauses(
+        schema,
+        &owner,
+        properties,
+        var,
+        filters,
+        &mut params,
+    )?);
+    let text = format!(
+        "query studio_value_counts({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ ${var}.{prop} as value, count({counted}) as n }}\n  order {{ value asc }}\n  limit {limit}\n}}\n",
+        sig = params.signature(),
+        clauses = clauses.join("\n    "),
+        prop = property.name,
+    );
+    Ok(BuiltQuery {
+        name: "studio_value_counts".into(),
+        text,
+        params: params.values,
+    })
+}
+
 fn traversal_clause(group: &RelationshipGroup, edge_var: Option<&str>) -> String {
     let edge = match edge_var {
         Some(var) => format!("${var}:{}", traversal_name(&group.edge)),
@@ -1543,6 +1605,34 @@ mod tests {
             update_rows(&schema, "Person", &key),
             Err(BuildError::NotEditable(_))
         ));
+    }
+
+    #[test]
+    fn value_counts_group_filtered_rows_of_nodes_and_edges() {
+        let schema = dev();
+        let filters = [Filter {
+            property: "name".into(),
+            op: FilterOp::Contains,
+            value: json!("a"),
+        }];
+        for node in ["Person", "Company", "Project"] {
+            let node_type = schema.node(node).unwrap();
+            for property in node_type.properties.iter().filter(|p| GroupBy::allowed(p)) {
+                let query =
+                    value_counts(&schema, node, false, &filters, &property.name, 200).unwrap();
+                assert_compiles(&query);
+                assert!(
+                    query
+                        .text
+                        .contains(&format!("$n.{} as value", property.name))
+                );
+            }
+        }
+        let query = value_counts(&schema, "WorksAt", true, &[], "role", 200).unwrap();
+        assert_compiles(&query);
+        assert!(query.text.contains("count($e.@id) as n"), "{}", query.text);
+        assert!(value_counts(&schema, "Person", false, &[], "slug", 10).is_err());
+        assert!(value_counts(&schema, "Person", false, &[], "tags", 10).is_err());
     }
 
     #[test]

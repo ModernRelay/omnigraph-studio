@@ -114,12 +114,35 @@ stay put), IX (paged, virtualized).
 - Relationship filters: "has any", "has none", "related to …" through `exists { }`, `not { }`,
   and a bound endpoint. Measure "has none" on a large type before shipping it (Tower could not,
   on an older engine).
+- The value field offers what it can take: an enum's values (or `true` and `false`), narrowed
+  as text is typed with matches at the start first, and for "related to" the other type's
+  nodes, searched on the server by id or label (`builder::node_search`, 8 at a time, at the
+  table's commit, once typing pauses for 120 ms). ↑/↓ move through the offers (context
+  `FilterValue > Editor`), ↵ or a click picks one; a single value adds the filter at once, an
+  `in` list adds the value and waits for the next. With nothing typed ↵ adds the filter as it
+  stands. A "related to" pill reads the picked node's label. The offers hide while the
+  property or operator menu is open.
 - A view is a name for a filter, sort and column state; saved per graph in Studio's settings.
   Built for filters and sort (columns are fixed today): `graphs."<server>/<graph>".views` in
   `settings.json`, each with its type, filters (`FilterOp::key` names) and sort. The toolbar's
   Views menu lists the type's views with the shown one checked, saves the table's state under
   a name (the same name replaces), and deletes the shown one; the button reads the view's
   name while the table matches it. Filters or a sort the schema no longer has are left out.
+
+### Grouping
+
+Built: the toolbar's Group menu groups the rows by a property (text, enum, Bool, integer or
+date; not the key, a list or a vector). One read counts the rows per value under the filters
+(`builder::value_counts`: `return { $n.title as value, count($n) as n }`, by value, at most
+200 values, rows without a value last); each value is a section with a header (value, count,
+disclosure). An open section reads its first 10 rows when its line comes into view, then "Show
+N more of M" reads a page, all keyset pages narrowed with `title = $value` (or `is null`) and
+pinned to the table's commit, in the table's sort. A closed section reads nothing. Every read
+is engine-side, so the counts are right at any size. Edge tables group by their own properties
+the same way. The grouping is part of the tab and of saved views. The cursor moves over
+headers and past closed sections; ⇧-click picks the rows shown between two rows. A row edited
+out of its section's value stays in place, dimmed, until the next read; a new row goes first in
+its open section.
 
 ### Editing
 
@@ -185,7 +208,8 @@ opens the branch's recent commits.
   - R1 Blob writes: upload and clear only when the server advertises `cluster_putBlob`.
   - R2 unpublished commits: staged edits as a reviewable proposal only when the server
     advertises `cluster_publishCommit`.
-- Group-by (Tower 084) until filters and editing ship.
+- Grouping edge tables by a property of an endpoint, and grouping by a relationship ("people
+  by company").
 - Views do not hold column state: columns are fixed. The preview tab is built (spec 002).
 - Per-row history beyond the commits that the change feed can cheaply return.
 
@@ -216,6 +240,8 @@ opens the branch's recent commits.
 | 2026-10-12 | Saved views | `studio_settings` `views_are_saved_per_graph_and_type_and_replaced_by_name`; `gq_language` `filter_operators_round_trip_through_their_keys`; offscreen snapshots with `click:` and `type:` steps: a seeded "Founders" applied from the Views menu, then sorted by email and saved as "Founders by email" | "title is Founder", name ascending, "25 of 200", and the button read "Founders"; `settings.json` held both views |
 | 2026-10-12 | Spike S1: several rows in one commit | on a scratch branch of the dev server: `update Person set { title: $v } where @id in $ids` (3 rows), and one mutation of two `update` statements | Both publish one commit; multi-statement mutations are the mechanism, so merge-mode NDJSON was not needed |
 | 2026-10-12 | Bulk set | `gq_language` `a_bulk_set_is_one_mutation_bound_row_by_row`; offscreen snapshots with `click:…,cmd` and `click:…,shift` on Project at branch `bulk-test`: three rows picked, status set to paused | One commit; `project-00001`, already paused, was left out ("Set status on 2 Project rows"); the rows updated in place and the selection cleared |
+| 2026-10-12 | Filters offer enum values and related nodes | `type_table` `suggest` tests (narrowing, prefixes first, lists skip given values, completion); offscreen snapshots on Project: ⌘F on status, `a` → "active, paused", ↓ ↵ added "status is paused" (12 of 40); `← contributes Person` · is related to · `ada` listed eight Adas with their ids, ↵ added "← contributes is Ada Sammet" (2 of 40) | As described; the property menu now hides the offers |
+| 2026-10-12 | Group-by reads counts per value and pages per section | `gq_language` `value_counts_group_filtered_rows_of_nodes_and_edges` (every groupable property of every dev node type, with a filter, and an edge property, compile); `type_table` `grouping` tests (value order with no value last, section slices shifting as rows are read in and removed, steps over headers and past closed sections, the cut-off line); offscreen snapshots: Person, Group → title, Analyst collapsed, Show more on Designer | Analyst 27, Designer 29, Engineer 31, … each with 10 rows and "Show 17 more of 17"; Analyst closed to its header; Designer read 19 more in place (71 → 90 rows loaded) |
 | 2026-10-12 | Drafts of different values on several rows save as one commit, each row bound to what it showed | `gq_language` `edits_of_different_values_are_one_mutation_bound_row_by_row` (one statement per row, lists unbound, compiles); offscreen snapshots on branch `drafts-test`: ⌥↵ on Person 0 title "CTO", Person 2 title "Lead Designer" and born 1990-01-02, then ⌘S; then again with Person 0's title changed by another client (`wait:` step) between staging and saving | First run: the branch went from 5 to 6 commits and both rows read back with the new values; the drafts cleared. Second run: "Design Lead" landed, Person 0 kept its draft with "Changed elsewhere to “Acting CTO”", and the pill read "1 draft not saved" |
 | 2026-10-12 | A Blob value saves whole or not at all | `type_table` tests `a_save_lands_whole_or_not_at_all`, `a_saved_value_is_named_for_its_row_property_and_kind`; an offscreen snapshot of a note with a 12 KB text attachment | "Save…" at the end of the attachment's line; a save writes `<name>.part`, appends each range, and renames it into place only at the value's full size (a short value or a stop removes the part); the name is `<id>-<property>` with the kind's extension. The native save dialog cannot be driven offscreen |
 | 2026-10-12 | A Blob value opens in a tab of its own, shown for its kind | `type_table` tests `values_are_told_apart_by_their_bytes`, `a_pdf_is_drawn_page_by_page`, `a_page_is_drawn_to_scale_on_white_with_its_marks`, `the_open_folder_keeps_a_day`; offscreen snapshots of four notes on the dev `notes` graph with attachments set through a `Blob` parameter | A 960 × 600 transparent PNG fitted at 100% on the checkerboard ("PNG · 960 × 600 · 8.8 KB"); a two-page PDF drawn sharp ("PDF · 2 pages · 1.2 KB"); a 12 KB text in the read-only editor with line numbers; 3 KB of a binary as sixteen-byte hex lines. The first PDF test failed until the context was scaled before drawing: CoreGraphics' page transform never enlarges a page |

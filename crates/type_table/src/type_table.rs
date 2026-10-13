@@ -6,10 +6,12 @@
 mod blob;
 mod blob_view;
 mod dialogs;
+mod grouping;
 pub mod model;
 mod nodes_panel;
 mod pdf;
 mod peek;
+mod suggest;
 mod table;
 mod types_list;
 
@@ -57,9 +59,20 @@ pub fn init(cx: &mut App) {
                     descending: sort.get("descending")?.as_bool()?,
                 })
             });
+            let group_by = data
+                .get("group_by")
+                .and_then(|property| property.as_str())
+                .map(str::to_owned);
             let table = open_type(workspace, type_name, at_commit, false, window, cx);
-            if let (Some(table), Some(sort)) = (table, sort) {
-                table.update(cx, |table, cx| table.set_sort(Some(sort), cx));
+            if let Some(table) = table {
+                table.update(cx, |table, cx| {
+                    if sort.is_some() {
+                        table.set_sort(sort, cx);
+                    }
+                    if group_by.is_some() {
+                        table.set_grouping(group_by, cx);
+                    }
+                });
             }
         }
     });

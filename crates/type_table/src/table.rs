@@ -27,7 +27,7 @@ use serde_json::Value;
 use studio_actions::table::{
     AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyCell, DeleteRow, EditCell, ExploreRow,
     FilterBySelection, InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp, PeekRow, RefreshTable,
-    SaveDrafts, StageEdit,
+    SaveDrafts, SelectNextSuggestion, SelectPreviousSuggestion, StageEdit,
 };
 use studio_ui::ROW_HEIGHT;
 use studio_workspace::{
@@ -35,11 +35,12 @@ use studio_workspace::{
 };
 use ui::prelude::*;
 use ui::{
-    ColumnWidthConfig, ContextMenu, ContextMenuEntry, Indicator, PopoverMenu,
+    ColumnWidthConfig, ContextMenu, ContextMenuEntry, Indicator, PopoverMenu, PopoverMenuHandle,
     ResizableColumnsState, Table, TableInteractionState, TableResizeBehavior, TintColor, Tooltip,
 };
 
 use crate::dialogs::{DeleteRowModal, InsertRowModal, SaveViewModal};
+use crate::grouping::{GROUP_LIMIT, Grouping, Line, SECTION_FIRST_PAGE};
 use crate::model::{
     ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN, Row, SaveResult, TableKind, Tone,
     changed_elsewhere, chips_that_fit, copy_text, count_of, display_value, edge_columns, edge_rows,
@@ -48,6 +49,7 @@ use crate::model::{
     same_value, save_result, short_commit,
 };
 use crate::peek::{NodePeek, PeekSubject};
+use crate::suggest::{self, NODE_SUGGESTIONS, Suggestion};
 
 /// How often an open, visible table asks whether its branch moved (constitution II: offer
 /// Refresh, never change under the reader).
@@ -84,6 +86,18 @@ struct FilterDraft {
     property: String,
     op: FilterOp,
     error: Option<String>,
+    /// What the value field offers for its text, the one ↵ picks, and the node search under way.
+    suggestions: Vec<Suggestion>,
+    highlighted: Option<usize>,
+    suggest_generation: u64,
+    _suggest_task: Option<Task<()>>,
+}
+
+/// Where a filter's value field finds what to offer.
+enum SuggestSource {
+    Values(Vec<String>),
+    /// Nodes of this type, searched on the server.
+    Nodes(String),
 }
 
 /// The table's drafts as a whole: whether they are being saved, what came of the last try,
@@ -180,6 +194,13 @@ pub struct TypeTable {
     filters: Vec<Filter>,
     /// The order: a property then `@id`, values first and empty values last; `None` is `@id`.
     sort: Option<Sort>,
+    /// Rows grouped by one property: sections by value, each read on its own.
+    grouping: Option<Grouping>,
+    /// Labels of nodes picked for "related to" filters, so their pills read by name.
+    node_labels: HashMap<String, String>,
+    /// The filter being written's property and operator menus; the offered values hide while
+    /// either is open.
+    filter_menus: [PopoverMenuHandle<ContextMenu>; 2],
     filter_draft: Option<FilterDraft>,
     filter_editor: Entity<Editor>,
     /// Rows picked for a bulk set (⌘-click, ⇧-click), by id, and the row ⇧ extends from.
@@ -248,6 +269,7 @@ impl Item for TypeTable {
                     "property": sort.property,
                     "descending": sort.descending,
                 })),
+                "group_by": self.grouping.as_ref().map(|g| &g.property),
             }),
         })
     }
@@ -312,14 +334,21 @@ impl TypeTable {
                     _ => {}
                 },
             ),
-            cx.subscribe(&filter_editor, |this, _, event: &EditorEvent, cx| {
-                if let EditorEvent::BufferEdited = event {
-                    if let Some(draft) = &mut this.filter_draft {
-                        draft.error = None;
+            cx.subscribe(
+                &filter_editor,
+                |this, _, event: &EditorEvent, cx| match event {
+                    EditorEvent::BufferEdited => {
+                        if let Some(draft) = &mut this.filter_draft {
+                            draft.error = None;
+                        }
+                        this.refresh_suggestions(cx);
+                        cx.notify();
                     }
-                    cx.notify();
-                }
-            }),
+                    // The offered values show only while the field has focus.
+                    EditorEvent::Focused | EditorEvent::Blurred => cx.notify(),
+                    _ => {}
+                },
+            ),
         ];
         if let Some(workspace) = workspace.upgrade() {
             subscriptions.push(cx.subscribe_in(
@@ -376,6 +405,9 @@ impl TypeTable {
             total: Loadable::NotLoaded,
             filters: Vec::new(),
             sort: None,
+            grouping: None,
+            node_labels: HashMap::new(),
+            filter_menus: Default::default(),
             filter_draft: None,
             filter_editor,
             selection: Vec::new(),
@@ -527,9 +559,15 @@ impl TypeTable {
 
     // ---- reading ----
 
-    fn page_query(&self, start: &PageStart, limit: u32) -> Result<BuiltQuery, BuildError> {
+    fn page_query(
+        &self,
+        start: &PageStart,
+        limit: u32,
+        section: Option<&Filter>,
+    ) -> Result<BuiltQuery, BuildError> {
         let schema = self.schema.as_ref().expect("schema loaded before reading");
-        let filters = self.resolved_filters();
+        let mut filters = self.resolved_filters();
+        filters.extend(section.cloned());
         let sort = self.sort.as_ref();
         match self.kind {
             TableKind::Node => {
@@ -576,6 +614,7 @@ impl TypeTable {
                 property: sort.property.clone(),
                 descending: sort.descending,
             }),
+            group_by: self.grouping.as_ref().map(|g| g.property.clone()),
         }
     }
 
@@ -592,7 +631,11 @@ impl TypeTable {
         let current = self.current_view();
         self.saved_views(cx)
             .into_iter()
-            .find(|view| view.filters == current.filters && view.sort == current.sort)
+            .find(|view| {
+                view.filters == current.filters
+                    && view.sort == current.sort
+                    && view.group_by == current.group_by
+            })
             .map(|view| view.name)
     }
 
@@ -629,6 +672,16 @@ impl TypeTable {
                     .filter_map(ColumnSpec::property)
                     .any(|p| p.name == sort.property && Sort::allowed(p))
             });
+        self.grouping = view
+            .group_by
+            .as_ref()
+            .filter(|name| {
+                self.columns
+                    .iter()
+                    .filter_map(ColumnSpec::property)
+                    .any(|p| p.name == **name && builder::GroupBy::allowed(p))
+            })
+            .map(Grouping::new);
         self.filter_draft = None;
         self.reload(true, cx);
     }
@@ -659,9 +712,14 @@ impl TypeTable {
         };
         match self.selection_anchor.filter(|_| range) {
             Some(anchor) => {
-                let (from, to) = (anchor.min(row), anchor.max(row).min(self.rows.len() - 1));
-                for picked in &self.rows[from..=to] {
-                    if !self.selection.contains(&picked.id) {
+                let between: Vec<usize> = match &self.grouping {
+                    Some(grouping) => grouping.rows_between(anchor, row),
+                    None => (anchor.min(row)..=anchor.max(row).min(self.rows.len() - 1)).collect(),
+                };
+                for ix in between {
+                    if let Some(picked) = self.rows.get(ix)
+                        && !self.selection.contains(&picked.id)
+                    {
                         self.selection.push(picked.id.clone());
                     }
                 }
@@ -773,8 +831,7 @@ impl TypeTable {
                         for (id, _) in &rows {
                             if let Some(ix) = self.row_index(id) {
                                 set_value(&mut self.rows[ix], &column, new.clone());
-                                let matches = row_matches(&self.filters, &self.rows[ix].values);
-                                self.rows[ix].dimmed = !matches;
+                                self.rows[ix].dimmed = !self.row_fits(ix);
                             }
                         }
                         if self.paging.advance_for_own_commit(
@@ -941,6 +998,67 @@ impl TypeTable {
             )
             .into_any_element(),
         )
+    }
+
+    /// The toolbar's Group menu: the properties rows can be grouped by, and No grouping.
+    fn render_group_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let choices: Vec<String> = self
+            .columns
+            .iter()
+            .filter_map(ColumnSpec::property)
+            .filter(|p| builder::GroupBy::allowed(p))
+            .map(|p| p.name.clone())
+            .collect();
+        let current = self.grouping.as_ref().map(|g| g.property.clone());
+        let table = cx.entity().downgrade();
+        PopoverMenu::new("group-menu")
+            .anchor(gpui::Anchor::TopRight)
+            .trigger(
+                studio_ui::ds::button(
+                    "group",
+                    match &current {
+                        Some(property) => format!("Group: {property}"),
+                        None => "Group".to_owned(),
+                    },
+                )
+                .style(ButtonStyle::Subtle)
+                .label_size(LabelSize::Small)
+                .start_icon(Icon::new(IconName::ListTree).size(IconSize::Small))
+                .disabled(choices.is_empty())
+                .tooltip(Tooltip::text("Group the rows by a property")),
+            )
+            .menu(move |window, cx| {
+                let (table, current, choices) = (table.clone(), current.clone(), choices.clone());
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    let set = |property: Option<String>| {
+                        let table = table.clone();
+                        move |_: &mut Window, cx: &mut App| {
+                            table
+                                .update(cx, |table, cx| table.set_grouping(property.clone(), cx))
+                                .ok();
+                        }
+                    };
+                    menu = menu
+                        .toggleable_entry(
+                            "No grouping",
+                            current.is_none(),
+                            IconPosition::Start,
+                            None,
+                            set(None),
+                        )
+                        .separator();
+                    for name in &choices {
+                        menu = menu.toggleable_entry(
+                            name.clone(),
+                            current.as_ref() == Some(name),
+                            IconPosition::Start,
+                            None,
+                            set(Some(name.clone())),
+                        );
+                    }
+                    menu
+                }))
+            })
     }
 
     /// The toolbar's Views menu: this type's saved views, then save and delete.
@@ -1116,7 +1234,12 @@ impl TypeTable {
             .scroll_handle
             .scroll_to_item(0, ScrollStrategy::Top);
         let size = self.page_size(cx);
-        let query = match self.page_query(&PageStart::First, size) {
+        if self.grouping.is_some() {
+            self.read_groups(cx);
+            cx.notify();
+            return;
+        }
+        let query = match self.page_query(&PageStart::First, size, None) {
             Ok(query) => query,
             Err(error) => {
                 self.first_page = Loadable::Failed(error.to_string());
@@ -1146,7 +1269,8 @@ impl TypeTable {
     }
 
     fn load_more(&mut self, cx: &mut Context<Self>) {
-        if self.loading_more
+        if self.grouping.is_some()
+            || self.loading_more
             || self.paging.exhausted
             || !matches!(self.first_page, Loadable::Loaded(()))
         {
@@ -1154,7 +1278,7 @@ impl TypeTable {
         }
         let size = self.page_size(cx);
         let start = self.paging.start.clone();
-        let query = match self.page_query(&start, size) {
+        let query = match self.page_query(&start, size, None) {
             Ok(query) => query,
             Err(error) => {
                 self.more_error = Some(error.to_string());
@@ -1174,6 +1298,223 @@ impl TypeTable {
                 .ok();
         }));
         cx.notify();
+    }
+
+    /// Groups the rows by a property, or stops; the table is read again at the same commit.
+    pub fn set_grouping(&mut self, property: Option<String>, cx: &mut Context<Self>) {
+        let property = property.filter(|name| {
+            self.columns
+                .iter()
+                .filter_map(ColumnSpec::property)
+                .any(|p| p.name == *name && builder::GroupBy::allowed(p))
+        });
+        if self.grouping.as_ref().map(|g| &g.property) == property.as_ref() {
+            return;
+        }
+        self.grouping = property.map(Grouping::new);
+        self.reload(true, cx);
+    }
+
+    /// Reads how many rows hold each value of the grouping property, under the filters.
+    fn read_groups(&mut self, cx: &mut Context<Self>) {
+        let (Some(schema), Some(grouping)) = (self.schema.clone(), self.grouping.as_mut()) else {
+            return;
+        };
+        let generation = grouping.restart();
+        let property = grouping.property.clone();
+        let query = builder::value_counts(
+            &schema,
+            &self.type_name,
+            self.kind == TableKind::Edge,
+            &self.resolved_filters(),
+            &property,
+            GROUP_LIMIT,
+        );
+        let query = match query {
+            Ok(query) => query,
+            Err(error) => {
+                self.first_page = Loadable::Failed(error.to_string());
+                return;
+            }
+        };
+        let snapshot = self.paging.pinned.clone();
+        let read = self
+            .session
+            .update(cx, |session, cx| session.read(&query, snapshot, cx));
+        self.page_task = Some(cx.spawn(async move |this, cx| {
+            let result = read.await;
+            this.update(cx, |this, cx| this.apply_groups(generation, result, cx))
+                .ok();
+        }));
+    }
+
+    fn apply_groups(
+        &mut self,
+        generation: u64,
+        result: Result<ReadOutput, ReadError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(grouping) = self
+            .grouping
+            .as_mut()
+            .filter(|g| g.generation == generation)
+        else {
+            return;
+        };
+        match result {
+            Ok(output) => {
+                if self.paging.pinned.is_none() {
+                    self.paging.pinned = output.graph_commit_id.clone();
+                }
+                grouping.accept_counts(&output, GROUP_LIMIT);
+                self.first_page = Loadable::Loaded(());
+                self.load_counts(cx);
+            }
+            Err(error) => {
+                grouping.sections = Loadable::Failed(error.to_string());
+                self.first_page = Loadable::Failed(error.to_string());
+                self.count = Loadable::NotLoaded;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Reads the next rows of one section: its first few when it shows, a page on "Show more".
+    fn load_section(&mut self, index: usize, size: u32, cx: &mut Context<Self>) {
+        let Some(grouping) = &self.grouping else {
+            return;
+        };
+        let generation = grouping.generation;
+        let (Some(filter), Some(section)) =
+            (grouping.filter_for(index), grouping.sections().get(index))
+        else {
+            return;
+        };
+        if section.loading || !section.has_more() {
+            return;
+        }
+        let start = section.paging.start.clone();
+        let query = self.page_query(&start, size, Some(&filter));
+        let Some(section) = self.grouping.as_mut().and_then(|g| g.section_mut(index)) else {
+            return;
+        };
+        let query = match query {
+            Ok(query) => query,
+            Err(error) => {
+                section.error = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        section.loading = true;
+        section.error = None;
+        let snapshot = self.paging.pinned.clone();
+        let read = self
+            .session
+            .update(cx, |session, cx| session.read(&query, snapshot, cx));
+        cx.spawn(async move |this, cx| {
+            let result = read.await;
+            this.update(cx, |this, cx| {
+                this.apply_section_page(generation, index, result, size, cx)
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn apply_section_page(
+        &mut self,
+        generation: u64,
+        index: usize,
+        result: Result<ReadOutput, ReadError>,
+        size: u32,
+        cx: &mut Context<Self>,
+    ) {
+        if self.grouping.as_ref().map(|g| g.generation) != Some(generation) {
+            return;
+        }
+        let page = match result {
+            Ok(output) => {
+                let page = self.rows_from(&output.rows);
+                let sort_column = self.sort.as_ref().map(|sort| sort.property.clone());
+                if let Some(section) = self.grouping.as_mut().and_then(|g| g.section_mut(index)) {
+                    section.loading = false;
+                    section.paging.accept(
+                        output.graph_commit_id.as_deref(),
+                        &page,
+                        size,
+                        sort_column.as_deref(),
+                    );
+                }
+                page
+            }
+            Err(error) => {
+                if let Some(section) = self.grouping.as_mut().and_then(|g| g.section_mut(index)) {
+                    section.loading = false;
+                    section.error = Some(error.to_string());
+                }
+                cx.notify();
+                return;
+            }
+        };
+        let Some(at) = self
+            .grouping
+            .as_ref()
+            .and_then(|g| g.sections().get(index))
+            .map(|section| section.range.end)
+        else {
+            return;
+        };
+        let count = page.len();
+        let ids: Vec<String> = page.iter().map(|row| row.id.clone()).collect();
+        self.rows.splice(at..at, page);
+        if let Some(grouping) = &mut self.grouping {
+            grouping.inserted(index, count);
+        }
+        self.rows_inserted(at, count);
+        self.load_relations(ids, cx);
+        cx.notify();
+    }
+
+    /// Keeps the cursor and the selection anchor on their rows after `count` rows went in at
+    /// `at`.
+    fn rows_inserted(&mut self, at: usize, count: usize) {
+        if let Some(cursor) = &mut self.cursor
+            && cursor.row >= at
+        {
+            cursor.row += count;
+        }
+        if let Some(anchor) = &mut self.selection_anchor
+            && *anchor >= at
+        {
+            *anchor += count;
+        }
+    }
+
+    fn toggle_section(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(section) = self.grouping.as_mut().and_then(|g| g.section_mut(index)) {
+            section.expanded = !section.expanded;
+            cx.notify();
+        }
+    }
+
+    /// Whether a row still belongs where it is shown: it matches the filters and, grouped, holds
+    /// its section's value.
+    fn row_fits(&self, ix: usize) -> bool {
+        let Some(row) = self.rows.get(ix) else {
+            return true;
+        };
+        if !row_matches(&self.filters, &row.values) {
+            return false;
+        }
+        match &self.grouping {
+            Some(grouping) => grouping
+                .section_of(ix)
+                .and_then(|section| grouping.sections().get(section))
+                .is_none_or(|section| same_value(row.value(&grouping.property), &section.value)),
+            None => true,
+        }
     }
 
     fn apply_page(
@@ -1368,7 +1709,7 @@ impl TypeTable {
         // One row of the plain key order is enough to learn the head's commit.
         let saved_filters = std::mem::take(&mut self.filters);
         let saved_sort = self.sort.take();
-        let query = self.page_query(&PageStart::First, 1);
+        let query = self.page_query(&PageStart::First, 1, None);
         self.filters = saved_filters;
         self.sort = saved_sort;
         let Ok(query) = query else { return };
@@ -1433,12 +1774,38 @@ impl TypeTable {
         match key {
             Some(id) => {
                 values.insert(crate::model::ID_COLUMN.into(), Value::String(id.clone()));
-                // Sorted, a new row goes first, where it is seen; the next read places it.
-                let position = if self.sort.is_some() {
-                    Some(0)
-                } else {
-                    insert_position(&self.rows, &id, self.paging.exhausted)
+                // Grouped, a new row goes first in its open section; sorted, first in the list,
+                // where it is seen. The next read places it.
+                let section = self.grouping.as_ref().map(|grouping| {
+                    let value = values.get(&grouping.property).unwrap_or(&Value::Null);
+                    grouping.section_with(value).filter(|ix| {
+                        grouping
+                            .sections()
+                            .get(*ix)
+                            .is_some_and(|section| section.expanded)
+                    })
+                });
+                let position = match section {
+                    Some(Some(ix)) => self
+                        .grouping
+                        .as_ref()
+                        .and_then(|g| g.sections().get(ix))
+                        .map(|section| section.range.start),
+                    // A value with no open section shows after a read.
+                    Some(None) => {
+                        self.newer = true;
+                        cx.emit(ItemEvent::UpdateTab);
+                        None
+                    }
+                    None if self.sort.is_some() => Some(0),
+                    None => insert_position(&self.rows, &id, self.paging.exhausted),
                 };
+                if let (Some(Some(ix)), Some(grouping)) = (section, self.grouping.as_mut()) {
+                    grouping.inserted(ix, 1);
+                    if let Some(section) = grouping.section_mut(ix) {
+                        section.count += 1;
+                    }
+                }
                 if let Some(position) = position {
                     let dimmed = !row_matches(&self.filters, &values);
                     self.rows.insert(position, Row { id, values, dimmed });
@@ -1485,6 +1852,9 @@ impl TypeTable {
         }
         if let Some(index) = self.rows.iter().position(|row| row.id == id) {
             let row = self.rows.remove(index);
+            if let Some(grouping) = &mut self.grouping {
+                grouping.removed(index);
+            }
             if !row.dimmed
                 && let Loadable::Loaded(n) = &mut self.count
             {
@@ -1528,22 +1898,40 @@ impl TypeTable {
         if self.rows.is_empty() || self.columns.is_empty() {
             return;
         }
-        let cursor = match self.cursor {
-            None => Cursor { row: 0, col: 0 },
-            Some(c) => Cursor {
-                row: (c.row as isize + rows).clamp(0, self.rows.len() as isize - 1) as usize,
-                col: (c.col as isize + cols).clamp(0, self.columns.len() as isize - 1) as usize,
-            },
+        let col = self.cursor.map_or(0, |c| {
+            (c.col as isize + cols).clamp(0, self.columns.len() as isize - 1) as usize
+        });
+        let row = match (&self.grouping, self.cursor) {
+            // Grouped, the cursor moves among the rows shown: over headers, past closed groups.
+            (Some(grouping), cursor) => {
+                match grouping.step_row(
+                    cursor.map(|c| c.row),
+                    if cursor.is_some() { rows } else { 0 },
+                ) {
+                    Some(row) => row,
+                    None => return,
+                }
+            }
+            (None, None) => 0,
+            (None, Some(c)) => {
+                (c.row as isize + rows).clamp(0, self.rows.len() as isize - 1) as usize
+            }
         };
-        self.set_cursor(cursor, window, cx);
+        self.set_cursor(Cursor { row, col }, window, cx);
     }
 
     fn set_cursor(&mut self, cursor: Cursor, window: &mut Window, cx: &mut Context<Self>) {
         self.cursor = Some(cursor);
-        self.table_state
-            .read(cx)
-            .scroll_handle
-            .scroll_to_item(cursor.row, ScrollStrategy::Nearest);
+        let line = match &self.grouping {
+            Some(grouping) => grouping.line_of_row(cursor.row),
+            None => Some(cursor.row),
+        };
+        if let Some(line) = line {
+            self.table_state
+                .read(cx)
+                .scroll_handle
+                .scroll_to_item(line, ScrollStrategy::Nearest);
+        }
         self.scroll_column_into_view(cursor.col, window, cx);
         if self
             .paging
@@ -1762,7 +2150,18 @@ impl TypeTable {
 
     fn confirm_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.filter_draft.is_some() && self.filter_editor.focus_handle(cx).is_focused(window) {
-            self.apply_filter_draft(window, cx);
+            // ↵ picks the highlighted offer, unless it is just what is typed.
+            let text = self.filter_editor.read(cx).text(cx);
+            let pick = self.filter_draft.as_ref().and_then(|draft| {
+                let index = draft.highlighted?;
+                let suggestion = draft.suggestions.get(index)?;
+                let list = draft.op == FilterOp::In;
+                (!suggest::already_typed(&text, &suggestion.value, list)).then_some(index)
+            });
+            match pick {
+                Some(index) => self.pick_suggestion(index, window, cx),
+                None => self.apply_filter_draft(window, cx),
+            }
             return;
         }
         let Some(editing) = self.editing.as_ref() else {
@@ -1860,8 +2259,7 @@ impl TypeTable {
                     self.newer = true;
                 }
                 if let Some(ix) = self.row_index(&row_id) {
-                    let matches = row_matches(&self.filters, &self.rows[ix].values);
-                    self.rows[ix].dimmed = !matches;
+                    self.rows[ix].dimmed = !self.row_fits(ix);
                 }
             }
             SaveResult::NoMatch => {
@@ -2126,8 +2524,7 @@ impl TypeTable {
     fn refresh_dimmed(&mut self, edits: &[DraftEdit]) {
         for edit in edits {
             if let Some(ix) = self.row_index(&edit.row_id) {
-                let matches = row_matches(&self.filters, &self.rows[ix].values);
-                self.rows[ix].dimmed = !matches;
+                self.rows[ix].dimmed = !self.row_fits(ix);
             }
         }
     }
@@ -2660,9 +3057,10 @@ impl TypeTable {
         {
             for group in schema.relationships_of(&self.type_name) {
                 let key = builder::relationship_key(&group);
+                // The entry's icon shows the direction, so the label names the traversal only.
                 let label = format!(
                     "{} {}",
-                    builder::relationship_label(&key).unwrap_or_default(),
+                    gq_language::traversal_name(&group.edge),
                     group.other_type
                 );
                 choices.push((key, label));
@@ -2707,13 +3105,150 @@ impl TypeTable {
             property: name,
             op,
             error: None,
+            suggestions: Vec::new(),
+            highlighted: None,
+            suggest_generation: 0,
+            _suggest_task: None,
         });
         self.filter_editor.update(cx, |editor, cx| {
             editor.set_text("", window, cx);
             editor.set_placeholder_text(filter_placeholder(op), window, cx);
         });
         window.focus(&self.filter_editor.focus_handle(cx), cx);
+        self.refresh_suggestions(cx);
         cx.notify();
+    }
+
+    /// Where the value field of a filter on `key` with `op` finds what to offer: an enum's
+    /// values, `true` and `false`, or for "related to" the other type's nodes.
+    fn suggestion_source(&self, key: &str, op: FilterOp) -> Option<SuggestSource> {
+        if !op.takes_value() {
+            return None;
+        }
+        if op == FilterOp::RelatedTo {
+            let group = self
+                .schema
+                .as_ref()?
+                .relationships_of(&self.type_name)
+                .into_iter()
+                .find(|group| builder::relationship_key(group) == key)?;
+            return Some(SuggestSource::Nodes(group.other_type));
+        }
+        let property = self.filterable().into_iter().find(|p| p.name == key)?;
+        if let Some(values) = &property.enum_values {
+            return Some(SuggestSource::Values(values.clone()));
+        }
+        (property.kind == ScalarKind::Bool)
+            .then(|| SuggestSource::Values(vec!["true".to_owned(), "false".to_owned()]))
+    }
+
+    /// Updates what the value field offers for its text. Nodes are searched on the server,
+    /// at the table's commit, once typing pauses.
+    fn refresh_suggestions(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = &self.filter_draft else {
+            return;
+        };
+        let text = self.filter_editor.read(cx).text(cx);
+        let list = draft.op == FilterOp::In;
+        let source = self.suggestion_source(&draft.property, draft.op);
+        let typed = !suggest::needle(&text, list).is_empty();
+        let schema = self.schema.clone();
+        let snapshot = self.paging.pinned.clone();
+        let session = self.session.clone();
+        let Some(draft) = &mut self.filter_draft else {
+            return;
+        };
+        draft.suggest_generation += 1;
+        let generation = draft.suggest_generation;
+        match source {
+            None => {
+                draft.suggestions.clear();
+                draft.highlighted = None;
+                draft._suggest_task = None;
+            }
+            Some(SuggestSource::Values(values)) => {
+                draft.suggestions = suggest::from_values(&values, &text, list);
+                draft.highlighted = (typed && !draft.suggestions.is_empty()).then_some(0);
+                draft._suggest_task = None;
+            }
+            Some(SuggestSource::Nodes(type_name)) => {
+                let Some(schema) = schema else {
+                    return;
+                };
+                let needle = suggest::needle(&text, list).to_owned();
+                draft._suggest_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(120))
+                        .await;
+                    let Ok(query) =
+                        builder::node_search(&schema, &type_name, &needle, NODE_SUGGESTIONS)
+                    else {
+                        return;
+                    };
+                    let read = cx.update(|cx| {
+                        session.update(cx, |session, cx| session.read(&query, snapshot, cx))
+                    });
+                    let Ok(output) = read.await else { return };
+                    this.update(cx, |this, cx| {
+                        let Some(draft) = &mut this.filter_draft else {
+                            return;
+                        };
+                        if draft.suggest_generation != generation {
+                            return;
+                        }
+                        draft.suggestions = node_suggestions(&output.rows);
+                        draft.highlighted = (typed && !draft.suggestions.is_empty()).then_some(0);
+                        cx.notify();
+                    })
+                    .ok();
+                }));
+            }
+        }
+        cx.notify();
+    }
+
+    /// ↑/↓ in the value field: highlights another offered value.
+    fn move_suggestion(&mut self, step: isize, cx: &mut Context<Self>) {
+        let Some(draft) = &mut self.filter_draft else {
+            return;
+        };
+        let count = draft.suggestions.len();
+        if count == 0 {
+            return;
+        }
+        draft.highlighted = Some(match draft.highlighted {
+            None if step > 0 => 0,
+            None => count - 1,
+            Some(at) => (at as isize + step).rem_euclid(count as isize) as usize,
+        });
+        cx.notify();
+    }
+
+    /// Puts an offered value in the field. A single value adds the filter at once; a list
+    /// waits for its next value.
+    fn pick_suggestion(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft) = &self.filter_draft else {
+            return;
+        };
+        let Some(suggestion) = draft.suggestions.get(index).cloned() else {
+            return;
+        };
+        let list = draft.op == FilterOp::In;
+        let text = self.filter_editor.read(cx).text(cx);
+        let text = suggest::complete(&text, &suggestion.value, list);
+        if let Some(label) = &suggestion.label {
+            self.node_labels
+                .insert(suggestion.value.clone(), label.clone());
+        }
+        self.filter_editor.update(cx, |editor, cx| {
+            editor.set_text(text, window, cx);
+            editor.move_to_end(&editor::actions::MoveToEnd, window, cx);
+        });
+        if list {
+            self.refresh_suggestions(cx);
+        } else {
+            self.apply_filter_draft(window, cx);
+        }
     }
 
     fn set_draft_op(&mut self, op: FilterOp, window: &mut Window, cx: &mut Context<Self>) {
@@ -2727,6 +3262,7 @@ impl TypeTable {
         if op.takes_value() {
             window.focus(&self.filter_editor.focus_handle(cx), cx);
         }
+        self.refresh_suggestions(cx);
         cx.notify();
     }
 
@@ -2917,6 +3453,7 @@ impl TypeTable {
             })
             .child(div().flex_1())
             .child(self.render_views_menu(cx))
+            .child(self.render_group_menu(cx))
             .child(
                 studio_ui::ds::button("add-filter", "Filter")
                     .style(ButtonStyle::Subtle)
@@ -2953,7 +3490,7 @@ impl TypeTable {
             .into_any_element()
     }
 
-    fn render_filter_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_filter_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.filters.is_empty() && self.filter_draft.is_none() {
             return None;
         }
@@ -2968,7 +3505,12 @@ impl TypeTable {
             .border_b_1()
             .border_color(studio_ui::ds::surface::rule(cx));
         for (index, filter) in self.filters.iter().enumerate() {
-            let (field, test, value) = filter_parts(filter);
+            let (field, test, mut value) = filter_parts(filter);
+            if filter.op == FilterOp::RelatedTo
+                && let Some(label) = value.as_ref().and_then(|id| self.node_labels.get(id))
+            {
+                value = Some(label.clone());
+            }
             bar = bar.child(studio_ui::ds::filter_pill(
                 ("filter", index),
                 self.key_icon(&filter.property),
@@ -3019,6 +3561,7 @@ impl TypeTable {
                 .overflow_hidden()
                 .child(
                     PopoverMenu::new("filter-property")
+                        .with_handle(self.filter_menus[0].clone())
                         .trigger(
                             Button::new("filter-property-button", chosen)
                                 .style(ButtonStyle::Subtle)
@@ -3068,6 +3611,7 @@ impl TypeTable {
                 .child(divider())
                 .child(
                     PopoverMenu::new("filter-op")
+                        .with_handle(self.filter_menus[1].clone())
                         .trigger(
                             Button::new("filter-op-button", draft.op.label())
                                 .style(ButtonStyle::Subtle)
@@ -3094,11 +3638,25 @@ impl TypeTable {
                         }),
                 )
                 .when(draft.op.takes_value(), |pill| {
+                    let menu_open = self.filter_menus.iter().any(PopoverMenuHandle::is_deployed);
+                    let offers = (self.filter_editor.focus_handle(cx).is_focused(window)
+                        && !menu_open
+                        && !draft.suggestions.is_empty())
+                    .then(|| self.render_suggestions(draft, cx));
                     pill.child(divider()).child(
                         div()
+                            .key_context("FilterValue")
+                            .on_action(cx.listener(|this, _: &SelectNextSuggestion, _, cx| {
+                                this.move_suggestion(1, cx)
+                            }))
+                            .on_action(cx.listener(|this, _: &SelectPreviousSuggestion, _, cx| {
+                                this.move_suggestion(-1, cx)
+                            }))
+                            .relative()
                             .w(px(180.))
                             .px(px(studio_ui::ds::space::MD))
-                            .child(self.filter_editor.clone()),
+                            .child(self.filter_editor.clone())
+                            .children(offers),
                     )
                 })
                 .child(divider())
@@ -3148,6 +3706,92 @@ impl TypeTable {
         Some(bar.into_any_element())
     }
 
+    /// The values the filter's value field offers, under it: ↑/↓ highlight, ↵ or a click picks.
+    fn render_suggestions(&self, draft: &FilterDraft, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors();
+        let (bg, border, highlight) = (
+            colors.elevated_surface_background,
+            colors.border_variant,
+            colors.element_selected,
+        );
+        let items = draft
+            .suggestions
+            .iter()
+            .enumerate()
+            .map(|(index, suggestion)| {
+                let highlighted = draft.highlighted == Some(index);
+                // A node reads by its label, with its id after it; a value reads as itself.
+                let (primary, secondary) = match &suggestion.label {
+                    Some(label) => (label.clone(), Some(suggestion.value.clone())),
+                    None => (suggestion.value.clone(), None),
+                };
+                h_flex()
+                    .id(("filter-suggestion", index))
+                    .h(px(26.))
+                    .px_2()
+                    .gap_2()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(highlighted, |row| row.bg(highlight))
+                    .hover(|row| row.bg(highlight))
+                    .child(
+                        div().min_w_0().flex_shrink(1.).child(
+                            Label::new(primary)
+                                .size(LabelSize::Small)
+                                .single_line()
+                                .truncate(),
+                        ),
+                    )
+                    .children(secondary.map(|id| {
+                        div().min_w_0().flex_shrink(1.).child(
+                            Label::new(id)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .single_line()
+                                .truncate_start(),
+                        )
+                    }))
+                    // On press, before the field loses focus to the click.
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.pick_suggestion(index, window, cx);
+                        }),
+                    )
+            });
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .child(
+                deferred(
+                    anchored()
+                        .anchor(Anchor::TopLeft)
+                        .offset(point(px(-4.), px(28.)))
+                        .snap_to_window_with_margin(px(8.))
+                        .child(
+                            v_flex()
+                                .id("filter-suggestions")
+                                .occlude()
+                                .min_w(px(220.))
+                                .max_w(px(360.))
+                                .max_h(px(260.))
+                                .overflow_y_scroll()
+                                .p_1()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(border)
+                                .bg(bg)
+                                .shadow(studio_ui::ds::elevation::overlay())
+                                .children(items),
+                        ),
+                )
+                .with_priority(1),
+            )
+            .into_any_element()
+    }
+
     fn render_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if self.missing {
             return studio_ui::empty_state(
@@ -3182,7 +3826,11 @@ impl TypeTable {
             }
             Loadable::Loaded(()) => {}
         }
-        if self.rows.is_empty() {
+        let empty = match &self.grouping {
+            Some(grouping) => grouping.sections().is_empty(),
+            None => self.rows.is_empty(),
+        };
+        if empty {
             let (title, detail) = if self.filters.is_empty() {
                 (
                     format!("No {} rows on {}", self.type_name, self.branch),
@@ -3272,22 +3920,50 @@ impl TypeTable {
                 }
             })
             .collect();
+        // Grouped, the grid draws lines (headers, rows, read-more lines); otherwise one line
+        // per row. Per line: the row it shows, if any.
+        let lines: Option<Vec<Line>> = self.grouping.as_ref().map(Grouping::lines);
+        let row_at: Vec<Option<usize>> = match &lines {
+            Some(lines) => lines
+                .iter()
+                .map(|line| match line {
+                    Line::Row(row) => Some(*row),
+                    _ => None,
+                })
+                .collect(),
+            None => (0..self.rows.len()).map(Some).collect(),
+        };
         let cursor_row = self.cursor.map(|c| c.row);
-        let picked: HashSet<usize> = self
-            .rows
+        let picked: HashSet<usize> = row_at
             .iter()
             .enumerate()
-            .filter(|(_, row)| self.selection.contains(&row.id))
-            .map(|(ix, _)| ix)
+            .filter(|(_, row)| {
+                row.and_then(|row| self.rows.get(row))
+                    .is_some_and(|row| self.selection.contains(&row.id))
+            })
+            .map(|(line, _)| line)
             .collect();
         let picked_bg = studio_ui::ds::surface::selected_document(cx).opacity(0.6);
-        let dimmed: HashSet<usize> = self
-            .rows
+        let dimmed: HashSet<usize> = row_at
             .iter()
             .enumerate()
-            .filter(|(_, row)| row.dimmed)
+            .filter(|(_, row)| {
+                row.and_then(|row| self.rows.get(row))
+                    .is_some_and(|row| row.dimmed)
+            })
+            .map(|(line, _)| line)
+            .collect();
+        let cursor_line =
+            cursor_row.and_then(|cursor| row_at.iter().position(|row| *row == Some(cursor)));
+        let header_lines: HashSet<usize> = lines
+            .iter()
+            .flatten()
+            .enumerate()
+            .filter(|(_, line)| matches!(line, Line::Header(_)))
             .map(|(ix, _)| ix)
             .collect();
+        let header_bg = studio_ui::ds::surface::well(cx);
+        let line_count = row_at.len();
         let hairline = studio_ui::ds::surface::rule(cx);
         let glass = studio_ui::ds::is_glass(cx);
         // Fixed fitted widths: Zed's resizable columns draw a full-height rule between every
@@ -3304,28 +3980,226 @@ impl TypeTable {
                 row.border_b_1()
                     .border_color(hairline)
                     .when(glass, |row| row.border_dashed())
+                    .when(header_lines.contains(&ix), |row| row.bg(header_bg))
                     .when(picked.contains(&ix), |row| row.bg(picked_bg))
-                    .when(cursor_row == Some(ix), |row| row.bg(selected_bg))
+                    .when(cursor_line == Some(ix), |row| row.bg(selected_bg))
                     .when(dimmed.contains(&ix), |row| row.opacity(0.45))
                     .into_any_element()
             })
             .uniform_list(
                 "type-table-rows",
-                self.rows.len(),
+                line_count,
                 cx.processor(|this, range: Range<usize>, window, cx| {
-                    if this.more_error.is_none()
-                        && this
-                            .paging
-                            .wants_more(this.rows.len(), range.end, this.loading_more)
-                    {
-                        cx.defer_in(window, |this, _, cx| this.load_more(cx));
+                    let Some(lines) = this.grouping.as_ref().map(Grouping::lines) else {
+                        if this.more_error.is_none()
+                            && this
+                                .paging
+                                .wants_more(this.rows.len(), range.end, this.loading_more)
+                        {
+                            cx.defer_in(window, |this, _, cx| this.load_more(cx));
+                        }
+                        let shown = range.clone();
+                        cx.defer_in(window, move |this, _, cx| this.load_blob_metas(shown, cx));
+                        return range.map(|ix| this.render_row(ix, window, cx)).collect();
+                    };
+                    let range = range.start.min(lines.len())..range.end.min(lines.len());
+                    let shown = &lines[range.clone()];
+                    // An open section reads its first rows when its read line comes into view.
+                    for line in shown {
+                        if let Line::More(index) = *line
+                            && this
+                                .grouping
+                                .as_ref()
+                                .and_then(|g| g.sections().get(index))
+                                .is_some_and(|section| {
+                                    section.range.is_empty()
+                                        && !section.loading
+                                        && section.error.is_none()
+                                })
+                        {
+                            cx.defer_in(window, move |this, _, cx| {
+                                this.load_section(index, SECTION_FIRST_PAGE, cx)
+                            });
+                        }
                     }
-                    let shown = range.clone();
-                    cx.defer_in(window, move |this, _, cx| this.load_blob_metas(shown, cx));
-                    range.map(|ix| this.render_row(ix, window, cx)).collect()
+                    let rows: Vec<usize> = shown
+                        .iter()
+                        .filter_map(|line| match line {
+                            Line::Row(row) => Some(*row),
+                            _ => None,
+                        })
+                        .collect();
+                    if let (Some(first), Some(last)) = (rows.iter().min(), rows.iter().max()) {
+                        let shown = *first..*last + 1;
+                        cx.defer_in(window, move |this, _, cx| this.load_blob_metas(shown, cx));
+                    }
+                    shown
+                        .iter()
+                        .map(|line| match *line {
+                            Line::Row(row) => this.render_row(row, window, cx),
+                            Line::Header(index) => this.render_section_header(index, cx),
+                            Line::More(index) => this.render_section_more(index, cx),
+                            Line::OtherValues => this.render_other_values(),
+                        })
+                        .collect()
                 }),
             )
             .into_any_element()
+    }
+
+    /// A grouped grid's header line: the value, how many rows hold it, and the disclosure.
+    fn render_section_header(&self, index: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(grouping) = &self.grouping else {
+            return Vec::new();
+        };
+        let Some(section) = grouping.sections().get(index) else {
+            return Vec::new();
+        };
+        let property = self.property_of(&grouping.property);
+        let missing = section.value.is_null();
+        let text = if missing {
+            "No value".to_owned()
+        } else {
+            display_value(property.as_ref(), &section.value)
+        };
+        let first = h_flex()
+            .id(("section-header", index))
+            .h(px(ROW_HEIGHT))
+            .w_full()
+            .px_3()
+            .gap_1p5()
+            .items_center()
+            .overflow_hidden()
+            .cursor_pointer()
+            .child(
+                Icon::new(if section.expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(
+                div().min_w_0().flex_shrink(1.).child(
+                    Label::new(text)
+                        .size(LabelSize::Small)
+                        .weight(gpui::FontWeight::MEDIUM)
+                        .color(if missing {
+                            Color::Muted
+                        } else {
+                            Color::Default
+                        })
+                        .when(missing, |label| label.italic())
+                        .truncate(),
+                ),
+            )
+            .child(
+                Label::new(format_count(section.count as i64))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .single_line(),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(index, cx)))
+            .into_any_element();
+        self.line_cells(first)
+    }
+
+    /// The line under an open section's rows: Show more, Loading…, or what failed and Retry.
+    fn render_section_more(&self, index: usize, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(section) = self.grouping.as_ref().and_then(|g| g.sections().get(index)) else {
+            return Vec::new();
+        };
+        let page = self.page_size(cx);
+        let content: AnyElement = if section.loading {
+            Label::new("Loading…")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element()
+        } else if let Some(error) = &section.error {
+            h_flex()
+                .gap_1()
+                .child(
+                    Icon::new(IconName::Warning)
+                        .size(IconSize::XSmall)
+                        .color(Color::Error),
+                )
+                .child(
+                    div()
+                        .id(("section-error", index))
+                        .tooltip(Tooltip::text(error.clone()))
+                        .child(
+                            Label::new("Not read")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Error),
+                        ),
+                )
+                .child(
+                    studio_ui::ds::button(("section-retry", index), "Retry")
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::XSmall)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(section) =
+                                this.grouping.as_mut().and_then(|g| g.section_mut(index))
+                            {
+                                section.error = None;
+                            }
+                            let size = this.page_size(cx);
+                            this.load_section(index, size, cx);
+                        })),
+                )
+                .into_any_element()
+        } else {
+            let remaining = section.count.saturating_sub(section.range.len() as u64);
+            let next = remaining.min(u64::from(page));
+            studio_ui::ds::button(
+                ("section-more", index),
+                format!("Show {next} more of {}", format_count(remaining as i64)),
+            )
+            .style(ButtonStyle::Subtle)
+            .label_size(LabelSize::XSmall)
+            .color(Color::Accent)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                let size = this.page_size(cx);
+                this.load_section(index, size, cx);
+            }))
+            .into_any_element()
+        };
+        self.line_cells(
+            h_flex()
+                .h(px(ROW_HEIGHT))
+                .w_full()
+                .px_4()
+                .items_center()
+                .child(content)
+                .into_any_element(),
+        )
+    }
+
+    fn render_other_values(&self) -> Vec<AnyElement> {
+        self.line_cells(
+            h_flex()
+                .h(px(ROW_HEIGHT))
+                .w_full()
+                .px_3()
+                .items_center()
+                .child(
+                    Label::new(format!(
+                        "The first {GROUP_LIMIT} values are shown; filter to see the others"
+                    ))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .single_line(),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// A line's cells: its content in the first (pinned) column, the others empty.
+    fn line_cells(&self, first: AnyElement) -> Vec<AnyElement> {
+        std::iter::once(first)
+            .chain((1..self.columns.len()).map(|_| div().h(px(ROW_HEIGHT)).into_any_element()))
+            .collect()
     }
 
     /// Reads what the Blob cells of rows `range` hold, once each, at the page's commit. Only
@@ -3696,7 +4570,7 @@ impl TypeTable {
         }
         if row.dimmed && col == 0 {
             cell = cell.tooltip(Tooltip::text(
-                "No longer matches the filters. It leaves when the list is read again.",
+                "No longer matches the filters or its group. It leaves when the list is read again.",
             ));
         } else if let Some(tooltip) = tooltip {
             cell = cell.tooltip(Tooltip::text(tooltip));
@@ -3896,10 +4770,23 @@ impl TypeTable {
 }
 
 /// What the value field asks for.
+/// A node search's rows as offers: the id goes in the field, the label beside it.
+fn node_suggestions(rows: &Value) -> Vec<Suggestion> {
+    rows.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let id = row.get("id")?.as_str()?.to_owned();
+            let label = row.get("label").and_then(Value::as_str).map(str::to_owned);
+            Some(Suggestion { value: id, label })
+        })
+        .collect()
+}
+
 fn filter_placeholder(op: FilterOp) -> &'static str {
     match op {
         FilterOp::In => "Values, separated by commas",
-        FilterOp::RelatedTo => "Node id, for example company-00002",
+        FilterOp::RelatedTo => "Name or id",
         _ => "Value",
     }
 }
@@ -3928,7 +4815,7 @@ impl Render for TypeTable {
         }
         let background = cx.theme().colors().editor_background;
         let toolbar = self.render_toolbar(cx);
-        let filter_bar = self.render_filter_bar(cx);
+        let filter_bar = self.render_filter_bar(window, cx);
         let bulk_bar = self.render_bulk_bar(cx);
         let drafts_bar = self.render_drafts_bar(cx);
         let body = self.render_body(cx);

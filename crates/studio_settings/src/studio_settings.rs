@@ -135,7 +135,7 @@ pub struct GraphOverrides {
     pub views: Vec<SavedView>,
 }
 
-/// A named filter and order for one type's table (spec 004).
+/// A named filter, order and grouping for one type's table (spec 004).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct SavedView {
@@ -145,6 +145,9 @@ pub struct SavedView {
     pub filters: Vec<SavedFilter>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort: Option<SavedSort>,
+    /// The property the rows are grouped by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<String>,
 }
 
 /// A filter as the table holds it: a property or relationship key, an operator's key
@@ -576,6 +579,7 @@ mod tests {
                 property: "name".into(),
                 descending: false,
             }),
+            group_by: Some("title".into()),
         };
         settings.save_view("dev/knowledge", view("Founders", "eq"));
         settings.save_view("dev/knowledge", view("Founders", "ne"));

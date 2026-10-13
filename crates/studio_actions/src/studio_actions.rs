@@ -278,6 +278,10 @@ pub mod table {
             StageEdit,
             /// Save every draft in the table as one commit.
             SaveDrafts,
+            /// Highlight the next value the filter's value field offers.
+            SelectNextSuggestion,
+            /// Highlight the previous value the filter's value field offers.
+            SelectPreviousSuggestion,
             /// Cancel the edit, or step back one level.
             Cancel,
             /// Show the selected row in the inspector.
