@@ -8,6 +8,7 @@ pub mod cli_config;
 mod connection;
 mod exploration;
 pub mod fixes;
+mod memo;
 mod registry;
 mod session;
 
@@ -25,7 +26,9 @@ pub use connection::{
 pub use exploration::*;
 pub use fixes::{RevertUnavailable, revert_query};
 pub use registry::{ConnectionRegistry, RegistryEvent, data_dir};
-pub use session::{GraphSession, Loadable, OutcomeEntry, OutcomeKind, SessionEvent, open_session};
+pub use session::{
+    CommitList, GraphSession, Loadable, OutcomeEntry, OutcomeKind, SessionEvent, open_session,
+};
 
 /// Sets up the HTTP client and loads every known server. Call once at startup.
 pub fn init(cx: &mut App) {

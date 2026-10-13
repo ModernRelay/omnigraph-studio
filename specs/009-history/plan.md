@@ -53,6 +53,11 @@ XI (lane logic forked from Zed with notices).
   changes never change, and the detail's full count replaces a first-page one. A commit
   without a first parent shows none.
 
+Commit lists come from the session's shared lists (spec 003): the history and the branches
+panel read a branch once between commits on it, all branches at once rather than in turn.
+A row's change count is read once scrolling has paused for 120 ms, and reads for rows scrolled
+away are dropped.
+
 ## Decisions
 
 | Decision | Rejected alternatives | Why |

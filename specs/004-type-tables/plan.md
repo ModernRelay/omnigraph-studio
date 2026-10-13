@@ -228,7 +228,10 @@ The table is a cached view (spec 002): it is drawn again only when it notifies. 
 row callback works out how each drawn line looks (picked, dimmed, the cursor's, a group
 header) for the lines it draws, not for every loaded row, and the grouped line list is built
 once a frame. Blob cells are read once scrolling has paused for 120 ms, for the rows then
-drawn; reads still out for rows scrolled away are dropped and asked again when they return.
+drawn; reads still out for rows scrolled away are dropped and asked again when they return. A
+new order or filter at the same commit keeps the relationship cells and Blob cells already
+read and reads only rows not seen yet; the counts it asks for again come from the session's
+kept answers.
 
 ## Decisions
 

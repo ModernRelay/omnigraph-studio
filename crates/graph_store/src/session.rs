@@ -4,17 +4,19 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use futures::FutureExt as _;
 use futures::channel::oneshot;
-use futures::future::{Either, select};
+use futures::future::{Either, Shared, select};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task};
 use gq_language::{BuiltQuery, SchemaModel};
 use graph_client::api::{
     BranchCreateOutput, BranchCreateRequest, BranchMergeOutput, BranchMergeRequest, ChangeOutput,
-    ChangeRequest, QueryRequest, ReadOutput, SnapshotDatasetOutput,
+    ChangeRequest, CommitOutput, QueryRequest, ReadOutput, SnapshotDatasetOutput,
 };
 use graph_client::{BlobAt, BlobCell, BlobMeta, GraphClient, ReadError, WriteOutcome};
 
 use crate::connection::Connection;
+use crate::memo::{Held, Memo};
 
 /// A value that loads from the server.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +71,24 @@ pub enum SessionEvent {
     AvailabilityChanged,
 }
 
+/// How many answers to reads pinned to a commit, and Blob cells at a commit, a session keeps.
+const PINNED_READS: usize = 256;
+const PINNED_BLOBS: usize = 2_048;
+
+/// How many branches' commit lists a session keeps.
+const COMMIT_LISTS: usize = 64;
+
+/// A branch's commits, newest first, shared by the views that show them.
+pub type CommitList = Arc<Vec<CommitOutput>>;
+
+/// A read at a commit: the commit, the query text and its parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PinnedRead {
+    commit: String,
+    query: String,
+    params: String,
+}
+
 /// The first wait before a graph that answered 503 is asked again; it doubles up to the cap.
 const RECHECK_FIRST: Duration = Duration::from_secs(5);
 const RECHECK_CAP: Duration = Duration::from_secs(60);
@@ -87,6 +107,11 @@ pub struct GraphSession {
     /// clears, when it answers again.
     pub unavailable: Option<String>,
     recheck_after: Duration,
+    /// Answers to reads pinned to a commit, and those under way (they never change).
+    pinned_reads: Memo<PinnedRead, ReadOutput, Shared<Task<Result<ReadOutput, ReadError>>>>,
+    pinned_blobs: Memo<(BlobCell, String), BlobMeta, Shared<Task<Result<BlobMeta, ReadError>>>>,
+    /// Each branch's commit list, read once and shared until a commit lands on that branch.
+    commit_lists: Memo<String, CommitList, Shared<Task<Result<CommitList, ReadError>>>>,
     _recheck: Option<Task<()>>,
     _schema_task: Option<Task<()>>,
     _branches_task: Option<Task<()>>,
@@ -114,6 +139,9 @@ impl GraphSession {
             writes_in_flight: 0,
             unavailable: None,
             recheck_after: RECHECK_FIRST,
+            pinned_reads: Memo::new(PINNED_READS),
+            pinned_blobs: Memo::new(PINNED_BLOBS),
+            commit_lists: Memo::new(COMMIT_LISTS),
             _recheck: None,
             _schema_task: None,
             _branches_task: None,
@@ -222,6 +250,8 @@ impl GraphSession {
             };
             this.update(cx, |this, cx| {
                 this.branches = result;
+                // A branch deleted and made again under its name has another history.
+                this.commit_lists.clear();
                 cx.emit(SessionEvent::BranchesChanged);
                 cx.notify();
             })
@@ -284,7 +314,9 @@ impl GraphSession {
         cx.notify();
     }
 
-    /// Runs a read on the session's branch, or at `snapshot` when given (constitution II).
+    /// Runs a read on the session's branch, or at `snapshot` when given (constitution II). A
+    /// read at a commit is answered from what was read at that commit before, or shares an
+    /// identical read under way: a commit never changes.
     pub fn read(
         &mut self,
         query: &BuiltQuery,
@@ -298,7 +330,33 @@ impl GraphSession {
             branch: snapshot.is_none().then(|| self.branch.clone()),
             snapshot,
         };
-        self.read_request(request, cx)
+        let Some(commit) = request.snapshot.clone() else {
+            return self.read_request(request, cx);
+        };
+        let key = PinnedRead {
+            commit,
+            query: request.query.clone(),
+            params: request
+                .params
+                .as_ref()
+                .map(|params| params.to_string())
+                .unwrap_or_default(),
+        };
+        let shared = match self.pinned_reads.get(&key) {
+            Some(Held::Done(output)) => return Task::ready(Ok(output)),
+            Some(Held::Pending(shared)) => shared,
+            None => {
+                let shared = self.read_request(request, cx).shared();
+                self.pinned_reads.start(key.clone(), shared.clone());
+                shared
+            }
+        };
+        cx.spawn(async move |this, cx| {
+            let result = shared.await;
+            this.update(cx, |this, _| this.pinned_reads.finish(&key, &result))
+                .ok();
+            result
+        })
     }
 
     pub fn read_request(
@@ -381,6 +439,34 @@ impl GraphSession {
         snapshot: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<BlobMeta, ReadError>> {
+        // At a commit a cell never changes: the table, the peek and the Blob tab share one read.
+        if let Some(commit) = snapshot.clone() {
+            let key = (cell.clone(), commit);
+            let shared = match self.pinned_blobs.get(&key) {
+                Some(Held::Done(meta)) => return Task::ready(Ok(meta)),
+                Some(Held::Pending(shared)) => shared,
+                None => {
+                    let shared = self.blob_meta_unpinned(cell, snapshot, cx).shared();
+                    self.pinned_blobs.start(key.clone(), shared.clone());
+                    shared
+                }
+            };
+            return cx.spawn(async move |this, cx| {
+                let result = shared.await;
+                this.update(cx, |this, _| this.pinned_blobs.finish(&key, &result))
+                    .ok();
+                result
+            });
+        }
+        self.blob_meta_unpinned(cell, snapshot, cx)
+    }
+
+    fn blob_meta_unpinned(
+        &mut self,
+        cell: BlobCell,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<BlobMeta, ReadError>> {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let branch = self.branch.clone();
@@ -391,6 +477,50 @@ impl GraphSession {
             };
             let result = client.blob_head(&graph, &cell, at).await;
             this.update(cx, |this, cx| this.note_read(&result, cx)).ok();
+            result
+        })
+    }
+
+    /// A branch's commits as the server lists them. Read once and shared by every view that
+    /// asks (the history, the branches panel), and read again only after a commit Studio makes
+    /// on that branch or a change to the branch list; `fresh` reads it again now, as a Refresh
+    /// does, to see commits made elsewhere.
+    pub fn commits(
+        &mut self,
+        branch: &str,
+        fresh: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<CommitList, ReadError>> {
+        let key = branch.to_owned();
+        if fresh {
+            self.commit_lists.forget(&key);
+        }
+        let shared = match self.commit_lists.get(&key) {
+            Some(Held::Done(list)) => return Task::ready(Ok(list)),
+            Some(Held::Pending(shared)) => shared,
+            None => {
+                let client = self.client(cx);
+                let graph = self.graph_id.clone();
+                let branch = key.clone();
+                let shared = self
+                    .counted_read(
+                        async move {
+                            client
+                                .commits(&graph, &branch)
+                                .await
+                                .map(|list| Arc::new(list.commits))
+                        },
+                        cx,
+                    )
+                    .shared();
+                self.commit_lists.start(key.clone(), shared.clone());
+                shared
+            }
+        };
+        cx.spawn(async move |this, cx| {
+            let result = shared.await;
+            this.update(cx, |this, _| this.commit_lists.finish(&key, &result))
+                .ok();
             result
         })
     }
@@ -490,6 +620,7 @@ impl GraphSession {
         });
         if committed {
             self.reload_counts(cx);
+            self.commit_lists.forget(&branch);
             cx.emit(SessionEvent::Committed { branch });
         }
         cx.emit(SessionEvent::ActivityChanged);
@@ -671,6 +802,179 @@ mod tests {
                 Some(vec!["main".to_owned()])
             );
         });
+    }
+
+    /// A read at a commit is sent once: an identical read under way is shared, a later one is
+    /// answered from memory. A read at the branch head is always sent.
+    #[gpui::test]
+    async fn reads_at_a_commit_are_sent_once(cx: &mut TestAppContext) {
+        let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queries_seen = queries.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let queries = queries_seen.clone();
+            async move {
+                let body = if path.ends_with("/query") {
+                    queries.fetch_add(1, Ordering::SeqCst);
+                    r#"{"query_name":"q","target":{"snapshot":"c1"},"row_count":1,"columns":["n"],"rows":[{"n":3}],"graph_commit_id":"c1"}"#
+                } else {
+                    r#"{"branches":["main"]}"#
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        let at_start = queries.load(Ordering::SeqCst);
+
+        let query = BuiltQuery {
+            name: "q".into(),
+            text: "query q() { match { $p: Person } return { count($p) as n } }".into(),
+            params: Default::default(),
+        };
+        let (first, second) = session.update(cx, |session, cx| {
+            (
+                session.read(&query, Some("c1".into()), cx),
+                session.read(&query, Some("c1".into()), cx),
+            )
+        });
+        let (first, second) = (first.await.unwrap(), second.await.unwrap());
+        assert_eq!(first.rows, second.rows);
+        assert_eq!(
+            queries.load(Ordering::SeqCst) - at_start,
+            1,
+            "shared while under way"
+        );
+
+        let later = session.update(cx, |session, cx| {
+            session.read(&query, Some("c1".into()), cx)
+        });
+        assert_eq!(later.await.unwrap().rows, first.rows);
+        assert_eq!(
+            queries.load(Ordering::SeqCst) - at_start,
+            1,
+            "answered from memory"
+        );
+
+        let other = session.update(cx, |session, cx| {
+            session.read(&query, Some("c2".into()), cx)
+        });
+        other.await.unwrap();
+        assert_eq!(
+            queries.load(Ordering::SeqCst) - at_start,
+            2,
+            "another commit is read"
+        );
+
+        for _ in 0..2 {
+            let head = session.update(cx, |session, cx| session.read(&query, None, cx));
+            head.await.unwrap();
+        }
+        assert_eq!(
+            queries.load(Ordering::SeqCst) - at_start,
+            4,
+            "the branch head moves: every read is sent"
+        );
+    }
+
+    /// A branch's commit list is read once for every view that shows it, and again only after
+    /// a commit lands on that branch.
+    #[gpui::test]
+    async fn commit_lists_are_read_again_only_for_the_branch_a_commit_lands_on(
+        cx: &mut TestAppContext,
+    ) {
+        let lists: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let seen = lists.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let query = request.uri().query().unwrap_or_default().to_owned();
+            let seen = seen.clone();
+            async move {
+                let body = if path.ends_with("/commits") {
+                    seen.lock().unwrap().push(query);
+                    r#"{"commits":[{"graph_commit_id":"c1","created_at":1,"graph_manifest_version":1,"published":true}]}"#
+                } else if path.ends_with("/mutate") {
+                    r#"{"branch":"main","query_name":"m","affected_nodes":1,"affected_edges":0,"commit":{"graph_commit_id":"c2","graph_branch":"main","graph_manifest_version":2,"created_at":2,"parent_commit_id":"c1"}}"#
+                } else {
+                    r#"{"branches":["main","feature"]}"#
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        let reads_of = |branch: &str| {
+            lists
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|query| query.contains(&format!("branch={branch}")))
+                .count()
+        };
+
+        // The history and the branches panel ask together: one read.
+        let (a, b) = session.update(cx, |session, cx| {
+            (
+                session.commits("main", false, cx),
+                session.commits("main", false, cx),
+            )
+        });
+        assert_eq!(a.await.unwrap().len(), 1);
+        assert_eq!(b.await.unwrap().len(), 1);
+        let feature = session.update(cx, |session, cx| session.commits("feature", false, cx));
+        feature.await.unwrap();
+        assert_eq!((reads_of("main"), reads_of("feature")), (1, 1));
+
+        // Asked again: nothing is read.
+        let again = session.update(cx, |session, cx| session.commits("main", false, cx));
+        again.await.unwrap();
+        assert_eq!(reads_of("main"), 1);
+
+        // A commit on main: main is read again, feature is not.
+        let query = BuiltQuery {
+            name: "m".into(),
+            text: "query m() { update Person set { title: \"x\" } where @id = \"p\" }".into(),
+            params: Default::default(),
+        };
+        let write = session.update(cx, |session, cx| {
+            session.write(&query, None, "Set title".into(), cx)
+        });
+        write.await;
+        cx.run_until_parked();
+        for branch in ["main", "feature"] {
+            let read = session.update(cx, |session, cx| session.commits(branch, false, cx));
+            read.await.unwrap();
+        }
+        assert_eq!((reads_of("main"), reads_of("feature")), (2, 1));
+
+        // Refresh reads it again whatever was kept.
+        let fresh = session.update(cx, |session, cx| session.commits("feature", true, cx));
+        fresh.await.unwrap();
+        assert_eq!(reads_of("feature"), 2);
     }
 
     /// The command palette's search drops its reads when the text changes; the count must come

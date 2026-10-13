@@ -557,10 +557,12 @@ impl TypeTable {
                 return;
             }
         };
+        // The session builds a new model on every schema read (Refresh, a recheck after a 503,
+        // the Types panel); only a different schema text resets the table and reads it again.
         if self
             .schema
             .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &schema))
+            .is_some_and(|current| Arc::ptr_eq(current, &schema) || current.source == schema.source)
         {
             return;
         }
@@ -1563,12 +1565,16 @@ impl TypeTable {
             cx.emit(ItemEvent::UpdateTab);
         }
         self.rows.clear();
-        self.blobs.clear();
-        self.blob_tasks.clear();
+        // At the same commit a row's relationships and Blob cells cannot have changed: a new
+        // order or filter keeps what was read and reads only rows not seen yet.
+        if !keep_pin {
+            self.blobs.clear();
+            self.blob_tasks.clear();
+            self.relations.clear();
+            self.relation_tasks.clear();
+        }
         self.blob_rows = None;
         self._blob_wait = None;
-        self.relations.clear();
-        self.relation_tasks.clear();
         self.cursor = None;
         self.editing = None;
         self.loading_more = false;
@@ -2021,6 +2027,15 @@ impl TypeTable {
         let snapshot = self.paging.pinned.clone();
         for group in groups {
             let key = builder::relationship_key(&group);
+            // Rows whose relationship was read at this commit already need no read.
+            let ids: Vec<String> = ids
+                .iter()
+                .filter(|id| !self.relations.contains_key(&((*id).clone(), key.clone())))
+                .cloned()
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
             let Ok(degrees) = builder::page_degrees(&schema, &self.type_name, &group, &ids) else {
                 continue;
             };

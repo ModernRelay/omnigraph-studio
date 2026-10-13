@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::time::Duration;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
@@ -27,6 +28,8 @@ use crate::merged::{branch_heads, with_merged_commits};
 pub const LONG_HISTORY: usize = 5_000;
 
 /// Other branches whose lists History reads for heads and merged-in commits.
+/// How long scrolling must pause before the drawn rows' change counts are read.
+const COUNTS_AFTER: Duration = Duration::from_millis(120);
 const OTHER_BRANCHES: usize = 20;
 
 const ROW_HEIGHT: f32 = studio_ui::ds::size::ROW;
@@ -67,7 +70,11 @@ pub struct HistoryView {
     /// Commits whose counts come from a first page only, and those asked for already.
     partial_counts: HashSet<String>,
     asked_counts: HashSet<String>,
-    count_tasks: Vec<Task<()>>,
+    /// The count reads under way, by commit; and the drawn rows they were last asked for,
+    /// with the pause before they are read.
+    count_tasks: HashMap<String, Task<()>>,
+    count_rows: Option<Range<usize>>,
+    _count_wait: Option<Task<()>>,
     /// Branch names by the commit they point at.
     heads: HashMap<String, Vec<String>>,
     /// Commits in the branch's own list; the rest came in through merges.
@@ -138,6 +145,8 @@ impl HistoryView {
                         this.reload(cx);
                     }
                     SessionEvent::Committed { branch } if *branch == this.branch => this.reload(cx),
+                    // The list of other branches, whose heads and merges the history shows.
+                    SessionEvent::BranchesChanged => this.reload(cx),
                     _ => {}
                 }),
             );
@@ -180,7 +189,9 @@ impl HistoryView {
             counts: HashMap::new(),
             partial_counts: HashSet::new(),
             asked_counts: HashSet::new(),
-            count_tasks: Vec::new(),
+            count_tasks: HashMap::new(),
+            count_rows: None,
+            _count_wait: None,
             heads: HashMap::new(),
             own_count: 0,
             scroll: UniformListScrollHandle::new(),
@@ -191,14 +202,51 @@ impl HistoryView {
         view
     }
 
+    /// Shows the branch's history again from the session's commit lists, which are read again
+    /// only for branches with new commits.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.load(false, cx);
+    }
+
+    /// Refresh: reads the branch's own commits again, to see commits made elsewhere.
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.load(true, cx);
+    }
+
+    fn load(&mut self, fresh: bool, cx: &mut Context<Self>) {
         self.state = State::Loading;
-        let client = self.session.read(cx).client(cx);
-        let graph = self.session.read(cx).graph_id.clone();
         let branch = self.branch.clone();
+        // Other live branches: their heads, and the commits merged in from them (E9). All the
+        // lists are asked for at once, and come from the session's lists where it has them.
+        let others: Vec<String> = self
+            .session
+            .read(cx)
+            .branches
+            .loaded()
+            .map(|branches| {
+                branches
+                    .iter()
+                    .filter(|name| **name != branch)
+                    .take(OTHER_BRANCHES)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let own_read = self
+            .session
+            .update(cx, |session, cx| session.commits(&branch, fresh, cx));
+        let other_reads: Vec<_> = others
+            .into_iter()
+            .map(|name| {
+                let read = self
+                    .session
+                    .update(cx, |session, cx| session.commits(&name, false, cx));
+                (name, read)
+            })
+            .collect();
         self._task = Some(cx.spawn(async move |this, cx| {
-            let own = match client.commits(&graph, &branch).await {
-                Ok(list) => list.commits,
+            let own = match own_read.await {
+                Ok(list) => list.as_ref().clone(),
                 Err(error) => {
                     this.update(cx, |this, cx| {
                         this.state = State::Failed(error.to_string().into());
@@ -208,18 +256,10 @@ impl HistoryView {
                     return;
                 }
             };
-            // Other live branches: their heads, and the commits merged in from them (E9).
             let mut others: Vec<(String, Vec<CommitOutput>)> = Vec::new();
-            if let Ok(list) = client.branches(&graph).await {
-                for name in list
-                    .branches
-                    .into_iter()
-                    .filter(|name| *name != branch)
-                    .take(OTHER_BRANCHES)
-                {
-                    if let Ok(commits) = client.commits(&graph, &name).await {
-                        others.push((name, commits.commits));
-                    }
+            for (name, read) in other_reads {
+                if let Ok(list) = read.await {
+                    others.push((name, list.as_ref().clone()));
                 }
             }
             // Lay out off the main thread; long histories load in full (E10).
@@ -392,6 +432,40 @@ impl HistoryView {
         ((self.graph.lane_count.max(1) as f32) * LANE_WIDTH + GRAPH_PADDING * 2.).max(52.)
     }
 
+    /// Asks for the drawn rows' change counts once scrolling has paused: a fast scroll reads
+    /// nothing for the rows it passes, and reads still out for rows no longer drawn are dropped
+    /// (and asked again if they come back).
+    fn want_row_counts(&mut self, rows: Range<usize>, cx: &mut Context<Self>) {
+        if self.count_rows.as_ref() == Some(&rows) {
+            return;
+        }
+        self.count_rows = Some(rows.clone());
+        self._count_wait = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COUNTS_AFTER).await;
+            this.update(cx, |this, cx| {
+                let drawn: HashSet<&str> = this
+                    .commits
+                    .get(rows.start..rows.end.min(this.commits.len()))
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|commit| commit.graph_commit_id.as_str())
+                    .collect();
+                let gone: Vec<String> = this
+                    .count_tasks
+                    .keys()
+                    .filter(|id| !drawn.contains(id.as_str()))
+                    .cloned()
+                    .collect();
+                for id in gone {
+                    this.count_tasks.remove(&id);
+                    this.asked_counts.remove(&id);
+                }
+                this.load_row_counts(rows, cx);
+            })
+            .ok();
+        }));
+    }
+
     /// Reads change counts for drawn commits that have none yet: one page each, netted as the
     /// detail nets them. A commit with more changes than the page shows "N+". A commit's
     /// changes never change, so an answer is kept for the life of the view.
@@ -409,7 +483,8 @@ impl HistoryView {
         for id in ids {
             self.asked_counts.insert(id.clone());
             let (client, graph) = (client.clone(), graph.clone());
-            self.count_tasks.push(cx.spawn(async move |this, cx| {
+            let key = id.clone();
+            let task = cx.spawn(async move |this, cx| {
                 // A parentless commit or one past cleanup cannot be compared: no count.
                 let Ok(page) = client
                     .commit_changes(&graph, &id, None, ROW_COUNT_PAGE)
@@ -434,6 +509,7 @@ impl HistoryView {
                     })
                     .await;
                 this.update(cx, |this, cx| {
+                    this.count_tasks.remove(&id);
                     // The detail's full count, if it arrived meanwhile, wins.
                     if !this.counts.contains_key(&id) {
                         this.counts.insert(id.clone(), folded);
@@ -444,7 +520,8 @@ impl HistoryView {
                     }
                 })
                 .ok();
-            }));
+            });
+            self.count_tasks.insert(key, task);
         }
     }
 
@@ -642,8 +719,7 @@ impl HistoryView {
                     "history-rows",
                     self.commits.len(),
                     cx.processor(|this, range: Range<usize>, window, cx| {
-                        let drawn = range.clone();
-                        cx.defer_in(window, move |this, _, cx| this.load_row_counts(drawn, cx));
+                        this.want_row_counts(range.clone(), cx);
                         this.render_rows(range, window, cx)
                     }),
                 )
@@ -804,7 +880,7 @@ impl Render for HistoryView {
                     .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Read the history again"))
-                    .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             );
         let warning = (count > LONG_HISTORY).then(|| {
             div().px_4().py_1().child(

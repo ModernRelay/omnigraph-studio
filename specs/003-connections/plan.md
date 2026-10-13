@@ -91,6 +91,13 @@ from the served document).
   (0.13 refuses past its read ingress cap, 64 by default, with "read ingress count cap 64
   exceeded"), and a view that counts every relationship of a node at once would otherwise be
   refused for some of them. A read waiting out a 429 does so without its slot.
+- A read at a commit is answered once per session: the answer is kept (256 reads, 2,048 Blob
+  cells, least recently used out first) and an identical read under way is shared, since a
+  commit never changes. Failures are not kept, and reads at the branch head always go out.
+- Each branch's commit list is read once and shared by the views that show it (the history,
+  the branches panel); a commit Studio makes on a branch drops that branch's list, a change to
+  the branch list drops them all, and Refresh reads its branch again. A write used to set off
+  one full commit list per branch in each of those views, one after another.
 - The footer's "N queries running" and "Writing…" count requests actually in flight. A read
   whose caller stops waiting (a search superseded by the next keystroke, a closed tab) is
   stopped and counted out. A write runs to its outcome whoever still waits for it, and the
