@@ -2108,47 +2108,44 @@ impl AgentPanel {
         .into_any_element()
     }
 
-    /// One step of a run: a tool call with its state, or a thought.
+    /// One step of a run, as text: a tool call by name, a thought by its words. No marks for
+    /// steps that went well; a running call turns an arrow, a failed one reads in the error
+    /// colour.
     fn activity_step(&self, index: usize, entry: &Entry, cx: &App) -> AnyElement {
         match entry {
-            Entry::Thought(text) => h_flex()
+            Entry::Thought(text) => div()
                 .id(("thought", index))
-                .gap_1()
-                .items_start()
-                .child(
-                    Icon::new(IconName::Sparkle)
-                        .size(IconSize::XSmall)
-                        .color(Color::Disabled),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().colors().text_muted)
-                        .child(text.trim().to_owned()),
-                )
+                .text_xs()
+                .text_color(cx.theme().colors().text_muted)
+                .child(text.trim().to_owned())
                 .into_any_element(),
             Entry::Tool { title, status, .. } => {
-                let icon = match status {
-                    ToolCallStatus::Pending => Icon::new(IconName::Circle).color(Color::Disabled),
-                    ToolCallStatus::InProgress => {
-                        Icon::new(IconName::ArrowCircle).color(Color::Accent)
-                    }
-                    ToolCallStatus::Completed => Icon::new(IconName::Check).color(Color::Muted),
-                    ToolCallStatus::Failed => Icon::new(IconName::XCircle).color(Color::Error),
-                    _ => Icon::new(IconName::Circle).color(Color::Disabled),
-                };
+                let failed = matches!(status, ToolCallStatus::Failed);
+                let running =
+                    matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
                 h_flex()
                     .id(("tool", index))
                     .gap_1()
                     .tooltip(Tooltip::text(title.clone()))
-                    .child(icon.size(IconSize::XSmall))
                     .child(
-                        Label::new(tool_verb(title))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .single_line()
-                            .truncate(),
+                        Label::new(if failed {
+                            format!("{} failed", tool_verb(title))
+                        } else {
+                            tool_verb(title)
+                        })
+                        .size(LabelSize::Small)
+                        .color(if failed { Color::Error } else { Color::Muted })
+                        .single_line()
+                        .truncate(),
                     )
+                    .when(running, |row| {
+                        row.child(
+                            Icon::new(IconName::ArrowCircle)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted)
+                                .with_rotate_animation(2),
+                        )
+                    })
                     .into_any_element()
             }
             _ => div().into_any_element(),

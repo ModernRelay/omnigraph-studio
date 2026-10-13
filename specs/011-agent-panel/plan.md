@@ -127,8 +127,9 @@ Rendered in order, as Delta's thread reads: the person's messages with their mar
 replies as markdown, with the agent's mark once per turn rather than on every chunk; each run of
 tool calls and thoughts folded into one muted line that says what happened ("Thought 1 time,
 read the schema, ran 2 queries", then "· 1 failed" in the error colour when a call failed), with
-a turning arrow while a step runs and a chevron that opens the steps (each call's state and
-name, each thought's text) under a hairline; the plan as a list with each entry's status. Steps
+a turning arrow while a step runs and a chevron that opens the steps under a hairline: each
+call by name, with no mark when it went well, a turning arrow while it runs and "… failed" in
+the error colour, and each thought's text; the plan as a list with each entry's status. Steps
 of a turn sit 12 px apart and a new question opens 16 px more. Other updates are ignored. A
 banner above the composer shows "`agent/<stamp>` · N changes · **Review**" after the first
 committed change; Review switches the session to the agent branch and opens spec 008's review.
@@ -240,7 +241,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 | 2026-10-12 | A conversation comes back after a restart | `agent_panel` `a_session_is_kept_per_graph_and_agent`; offscreen snapshots with the test agent (now with `loadSession` and a transcript per session): ask, close, reopen the Agent tab; then ↻ | The question and the markdown reply replayed with "Resumed the last conversation"; after ↻ the panel cleared and `sessions.json` held a new session id |
 | 2026-10-12 | Zed's agent offers the model through ACP session options and shows context from `usage_update` | Read `agent_ui/src/config_options.rs`, `agent_servers/src/acp.rs` (`set_config_option`) and `thread_view.rs` (`render_token_usage`) at `v1.23.2`, and `SessionConfigOption`, `UsageUpdate` in `agent-client-protocol-schema` 1.9.1 | One picker per option in the agent's order, the current value's name with a chevron; the response to `session/set_config_option` replaces every option; a 16 px ring, warning colour from 85 %, used, size and cost on hover |
 | 2026-10-12 | The footer shows the agent's options and how full its context is | Offscreen snapshots with the test agent (now offering a mode and a grouped model, taking `session/set_config_option`, reporting usage after each turn): ask, open the model menu, pick Claude Opus, ↻, hover the ring | "Ask before changes ▾", "Claude Sonnet ▾", then a ring with "21%"; the menu showed the Claude and Local groups with Sonnet checked; after ↻ the new session showed Claude Opus and no ring; the tooltip read "21% of the context window · 42k of 200k tokens · 0.14 USD so far"; `preferences.json` held `"model": "opus"`, mode `0600` |
-| 2026-10-12 | The footer and thread read like Delta's | Offscreen snapshots with the test agent offering Claude's five options: two questions, open a run, open ⋯ | Footer: ring, "Ask before changes", "High", ⋯, "Claude Opus" with the Anthropic mark, ↻, send (filled with text in the composer); ⋯ held Fast mode and Agent (Default checked); each turn showed one agent mark and "Read the schema ›", "Ran 1 query ›", the first opening to "✓ Read the schema" |
+| 2026-10-12 | The footer and thread read like Delta's | Offscreen snapshots with the test agent offering Claude's five options: two questions, open a run, open ⋯ | Footer: ring, "Ask before changes", "High", ⋯, "Claude Opus" with the Anthropic mark, ↻, send (filled with text in the composer); ⋯ held Fast mode and Agent (Default checked); each turn showed one agent mark and "Read the schema ›", "Ran 1 query ›", the first opening to "Read the schema" |
 
 ## Corrections
 
