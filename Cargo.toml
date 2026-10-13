@@ -85,6 +85,9 @@ omnigraph-compiler = { git = "https://github.com/ModernRelay/omnigraph", tag = "
 # Third party
 anyhow = "1"
 futures = "0.3"
+getrandom = "0.3"
+httparse = "1"
+percent-encoding = "2"
 # The Agent Client Protocol at the version Zed v1.23.2 pins; stable v1 only (spec 011).
 agent-client-protocol = "=2.2.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

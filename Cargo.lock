@@ -183,12 +183,17 @@ dependencies = [
  "chrono",
  "editor",
  "futures",
+ "getrandom 0.3.4",
  "gpui",
  "gq_language",
  "graph_client",
  "graph_store",
+ "http_client",
+ "httparse",
  "markdown",
  "menu",
+ "percent-encoding",
+ "reqwest_client",
  "serde",
  "serde_json",
  "smol",
@@ -197,6 +202,7 @@ dependencies = [
  "studio_ui",
  "studio_workspace",
  "ui",
+ "url",
 ]
 
 [[package]]

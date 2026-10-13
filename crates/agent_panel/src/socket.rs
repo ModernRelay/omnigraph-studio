@@ -107,22 +107,33 @@ impl ToolSocket {
     }
 
     /// Serves connections until the returned future is dropped.
+    /// `instructions` are this conversation's, appended to the server's in `initialize`.
     pub fn serve(
         &mut self,
         tools: mpsc::UnboundedSender<ToolRequest>,
+        instructions: String,
     ) -> impl Future<Output = ()> + Send + 'static {
         let listener = self.listener.take();
+        let instructions: std::sync::Arc<str> = instructions.into();
         async move {
             let Some(listener) = listener else { return };
             let mut connections = Vec::new();
             while let Ok((stream, _)) = listener.accept().await {
-                connections.push(smol::spawn(serve_connection(stream, tools.clone())));
+                connections.push(smol::spawn(serve_connection(
+                    stream,
+                    tools.clone(),
+                    instructions.clone(),
+                )));
             }
         }
     }
 }
 
-async fn serve_connection(stream: UnixStream, tools: mpsc::UnboundedSender<ToolRequest>) {
+async fn serve_connection(
+    stream: UnixStream,
+    tools: mpsc::UnboundedSender<ToolRequest>,
+    instructions: std::sync::Arc<str>,
+) {
     let (replies_tx, mut replies_rx) = mpsc::unbounded::<Value>();
     let mut writer = stream.clone();
     let write = smol::spawn(async move {
@@ -142,7 +153,7 @@ async fn serve_connection(stream: UnixStream, tools: mpsc::UnboundedSender<ToolR
         if line.trim().is_empty() {
             continue;
         }
-        match mcp::handle(&line) {
+        match mcp::handle(&line, &instructions) {
             Incoming::Reply(reply) => {
                 replies_tx.unbounded_send(reply).ok();
             }

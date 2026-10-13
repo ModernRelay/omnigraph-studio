@@ -19,6 +19,11 @@ pub fn definitions() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
         }),
         json!({
+            "name": "omnigraph_cli",
+            "description": "This conversation's omnigraph CLI: the path to run, the flags every command takes, your branch, and the rules for writing. Prefer the CLI to the other tools when it is available.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+        }),
+        json!({
             "name": "omnigraph_branches",
             "description": "The graph's branches, marking the person's branch and yours.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
@@ -60,6 +65,7 @@ pub fn definitions() -> Vec<Value> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolCall {
     Schema,
+    Cli,
     Branches,
     Query {
         query: String,
@@ -101,6 +107,7 @@ impl ToolCall {
         };
         match name {
             "omnigraph_schema" => Ok(Self::Schema),
+            "omnigraph_cli" => Ok(Self::Cli),
             "omnigraph_branches" => Ok(Self::Branches),
             "omnigraph_query" => Ok(Self::Query {
                 query: required("query")?,

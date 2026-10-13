@@ -2,7 +2,9 @@
 //!
 //! It speaks ACP v1 on stdio, starts the MCP server Studio names in `session/new` (Studio's
 //! `mcp-proxy`), and on every prompt reads the schema and counts `Person` nodes. When the prompt
-//! contains "change", it also proposes retitling the first person and reports the outcome.
+//! contains "change", it also proposes retitling the first person and reports the outcome. When
+//! it contains "cli", it asks Studio for the conversation's omnigraph CLI and retitles a person
+//! on its own branch with it (spec 013).
 //!
 //! One process serves every session Studio opens with it. It keeps each session's transcript in
 //! the session's working directory and supports `session/load` (replaying the messages),
@@ -650,6 +652,87 @@ async fn turn(
             None,
         );
         say(connection, session, &format!("\n\nChange: {outcome}"));
+    }
+
+    // "cli" uses the conversation's omnigraph CLI (spec 013): it asks Studio for the command,
+    // creates its branch, and retitles a person with the real CLI through Studio's gateway.
+    if prompt.contains("cli") {
+        let (info, error) = mcp.call("omnigraph_cli", json!({})).await?;
+        if error {
+            say(connection, session, &format!("\n\nNo CLI: {info}"));
+            return Ok(());
+        }
+        let after = |marker: &str, end: &[char]| -> Option<String> {
+            let rest = info.split(marker).nth(1)?;
+            Some(rest.split(end).next()?.trim().to_owned())
+        };
+        let command = after("omnigraph CLI is ", &['(']).ok_or("no command in the instructions")?;
+        let branch = after("Write only to your branch, ", &[':']).ok_or("no branch")?;
+        let base = after("--from ", &[' ']).ok_or("no base")?;
+        let graph = after("--graph ", &[' ']).ok_or("no graph")?;
+        let run = |args: Vec<String>| {
+            let command = command.clone();
+            async move {
+                let output = smol::process::Command::new(&command)
+                    .args(&args)
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(if output.status.success() {
+                    "ok".to_owned()
+                } else {
+                    String::from_utf8_lossy(&output.stderr)
+                        .lines()
+                        .find(|line| line.contains("Studio") || line.contains("rror"))
+                        .unwrap_or("failed")
+                        .trim()
+                        .to_owned()
+                })
+            }
+        };
+        let target = |mut args: Vec<String>| {
+            args.extend([
+                "--server".into(),
+                "studio".into(),
+                "--graph".into(),
+                graph.clone(),
+            ]);
+            args
+        };
+        let created = run(target(vec![
+            "branch".into(),
+            "create".into(),
+            branch.clone(),
+            "--from".into(),
+            base.clone(),
+        ]))
+        .await?;
+        let changed = run(target(vec![
+            "mutate".into(),
+            "--branch".into(),
+            branch.clone(),
+            "-e".into(),
+            "query retitle() { update Person set { title: \"Retitled through the CLI\" } where @id = \"person-000002\" }".into(),
+        ]))
+        .await?;
+        let refused = run(target(vec![
+            "mutate".into(),
+            "--branch".into(),
+            base.clone(),
+            "-e".into(),
+            "query retitle() { update Person set { title: \"x\" } where @id = \"person-000002\" }"
+                .into(),
+        ]))
+        .await?;
+        say(
+            connection,
+            session,
+            &format!(
+                "\n\nWith the CLI: created {branch}: {created}; retitled on it: {changed}; on \
+                 {base}: {refused}"
+            ),
+        );
     }
     Ok(())
 }

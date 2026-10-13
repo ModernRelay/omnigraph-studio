@@ -14,12 +14,16 @@ anyhow = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 editor = { workspace = true }
 futures = { workspace = true }
+getrandom = { workspace = true }
 gpui = { workspace = true }
+url = { workspace = true }
 gq_language = { workspace = true }
+httparse = { workspace = true }
 graph_client = { workspace = true }
 graph_store = { workspace = true }
 # Zed's markdown renderer for agent replies; `editor` already builds it.
 menu = { workspace = true }
+percent-encoding = { workspace = true }
 markdown = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -32,6 +36,8 @@ ui = { workspace = true }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+http_client = { workspace = true }
+reqwest_client = { workspace = true }
 
 [lints]
 workspace = true

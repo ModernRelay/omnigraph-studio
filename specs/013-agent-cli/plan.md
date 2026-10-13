@@ -1,6 +1,6 @@
 # 013: The agent uses the OmniGraph CLI
 
-Status: draft · 2026-10-13
+Status: first slice implemented · 2026-10-13
 
 ## Problem
 
@@ -106,127 +106,119 @@ Agents (claude-agent-acp 0.89.1 with Claude Agent SDK 0.3.293; codex-acp 2.2.2 w
 
 | Piece | Where | Role |
 |---|---|---|
-| Gateway | `crates/agent_panel/src/gateway.rs` | A loopback HTTP server per agent session. Checks the session token and the contract, applies the sandbox rules, and forwards through `graph_client` |
-| Raw forwarding | `crates/graph_client` | `forward(method, path, query, headers, body stream) -> response stream` with the person's token, and the contract header added and checked. The one client crate keeps every request (I) |
-| Session home | `<cwd>/.omnigraph/` | The `OMNIGRAPH_HOME` the agent's CLI reads |
-| Launcher wrapper | `crates/agent_panel/src/host.rs` | Starts the agent with a clean environment |
-| Instructions | `<cwd>/AGENTS.md` | How to reach the graph, read by Claude and Codex |
+| Forwarding | `GraphClient::forward` (`crates/graph_client/src/client.rs`) | Sends a request on as it came, with the person's token and the contract header. Bodies stream both ways, no total timeout, never retried, and a path that would leave the server root is refused. The one client crate keeps every request (I) |
+| Rules | `crates/agent_panel/src/gateway_rules.rs` | `classify(request, sandbox) -> Verdict`: health, read, read with a rewritten body, a write for the agent's branch, or a refusal |
+| Gateway | `crates/agent_panel/src/gateway.rs` | A loopback HTTP/1.1 server per conversation (`127.0.0.1:0`, one request per connection). Checks the session token and contract header, applies the rules, forwards, and reports writes to the panel |
+| CLI home | `crates/agent_panel/src/cli_home.rs` | The conversation's directory, config, credentials and wrapper; the shared `AGENTS.md`; finding a CLI that answers |
+| Panel | `crates/agent_panel/src/panel.rs` | Starts the gateway and home with the conversation, shows each write as a card, and records outcomes in the session's write log (`GraphSession::note_write`) |
+| Agent launch | `crates/agent_panel/src/host.rs` | Starts the agent without OmniGraph credentials in its environment |
 
-### The session home
+### One directory per conversation
 
-Written when the session starts, in a directory with mode `0700`:
+A graph's conversations share one agent process and one working directory
+(`<data dir>/agent/graphs/<graph>/`), so nothing per conversation can travel in the agent's
+environment or in one instructions file. Each conversation gets
+`<cwd>/.studio/<agent branch with / as ->/` (mode `0700`):
 
 ```yaml
-# <cwd>/.omnigraph/config.yaml
+# config.yaml (0600)
 servers:
-  studio: { url: "http://127.0.0.1:<port>" }
+  studio: { url: "http://127.0.0.1:<gateway port>" }
 defaults:
   server: studio
-  default_graph: <graph id>
+  default_graph: "<graph id>"
 ```
 
 ```ini
-# <cwd>/.omnigraph/credentials, mode 0600
+# credentials (0600), removed when the conversation ends
 [studio]
-token = <32 random bytes, base64url>
+token = <32 random bytes as hex>
 ```
 
-The token lives in a file, not in the environment, because Codex may strip variable names
-containing `TOKEN`. It is valid only for this gateway and this session, and it dies with them.
-It is never the person's token. The agent's environment gets `OMNIGRAPH_HOME=<cwd>/.omnigraph`
-and `NO_PROXY=127.0.0.1,localhost`.
+`omnigraph` (`0700`) is a wrapper: it unsets every `OMNIGRAPH_TOKEN_*`,
+`OMNIGRAPH_BEARER_TOKEN`, `OMNIGRAPH_PROFILE` and `OMNIGRAPH_CONTROL_*`, sets `OMNIGRAPH_HOME` to
+the directory, puts `127.0.0.1,localhost` in `NO_PROXY`, and runs the chosen CLI. The agent runs
+it by absolute path, so neither Codex's environment filter (it may drop names like `*TOKEN*`)
+nor a shell snapshot that reorders PATH can change what the CLI reads.
+
+The agent learns the path two ways: the conversation's MCP server adds it to its `initialize`
+instructions, and a new `omnigraph_cli` tool returns it with the branch, its base and the rules.
+`<cwd>/AGENTS.md`, shared by the graph's conversations, gives the rules and says where to find
+the command. Codex reads `AGENTS.md`; Claude reads it when there is no `CLAUDE.md`.
 
 ### The agent's environment
 
-Studio starts the agent through `/usr/bin/env` with explicit unsets, because the ACP crate
-cannot remove variables. It removes every `OMNIGRAPH_TOKEN_*`, `OMNIGRAPH_BEARER_TOKEN`,
-`OMNIGRAPH_PROFILE`, `OMNIGRAPH_CONTROL_*`, `AWS_*`, `AZURE_*` and `GOOGLE_APPLICATION_CREDENTIALS`
-variable present in Studio's environment. The person's model-provider keys pass through, since
-the agent needs them. This closes the gap where the agent inherited the person's graph tokens
-today.
+The agent process is started through `/usr/bin/env -u …` because the ACP crate can add variables
+but not remove them. It removes `OMNIGRAPH_TOKEN_*`, `OMNIGRAPH_BEARER_TOKEN`,
+`OMNIGRAPH_PROFILE`, `OMNIGRAPH_HOME`, `OMNIGRAPH_CONTROL_TOKEN`, `OMNIGRAPH_CONTROL_API` and
+`OMNIGRAPH_STUDIO_TOKEN` when Studio holds them, unless `agent.env` sets them. Cloud variables
+(`AWS_*`, `AZURE_*`, Google's) stay: the agent may need them for its model, as Claude Code on
+Bedrock does. This closes the gap where the agent inherited the person's graph tokens.
 
 ### Choosing the CLI
 
-1. A configured path (`agent.omnigraph_cli`), else `omnigraph` on PATH, else `~/.local/bin`,
-   then `/opt/homebrew/bin`.
-2. Each candidate is tested once, with `omnigraph snapshot --server <gateway> --graph <id> --json`
-   in the session environment, and the result is kept per path, size and modification time.
-   With `omnigraph version --json` (E23), the check reads `http_contract` instead.
-3. The first candidate that answers is written into `AGENTS.md` by absolute path. Codex's shell
-   snapshot may reorder PATH, so the path, not a PATH entry, is what the agent is told.
-4. If none answers, the panel says: "This graph speaks OmniGraph API 0.13. Install omnigraph
-   0.13 to let the agent use the CLI." The agent still has the read tools of spec 011.
+1. `agent.omnigraph_cli` (in `settings.json`), then each `omnigraph` on PATH, then
+   `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`, without duplicates.
+2. Each is tried through the conversation's gateway with
+   `omnigraph snapshot --server studio --graph <id> --json`, bounded to 20 s. The first that
+   answers stays in the wrapper. With `omnigraph version --json` (E23) this can read the contract
+   instead.
+3. If none answers, a notice in the thread names the API the graph speaks and the setting, and
+   the `omnigraph_cli` tool says the CLI is unavailable. The agent keeps the graph tools.
 
 ### Gateway rules
 
-The gateway answers `HEAD /healthz` itself, with one header for the upstream's contract and no
-body. It never adds a second header to a forwarded response. A request with a missing or
-different `omnigraph-http-api` value gets a 400 `api_contract_mismatch` that names the CLI to
-use. A wrong or missing session token gets a 401.
+The gateway answers `GET`/`HEAD /healthz` itself with one contract header, before the token
+check, as the CLI probes with no token. Every other request needs the session token (else 401)
+and exactly one `omnigraph-http-api: 0.13` (else 400 `api_contract_mismatch`, naming the CLI to
+use). Request bodies are read whole, at most 64 MiB (413 above, before anything is sent).
 
 | Request | Rule |
 |---|---|
-| `GET`/`HEAD` routes, `POST /query`, `POST /export`, `POST /changes/baseline`, `GET /schema`, `GET /snapshot`, `GET /commits…`, `GET /branches`, Blob `GET`/`HEAD` | Forward, any branch or snapshot |
-| `POST /mutate`, `POST /mutate/if-graph-commit` | Forward only when `branch` is the session's agent branch. Refuse `branch: null` (statement mutations) |
-| `POST /load/ndjson`, `POST /load` | Forward only when `branch` is the agent branch. `from` is allowed only while the agent branch does not exist yet, and must be the session's base branch |
-| `PUT`/`DELETE /blob` | Forward only when `branch` is the agent branch |
-| `POST /branches` | Forward only `{name: <agent branch>, from: <base>}` |
-| `DELETE /branches/{name}` | Forward only the agent branch |
-| `POST /branches/merge` | Forward only when `target` is the agent branch, so the agent can merge `main` in. `delete_branch: true` only when `source` is also the agent branch |
-| `POST /queries/{name}` | Forward with `expect_mutation: false` unless `branch` is the agent branch |
-| `POST /commits/{id}/publish`, `DELETE /commits/{id}` | Refuse |
-| Anything else | Refuse |
+| `GET`/`HEAD` anything; `POST /query`, `/export`, `/changes/baseline` | Forward, any graph, branch or snapshot; the answer streams back |
+| `POST /mutate`, `/mutate/if-graph-commit` | Only when `branch` is the agent branch. `branch: null` (branch and commit statements) is refused |
+| `POST /load/ndjson`, `/load` | Only when `branch` is the agent branch; `from`, when given, must be the base (it creates the branch) |
+| `PUT`/`DELETE /blob` | Only when `branch` is the agent branch |
+| `POST /branches` | Only `{name: <agent branch>, from: <base>}` |
+| `DELETE /branches/{name}` | Only the agent branch |
+| `POST /branches/merge` | Only into the agent branch, and never with `delete_branch: true` |
+| `POST /queries/{name}` | On the agent branch, a write; elsewhere forwarded with `expect_mutation: false` |
+| `POST /commits/{id}/publish`, `DELETE /commits/{id}`, non-`GET` `/cluster/…`, anything else | Refused |
 
-A refusal is a 403 `{"error": "...", "code": "forbidden"}` with the contract header. Its message
-says what the agent may do instead, for example: "Studio: the agent writes only to
-`agent/20261013-101500`. Pass `--branch agent/20261013-101500`." Until E22, the CLI reports
-these refusals as `effects: unknown`. `AGENTS.md` tells the agent that a Studio refusal never
-wrote anything.
+Writes are checked on the conversation's graph only. A refusal is a 403 `ErrorOutput` with
+`code: forbidden` and the contract header; its message ends "Nothing was sent." and says what to
+do instead. Until E22, the CLI still reports it as `effects: unknown`; `AGENTS.md` says a Studio
+refusal never wrote anything.
 
-The agent branch is chosen as in spec 011 (`agent/<YYYYMMDD-HHMMSS>` from the person's branch).
-The gateway also lets the agent create it, so a `load --from` or `branch create` is how it
-starts.
+A forwarded write's answer is read whole (at most 8 MiB) so the card can show it, then sent on.
+When the server's answer is lost, the gateway closes the connection without one, and the CLI
+reports the outcome as unknown, as it is.
 
-### Approval
+### Cards and approval
 
-- **Sandbox** (default): writes to the agent branch are forwarded at once. Each one is a card
-  in the thread showing the command's route, the branch, and the outcome Studio saw (spec 011's
-  three outcomes). Merging into `main` stays the person's, in review (spec 008).
-- **Ask before writes**: the gateway holds each write until the person allows or rejects it on
-  its card. The CLI has no client timeout, so a held request waits. Checked by holding a
-  mutation 150 s, which then committed. A rejection is a 403 sent before forwarding.
+Each write is a card in the thread, like a proposal: the summary ("Mutation", "Load (append)
+into …", "Create … from main"), the query when there is one, the branch, and the outcome:
+Committed with the commit and the change count, Done or "Branch created" for a write without a
+commit, Refused with the server's message, or Outcome unknown. A committed write is logged in the
+session (the workspace's "Agent CLI: … committed" notice) and the agent branch banner counts it.
 
-The mode is a toggle in the panel's footer, kept per conversation.
+- **Sandbox** (default): writes to the agent branch go through at once.
+- **Ask before writes** (`agent.ask_before_writes` in `settings.json`): each write waits on its
+  card with Allow (⌘Y), Always on this branch (⌘⌥Y) and Reject (⌘⌥N). The CLI waits, since it has
+  no timeout. Reject answers 403 and nothing is sent.
 
 ### Codex
 
-Codex's default sandbox blocks loopback, so its `omnigraph` calls cannot reach the gateway.
-Studio shows this once per Codex conversation: "Codex runs commands without network access, so
-it can't reach the graph through the CLI. Give it network access for this conversation, or keep
-using the graph tools." Giving it network access sets the codex-acp session to workspace-write
-with network enabled. That opens all network, not only the gateway, which is why the person
-chooses. A Unix-socket gateway (E24) would let the sandbox allow one socket instead.
+Codex's default sandbox blocks loopback, so its CLI calls fail with "server discovery connection
+failed". `AGENTS.md` tells the agent what that means: tell the person, and use the graph tools.
+Giving Codex network access (a codex-acp mode with network) lets it through, and opens all
+network, so it stays the person's choice. E24 would let the sandbox allow one socket instead.
 
 ### The MCP tools
 
-The tools of spec 011 stay for agents that cannot reach the gateway, Codex without network
-among them. Once a conversation's CLI answers, `omnigraph_query` and `omnigraph_propose_change`
-are left out of its tool list. `omnigraph_schema` and `omnigraph_branches` stay as cheap
-context. When every supported agent reaches the gateway, the tools and the `mcp-proxy`
-subcommand are removed.
-
-### AGENTS.md
-
-Written at session start and rewritten when the agent branch is created:
-
-- the graph, the server name `studio`, the agent branch, and the base branch;
-- the CLI's absolute path, with explicit `--server studio --graph <id>` in every example, so a
-  `.omnigraph/context` in another folder is never used;
-- reads anywhere; writes only with `--branch <agent branch>`;
-- batch writes with `load`, because one load of many rows costs about one commit while each
-  `mutate` is a commit of its own;
-- "A Studio refusal never wrote anything. An `effects: unknown` from a write Studio forwarded
-  means the server's answer was lost; check `commit list` before retrying."
+The tools of spec 011 stay: they are the path for agents without network, and
+`omnigraph_cli` is new. When every supported agent reaches the gateway, the query and propose
+tools and the `mcp-proxy` subcommand can go.
 
 ## Decisions
 
@@ -236,7 +228,9 @@ Written at session start and rewritten when the agent branch is created:
 | Studio holds the person's token; the agent gets a session token for the gateway only | Give the agent the person's token; mint a server token for the agent | The person's token could write `main` and every branch. 0.13 cannot mint a narrower credential: credentials carry no grants, and branch scopes cannot name a branch (E20) |
 | The gateway classifies writes by structured fields and refuses what it cannot classify | Parse statement mutations with `gq_language` | Statement targets live in query text, `commit publish/drop` names no branch, and stored-query mutability is the server's. A second parser of the write language could drift from the engine's. Refusing keeps the gateway closed by default; the agent uses the structured commands instead |
 | Session token in a 0600 file | An environment variable | Codex's environment filter matches names like `*TOKEN*` |
-| The CLI's absolute path in `AGENTS.md` | A PATH entry Studio prepends | Codex's shell snapshot may reorder PATH; Claude keeps it |
+| A wrapper per conversation, run by absolute path | Environment variables and a PATH entry on the agent process; one `AGENTS.md` naming the command | The agent process and working directory are shared by the graph's conversations, so per-conversation values cannot live there. Codex's shell snapshot may reorder PATH and its filter may drop `*TOKEN*` names |
+| Remove only OmniGraph's variables from the agent's environment | Also remove `AWS_*`, `AZURE_*`, Google credentials | The agent may need them for its model provider |
+| Request bodies read whole, at most 64 MiB; answers to reads stream | Stream request bodies too | The rules need small JSON bodies whole; a load larger than 64 MiB is refused before sending, which bounds memory (IX) |
 | The gateway passes the upstream contract through and refuses a CLI that speaks another | Translate between contracts | The contract is an exact-match safety property. A translation layer would be a second API that drifts |
 | Studio tests each CLI once against the gateway | Map package versions to contracts | The package version does not determine the contract; a real request does, until E23 |
 | Codex gets network only when the person allows it | Always enable it; always refuse the CLI to Codex | Enabling it opens all network; refusing it gives up the CLI where the person accepts the risk |
@@ -277,5 +271,23 @@ CLI is the one they trust).
 | 2026-10-13 | Destructive commands need `--yes` with no terminal, even on loopback | `branch delete gw-probe < /dev/null` | Refused, `not_started`; `--yes` deleted it |
 | 2026-10-13 | Codex's sandbox blocks loopback | `codex sandbox` (0.160.1, a throwaway `CODEX_HOME`) running `curl http://127.0.0.1:8790/healthz` | Default: no connection, `CODEX_SANDBOX_NETWORK_DISABLED=1`. Workspace-write without network: none. With `sandbox_workspace_write.network_access=true`: 200. Danger-full-access: 200 |
 | 2026-10-13 | A `unix://` server is not a server address today | `omnigraph query --server unix:///tmp/x.sock …` | `storage_root_invalid … unsupported storage URI scheme 'unix'` (E24) |
+| 2026-10-13 | Forwarding keeps Studio's credentials and stays under the root | `graph_client` `a_forward_carries_studios_credentials_and_stays_under_the_root` | Token and contract added, the caller's content type and body kept, the answer streamed; `/…`, `../`, `graphs/../..`, a full URL and a backslash refused before sending |
+| 2026-10-13 | The rules classify every route the CLI uses | `agent_panel` `gateway_rules` tests (5) | Reads anywhere; mutate, load, Blob, branch, merge and stored-query writes only on the agent branch; statements, other branches, other graphs, commit publish/drop and cluster changes refused; a stored query elsewhere gets `expect_mutation: false` |
+| 2026-10-13 | The gateway checks the session, then forwards reads and approved writes | `agent_panel` `the_gateway_checks_the_session_then_forwards_reads_and_approved_writes` (real loopback sockets, a fake upstream) | Health without a token; 401 for a wrong token and 400 for no contract, nothing sent; a read forwarded with the person's token; a write to main refused; a rejected write not sent; an approved write sent once, its commit reported; a chunked body decoded |
+| 2026-10-13 | A conversation's home holds its config, token and wrapper | `agent_panel` `a_conversation_home_holds_its_config_token_and_wrapper` | Modes `0700`/`0600`; the wrapper unsets other OmniGraph tokens, prefixes `NO_PROXY`, sets `OMNIGRAPH_HOME`, quotes paths; the token is removed with the conversation |
+| 2026-10-13 | The agent starts without OmniGraph credentials | `agent_panel` `the_agent_starts_without_omnigraph_credentials` | OmniGraph tokens, profile, home and Studio's token are removed unless `agent.env` sets them; `ANTHROPIC_API_KEY` and `AWS_PROFILE` stay |
+| 2026-10-13 | The stock CLI reads and writes its branch through the real gateway | `agent_panel` `the_stock_cli_reads_and_writes_its_branch_through_the_gateway` (ignored; run with `STUDIO_GATEWAY_E2E_*` against `script/dev-server` and `~/.local/bin/omnigraph` 0.13.0) | Passed: a read on main; mutate on main and a branch statement refused; branch create, a mutation (1 node) and a load on the agent branch; a merge into main refused; the branch deleted |
+| 2026-10-13 | The panel shows the agent's CLI writes | Offscreen snapshots with the test agent, which now uses `omnigraph_cli` and the real CLI on "cli" | "Create agent/… from main · Branch created", "Mutation · Committed" with the commit and 1 change, the refusal on main ending "Nothing was sent", the workspace's "Agent CLI: Mutation · committed" notice and the branch banner with Review. With `ask_before_writes`, each card waited with Allow, Always and Reject, and committed after Allow |
 
 ## Corrections
+
+- 2026-10-13 · The draft put the session home in `<cwd>/.omnigraph/` and passed `OMNIGRAPH_HOME`
+  in the agent's environment. A graph's conversations share one agent process and one working
+  directory, so that would have mixed conversations' gateways and branches. Each conversation now
+  has its own directory and a wrapper run by absolute path.
+- 2026-10-13 · The draft removed `AWS_*`, `AZURE_*` and Google credentials from the agent's
+  environment. An agent may need them for its model provider, so only OmniGraph's variables are
+  removed.
+- 2026-10-13 · The draft made "Ask before writes" a footer toggle and dropped the query tools once
+  the CLI answered. The first slice has a setting, and keeps every tool; MCP has no way to drop a
+  tool mid-session without `listChanged`.

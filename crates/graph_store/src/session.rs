@@ -710,6 +710,37 @@ impl GraphSession {
         Self::to_outcome(work, cx)
     }
 
+    /// Records a write sent on the person's behalf outside this session's own calls, as the
+    /// agent's CLI writes through Studio's gateway (spec 013): logged with Studio's own
+    /// writes, and views of the branch learn of the commit. `branch_created` reads the branch
+    /// list again.
+    pub fn note_write(
+        &mut self,
+        branch: String,
+        description: String,
+        outcome: OutcomeKind,
+        branch_created: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let committed = matches!(&outcome, OutcomeKind::Committed { commit: Some(_) });
+        self.outcomes.push(OutcomeEntry {
+            at: SystemTime::now(),
+            branch: branch.clone(),
+            description,
+            outcome,
+        });
+        if committed {
+            self.reload_counts(cx);
+            self.commit_lists.forget(&branch);
+            cx.emit(SessionEvent::Committed { branch });
+        }
+        if branch_created {
+            self.reload_branches(cx);
+        }
+        cx.emit(SessionEvent::ActivityChanged);
+        cx.notify();
+    }
+
     fn finish_write(
         &mut self,
         branch: String,

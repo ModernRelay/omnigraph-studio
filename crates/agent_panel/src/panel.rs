@@ -21,7 +21,7 @@ use gpui::{
 use gq_language::QueryInfo;
 use graph_client::WriteOutcome;
 use graph_client::api::{ChangeOutput, ChangeRequest, QueryRequest};
-use graph_store::GraphSession;
+use graph_store::{GraphSession, OutcomeKind};
 use serde_json::{Map, Value};
 use studio_actions::agent::{Allow, AllowAlways, ClearQueue, Reject, Restart, Send, SendNow, Stop};
 use studio_actions::graph::ReviewBranch;
@@ -34,6 +34,9 @@ use ui::{
     PopoverMenu, Severity, Tooltip,
 };
 
+use crate::cli_home::{self, CliHome};
+use crate::gateway::{Gateway, GatewayEvent, Seen};
+use crate::gateway_rules::{Sandbox, WriteSummary};
 use crate::host::{AgentLaunch, HostCommand, HostEvent, Opened, SessionLaunch};
 use crate::sessions::{AgentSessions, Live, SessionRecord};
 use crate::socket::{ToolRequest, ToolSocket};
@@ -166,6 +169,8 @@ enum ProposalState {
     Refused(String),
     Unknown,
     Rejected,
+    /// A write that made no commit of its own went through, such as creating a branch.
+    Done(String),
 }
 
 struct Proposal {
@@ -280,6 +285,10 @@ fn hash_entry(entry: &Entry, hasher: &mut impl std::hash::Hasher) {
                 }
                 ProposalState::Unknown => 4u8.hash(hasher),
                 ProposalState::Rejected => 5u8.hash(hasher),
+                ProposalState::Done(label) => {
+                    6u8.hash(hasher);
+                    label.hash(hasher);
+                }
             }
         }
         Entry::Notice { text, error } => {
@@ -351,6 +360,8 @@ struct Host {
     /// Keeps the agent's process running while this conversation is open.
     _connection: std::sync::Arc<crate::connection::AgentConnection>,
     _socket: ToolSocket,
+    /// The conversation's CLI home (spec 013); its session token goes with it.
+    cli_home: Option<std::sync::Arc<CliHome>>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -400,6 +411,12 @@ pub struct AgentPanel {
     /// Query calls whose card is folded away, by entry.
     folded_queries: std::collections::HashSet<usize>,
     queue: MessageQueue,
+    /// Whether a CLI that speaks the graph's API was found for this conversation (spec 013);
+    /// `None` while Studio looks.
+    cli_ready: Option<bool>,
+    /// The card of each write the gateway forwards, by the gateway's id: the entry, whether
+    /// the write creates the agent's branch, and its summary.
+    gateway_cards: std::collections::HashMap<u64, (usize, bool, String)>,
 }
 
 impl EventEmitter<ItemEvent> for AgentPanel {}
@@ -583,6 +600,8 @@ impl AgentPanel {
             expanded_activity: std::collections::HashSet::new(),
             folded_queries: std::collections::HashSet::new(),
             queue: MessageQueue::default(),
+            cli_ready: None,
+            gateway_cards: std::collections::HashMap::new(),
         };
         panel.sync_setup_state(cx);
         panel
@@ -677,6 +696,57 @@ impl AgentPanel {
         });
         self.always_allow = false;
 
+        // The agent's omnigraph CLI (spec 013): a gateway for this conversation, and a home that
+        // points the CLI at it. Without them the agent still has the tools.
+        let (agent_branch, agent_base) = self
+            .branch
+            .as_ref()
+            .map(|branch| (branch.name.clone(), branch.base.clone()))
+            .unwrap_or_default();
+        let graph = self.session.read(cx).graph_id.clone();
+        let (gateway_tx, mut gateway_rx) = mpsc::unbounded::<GatewayEvent>();
+        self.cli_ready = None;
+        self.gateway_cards.clear();
+        let gateway = Gateway::bind().and_then(|mut gateway| {
+            let home = CliHome::write(
+                &cwd,
+                gateway.port,
+                &gateway.token,
+                &graph,
+                &agent_branch,
+                &agent_base,
+            )?;
+            cli_home::write_agents_md(&cwd, &graph)?;
+            let serve = gateway.serve(
+                self.session.read(cx).client(cx),
+                Sandbox {
+                    graph: graph.clone(),
+                    branch: agent_branch.clone(),
+                    base: agent_base.clone(),
+                },
+                gateway_tx,
+            );
+            Ok((std::sync::Arc::new(home), serve))
+        });
+        let (cli_home, gateway_serve) = match gateway {
+            Ok((home, serve)) => (Some(home), Some(serve)),
+            Err(error) => {
+                self.cli_ready = Some(false);
+                self.entries.push(Entry::Notice {
+                    text: format!(
+                        "Studio could not set up the omnigraph CLI for this conversation \
+                         ({error}). The agent can still use the graph tools."
+                    ),
+                    error: true,
+                });
+                (None, None)
+            }
+        };
+        let instructions = cli_home
+            .as_ref()
+            .map(|home| home.instructions(None))
+            .unwrap_or_default();
+
         self.cwd = Some(cwd.clone());
         let launch = SessionLaunch {
             cwd,
@@ -703,7 +773,33 @@ impl AgentPanel {
             return;
         }
 
-        let serve = cx.background_spawn(socket.serve(tools_tx));
+        let serve = cx.background_spawn(socket.serve(tools_tx, instructions));
+        let mut tasks = Vec::new();
+        if let Some(gateway_serve) = gateway_serve {
+            tasks.push(cx.background_spawn(gateway_serve));
+        }
+        tasks.push(cx.spawn(async move |this, cx| {
+            while let Some(event) = gateway_rx.next().await {
+                if this
+                    .update(cx, |this, cx| this.apply_gateway(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+        if let Some(home) = cli_home.clone() {
+            let configured = settings.omnigraph_cli.clone();
+            tasks.push(cx.spawn(async move |this, cx| {
+                let chosen = cx
+                    .background_spawn(async move {
+                        let candidates = cli_home::candidates(configured.as_deref());
+                        cli_home::choose_cli(&home, candidates).await
+                    })
+                    .await;
+                this.update(cx, |this, cx| this.cli_chosen(chosen, cx)).ok();
+            }));
+        }
         let event_pump = cx.spawn(async move |this, cx| {
             while let Some(event) = events_rx.next().await {
                 if this
@@ -724,11 +820,13 @@ impl AgentPanel {
                 }
             }
         });
+        tasks.extend([serve, event_pump, tool_pump]);
         self.host = Some(Host {
             commands: commands_tx,
             _connection: connection,
             _socket: socket,
-            _tasks: vec![serve, event_pump, tool_pump],
+            cli_home,
+            _tasks: tasks,
         });
         self.state = State::Starting;
         cx.notify();
@@ -1339,6 +1437,10 @@ impl AgentPanel {
                 return;
             }
         };
+        if call == ToolCall::Cli {
+            reply.send(self.cli_instructions()).ok();
+            return;
+        }
         let session = self.session.read(cx);
         let Some(schema) = session.schema_model() else {
             reply
@@ -1357,6 +1459,8 @@ impl AgentPanel {
             .map(|branch| branch.name.clone());
 
         match call {
+            // Answered above, before the schema is needed.
+            ToolCall::Cli => {}
             ToolCall::Schema => {
                 reply.send((tools::describe_schema(&schema), false)).ok();
             }
@@ -1585,6 +1689,178 @@ impl AgentPanel {
             reply.send((text, is_error)).ok();
         })
         .detach();
+    }
+
+    fn apply_gateway(&mut self, event: GatewayEvent, cx: &mut Context<Self>) {
+        match event {
+            GatewayEvent::Reached => {}
+            GatewayEvent::Write { id, write, decide } => self.gateway_write(id, write, decide, cx),
+            GatewayEvent::Finished { id, outcome } => self.gateway_finished(id, outcome, cx),
+        }
+    }
+
+    /// A write the agent's CLI sent to its own branch (spec 013): a card in the thread. It goes
+    /// through at once, or waits for Allow when the person asked to approve each write.
+    fn gateway_write(
+        &mut self,
+        id: u64,
+        write: WriteSummary,
+        decide: oneshot::Sender<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(branch) = &self.branch else {
+            decide.send(false).ok();
+            return;
+        };
+        let ask = StudioSettings::get(cx).agent.ask_before_writes && !self.always_allow;
+        let index = self.entries.len();
+        let (state, waiting) = if ask {
+            let (reply, decision) = oneshot::channel();
+            (ProposalState::Waiting(reply), Some(decision))
+        } else {
+            (ProposalState::Running, None)
+        };
+        self.entries.push(Entry::Proposal(Proposal {
+            summary: write.summary.clone(),
+            query: write.query.clone().unwrap_or_default(),
+            params: write.params.clone(),
+            branch: branch.name.clone(),
+            creates_from: write.creates_branch.then(|| branch.base.clone()),
+            state,
+        }));
+        self.gateway_cards
+            .insert(id, (index, write.creates_branch, write.summary));
+        match waiting {
+            None => {
+                decide.send(true).ok();
+            }
+            Some(decision) => {
+                cx.spawn(async move |this, cx| {
+                    let decision = decision.await.unwrap_or(Decision::Reject);
+                    let allow = !matches!(decision, Decision::Reject);
+                    this.update(cx, |this, cx| {
+                        if let Decision::AllowAlways = decision {
+                            this.always_allow = true;
+                        }
+                        if !allow {
+                            this.set_proposal_state(index, ProposalState::Rejected, cx);
+                        }
+                    })
+                    .ok();
+                    decide.send(allow).ok();
+                })
+                .detach();
+            }
+        }
+        self.thread.scroll_to_end();
+        cx.notify();
+    }
+
+    fn gateway_finished(&mut self, id: u64, outcome: Seen, cx: &mut Context<Self>) {
+        let Some((index, creates_branch, summary)) = self.gateway_cards.remove(&id) else {
+            return;
+        };
+        let (state, kind) = match &outcome {
+            Seen::Committed {
+                commit: Some(commit),
+                nodes,
+                edges,
+            } => (
+                ProposalState::Committed {
+                    commit: Some(commit.clone()),
+                    nodes: *nodes,
+                    edges: *edges,
+                },
+                OutcomeKind::Committed {
+                    commit: Some(commit.clone()),
+                },
+            ),
+            Seen::Committed { commit: None, .. } => (
+                ProposalState::Done(if creates_branch {
+                    "Branch created".into()
+                } else {
+                    "Done".into()
+                }),
+                OutcomeKind::Committed { commit: None },
+            ),
+            Seen::Refused(message) => (
+                ProposalState::Refused(message.clone()),
+                OutcomeKind::Refused {
+                    message: message.clone(),
+                },
+            ),
+            Seen::Unknown(reason) => (
+                ProposalState::Unknown,
+                OutcomeKind::Unknown {
+                    reason: reason.clone(),
+                },
+            ),
+        };
+        let went_through = matches!(outcome, Seen::Committed { .. });
+        let mut created = false;
+        let mut branch_name = String::new();
+        if let Some(branch) = &mut self.branch {
+            branch_name = branch.name.clone();
+            if went_through && creates_branch && !branch.created {
+                branch.created = true;
+                created = true;
+            }
+            if matches!(
+                outcome,
+                Seen::Committed {
+                    commit: Some(_),
+                    ..
+                }
+            ) {
+                branch.changes += 1;
+            }
+        }
+        if created {
+            self.remember_session(cx);
+        }
+        self.session.update(cx, |session, cx| {
+            session.note_write(
+                branch_name,
+                format!("Agent CLI: {summary}"),
+                kind,
+                created,
+                cx,
+            )
+        });
+        self.set_proposal_state(index, state, cx);
+    }
+
+    /// Studio found (or did not find) a CLI that speaks the graph's API for this conversation.
+    fn cli_chosen(&mut self, chosen: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.cli_ready = Some(chosen.is_some());
+        if chosen.is_none() {
+            self.entries.push(Entry::Notice {
+                text: format!(
+                    "No omnigraph CLI here speaks this graph's HTTP API ({}), so the agent uses \
+                     the graph tools. Install a matching omnigraph CLI, or set \
+                     `agent.omnigraph_cli`, to let it use the CLI.",
+                    graph_client::SUPPORTED_CONTRACTS[0]
+                ),
+                error: false,
+            });
+        }
+        cx.notify();
+    }
+
+    /// What the `omnigraph_cli` tool answers: this conversation's CLI, or why it has none.
+    fn cli_instructions(&self) -> (String, bool) {
+        match self.host.as_ref().and_then(|host| host.cli_home.as_ref()) {
+            Some(home) => match self.cli_ready {
+                Some(false) => (home.instructions(Some(false)), true),
+                ready => (home.instructions(ready), false),
+            },
+            None => (
+                "The omnigraph CLI is not available in this conversation. Use the omnigraph_* \
+                 tools."
+                    .into(),
+                true,
+            ),
+        }
     }
 
     fn set_proposal_state(&mut self, index: usize, state: ProposalState, cx: &mut Context<Self>) {
@@ -2954,9 +3230,14 @@ impl AgentPanel {
                 )
             }))
         });
-        let body = ds::card_body()
-            .child(ds::code_block(proposal.query.clone(), cx))
-            .children(params);
+        // A write with no query or parameters (a branch created through the CLI) has no body.
+        let body = (!proposal.query.is_empty() || params.is_some()).then(|| {
+            ds::card_body()
+                .when(!proposal.query.is_empty(), |body| {
+                    body.child(ds::code_block(proposal.query.clone(), cx))
+                })
+                .children(params)
+        });
         let footer = match &proposal.state {
             ProposalState::Waiting(_) => studio_ui::ds::card_footer(cx)
                 .child(
@@ -3035,6 +3316,9 @@ impl AgentPanel {
                             "Outcome unknown".into(),
                             Some(UNKNOWN_OUTCOME.into()),
                         ),
+                        ProposalState::Done(label) => {
+                            (IconName::Check, Color::Success, label.clone(), None)
+                        }
                         _ => (IconName::Close, Color::Muted, "Rejected".into(), None),
                     };
                 let commit = match state {
@@ -3064,7 +3348,7 @@ impl AgentPanel {
         };
         studio_ui::ds::card(cx)
             .child(header)
-            .child(body)
+            .children(body)
             .child(footer)
             .into_any_element()
     }

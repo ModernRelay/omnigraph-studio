@@ -12,8 +12,12 @@ mod client;
 
 pub use api::ErrorOutput;
 pub use client::{
-    ApiErrorSummary, BLOB_READ_MAX, BlobAt, BlobCell, BlobMeta, CommitChanges, GraphClient,
-    ReadError, ServerHealth, server_root,
+    ApiErrorSummary, BLOB_READ_MAX, BlobAt, BlobCell, BlobMeta, CommitChanges, ForwardRequest,
+    ForwardResponse, GraphClient, ReadError, ServerHealth, server_root,
+};
+pub use http_client::{
+    AsyncBody,
+    http::{HeaderMap, Method, StatusCode},
 };
 
 /// Header every protected request sends and every response echoes

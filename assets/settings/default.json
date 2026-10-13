@@ -18,7 +18,9 @@
   },
   "agent": {
     "command": [],
-    "env": {}
+    "env": {},
+    "ask_before_writes": false,
+    "omnigraph_cli": null
   },
   "graphs": {}
 }

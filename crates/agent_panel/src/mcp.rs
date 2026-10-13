@@ -30,7 +30,9 @@ pub enum Incoming {
     Nothing,
 }
 
-pub fn handle(line: &str) -> Incoming {
+/// Answers one line. `conversation` is appended to the server's instructions: what this
+/// conversation's `omnigraph` CLI is and which branch is the agent's (spec 013).
+pub fn handle(line: &str, conversation: &str) -> Incoming {
     let message: Value = match serde_json::from_str(line) {
         Ok(message) => message,
         Err(_) => return Incoming::Reply(error(Value::Null, -32700, "Parse error")),
@@ -57,7 +59,11 @@ pub fn handle(line: &str) -> Incoming {
                         "name": "omnigraph-studio",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
-                    "instructions": INSTRUCTIONS,
+                    "instructions": if conversation.is_empty() {
+                        INSTRUCTIONS.to_owned()
+                    } else {
+                        format!("{INSTRUCTIONS}\n\n{conversation}")
+                    },
                 }),
             ))
         }
@@ -102,19 +108,36 @@ mod tests {
 
     #[test]
     fn initialize_echoes_a_known_revision_and_offers_the_newest_otherwise() {
-        let reply = |version: &str| match handle(&format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"{version}"}}}}"#
-        )) {
-            Incoming::Reply(reply) => reply["result"]["protocolVersion"].clone(),
+        let initialize = |version: &str, conversation: &str| match handle(
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"{version}"}}}}"#
+            ),
+            conversation,
+        ) {
+            Incoming::Reply(reply) => reply["result"].clone(),
             other => panic!("{other:?}"),
         };
-        assert_eq!(reply("2025-03-26"), "2025-03-26");
-        assert_eq!(reply("1999-01-01"), PROTOCOL_VERSIONS[0]);
+        assert_eq!(
+            initialize("2025-03-26", "")["protocolVersion"],
+            "2025-03-26"
+        );
+        assert_eq!(
+            initialize("1999-01-01", "")["protocolVersion"],
+            PROTOCOL_VERSIONS[0]
+        );
+        // A conversation's own instructions follow the server's.
+        let instructions = initialize("2025-06-18", "Your branch is agent/x.")["instructions"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(instructions.starts_with(INSTRUCTIONS));
+        assert!(instructions.ends_with("Your branch is agent/x."));
     }
 
     #[test]
     fn lists_tools_and_routes_calls() {
-        let Incoming::Reply(list) = handle(r#"{"jsonrpc":"2.0","id":"a","method":"tools/list"}"#)
+        let Incoming::Reply(list) =
+            handle(r#"{"jsonrpc":"2.0","id":"a","method":"tools/list"}"#, "")
         else {
             panic!()
         };
@@ -128,6 +151,7 @@ mod tests {
             names,
             [
                 "omnigraph_schema",
+                "omnigraph_cli",
                 "omnigraph_branches",
                 "omnigraph_query",
                 "omnigraph_propose_change"
@@ -135,7 +159,8 @@ mod tests {
         );
         assert_eq!(
             handle(
-                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"omnigraph_schema"}}"#
+                r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"omnigraph_schema"}}"#,
+                ""
             ),
             Incoming::CallTool {
                 id: json!(7),
@@ -148,20 +173,23 @@ mod tests {
     #[test]
     fn notifications_and_responses_get_no_reply_and_unknown_methods_an_error() {
         assert_eq!(
-            handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
+            handle(
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                ""
+            ),
             Incoming::Nothing
         );
         assert_eq!(
-            handle(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#),
+            handle(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#, ""),
             Incoming::Nothing
         );
         let Incoming::Reply(reply) =
-            handle(r#"{"jsonrpc":"2.0","id":4,"method":"resources/list"}"#)
+            handle(r#"{"jsonrpc":"2.0","id":4,"method":"resources/list"}"#, "")
         else {
             panic!()
         };
         assert_eq!(reply["error"]["code"], -32601);
-        let Incoming::Reply(reply) = handle("not json") else {
+        let Incoming::Reply(reply) = handle("not json", "") else {
             panic!()
         };
         assert_eq!(reply["error"]["code"], -32700);

@@ -204,6 +204,22 @@ impl std::fmt::Debug for GraphClient {
     }
 }
 
+/// A request for [`GraphClient::forward`]. The caller drops the incoming request's own
+/// `authorization`, contract and hop-by-hop headers; this client adds its own.
+pub struct ForwardRequest {
+    pub method: Method,
+    pub path_and_query: String,
+    pub headers: Vec<(String, String)>,
+    pub body: AsyncBody,
+}
+
+/// What [`GraphClient::forward`] got back, with the body still streaming.
+pub struct ForwardResponse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: AsyncBody,
+}
+
 impl GraphClient {
     /// `base` is the server root, for example `http://127.0.0.1:8787`.
     pub fn new(
@@ -477,6 +493,61 @@ impl GraphClient {
     }
 
     // ---- public reads ----
+
+    /// Sends a request on as it came (spec 013): the agent's CLI speaks to Studio's gateway,
+    /// which forwards here with this client's token and contract header. Bodies stream both
+    /// ways and there is no total timeout, as the CLI sets none; a write is sent once and never
+    /// retried (constitution III). `path_and_query` is below the server root, without a leading
+    /// slash; a path that would leave the root is refused.
+    pub async fn forward(&self, request: ForwardRequest) -> Result<ForwardResponse, String> {
+        let path = request
+            .path_and_query
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("");
+        if request.path_and_query.starts_with('/')
+            || request.path_and_query.contains("://")
+            || path
+                .split('/')
+                .any(|segment| segment == ".." || segment == ".")
+            || path.contains('\\')
+        {
+            return Err(format!("refused path {:?}", request.path_and_query));
+        }
+        let url = self
+            .base
+            .join(&request.path_and_query)
+            .map_err(|error| error.to_string())?;
+        if !url.as_str().starts_with(self.base.as_str()) {
+            return Err(format!("refused path {:?}", request.path_and_query));
+        }
+        let mut builder = Request::builder()
+            .method(request.method)
+            .uri(url.as_str())
+            .header(CONTRACT_HEADER, SUPPORTED_CONTRACTS[0])
+            .follow_redirects(RedirectPolicy::NoFollow);
+        if let Some(token) = &self.token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        for (name, value) in &request.headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        let request = builder
+            .body(request.body)
+            .map_err(|error| error.to_string())?;
+        let response = self
+            .http
+            .send(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        Ok(ForwardResponse {
+            status,
+            headers,
+            body: response.into_body(),
+        })
+    }
 
     /// `GET /healthz`. Public; used to discover the server's contract.
     pub async fn health(&self) -> Result<ServerHealth, ReadError> {
@@ -815,6 +886,89 @@ mod tests {
 
     const CHANGE: &str =
         r#"{"branch":"main","query_name":"u","affected_nodes":1,"affected_edges":0,"commit":null}"#;
+
+    /// The gateway's forward goes to the same root with Studio's token and contract, keeps the
+    /// caller's other headers and body, streams the answer back, and never leaves the root.
+    #[test]
+    fn a_forward_carries_studios_credentials_and_stays_under_the_root() {
+        type Sent = (String, String, Vec<(String, String)>, String);
+        let seen: Arc<std::sync::Mutex<Vec<Sent>>> = Arc::default();
+        let log = seen.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let log = log.clone();
+            async move {
+                let uri = request.uri().to_string();
+                let method = request.method().to_string();
+                let headers = request
+                    .headers()
+                    .iter()
+                    .filter(|(name, _)| {
+                        matches!(
+                            name.as_str(),
+                            "authorization" | "omnigraph-http-api" | "content-type"
+                        )
+                    })
+                    .map(|(name, value)| {
+                        (name.to_string(), value.to_str().unwrap_or("").to_owned())
+                    })
+                    .collect();
+                let mut body = String::new();
+                request.into_body().read_to_string(&mut body).await.unwrap();
+                log.lock().unwrap().push((method, uri, headers, body));
+                Ok(Response::builder()
+                    .status(201)
+                    .header(CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from("{\"ok\":true}"))
+                    .unwrap())
+            }
+        });
+        let client =
+            GraphClient::new("http://127.0.0.1:8787/prefix", Some("t".into()), http).unwrap();
+        let mut response = block_on(client.forward(ForwardRequest {
+            method: Method::POST,
+            path_and_query: "graphs/g/load/ndjson?branch=agent%2Fx&mode=append".into(),
+            headers: vec![("content-type".into(), "application/x-ndjson".into())],
+            body: AsyncBody::from_reader(futures::io::Cursor::new(b"{}\n".to_vec())),
+        }))
+        .unwrap();
+        assert_eq!(response.status, StatusCode::CREATED);
+        let mut body = String::new();
+        block_on(response.body.read_to_string(&mut body)).unwrap();
+        assert_eq!(body, "{\"ok\":true}");
+        let (method, uri, mut headers, sent) = seen.lock().unwrap().remove(0);
+        headers.sort();
+        assert_eq!(method, "POST");
+        assert_eq!(
+            uri,
+            "http://127.0.0.1:8787/prefix/graphs/g/load/ndjson?branch=agent%2Fx&mode=append"
+        );
+        assert_eq!(
+            headers,
+            vec![
+                ("authorization".into(), "Bearer t".into()),
+                ("content-type".into(), "application/x-ndjson".into()),
+                ("omnigraph-http-api".into(), "0.13".into()),
+            ]
+        );
+        assert_eq!(sent, "{}\n");
+
+        for path in [
+            "/graphs/g/query",
+            "../graphs/g/query",
+            "graphs/../../etc",
+            "http://elsewhere/graphs",
+            "graphs\\g",
+        ] {
+            let refused = block_on(client.forward(ForwardRequest {
+                method: Method::GET,
+                path_and_query: path.into(),
+                headers: Vec::new(),
+                body: AsyncBody::empty(),
+            }));
+            assert!(refused.is_err(), "{path} was sent");
+        }
+        assert!(seen.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn a_committed_write_needs_the_contract_header() {

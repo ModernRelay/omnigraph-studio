@@ -204,6 +204,14 @@ pub struct AgentSettings {
     /// Extra environment for the agent; edited in `settings.json`.
     #[schemars(extend("x-hidden" = true))]
     pub env: BTreeMap<String, String>,
+    /// Hold each write the agent's `omnigraph` CLI sends until the person allows it (spec 013).
+    /// Off: writes to the agent's own branch go through, each shown as a card.
+    #[schemars(extend("x-hidden" = true))]
+    pub ask_before_writes: bool,
+    /// The `omnigraph` CLI the agent uses (spec 013). Empty: Studio looks on PATH, in
+    /// `~/.local/bin`, then in Homebrew's and `/usr/local`'s `bin`.
+    #[schemars(extend("x-hidden" = true))]
+    pub omnigraph_cli: Option<String>,
 }
 
 /// The whole settings document. Each field's doc comment is its row's description in the

@@ -225,7 +225,24 @@ async fn connect(
     let Some((program, args)) = launch.command.split_first() else {
         return Err(agent_client_protocol::Error::invalid_params().data("no agent command is set"));
     };
-    let config = AcpAgentConfig::new(program)
+    // The agent never inherits the person's graph credentials (spec 013): OmniGraph's own
+    // variables in Studio's environment are removed for its process, unless the agent's
+    // settings set them. The process API can add variables but not remove them, so the agent
+    // starts through `env -u`. Model providers' variables (AWS, Azure, Google) stay: the agent
+    // may need them for its model.
+    let removed = credential_variables(std::env::vars_os().map(|(name, _)| name), &launch.env);
+    let (program, args): (String, Vec<String>) = if removed.is_empty() {
+        (program.clone(), args.to_vec())
+    } else {
+        let mut wrapped: Vec<String> = removed
+            .into_iter()
+            .flat_map(|name| ["-u".to_owned(), name])
+            .collect();
+        wrapped.push(program.clone());
+        wrapped.extend(args.iter().cloned());
+        ("/usr/bin/env".to_owned(), wrapped)
+    };
+    let config = AcpAgentConfig::new(&program)
         .args(args.iter().cloned())
         .envs(launch.env.clone());
     // Only stderr is kept, bounded, and only to show why the agent stopped. Stdin and stdout
@@ -629,5 +646,62 @@ mod tests {
             routes.update(SessionId::new("c"), chunk("x"));
         }
         assert_eq!(routes.early[&SessionId::new("c")].len(), EARLY_UPDATES);
+    }
+}
+
+/// OmniGraph's credential and addressing variables among `names`, except those the agent's own
+/// settings set.
+fn credential_variables(
+    names: impl Iterator<Item = std::ffi::OsString>,
+    configured: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut found: Vec<String> = names
+        .filter_map(|name| name.into_string().ok())
+        .filter(|name| {
+            name.starts_with("OMNIGRAPH_TOKEN_")
+                || matches!(
+                    name.as_str(),
+                    "OMNIGRAPH_BEARER_TOKEN"
+                        | "OMNIGRAPH_PROFILE"
+                        | "OMNIGRAPH_HOME"
+                        | "OMNIGRAPH_CONTROL_TOKEN"
+                        | "OMNIGRAPH_CONTROL_API"
+                        | "OMNIGRAPH_STUDIO_TOKEN"
+                )
+        })
+        .filter(|name| !configured.contains_key(name))
+        .collect();
+    found.sort();
+    found
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn the_agent_starts_without_omnigraph_credentials() {
+        let names = [
+            "PATH",
+            "OMNIGRAPH_TOKEN_PERSONAL",
+            "OMNIGRAPH_BEARER_TOKEN",
+            "OMNIGRAPH_STUDIO_TOKEN",
+            "OMNIGRAPH_PROFILE",
+            "ANTHROPIC_API_KEY",
+            "AWS_PROFILE",
+            "OMNIGRAPH_HOME",
+        ]
+        .map(std::ffi::OsString::from);
+        let mut configured = std::collections::BTreeMap::new();
+        configured.insert("OMNIGRAPH_HOME".to_owned(), "/x".to_owned());
+        assert_eq!(
+            credential_variables(names.into_iter(), &configured),
+            [
+                "OMNIGRAPH_BEARER_TOKEN",
+                "OMNIGRAPH_PROFILE",
+                "OMNIGRAPH_STUDIO_TOKEN",
+                "OMNIGRAPH_TOKEN_PERSONAL",
+            ]
+        );
     }
 }
