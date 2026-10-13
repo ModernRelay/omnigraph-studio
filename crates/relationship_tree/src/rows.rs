@@ -1,7 +1,7 @@
 //! What the tree shows, without GPUI: row identity, the text a filter matches, filtering that
 //! keeps ancestors, and the moves the keys make.
 
-use graph_store::{Entry, EntryKind, ExplorePath, ExploreState, NodeRef};
+use graph_store::{BucketValue, Entry, EntryKind, ExplorePath, ExploreState, NodeRef};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -10,6 +10,8 @@ pub enum RowTag {
     Cycle,
     Field,
     Group,
+    Bucket,
+    OtherValues,
     More,
     Loading,
     Error,
@@ -28,6 +30,8 @@ pub fn row_id(entry: &Entry) -> RowId {
         EntryKind::Cycle { .. } => RowTag::Cycle,
         EntryKind::Field { .. } => RowTag::Field,
         EntryKind::Group { .. } => RowTag::Group,
+        EntryKind::Bucket { .. } => RowTag::Bucket,
+        EntryKind::OtherValues { .. } => RowTag::OtherValues,
         EntryKind::More { .. } => RowTag::More,
         EntryKind::Loading { .. } => RowTag::Loading,
         EntryKind::Error { .. } => RowTag::Error,
@@ -61,9 +65,15 @@ pub fn row_text(entry: &Entry, state: &ExploreState) -> String {
                 .unwrap_or_default()
         ),
         EntryKind::Group { key, .. } => format!("{} {}", key.group.edge, key.group.other_type),
-        EntryKind::More { .. } | EntryKind::Loading { .. } | EntryKind::Error { .. } => {
-            String::new()
-        }
+        EntryKind::Bucket { key, .. } => key
+            .within
+            .as_ref()
+            .map(|within| bucket_text(&within.value))
+            .unwrap_or_default(),
+        EntryKind::OtherValues { .. }
+        | EntryKind::More { .. }
+        | EntryKind::Loading { .. }
+        | EntryKind::Error { .. } => String::new(),
     }
 }
 
@@ -139,8 +149,10 @@ pub fn nearest(visible: &[usize], entries: &[Entry], id: &RowId) -> Option<usize
         .enumerate()
         .filter(|(_, ix)| {
             let entry = &entries[**ix];
-            matches!(entry.kind, EntryKind::Node { .. } | EntryKind::Group { .. })
-                && id.path.starts_with(&entry.path)
+            matches!(
+                entry.kind,
+                EntryKind::Node { .. } | EntryKind::Group { .. } | EntryKind::Bucket { .. }
+            ) && id.path.starts_with(&entry.path)
         })
         .max_by_key(|(_, ix)| entries[**ix].path.depth())
         .map(|(position, _)| position)
@@ -183,6 +195,24 @@ pub fn edge_summary(edge: &[(String, Value)]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" · ")
+}
+
+/// A grouping value as its row shows it: text as written, other values formatted, and
+/// "No value" for neighbours without one.
+pub fn bucket_text(value: &BucketValue) -> String {
+    match value.value() {
+        serde_json::Value::Null => "No value".to_owned(),
+        serde_json::Value::String(text) => text,
+        other => studio_ui::format_value(&other),
+    }
+}
+
+/// Below a group's most common values: how many neighbours the other values hold, when known.
+pub fn other_values_label(shown: usize, rest: Option<u64>) -> String {
+    match rest {
+        Some(rest) if rest > 0 => format!("{rest} more in other values"),
+        _ => format!("The {shown} most common values"),
+    }
 }
 
 /// "Show 50 more of 418": the next page size and how many are not shown yet.
@@ -239,14 +269,8 @@ mod tests {
             label: None,
             edge: Vec::new(),
         };
-        let ada_knows = GroupKey {
-            node: person("ada"),
-            group: knows(),
-        };
-        let bob_knows = GroupKey {
-            node: person("bob"),
-            group: knows(),
-        };
+        let ada_knows = GroupKey::new(person("ada"), knows());
+        let bob_knows = GroupKey::new(person("bob"), knows());
         state.counts.insert(ada_knows.clone(), Loadable::Loaded(60));
         state.neighbours.insert(
             ada_knows,
@@ -324,10 +348,7 @@ mod tests {
     #[test]
     fn empty_groups_hide_with_their_rows_when_asked() {
         let (schema, mut state, _) = fixture();
-        let bob_knows = GroupKey {
-            node: person("bob"),
-            group: knows(),
-        };
+        let bob_knows = GroupKey::new(person("bob"), knows());
         state.counts.insert(bob_knows, Loadable::Loaded(0));
         let entries = state.entries(&schema);
         let all = filter(&entries, &state, "", false);
@@ -386,5 +407,10 @@ mod tests {
         assert_eq!(more_label(50, Some(60), 50), "Show 10 more of 10");
         assert_eq!(more_label(50, None, 50), "Show 50 more");
         assert_eq!(more_label(20, Some(418), 20), "Show 20 more of 398");
+        assert_eq!(bucket_text(&BucketValue::new(&json!("lead"))), "lead");
+        assert_eq!(bucket_text(&BucketValue::new(&json!(null))), "No value");
+        assert_eq!(bucket_text(&BucketValue::new(&json!(true))), "true");
+        assert_eq!(other_values_label(100, Some(42)), "42 more in other values");
+        assert_eq!(other_values_label(100, None), "The 100 most common values");
     }
 }

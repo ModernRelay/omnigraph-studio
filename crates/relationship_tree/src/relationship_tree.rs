@@ -22,6 +22,7 @@ use gpui::{
     KeyContext, KeyDownEvent, ListSizingBehavior, Render, ScrollStrategy, Subscription,
     UniformListScrollHandle, Window, uniform_list,
 };
+use gq_language::builder::{GroupBy, GroupOn};
 use graph_store::{
     Entry, EntryKind, Exploration, ExplorationEvent, GraphSession, Loadable, NodeRef, SessionEvent,
 };
@@ -35,7 +36,7 @@ use studio_actions::tree::{
 use studio_ui::type_swatch;
 use studio_workspace::{PanelPosition, Workspace, WorkspaceEvent};
 use ui::prelude::*;
-use ui::{IndentGuideColors, StickyCandidate, Tooltip};
+use ui::{ContextMenu, IndentGuideColors, PopoverMenu, StickyCandidate, Tooltip};
 
 pub use rows::{RowId, RowTag};
 
@@ -261,7 +262,10 @@ impl RelationshipTree {
         let row = self.visible.iter().position(|ix| {
             let entry = &self.entries[*ix];
             entry.path == path
-                && matches!(entry.kind, EntryKind::Node { .. } | EntryKind::Group { .. })
+                && matches!(
+                    entry.kind,
+                    EntryKind::Node { .. } | EntryKind::Group { .. } | EntryKind::Bucket { .. }
+                )
         });
         if let Some(row) = row {
             self.selected = Some(rows::row_id(&self.entries[self.visible[row]]));
@@ -286,8 +290,11 @@ impl RelationshipTree {
             return;
         };
         let id = rows::row_id(entry);
-        let shared = matches!(entry.kind, EntryKind::Node { .. } | EntryKind::Group { .. })
-            .then(|| entry.path.clone());
+        let shared = matches!(
+            entry.kind,
+            EntryKind::Node { .. } | EntryKind::Group { .. } | EntryKind::Bucket { .. }
+        )
+        .then(|| entry.path.clone());
         self.selected = Some(id);
         self.selected_row_index_hint = Some(row);
         self.scroll_handle
@@ -337,6 +344,9 @@ impl RelationshipTree {
             EntryKind::Group {
                 count, expanded, ..
             } => (*count != Loadable::Loaded(0), *expanded),
+            EntryKind::Bucket {
+                count, expanded, ..
+            } => (*count > 0, *expanded),
             _ => (false, false),
         };
         if expandable && !expanded {
@@ -353,7 +363,9 @@ impl RelationshipTree {
         let entry = self.entries[self.visible[row]].clone();
         let expanded = matches!(
             entry.kind,
-            EntryKind::Node { expanded: true, .. } | EntryKind::Group { expanded: true, .. }
+            EntryKind::Node { expanded: true, .. }
+                | EntryKind::Group { expanded: true, .. }
+                | EntryKind::Bucket { expanded: true, .. }
         );
         if expanded {
             self.with_exploration(cx, |e, cx| e.collapse(&entry.path, cx));
@@ -366,8 +378,14 @@ impl RelationshipTree {
         let Some(entry) = self.selected_entry().cloned() else {
             return;
         };
-        if matches!(entry.kind, EntryKind::Node { .. } | EntryKind::Group { .. }) {
-            self.with_exploration(cx, |e, cx| e.expand_all(&entry.path, cx));
+        match entry.kind {
+            EntryKind::Node { .. } | EntryKind::Group { .. } => {
+                self.with_exploration(cx, |e, cx| e.expand_all(&entry.path, cx));
+            }
+            EntryKind::Bucket { .. } => {
+                self.with_exploration(cx, |e, cx| e.expand(&entry.path, cx));
+            }
+            _ => {}
         }
     }
 
@@ -377,7 +395,9 @@ impl RelationshipTree {
         };
         let entry = &self.entries[self.visible[row]];
         let path = match entry.kind {
-            EntryKind::Node { .. } | EntryKind::Group { .. } => entry.path.clone(),
+            EntryKind::Node { .. } | EntryKind::Group { .. } | EntryKind::Bucket { .. } => {
+                entry.path.clone()
+            }
             _ => match rows::parent_row(&self.visible, &self.entries, row) {
                 Some(parent) => {
                     let path = self.entries[self.visible[parent]].path.clone();
@@ -405,7 +425,7 @@ impl RelationshipTree {
                 target: Some(target),
                 ..
             } => open_node(&target.node, window, cx),
-            EntryKind::Group { .. } => {
+            EntryKind::Group { .. } | EntryKind::Bucket { .. } => {
                 self.with_exploration(cx, |e, cx| e.toggle(&entry.path, cx));
             }
             EntryKind::More { key, .. } => {
@@ -426,7 +446,8 @@ impl RelationshipTree {
             EntryKind::Error { target, .. } => {
                 self.with_exploration(cx, |e, cx| e.retry(&target, cx));
             }
-            EntryKind::Field { .. } | EntryKind::Loading { .. } => {}
+            EntryKind::Field { .. } | EntryKind::OtherValues { .. } | EntryKind::Loading { .. } => {
+            }
         }
     }
 
@@ -504,7 +525,7 @@ impl RelationshipTree {
                 via: None,
                 preview: false,
             },
-            Some(EntryKind::Group { key, .. }) => {
+            Some(EntryKind::Group { key, .. } | EntryKind::Bucket { key, .. }) => {
                 // Seen from the other type, the relationship runs the other way.
                 let back = gq_language::RelationshipGroup {
                     edge: key.group.edge.clone(),
@@ -593,6 +614,9 @@ impl RelationshipTree {
             EntryKind::Group {
                 count, expanded, ..
             } => (*count != Loadable::Loaded(0), *expanded),
+            EntryKind::Bucket {
+                count, expanded, ..
+            } => (*count > 0, *expanded),
             _ => (false, false),
         };
         let toggle_path = entry.path.clone();
@@ -732,6 +756,13 @@ impl RelationshipTree {
                     Loadable::Failed(_) => "!".to_owned(),
                     Loadable::NotLoaded | Loadable::Loading => "…".to_owned(),
                 };
+                let grouped_by = exploration
+                    .read(cx)
+                    .grouping(&key.group)
+                    .map(|by| by.property.clone());
+                let group_menu = (!empty)
+                    .then(|| self.group_by_menu(row, entry, &key.group, sticky, selected, cx))
+                    .flatten();
                 h_flex()
                     .min_w_0()
                     .flex_1()
@@ -754,7 +785,16 @@ impl RelationshipTree {
                                 .truncate(),
                         ),
                     )
+                    .children(grouped_by.map(|property| {
+                        div().min_w_0().flex_shrink(1.).child(
+                            Label::new(format!("by {property}"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Accent)
+                                .truncate(),
+                        )
+                    }))
                     .child(div().flex_1())
+                    .children(group_menu)
                     .child(
                         Label::new(count_label)
                             .size(LabelSize::XSmall)
@@ -765,6 +805,43 @@ impl RelationshipTree {
                             })
                             .single_line(),
                     )
+                    .into_any_element()
+            }
+            EntryKind::Bucket { key, count, .. } => {
+                let value = key.within.as_ref().map(|within| &within.value);
+                let missing = value.is_none_or(|value| value.is_null());
+                let text = value.map(rows::bucket_text).unwrap_or_default();
+                h_flex()
+                    .min_w_0()
+                    .flex_1()
+                    .gap_1p5()
+                    .child(
+                        div().min_w_0().flex_shrink(1.).child(
+                            Label::new(text)
+                                .size(LabelSize::Small)
+                                .color(if missing {
+                                    Color::Muted
+                                } else {
+                                    Color::Default
+                                })
+                                .when(missing, |label| label.italic())
+                                .truncate(),
+                        ),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Label::new(count.to_string())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .single_line(),
+                    )
+                    .into_any_element()
+            }
+            EntryKind::OtherValues { shown, rest } => {
+                Label::new(rows::other_values_label(*shown, *rest))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .single_line()
                     .into_any_element()
             }
             EntryKind::More { shown, total, key } => {
@@ -838,6 +915,7 @@ impl RelationshipTree {
 
         h_flex()
             .id((if sticky { "sticky-row" } else { "tree-row" }, row))
+            .group("tree-row")
             .w_full()
             .h(px(ROW_HEIGHT))
             .pl(px(LEFT_PAD + entry.depth as f32 * INDENT))
@@ -858,7 +936,10 @@ impl RelationshipTree {
                 let single_activates = matches!(
                     kind,
                     Some(
-                        EntryKind::Group { .. } | EntryKind::More { .. } | EntryKind::Cycle { .. }
+                        EntryKind::Group { .. }
+                            | EntryKind::Bucket { .. }
+                            | EntryKind::More { .. }
+                            | EntryKind::Cycle { .. }
                     )
                 );
                 if single_activates || event.click_count() >= 2 {
@@ -868,6 +949,111 @@ impl RelationshipTree {
             .child(chevron)
             .child(content)
             .into_any_element()
+    }
+
+    /// The button on a relationship group that groups its neighbours by a property of the
+    /// other type or of the edge, shown while the row is hovered or selected.
+    fn group_by_menu(
+        &self,
+        row: usize,
+        entry: &Entry,
+        group: &gq_language::RelationshipGroup,
+        sticky: bool,
+        selected: bool,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let exploration = self.exploration.clone()?;
+        let schema = exploration.read(cx).schema(cx)?;
+        let choices = GroupBy::choices(&schema, group);
+        if choices.is_empty() {
+            return None;
+        }
+        let current = exploration.read(cx).grouping(group).cloned();
+        // The trigger shows while the row is hovered or selected, or while grouping is on.
+        let always = selected || current.is_some();
+        let group = group.clone();
+        let path = entry.path.clone();
+        let id = (
+            if sticky {
+                "sticky-group-by"
+            } else {
+                "group-by"
+            },
+            row,
+        );
+        let tooltip = match &current {
+            Some(by) => format!("Grouped by {}", by.property),
+            None => "Group by a property".to_owned(),
+        };
+        let menu = PopoverMenu::new(SharedString::from(format!("{}-{row}", id.0)))
+            .trigger(
+                IconButton::new(id, IconName::ListTree)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .toggle_state(current.is_some())
+                    .tooltip(Tooltip::text(tooltip)),
+            )
+            .anchor(gpui::Anchor::TopRight)
+            .menu(move |window, cx| {
+                let (exploration, group, path, current, choices) = (
+                    exploration.clone(),
+                    group.clone(),
+                    path.clone(),
+                    current.clone(),
+                    choices.clone(),
+                );
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    // Choosing a property opens the group on its values.
+                    let set = |by: Option<GroupBy>| {
+                        let (exploration, group, path) =
+                            (exploration.clone(), group.clone(), path.clone());
+                        move |_: &mut Window, cx: &mut App| {
+                            exploration.update(cx, |e, cx| {
+                                let open = by.is_some();
+                                e.set_grouping(&group, by.clone(), cx);
+                                if open {
+                                    e.expand(&path, cx);
+                                }
+                            });
+                        }
+                    };
+                    menu = menu.toggleable_entry(
+                        "No grouping",
+                        current.is_none(),
+                        IconPosition::Start,
+                        None,
+                        set(None),
+                    );
+                    for (on, title) in [
+                        (GroupOn::Node, group.other_type.clone()),
+                        (GroupOn::Edge, group.edge.clone()),
+                    ] {
+                        let section: Vec<&GroupBy> =
+                            choices.iter().filter(|by| by.on == on).collect();
+                        if section.is_empty() {
+                            continue;
+                        }
+                        menu = menu.separator().header(title);
+                        for by in section {
+                            menu = menu.toggleable_entry(
+                                by.property.clone(),
+                                current.as_ref() == Some(by),
+                                IconPosition::Start,
+                                None,
+                                set(Some(by.clone())),
+                            );
+                        }
+                    }
+                    menu
+                }))
+            });
+        Some(
+            div()
+                .flex_none()
+                .when(!always, |d| d.visible_on_hover("tree-row"))
+                .child(menu)
+                .into_any_element(),
+        )
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> Option<AnyElement> {

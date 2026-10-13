@@ -6,7 +6,9 @@
 //! the session's branch raises [`Exploration::newer_available`] and changes nothing until
 //! [`Exploration::refresh`]. Counts come from one `builder::degree` query per relationship
 //! group, run concurrently (engine change E16 would replace them); neighbours come in keyset
-//! pages from `builder::neighbours`, as many as the graph's `tree_page_size` setting.
+//! pages from `builder::neighbours`, as many as the graph's `tree_page_size` setting. A
+//! relationship grouped by a property shows one row per value, from
+//! `builder::neighbour_values`, each opening to the neighbours with that value.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -15,6 +17,7 @@ use gpui::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, Global, Subscription, Task,
     WeakEntity,
 };
+use gq_language::builder::{GroupBy, Narrow};
 use gq_language::{BuiltQuery, Direction, RelationshipGroup, SchemaModel, builder};
 use graph_client::ReadError;
 use graph_client::api::ReadOutput;
@@ -38,11 +41,39 @@ impl NodeRef {
     }
 }
 
-/// One step of a path from the root: into a relationship group, or into one of its nodes.
+/// One step of a path from the root: into a relationship group, into one value of the property
+/// it is grouped by, or into one of its nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Step {
     Group(RelationshipGroup),
+    Value(BucketValue),
     Node(NodeRef),
+}
+
+/// One value of a grouping property, kept as JSON text so it can key maps; `null` stands for
+/// neighbours without a value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BucketValue(String);
+
+impl BucketValue {
+    pub fn new(value: &Value) -> Self {
+        Self(value.to_string())
+    }
+
+    pub fn value(&self) -> Value {
+        serde_json::from_str(&self.0).unwrap_or(Value::Null)
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.0 == "null"
+    }
+}
+
+/// A relationship group narrowed to the neighbours with one value of a property.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Within {
+    pub by: GroupBy,
+    pub value: BucketValue,
 }
 
 /// A path from the root, alternating group and node steps. The empty path is the root. A
@@ -74,6 +105,12 @@ impl ExplorePath {
         Self(steps)
     }
 
+    pub fn child_value(&self, value: &BucketValue) -> Self {
+        let mut steps = self.0.clone();
+        steps.push(Step::Value(value.clone()));
+        Self(steps)
+    }
+
     pub fn child_node(&self, node: &NodeRef) -> Self {
         let mut steps = self.0.clone();
         steps.push(Step::Node(node.clone()));
@@ -97,6 +134,27 @@ impl ExplorePath {
         }
     }
 
+    /// The group this path ends in, or the group whose value it ends at, with that value.
+    pub fn group_step(&self) -> Option<(&RelationshipGroup, Option<&BucketValue>)> {
+        match self.0.as_slice() {
+            [.., Step::Group(group)] => Some((group, None)),
+            [.., Step::Group(group), Step::Value(value)] => Some((group, Some(value))),
+            _ => None,
+        }
+    }
+
+    /// Whether the path ends at a node (the root included), not a group or a value.
+    pub fn ends_at_node(&self) -> bool {
+        matches!(self.0.last(), None | Some(Step::Node(_)))
+    }
+
+    /// Whether the path passes through a value of `group`.
+    fn passes_value_of(&self, group: &RelationshipGroup) -> bool {
+        self.0
+            .windows(2)
+            .any(|pair| matches!(pair, [Step::Group(g), Step::Value(_)] if g == group))
+    }
+
     /// The node this path ends at, or the node whose group it ends in.
     pub fn node<'a>(&'a self, root: &'a NodeRef) -> &'a NodeRef {
         self.0
@@ -104,7 +162,7 @@ impl ExplorePath {
             .rev()
             .find_map(|step| match step {
                 Step::Node(node) => Some(node),
-                Step::Group(_) => None,
+                Step::Group(_) | Step::Value(_) => None,
             })
             .unwrap_or(root)
     }
@@ -113,7 +171,7 @@ impl ExplorePath {
     pub fn nodes(&self) -> impl Iterator<Item = &NodeRef> {
         self.0.iter().filter_map(|step| match step {
             Step::Node(node) => Some(node),
-            Step::Group(_) => None,
+            Step::Group(_) | Step::Value(_) => None,
         })
     }
 
@@ -124,11 +182,42 @@ impl ExplorePath {
     }
 }
 
-/// One relationship group of one node: the unit counts and neighbour pages are cached by.
+/// One relationship group of one node, or the part of it with one value of a grouping
+/// property: the unit counts and neighbour pages are cached by.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GroupKey {
     pub node: NodeRef,
     pub group: RelationshipGroup,
+    pub within: Option<Within>,
+}
+
+impl GroupKey {
+    pub fn new(node: NodeRef, group: RelationshipGroup) -> Self {
+        Self {
+            node,
+            group,
+            within: None,
+        }
+    }
+
+    /// The part of this group with one value of `by`.
+    pub fn with_value(&self, by: &GroupBy, value: &BucketValue) -> Self {
+        Self {
+            within: Some(Within {
+                by: by.clone(),
+                value: value.clone(),
+            }),
+            ..self.clone()
+        }
+    }
+}
+
+/// The values of a grouping property among a group's neighbours, most common first.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Buckets {
+    pub values: Vec<(BucketValue, u64)>,
+    /// Every value was read; otherwise only the most common ones were.
+    pub complete: bool,
 }
 
 /// A node at the other end of a relationship group, with the edge's properties.
@@ -177,7 +266,11 @@ pub enum LoadTarget {
     Root,
     Count(GroupKey),
     Page(GroupKey),
+    Values(GroupKey, GroupBy),
 }
+
+/// How many values of a grouping property one read returns, most common first.
+pub const VALUES_LIMIT: u32 = 100;
 
 /// One row of the flattened exploration, in tree order. The relationship tree renders these;
 /// the canvas derives its nodes, hubs and edges from them.
@@ -217,6 +310,19 @@ pub enum EntryKind {
         count: Loadable<u64>,
         expanded: bool,
     },
+    /// One value of the property the parent group is grouped by, and how many neighbours have
+    /// it.
+    Bucket {
+        key: GroupKey,
+        count: u64,
+        expanded: bool,
+    },
+    /// Below a group's values: it has values beyond the most common ones read, holding `rest`
+    /// neighbours when the group's count is known.
+    OtherValues {
+        shown: usize,
+        rest: Option<u64>,
+    },
     /// "Show 50 more of N": `shown` rows are loaded, `total` is the group's count when known.
     More {
         key: GroupKey,
@@ -254,6 +360,9 @@ pub struct ExploreState {
     pub neighbours: HashMap<GroupKey, NeighbourList>,
     /// Groups whose neighbours are narrowed on the server to ids or labels matching a text.
     pub searches: HashMap<GroupKey, String>,
+    /// The property each relationship's neighbours are grouped by, wherever it appears.
+    pub grouping: HashMap<RelationshipGroup, GroupBy>,
+    pub values: HashMap<(GroupKey, GroupBy), Loadable<Buckets>>,
     pub selection: Option<ExplorePath>,
 }
 
@@ -268,6 +377,8 @@ impl Default for ExploreState {
             counts: HashMap::new(),
             neighbours: HashMap::new(),
             searches: HashMap::new(),
+            grouping: HashMap::new(),
+            values: HashMap::new(),
             selection: None,
         }
     }
@@ -295,11 +406,32 @@ impl ExploreState {
 
     fn group_key(&self, path: &ExplorePath) -> Option<GroupKey> {
         let root = self.root.as_ref()?;
-        let group = path.last_group()?;
-        Some(GroupKey {
-            node: path.node(root).clone(),
-            group: group.clone(),
-        })
+        let (group, value) = path.group_step()?;
+        let key = GroupKey::new(path.node(root).clone(), group.clone());
+        match value {
+            None => Some(key),
+            Some(value) => Some(key.with_value(self.grouping.get(group)?, value)),
+        }
+    }
+
+    /// Groups a relationship's neighbours by a property wherever it appears, or stops; values
+    /// opened under the old grouping close.
+    pub fn set_grouping(&mut self, group: &RelationshipGroup, by: Option<GroupBy>) {
+        self.expanded.retain(|path| !path.passes_value_of(group));
+        if let Some(selection) = &self.selection
+            && selection.passes_value_of(group)
+        {
+            let steps = selection.steps();
+            let at = steps
+                .windows(2)
+                .position(|pair| matches!(pair, [Step::Group(g), Step::Value(_)] if g == group))
+                .unwrap_or(0);
+            self.selection = Some(ExplorePath(steps[..=at].to_vec()));
+        }
+        match by {
+            Some(by) => self.grouping.insert(group.clone(), by),
+            None => self.grouping.remove(group),
+        };
     }
 
     /// Expands a node or group path. A group known to be empty stays closed.
@@ -346,7 +478,7 @@ impl ExploreState {
         let Some(root) = self.root.clone() else {
             return false;
         };
-        if path.is_root() || path.last_group().is_some() {
+        if path.is_root() || !path.ends_at_node() {
             return false;
         }
         let new_root = path.node(&root).clone();
@@ -376,6 +508,7 @@ impl ExploreState {
         self.labels.clear();
         self.counts.clear();
         self.neighbours.clear();
+        self.values.clear();
     }
 
     /// The exploration flattened in tree order.
@@ -457,10 +590,7 @@ impl ExploreState {
         }
         ancestors.push((node.clone(), index));
         for group in groups {
-            let key = GroupKey {
-                node: node.clone(),
-                group: group.clone(),
-            };
+            let key = GroupKey::new(node.clone(), group.clone());
             let group_path = path.child_group(&group);
             let list = self.neighbours.get(&key);
             if is_field(schema, &group) {
@@ -520,70 +650,187 @@ impl ExploreState {
             if !group_expanded {
                 continue;
             }
-            let Some(list) = list else {
-                out.push(Entry {
-                    path: group_path,
-                    depth: depth + 2,
-                    parent: Some(group_index),
-                    kind: EntryKind::Loading {
-                        target: LoadTarget::Page(key),
-                    },
-                });
-                continue;
-            };
-            for neighbour in &list.rows {
-                let node_path = group_path.child_node(&neighbour.node);
-                if let Some((_, ancestor)) = ancestors.iter().find(|(n, _)| *n == neighbour.node) {
-                    out.push(Entry {
-                        path: node_path,
-                        depth: depth + 2,
-                        parent: Some(group_index),
-                        kind: EntryKind::Cycle {
-                            node: neighbour.node.clone(),
-                            via: neighbour.clone(),
-                            ancestor: *ancestor,
-                        },
-                    });
-                } else {
-                    self.push_node(
-                        schema,
-                        &neighbour.node,
-                        Some(neighbour),
-                        node_path,
-                        depth + 2,
-                        Some(group_index),
-                        ancestors,
-                        out,
-                    );
-                }
-            }
-            let tail = match &list.status {
-                PageStatus::Loading => Some(EntryKind::Loading {
-                    target: LoadTarget::Page(key),
-                }),
-                PageStatus::Failed(message) => Some(EntryKind::Error {
-                    target: LoadTarget::Page(key),
-                    message: message.clone(),
-                }),
-                PageStatus::Idle => {
-                    list.has_more(count.loaded().copied())
-                        .then(|| EntryKind::More {
-                            shown: list.rows.len(),
-                            total: count.loaded().copied(),
-                            key,
-                        })
-                }
-            };
-            if let Some(kind) = tail {
-                out.push(Entry {
-                    path: group_path,
-                    depth: depth + 2,
-                    parent: Some(group_index),
-                    kind,
-                });
+            match self.grouping.get(&group) {
+                Some(by) => self.push_values(
+                    schema,
+                    &key,
+                    by,
+                    &count,
+                    &group_path,
+                    depth + 2,
+                    group_index,
+                    ancestors,
+                    out,
+                ),
+                None => self.push_list(
+                    schema,
+                    &key,
+                    count.loaded().copied(),
+                    &group_path,
+                    depth + 2,
+                    group_index,
+                    ancestors,
+                    out,
+                ),
             }
         }
         ancestors.pop();
+    }
+
+    /// A group's values, each with its count, and the neighbours of each value opened.
+    #[allow(clippy::too_many_arguments)]
+    fn push_values(
+        &self,
+        schema: &SchemaModel,
+        key: &GroupKey,
+        by: &GroupBy,
+        count: &Loadable<u64>,
+        group_path: &ExplorePath,
+        depth: usize,
+        parent: usize,
+        ancestors: &mut Vec<(NodeRef, usize)>,
+        out: &mut Vec<Entry>,
+    ) {
+        let target = LoadTarget::Values(key.clone(), by.clone());
+        let buckets = match self.values.get(&(key.clone(), by.clone())) {
+            Some(Loadable::Loaded(buckets)) => buckets,
+            Some(Loadable::Failed(message)) => {
+                out.push(Entry {
+                    path: group_path.clone(),
+                    depth,
+                    parent: Some(parent),
+                    kind: EntryKind::Error {
+                        target,
+                        message: message.clone(),
+                    },
+                });
+                return;
+            }
+            None | Some(Loadable::NotLoaded | Loadable::Loading) => {
+                out.push(Entry {
+                    path: group_path.clone(),
+                    depth,
+                    parent: Some(parent),
+                    kind: EntryKind::Loading { target },
+                });
+                return;
+            }
+        };
+        for (value, n) in &buckets.values {
+            let bucket = key.with_value(by, value);
+            let path = group_path.child_value(value);
+            let expanded = *n > 0 && self.expanded.contains(&path);
+            let index = out.len();
+            out.push(Entry {
+                path: path.clone(),
+                depth,
+                parent: Some(parent),
+                kind: EntryKind::Bucket {
+                    key: bucket.clone(),
+                    count: *n,
+                    expanded,
+                },
+            });
+            if expanded {
+                self.push_list(
+                    schema,
+                    &bucket,
+                    Some(*n),
+                    &path,
+                    depth + 1,
+                    index,
+                    ancestors,
+                    out,
+                );
+            }
+        }
+        let shown: u64 = buckets.values.iter().map(|(_, n)| n).sum();
+        let rest = count.loaded().map(|total| total.saturating_sub(shown));
+        if !buckets.complete && rest != Some(0) {
+            out.push(Entry {
+                path: group_path.clone(),
+                depth,
+                parent: Some(parent),
+                kind: EntryKind::OtherValues {
+                    shown: buckets.values.len(),
+                    rest,
+                },
+            });
+        }
+    }
+
+    /// The neighbours read so far under a group or a value, then a row to read more.
+    #[allow(clippy::too_many_arguments)]
+    fn push_list(
+        &self,
+        schema: &SchemaModel,
+        key: &GroupKey,
+        total: Option<u64>,
+        list_path: &ExplorePath,
+        depth: usize,
+        parent: usize,
+        ancestors: &mut Vec<(NodeRef, usize)>,
+        out: &mut Vec<Entry>,
+    ) {
+        let Some(list) = self.neighbours.get(key) else {
+            out.push(Entry {
+                path: list_path.clone(),
+                depth,
+                parent: Some(parent),
+                kind: EntryKind::Loading {
+                    target: LoadTarget::Page(key.clone()),
+                },
+            });
+            return;
+        };
+        for neighbour in &list.rows {
+            let node_path = list_path.child_node(&neighbour.node);
+            if let Some((_, ancestor)) = ancestors.iter().find(|(n, _)| *n == neighbour.node) {
+                out.push(Entry {
+                    path: node_path,
+                    depth,
+                    parent: Some(parent),
+                    kind: EntryKind::Cycle {
+                        node: neighbour.node.clone(),
+                        via: neighbour.clone(),
+                        ancestor: *ancestor,
+                    },
+                });
+            } else {
+                self.push_node(
+                    schema,
+                    &neighbour.node,
+                    Some(neighbour),
+                    node_path,
+                    depth,
+                    Some(parent),
+                    ancestors,
+                    out,
+                );
+            }
+        }
+        let tail = match &list.status {
+            PageStatus::Loading => Some(EntryKind::Loading {
+                target: LoadTarget::Page(key.clone()),
+            }),
+            PageStatus::Failed(message) => Some(EntryKind::Error {
+                target: LoadTarget::Page(key.clone()),
+                message: message.clone(),
+            }),
+            PageStatus::Idle => list.has_more(total).then(|| EntryKind::More {
+                shown: list.rows.len(),
+                total,
+                key: key.clone(),
+            }),
+        };
+        if let Some(kind) = tail {
+            out.push(Entry {
+                path: list_path.clone(),
+                depth,
+                parent: Some(parent),
+                kind,
+            });
+        }
     }
 
     /// The reads the visible entries still need, each once, in tree order.
@@ -609,6 +856,11 @@ impl ExploreState {
                 EntryKind::Loading {
                     target: LoadTarget::Page(key),
                 } if !self.neighbours.contains_key(&key) => LoadTarget::Page(key),
+                EntryKind::Loading {
+                    target: LoadTarget::Values(key, by),
+                } if !self.values.contains_key(&(key.clone(), by.clone())) => {
+                    LoadTarget::Values(key, by)
+                }
                 _ => continue,
             };
             if seen.insert(target.clone()) {
@@ -655,6 +907,27 @@ impl ExploreState {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         self.counts.insert(key, Loadable::Loaded(count));
+    }
+
+    /// Applies the answer to a values read, most common first and neighbours without a value
+    /// last. Each value's count is its neighbour list's count.
+    pub fn apply_values(&mut self, key: GroupKey, by: GroupBy, output: &ReadOutput, limit: u32) {
+        let mut values: Vec<(BucketValue, u64)> = rows(output)
+            .iter()
+            .map(|row| {
+                let value = row.get("value").cloned().unwrap_or(Value::Null);
+                let n = row.get("n").and_then(Value::as_u64).unwrap_or(0);
+                (BucketValue::new(&value), n)
+            })
+            .collect();
+        values.sort_by_key(|(value, _)| value.is_null());
+        for (value, n) in &values {
+            self.counts
+                .insert(key.with_value(&by, value), Loadable::Loaded(*n));
+        }
+        let complete = (values.len() as u32) < limit;
+        self.values
+            .insert((key, by), Loadable::Loaded(Buckets { values, complete }));
     }
 
     /// Appends one page of neighbours.
@@ -828,7 +1101,9 @@ impl Exploration {
     /// Starts a new exploration at `node`, at the branch head.
     pub fn root_at(&mut self, node: NodeRef, cx: &mut Context<Self>) {
         self.reset_reads();
+        let grouping = std::mem::take(&mut self.state.grouping);
         self.state = ExploreState::rooted(node);
+        self.state.grouping = grouping;
         self.request_missing(cx);
         self.changed(cx);
         cx.emit(ExplorationEvent::SelectionChanged);
@@ -863,6 +1138,8 @@ impl Exploration {
         let labels = std::mem::take(&mut self.state.labels);
         let counts = std::mem::take(&mut self.state.counts);
         let neighbours = std::mem::take(&mut self.state.neighbours);
+        let values = std::mem::take(&mut self.state.values);
+        let grouping = std::mem::take(&mut self.state.grouping);
         let mut state = ExploreState::rooted(node.clone());
         state.root_status = if labels.contains_key(&node) {
             Loadable::Loaded(())
@@ -873,6 +1150,8 @@ impl Exploration {
         state.labels = labels;
         state.counts = counts;
         state.neighbours = neighbours;
+        state.values = values;
+        state.grouping = grouping;
         self.state = state;
         self.request_missing(cx);
         self.changed(cx);
@@ -913,6 +1192,28 @@ impl Exploration {
     pub fn collapse_subtree(&mut self, path: &ExplorePath, cx: &mut Context<Self>) {
         self.state.collapse_subtree(path);
         self.changed(cx);
+    }
+
+    /// The property a relationship's neighbours are grouped by, if any.
+    pub fn grouping(&self, group: &RelationshipGroup) -> Option<&GroupBy> {
+        self.state.grouping.get(group)
+    }
+
+    /// Groups a relationship's neighbours by a property wherever it appears in this
+    /// exploration, or stops grouping them.
+    pub fn set_grouping(
+        &mut self,
+        group: &RelationshipGroup,
+        by: Option<GroupBy>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.grouping.get(group) == by.as_ref() {
+            return;
+        }
+        self.state.set_grouping(group, by);
+        self.request_missing(cx);
+        self.changed(cx);
+        cx.emit(ExplorationEvent::SelectionChanged);
     }
 
     pub fn selection(&self) -> Option<&ExplorePath> {
@@ -977,6 +1278,9 @@ impl Exploration {
             LoadTarget::Root => self.state.root_status = Loadable::NotLoaded,
             LoadTarget::Count(key) => {
                 self.state.counts.remove(key);
+            }
+            LoadTarget::Values(key, by) => {
+                self.state.values.remove(&(key.clone(), by.clone()));
             }
             LoadTarget::Page(key) => {
                 if let Some(list) = self.state.neighbours.get_mut(key) {
@@ -1048,14 +1352,36 @@ impl Exploration {
                 let list = self.state.neighbours.entry(key.clone()).or_default();
                 list.status = PageStatus::Loading;
                 list.page_size = page_size;
+                let value = key.within.as_ref().map(|within| within.value.value());
+                let narrow = Narrow {
+                    search: self.state.searches.get(key).map(String::as_str),
+                    value: key
+                        .within
+                        .as_ref()
+                        .zip(value.as_ref())
+                        .map(|(within, value)| (&within.by, value)),
+                };
                 builder::neighbours(
                     &schema,
                     &key.node.type_name,
                     &key.group,
                     &key.node.id,
                     list.next_after(),
-                    self.state.searches.get(key).map(String::as_str),
+                    narrow,
                     page_size,
+                )
+            }
+            LoadTarget::Values(key, by) => {
+                self.state
+                    .values
+                    .insert((key.clone(), by.clone()), Loadable::Loading);
+                builder::neighbour_values(
+                    &schema,
+                    &key.node.type_name,
+                    &key.group,
+                    &key.node.id,
+                    by,
+                    VALUES_LIMIT,
                 )
             }
         };
@@ -1101,6 +1427,10 @@ impl Exploration {
         match target {
             LoadTarget::Root => self.state.apply_root(&output),
             LoadTarget::Count(key) => self.state.apply_count(key.clone(), &output),
+            LoadTarget::Values(key, by) => {
+                self.state
+                    .apply_values(key.clone(), by.clone(), &output, VALUES_LIMIT)
+            }
             LoadTarget::Page(key) => {
                 let page_size = self
                     .state
@@ -1123,6 +1453,11 @@ impl Exploration {
             LoadTarget::Page(key) => {
                 self.state.neighbours.entry(key.clone()).or_default().status =
                     PageStatus::Failed(message);
+            }
+            LoadTarget::Values(key, by) => {
+                self.state
+                    .values
+                    .insert((key.clone(), by.clone()), Loadable::Failed(message));
             }
         }
     }
@@ -1206,6 +1541,13 @@ mod tests {
                         key.group.direction,
                         count.loaded()
                     ),
+                    EntryKind::Bucket { key, count, .. } => format!(
+                        "value {} {count}",
+                        key.within
+                            .as_ref()
+                            .map_or("-", |within| within.value.0.as_str())
+                    ),
+                    EntryKind::OtherValues { shown, rest } => format!("other {shown} {rest:?}"),
                     EntryKind::More { shown, total, .. } => format!("more {shown}/{total:?}"),
                     EntryKind::Loading { .. } => "loading".into(),
                     EntryKind::Error { message, .. } => format!("error {message}"),
@@ -1225,10 +1567,10 @@ mod tests {
         // Groups need counts; the field needs its single target.
         let missing = state.missing_loads(&schema);
         assert_eq!(missing.len(), 5, "{missing:?}");
-        assert!(missing.contains(&LoadTarget::Page(GroupKey {
-            node: person("ada"),
-            group: group(&schema, "Person", "Manager", Direction::Outgoing),
-        })));
+        assert!(missing.contains(&LoadTarget::Page(GroupKey::new(
+            person("ada"),
+            group(&schema, "Person", "Manager", Direction::Outgoing),
+        ))));
     }
 
     #[test]
@@ -1253,10 +1595,8 @@ mod tests {
         let works = group(&schema, "Person", "WorksAt", Direction::Outgoing);
         let manager = group(&schema, "Person", "Manager", Direction::Outgoing);
         let ada = person("ada");
-        let key = |node: &NodeRef, group: &RelationshipGroup| GroupKey {
-            node: node.clone(),
-            group: group.clone(),
-        };
+        let key =
+            |node: &NodeRef, group: &RelationshipGroup| GroupKey::new(node.clone(), group.clone());
         state.apply_count(key(&ada, &works), &output(&["n"], json!([{"n": 0}])));
         state.apply_count(key(&ada, &knows_out), &output(&["n"], json!([{"n": 2}])));
         state.apply_count(key(&ada, &knows_in), &output(&["n"], json!([{"n": 1}])));
@@ -1332,10 +1672,7 @@ mod tests {
         let schema = schema();
         let mut state = loaded_root(&schema);
         let knows = group(&schema, "Person", "Knows", Direction::Outgoing);
-        let key = GroupKey {
-            node: person("ada"),
-            group: knows.clone(),
-        };
+        let key = GroupKey::new(person("ada"), knows.clone());
         state.apply_count(key.clone(), &output(&["n"], json!([{"n": 3}])));
         state.expand(&ExplorePath::root().child_group(&knows));
         assert!(
@@ -1371,14 +1708,104 @@ mod tests {
     }
 
     #[test]
+    fn a_grouped_relationship_lists_its_values_and_each_opens_to_its_neighbours() {
+        let schema = schema();
+        let mut state = loaded_root(&schema);
+        let works_at = group(&schema, "Person", "WorksAt", Direction::Outgoing);
+        let key = GroupKey::new(person("ada"), works_at.clone());
+        let by = GroupBy {
+            on: gq_language::builder::GroupOn::Edge,
+            property: "role".into(),
+        };
+        let group_path = ExplorePath::root().child_group(&works_at);
+        state.apply_count(key.clone(), &output(&["n"], json!([{"n": 7}])));
+        state.set_grouping(&works_at, Some(by.clone()));
+        state.expand(&group_path);
+        let missing = state.missing_loads(&schema);
+        assert!(
+            missing.contains(&LoadTarget::Values(key.clone(), by.clone())),
+            "{missing:?}"
+        );
+        assert!(
+            !missing.contains(&LoadTarget::Page(key.clone())),
+            "a grouped relationship reads its values, not its neighbours"
+        );
+
+        // Two values came back with a limit of two: there may be more.
+        state.apply_values(
+            key.clone(),
+            by.clone(),
+            &output(
+                &["value", "n"],
+                json!([{"n": 3}, {"value": "lead", "n": 3}]),
+            ),
+            2,
+        );
+        let shown = kinds(&state.entries(&schema));
+        let at = shown
+            .iter()
+            .position(|row| row == "  group WorksAt Outgoing Some(7)")
+            .unwrap();
+        assert_eq!(
+            shown[at + 1..at + 4],
+            [
+                "    value \"lead\" 3",
+                "    value null 3",
+                "    other 2 Some(1)"
+            ],
+            "neighbours without a value come last"
+        );
+
+        // A value opens to the neighbours with that value, read on their own.
+        let lead = BucketValue::new(&json!("lead"));
+        let lead_path = group_path.child_value(&lead);
+        let lead_key = key.with_value(&by, &lead);
+        state.expand(&lead_path);
+        assert!(
+            state
+                .missing_loads(&schema)
+                .contains(&LoadTarget::Page(lead_key.clone()))
+        );
+        state.apply_page(
+            lead_key.clone(),
+            &output(&["id"], json!([{"id": "acme"}, {"id": "initech"}])),
+            2,
+        );
+        let shown = kinds(&state.entries(&schema));
+        assert!(shown.contains(&"      node acme".to_owned()), "{shown:#?}");
+        assert!(
+            shown.contains(&"      more 2/Some(3)".to_owned()),
+            "a value pages with its own count: {shown:#?}"
+        );
+        let acme = NodeRef::new("Company", "acme");
+        assert_eq!(
+            state.path_of(&schema, &acme),
+            Some(lead_path.child_node(&acme))
+        );
+
+        // Ending the grouping closes the values and leaves the selection on the group.
+        state.selection = Some(lead_path.child_node(&acme));
+        state.set_grouping(&works_at, None);
+        assert!(!state.is_expanded(&lead_path));
+        assert_eq!(state.selection, Some(group_path.clone()));
+        assert!(
+            state
+                .missing_loads(&schema)
+                .contains(&LoadTarget::Page(key.clone()))
+        );
+        assert!(
+            !kinds(&state.entries(&schema))
+                .iter()
+                .any(|row| row.contains("value"))
+        );
+    }
+
+    #[test]
     fn edge_properties_skip_nulls_and_keep_order() {
         let schema = schema();
         let mut state = loaded_root(&schema);
         let works = group(&schema, "Person", "WorksAt", Direction::Outgoing);
-        let key = GroupKey {
-            node: person("ada"),
-            group: works,
-        };
+        let key = GroupKey::new(person("ada"), works);
         state.apply_page(
             key.clone(),
             &output(

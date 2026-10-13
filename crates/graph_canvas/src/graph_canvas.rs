@@ -1581,11 +1581,9 @@ fn half_widths(scene: &Scene, measure: &impl Fn(&str, f32, gpui::FontWeight) -> 
 }
 
 fn scene_id_of(path: &ExplorePath, root: &NodeRef) -> SceneId {
-    match path.last_group() {
-        Some(group) => SceneId::Hub(GroupKey {
-            node: path.node(root).clone(),
-            group: group.clone(),
-        }),
+    // A value of a grouped relationship is drawn as the relationship's hub.
+    match path.group_step() {
+        Some((group, _)) => SceneId::Hub(GroupKey::new(path.node(root).clone(), group.clone())),
         None => SceneId::Node(path.node(root).clone()),
     }
 }
@@ -1729,17 +1727,17 @@ mod tests {
         assert_eq!(back["type:Person"], Vec2::new(12., -31.));
         assert_eq!(back["node:Person/person-000001"], Vec2::new(-5., 7.));
         // Hubs follow their node; they are never placed by hand.
-        let hub = SceneId::Hub(GroupKey {
-            node: NodeRef {
+        let hub = SceneId::Hub(GroupKey::new(
+            NodeRef {
                 type_name: "Person".into(),
                 id: "person-000001".into(),
             },
-            group: gq_language::RelationshipGroup {
+            gq_language::RelationshipGroup {
                 edge: "Knows".into(),
                 direction: gq_language::Direction::Outgoing,
                 other_type: "Person".into(),
             },
-        });
+        ));
         assert_eq!(pin_key(&hub), None);
         assert!(pins_from_json(&serde_json::Value::Null).is_empty());
         assert!(

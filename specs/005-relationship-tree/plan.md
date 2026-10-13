@@ -33,6 +33,7 @@ II (the tree reads one commit), V (rows do not jump), VIII (keyboard), IX (paged
 | Node | type color dot, label property, key; in review mode `+ ~ −` | its relationship groups |
 | Relationship group | `→` or `←`, edge name, other type, count; zero-count groups dimmed or hidden (toggle) | neighbour nodes, 50 at a time |
 | Field | an edge with cardinality at most one, shown on its node as `manager → Charles` | nothing (Enter follows it) |
+| Value | one value of the property the group is grouped by, and how many neighbours have it; "No value" last | the neighbours with that value, paged like a group |
 | More | "Show 50 more of 418 · Filter…" | the next page; a filter box appears above 50 |
 | Cycle | a node already on its own path, "↺ already above" | Enter jumps to the ancestor |
 
@@ -59,6 +60,15 @@ on the canvas. Typing filters the visible rows.
 
 - Neighbour pages: keyset by `@id`, `studio.tree_page_size` per page (50 by default; a graph
   can have its own, spec 002), with edge properties through an edge binding.
+- Grouping: a relationship group's button (shown on hover or selection) groups its neighbours
+  by a property of the other type or of the edge: text, enum, Bool, integer or date, never the
+  key, a list or a vector. The group row reads "by title"; it opens to one row per value from one
+  grouped count read (`return { $m.title as value, count($m) as n }`, most common first, at most
+  100 values), then "N more in other values" when the read was cut. A value opens to its
+  neighbours, read with `$m.title = $value` (or `is null`) in the same keyset pages. The grouping
+  belongs to the relationship (edge, direction, other type), so it applies wherever that
+  relationship appears in the tree, survives re-rooting, and ends from the same menu. The canvas
+  draws a grouped relationship as its hub, with the open values' neighbours on it.
 - The whole tree reads one commit; when the branch moves, "Newer data · Refresh" appears.
 
 ### Rendering and state
@@ -80,7 +90,8 @@ on the canvas. Typing filters the visible rows.
 
 - Engine change E16 (neighbourhood counts per node), [spec 012](../012-omnigraph-engine-changes/plan.md). Until then, one count query per
   edge type, run concurrently and cached for the pinned commit.
-- Grouping neighbours by a property ("by company").
+- Grouping by a relationship of the neighbour ("people by the company they work at"), which needs
+  a two-hop grouped count; grouping by floats and datetimes, which need buckets.
 - Showing the same model as columns in wide windows (node | relationships | nodes | …): the
   tree lives in a fixed-width dock panel, and the canvas covers the wide view.
 
@@ -100,6 +111,8 @@ on the canvas. Typing filters the visible rows.
 | 2026-10-12 | Flattening, cycle detection, filtering with ancestors, paging state | `cargo test -p graph_store -p relationship_tree` | 9 + 4 unit tests pass |
 | 2026-10-12 | ⌘↵ on a group opens the related table | offscreen snapshot: `OpenNode` person-000000, ↓, ⌘↵ | The left dock switched to Explore; Project opened with "← contributes person-000000", 1 of 40 (project-00036, as the tree shows) |
 | 2026-10-12 | Group search reads the server | `gq_language` `relationship_queries_compile_in_both_directions` with a search; `rows` tests keep the "Show more" row under a kept group and hide empty groups | Pass |
+| 2026-10-12 | Grouped counts by a node or edge property, nulls as their own group | HTTP probe on the dev server: `company-00000`'s ← WorksAt by `$m.title` and by `$e.role`, `person-000000`'s Knows by `$m.born` | Rows such as `{"value": "Engineer", "n": 2}`; neighbours without a value come back as one row with no `value` |
+| 2026-10-12 | Group by: values with counts, a value opens to its neighbours, "No value" last; ending it closes the values and keeps the selection on the group | `gq_language` `neighbours_group_by_a_property_of_either_end_and_narrow_to_one_value` (every choice of every dev relationship compiles, with and without a value); `graph_store` `a_grouped_relationship_lists_its_values_and_each_opens_to_its_neighbours`; offscreen snapshots: Sammet Systems → ← WorksAt → group-by menu → title, then the canvas | Menu: No grouping, Person (name, title, email, born), WorksAt (role, since). Rows: Engineer 2, Designer 1, Manager 1, Researcher 1, No value 2; Engineer and Designer opened to their people; the canvas hub showed the three open people and "+4 more" |
 
 ## Corrections
 

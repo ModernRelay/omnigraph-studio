@@ -595,7 +595,7 @@ impl NodePeek {
             &group.group,
             &id,
             None,
-            None,
+            builder::Narrow::default(),
             NEIGHBOUR_LIMIT,
         ) {
             Ok(query) => query,

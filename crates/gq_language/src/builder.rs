@@ -801,6 +801,101 @@ pub fn reversed(group: &RelationshipGroup, node_type: &str) -> RelationshipGroup
     }
 }
 
+/// Where a grouping property lives: on the neighbour, or on the edge that reaches it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GroupOn {
+    Node,
+    Edge,
+}
+
+/// A property a relationship group's neighbours are grouped by in the tree (spec 005).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GroupBy {
+    pub on: GroupOn,
+    pub property: String,
+}
+
+impl GroupBy {
+    /// Whether neighbours can be grouped by a property: one value per row that can repeat
+    /// (text, enum, Bool, integer or date), and not the key, which never repeats.
+    pub fn allowed(property: &Property) -> bool {
+        !property.list
+            && !property.is_key
+            && matches!(
+                property.kind,
+                ScalarKind::Text | ScalarKind::Bool | ScalarKind::Integer | ScalarKind::Date
+            )
+    }
+
+    /// What a group's neighbours can be grouped by: the other type's properties, then the
+    /// edge's, in schema order.
+    pub fn choices(schema: &SchemaModel, group: &RelationshipGroup) -> Vec<GroupBy> {
+        let node = schema
+            .node(&group.other_type)
+            .map(|node| node.properties.as_slice())
+            .unwrap_or_default();
+        let edge = schema
+            .edge(&group.edge)
+            .map(|edge| edge.properties.as_slice())
+            .unwrap_or_default();
+        let pick = |on: GroupOn, properties: &[Property]| -> Vec<GroupBy> {
+            properties
+                .iter()
+                .filter(|property| Self::allowed(property))
+                .map(|property| GroupBy {
+                    on,
+                    property: property.name.clone(),
+                })
+                .collect()
+        };
+        let mut choices = pick(GroupOn::Node, node);
+        choices.extend(pick(GroupOn::Edge, edge));
+        choices
+    }
+
+    fn resolve<'a>(
+        &self,
+        schema: &'a SchemaModel,
+        group: &RelationshipGroup,
+    ) -> Result<&'a Property, BuildError> {
+        let (owner, properties) = match self.on {
+            GroupOn::Node => {
+                let node = self::node(schema, &group.other_type)?;
+                (&node.name, node.properties.as_slice())
+            }
+            GroupOn::Edge => {
+                let edge = schema
+                    .edge(&group.edge)
+                    .ok_or_else(|| BuildError::UnknownEdge(group.edge.clone()))?;
+                (&edge.name, edge.properties.as_slice())
+            }
+        };
+        properties
+            .iter()
+            .find(|property| property.name == self.property && Self::allowed(property))
+            .ok_or_else(|| BuildError::UnknownProperty {
+                type_name: owner.clone(),
+                property: self.property.clone(),
+            })
+    }
+
+    /// The property as the neighbour queries spell it: `$m.title` or `$e.role`.
+    fn target(&self) -> String {
+        match self.on {
+            GroupOn::Node => format!("$m.{}", self.property),
+            GroupOn::Edge => format!("$e.{}", self.property),
+        }
+    }
+}
+
+/// What narrows a page of neighbours: ids or labels matching a text, and one value of the
+/// property the group is grouped by (`Value::Null` for neighbours without one).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Narrow<'a> {
+    pub search: Option<&'a str>,
+    pub value: Option<(&'a GroupBy, &'a Value)>,
+}
+
 /// One page of a node's neighbours through a relationship group, with the neighbour's label
 /// and the edge's properties (spec 005). Columns: `id`, `label` (when the other type has one),
 /// then `e_<property>` for each projectable edge property.
@@ -810,7 +905,7 @@ pub fn neighbours(
     group: &RelationshipGroup,
     id: &str,
     after: Option<&str>,
-    search: Option<&str>,
+    narrow: Narrow<'_>,
     limit: u32,
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, node_type)?;
@@ -834,18 +929,29 @@ pub fn neighbours(
     for property in edge.properties.iter().filter(|p| p.projectable()) {
         columns.push(format!("$e.{0} as e_{0}", property.name));
     }
+    let mut extra = String::new();
     // A search narrows the neighbours to ids starting with, or labels containing, the text.
-    let search = match search.filter(|text| !text.is_empty()) {
-        Some(text) => {
-            let label = other
-                .label_property()
-                .filter(|label| Some(*label) != other.key.as_deref());
-            format!("\n    {}", text_match("m", label, text, &mut params))
-        }
-        None => String::new(),
-    };
+    if let Some(text) = narrow.search.filter(|text| !text.is_empty()) {
+        let label = other
+            .label_property()
+            .filter(|label| Some(*label) != other.key.as_deref());
+        extra.push_str(&format!(
+            "\n    {}",
+            text_match("m", label, text, &mut params)
+        ));
+    }
+    if let Some((by, value)) = narrow.value {
+        let property = by.resolve(schema, group)?;
+        let clause = if value.is_null() {
+            format!("{} is null", by.target())
+        } else {
+            let value = params.add("value", &property.param_type(false), value.clone());
+            format!("{} = {value}", by.target())
+        };
+        extra.push_str(&format!("\n    {clause}"));
+    }
     let text = format!(
-        "query studio_neighbours({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n    {traversal}\n    $m.@id > {after}{search}\n  }}\n  return {{ {columns} }}\n  order {{ $m.@id asc }}\n  limit {limit}\n}}\n",
+        "query studio_neighbours({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n    {traversal}\n    $m.@id > {after}{extra}\n  }}\n  return {{ {columns} }}\n  order {{ $m.@id asc }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         ty = node.name,
         traversal = traversal_clause(group, Some("e")),
@@ -853,6 +959,35 @@ pub fn neighbours(
     );
     Ok(BuiltQuery {
         name: "studio_neighbours".into(),
+        text,
+        params: params.values,
+    })
+}
+
+/// How many of a node's neighbours through a relationship group have each value of a property,
+/// most first, then by value (spec 005, grouping). Columns: `value`, absent where the
+/// neighbours have none, and `n`. At most `limit` values.
+pub fn neighbour_values(
+    schema: &SchemaModel,
+    node_type: &str,
+    group: &RelationshipGroup,
+    id: &str,
+    by: &GroupBy,
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, node_type)?;
+    by.resolve(schema, group)?;
+    let mut params = Params::new();
+    let id = params.add("id", "String", Value::String(id.to_owned()));
+    let text = format!(
+        "query studio_neighbour_values({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n    {traversal}\n  }}\n  return {{ {target} as value, count($m) as n }}\n  order {{ n desc, value asc }}\n  limit {limit}\n}}\n",
+        sig = params.signature(),
+        ty = node.name,
+        traversal = traversal_clause(group, Some("e")),
+        target = by.target(),
+    );
+    Ok(BuiltQuery {
+        name: "studio_neighbour_values".into(),
         text,
         params: params.values,
     })
@@ -1601,10 +1736,23 @@ mod tests {
         for group in schema.relationships_of("Person") {
             assert_compiles(&degree(&schema, "Person", &group, "person-000000").unwrap());
             assert_compiles(
-                &neighbours(&schema, "Person", &group, "person-000000", None, None, 50).unwrap(),
+                &neighbours(
+                    &schema,
+                    "Person",
+                    &group,
+                    "person-000000",
+                    None,
+                    Narrow::default(),
+                    50,
+                )
+                .unwrap(),
             );
         }
         for group in schema.relationships_of("Company") {
+            let search = Narrow {
+                search: Some("ada"),
+                value: None,
+            };
             assert_compiles(
                 &neighbours(
                     &schema,
@@ -1612,11 +1760,81 @@ mod tests {
                     &group,
                     "company-00000",
                     None,
-                    Some("ada"),
+                    search,
                     50,
                 )
                 .unwrap(),
             );
+        }
+    }
+
+    #[test]
+    fn neighbours_group_by_a_property_of_either_end_and_narrow_to_one_value() {
+        let schema = dev();
+        for node_type in ["Person", "Company", "Project"] {
+            for group in schema.relationships_of(node_type) {
+                for by in GroupBy::choices(&schema, &group) {
+                    let values =
+                        neighbour_values(&schema, node_type, &group, "x", &by, 100).unwrap();
+                    assert_compiles(&values);
+                    assert!(values.text.contains("order { n desc, value asc }"));
+                    for value in [json!(null), sample_value(&schema, &group, &by)] {
+                        let narrow = Narrow {
+                            search: Some("a"),
+                            value: Some((&by, &value)),
+                        };
+                        let page =
+                            neighbours(&schema, node_type, &group, "x", None, narrow, 50).unwrap();
+                        assert_compiles(&page);
+                        assert_eq!(
+                            page.text.contains("is null"),
+                            value.is_null(),
+                            "{}",
+                            page.text
+                        );
+                    }
+                }
+            }
+        }
+        let works_at = schema
+            .relationships_of("Company")
+            .into_iter()
+            .find(|group| group.edge == "WorksAt")
+            .unwrap();
+        let choices: Vec<String> = GroupBy::choices(&schema, &works_at)
+            .iter()
+            .map(|by| format!("{:?} {}", by.on, by.property))
+            .collect();
+        assert_eq!(
+            choices,
+            [
+                "Node name",
+                "Node title",
+                "Node email",
+                "Node born",
+                "Edge role",
+                "Edge since"
+            ],
+            "the key, lists, and vectors are left out"
+        );
+        let key = GroupBy {
+            on: GroupOn::Node,
+            property: "slug".into(),
+        };
+        assert!(neighbour_values(&schema, "Company", &works_at, "x", &key, 10).is_err());
+    }
+
+    /// A value of the grouping property's type, as a bucket would hold it.
+    fn sample_value(schema: &SchemaModel, group: &RelationshipGroup, by: &GroupBy) -> Value {
+        let property = by.resolve(schema, group).unwrap();
+        match property.kind {
+            ScalarKind::Bool => json!(true),
+            ScalarKind::Integer => json!(3),
+            ScalarKind::Date => json!("2024-01-02"),
+            _ => match &property.enum_values {
+                Some(values) => json!(values[0]),
+                None => json!("Engineer"),
+            },
         }
     }
 

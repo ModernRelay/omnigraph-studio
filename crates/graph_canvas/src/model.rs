@@ -412,7 +412,11 @@ pub fn explore_scene(
                     push_edge(&mut scene, hub, existing);
                 }
             }
+            // The canvas draws a grouped relationship as its hub: a value's neighbours hang
+            // from the hub, as they do without grouping.
+            EntryKind::Bucket { .. } => placed[index] = parent_scene,
             EntryKind::Field { .. }
+            | EntryKind::OtherValues { .. }
             | EntryKind::More { .. }
             | EntryKind::Loading { .. }
             | EntryKind::Error { .. } => {}
@@ -533,10 +537,7 @@ mod tests {
             .into_iter()
             .find(|g| g.edge == "Knows" && g.direction == Direction::Outgoing)
             .unwrap();
-        let ada_knows = GroupKey {
-            node: person("ada"),
-            group: knows.clone(),
-        };
+        let ada_knows = GroupKey::new(person("ada"), knows.clone());
         state.counts.insert(ada_knows.clone(), Loadable::Loaded(20));
         state.neighbours.insert(
             ada_knows,
@@ -557,10 +558,7 @@ mod tests {
         let p00 = group.child_node(&person("p00"));
         state.expanded.insert(p00.clone());
         state.expanded.insert(p00.child_group(&knows));
-        let p00_knows = GroupKey {
-            node: person("p00"),
-            group: knows,
-        };
+        let p00_knows = GroupKey::new(person("p00"), knows);
         state.counts.insert(p00_knows.clone(), Loadable::Loaded(2));
         state.neighbours.insert(
             p00_knows,
@@ -597,10 +595,7 @@ mod tests {
             .into_iter()
             .find(|g| g.edge == "Employer")
             .unwrap();
-        let key = GroupKey {
-            node: person("ada"),
-            group: employer.clone(),
-        };
+        let key = GroupKey::new(person("ada"), employer.clone());
         let acme = NodeRef::new("Company", "acme");
         state.neighbours.insert(
             key.clone(),
