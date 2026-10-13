@@ -5,9 +5,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{App, ClipboardItem, Context, Entity, Render, SharedString, Task, Window};
+use gpui::{App, ClipboardItem, Context, Entity, Render, SharedString, Subscription, Task, Window};
 use gq_language::{Direction, RelationshipGroup, SchemaModel, builder};
-use graph_store::{GraphSession, Loadable};
+use graph_store::{GraphSession, Loadable, SessionEvent};
 use serde_json::{Map, Value};
 use studio_actions::graph::{OpenBlob, OpenNode};
 use ui::Tooltip;
@@ -98,7 +98,10 @@ pub struct NodePeek {
     values: Loadable<Map<String, Value>>,
     groups: Vec<Group>,
     copied: Option<String>,
+    /// Studio committed to the peek's branch since it read: what it shows may be older.
+    newer: bool,
     _tasks: Vec<Task<()>>,
+    _subscription: Subscription,
 }
 
 impl NodePeek {
@@ -114,6 +117,15 @@ impl NodePeek {
         cx: &mut Context<Self>,
     ) -> Self {
         let schema = session.read(cx).schema_model();
+        let subscription = cx.subscribe(&session, |this: &mut Self, session, event, cx| {
+            if let SessionEvent::Committed { branch } = event
+                && *branch == session.read(cx).branch
+                && this.snapshot.is_some()
+            {
+                this.newer = true;
+                cx.notify();
+            }
+        });
         let mut this = Self {
             session,
             blobs: Vec::new(),
@@ -123,7 +135,9 @@ impl NodePeek {
             values: Loadable::NotLoaded,
             groups: Vec::new(),
             copied: None,
+            newer: false,
             _tasks: Vec::new(),
+            _subscription: subscription,
         };
         match values {
             Some(values) => {
@@ -138,6 +152,16 @@ impl NodePeek {
 
     pub fn subject(&self) -> &PeekSubject {
         &self.subject
+    }
+
+    /// Reads a node again at the branch head, with its relationships and Blobs.
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.newer = false;
+        self.snapshot = None;
+        self.groups.clear();
+        self._tasks.clear();
+        self.load_node(cx);
+        cx.notify();
     }
 
     fn load_node(&mut self, cx: &mut Context<Self>) {
@@ -1050,7 +1074,9 @@ impl Render for NodePeek {
             )
             .child(
                 h_flex()
-                    .gap_3()
+                    .flex_wrap()
+                    .gap_x_3()
+                    .gap_y_1()
                     .child(studio_ui::ds::meta_code(IconName::Hash, id, cx))
                     .children(at.map(|commit| {
                         div()
@@ -1061,7 +1087,19 @@ impl Render for NodePeek {
                                 short_commit(&commit),
                                 cx,
                             ))
-                    })),
+                    }))
+                    // A node opened by id reads again by id; an edge is read with its table.
+                    .when(self.newer && is_node, |meta| {
+                        meta.child(
+                            studio_ui::ds::button("peek-newer", "Newer data · Refresh")
+                                .label_size(LabelSize::XSmall)
+                                .style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                                .tooltip(Tooltip::text(
+                                    "The branch moved since this was read. Refresh reads it at the head.",
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                        )
+                    }),
             )
             .children(
                 endpoints.map(|endpoints| v_flex().child(section("Endpoints")).child(endpoints)),

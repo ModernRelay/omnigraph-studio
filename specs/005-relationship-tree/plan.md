@@ -125,6 +125,7 @@ on the canvas. Typing filters the visible rows.
 | 2026-10-12 | Grouped counts by a node or edge property, nulls as their own group | HTTP probe on the dev server: `company-00000`'s ← WorksAt by `$m.title` and by `$e.role`, `person-000000`'s Knows by `$m.born` | Rows such as `{"value": "Engineer", "n": 2}`; neighbours without a value come back as one row with no `value` |
 | 2026-10-12 | Group by: values with counts, a value opens to its neighbours, "No value" last; ending it closes the values and keeps the selection on the group | `gq_language` `neighbours_group_by_a_property_of_either_end_and_narrow_to_one_value` (every choice of every dev relationship compiles, with and without a value); `graph_store` `a_grouped_relationship_lists_its_values_and_each_opens_to_its_neighbours`; offscreen snapshots: Sammet Systems → ← WorksAt → group-by menu → title, then the canvas | Menu: No grouping, Person (name, title, email, born), WorksAt (role, since). Rows: Engineer 2, Designer 1, Manager 1, Researcher 1, No value 2; Engineer and Designer opened to their people; the canvas hub showed the three open people and "+4 more" |
 | 2026-10-12 | Hover cards with every edge property | `relationship_tree` `labels_read_well` (`edge_value`); offscreen snapshot: `OpenNode` person-000000, WorksAt opened, hover on Allen Labs | The card read "Allen Labs · Company", `company-00002`, then "→ WorksAt" with role lead and since 2000-06-09, names aligned |
+| 2026-10-12 | "Newer data · Refresh" after Studio's own write | offscreen snapshot on the scratch branch `drafts-test`: `OpenNode` person-000000, a title edited in the Person table, then the Explore panel | The tree, pinned to its read, showed "Newer data · Refresh" above Radia Knuth |
 
 ## Corrections
 
@@ -145,8 +146,8 @@ on the canvas. Typing filters the visible rows.
   dispatch node, above the workspace's `register_action` handlers, so window actions do nothing
   until something has focus. The tree takes focus when a graph opens and nothing else holds it.
   The frame (spec 002) should own this.
-- **Key bindings** are registered in `relationship_tree::init` with `cx.bind_keys`; they still
-  need entries in `assets/keymaps/`.
+- **Key bindings** were first registered in `relationship_tree::init` with `cx.bind_keys`; they
+  now live in `assets/keymaps/` (contexts `Tree`, `Tree && !filtering`, `Tree && filtering`).
 - **Built since:** Space peeks (`studio_graph::PeekNode`: the inspector only, focus stays in
   the tree); ⌘↵ opens the node's table filtered to its id, or on a relationship group the other
   type's table filtered to "related to" this node (spec 004's relationship filter); the eye
@@ -157,5 +158,5 @@ on the canvas. Typing filters the visible rows.
   propagates, so Explore shows and the tree reveals the node. A node row's hover card shows
   its label, type and key, then under the relationship that led to it (`→ WorksAt`) every
   property of that edge, one per line; a row shows only the first, when it fits.
-- **Not built yet:** the "Newer data · Refresh" chip is wired to `SessionEvent::Committed` but not seen in a snapshot,
-  and fields (at-most-one edges) are covered by unit tests only: the dev schema has none.
+- **Not seen yet:** fields (at-most-one edges) are covered by unit tests only: the dev schema
+  has none.
