@@ -119,7 +119,8 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   text to the agent ("Ask") once spec 011 lands.
   Built: a segmented control under the search field; ⌘1–⌘6 (Alt elsewhere) inside the
   palette. ⌘K opens All, ⌘P Nodes, ⌘⇧B Branches; the key sheet (`?`) has no tabs. Queries
-  lists the open query tabs with their first line, since saved queries are not built. Tab
+  lists the open query tabs with their first line, then the graph's saved query files that no
+  tab has open (spec 007). Tab
   (bound under `CommandPalette > Editor`, so it outranks the editor's) dismisses the palette
   and sends `studio_agent::Ask`; with no agent chosen, the agent tab says the question waits.
   Node search tries the text as typed, lowercase and capitalized, because `contains` is

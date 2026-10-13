@@ -193,7 +193,7 @@ impl Mode {
             Mode::Picker(Scope::Nodes) if !typed => "Type an id or a name to find nodes.",
             Mode::Picker(Scope::Nodes) => "No node matches.",
             Mode::Picker(Scope::Types) => "No type matches.",
-            Mode::Picker(Scope::Queries) => "No query tab matches.",
+            Mode::Picker(Scope::Queries) => "No query matches.",
             Mode::Picker(Scope::Branches) => "No branch matches.",
             Mode::Picker(Scope::Commands) => "No command matches.",
             Mode::Picker(Scope::All) => "Nothing matches.",
