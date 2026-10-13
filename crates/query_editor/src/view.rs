@@ -607,10 +607,11 @@ impl QueryEditor {
         let written = text.clone();
         let target = path.clone();
         let write = cx.background_spawn(async move {
-            if let Some(dir) = target.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            std::fs::write(&target, written)
+            studio_settings::write_atomic(
+                &target,
+                written.as_bytes(),
+                studio_settings::Access::Keep,
+            )
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = write.await;

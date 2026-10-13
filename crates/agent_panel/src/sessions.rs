@@ -361,30 +361,28 @@ fn read_records(path: &Path) -> Vec<SessionRecord> {
         .collect()
 }
 
+/// The file's object. A file that exists but is not a JSON object is set aside, so the next
+/// write does not replace every conversation it lists.
 fn read(path: &Path) -> Map<String, Value> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default()
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Map::new();
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(object)) => object,
+        _ => {
+            studio_settings::set_aside(path);
+            Map::new()
+        }
+    }
 }
 
+/// Replaces the file in one step, readable only by its owner: a crash mid-write leaves the
+/// previous list, never an empty one.
 fn write(path: &Path, value: &Value) {
-    if let Some(dir) = path.parent()
-        && std::fs::create_dir_all(dir).is_err()
-    {
-        return;
-    }
     let Ok(text) = serde_json::to_string_pretty(value) else {
         return;
     };
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    if let Ok(mut file) = options.open(path) {
-        std::io::Write::write_all(&mut file, text.as_bytes()).ok();
-    }
+    studio_settings::write_atomic(path, text.as_bytes(), studio_settings::Access::Private).ok();
 }
 
 /// The option values the person last chose for an agent (its model, mode, reasoning level),

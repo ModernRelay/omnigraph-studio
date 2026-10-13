@@ -421,11 +421,13 @@ impl ConnectionRegistry {
             })
             .collect();
         let saved = SavedServers { servers };
-        let dir = data_dir();
-        if std::fs::create_dir_all(&dir).is_ok()
-            && let Ok(text) = serde_json::to_string_pretty(&saved)
-        {
-            let _ = std::fs::write(saved_path(), text);
+        if let Ok(text) = serde_json::to_string_pretty(&saved) {
+            studio_settings::write_atomic(
+                &saved_path(),
+                text.as_bytes(),
+                studio_settings::Access::Private,
+            )
+            .ok();
         }
     }
 

@@ -67,14 +67,10 @@ pub fn record(key: &str, cx: &mut App) {
     let saved = Saved {
         recent: recent.keys.clone(),
     };
-    cx.background_spawn(async move {
-        let path = path();
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(text) = serde_json::to_string_pretty(&saved) {
-            let _ = std::fs::write(path, text);
-        }
-    })
-    .detach();
+    // Written on the main thread: the list is small, and two runs started close together must
+    // land in order, the later list last.
+    if let Ok(text) = serde_json::to_string_pretty(&saved) {
+        studio_settings::write_atomic(&path(), text.as_bytes(), studio_settings::Access::Private)
+            .ok();
+    }
 }

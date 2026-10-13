@@ -7,7 +7,6 @@
 //! draft, so the files are readable by their owner only.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use gpui::{App, Bounds, Context, Global, Pixels, Window, WindowId, point, px, size};
@@ -96,30 +95,34 @@ fn key(server_url: &str, graph: &str) -> String {
 }
 
 pub(crate) fn load(server_url: &str, graph: &str) -> Option<SavedWorkspace> {
-    let text = std::fs::read_to_string(workspaces_dir().join(key(server_url, graph))).ok()?;
-    serde_json::from_str(&text).ok()
+    let path = workspaces_dir().join(key(server_url, graph));
+    let text = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str(&text) {
+        Ok(saved) => Some(saved),
+        // Kept beside it, so the next save does not overwrite tabs and drafts that may be
+        // recoverable.
+        Err(_) => {
+            studio_settings::set_aside(&path);
+            None
+        }
+    }
 }
 
+/// Saves a graph's tabs and drafts, unless restoring is off: a run that did not read them
+/// (the snapshot tool) must not replace them.
 pub(crate) fn save(server_url: &str, graph: &str, saved: &SavedWorkspace) {
-    let dir = workspaces_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
+    if !restore_enabled() {
         return;
     }
     if let Ok(text) = serde_json::to_string_pretty(saved) {
-        write_private(&dir.join(key(server_url, graph)), &text).ok();
+        write_private(&workspaces_dir().join(key(server_url, graph)), &text).ok();
     }
 }
 
-/// Writes `text` to a file only its owner can read, including a file an older build created.
+/// Replaces a file in one step (a crash leaves the old file or the new one, never an empty
+/// one), readable only by its owner, including a file an older build created.
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-    file.write_all(text.as_bytes())
+    studio_settings::write_atomic(path, text.as_bytes(), studio_settings::Access::Private)
 }
 
 /// The graphs a window had open, in the order they were opened, and which one it showed.
@@ -174,9 +177,15 @@ pub fn load_windows() -> Vec<SavedWindow> {
     if !restore_enabled() {
         return Vec::new();
     }
-    std::fs::read_to_string(session_path())
-        .map(|text| parse_session(&text))
-        .unwrap_or_default()
+    let path = session_path();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    if serde_json::from_str::<SessionFile>(&text).is_err() {
+        studio_settings::set_aside(&path);
+        return Vec::new();
+    }
+    parse_session(&text)
 }
 
 fn parse_session(text: &str) -> Vec<SavedWindow> {
@@ -331,9 +340,6 @@ pub(crate) fn window_moved(slot: u64, bounds: Bounds<Pixels>, cx: &mut App) {
 }
 
 fn write_session(windows: &[SavedWindow]) {
-    if std::fs::create_dir_all(studio_settings::data_dir()).is_err() {
-        return;
-    }
     let file = SessionFile {
         windows: windows.to_vec(),
         ..SessionFile::default()
@@ -393,12 +399,12 @@ pub fn saved_window_bounds(cx: &App) -> Option<Bounds<Pixels>> {
 }
 
 pub(crate) fn save_window_bounds(bounds: Bounds<Pixels>) {
-    let saved = SavedBounds::from(bounds);
-    if let Some(dir) = bounds_path().parent() {
-        std::fs::create_dir_all(dir).ok();
+    if !restore_enabled() {
+        return;
     }
+    let saved = SavedBounds::from(bounds);
     if let Ok(text) = serde_json::to_string(&saved) {
-        std::fs::write(bounds_path(), text).ok();
+        write_private(&bounds_path(), &text).ok();
     }
 }
 

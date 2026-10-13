@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use settings::{ParseStatus, SettingsStore};
 
 mod fields;
+mod files;
+
+pub use files::{Access, set_aside, write_atomic};
 
 pub use fields::{Choice, FieldKind, Scope, SettingField, fields, sections};
 
@@ -280,30 +283,66 @@ impl Global for StudioSettings {}
 struct SettingsFileState {
     modified: Option<SystemTime>,
     error: Option<String>,
+    /// The file exists but does not parse, so Studio must not overwrite it.
+    unreadable: bool,
 }
 
 impl Global for SettingsFileState {}
 
 /// Studio's data directory, for every crate: `OMNIGRAPH_STUDIO_DATA`, else
 /// `~/Library/Application Support/OmniGraph Studio` on macOS, `$XDG_CONFIG_HOME/omnigraph-studio`
-/// elsewhere.
+/// elsewhere. A binary run from a Cargo build directory (`cargo run`, an example) uses a
+/// sibling directory ending in "Dev" instead, so a development run never rewrites the tabs,
+/// drafts and conversations of the app the person uses. A bundled app is not a development run,
+/// whichever profile built it.
 pub fn data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("OMNIGRAPH_STUDIO_DATA")
         && !dir.is_empty()
     {
         return PathBuf::from(dir);
     }
+    let dev = std::env::current_exe().is_ok_and(|exe| is_build_output(&exe));
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
     if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/OmniGraph Studio")
+        home.join("Library/Application Support").join(if dev {
+            "OmniGraph Studio Dev"
+        } else {
+            "OmniGraph Studio"
+        })
     } else {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".config"))
-            .join("omnigraph-studio")
+            .join(if dev {
+                "omnigraph-studio-dev"
+            } else {
+                "omnigraph-studio"
+            })
     }
+}
+
+/// Whether an executable is Cargo's build output rather than an installed app: it sits in a
+/// profile directory (or its `examples`) under a `target` directory, and not in a macOS bundle.
+fn is_build_output(exe: &std::path::Path) -> bool {
+    let parts: Vec<&std::ffi::OsStr> = exe.iter().collect();
+    if parts
+        .windows(3)
+        .any(|w| w[0].to_string_lossy().ends_with(".app") && w[1] == "Contents" && w[2] == "MacOS")
+    {
+        return false;
+    }
+    let mut dirs = exe.ancestors().skip(1);
+    let parent = dirs.next();
+    let profile = match parent.and_then(|dir| dir.file_name()) {
+        Some(name) if name == "examples" || name == "deps" => dirs.next(),
+        _ => parent,
+    };
+    profile
+        .and_then(|profile| profile.parent())
+        .and_then(|target| target.file_name())
+        .is_some_and(|name| name == "target")
 }
 
 /// Where a graph's saved queries live (spec 007): one folder per [`graph_key`] under the data
@@ -438,8 +477,13 @@ impl StudioSettings {
 /// Loads the settings file and applies it. Call after `settings::init`.
 pub fn init(cx: &mut App) {
     let (settings, modified, error) = read_file();
-    cx.set_global(SettingsFileState { modified, error });
-    apply(settings, cx);
+    let unreadable = settings.is_none() && error.is_some();
+    cx.set_global(SettingsFileState {
+        modified,
+        error,
+        unreadable,
+    });
+    apply(settings.unwrap_or_default(), cx);
     watch(cx);
 }
 
@@ -448,19 +492,21 @@ pub fn file_error(cx: &App) -> Option<String> {
     cx.global::<SettingsFileState>().error.clone()
 }
 
-fn read_file() -> (StudioSettings, Option<SystemTime>, Option<String>) {
+/// The settings in the file, or `None` with the problem when it exists but cannot be parsed.
+/// A missing file is the defaults.
+fn read_file() -> (Option<StudioSettings>, Option<SystemTime>, Option<String>) {
     let path = settings_path();
     let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     match std::fs::read_to_string(&path) {
         Ok(text) => match StudioSettings::parse(&text) {
-            Ok(settings) => (settings, modified, None),
+            Ok(settings) => (Some(settings), modified, None),
             Err(error) => (
-                StudioSettings::default(),
+                None,
                 modified,
                 Some(format!("{} could not be read: {error}", path.display())),
             ),
         },
-        Err(_) => (StudioSettings::default(), modified, None),
+        Err(_) => (Some(StudioSettings::default()), modified, None),
     }
 }
 
@@ -477,21 +523,32 @@ fn apply(settings: StudioSettings, cx: &mut App) {
     cx.refresh_windows();
 }
 
-/// Writes the settings file and applies it.
+/// Writes the settings file and applies it. A file Studio could not parse is not overwritten:
+/// the person's text, comments and all, may hold what they meant, so the change is refused
+/// until the file reads again.
 pub fn update(cx: &mut App, f: impl FnOnce(&mut StudioSettings)) {
+    let path = settings_path();
+    if cx.global::<SettingsFileState>().unreadable {
+        cx.global_mut::<SettingsFileState>().error = Some(format!(
+            "{} could not be read, so the change was not saved. Fix the file and try again.",
+            path.display()
+        ));
+        cx.refresh_windows();
+        return;
+    }
     let mut settings = StudioSettings::get(cx).clone();
     f(&mut settings);
-    let path = settings_path();
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
+    // Private: `agent.env` may hold a model provider's key.
     let written = serde_json::to_string_pretty(&settings)
         .map_err(|e| e.to_string())
-        .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
+        .and_then(|text| {
+            write_atomic(&path, text.as_bytes(), Access::Private).map_err(|e| e.to_string())
+        });
     let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     cx.set_global(SettingsFileState {
         modified,
         error: written.err(),
+        unreadable: false,
     });
     apply(settings, cx);
 }
@@ -505,10 +562,19 @@ fn watch(cx: &mut App) {
             let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
             let changed = cx.update(|cx| cx.global::<SettingsFileState>().modified != modified);
             if changed {
+                // A file that no longer parses keeps the settings in effect; the problem is
+                // shown until the file reads again.
                 let (settings, modified, error) = read_file();
                 cx.update(|cx| {
-                    cx.set_global(SettingsFileState { modified, error });
-                    apply(settings, cx);
+                    cx.set_global(SettingsFileState {
+                        modified,
+                        unreadable: settings.is_none(),
+                        error,
+                    });
+                    match settings {
+                        Some(settings) => apply(settings, cx),
+                        None => cx.refresh_windows(),
+                    }
                 });
             }
         }
@@ -519,6 +585,25 @@ fn watch(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_build_directory_binary_is_a_development_run_and_a_bundle_is_not() {
+        let dev = |path: &str| is_build_output(std::path::Path::new(path));
+        assert!(dev("/w/omnigraph-studio/target/debug/omnigraph-studio"));
+        assert!(dev(
+            "/w/omnigraph-studio/target/release-fast/omnigraph-studio"
+        ));
+        assert!(dev("/w/omnigraph-studio/target/debug/examples/snapshot"));
+        assert!(dev("/w/omnigraph-studio/target/debug/deps/studio-0123abcd"));
+        assert!(!dev(
+            "/w/omnigraph-studio/target/bundle/OmniGraph Studio.app/Contents/MacOS/omnigraph-studio"
+        ));
+        assert!(!dev(
+            "/Applications/OmniGraph Studio.app/Contents/MacOS/omnigraph-studio"
+        ));
+        assert!(!dev("/opt/omnigraph-studio/bin/omnigraph-studio"));
+        assert!(!dev("/usr/local/bin/omnigraph-studio"));
+    }
 
     /// `assets/settings/default.json` documents the defaults (spec 002); it must say what the
     /// code does.

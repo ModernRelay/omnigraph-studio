@@ -15,7 +15,9 @@
 //! (for a write from outside to land between steps); `measure:<n>[,refresh]` draws n frames
 //! after notifying the workspace (or redrawing everything) and prints their times. `SNAPSHOT_WAIT_MS` (default 1500) is how
 //! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
-//! 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`.
+//! 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`. The run
+//! keeps its state in a fresh temporary directory unless `OMNIGRAPH_STUDIO_DATA` names one, so
+//! it neither reads nor writes the app's settings, tabs or conversations.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -135,6 +137,14 @@ fn main() {
     if std::env::var_os("OMNIGRAPH_STUDIO_NO_RESTORE").is_none() {
         // SAFETY: no other thread exists yet.
         unsafe { std::env::set_var("OMNIGRAPH_STUDIO_NO_RESTORE", "1") };
+    }
+    if std::env::var_os("OMNIGRAPH_STUDIO_DATA").is_none_or(|dir| dir.is_empty()) {
+        let dir =
+            std::env::temp_dir().join(format!("omnigraph-studio-snapshot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the snapshot's data directory");
+        eprintln!("snapshot data: {}", dir.display());
+        // SAFETY: no other thread exists yet.
+        unsafe { std::env::set_var("OMNIGRAPH_STUDIO_DATA", &dir) };
     }
     let mut args = std::env::args().skip(1);
     let out = args.next().unwrap_or_else(|| "snapshot.png".into());
