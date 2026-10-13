@@ -142,6 +142,8 @@ pub struct Workspace {
     /// What was last written for this graph, so unchanged state is not rewritten.
     saved: Option<SavedWorkspace>,
     _save: Option<Task<()>>,
+    /// The next comparison of the state with what was last written.
+    _save_check: Option<Task<()>>,
     _save_bounds: Option<Task<()>>,
     _bounds_subscription: Subscription,
     _session_subscription: Option<Subscription>,
@@ -149,6 +151,8 @@ pub struct Workspace {
 }
 
 /// How long state must be still before it is written.
+/// How often, at most, the workspace's state is compared with what was last written.
+const SAVE_CHECK: Duration = Duration::from_millis(250);
 const SAVE_DELAY: Duration = Duration::from_millis(500);
 /// Height of a column's header strip (spec 002, after Delta).
 const STRIP_HEIGHT: f32 = studio_ui::ds::size::STRIP;
@@ -242,6 +246,7 @@ impl Workspace {
             _settings_subscription: settings_subscription,
             saved: None,
             _save: None,
+            _save_check: None,
             _save_bounds: None,
             _bounds_subscription: bounds_subscription,
             _session_subscription: None,
@@ -2395,8 +2400,19 @@ fn toast_text(entry: &graph_store::OutcomeEntry) -> String {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Every change to tabs or panels re-renders the workspace, so this sees all of them.
-        self.save_if_changed(cx);
+        // Every change to tabs or panels re-renders the workspace, so this sees all of them. The
+        // workspace also renders whenever anything inside it notifies (a streamed reply, a
+        // hover), so the state is compared at most every `SAVE_CHECK`, not on every frame.
+        if self._save_check.is_none() {
+            self._save_check = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(SAVE_CHECK).await;
+                this.update(cx, |this, cx| {
+                    this._save_check = None;
+                    this.save_if_changed(cx);
+                })
+                .ok();
+            }));
+        }
         // As Zed's workspace does: the window's rem size is the UI font size, which every `ui`
         // size is relative to, and the root carries the UI font.
         let ui_font = theme_settings::setup_ui_font(window, cx);

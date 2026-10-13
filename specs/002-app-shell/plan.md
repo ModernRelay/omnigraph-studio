@@ -86,7 +86,9 @@ content lacks; the host has one and scrolls the panel). A cached view is drawn a
 or a view inside it notifies, or when a setting changes (which redraws every window); otherwise
 the frame replays it. A hover, a toast or an agent's streamed reply therefore redraws only what
 changed. The left panel's title stays put above its scrolling content. The snapshot example's
-`measure:<n>[,refresh]` step times frames after notifying the workspace, or redrawing all.
+`measure:<n>[,refresh]` step times frames after notifying the workspace, or redrawing all. The
+workspace itself renders whenever anything inside it notifies, so it compares its state with
+what was last saved at most every 250 ms rather than serializing every tab on every frame.
 
 ### Window chrome
 
