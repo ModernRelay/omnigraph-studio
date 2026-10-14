@@ -255,9 +255,13 @@ than styling one-off elements.
   - With `studio.show_performance` on (the default since 2026-10-14), the document footer ends with
     Studio's memory and CPU, muted, in the warning colour past 2 GB or half a core:
     "412 MB · 3% CPU". Memory is macOS's physical footprint (`proc_pid_rusage`, what
-    Activity Monitor shows) or Linux's resident set; CPU is the share of one core between
-    readings (`getrusage`). It is read every 2 s while the window is in front; the tooltip
-    adds the peak. Other platforms show CPU only.
+    Activity Monitor shows) or Linux's resident set. CPU is Studio's own process, every
+    thread, user and system time (`getrusage(RUSAGE_SELF)`), over the 2 s between readings,
+    as a share of one core: 100% is one core busy throughout, more when several threads are,
+    as Activity Monitor counts. Agents, their MCP proxies and the CLIs they run are separate
+    processes and not counted. It is read every 2 s while the window is in front, and a
+    reading never spans time in the background. The tooltip adds the memory peak and says
+    what CPU counts. Other platforms show CPU only.
   - Frame times are not in the footer: an FPS counter reads 0 when idle and draws frames
     itself. A build with the `perf` feature (GPUI's `profiler`) has its frame-time overlay,
     `studio::ToggleFrameOverlay` (⌘⌥⇧F); other builds say how to get one.

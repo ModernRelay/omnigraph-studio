@@ -352,16 +352,26 @@ impl Workspace {
         self._performance = Some(cx.spawn(async move |this, cx| {
             loop {
                 let read = this.update(cx, |this, cx| {
-                    let active = this.window_active;
-                    if active {
-                        let sample = process_stats::Sample::now();
-                        let cpu = this
-                            .performance
-                            .as_ref()
-                            .and_then(|last| sample.cpu_since(&last.sample));
-                        this.performance = Some(Performance { sample, cpu });
-                        cx.notify();
+                    if !this.window_active {
+                        // A reading after a pause would average CPU over the time away; the
+                        // next one starts over, keeping the figure shown until then.
+                        if let Some(last) = &mut this.performance {
+                            last.paused = true;
+                        }
+                        return;
                     }
+                    let sample = process_stats::Sample::now();
+                    let cpu = match &this.performance {
+                        Some(last) if last.paused => last.cpu,
+                        Some(last) => sample.cpu_since(&last.sample),
+                        None => None,
+                    };
+                    this.performance = Some(Performance {
+                        sample,
+                        cpu,
+                        paused: false,
+                    });
+                    cx.notify();
                 });
                 if read.is_err() {
                     return;
@@ -389,12 +399,15 @@ impl Workspace {
         let busy = memory.is_some_and(|(now, _)| now > 2 << 30) || reading.cpu > Some(0.5);
         let tooltip = match memory {
             Some((now, peak)) => format!(
-                "Studio holds {} of memory, at most {} so far. CPU is the share of one core over \
-                 the last two seconds.",
+                "Studio holds {} of memory, at most {} so far. CPU is how much of one core \
+                 Studio used over the last two seconds; agents run as their own processes and \
+                 are not counted.",
                 studio_ui::format_bytes(now),
                 studio_ui::format_bytes(peak)
             ),
-            None => "CPU is the share of one core over the last two seconds.".to_owned(),
+            None => "CPU is how much of one core Studio used over the last two seconds; agents \
+                     run as their own processes and are not counted."
+                .to_owned(),
         };
         Some(
             div()
@@ -2849,6 +2862,9 @@ const PERFORMANCE_INTERVAL: Duration = Duration::from_secs(2);
 struct Performance {
     sample: process_stats::Sample,
     cpu: Option<f32>,
+    /// The window went to the background after this reading, so the next one does not measure
+    /// from it.
+    paused: bool,
 }
 
 /// A dock edge being dragged.
