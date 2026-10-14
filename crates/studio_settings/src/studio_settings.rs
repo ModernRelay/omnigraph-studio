@@ -207,13 +207,14 @@ pub struct AgentSettings {
     /// Extra environment for the agent; edited in `settings.json`.
     #[schemars(extend("x-hidden" = true))]
     pub env: BTreeMap<String, String>,
-    /// Hold each write the agent's `omnigraph` CLI sends until the person allows it (spec 013).
-    /// Off: writes to the agent's own branch go through, each shown as a card.
-    #[schemars(extend("x-hidden" = true))]
+    // Spec 013. The doc comments below are the settings tab's descriptions.
+    /// Hold each write the agent makes until you allow it. Off: writes to the agent's own branch
+    /// go through, each shown as a card.
+    #[schemars(title = "Ask before writes")]
     pub ask_before_writes: bool,
-    /// The `omnigraph` CLI the agent uses (spec 013). Empty: Studio looks on PATH, in
-    /// `~/.local/bin`, then in Homebrew's and `/usr/local`'s `bin`.
-    #[schemars(extend("x-hidden" = true))]
+    /// The omnigraph program the agent runs. Empty: Studio finds it on PATH or in the usual
+    /// install folders.
+    #[schemars(title = "OmniGraph CLI")]
     pub omnigraph_cli: Option<String>,
 }
 

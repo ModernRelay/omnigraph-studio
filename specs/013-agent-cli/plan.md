@@ -157,7 +157,7 @@ Bedrock does. This closes the gap where the agent inherited the person's graph t
 
 ### Choosing the CLI
 
-1. `agent.omnigraph_cli` (in `settings.json`), then each `omnigraph` on PATH, then
+1. `agent.omnigraph_cli` (Settings → Agent → OmniGraph CLI), then each `omnigraph` on PATH, then
    `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`, without duplicates.
 2. Each says which HTTP contract it speaks, without a server, bounded to 5 s: `omnigraph
    version --json` reports `http_contract` (OmniGraph #987, E23), and 0.13.x, which predates
@@ -207,7 +207,7 @@ commit, Refused with the server's message, or Outcome unknown. A committed write
 session (the workspace's "Agent CLI: … committed" notice) and the agent branch banner counts it.
 
 - **Sandbox** (default): writes to the agent branch go through at once.
-- **Ask before writes** (`agent.ask_before_writes` in `settings.json`): each write waits on its
+- **Ask before writes** (Settings → Agent, `agent.ask_before_writes`): each write waits on its
   card with Allow (⌘Y), Always on this branch (⌘⌥Y) and Reject (⌘⌥N). The CLI waits, since it has
   no timeout. Reject answers 403 and nothing is sent.
 

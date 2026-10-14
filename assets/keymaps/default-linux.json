@@ -256,6 +256,12 @@
     }
   },
   {
+    "context": "SettingsField",
+    "bindings": {
+      "enter": "menu::Confirm"
+    }
+  },
+  {
     "context": "QueryConfirm",
     "bindings": {
       "enter": "menu::Confirm",

@@ -125,10 +125,19 @@ fn walk(
         path: path.clone(),
         section,
         title: text(schema, "title").map_or_else(|| sentence(&key), str::to_owned),
-        description: text(schema, "description").unwrap_or_default().to_owned(),
+        description: paragraphs(text(schema, "description").unwrap_or_default()),
         kind,
         per_graph: schema.get("x-per-graph") == Some(&Value::Bool(true)),
     });
+}
+
+/// A doc comment as the tab shows it: the lines of a paragraph joined by spaces, paragraphs
+/// kept apart.
+fn paragraphs(doc: &str) -> String {
+    doc.split("\n\n")
+        .map(|paragraph| paragraph.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// `schema` with a `$ref` (direct or as the one `allOf` member) replaced by its definition.
@@ -355,8 +364,10 @@ mod tests {
                 "studio.canvas_max_nodes",
                 "studio.health_check_seconds",
                 "agent.command",
+                "agent.ask_before_writes",
+                "agent.omnigraph_cli",
             ],
-            "agent.env is edited in settings.json only"
+            "agent.env, a map, is edited in settings.json only"
         );
         assert_eq!(
             sections(),
@@ -400,6 +411,14 @@ mod tests {
             FieldKind::Custom("font".into())
         );
         assert_eq!(field("agent.command").section, "Agent");
+        assert_eq!(field("agent.ask_before_writes").kind, FieldKind::Toggle);
+        // A doc comment's lines are one paragraph.
+        assert!(!field("agent.ask_before_writes").description.contains('\n'));
+        assert_eq!(field("agent.omnigraph_cli").title, "OmniGraph CLI");
+        assert_eq!(
+            field("agent.omnigraph_cli").kind,
+            FieldKind::Text { nullable: true }
+        );
     }
 
     #[test]

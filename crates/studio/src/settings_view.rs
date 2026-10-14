@@ -24,7 +24,16 @@ pub struct SettingsView {
     /// The open graph's settings key and name, when there is one.
     graph: Option<(String, String)>,
     scope: Scope,
-    _subscription: Subscription,
+    /// A field for each text setting, made with the tab.
+    text_inputs: Vec<TextInput>,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// A text setting's field. It writes when the person presses Enter or leaves it, not on every
+/// key, and shows the setting's value again whenever it changes elsewhere.
+struct TextInput {
+    field: &'static SettingField,
+    editor: Entity<Editor>,
 }
 
 impl EventEmitter<ItemEvent> for SettingsView {}
@@ -69,18 +78,115 @@ impl SettingsView {
             editor.set_placeholder_text("Search settings", window, cx);
             editor
         });
-        let subscription = cx.subscribe(&search, |_, _, event: &EditorEvent, cx| {
-            if let EditorEvent::BufferEdited = event {
-                cx.notify();
+        let mut subscriptions = vec![
+            cx.subscribe(&search, |_, _, event: &EditorEvent, cx| {
+                if let EditorEvent::BufferEdited = event {
+                    cx.notify();
+                }
+            }),
+            cx.observe_global_in::<StudioSettings>(window, |this, window, cx| {
+                this.show_text_values(window, cx)
+            }),
+        ];
+        let mut text_inputs = Vec::new();
+        for field in studio_settings::fields() {
+            if !matches!(field.kind, FieldKind::Text { .. }) {
+                continue;
             }
-        });
-        Self {
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text("Not set", window, cx);
+                editor.set_text_style_refinement(ds::field_text(cx));
+                editor
+            });
+            let index = text_inputs.len();
+            subscriptions.push(cx.subscribe_in(
+                &editor,
+                window,
+                move |this, _, event: &EditorEvent, window, cx| {
+                    if let EditorEvent::Blurred = event {
+                        this.write_text(index, window, cx);
+                    }
+                },
+            ));
+            text_inputs.push(TextInput { field, editor });
+        }
+        let mut this = Self {
             search,
             section: 0,
             graph,
             scope: Scope::All,
-            _subscription: subscription,
+            text_inputs,
+            _subscriptions: subscriptions,
+        };
+        this.show_text_values(window, cx);
+        this
+    }
+
+    /// Each text field shows its setting's value in the current scope, unless it is being
+    /// typed in.
+    fn show_text_values(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let settings = StudioSettings::get(cx).clone();
+        for input in &self.text_inputs {
+            let text = text_of(&settings.value_in(&self.scope, input.field));
+            input.editor.update(cx, |editor, cx| {
+                if !editor.focus_handle(cx).is_focused(window) && editor.text(cx) != text {
+                    editor.set_text(text, window, cx);
+                }
+            });
         }
+    }
+
+    /// Writes text field `index` to its setting: empty is unset where the setting may be.
+    fn write_text(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self.text_inputs.get(index) else {
+            return;
+        };
+        let text = input.editor.read(cx).text(cx).trim().to_owned();
+        let value = match input.field.kind {
+            FieldKind::Text { nullable: true } if text.is_empty() => Value::Null,
+            _ => Value::String(text),
+        };
+        let target = Target {
+            scope: self.scope.clone(),
+            field: input.field,
+        };
+        if StudioSettings::get(cx).value_in(&target.scope, target.field) != value {
+            target.set(value, cx);
+        }
+        // The value as the settings hold it, trimmed or refused.
+        self.show_text_values(window, cx);
+    }
+
+    /// Text field `index`'s control: the field, which Enter writes.
+    fn text_control(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .key_context("SettingsField")
+            .w(px(260.))
+            .h(px(size::SIDEBAR_ROW))
+            .px(px(space::MD))
+            .rounded(px(radius::SM))
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .on_action(cx.listener(move |this, _: &menu::Confirm, window, cx| {
+                this.write_text(index, window, cx)
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(self.text_inputs[index].editor.clone()),
+            )
+            .into_any_element()
+    }
+}
+
+/// A setting's value as a text field shows it: unset is empty.
+fn text_of(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -328,8 +434,9 @@ impl SettingsView {
                 .child(
                     ds::segment("scope-all", "All graphs", all, cx)
                         .tooltip(Tooltip::text("Settings for every graph"))
-                        .on_click(cx.listener(|this, _, _, cx| {
+                        .on_click(cx.listener(|this, _, window, cx| {
                             this.scope = Scope::All;
+                            this.show_text_values(window, cx);
                             cx.notify();
                         })),
                 )
@@ -338,8 +445,9 @@ impl SettingsView {
                         .tooltip(Tooltip::text(format!(
                             "Values for {name} only, over those for all graphs"
                         )))
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .on_click(cx.listener(move |this, _, window, cx| {
                             this.scope = Scope::Graph(key.clone());
+                            this.show_text_values(window, cx);
                             cx.notify();
                         })),
                 ),
@@ -460,11 +568,19 @@ impl Render for SettingsView {
                                 ),
                                 _ => field.description.clone(),
                             };
+                            let text_input = self
+                                .text_inputs
+                                .iter()
+                                .position(|input| std::ptr::eq(input.field, field));
+                            let control = match text_input {
+                                Some(index) => self.text_control(index, cx),
+                                None => control(&target, &settings, cx),
+                            };
                             let row = ds::setting_row(
                                 target.id("row"),
                                 field.title.clone(),
                                 description,
-                                control(&target, &settings, cx),
+                                control,
                                 reset,
                             );
                             if index + 1 < count {
