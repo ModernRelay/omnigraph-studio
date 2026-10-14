@@ -128,6 +128,12 @@ lto = "thin"
 codegen-units = 1
 debug = "limited"
 
+# Optimized but quick to build, for measuring (as Zed's): `--profile release-fast`.
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 [workspace.lints.clippy]
 dbg_macro = "deny"
 todo = "deny"

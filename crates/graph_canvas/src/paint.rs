@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use gpui::{
     App, BorderStyle, Bounds, BoxShadow, Corners, Font, FontWeight, Hsla, PathBuilder, Pixels,
-    Point, SharedString, TextAlign, TextRun, Window, point, px, quad, size,
+    Point, ShapedLine, SharedString, TextAlign, TextRun, Window, point, px, quad, size,
 };
 use studio_ui::type_color;
 
@@ -303,6 +303,7 @@ pub(crate) fn paint(
 
     // Lines, batched by tone.
     let routes = routes(scene, screen, scale, schema);
+    let far = CHIP_TEXT * scale < MARK_ONLY_BELOW;
     let mut batches: HashMap<Tone, Vec<Segment>> = HashMap::new();
     let mut loops: Vec<(usize, usize, Tone)> = Vec::new();
     for (edge, route) in scene.edges.iter().zip(&routes) {
@@ -358,7 +359,13 @@ pub(crate) fn paint(
         if edge.from == edge.to {
             loops.push((edge.from, route.loop_rank, tone));
         } else {
-            batches.entry(tone).or_default().push((a, b, route.curve));
+            // From afar an exploration's lines are straight: at mark size the fan of curves
+            // reads the same, and a straight line costs two triangles, a curve dozens.
+            let curve = match route.curve {
+                Curve::Level(..) if far => Curve::Straight,
+                curve => curve,
+            };
+            batches.entry(tone).or_default().push((a, b, curve));
         }
     }
     window.paint_layer(bounds, |window| {
@@ -446,7 +453,9 @@ pub(crate) fn paint(
         paint_labels(window, cx);
     }
 
-    // Chips.
+    // Chips. From afar most are a letter mark, and a frame of thousands repeats a few letters:
+    // each is shaped once here, not once a chip.
+    let mut letters: HashMap<(char, u32), ShapedLine> = HashMap::new();
     let mut rects = chips.borrow_mut();
     rects.clear();
     rects.resize(scene.nodes.len(), Bounds::default());
@@ -474,16 +483,30 @@ pub(crate) fn paint(
                 SceneKind::Hub { .. } | SceneKind::More { .. } => {
                     paint_dot(p, 4., palette.text.opacity(0.25 * alpha), window)
                 }
-                _ => paint_mark(
-                    p,
-                    &node.color_key,
-                    &node.label,
-                    12.,
-                    alpha,
-                    palette,
-                    window,
-                    cx,
-                ),
+                _ => {
+                    let first = initial_char(&node.label, &node.color_key);
+                    let line = letters
+                        .entry((first, alpha.to_bits()))
+                        .or_insert_with(|| {
+                            shape_letter(
+                                &initial(&node.label, &node.color_key),
+                                12.,
+                                alpha,
+                                palette,
+                                window,
+                            )
+                        })
+                        .clone();
+                    paint_letter_mark(
+                        p,
+                        type_color(&node.color_key),
+                        &line,
+                        12.,
+                        alpha,
+                        window,
+                        cx,
+                    )
+                }
             };
             continue;
         }
@@ -771,16 +794,8 @@ fn paint_pill(
     let middle = at.y;
     if let Some((tint, letter)) = mark {
         let center = point(px(x + mark_size / 2.), middle);
-        paint_letter_mark(
-            center,
-            tint,
-            &letter,
-            mark_size,
-            style.fill.a,
-            palette,
-            window,
-            cx,
-        );
+        let line = shape_letter(&letter, mark_size, style.fill.a, palette, window);
+        paint_letter_mark(center, tint, &line, mark_size, style.fill.a, window, cx);
         x += mark_size + gap;
     }
     for line in &lines {
@@ -798,39 +813,41 @@ fn paint_pill(
     rect
 }
 
-/// A node from afar: its letter mark alone, ringed in the background so lines stop at it.
-#[allow(clippy::too_many_arguments)]
-fn paint_mark(
-    at: Point<Pixels>,
-    type_name: &str,
-    label: &str,
-    size_px: f32,
-    alpha: f32,
-    palette: &Palette,
-    window: &mut Window,
-    cx: &mut App,
-) -> Bounds<Pixels> {
-    paint_letter_mark(
-        at,
-        type_color(type_name),
-        &initial(label, type_name),
-        size_px,
-        alpha,
-        palette,
-        window,
-        cx,
-    )
-}
-
-/// The type mark: the initial in white on the type's tint, a rounded square.
-#[allow(clippy::too_many_arguments)]
-fn paint_letter_mark(
-    center: Point<Pixels>,
-    tint: Hsla,
+/// A mark's letter, shaped for a mark `size_px` across.
+fn shape_letter(
     letter: &str,
     size_px: f32,
     alpha: f32,
     palette: &Palette,
+    window: &mut Window,
+) -> ShapedLine {
+    let font = Font {
+        weight: FontWeight::SEMIBOLD,
+        ..palette.font.clone()
+    };
+    window.text_system().shape_line(
+        SharedString::from(letter.to_owned()),
+        px(size_px * 9. / 16.),
+        &[TextRun {
+            len: letter.len(),
+            font,
+            color: gpui::white().opacity(alpha),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }],
+        None,
+    )
+}
+
+/// The type mark: the initial in white on the type's tint, a rounded square. A node from afar
+/// is this mark alone.
+fn paint_letter_mark(
+    center: Point<Pixels>,
+    tint: Hsla,
+    line: &ShapedLine,
+    size_px: f32,
+    alpha: f32,
     window: &mut Window,
     cx: &mut App,
 ) -> Bounds<Pixels> {
@@ -847,23 +864,6 @@ fn paint_letter_mark(
         BorderStyle::Solid,
     ));
     let text_size = size_px * 9. / 16.;
-    let font = Font {
-        weight: FontWeight::SEMIBOLD,
-        ..palette.font.clone()
-    };
-    let line = window.text_system().shape_line(
-        SharedString::from(letter.to_owned()),
-        px(text_size),
-        &[TextRun {
-            len: letter.len(),
-            font,
-            color: gpui::white().opacity(alpha),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        }],
-        None,
-    );
     line.paint(
         point(center.x - line.width / 2., center.y - px(text_size * 0.7)),
         px(text_size * 1.4),
@@ -904,6 +904,16 @@ fn edge_is_member(scene: &Scene, from: usize, to: usize) -> bool {
 }
 
 /// The letter of a mark: the label's first character, else the type's.
+/// The character [`initial`] is made from.
+fn initial_char(label: &str, type_name: &str) -> char {
+    label
+        .trim()
+        .chars()
+        .next()
+        .or_else(|| type_name.chars().next())
+        .unwrap_or('?')
+}
+
 fn initial(label: &str, type_name: &str) -> String {
     label
         .trim()
