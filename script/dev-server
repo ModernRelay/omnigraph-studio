@@ -37,6 +37,16 @@ if [[ ! -d "$DATA/__cluster" ]]; then
   (cd "$DATA" && "$CLI" cluster force-unlock "$lock" --config . > /dev/null)
 fi
 
+# A server stopped without shutting down (killed, or its shell closed) leaves its lock behind.
+# Release a lock whose process is gone; a live one means another server is running.
+if [[ -f "$DATA/__cluster/lock.json" ]]; then
+  read -r lock pid < <(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["lock_id"], d.get("pid", ""))' "$DATA/__cluster/lock.json")
+  if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+    (cd "$DATA" && "$CLI" cluster force-unlock "$lock" --config . > /dev/null)
+    echo "Released the lock of a stopped server (pid $pid)." >&2
+  fi
+fi
+
 OMNIGRAPH_SERVER_BEARER_TOKENS_JSON="{\"act-dev\":\"$TOKEN\"}" \
   "$SERVER" --cluster "$DATA" --bind "$BIND" &
 server=$!
