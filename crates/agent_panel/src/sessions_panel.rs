@@ -557,20 +557,12 @@ impl Render for SessionsPanel {
         if self.search_open || searching {
             // The field's text sits on the rows' edge, as their titles do; ⎋ closes it.
             list = list.child(
-                h_flex()
-                    .h(px(ds::size::SIDEBAR_ROW))
-                    .mx(px(ds::space::SM))
-                    .mb(px(ds::space::XS))
-                    .px(px(ds::space::SM))
-                    .items_center()
-                    .rounded(px(ds::radius::SM))
-                    .bg(ds::surface::sunken(cx))
+                ds::sidebar_search(self.search.clone(), cx)
                     .key_context("ConversationSearch")
                     .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
                         this.search_open = true;
                         this.toggle_search(window, cx);
-                    }))
-                    .child(div().flex_1().child(self.search.clone())),
+                    })),
             );
         }
         if pinned.is_empty() && recent.is_empty() && archived.is_empty() {

@@ -166,7 +166,10 @@ second line shows it (`omnigraph branch create feature-x --from main`).
     draws a control per kind (segmented choice up to four, a menu above that, a stepper in
     range, a switch, a text field, the theme and font menus, the agent presets) and writes by
     path, so a new setting is a field and its attributes. A text field writes when Enter is
-    pressed or it loses focus, not on every key; empty unsets a setting that may be unset. A
+    pressed or it loses focus, not on every key; empty unsets a setting that may be unset.
+    Typing not yet written stays when the values are drawn again (a switch pressed before the
+    field hears it lost focus), and the scope switch writes it to the scope it was typed in
+    before showing the other. A
     doc comment's lines read as one paragraph. Only `agent.env` (a map) and `graphs` stay in
     `settings.json` alone. The nav counts changed settings per section;
     search spans every section; the search box has focus when the tab opens.
@@ -251,7 +254,8 @@ than styling one-off elements.
   commit and key hints; the agent its restart, agent pill and send. The document header holds
   only the tabs and the dock toggles.
   - The connection's state reads with the server's round trip, from the last health check
-    (`Connection::latency`, no extra request): "contract 0.13 · 42 ms".
+    (`Connection::latency`, no extra request): "contract 0.13 · 42 ms". It is timed on the
+    background executor, so a busy main thread does not lengthen it.
   - With `studio.show_performance` on (the default since 2026-10-14), the document footer ends with
     Studio's memory and CPU, muted, in the warning colour past 2 GB or half a core:
     "412 MB · 3% CPU". Memory is macOS's physical footprint (`proc_pid_rusage`, what
@@ -260,14 +264,16 @@ than styling one-off elements.
     as a share of one core: 100% is one core busy throughout, more when several threads are,
     as Activity Monitor counts. Agents, their MCP proxies and the CLIs they run are separate
     processes and not counted. It is read every 2 s while the window is in front, and a
-    reading never spans time in the background. The tooltip adds the memory peak and says
-    what CPU counts. Other platforms show CPU only.
+    reading never spans time in the background: the window leaving marks the last reading,
+    so the next one, whenever it comes, starts over. The tooltip adds the memory peak and says
+    what CPU counts. Other Unix systems show CPU only, and Windows shows neither.
   - Frame times are not in the footer: an FPS counter reads 0 when idle and draws frames
     itself. A build with the `perf` feature (GPUI's `profiler`) has its frame-time overlay,
     `studio::ToggleFrameOverlay` (⌘⌥⇧F); other builds say how to get one.
 - **Window styles.** `studio.window_style`: `flat` splits columns with hairlines; `glass`
   floats the three columns as sheets over a soft wash, with one gap around and between them,
-  and moves the traffic lights into the sidebar sheet.
+  and moves the traffic lights into the sidebar sheet. They sit centered in the first header
+  strip (`studio_workspace::traffic_light_position`), where a window also opens with them.
 - **Hairlines.** `ds::surface::rule`, never a solid border; dashed between rows on glass.
 - **Sheet corners.** GPUI clips a glass sheet's children to its rectangle, not its rounded
   corners, so a child with a fill flush in a corner takes the sheet's radius (`radius::LG`):
@@ -279,14 +285,19 @@ than styling one-off elements.
   The nested pieces are components: `ds::segmented`, `ds::row_list` (a field's offers),
   `ds::float_bar` (the canvas's floating controls, 7 px around 22 px buttons 3 px in),
   `ds::pill_button` (round, 4 px inside a pill's round end) and the context chip's tile. The
-  `ds` test `nested_radii_are_concentric` pins the pairs.
+  `ds` test `nested_radii_are_concentric` pins the pairs. A float bar holds
+  `ds::bar_button`s and `ds::bar_icon_button`s (`size::BAR_BUTTON`, 22 px): a medium button
+  does not fit inside its border. A pill button acts as Zed's buttons do: pressing it leaves
+  the focus in the pill's field, and its click goes no further.
 - **Control sizes, in code.** `size::CONTROL` (28 px: a medium button, a field, a segmented
   track, a floating bar, a tile) and `size::PILL` (26 px: a filter, a composer's picker, a
   dock's title tab); a segment is a control less its track's inset. Every single-line field is
   `ds::field_frame` (a hairline box at a control's height, the error border when invalid)
   around `ds::field_input`, and every search box is `ds::search_field`, so fields line up
   with the buttons beside them: the settings search and text fields, the history and review
-  searches, and the dialogs' fields.
+  searches, the dialogs' fields, the review editor's fields and the query's parameters. A
+  filter among a sidebar's rows (the conversations') is `ds::sidebar_search` instead: a
+  sunken row as tall as the rows, its text on their edge, with no border.
 - **Tabs** fill the 36 px strip (an explicit height: the right-click wrapper lays a tab out at
   its content's height, so `h_full` would shrink it to its label); the active tab joins the
   document, inactive ones sit on the strip's rule.
@@ -383,9 +394,22 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-13 | A development run uses its own data directory | `studio_settings` test `a_build_directory_binary_is_a_development_run_and_a_bundle_is_not`; the snapshot tool run without `OMNIGRAPH_STUDIO_DATA` | `target/debug`, `target/release-fast`, `examples` and `deps` binaries are development runs; an `.app` (also under `target/bundle`) and installed paths are not. The snapshot printed `snapshot data: …/omnigraph-studio-snapshot-<pid>` |
 | 2026-10-13 | A refused connection reads as its cause | `graph_client` test `a_transport_error_names_its_cause_and_never_the_url`; the snapshot tool against `http://127.0.0.1:9` | "Studio could not read the schema. Could not reach the server: the connection was refused"; before, the message was the client's "error sending request for url (…)" with the full URL |
 | 2026-10-13 | A busy modal stays open until it agrees | `studio_workspace` GPUI test `a_busy_modal_stays_open_until_it_agrees` (a real `Workspace` in a test window, Zed's base theme) | `hide_modal` and the same command again leave it open while busy; it closes once not. Before the change, every close went straight through |
+| 2026-10-14 | Review findings on the footer, settings fields and controls | `studio` `typing_not_yet_written_outlives_the_values_drawn_again` (fails on the earlier show logic); `studio_workspace` `leaving_the_window_pauses_the_cpu_reading` (fails without the mark on leaving); `studio_ui` `a_pill_button_keeps_the_focus_and_the_click` (fails without it: the click reached the surface around it) and `controls_draw_at_their_sizes` (a float bar's buttons 22 px, inside its border) | All pass. The settings test runs on `studio_settings::init_test`, settings in memory that refuse every write, so no test reaches `settings.json` |
 | 2026-10-13 | A panic message loses quoted text | `studio` test `a_panic_message_loses_the_text_it_quotes` | ``'é'`` and `` `Ada Lovelace's notes` `` become `'…'` and `` `…` ``; messages over 300 characters are cut |
 
 ## Corrections
+
+- 2026-10-14 · A review of the footer and control changes found: a settings text field lost
+  typing when a switch was pressed before the field heard it lost focus, and a scope switch
+  then wrote it to the other scope; a CPU reading could span a stretch in the background that
+  fell between two ticks; the canvas's text buttons were medium buttons in a 26 px space; a
+  pill button let the click reach the surface around it and took the focus from its field;
+  the round trip counted time the main thread was busy; the window opened with the traffic
+  lights 2 px lower than the workspace puts them; and three fields were framed by hand. Each
+  is fixed as described above. A reported fifth, that a table culls its columns with the last
+  frame's width, does not occur: the header tracks the same scroll handle and is laid out
+  before the rows are picked; `rows_draw_only_the_columns_in_view` now widens the window and
+  checks the far column in that frame.
 
 - 2026-10-14 · `?` opened the key sheet inside every text field (the query, filters, the agent's
   composer), so it could not be typed. Its binding excluded `TextInput`, a context nothing sets;

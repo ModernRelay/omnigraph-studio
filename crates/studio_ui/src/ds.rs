@@ -8,8 +8,8 @@
 //! elevation.
 
 use gpui::{
-    AnyElement, App, Background, BoxShadow, ClickEvent, Div, ElementId, Hsla, SharedString,
-    Stateful, Window, point,
+    AnyElement, App, Background, BoxShadow, ClickEvent, Div, ElementId, Hsla, MouseButton,
+    SharedString, Stateful, Window, point,
 };
 use studio_settings::{StudioSettings, WindowStyle};
 use ui::prelude::*;
@@ -94,6 +94,9 @@ pub mod size {
     pub const SIDEBAR_ROW: f32 = 26.;
     /// A control: a medium button, a field, a segmented track, a floating bar, a tile.
     pub const CONTROL: f32 = 28.;
+    /// A button inside a floating bar ([`super::bar_button`]): Zed's default size, 3 px inside
+    /// the bar's edge.
+    pub const BAR_BUTTON: f32 = 22.;
     /// A pill: a filter, a composer's picker, a dock's title tab.
     pub const PILL: f32 = 26.;
     /// A thread's or feed's gutter, where each entry's icon sits.
@@ -682,6 +685,16 @@ pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Butto
     Button::new(id, label).label_size(LabelSize::Small)
 }
 
+/// [`button`] inside a [`float_bar`]: Zed's default size, `size::BAR_BUTTON` tall.
+pub fn bar_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    button(id, label).size(ButtonSize::Default)
+}
+
+/// [`icon_button`] inside a [`float_bar`].
+pub fn bar_icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
+    icon_button(id, icon).size(ButtonSize::Default)
+}
+
 /// [`button`] for an icon alone: a 28 px square.
 pub fn icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
     IconButton::new(id, icon)
@@ -691,7 +704,8 @@ pub fn icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
 
 /// A text field's frame: a hairline box at a control's height, so a field lines up with the
 /// buttons beside it, around an editor and an icon or a counter. `invalid` draws the error
-/// border. Every single-line field in Studio is one.
+/// border. Every single-line field in Studio is one, but for a filter among a sidebar's rows
+/// ([`sidebar_search`]).
 pub fn field_frame(invalid: bool, cx: &App) -> Div {
     let colors = cx.theme().colors();
     h_flex()
@@ -722,6 +736,20 @@ pub fn search_field(editor: impl IntoElement, cx: &App) -> Div {
                 .size(IconSize::XSmall)
                 .color(Color::Muted),
         )
+        .child(field_input(editor))
+}
+
+/// A filter at the top of a sidebar's list: a sunken row as tall as the rows under it, its
+/// text on their edge, as their titles are, with no border, since it is part of the list.
+pub fn sidebar_search(editor: impl IntoElement, cx: &App) -> Div {
+    h_flex()
+        .h(px(size::SIDEBAR_ROW))
+        .mx(px(space::SM))
+        .mb(px(space::XS))
+        .px(px(space::SM))
+        .items_center()
+        .rounded(px(radius::SM))
+        .bg(surface::sunken(cx))
         .child(field_input(editor))
 }
 
@@ -806,7 +834,8 @@ pub const PILL_BUTTON_GAP: f32 = space::XS;
 
 /// An icon button at a pill's end, [`PILL_BUTTON_GAP`] inside it: round, so its fill follows
 /// the pill's round end (`radius::within(size::PILL / 2, gap)` is its own half height) where
-/// Zed's 4 px button would sit square in it.
+/// Zed's 4 px button would sit square in it. Pressed, it acts as Zed's buttons do: the focus
+/// stays where it was (a pill's field), and the click goes no further than it.
 pub fn pill_button(
     id: impl Into<ElementId>,
     icon: IconName,
@@ -827,6 +856,8 @@ pub fn pill_button(
         .cursor_pointer()
         .hover(move |style| style.bg(hover))
         .active(move |style| style.bg(active))
+        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+        .on_click(|_, _, cx| cx.stop_propagation())
         .child(Icon::new(icon).size(IconSize::XSmall).color(color))
 }
 
@@ -839,12 +870,10 @@ pub fn row_list() -> Div {
 }
 
 /// A floating group of controls over a canvas: 28 px tall, a hairline, a float shadow, holding
-/// Zed's default-size (22 px) buttons, so they sit 3 px inside its edge and its radius is
-/// theirs plus that.
+/// [`bar_button`]s and [`bar_icon_button`]s (22 px), so they sit 3 px inside its edge and its
+/// radius is theirs plus that. A medium button would not fit inside its border.
 pub fn float_bar(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
-    // Zed's default-size button.
-    const BUTTON: f32 = 22.;
-    let gap = (size::CONTROL - BUTTON) / 2.;
+    let gap = (size::CONTROL - size::BAR_BUTTON) / 2.;
     let colors = cx.theme().colors();
     let fill = if cx.theme().appearance.is_light() {
         gpui::white()

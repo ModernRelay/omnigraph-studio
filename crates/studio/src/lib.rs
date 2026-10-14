@@ -11,8 +11,8 @@ mod open_graph;
 mod settings_view;
 
 use gpui::{
-    App, AppContext as _, Context, Entity, Focusable as _, Window, WindowBounds, WindowOptions,
-    point, px, size,
+    App, AppContext as _, Context, Entity, Focusable as _, Window, WindowBounds, WindowOptions, px,
+    size,
 };
 use graph_store::{ConnectionRegistry, ConnectionState, open_session};
 use studio_actions::workspace::{NewWindow, OpenGraph, OpenLink, OpenSettings, Quit, RevealLog};
@@ -173,7 +173,9 @@ pub fn window_options(bounds: Option<gpui::Bounds<gpui::Pixels>>, cx: &App) -> W
         titlebar: Some(gpui::TitlebarOptions {
             title: Some("OmniGraph Studio".into()),
             appears_transparent: true,
-            traffic_light_position: Some(point(px(12.), px(12.))),
+            traffic_light_position: Some(studio_workspace::traffic_light_position(
+                studio_ui::ds::is_glass(cx),
+            )),
         }),
         app_id: Some("com.modernrelay.omnigraph-studio".into()),
         ..Default::default()

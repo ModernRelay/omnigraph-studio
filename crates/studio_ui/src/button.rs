@@ -214,6 +214,22 @@ mod tests {
             use ui::prelude::*;
             v_flex()
                 .items_start()
+                // First: its button's label shares the selector `button-label`, and the last
+                // drawn holds it.
+                .child(
+                    ds::float_bar("bar", cx)
+                        .debug_selector(|| "float-bar".into())
+                        .child(
+                            div()
+                                .debug_selector(|| "bar-button".into())
+                                .child(ds::bar_button("fit", "Fit")),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "bar-icon-button".into())
+                                .child(ds::bar_icon_button("zoom", ui::IconName::Plus)),
+                        ),
+                )
                 .child(
                     div()
                         .debug_selector(|| "button".into())
@@ -232,8 +248,62 @@ mod tests {
         }
     }
 
+    struct PillProbe {
+        field: gpui::FocusHandle,
+        outer: gpui::FocusHandle,
+        pressed: usize,
+        outer_clicks: usize,
+    }
+
+    impl gpui::Render for PillProbe {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            use ui::prelude::*;
+            // A focusable surface around a field and a pill button, as a table around its
+            // filter pill.
+            div()
+                .id("outer")
+                .size_full()
+                .track_focus(&self.outer)
+                .on_click(cx.listener(|this, _, _, _| this.outer_clicks += 1))
+                .child(div().id("field").size_8().track_focus(&self.field))
+                .child(
+                    ds::pill_button("p", ui::IconName::Check, Color::Accent, cx)
+                        .debug_selector(|| "pill".into())
+                        .on_click(cx.listener(|this, _, _, _| this.pressed += 1)),
+                )
+        }
+    }
+
+    /// Pressing a pill's button leaves the focus in the pill's field and the click with the
+    /// button, as Zed's buttons do.
+    #[gpui::test]
+    fn a_pill_button_keeps_the_focus_and_the_click(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (probe, cx): (_, &mut VisualTestContext) = cx.add_window_view(|_, cx| PillProbe {
+            field: cx.focus_handle(),
+            outer: cx.focus_handle(),
+            pressed: 0,
+            outer_clicks: 0,
+        });
+        let field = probe.read_with(cx, |probe, _| probe.field.clone());
+        cx.update(|window, cx| window.focus(&field, cx));
+        cx.run_until_parked();
+        let pill = cx.debug_bounds("pill").expect("the pill button was drawn");
+        cx.simulate_click(pill.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        probe.read_with(cx, |probe, _| {
+            assert_eq!((probe.pressed, probe.outer_clicks), (1, 0));
+        });
+        cx.update(|window, _| assert!(field.is_focused(window), "the field kept the focus"));
+    }
+
     /// The design system's controls draw at their tokens: a button 28 px tall with its content
-    /// 6 px in, a field as tall as a button, a pill button round in a pill.
+    /// 6 px in, a field as tall as a button, a pill button round in a pill, and a floating
+    /// bar's buttons inside its border.
     #[gpui::test]
     fn controls_draw_at_their_sizes(cx: &mut TestAppContext) {
         cx.update(studio_theme::init_test);
@@ -262,5 +332,22 @@ mod tests {
             f32::from(pill.size.height),
             ds::size::PILL - 2. * ds::PILL_BUTTON_GAP
         );
+        let bar = bounds(cx, "float-bar");
+        assert_eq!(f32::from(bar.size.height), ds::size::CONTROL);
+        for selector in ["bar-button", "bar-icon-button"] {
+            let button = bounds(cx, selector);
+            assert_eq!(
+                f32::from(button.size.height),
+                ds::size::BAR_BUTTON,
+                "{selector}"
+            );
+            // Inside the bar's 1 px border, the same distance from its top and bottom.
+            assert_eq!(
+                f32::from(button.top() - bar.top()),
+                f32::from(bar.bottom() - button.bottom()),
+                "{selector}"
+            );
+            assert!(button.top() >= bar.top() + gpui::px(1.), "{selector}");
+        }
     }
 }

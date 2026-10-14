@@ -30,10 +30,19 @@ pub struct SettingsView {
 }
 
 /// A text setting's field. It writes when the person presses Enter or leaves it, not on every
-/// key, and shows the setting's value again whenever it changes elsewhere.
+/// key, and shows the setting's value again whenever it changes elsewhere, unless it holds
+/// typing not yet written.
 struct TextInput {
     field: &'static SettingField,
     editor: Entity<Editor>,
+    /// The text the field last showed or wrote; other text in it is typing not yet written.
+    shown: String,
+}
+
+impl TextInput {
+    fn edited(&self, cx: &App) -> bool {
+        self.editor.read(cx).text(cx) != self.shown
+    }
 }
 
 impl EventEmitter<ItemEvent> for SettingsView {}
@@ -104,12 +113,18 @@ impl SettingsView {
                 &editor,
                 window,
                 move |this, _, event: &EditorEvent, window, cx| {
-                    if let EditorEvent::Blurred = event {
+                    if let EditorEvent::Blurred = event
+                        && this.text_inputs[index].edited(cx)
+                    {
                         this.write_text(index, window, cx);
                     }
                 },
             ));
-            text_inputs.push(TextInput { field, editor });
+            text_inputs.push(TextInput {
+                field,
+                editor,
+                shown: String::new(),
+            });
         }
         let mut this = Self {
             search,
@@ -123,18 +138,35 @@ impl SettingsView {
         this
     }
 
-    /// Each text field shows its setting's value in the current scope, unless it is being
-    /// typed in.
+    /// Each text field shows its setting's value in the current scope, unless it holds typing
+    /// not yet written: a control pressed while a field has focus draws the values before the
+    /// field hears it lost focus and writes.
     fn show_text_values(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let settings = StudioSettings::get(cx).clone();
-        for input in &self.text_inputs {
+        for input in &mut self.text_inputs {
+            if input.edited(cx) {
+                continue;
+            }
             let text = text_of(&settings.value_in(&self.scope, input.field));
-            input.editor.update(cx, |editor, cx| {
-                if !editor.focus_handle(cx).is_focused(window) && editor.text(cx) != text {
-                    editor.set_text(text, window, cx);
-                }
-            });
+            if input.editor.read(cx).text(cx) != text {
+                input
+                    .editor
+                    .update(cx, |editor, cx| editor.set_text(text.clone(), window, cx));
+            }
+            input.shown = text;
         }
+    }
+
+    /// Shows another scope's values, after writing any typing to the scope it was typed in.
+    fn set_scope(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<Self>) {
+        for index in 0..self.text_inputs.len() {
+            if self.text_inputs[index].edited(cx) {
+                self.write_text(index, window, cx);
+            }
+        }
+        self.scope = scope;
+        self.show_text_values(window, cx);
+        cx.notify();
     }
 
     /// Writes text field `index` to its setting: empty is unset where the setting may be.
@@ -142,7 +174,8 @@ impl SettingsView {
         let Some(input) = self.text_inputs.get(index) else {
             return;
         };
-        let text = input.editor.read(cx).text(cx).trim().to_owned();
+        let typed = input.editor.read(cx).text(cx);
+        let text = typed.trim().to_owned();
         let value = match input.field.kind {
             FieldKind::Text { nullable: true } if text.is_empty() => Value::Null,
             _ => Value::String(text),
@@ -154,6 +187,7 @@ impl SettingsView {
         if StudioSettings::get(cx).value_in(&target.scope, target.field) != value {
             target.set(value, cx);
         }
+        self.text_inputs[index].shown = typed;
         // The value as the settings hold it, trimmed or refused.
         self.show_text_values(window, cx);
     }
@@ -425,9 +459,7 @@ impl SettingsView {
                     ds::segment("scope-all", "All graphs", all, cx)
                         .tooltip(Tooltip::text("Settings for every graph"))
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.scope = Scope::All;
-                            this.show_text_values(window, cx);
-                            cx.notify();
+                            this.set_scope(Scope::All, window, cx)
                         })),
                 )
                 .child(
@@ -436,9 +468,7 @@ impl SettingsView {
                             "Values for {name} only, over those for all graphs"
                         )))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.scope = Scope::Graph(key.clone());
-                            this.show_text_values(window, cx);
-                            cx.notify();
+                            this.set_scope(Scope::Graph(key.clone()), window, cx)
                         })),
                 ),
         )
@@ -644,5 +674,75 @@ impl Render for SettingsView {
                     }))
                     .child(body),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{TestAppContext, VisualTestContext};
+
+    use super::*;
+
+    fn cli_field(view: &SettingsView) -> usize {
+        view.text_inputs
+            .iter()
+            .position(|input| input.field.path.join(".") == "agent.omnigraph_cli")
+            .expect("the CLI path is a text setting")
+    }
+
+    /// A value drawn again while a field holds typing not yet written (a control pressed
+    /// before the field hears it lost focus) leaves the typing; a field without any shows the
+    /// new value, focused or not. Nothing here writes the settings file.
+    #[gpui::test]
+    fn typing_not_yet_written_outlives_the_values_drawn_again(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            studio_settings::init_test(cx);
+        });
+        let (view, cx): (_, &mut VisualTestContext) = cx.add_window_view(|window, cx| {
+            SettingsView::new(Some(("k".into(), "Graph".into())), window, cx)
+        });
+        let index = view.read_with(cx, |view, _| cli_field(view));
+        let editor = view.read_with(cx, |view, _| view.text_inputs[index].editor.clone());
+        // The Agent section of an active window, where the field is drawn and hears its focus
+        // come and go.
+        cx.update(|window, _| window.activate_window());
+        view.update(cx, |view, cx| {
+            view.section = studio_settings::sections()
+                .iter()
+                .position(|section| *section == "Agent")
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let text = |cx: &mut VisualTestContext| editor.read_with(cx, |editor, cx| editor.text(cx));
+
+        // Focused without typing: a change elsewhere shows.
+        cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
+        let mut settings = StudioSettings::default();
+        settings.agent.omnigraph_cli = Some("/usr/local/bin/omnigraph".into());
+        cx.update(|_, cx| cx.set_global(settings.clone()));
+        cx.run_until_parked();
+        assert_eq!(text(cx), "/usr/local/bin/omnigraph");
+
+        // Typing; then a control is pressed, which moves the focus and draws the values before
+        // the field hears it lost focus.
+        editor.update_in(cx, |editor, window, cx| {
+            editor.move_to_end(&Default::default(), window, cx)
+        });
+        cx.simulate_input("2");
+        cx.run_until_parked();
+        let search = view.read_with(cx, |view, _| view.search.clone());
+        let kept = cx.update(|window, cx| {
+            window.focus(&search.focus_handle(cx), cx);
+            view.update(cx, |view, cx| view.show_text_values(window, cx));
+            editor.read(cx).text(cx)
+        });
+        assert_eq!(kept, "/usr/local/bin/omnigraph2", "the typing stays");
+        // The field then writes; this test's settings refuse every write, so it shows the
+        // value they hold.
+        cx.run_until_parked();
+        assert_eq!(text(cx), "/usr/local/bin/omnigraph");
     }
 }

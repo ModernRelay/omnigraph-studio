@@ -493,6 +493,18 @@ pub fn init(cx: &mut App) {
     watch(cx);
 }
 
+/// Default settings for a test, held in memory: every write is refused as for an unreadable
+/// file, so no test reaches the settings file.
+#[cfg(any(test, feature = "test-support"))]
+pub fn init_test(cx: &mut App) {
+    cx.set_global(SettingsFileState {
+        modified: None,
+        error: None,
+        unreadable: true,
+    });
+    cx.set_global(StudioSettings::default());
+}
+
 /// The last problem reading `settings.json`, for a notification.
 pub fn file_error(cx: &App) -> Option<String> {
     cx.global::<SettingsFileState>().error.clone()

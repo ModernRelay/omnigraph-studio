@@ -78,8 +78,8 @@ impl Offers {
                 h_flex()
                     .id((id, index))
                     .h(px(studio_ui::ds::size::SIDEBAR_ROW))
-                    .px_2()
-                    .gap_2()
+                    .px(px(studio_ui::ds::space::MD))
+                    .gap(px(studio_ui::ds::space::MD))
                     // A row of a `ds::row_list`, which is concentric around this radius.
                     .rounded(px(studio_ui::ds::radius::XS))
                     .cursor_pointer()

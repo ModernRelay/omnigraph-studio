@@ -193,7 +193,11 @@ impl Connection {
         cx.notify();
         let client = self.client.clone();
         self._task = Some(cx.spawn(async move |this, cx| {
-            let outcome = probe(&client).await;
+            // Off the main thread, so its round trip is not lengthened by a busy frame.
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { probe(&client).await })
+                .await;
             this.update(cx, |this, cx| {
                 match outcome {
                     Probe::Ready {
@@ -232,9 +236,15 @@ impl Connection {
         let client = self.client.clone();
         self._health_check = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(interval).await;
-            let started = Instant::now();
-            let health = client.health().await;
-            let latency = started.elapsed();
+            // Timed off the main thread, so a busy frame does not count as the server's time.
+            let (health, latency) = cx
+                .background_executor()
+                .spawn(async move {
+                    let started = Instant::now();
+                    let health = client.health().await;
+                    (health, started.elapsed())
+                })
+                .await;
             this.update(cx, |this, cx| this.apply_health_check(health, latency, cx))
                 .ok();
         }));

@@ -1793,7 +1793,10 @@ impl QueryEditor {
                     start.push(
                         ds::meta(
                             IconName::ListTree,
-                            format!("{name} returns {} columns", info.columns.len()),
+                            match info.columns.len() {
+                                1 => format!("{name} returns 1 column"),
+                                n => format!("{name} returns {n} columns"),
+                            },
                         )
                         .into_any_element(),
                     );
@@ -2023,8 +2026,6 @@ impl QueryEditor {
         if params.is_empty() {
             return None;
         }
-        let colors = cx.theme().colors();
-        let (field_border, field_bg) = (colors.border, colors.editor_background);
         Some(
             v_flex()
                 .flex_none()
@@ -2042,18 +2043,10 @@ impl QueryEditor {
                                 .gap(px(space::MD))
                                 .items_center()
                                 .child(
-                                    div()
+                                    ds::field_frame(false, cx)
                                         .flex_1()
                                         .max_w(px(size::INSPECTOR_WIDTH))
-                                        .h(px(size::ROW))
-                                        .px(px(space::MD))
-                                        .flex()
-                                        .items_center()
-                                        .rounded(px(ds::radius::SM))
-                                        .border_1()
-                                        .border_color(field_border)
-                                        .bg(field_bg)
-                                        .child(input),
+                                        .child(ds::field_input(input)),
                                 )
                                 .child(ds::text::meta(ty).single_line()),
                         ))

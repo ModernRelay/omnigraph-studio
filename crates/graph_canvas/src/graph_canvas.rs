@@ -1975,10 +1975,7 @@ impl GraphCanvas {
                     .when(newer && mode != Mode::Results, |d| {
                         d.child(
                             panel("canvas-newer").child(
-                                studio_ui::ds::button("canvas-refresh", "Newer data · Refresh")
-                                    // The bar is sized around Zed's default buttons.
-                                    .size(ui::ButtonSize::Default)
-                                    .label_size(LabelSize::Small)
+                                studio_ui::ds::bar_button("canvas-refresh", "Newer data · Refresh")
                                     .tooltip(Tooltip::text(
                                         "The branch moved since this exploration was read",
                                     ))
@@ -2018,9 +2015,8 @@ impl GraphCanvas {
                         panel("canvas-zoom")
                             .when(!self.pinned.is_empty(), |panel| {
                                 panel.child(
-                                    studio_ui::ds::icon_button("reset-layout", IconName::RotateCcw)
+                                    studio_ui::ds::bar_icon_button("reset-layout", IconName::RotateCcw)
                                         .icon_size(IconSize::Small)
-                                    .size(ui::ButtonSize::Default)
                                         .tooltip(|_window, cx| {
                                             Tooltip::for_action(
                                                 "Reset the layout: forget the nodes you placed",
@@ -2034,9 +2030,8 @@ impl GraphCanvas {
                                 )
                             })
                             .child(
-                                studio_ui::ds::icon_button("zoom-out", IconName::Dash)
+                                studio_ui::ds::bar_icon_button("zoom-out", IconName::Dash)
                                     .icon_size(IconSize::Small)
-                                    .size(ui::ButtonSize::Default)
                                     .tooltip(|_window, cx| {
                                         Tooltip::for_action("Zoom out", &ZoomOut, cx)
                                     })
@@ -2045,9 +2040,7 @@ impl GraphCanvas {
                                     })),
                             )
                             .child(
-                                studio_ui::ds::button("zoom-fit", "Fit")
-                                    .label_size(LabelSize::Small)
-                                    .size(ui::ButtonSize::Default)
+                                studio_ui::ds::bar_button("zoom-fit", "Fit")
                                     .tooltip(|_window, cx| {
                                         Tooltip::for_action("Fit to window", &FitToWindow, cx)
                                     })
@@ -2056,9 +2049,8 @@ impl GraphCanvas {
                                     })),
                             )
                             .child(
-                                studio_ui::ds::icon_button("zoom-in", IconName::Plus)
+                                studio_ui::ds::bar_icon_button("zoom-in", IconName::Plus)
                                     .icon_size(IconSize::Small)
-                                    .size(ui::ButtonSize::Default)
                                     .tooltip(|_window, cx| {
                                         Tooltip::for_action("Zoom in", &ZoomIn, cx)
                                     })
@@ -2082,8 +2074,7 @@ impl GraphCanvas {
                                 .color(Color::Error),
                         )
                         .child(
-                            studio_ui::ds::button("canvas-retry", "Retry")
-                                .label_size(LabelSize::Small)
+                            studio_ui::ds::bar_button("canvas-retry", "Retry")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.exploration.update(cx, |e, cx| {
                                         e.retry(&graph_store::LoadTarget::Root, cx)
@@ -2107,8 +2098,7 @@ impl GraphCanvas {
                             .size(LabelSize::Small),
                         )
                         .child(
-                            studio_ui::ds::button("canvas-tree", "Show in tree")
-                                .label_size(LabelSize::Small)
+                            studio_ui::ds::bar_button("canvas-tree", "Show in tree")
                                 .style(ButtonStyle::Outlined)
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(
@@ -2120,8 +2110,7 @@ impl GraphCanvas {
                                 }),
                         )
                         .child(
-                            studio_ui::ds::button("canvas-table", "Open as table")
-                                .label_size(LabelSize::Small)
+                            studio_ui::ds::bar_button("canvas-table", "Open as table")
                                 .style(ButtonStyle::Filled)
                                 .on_click(move |_, window, cx| {
                                     window.dispatch_action(

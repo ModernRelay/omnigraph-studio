@@ -183,6 +183,17 @@ const HEADER_HEIGHT: f32 = studio_ui::ds::size::HEADER_STRIP;
 const TRAFFIC_LIGHTS_WIDTH: f32 = 76.;
 /// The traffic lights' offset from the top of that strip: centers the 16-point buttons in it.
 const TRAFFIC_LIGHTS_TOP: f32 = (HEADER_HEIGHT - 16.) / 2.;
+
+/// Where the traffic lights sit: centered in the first header strip, which the glass style
+/// insets. A window opens with them there, so they do not move on its first draw.
+pub fn traffic_light_position(glass: bool) -> Point<Pixels> {
+    let gap = if glass {
+        px(studio_ui::ds::size::SHEET_GAP)
+    } else {
+        px(0.)
+    };
+    point(gap + px(12.), gap + px(TRAFFIC_LIGHTS_TOP))
+}
 /// How many visited tabs ⌘[ remembers.
 const NAV_HISTORY: usize = 100;
 /// A dock panel inside a scrolling host of its own. The host is what is cached (a cached view
@@ -273,6 +284,7 @@ impl Workspace {
         let activation_subscription = cx.observe_window_activation(window, |this, window, cx| {
             this.window_active = window.is_window_active();
             if !this.window_active {
+                this.pause_performance();
                 return;
             }
             let sessions: Vec<_> = this
@@ -334,8 +346,8 @@ impl Workspace {
     }
 
     /// Starts or stops reading Studio's memory and CPU as `studio.show_performance` says. The
-    /// reading waits while another window is in front, and costs a footer draw every two
-    /// seconds while it runs.
+    /// reading waits while another window is in front, and while it runs it draws the
+    /// workspace again every two seconds (a cached tab's parts keep their last frame).
     fn watch_performance(&mut self, cx: &mut Context<Self>) {
         let on = cx
             .try_global::<StudioSettings>()
@@ -353,11 +365,7 @@ impl Workspace {
             loop {
                 let read = this.update(cx, |this, cx| {
                     if !this.window_active {
-                        // A reading after a pause would average CPU over the time away; the
-                        // next one starts over, keeping the figure shown until then.
-                        if let Some(last) = &mut this.performance {
-                            last.paused = true;
-                        }
+                        this.pause_performance();
                         return;
                     }
                     let sample = process_stats::Sample::now();
@@ -370,6 +378,15 @@ impl Workspace {
                 cx.background_executor().timer(PERFORMANCE_INTERVAL).await;
             }
         }));
+    }
+
+    /// The window went to the background: a reading after it would average CPU over the time
+    /// away, so the next one starts over, keeping the figure shown until then. Marked when the
+    /// window leaves, not at the next tick, which may come after it is back.
+    fn pause_performance(&mut self) {
+        if let Some(last) = &mut self.performance {
+            last.paused = true;
+        }
     }
 
     /// Studio's memory and CPU, muted at the end of the footer; in the warning colour past
@@ -2802,12 +2819,7 @@ impl Render for Workspace {
         let glass = studio_ui::ds::is_glass(cx);
         let sidebar_shown = self.left.visible() && self.session.is_some();
         let gap = px(studio_ui::ds::size::SHEET_GAP);
-        // The traffic lights sit centered in the first header strip, which the glass style insets.
-        let lights = if glass {
-            point(gap + px(12.), gap + px(TRAFFIC_LIGHTS_TOP))
-        } else {
-            point(px(12.), px(TRAFFIC_LIGHTS_TOP))
-        };
+        let lights = traffic_light_position(glass);
         if self.traffic_lights != Some(lights) {
             self.traffic_lights = Some(lights);
             // Only macOS draws traffic lights; GPUI has the call on macOS alone.
@@ -3342,6 +3354,37 @@ mod tests {
             Some(0.2),
             "measured from the reading after the pause"
         );
+    }
+
+    /// The window leaving marks the last reading at once, so a return before the next tick
+    /// does not measure across the time away.
+    #[gpui::test]
+    fn leaving_the_window_pauses_the_cpu_reading(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let window = cx.add_window(Workspace::new);
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |workspace, _, _| {
+                workspace.performance = Some(Performance::next(None, process_stats::Sample::now()));
+            })
+            .unwrap();
+        let paused = |cx: &mut gpui::TestAppContext| {
+            window
+                .read_with(cx, |workspace, _| {
+                    workspace.performance.as_ref().map(|reading| reading.paused)
+                })
+                .unwrap()
+        };
+        assert_eq!(paused(cx), Some(false));
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.deactivate_window();
+        assert_eq!(paused(&mut cx), Some(true));
     }
 
     /// Only the top-left pane's first tab on glass, with nothing before it, meets the sheet's

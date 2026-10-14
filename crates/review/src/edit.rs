@@ -118,8 +118,6 @@ impl EditModal {
 
 impl Render for EditModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().colors().border_variant;
-        let editor_bg = cx.theme().colors().editor_background;
         ds::card(cx)
             .key_context("ReviewEdit")
             .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.save(cx)))
@@ -145,18 +143,8 @@ impl Render for EditModal {
                             v_flex()
                                 .gap(px(ds::space::XXS))
                                 .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(if field.error.is_some() {
-                                            cx.theme().status().error_border
-                                        } else {
-                                            border
-                                        })
-                                        .bg(editor_bg)
-                                        .child(field.editor.clone()),
+                                    ds::field_frame(field.error.is_some(), cx)
+                                        .child(ds::field_input(field.editor.clone())),
                                 )
                                 .children(field.error.clone().map(|error| {
                                     Label::new(error)

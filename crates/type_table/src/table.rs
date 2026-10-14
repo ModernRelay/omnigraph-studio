@@ -250,6 +250,9 @@ pub struct TypeTable {
     frame_lines: Option<Rc<Vec<Line>>>,
     /// How the lines drawn this frame look, filled by the row callback for the row styling.
     frame_looks: Rc<RefCell<HashMap<usize, RowLook>>>,
+    /// The columns the last drawn rows drew.
+    #[cfg(test)]
+    frame_drawn: Vec<bool>,
     /// A column being dragged wider or narrower: its key, and where the pointer and the column's
     /// width were when the drag began.
     resizing: Option<ColumnResize<String>>,
@@ -482,6 +485,8 @@ impl TypeTable {
             grouping: None,
             frame_lines: None,
             frame_looks: Rc::default(),
+            #[cfg(test)]
+            frame_drawn: Vec::new(),
             frame_now: chrono::Local::now(),
             grid,
             edit_slot: Default::default(),
@@ -3791,7 +3796,6 @@ impl TypeTable {
 
     // ---- filters ----
 
-    /// Why nothing can be written here, when the table reads a past commit.
     /// What the table says when its cells cannot change: an edge table at the head still adds
     /// and deletes rows.
     fn read_only_label(&self) -> &'static str {
@@ -3802,6 +3806,7 @@ impl TypeTable {
         }
     }
 
+    /// Why nothing can be written here, when the table reads a past commit.
     fn pinned_reason(&self) -> Option<String> {
         self.at_commit.as_ref().map(|commit| {
             format!(
@@ -4603,10 +4608,14 @@ impl TypeTable {
             let (title, detail) = if self.filters.is_empty() {
                 (
                     format!("No {} rows on {}", self.type_name, self.branch),
-                    match self.kind {
-                        TableKind::Node => Some("Add one with Row (⌘N).".into()),
-                        TableKind::Edge => None,
-                    },
+                    // Nodes and edges both add rows at the head; a past commit adds none.
+                    self.at_commit.is_none().then(|| {
+                        match studio_ui::shortcut_text(&InsertRow, cx) {
+                            Some(keys) => format!("Add one with Row ({keys})."),
+                            None => "Add one with Row.".to_owned(),
+                        }
+                        .into()
+                    }),
                 )
             } else {
                 (
@@ -4792,6 +4801,10 @@ impl TypeTable {
                 cx.processor(|this, range: Range<usize>, window, cx| {
                     this.note_looks(range.clone());
                     let drawn = this.drawn_columns(window, cx);
+                    #[cfg(test)]
+                    {
+                        this.frame_drawn = drawn.clone();
+                    }
                     let Some(lines) = this.frame_lines.clone() else {
                         if this.more_error.is_none()
                             && this
@@ -5345,6 +5358,8 @@ impl TypeTable {
     fn drawn_columns(&self, window: &Window, cx: &App) -> Vec<bool> {
         let count = self.columns.len();
         let handle = &self.table_state.read(cx).horizontal_scroll_handle;
+        // The header's scrolled part tracks the same handle and is laid out before the list
+        // draws its rows, so this is this frame's width, also right after a resize.
         let viewport = handle.bounds().size.width;
         if viewport <= px(0.) {
             return vec![true; count];
@@ -6177,5 +6192,28 @@ mod tests {
             table.cursor = Some(Cursor { row: 0, col: 1 })
         });
         assert!(drawn(cx)[1]);
+
+        // A wider grid draws the columns its new width shows in the frame that widens it: the
+        // header learns the width before the rows are picked (`drawn_columns`).
+        table.update_in(cx, |table, _, cx| {
+            table.cursor = None;
+            table
+                .table_state
+                .read(cx)
+                .horizontal_scroll_handle
+                .set_offset(point(px(0.), px(0.)));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let rows_drew = |cx: &mut gpui::VisualTestContext| {
+            table.read_with(cx, |table, _| table.frame_drawn.clone())
+        };
+        assert!(!rows_drew(cx)[20], "{:?}", rows_drew(cx));
+        cx.simulate_resize(gpui::size(px(6000.), px(800.)));
+        assert!(
+            rows_drew(cx).iter().all(|drawn| *drawn),
+            "every column fits now: {:?}",
+            rows_drew(cx)
+        );
     }
 }
