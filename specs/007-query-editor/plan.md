@@ -193,9 +193,15 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 | 2026-10-14 | Stored queries are listed, opened and run by name | `graph_client` test `stored_queries_are_listed_and_invoked_by_name` (catalog kinds, `expect_mutation` either way, the conditional route, an encoded name); `graph_store` tests `stored_queries_are_read_with_the_graph_and_run_by_name` (a 404 catalog is empty, a write is logged and is the head) and `cli_servers_follow_the_cli_files` (aliases by server and graph); `query_editor` tests of the parameter kinds; offscreen snapshots against a scratch 0.13 cluster serving `people_titled` and `set_title` | The panel listed both with the `founders` alias indented and one alias under Not served; `founders` opened `people_titled` with Founder filled and ⌘↵ read 20 rows; `set_title` on person-000002 asked first, committed, toasted, and a read of the server showed the new title |
 | 2026-10-14 | The query page follows the design system | offscreen snapshots of a query tab and a stored query's tab after a run | Toolbar: name and kind leading, picker, Explain and Run trailing; parameters as fields; rows, time and commit in the window footer beside the graph and branch, no second strip |
 | 2026-10-14 | Result columns are resized from their header's edge | `query_editor` headless test `a_dragged_result_column_keeps_its_width_by_name`; `studio_ui` test `a_drag_follows_the_pointer_within_bounds`; offscreen snapshots of `people` (slug, name, title) on the dev graph, then `drag:604,446,704,446` on name's edge and `hover:704,446` | Name went 100 px wider and title and its cells moved with it; the edge's line showed on hover. The test: the width held for `name` when the next result put it second, the tab saved `"widths": {"name": 250.0}`, and resetting fitted it to its values again |
+| 2026-10-14 | Typing in the query does not draw the results | Main-thread CPU per key from the snapshot tool, `release-fast`, `people` with no result, 3 and 6 columns of 200 rows, before and after in one session; headless `typing_in_the_query_leaves_the_results_as_they_were`, which fails with the per-key `notify` restored | Before: 1.7 ms with no result, 2.3 to 2.7 ms with 3 columns, 3.2 to 3.5 ms with 6, each column about 0.25 ms more. After: 1.5, 1.55 and 1.85 to 2.0 ms. A run, a column drag and a cell click drew as before |
 
 
 ## Corrections
+
+- 2026-10-14 · Every key in the query drew the result grid again, so wide results made typing
+  slower. The result area is now a view of its own (`QueryResults`), made with the tab and
+  drawn cached; the tab answers `caches_its_parts`; and a moved cursor notifies only when it
+  enters another declaration, which is all the result area shows of it (`docs/drawing.md`).
 
 - 2026-10-14 · Result columns can be resized as the table's can: drag a header's right edge
   (48 to 1,200 px), click it twice to fit the column to its values. A dragged width belongs to

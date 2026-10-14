@@ -14,9 +14,10 @@ use editor::{
     Editor, EditorEvent, HighlightKey, MultiBufferOffset, SelectionEffects, ToOffset as _,
 };
 use gpui::{
-    App, ClickEvent, ClipboardItem, Context, DragMoveEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, HighlightStyle, MouseButton, MouseDownEvent, Render, ScrollStrategy, SharedString,
-    Subscription, Task, UnderlineStyle, UniformListScrollHandle, Window, uniform_list,
+    AnyView, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, HighlightStyle, MouseButton, MouseDownEvent, Render, ScrollStrategy,
+    SharedString, StyleRefinement, Subscription, Task, UnderlineStyle, UniformListScrollHandle,
+    WeakEntity, Window, uniform_list,
 };
 use gq_language::{QueryInfo, ResultColumn, SchemaModel, Statement, TokenKind};
 use graph_client::api::ErrorCode;
@@ -275,7 +276,46 @@ pub struct QueryEditor {
     check_task: Option<Task<()>>,
     /// A stored query's tab (spec 007); `None` for a query written in the editor.
     stored: Option<Stored>,
+    /// The result area as a view of its own, drawn again whenever the tab notifies.
+    results: Entity<QueryResults>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The tab's result area, drawn as a view of its own, so a keystroke in the query draws the
+/// toolbar and the text again but leaves the rows as they were (`docs/drawing.md`).
+struct QueryResults {
+    query: WeakEntity<QueryEditor>,
+    _query_changed: Subscription,
+    /// How often the results were drawn, for the test that typing leaves them alone.
+    #[cfg(test)]
+    renders: usize,
+}
+
+impl QueryResults {
+    /// Made with the tab, not on its first draw (`docs/drawing.md`).
+    fn new(cx: &mut Context<QueryEditor>) -> Entity<Self> {
+        let query = cx.entity();
+        cx.new(|cx| QueryResults {
+            query: query.downgrade(),
+            _query_changed: cx.observe(&query, |_, _, cx| cx.notify()),
+            #[cfg(test)]
+            renders: 0,
+        })
+    }
+}
+
+impl Render for QueryResults {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        let results = self
+            .query
+            .update(cx, |query, cx| query.render_results(window, cx))
+            .unwrap_or_else(|_| gpui::Empty.into_any_element());
+        v_flex().size_full().child(results)
+    }
 }
 
 impl EventEmitter<ItemEvent> for QueryEditor {}
@@ -287,6 +327,11 @@ impl Focusable for QueryEditor {
 }
 
 impl Item for QueryEditor {
+    /// The result area is drawn cached on its own (`QueryResults`).
+    fn caches_its_parts(&self) -> bool {
+        true
+    }
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         let name = match (&self.stored, &self.path) {
             (Some(stored), _) => stored.entry.name.clone(),
@@ -487,6 +532,7 @@ impl QueryEditor {
             run_task: None,
             check_task: None,
             stored,
+            results: QueryResults::new(cx),
             _subscriptions: subscriptions,
         };
         this.parse_as_gq(cx);
@@ -807,11 +853,14 @@ impl QueryEditor {
             .to_offset(&snapshot)
             .0;
         self.sync_params(window, cx);
-        // The toolbar and the window's footer name the declaration under the cursor.
+        // The toolbar and the window's footer name the declaration under the cursor, and before
+        // a run the result area shows its columns. Only a new declaration notifies: the tab
+        // draws again anyway because its editor changed, and a notify on every key would draw
+        // the rows again too.
         if self.current_query().map(|(name, _)| name) != before {
             cx.emit(ItemEvent::UpdateTab);
+            cx.notify();
         }
-        cx.notify();
     }
 
     fn highlight_syntax(&mut self, cx: &mut Context<Self>) {
@@ -2651,7 +2700,7 @@ impl QueryEditor {
 }
 
 impl Render for QueryEditor {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Recolours the language when the theme has changed since it last coloured it.
         if self.parsed {
             crate::syntax::language(crate::syntax::Syntax::Gq, cx);
@@ -2660,7 +2709,8 @@ impl Render for QueryEditor {
         let problems = self.render_problems(cx);
         let params = self.render_params(cx);
         let confirm = self.render_confirm(cx);
-        let results = self.render_results(window, cx);
+        let results = AnyView::from(self.results.clone())
+            .cached(StyleRefinement::default().flex_1().min_h_0());
         let source = match &self.stored {
             Some(stored) => self.render_stored_about(stored, cx),
             None => Some(
@@ -2954,7 +3004,8 @@ mod tests {
         );
     }
 
-    mod widths {
+    /// Headless tests of the tab in a window.
+    mod views {
         use gpui::TestAppContext;
         use graph_store::{Connection, ServerEntry, ServerSource};
         use http_client::{AsyncBody, FakeHttpClient, Response};
@@ -3040,6 +3091,52 @@ mod tests {
                 assert_eq!(widths(editor), vec![fitted[1], fitted[0]]);
                 assert!(editor.column_widths.is_empty());
             });
+        }
+
+        /// Typing in the query draws the text and the toolbar again but not the rows
+        /// (`docs/drawing.md`); a notify from the tab draws them.
+        #[gpui::test]
+        async fn typing_in_the_query_leaves_the_results_as_they_were(cx: &mut TestAppContext) {
+            cx.update(|cx| {
+                studio_theme::init_test(cx);
+                editor::init(cx);
+            });
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            let renders = |cx: &mut gpui::VisualTestContext| {
+                editor.read_with(cx, |editor, cx| editor.results.read(cx).renders)
+            };
+            let text = "query people() { match { $p: Person } return { $p.name } }";
+            editor.update_in(cx, |editor, window, cx| {
+                editor.set_text(text, window, cx);
+                finish(editor, &["name"]);
+                cx.notify();
+                // The cursor inside the declaration, after `$p.name`.
+                let at = text.find("name }").unwrap() + "name".len();
+                editor.editor.update(cx, |editor, cx| {
+                    editor.change_selections(Default::default(), window, cx, |s| {
+                        s.select_ranges(vec![MultiBufferOffset(at)..MultiBufferOffset(at)])
+                    });
+                });
+                window.focus(&editor.editor.focus_handle(cx), cx);
+            });
+            // The first key also switches GPUI to keyboard input, which draws the whole
+            // window once; the keys after it are the ones counted.
+            cx.simulate_input("s");
+            cx.run_until_parked();
+            let before = renders(cx);
+            assert!(before > 0);
+            cx.simulate_input("ake");
+            cx.run_until_parked();
+            editor.read_with(cx, |editor, cx| {
+                assert!(editor.editor.read(cx).text(cx).contains("$p.namesake"))
+            });
+            assert_eq!(renders(cx), before, "typing drew the results");
+
+            editor.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            assert_eq!(renders(cx), before + 1);
         }
     }
 }

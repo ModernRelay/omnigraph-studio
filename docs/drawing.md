@@ -44,12 +44,18 @@ the interaction and asserts the count:
 | Guard | Holds |
 | --- | --- |
 | `type_table` `typing_in_a_field_leaves_the_grid_as_it_was` | The grid follows the table's `notify`; typing in the filter field or a cell does not draw it |
+| `query_editor` `typing_in_the_query_leaves_the_results_as_they_were` | The result area follows the tab's `notify`; typing in the query does not draw it |
 | `studio_workspace` `a_tab_that_caches_its_parts_keeps_them_while_a_field_changes` | A tab that caches its parts keeps them while a field changes; a cached tab draws them again, which is the GPUI behavior the opt-out exists for |
 
 Draw counts are exact, so they run in CI. Times are not: the machine's load moves them several
 times over.
 
 ## Measuring
+
+`script/measure-frames` runs the common cases against the development graph (`script/dev-server`)
+on `release-fast`: a key in the table's filter field, in a cell, in the query editor with six
+result columns, and in the Go To palette, and a table scroll. On 2026-10-14 (Apple M5 Pro, load
+average 5) each key cost 1.3 to 1.9 ms of main-thread CPU and a scroll 6 ms.
 
 `crates/studio/examples/snapshot.rs` draws Studio offscreen against a server and measures frames:
 `measure:<n>` with `,type` (a key into the focused field), `,scroll=<dy>` or `,drag=<dx>:<dy>`.

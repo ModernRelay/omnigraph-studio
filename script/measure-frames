@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Measure the frames that matter most against the development graph, on the release-fast
+# profile: a key in each kind of field and a table scroll (docs/drawing.md). Prints the main
+# thread's CPU time per frame, median and p95, which a busy machine moves far less than wall
+# time. An instrument, not a gate: compare runs made in the same session.
+#
+#   script/dev-server &        # once, in another shell
+#   script/measure-frames      # prints one line per case
+#   script/measure-frames 2    # each case twice
+#
+# Needs the snapshot tool's build; it builds it first.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+ROUNDS=${1:-1}
+FRAMES=${STUDIO_MEASURE_FRAMES:-200}
+OUT=$(mktemp -d)
+trap 'rm -rf "$OUT"' EXIT
+
+export OMNIGRAPH_STUDIO_SERVER=${OMNIGRAPH_STUDIO_SERVER:-http://127.0.0.1:8787}
+export OMNIGRAPH_STUDIO_TOKEN=${OMNIGRAPH_STUDIO_TOKEN:-dev-token}
+export OMNIGRAPH_STUDIO_GRAPH=${OMNIGRAPH_STUDIO_GRAPH:-knowledge}
+export SNAPSHOT_WAIT_MS=${SNAPSHOT_WAIT_MS:-2000}
+
+if ! curl -sf -o /dev/null "$OMNIGRAPH_STUDIO_SERVER/healthz"; then
+  echo "no server at $OMNIGRAPH_STUDIO_SERVER; start script/dev-server first" >&2
+  exit 1
+fi
+
+cargo build --quiet --profile release-fast -p studio --example snapshot --manifest-path "$ROOT/Cargo.toml"
+SNAPSHOT="$ROOT/target/release-fast/examples/snapshot"
+
+PERSON='studio_graph::OpenType={"type_name":"Person"}'
+QUERY='query people() { match { $p: Person } return { $p.slug, $p.name, $p.title, $p.email, $p.born, $p.tags } }'
+NEW_QUERY="studio_graph::NewQueryWithText={\"text\":\"$QUERY\"}"
+
+# name, then the snapshot steps.
+cases=(
+  "table filter key|$PERSON|studio_table::AddFilter|measure:$FRAMES,type"
+  "table cell key|$PERSON|studio_table::EditCell|key:right|studio_table::EditCell|measure:$FRAMES,type"
+  "table scroll|$PERSON|measure:$FRAMES,scroll=40"
+  "query key (6 columns)|$NEW_QUERY|studio_query::Run|measure:$FRAMES,type"
+  "palette key|$PERSON|studio::GoTo|measure:$FRAMES,type"
+)
+
+printf '%-24s %10s %10s\n' "case" "cpu median" "cpu p95"
+for ((round = 1; round <= ROUNDS; round++)); do
+  for case in "${cases[@]}"; do
+    IFS='|' read -r -a parts <<<"$case"
+    name=${parts[0]}
+    line=$("$SNAPSHOT" "$OUT/frame.png" "${parts[@]:1}" 2>&1 | grep '^measure' || true)
+    median=$(sed -n 's/.*cpu median \([^,]*\),.*/\1/p' <<<"$line")
+    p95=$(sed -n 's/.*cpu median [^,]*, p95 \([^,]*\),.*/\1/p' <<<"$line")
+    printf '%-24s %10s %10s\n' "$name" "${median:-failed}" "${p95:-}"
+  done
+done
+uptime
