@@ -15,9 +15,10 @@ use std::time::Duration;
 use collections::IndexSet;
 use editor::{Editor, EditorEvent};
 use gpui::{
-    Anchor, App, ClickEvent, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle,
-    Focusable, KeyContext, MouseButton, MouseDownEvent, Render, ScrollStrategy, SharedString,
-    Subscription, Task, WeakEntity, Window, anchored, deferred, point,
+    Anchor, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, Entity,
+    EventEmitter, FocusHandle, Focusable, KeyContext, MouseButton, MouseDownEvent, Pixels, Render,
+    ScrollStrategy, SharedString, Subscription, Task, WeakEntity, Window, anchored, deferred,
+    point,
 };
 use gq_language::{
     BuildError, BuiltQuery, Filter, FilterOp, PageStart, Property, RelationshipGroup, ScalarKind,
@@ -225,6 +226,9 @@ pub struct TypeTable {
     frame_lines: Option<Rc<Vec<Line>>>,
     /// How the lines drawn this frame look, filled by the row callback for the row styling.
     frame_looks: Rc<RefCell<HashMap<usize, RowLook>>>,
+    /// A column being dragged wider or narrower: its key, and where the pointer and the column's
+    /// width were when the drag began.
+    resizing: Option<(String, Pixels, f32)>,
     /// The time relative dates are read against, taken once a frame rather than once a cell
     /// (reading the local time zone is not free).
     frame_now: chrono::DateTime<chrono::Local>,
@@ -313,6 +317,7 @@ impl Item for TypeTable {
                 "group_by": self.grouping.as_ref().map(|g| &g.property),
                 "hidden": self.layout.hidden,
                 "order": self.layout.order,
+                "widths": self.layout.widths,
             }),
         })
     }
@@ -440,6 +445,7 @@ impl TypeTable {
             frame_lines: None,
             frame_looks: Rc::default(),
             frame_now: chrono::Local::now(),
+            resizing: None,
             blob_rows: None,
             _blob_wait: None,
             node_labels: HashMap::new(),
@@ -635,8 +641,93 @@ impl TypeTable {
         }
     }
 
+    /// The right edge of a column's header: drag to make the column wider or narrower, click
+    /// twice to fit it to its type again. A line shows there only on hover and while dragging,
+    /// so the grid keeps no rules between columns (spec 002).
+    fn render_resize_handle(
+        &self,
+        index: usize,
+        column: &ColumnSpec,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = column.key.clone();
+        let width = self.layout.width(column);
+        let active = self
+            .resizing
+            .as_ref()
+            .is_some_and(|(resizing, _, _)| *resizing == column.key);
+        let line = cx.theme().colors().border_focused;
+        let group = SharedString::from(format!("column-resize-{index}"));
+        div()
+            .id(("column-resize", index))
+            .group(group.clone())
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .w(px(6.))
+            .cursor_col_resize()
+            .flex()
+            .justify_end()
+            .child(
+                div()
+                    .w(px(2.))
+                    .h_full()
+                    .when(active, |d| d.bg(line))
+                    .group_hover(group, |d| d.bg(line)),
+            )
+            .on_mouse_down(MouseButton::Left, {
+                let key = key.clone();
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.resizing = Some((key.clone(), event.position.x, width));
+                    cx.stop_propagation();
+                    cx.notify();
+                })
+            })
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                if event.click_count() >= 2 {
+                    this.resizing = None;
+                    this.resize_column(&key, None, cx);
+                }
+            }))
+            .on_drag(ColumnDrag, |drag, _, _, cx| cx.new(|_| *drag))
+            .into_any_element()
+    }
+
+    /// Follows a column drag: the column's new width is where the pointer is now, relative to
+    /// where the drag began.
+    fn drag_column(&mut self, event: &DragMoveEvent<ColumnDrag>, cx: &mut Context<Self>) {
+        let Some((key, start_x, start_width)) = self.resizing.clone() else {
+            return;
+        };
+        let width = start_width + f32::from(event.event.position.x - start_x);
+        self.resize_column(&key, Some(width), cx);
+    }
+
+    fn resize_column(&mut self, key: &str, width: Option<f32>, cx: &mut Context<Self>) {
+        let before = self.layout.widths.get(key).copied();
+        self.layout.set_width(key, width);
+        if self.layout.widths.get(key).copied() == before {
+            return;
+        }
+        let widths: Vec<_> = self
+            .columns
+            .iter()
+            .map(|c| px(self.layout.width(c)))
+            .collect();
+        let behaviors = vec![TableResizeBehavior::MinSize(3.); self.columns.len()];
+        let count = self.columns.len();
+        self.widths.update(cx, |state, _| {
+            *state = ResizableColumnsState::new(count, widths, behaviors);
+        });
+        // Saved with the tab, like the columns' order.
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
     fn set_columns(&mut self, columns: Vec<ColumnSpec>, cx: &mut Context<Self>) {
-        let widths: Vec<_> = columns.iter().map(|c| px(c.width)).collect();
+        let widths: Vec<_> = columns.iter().map(|c| px(self.layout.width(c))).collect();
         let behaviors = vec![TableResizeBehavior::MinSize(3.); columns.len()];
         let count = columns.len();
         self.widths.update(cx, |state, _| {
@@ -4371,7 +4462,21 @@ impl TypeTable {
             };
             return studio_ui::empty_state(title, detail).into_any_element();
         }
-        self.render_grid(cx)
+        let grid = self.render_grid(cx);
+        // A column's edge dragged anywhere over the grid resizes it until released.
+        div()
+            .size_full()
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<ColumnDrag>, _, cx| {
+                    this.drag_column(event, cx)
+                }),
+            )
+            .on_drop(cx.listener(|this, _: &ColumnDrag, _, cx| {
+                this.resizing = None;
+                cx.notify();
+            }))
+            .child(grid)
+            .into_any_element()
     }
 
     fn render_grid(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -4390,8 +4495,11 @@ impl TypeTable {
                     .as_ref()
                     .filter(|sort| sortable.is_some_and(|p| p.name == sort.property));
                 let key = column.key.clone();
+                let resize = self.render_resize_handle(index, column, cx);
                 let header = h_flex()
                     .id(("column-header", index))
+                    .relative()
+                    .child(resize)
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -4498,9 +4606,14 @@ impl TypeTable {
         let line_count = lines.as_ref().map_or(self.rows.len(), |lines| lines.len());
         let hairline = studio_ui::ds::surface::rule(cx);
         let glass = studio_ui::ds::is_glass(cx);
-        // Fixed fitted widths: Zed's resizable columns draw a full-height rule between every
-        // column, which the visual language leaves out (spec 002).
-        let widths: Vec<_> = self.columns.iter().map(|c| px(c.width)).collect();
+        // Widths fitted to each column's type unless dragged. Not Zed's resizable columns: they
+        // draw a full-height rule between every column, which the visual language leaves out
+        // (spec 002); the header's edges resize instead.
+        let widths: Vec<_> = self
+            .columns
+            .iter()
+            .map(|c| px(self.layout.width(c)))
+            .collect();
         Table::new(self.columns.len())
             .interactable(&self.table_state)
             .width_config(ColumnWidthConfig::explicit(widths))
@@ -5427,6 +5540,16 @@ fn filter_placeholder(op: FilterOp) -> &'static str {
         FilterOp::In => "Values, separated by commas",
         FilterOp::RelatedTo => "Name or id",
         _ => "Value",
+    }
+}
+
+/// A column's right edge being dragged; what follows the pointer draws nothing.
+#[derive(Clone, Copy)]
+struct ColumnDrag;
+
+impl Render for ColumnDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
     }
 }
 

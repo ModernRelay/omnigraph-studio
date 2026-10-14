@@ -191,11 +191,42 @@ pub struct ColumnLayout {
     pub hidden: Vec<String>,
     /// The unpinned columns' keys as the person ordered them; empty is schema order.
     pub order: Vec<String>,
+    /// Widths the person dragged a column to, in pixels, by column key; the others are fitted
+    /// to their type.
+    pub widths: std::collections::BTreeMap<String, u32>,
 }
+
+/// The narrowest and widest a column can be dragged to.
+pub const COLUMN_MIN_WIDTH: f32 = 48.;
+pub const COLUMN_MAX_WIDTH: f32 = 1_200.;
 
 impl ColumnLayout {
     pub fn new(hidden: Vec<String>, order: Vec<String>) -> Self {
-        Self { hidden, order }
+        Self {
+            hidden,
+            order,
+            widths: Default::default(),
+        }
+    }
+
+    /// A column's width: the one it was dragged to, else its fitted one.
+    pub fn width(&self, column: &ColumnSpec) -> f32 {
+        self.widths
+            .get(&column.key)
+            .map_or(column.width, |width| *width as f32)
+    }
+
+    /// Sets the width a column was dragged to, within the bounds; `None` goes back to fitted.
+    pub fn set_width(&mut self, key: &str, width: Option<f32>) {
+        match width {
+            Some(width) => {
+                let width = width.clamp(COLUMN_MIN_WIDTH, COLUMN_MAX_WIDTH).round() as u32;
+                self.widths.insert(key.to_owned(), width);
+            }
+            None => {
+                self.widths.remove(key);
+            }
+        }
     }
 
     pub fn is_hidden(&self, key: &str) -> bool {
@@ -961,6 +992,25 @@ mod tests {
             Vec::<String>::new(),
             "schema order again is no order"
         );
+    }
+
+    #[test]
+    fn a_dragged_width_holds_within_bounds_until_reset() {
+        let all = columns(&["slug", "name"]);
+        let mut layout = ColumnLayout::default();
+        let fitted = all[1].width;
+        assert_eq!(layout.width(&all[1]), fitted);
+        layout.set_width("name", Some(321.4));
+        assert_eq!(layout.width(&all[1]), 321.);
+        layout.set_width("name", Some(5.));
+        assert_eq!(layout.width(&all[1]), COLUMN_MIN_WIDTH);
+        layout.set_width("name", Some(99_999.));
+        assert_eq!(layout.width(&all[1]), COLUMN_MAX_WIDTH);
+        // Another column keeps its own.
+        assert_eq!(layout.width(&all[0]), all[0].width);
+        layout.set_width("name", None);
+        assert_eq!(layout.width(&all[1]), fitted);
+        assert_eq!(layout, ColumnLayout::default());
     }
 
     #[test]

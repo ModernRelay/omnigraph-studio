@@ -74,7 +74,14 @@ pub fn init(cx: &mut App) {
                     })
                     .unwrap_or_default()
             };
-            let layout = model::ColumnLayout::new(keys("hidden"), keys("order"));
+            let mut layout = model::ColumnLayout::new(keys("hidden"), keys("order"));
+            if let Some(widths) = data.get("widths").and_then(Value::as_object) {
+                for (key, width) in widths {
+                    if let Some(width) = width.as_f64() {
+                        layout.set_width(key, Some(width as f32));
+                    }
+                }
+            }
             let table = open_type(workspace, type_name, at_commit, false, window, cx);
             if let Some(table) = table {
                 table.update(cx, |table, cx| {
