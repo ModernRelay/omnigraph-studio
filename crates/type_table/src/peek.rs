@@ -145,6 +145,8 @@ impl NodePeek {
                 cx.notify();
             }
         });
+        cx.on_release(|this: &mut Self, cx| this.release_images(cx))
+            .detach();
         let mut this = Self {
             session,
             blobs: Vec::new(),
@@ -259,9 +261,19 @@ impl NodePeek {
             .collect()
     }
 
+    /// Frees the images this peek decoded; GPUI would keep them otherwise.
+    fn release_images(&self, cx: &mut App) {
+        for slot in &self.blobs {
+            if let Loadable::Loaded(Preview::Image(image)) = &slot.preview {
+                image.release(cx);
+            }
+        }
+    }
+
     /// Reads each Blob property's metadata, then enough of a managed value to preview it: its
     /// first bytes, or the whole of an image that fits. Pinned to the peek's commit.
     fn load_blobs(&mut self, debounce: bool, cx: &mut Context<Self>) {
+        self.release_images(cx);
         let edge = matches!(self.subject, PeekSubject::Edge { .. });
         let type_name = self.subject.type_name().to_owned();
         let id = self.subject.id().to_owned();
@@ -340,8 +352,9 @@ impl NodePeek {
                     }
                 }
                 let head = bytes.iter().take(16).copied().collect();
+                let svg = cx.update(|cx| cx.svg_renderer());
                 let shown = cx
-                    .background_spawn(async move { preview(bytes, size) })
+                    .background_spawn(async move { preview(bytes, size, &svg) })
                     .await;
                 this.update(cx, |this, cx| {
                     this.blobs[index].head = head;
@@ -453,7 +466,7 @@ impl NodePeek {
                             .border_1()
                             .border_color(border)
                             .child(
-                                gpui::img(image.clone())
+                                gpui::img(image.source())
                                     .max_w_full()
                                     .max_h(px(240.))
                                     .object_fit(gpui::ObjectFit::Contain),

@@ -5,7 +5,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::{AppContext as _, AsyncApp, Image, ImageFormat, WeakEntity};
+use gpui::{
+    App, AppContext as _, AsyncApp, Image, ImageFormat, ImageSource, RenderImage, SvgRenderer,
+    WeakEntity,
+};
 use graph_client::{BlobCell, BlobMeta};
 use graph_store::GraphSession;
 
@@ -19,11 +22,62 @@ const TEXT_SHOWN: usize = 4 * 1024;
 const HEX_SHOWN: usize = 128;
 const HEX_LINE: usize = 8;
 
+/// A decoded image Studio holds, so it can free it. GPUI keeps an `Image` it decoded in its
+/// asset cache until asked, and its textures in every window that drew it: a peek moving
+/// through rows of photos would otherwise keep every one (an 8 MB JPEG decodes to about
+/// 100 MB).
+#[derive(Clone)]
+pub enum ShownImage {
+    /// Decoded off the main thread, drawn as is.
+    Raster(Arc<RenderImage>),
+    /// An SVG, which GPUI draws at the size it is shown.
+    Svg(Arc<Image>),
+}
+
+impl std::fmt::Debug for ShownImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShownImage::Raster(_) => f.write_str("ShownImage::Raster"),
+            ShownImage::Svg(_) => f.write_str("ShownImage::Svg"),
+        }
+    }
+}
+
+impl ShownImage {
+    /// Decodes an image of `format`; call it from a background task. `None` when the bytes do
+    /// not decode.
+    pub fn decode(format: ImageFormat, bytes: Vec<u8>, svg: &SvgRenderer) -> Option<Self> {
+        let image = Image::from_bytes(format, bytes);
+        if format == ImageFormat::Svg {
+            return Some(ShownImage::Svg(Arc::new(image)));
+        }
+        image
+            .to_image_data(svg.clone())
+            .ok()
+            .map(ShownImage::Raster)
+    }
+
+    pub fn source(&self) -> ImageSource {
+        match self {
+            ShownImage::Raster(image) => ImageSource::Render(image.clone()),
+            ShownImage::Svg(image) => ImageSource::Image(image.clone()),
+        }
+    }
+
+    /// Frees the decoded pixels and every window's texture of the image.
+    pub fn release(&self, cx: &mut App) {
+        match self {
+            ShownImage::Raster(image) => cx.drop_image(image.clone(), None),
+            ShownImage::Svg(image) => image.clone().remove_asset(cx),
+        }
+    }
+}
+
 /// What the peek shows for a managed value.
 #[derive(Debug, Clone)]
 pub enum Preview {
     Empty,
-    Image(Arc<Image>),
+    Image(ShownImage),
     /// The start of a UTF-8 value, and how many bytes are not shown.
     Text {
         text: String,
@@ -242,14 +296,16 @@ pub fn bytes_wanted(prefix: &[u8], size: u64) -> u64 {
 }
 
 /// The preview of a value of `size` bytes, from its first `bytes` (all of them for an image).
-pub fn preview(bytes: Vec<u8>, size: u64) -> Preview {
+/// An image is decoded here, so call it from a background task.
+pub fn preview(bytes: Vec<u8>, size: u64, svg: &SvgRenderer) -> Preview {
     if size == 0 {
         return Preview::Empty;
     }
     if let Some(format) = sniff_image(&bytes)
         && bytes.len() as u64 == size
+        && let Some(image) = ShownImage::decode(format, bytes.clone(), svg)
     {
-        return Preview::Image(Arc::new(Image::from_bytes(format, bytes)));
+        return Preview::Image(image);
     }
     // Text, allowing for a character cut at the end of the prefix.
     let text = match std::str::from_utf8(&bytes) {
@@ -330,6 +386,11 @@ pub fn host(uri: &str) -> &str {
 mod tests {
     use super::*;
 
+    /// A renderer for decoding in tests; no asset is ever read.
+    fn svg() -> SvgRenderer {
+        SvgRenderer::new(Arc::new(()))
+    }
+
     #[test]
     fn a_save_lands_whole_or_not_at_all() {
         let dir = std::env::temp_dir().join(format!("studio-blob-save-{}", std::process::id()));
@@ -385,29 +446,43 @@ mod tests {
         assert_eq!(bytes_wanted(PNG, 690), 690);
         assert_eq!(bytes_wanted(PNG, IMAGE_MAX + 1), PNG.len() as u64);
         assert_eq!(bytes_wanted(b"text", 9_000_000), 4);
+        let png = {
+            let mut png = Vec::new();
+            image::RgbaImage::new(3, 2)
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .unwrap();
+            png
+        };
         assert!(matches!(
-            preview(PNG.to_vec(), PNG.len() as u64),
-            Preview::Image(_)
+            preview(png.clone(), png.len() as u64, &svg()),
+            Preview::Image(ShownImage::Raster(_))
         ));
         assert!(
-            matches!(preview(PNG.to_vec(), 5_000), Preview::Bytes { .. }),
+            matches!(preview(png, 5_000, &svg()), Preview::Bytes { .. }),
             "a prefix of an image is not drawn"
+        );
+        assert!(
+            matches!(
+                preview(PNG.to_vec(), PNG.len() as u64, &svg()),
+                Preview::Bytes { .. }
+            ),
+            "an image that does not decode shows its bytes"
         );
     }
 
     #[test]
     fn text_shows_its_start_and_binary_a_hex_dump() {
-        let Preview::Text { text, more } = preview(b"query q() {}".to_vec(), 12) else {
+        let Preview::Text { text, more } = preview(b"query q() {}".to_vec(), 12, &svg()) else {
             panic!("text");
         };
         assert_eq!((text.as_str(), more), ("query q() {}", 0));
         // A character cut by the prefix is dropped, not an error.
         let cut = "café".as_bytes()[..4].to_vec();
-        let Preview::Text { text, more } = preview(cut, 100) else {
+        let Preview::Text { text, more } = preview(cut, 100, &svg()) else {
             panic!("text with a cut character");
         };
         assert_eq!((text.as_str(), more), ("caf", 97));
-        let Preview::Bytes { hex, more } = preview((0u8..=255).collect(), 1024) else {
+        let Preview::Bytes { hex, more } = preview((0u8..=255).collect(), 1024, &svg()) else {
             panic!("bytes");
         };
         assert_eq!(more, 896);
@@ -420,7 +495,7 @@ mod tests {
             Some("0028  28 29 2a 2b 2c 2d 2e 2f  ()*+,-./")
         );
         assert_eq!(hex.lines().count(), 16);
-        assert!(matches!(preview(Vec::new(), 0), Preview::Empty));
+        assert!(matches!(preview(Vec::new(), 0, &svg()), Preview::Empty));
     }
 
     #[test]

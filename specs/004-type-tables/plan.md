@@ -303,6 +303,14 @@ kept answers.
 
 ## Corrections
 
+- 2026-10-13 · Blob images were handed to GPUI as encoded images, which GPUI decodes into its
+  asset cache and keeps until asked, with a texture in every window that drew them; nothing
+  asked, so a peek moving through rows of photos kept every one (an 8 MB JPEG decodes to about
+  100 MB). The peek and the Blob tab now decode raster images off the main thread into images
+  they hold, draw those, and free them when they move on, reload or close; an SVG stays
+  GPUI's to rasterize. A value that sniffs as an image but does not decode shows its bytes
+  (offscreen snapshots of the notes graph's PNG in the peek and its tab: both drawn).
+
 - 2026-10-13 · A peek of a node missing at its commit read "This type takes part in no
   relationships" under "This node does not exist at this commit", and a peek still loading
   showed the same line for a moment: the relationship list is filled only after the node is

@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use editor::Editor;
 use gpui::{
-    App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Image,
+    App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable,
     ImageFormat, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels,
-    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, Task, Window, canvas,
-    checkerboard, div, img, point,
+    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, SvgRenderer, Task, Window,
+    canvas, checkerboard, div, img, point,
 };
 use graph_client::{BlobCell, BlobMeta};
 use graph_store::{GraphSession, Loadable};
@@ -24,7 +24,8 @@ use ui::Tooltip;
 use ui::prelude::*;
 
 use crate::blob::{
-    hex_dump_lines, read_value, save_bytes, save_value, sniff_image, suggested_file_name,
+    ShownImage, hex_dump_lines, read_value, save_bytes, save_value, sniff_image,
+    suggested_file_name,
 };
 use crate::pdf;
 
@@ -45,13 +46,13 @@ const FIT_MARGIN: f32 = 24.;
 /// What the value turned out to be, ready to show.
 enum Content {
     Image {
-        image: Arc<Image>,
+        image: ShownImage,
         /// Its pixel size; none for an SVG, which scales freely.
         size: Option<(u32, u32)>,
         format: &'static str,
     },
     Pdf {
-        pages: Vec<(Arc<Image>, u32, u32)>,
+        pages: Vec<(ShownImage, u32, u32)>,
         count: usize,
     },
     Text(Entity<Editor>),
@@ -104,6 +105,8 @@ impl BlobView {
         cx: &mut Context<Self>,
     ) -> Self {
         let load = Self::load(&session, &cell, &snapshot, window, cx);
+        cx.on_release(|this: &mut Self, cx| this.release_images(cx))
+            .detach();
         Self {
             session,
             cell,
@@ -202,30 +205,23 @@ impl BlobView {
                 Ok(bytes) => Arc::new(bytes),
                 Err(error) => return fail(error, cx),
             };
+            let Ok(svg) = cx.update(|_, cx| cx.svg_renderer()) else {
+                return;
+            };
             let kind = {
                 let bytes = bytes.clone();
-                cx.background_spawn(async move { classify(&bytes) }).await
+                cx.background_spawn(async move { classify(&bytes, &svg) })
+                    .await
             };
             this.update_in(cx, |this, window, cx| {
+                this.release_images(cx);
                 this.content = Loadable::Loaded(match kind {
-                    Kind::Image { format, size, name } => Content::Image {
-                        image: Arc::new(Image::from_bytes(format, bytes.to_vec())),
+                    Kind::Image { image, size, name } => Content::Image {
+                        image,
                         size,
                         format: name,
                     },
-                    Kind::Pdf { pages, count } => Content::Pdf {
-                        pages: pages
-                            .into_iter()
-                            .map(|page| {
-                                (
-                                    Arc::new(Image::from_bytes(ImageFormat::Png, page.png)),
-                                    page.width,
-                                    page.height,
-                                )
-                            })
-                            .collect(),
-                        count,
-                    },
+                    Kind::Pdf { pages, count } => Content::Pdf { pages, count },
                     Kind::Text(text) => Content::Text(cx.new(|cx| {
                         let mut editor = Editor::multi_line(window, cx);
                         editor.set_text(text, window, cx);
@@ -439,9 +435,22 @@ impl BlobView {
         facts.join(" · ")
     }
 
+    /// Frees the images this tab decoded; GPUI would keep them otherwise.
+    fn release_images(&self, cx: &mut App) {
+        match &self.content {
+            Loadable::Loaded(Content::Image { image, .. }) => image.release(cx),
+            Loadable::Loaded(Content::Pdf { pages, .. }) => {
+                for (image, _, _) in pages {
+                    image.release(cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn render_image(
         &self,
-        image: &Arc<Image>,
+        image: &ShownImage,
         size: Option<(u32, u32)>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -479,7 +488,7 @@ impl BlobView {
                     ))
                     .border_1()
                     .border_color(ds::surface::rule(cx))
-                    .child(img(image.clone()).size_full())
+                    .child(img(image.source()).size_full())
                     .into_any_element()
             }
             // An SVG, or before the tab is measured: fitted by the element.
@@ -488,7 +497,7 @@ impl BlobView {
                 .inset_0()
                 .p(px(FIT_MARGIN))
                 .child(
-                    img(image.clone())
+                    img(image.source())
                         .size_full()
                         .object_fit(gpui::ObjectFit::Contain),
                 )
@@ -545,7 +554,7 @@ impl BlobView {
         }
     }
 
-    fn render_pdf(&self, pages: &[(Arc<Image>, u32, u32)], count: usize, cx: &App) -> AnyElement {
+    fn render_pdf(&self, pages: &[(ShownImage, u32, u32)], count: usize, cx: &App) -> AnyElement {
         let width = self.pdf_width();
         v_flex()
             .id("blob-pdf")
@@ -564,7 +573,7 @@ impl BlobView {
                     .border_1()
                     .border_color(ds::surface::rule(cx))
                     .shadow_sm()
-                    .child(img(image.clone()).size_full())
+                    .child(img(image.source()).size_full())
             }))
             .when(count > pages.len(), |list| {
                 list.child(ds::text::meta(format!(
@@ -604,12 +613,12 @@ fn prepare_open_folder(directory: &std::path::Path) -> std::io::Result<()> {
 /// What a value is, worked out off the main thread.
 enum Kind {
     Image {
-        format: ImageFormat,
+        image: ShownImage,
         size: Option<(u32, u32)>,
         name: &'static str,
     },
     Pdf {
-        pages: Vec<pdf::Page>,
+        pages: Vec<(ShownImage, u32, u32)>,
         count: usize,
     },
     Text(String),
@@ -617,7 +626,9 @@ enum Kind {
     Unreadable(String),
 }
 
-fn classify(bytes: &[u8]) -> Kind {
+/// What a value is, with its images decoded; call it from a background task.
+fn classify(bytes: &[u8], svg: &SvgRenderer) -> Kind {
+    let unreadable = || Kind::Unreadable("The image could not be decoded.".into());
     if let Some(format) = sniff_image(bytes) {
         let size = image::ImageReader::new(std::io::Cursor::new(bytes))
             .with_guessed_format()
@@ -630,21 +641,36 @@ fn classify(bytes: &[u8]) -> Kind {
             ImageFormat::Webp => "WebP",
             _ => "Image",
         };
-        return Kind::Image { format, size, name };
+        return match ShownImage::decode(format, bytes.to_vec(), svg) {
+            Some(image) => Kind::Image { image, size, name },
+            None => unreadable(),
+        };
     }
     if pdf::is_pdf(&bytes[..bytes.len().min(1024)]) {
         return match pdf::render(bytes, PDF_DRAW_WIDTH, PDF_PAGES) {
-            Ok((pages, count)) => Kind::Pdf { pages, count },
+            Ok((pages, count)) => Kind::Pdf {
+                pages: pages
+                    .into_iter()
+                    .filter_map(|page| {
+                        let image = ShownImage::decode(ImageFormat::Png, page.png, svg)?;
+                        Some((image, page.width, page.height))
+                    })
+                    .collect(),
+                count,
+            },
             Err(reason) => Kind::Unreadable(reason),
         };
     }
     if let Ok(text) = std::str::from_utf8(bytes) {
         let head = &text[..text.len().min(4096)];
         if head.contains("<svg") {
-            return Kind::Image {
-                format: ImageFormat::Svg,
-                size: None,
-                name: "SVG",
+            return match ShownImage::decode(ImageFormat::Svg, bytes.to_vec(), svg) {
+                Some(image) => Kind::Image {
+                    image,
+                    size: None,
+                    name: "SVG",
+                },
+                None => unreadable(),
             };
         }
         return Kind::Text(text.to_owned());
@@ -925,6 +951,11 @@ impl Render for BlobView {
 mod tests {
     use super::*;
 
+    /// A renderer for decoding in tests; no asset is ever read.
+    fn svg() -> SvgRenderer {
+        SvgRenderer::new(Arc::new(()))
+    }
+
     #[test]
     fn values_are_told_apart_by_their_bytes() {
         let png = {
@@ -935,7 +966,7 @@ mod tests {
             png
         };
         assert!(matches!(
-            classify(&png),
+            classify(&png, &svg()),
             Kind::Image {
                 size: Some((3, 2)),
                 name: "PNG",
@@ -943,25 +974,34 @@ mod tests {
             }
         ));
         assert!(matches!(
-            classify(b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            classify(
+                b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+                &svg()
+            ),
             Kind::Image {
                 name: "SVG",
                 size: None,
                 ..
             }
         ));
-        assert!(matches!(classify(b"plain notes"), Kind::Text(text) if text == "plain notes"));
-        assert!(matches!(classify(&[0xff, 0x00, 0x13]), Kind::Bytes(_)));
+        assert!(
+            matches!(classify(b"plain notes", &svg()), Kind::Text(text) if text == "plain notes")
+        );
+        assert!(matches!(
+            classify(&[0xff, 0x00, 0x13], &svg()),
+            Kind::Bytes(_)
+        ));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn a_pdf_is_drawn_page_by_page() {
-        let Kind::Pdf { pages, count } = classify(&crate::pdf::tests::one_page_pdf()) else {
+        let Kind::Pdf { pages, count } = classify(&crate::pdf::tests::one_page_pdf(), &svg())
+        else {
             panic!("not read as a PDF");
         };
         assert_eq!((pages.len(), count), (1, 1));
-        assert_eq!(pages[0].width, PDF_DRAW_WIDTH);
+        assert_eq!(pages[0].1, PDF_DRAW_WIDTH);
     }
 
     #[test]
