@@ -9779,6 +9779,7 @@ dependencies = [
  "history",
  "image",
  "inspectors",
+ "libc",
  "log",
  "menu",
  "query_editor",
@@ -10825,6 +10826,7 @@ name = "type_table"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "collections",
  "editor",
  "gpui",
  "gq_language",

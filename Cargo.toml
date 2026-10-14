@@ -86,6 +86,7 @@ omnigraph-compiler = { git = "https://github.com/ModernRelay/omnigraph", tag = "
 # Third party
 anyhow = "1"
 futures = "0.3"
+libc = "0.2"
 log = "0.4"
 getrandom = "0.3"
 httparse = "1"
@@ -119,9 +120,29 @@ calloop = { git = "https://github.com/zed-industries/calloop" }
 split-debuginfo = "unpacked"
 debug = "limited"
 
-# GPUI's layout and painting are slow unoptimized; keep them fast in debug builds.
-[profile.dev.package.gpui]
-opt-level = 2
+# Built once for the build platform, as Zed does: without this, cargo builds the crates that
+# build scripts and proc-macros use a second time.
+[profile.dev.build-override]
+codegen-units = 16
+split-debuginfo = "unpacked"
+debug = "limited"
+
+# GPUI's layout and painting, its layout engine, SVG rendering and JSON parsing are slow
+# unoptimized; keep them fast in debug builds (Zed's list, for what Studio uses). Proc-macros
+# run at every build, so optimizing them speeds builds up.
+[profile.dev.package]
+gpui = { opt-level = 2 }
+taffy = { opt-level = 3 }
+resvg = { opt-level = 3 }
+serde_json = { opt-level = 3 }
+gpui_macros = { opt-level = 3 }
+derive_refineable = { opt-level = 3 }
+settings_macros = { opt-level = 3 }
+ui_macros = { opt-level = 3 }
+util_macros = { opt-level = 3 }
+quote = { opt-level = 3 }
+syn = { opt-level = 3 }
+proc-macro2 = { opt-level = 3 }
 
 [profile.release]
 lto = "thin"
