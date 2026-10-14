@@ -9,6 +9,7 @@ mod dialogs;
 mod grouping;
 pub mod model;
 mod nodes_panel;
+mod offers;
 mod pdf;
 mod peek;
 mod suggest;

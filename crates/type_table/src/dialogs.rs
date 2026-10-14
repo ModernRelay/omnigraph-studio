@@ -3,6 +3,7 @@
 //! the commit the table was read at (constitution IV). None retries; a refused or unknown
 //! outcome keeps the form.
 
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,7 +18,8 @@ use serde_json::{Map, Value};
 use ui::prelude::*;
 
 use crate::model::{Notice, SaveResult, Tone, parse_input, save_result};
-use crate::suggest::{self, NODE_SUGGESTIONS, Suggestion};
+use crate::offers::Offers;
+use crate::suggest::{self, NODE_SUGGESTIONS};
 use crate::table::TypeTable;
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 use studio_workspace::ModalView;
@@ -406,8 +408,8 @@ impl Render for InsertRowModal {
 struct Endpoint {
     type_name: String,
     editor: Entity<Editor>,
-    suggestions: Vec<Suggestion>,
-    highlighted: Option<usize>,
+    /// The nodes the field offers; the first is highlighted, so ↵ picks it.
+    offers: Offers,
     /// The id last picked from the list; typing it again does not search.
     picked: Option<String>,
     /// Counts searches, so an answer for older text is dropped.
@@ -502,8 +504,7 @@ impl InsertEdgeModal {
             Endpoint {
                 type_name,
                 editor,
-                suggestions: Vec::new(),
-                highlighted: None,
+                offers: Offers::default(),
                 picked: None,
                 generation: 0,
                 search: None,
@@ -585,8 +586,7 @@ impl InsertEdgeModal {
         endpoint.generation += 1;
         let generation = endpoint.generation;
         if text.is_empty() || endpoint.picked.as_deref() == Some(text.as_str()) {
-            endpoint.suggestions.clear();
-            endpoint.highlighted = None;
+            endpoint.offers.clear();
             endpoint.search = None;
             cx.notify();
             return;
@@ -609,8 +609,9 @@ impl InsertEdgeModal {
                 if endpoint.generation != generation {
                     return;
                 }
-                endpoint.suggestions = suggest::from_node_rows(&output.rows);
-                endpoint.highlighted = (!endpoint.suggestions.is_empty()).then_some(0);
+                endpoint
+                    .offers
+                    .set(suggest::from_node_rows(&output.rows), true);
                 cx.notify();
             })
             .ok();
@@ -622,28 +623,19 @@ impl InsertEdgeModal {
         let Some(end) = self.focused_end(window, cx) else {
             return;
         };
-        let endpoint = self.endpoint_mut(end);
-        let count = endpoint.suggestions.len();
-        if count == 0 {
-            return;
+        if self.endpoint_mut(end).offers.step(step) {
+            cx.notify();
         }
-        endpoint.highlighted = Some(match endpoint.highlighted {
-            None if step > 0 => 0,
-            None => count - 1,
-            Some(at) => (at as isize + step).rem_euclid(count as isize) as usize,
-        });
-        cx.notify();
     }
 
     /// Puts a node's id in its endpoint field and moves to the next field.
     fn pick(&mut self, end: End, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let endpoint = self.endpoint_mut(end);
-        let Some(suggestion) = endpoint.suggestions.get(index).cloned() else {
+        let Some(suggestion) = endpoint.offers.get(index).cloned() else {
             return;
         };
         endpoint.picked = Some(suggestion.value.clone());
-        endpoint.suggestions.clear();
-        endpoint.highlighted = None;
+        endpoint.offers.clear();
         let editor = endpoint.editor.clone();
         editor.update(cx, |editor, cx| {
             editor.set_text(suggestion.value, window, cx);
@@ -668,7 +660,7 @@ impl InsertEdgeModal {
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(end) = self.focused_end(window, cx) {
             let endpoint = self.endpoint_mut(end);
-            if let Some(index) = endpoint.highlighted {
+            if let Some(index) = endpoint.offers.highlighted() {
                 self.pick(end, index, window, cx);
                 return;
             }
@@ -793,9 +785,11 @@ impl InsertEdgeModal {
             End::To => &self.to,
         };
         let colors = cx.theme().colors();
-        let highlight = colors.element_selected;
         let focused = endpoint.editor.focus_handle(cx).is_focused(window);
-        let offers = (focused && !endpoint.suggestions.is_empty()).then(|| {
+        let offers = (focused && !endpoint.offers.is_empty()).then(|| {
+            let pick = cx.listener(move |this, index: &usize, window, cx| {
+                this.pick(end, *index, window, cx)
+            });
             v_flex()
                 .id(("endpoint-suggestions", end as usize))
                 .max_h(px(208.))
@@ -804,49 +798,11 @@ impl InsertEdgeModal {
                 .rounded_md()
                 .border_1()
                 .border_color(colors.border_variant)
-                .children(
-                    endpoint
-                        .suggestions
-                        .iter()
-                        .enumerate()
-                        .map(|(index, suggestion)| {
-                            // A node reads by its label, with its id after it.
-                            let (primary, secondary) = match &suggestion.label {
-                                Some(label) => (label.clone(), Some(suggestion.value.clone())),
-                                None => (suggestion.value.clone(), None),
-                            };
-                            h_flex()
-                                .id(("endpoint-suggestion", index))
-                                .h(px(26.))
-                                .px_2()
-                                .gap_2()
-                                .rounded_sm()
-                                .cursor_pointer()
-                                .when(endpoint.highlighted == Some(index), |row| row.bg(highlight))
-                                .hover(|row| row.bg(highlight))
-                                .child(
-                                    Label::new(primary)
-                                        .size(LabelSize::Small)
-                                        .single_line()
-                                        .truncate(),
-                                )
-                                .children(secondary.map(|id| {
-                                    Label::new(id)
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted)
-                                        .single_line()
-                                        .truncate_start()
-                                }))
-                                // On press, before the field loses focus to the click.
-                                .on_mouse_down(
-                                    gpui::MouseButton::Left,
-                                    cx.listener(move |this, _, window, cx| {
-                                        cx.stop_propagation();
-                                        this.pick(end, index, window, cx);
-                                    }),
-                                )
-                        }),
-                )
+                .children(endpoint.offers.rows(
+                    "endpoint-suggestion",
+                    Rc::new(move |index, window, cx| pick(&index, window, cx)),
+                    cx,
+                ))
         });
         v_flex()
             .gap_1()
@@ -1410,14 +1366,14 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(120));
         cx.run_until_parked();
         modal.read_with(cx, |modal, _| {
-            assert_eq!(modal.from.suggestions.len(), 2);
-            assert_eq!(modal.from.highlighted, Some(0));
+            assert_eq!(modal.from.offers.len(), 2);
+            assert_eq!(modal.from.offers.highlighted(), Some(0));
         });
 
         cx.simulate_keystrokes("down enter");
         modal.read_with(cx, |modal, cx| {
             assert_eq!(modal.from.editor.read(cx).text(cx), "person-000004");
-            assert!(modal.from.suggestions.is_empty());
+            assert!(modal.from.offers.is_empty());
         });
         modal.update_in(cx, |modal, window, cx| {
             assert!(modal.to.editor.focus_handle(cx).is_focused(window));

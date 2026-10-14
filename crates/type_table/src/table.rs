@@ -52,8 +52,9 @@ use crate::model::{
     node_rows, parse_filter_list, parse_filter_value, parse_input, preset_start, relation_sample,
     row_matches, same_value, save_result, short_commit,
 };
+use crate::offers::Offers;
 use crate::peek::{KnownRelation, NEIGHBOUR_LIMIT, Neighbour, NodePeek, PeekSubject};
-use crate::suggest::{self, NODE_SUGGESTIONS, Suggestion};
+use crate::suggest::{self, NODE_SUGGESTIONS};
 
 /// Rows per neighbour read when a relationship column comes into view: a page's worth, as the
 /// page reads do.
@@ -91,8 +92,7 @@ struct FilterDraft {
     op: FilterOp,
     error: Option<String>,
     /// What the value field offers for its text, the one ↵ picks, and the node search under way.
-    suggestions: Vec<Suggestion>,
-    highlighted: Option<usize>,
+    offers: Offers,
     suggest_generation: u64,
     _suggest_task: Option<Task<()>>,
 }
@@ -2725,8 +2725,8 @@ impl TypeTable {
             // ↵ picks the highlighted offer, unless it is just what is typed.
             let text = self.filter_editor.read(cx).text(cx);
             let pick = self.filter_draft.as_ref().and_then(|draft| {
-                let index = draft.highlighted?;
-                let suggestion = draft.suggestions.get(index)?;
+                let index = draft.offers.highlighted()?;
+                let suggestion = draft.offers.get(index)?;
                 let list = draft.op == FilterOp::In;
                 (!suggest::already_typed(&text, &suggestion.value, list)).then_some(index)
             });
@@ -3699,8 +3699,7 @@ impl TypeTable {
             property: name,
             op,
             error: None,
-            suggestions: Vec::new(),
-            highlighted: None,
+            offers: Offers::default(),
             suggest_generation: 0,
             _suggest_task: None,
         });
@@ -3756,13 +3755,13 @@ impl TypeTable {
         let generation = draft.suggest_generation;
         match source {
             None => {
-                draft.suggestions.clear();
-                draft.highlighted = None;
+                draft.offers.clear();
                 draft._suggest_task = None;
             }
             Some(SuggestSource::Values(values)) => {
-                draft.suggestions = suggest::from_values(&values, &text, list);
-                draft.highlighted = (typed && !draft.suggestions.is_empty()).then_some(0);
+                draft
+                    .offers
+                    .set(suggest::from_values(&values, &text, list), typed);
                 draft._suggest_task = None;
             }
             Some(SuggestSource::Nodes(type_name)) => {
@@ -3790,8 +3789,9 @@ impl TypeTable {
                         if draft.suggest_generation != generation {
                             return;
                         }
-                        draft.suggestions = suggest::from_node_rows(&output.rows);
-                        draft.highlighted = (typed && !draft.suggestions.is_empty()).then_some(0);
+                        draft
+                            .offers
+                            .set(suggest::from_node_rows(&output.rows), typed);
                         cx.notify();
                     })
                     .ok();
@@ -3804,19 +3804,11 @@ impl TypeTable {
 
     /// ↑/↓ in the value field: highlights another offered value.
     fn move_suggestion(&mut self, step: isize, cx: &mut Context<Self>) {
-        let Some(draft) = &mut self.filter_draft else {
-            return;
-        };
-        let count = draft.suggestions.len();
-        if count == 0 {
-            return;
+        if let Some(draft) = &mut self.filter_draft
+            && draft.offers.step(step)
+        {
+            cx.notify();
         }
-        draft.highlighted = Some(match draft.highlighted {
-            None if step > 0 => 0,
-            None => count - 1,
-            Some(at) => (at as isize + step).rem_euclid(count as isize) as usize,
-        });
-        cx.notify();
     }
 
     /// Puts an offered value in the field. A single value adds the filter at once; a list
@@ -3825,7 +3817,7 @@ impl TypeTable {
         let Some(draft) = &self.filter_draft else {
             return;
         };
-        let Some(suggestion) = draft.suggestions.get(index).cloned() else {
+        let Some(suggestion) = draft.offers.get(index).cloned() else {
             return;
         };
         let list = draft.op == FilterOp::In;
@@ -4247,7 +4239,7 @@ impl TypeTable {
                     let menu_open = self.filter_menus.iter().any(PopoverMenuHandle::is_deployed);
                     let offers = (self.filter_editor.focus_handle(cx).is_focused(window)
                         && !menu_open
-                        && !draft.suggestions.is_empty())
+                        && !draft.offers.is_empty())
                     .then(|| self.render_suggestions(draft, cx));
                     pill.child(divider()).child(
                         div()
@@ -4315,57 +4307,14 @@ impl TypeTable {
     /// The values the filter's value field offers, under it: ↑/↓ highlight, ↵ or a click picks.
     fn render_suggestions(&self, draft: &FilterDraft, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors();
-        let (bg, border, highlight) = (
-            colors.elevated_surface_background,
-            colors.border_variant,
-            colors.element_selected,
+        let (bg, border) = (colors.elevated_surface_background, colors.border_variant);
+        let pick =
+            cx.listener(|this, index: &usize, window, cx| this.pick_suggestion(*index, window, cx));
+        let items = draft.offers.rows(
+            "filter-suggestion",
+            Rc::new(move |index, window, cx| pick(&index, window, cx)),
+            cx,
         );
-        let items = draft
-            .suggestions
-            .iter()
-            .enumerate()
-            .map(|(index, suggestion)| {
-                let highlighted = draft.highlighted == Some(index);
-                // A node reads by its label, with its id after it; a value reads as itself.
-                let (primary, secondary) = match &suggestion.label {
-                    Some(label) => (label.clone(), Some(suggestion.value.clone())),
-                    None => (suggestion.value.clone(), None),
-                };
-                h_flex()
-                    .id(("filter-suggestion", index))
-                    .h(px(26.))
-                    .px_2()
-                    .gap_2()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .when(highlighted, |row| row.bg(highlight))
-                    .hover(|row| row.bg(highlight))
-                    .child(
-                        div().min_w_0().flex_shrink(1.).child(
-                            Label::new(primary)
-                                .size(LabelSize::Small)
-                                .single_line()
-                                .truncate(),
-                        ),
-                    )
-                    .children(secondary.map(|id| {
-                        div().min_w_0().flex_shrink(1.).child(
-                            Label::new(id)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .single_line()
-                                .truncate_start(),
-                        )
-                    }))
-                    // On press, before the field loses focus to the click.
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.pick_suggestion(index, window, cx);
-                        }),
-                    )
-            });
         div()
             .absolute()
             .top_0()

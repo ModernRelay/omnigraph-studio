@@ -245,6 +245,7 @@ kept answers.
 | Value-bound cell saves | `if-graph-commit` on every cell | Any unrelated commit would refuse the save |
 | Engine-side filter, sort and count | Filtering loaded rows | Correct at any size; grouping and filtering loaded rows is wrong once a type outgrows a page |
 | No row cap | A 1,000-row cap, as a web table needs | GPUI virtualizes; such a cap exists only because a browser renders every row |
+| One offer list (`offers.rs`) for the filter's value field and the edge dialog's endpoints | Zed's editor completion menu (`CompletionProvider`), as the query editor uses | The menu draws code completions in the editor's monospace font and opens on typing; these fields offer names with their ids muted beside them, in the interface's type, and an enum's values as soon as the field has focus. The two hand-built copies became one: the list, ↑/↓ around the ends, the rows and the pick on press |
 | Fork Zed's CSV preview renderer and selection model | GPUI Kit's table | One GPUI lineage (constitution XI) |
 
 ## Deferred
