@@ -158,7 +158,7 @@ date; not the key, a list or a vector). One read counts the rows per value under
 (`builder::value_counts`: `return { $n.title as value, count($n) as n }`, by value, at most
 200 values, rows without a value last); each value is a section with a header (value, count,
 disclosure). An open section reads its first 10 rows when its line comes into view, then "Show
-N more of M" reads a page, all keyset pages narrowed with `title = $value` (or `is null`) and
+N more of M" (or "Show N more" when the page holds the rest) reads a page, all keyset pages narrowed with `title = $value` (or `is null`) and
 pinned to the table's commit, in the table's sort. A closed section reads nothing. Every read
 is engine-side, so the counts are right at any size. Edge tables group by their own properties
 the same way.
@@ -173,6 +173,31 @@ share it and in the tooltip; the rows with none come last as "No Company". A sec
 are narrowed with "related to" its neighbour, or "has none". A row related to two neighbours
 shows in both sections, and an edit or a delete reaches every copy; a cell edit never dims a
 row out of its section, since it cannot change the row's neighbours.
+
+A node table also groups by a property of its neighbours ("people by their company's city",
+key `out:WorksAt.city`), and an edge table by a property of its source or target (`from.title`,
+`to.city`). The Group menu lists the table's own properties, then a submenu per relationship
+(by each neighbour, or by a property of the neighbour's type) or per end of an edge (by a
+property of the node there), with the relationship's arrow in the place of the entries' check,
+in the accent colour while the submenu holds the grouping. The Group button names the choice
+in full: "Group: worksAt → Company.city", "Group: to Company.city".
+
+- Neighbours: one read counts the filtered rows per value the neighbours hold
+  (`builder::neighbour_value_counts`), each row once per value: a `not {}` block keeps only
+  the first neighbour (by `@id`) holding a value, so a person at two companies in Berlin counts
+  once there. A second read, at the same commit, counts the rows no neighbour gives a value
+  (`node_count` with "is empty" on the key: `not { $r: Company  $n worksAt $r  $r.city is not
+  null }`), which come last as "No city". A section's pages are narrowed with `exists { $r:
+  Company  $n worksAt $r  $r.city = $value }`. A row whose neighbours hold two values shows in
+  both sections, as with a relationship.
+- Ends: one read counts the filtered edges per value of the end's property
+  (`builder::endpoint_value_counts`: `return { $b.city as value, count($e.@id) as n }`); every
+  edge has one source and one target, so the sections divide the rows, edges whose end has no
+  value last. Pages are narrowed with `$b.city = $value` (or `is null`).
+
+A cell edit never dims a row out of such a section, since it changes neither its neighbours'
+values nor an edge's ends. A new node goes into the "No city" section when it is open, since it
+has no neighbours yet; a new edge's ends are not in its row, so it shows after the next read.
 
 The grouping is part of the tab and of saved views. The cursor moves over
 headers and past closed sections; ⇧-click picks the rows shown between two rows. A row edited
@@ -247,6 +272,7 @@ kept answers.
 | No row cap | A 1,000-row cap, as a web table needs | GPUI virtualizes; such a cap exists only because a browser renders every row |
 | One offer list (`offers.rs`) for the filter's value field and the edge dialog's endpoints | Zed's editor completion menu (`CompletionProvider`), as the query editor uses | The menu draws code completions in the editor's monospace font and opens on typing; these fields offer names with their ids muted beside them, in the interface's type, and an enum's values as soon as the field has focus. The two hand-built copies became one: the list, ↑/↓ around the ends, the rows and the pick on press |
 | Fork Zed's CSV preview renderer and selection model | GPUI Kit's table | One GPUI lineage (constitution XI) |
+| Count a row once per value its neighbours hold (`not {}` over earlier neighbours with the value) | `count($n)` over the match | `count($n)` counts matches, not rows: a person at two Berlin companies would count twice, and the section would read fewer rows than its count says |
 
 ## Deferred
 
@@ -255,8 +281,6 @@ kept answers.
   - R1 Blob writes: upload and clear only when the server advertises `cluster_putBlob`.
   - R2 unpublished commits: staged edits as a reviewable proposal only when the server
     advertises `cluster_publishCommit`.
-- Grouping edge tables by a property of an endpoint, and a node table by a property of its
-  neighbour ("people by the city of their company").
 - Per-row history beyond the commits that the change feed can cheaply return.
 
 ## Validation log
@@ -305,8 +329,13 @@ kept answers.
 | 2026-10-14 | Typing in the filter field or a cell does not draw the grid | Main-thread CPU per frame from the snapshot tool, `release-fast`, Person (200 rows), 200 frames, before and after in the same sessions; `sample` of the filter loop; headless `typing_in_a_field_leaves_the_grid_as_it_was` and `studio_workspace` `a_tab_that_caches_its_parts_keeps_them_while_a_field_changes`, each failing with its fix undone | Before, a key in either field cost a full grid draw (10.5 ms filter, 10 ms scroll, under load); the profile put it in the grid's layout and paint, the editor's own work under 1 ms. After: filter 2.2 ms, cell 2.3 ms, query editor 3.5 ms, scroll 7.6 ms (load average 20). Undoing the per-key `notify` fails the filter assertion; drawing the editor inside the grid fails the cell assertion |
 | 2026-10-14 | A scroll frame's cost, and whether lighter cell text lowers it | `sample` of 1,500 scroll frames on Person, `release-fast`; then cell text drawn as one styled element instead of a `Label`, measured against the old build interleaved, three rounds each | A scroll costs 6 ms of main-thread CPU, inside a 120 Hz frame. The table's own code is 7% of it; GPUI's layout (40%), element layout requests (24%) and paint (25%) of the visible rows are the rest. Lighter cell text changed nothing measurable (5.9 to 6.6 ms before, 5.8 to 6.4 after), so it was not kept; a lower cost needs fewer elements per row, such as drawing a row's text without an element per cell |
 | 2026-10-14 | A row draws only the columns in view | Snapshot tool, `release-fast`, Person (10 columns, about 6.5 in view at 1440 px), 300 scroll frames at 1440×900 and 1440×1400, against the build before, interleaved, three rounds; renders after → nine times and six times; headless `rows_draw_only_the_columns_in_view` | Main-thread CPU a frame: 6.1 → 5.0 ms at 1440×900, 9.4–10.3 → 7.6 ms at 1440×1400. Every column that shows was drawn, including one half under the pinned column. The query result grid, which draws plain text cells without `ui::Table`, costs about the same per cell; what the table paid for was cells out of view |
+| 2026-10-14 | Grouping by a neighbour's property and by an end's property | `gq_language` `rows_group_by_a_neighbours_or_an_ends_property` (for every relationship of every dev node type and every groupable property of the other type: the counts, and pages and counts narrowed to a value and to "no value", compile; for both ends of every dev edge the same), `group_keys_name_one_kind_each`; `type_table` `a_neighbours_property_narrows_by_its_value_and_an_end_has_no_value_in_the_row`, `rows_group_by_a_neighbours_or_an_ends_property` (the menu's keys and labels on Person and WorksAt); offscreen snapshots on the dev server: Person, Group, the `worksAt Company` submenu, city; scrolled to the end; WorksAt, Group, `to Company`, city; and the same counts read with curl | Submenus for `contributes Project`, `knows Person`, `worksAt Company` and `← knows Person`, each with its arrow; Berlin 9, Lisbon 9, London 46, San Francisco 46, Tokyo 58, Toronto 35, "No city" 38 of 200 people, as curl counted; WorksAt by `to Company.city`: Berlin 9, Lisbon 9, London 49, and 7 edges to companies with no city |
 
 ## Corrections
+
+- 2026-10-14 · Grouping by a property of a neighbour or of an edge's end, which was deferred, is
+  built (see Grouping). "Show N more of M" read "Show 25 more of 25" when the page held the
+  rest of a section; it now reads "Show 25 more" then.
 
 - 2026-10-14 · Every key in the filter field or a cell drew the whole grid again: the fields
   were inside the table's view, GPUI draws every view around a changed field, and the pane

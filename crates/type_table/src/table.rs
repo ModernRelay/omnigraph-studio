@@ -192,6 +192,30 @@ fn relation_samples(rows: &Value) -> Vec<(String, String, Option<String>)> {
         .collect()
 }
 
+/// A submenu of the Group menu (see [`TypeTable::group_menus`]).
+#[derive(Clone)]
+struct GroupMenu {
+    /// The submenu's entry: `worksAt Company` beside its arrow, `to Company`.
+    label: String,
+    /// What names the choices it holds elsewhere: `worksAt → Company`, `to Company`.
+    prefix: String,
+    icon: IconName,
+    /// By each neighbour: its key and how the choice reads.
+    neighbour: Option<(String, String)>,
+    /// The type at the other end.
+    other_type: String,
+    /// By a property of it: the key and the property's name.
+    properties: Vec<(String, String)>,
+}
+
+/// A relationship's direction, as filters and the Group menu show it.
+fn direction_icon(direction: gq_language::Direction) -> IconName {
+    match direction {
+        gq_language::Direction::Outgoing => IconName::ArrowRight,
+        gq_language::Direction::Incoming => IconName::ArrowLeft,
+    }
+}
+
 pub struct TypeTable {
     workspace: WeakEntity<Workspace>,
     session: Entity<GraphSession>,
@@ -1393,6 +1417,7 @@ impl TypeTable {
     /// The toolbar's Group menu: the properties rows can be grouped by, and No grouping.
     fn render_group_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let choices = self.group_choices();
+        let menus = self.group_menus();
         let current = self.grouping.as_ref().map(|g| g.property.clone());
         let current_label = current.as_ref().map(|key| {
             choices
@@ -1419,12 +1444,17 @@ impl TypeTable {
                 .disabled(choices.is_empty())
                 .when(!open, |button| {
                     button.tooltip(Tooltip::text(
-                        "Group the rows by a property or a relationship",
+                        "Group the rows by a property, a relationship or a property of a neighbour",
                     ))
                 }),
             )
             .menu(move |window, cx| {
-                let (table, current, choices) = (table.clone(), current.clone(), choices.clone());
+                let (table, current, choices, menus) = (
+                    table.clone(),
+                    current.clone(),
+                    choices.clone(),
+                    menus.clone(),
+                );
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                     let set = |property: Option<String>| {
                         let table = table.clone();
@@ -1443,11 +1473,9 @@ impl TypeTable {
                             set(None),
                         )
                         .separator();
-                    let mut relationships = false;
                     for (key, label) in &choices {
-                        if !relationships && builder::parse_relationship_key(key).is_some() {
-                            relationships = true;
-                            menu = menu.separator();
+                        if !builder::parse_group_key(key).is_own_property() {
+                            break;
                         }
                         menu = menu.toggleable_entry(
                             label.clone(),
@@ -1455,6 +1483,68 @@ impl TypeTable {
                             IconPosition::Start,
                             None,
                             set(Some(key.clone())),
+                        );
+                    }
+                    if !menus.is_empty() {
+                        menu = menu.separator();
+                    }
+                    for group in &menus {
+                        let holds_current = current.as_ref().is_some_and(|current| {
+                            group
+                                .neighbour
+                                .as_ref()
+                                .is_some_and(|(key, _)| key == current)
+                                || group.properties.iter().any(|(key, _)| key == current)
+                        });
+                        let (table, current, group) =
+                            (table.clone(), current.clone(), group.clone());
+                        // The arrow takes the place of the entries' check, and is the accent
+                        // colour while the submenu holds the grouping.
+                        menu = menu.submenu_with_colored_icon(
+                            group.label.clone(),
+                            group.icon,
+                            if holds_current {
+                                Color::Accent
+                            } else {
+                                Color::Muted
+                            },
+                            move |mut menu, _, _| {
+                                let set = |property: String| {
+                                    let table = table.clone();
+                                    move |_: &mut Window, cx: &mut App| {
+                                        table
+                                            .update(cx, |table, cx| {
+                                                table.set_grouping(Some(property.clone()), cx)
+                                            })
+                                            .ok();
+                                    }
+                                };
+                                if let Some((key, _)) = &group.neighbour {
+                                    menu = menu.toggleable_entry(
+                                        format!("Each {}", group.other_type),
+                                        current.as_ref() == Some(key),
+                                        IconPosition::Start,
+                                        None,
+                                        set(key.clone()),
+                                    );
+                                    if !group.properties.is_empty() {
+                                        menu = menu.separator();
+                                    }
+                                }
+                                if !group.properties.is_empty() {
+                                    menu = menu.header(format!("{}'s property", group.other_type));
+                                }
+                                for (key, name) in &group.properties {
+                                    menu = menu.toggleable_entry(
+                                        name.clone(),
+                                        current.as_ref() == Some(key),
+                                        IconPosition::Start,
+                                        None,
+                                        set(key.clone()),
+                                    );
+                                }
+                                menu
+                            },
                         );
                     }
                     menu
@@ -1716,21 +1806,116 @@ impl TypeTable {
         cx.notify();
     }
 
-    /// What the rows can be grouped by: each groupable property, then each relationship of a
-    /// node table. Key and how the choice reads.
+    /// What the rows can be grouped by: each groupable property, then what each submenu of
+    /// [`Self::group_menus`] offers. Key and how the choice reads.
     fn group_choices(&self) -> Vec<(String, String)> {
-        let properties = self
+        let mut choices: Vec<(String, String)> = self
             .all_columns
             .iter()
             .filter_map(ColumnSpec::property)
             .filter(|p| builder::GroupBy::allowed(p))
-            .map(|p| (p.name.clone(), p.name.clone()));
-        let relationships = self
-            .all_columns
+            .map(|p| (p.name.clone(), p.name.clone()))
+            .collect();
+        for menu in self.group_menus() {
+            choices.extend(menu.neighbour.clone());
+            choices.extend(
+                menu.properties
+                    .iter()
+                    .map(|(key, name)| (key.clone(), format!("{}.{name}", menu.prefix))),
+            );
+        }
+        choices
+    }
+
+    /// The Group menu's submenus: in a node table one per relationship, by each neighbour or
+    /// by a property of the neighbours; in an edge table one per end, by a property of the
+    /// node at it.
+    fn group_menus(&self) -> Vec<GroupMenu> {
+        let Some(schema) = &self.schema else {
+            return Vec::new();
+        };
+        let groupable = |type_name: &str| -> Vec<String> {
+            schema.node(type_name).map_or_else(Vec::new, |node| {
+                node.properties
+                    .iter()
+                    .filter(|p| builder::GroupBy::allowed(p))
+                    .map(|p| p.name.clone())
+                    .collect()
+            })
+        };
+        self.all_columns
             .iter()
-            .filter(|c| c.relationship().is_some())
-            .map(|c| (c.key.clone(), c.title.clone()));
-        properties.chain(relationships).collect()
+            .filter_map(|column| match &column.role {
+                ColumnRole::Relationship(group) => Some(GroupMenu {
+                    // The icon shows the direction, so the label names the traversal only.
+                    label: format!(
+                        "{} {}",
+                        gq_language::traversal_name(&group.edge),
+                        group.other_type
+                    ),
+                    prefix: format!("{} {}", column.title, group.other_type),
+                    icon: direction_icon(group.direction),
+                    neighbour: Some((column.key.clone(), column.title.clone())),
+                    other_type: group.other_type.clone(),
+                    properties: groupable(&group.other_type)
+                        .into_iter()
+                        .map(|name| (builder::neighbour_property_key(group, &name), name))
+                        .collect(),
+                }),
+                ColumnRole::Endpoint { node_type } => {
+                    let end = if column.key == crate::model::FROM_COLUMN {
+                        builder::EdgeEnd::From
+                    } else {
+                        builder::EdgeEnd::To
+                    };
+                    Some(GroupMenu {
+                        label: column.title.clone(),
+                        prefix: column.title.clone(),
+                        icon: match end {
+                            builder::EdgeEnd::From => IconName::ArrowLeft,
+                            builder::EdgeEnd::To => IconName::ArrowRight,
+                        },
+                        neighbour: None,
+                        other_type: node_type.clone(),
+                        properties: groupable(node_type)
+                            .into_iter()
+                            .map(|name| (builder::endpoint_property_key(end, &name), name))
+                            .collect(),
+                    })
+                }
+                _ => None,
+            })
+            .filter(|menu| menu.neighbour.is_some() || !menu.properties.is_empty())
+            .collect()
+    }
+
+    /// The property a grouping key reads: the row's own, a neighbour's or an end's.
+    fn group_property(&self, key: &str) -> Option<Property> {
+        let schema = self.schema.as_ref()?;
+        let (type_name, property) = match builder::parse_group_key(key) {
+            builder::GroupKey::Property(_) => return self.property_of(key),
+            builder::GroupKey::Relationship(..) => return None,
+            builder::GroupKey::NeighbourProperty {
+                direction,
+                edge,
+                property,
+            } => {
+                let group = schema
+                    .relationships_of(&self.type_name)
+                    .into_iter()
+                    .find(|group| group.direction == direction && group.edge == edge)?;
+                (group.other_type, property)
+            }
+            builder::GroupKey::EndpointProperty { end, property } => {
+                let edge = schema.edge(&self.type_name)?;
+                let node_type = match end {
+                    builder::EdgeEnd::From => edge.from.clone(),
+                    builder::EdgeEnd::To => edge.to.clone(),
+                };
+                (node_type, property)
+            }
+        };
+        schema.node(&type_name)?.property(property).cloned()
     }
 
     fn can_group_by(&self, key: &str) -> bool {
@@ -1756,22 +1941,43 @@ impl TypeTable {
         let generation = grouping.restart();
         let property = grouping.property.clone();
         let filters = self.resolved_filters();
-        // By a relationship: the rows per neighbour, and apart from them the rows with none.
-        let queries = if builder::parse_relationship_key(&property).is_some() {
-            let none = Filter {
+        // By neighbours: the rows per neighbour or per value they hold, and apart from them the
+        // rows with no neighbour, or none with a value.
+        let with_none = |op: FilterOp| {
+            let mut none = filters.clone();
+            none.push(Filter {
                 property: property.clone(),
-                op: FilterOp::HasNone,
+                op,
                 value: Value::Null,
-            };
-            let mut unrelated = filters.clone();
-            unrelated.push(none);
-            builder::neighbour_counts(&schema, &self.type_name, &filters, &property, GROUP_LIMIT)
-                .and_then(|counts| {
-                    let none = builder::node_count(&schema, &self.type_name, &unrelated)?;
-                    Ok((counts, Some(none)))
-                })
-        } else {
-            builder::value_counts(
+            });
+            builder::node_count(&schema, &self.type_name, &none)
+        };
+        let queries = match builder::parse_group_key(&property) {
+            builder::GroupKey::Relationship(..) => builder::neighbour_counts(
+                &schema,
+                &self.type_name,
+                &filters,
+                &property,
+                GROUP_LIMIT,
+            )
+            .and_then(|counts| Ok((counts, Some(with_none(FilterOp::HasNone)?)))),
+            builder::GroupKey::NeighbourProperty { .. } => builder::neighbour_value_counts(
+                &schema,
+                &self.type_name,
+                &filters,
+                &property,
+                GROUP_LIMIT,
+            )
+            .and_then(|counts| Ok((counts, Some(with_none(FilterOp::IsEmpty)?)))),
+            builder::GroupKey::EndpointProperty { .. } => builder::endpoint_value_counts(
+                &schema,
+                &self.type_name,
+                &filters,
+                &property,
+                GROUP_LIMIT,
+            )
+            .map(|counts| (counts, None)),
+            builder::GroupKey::Property(_) => builder::value_counts(
                 &schema,
                 &self.type_name,
                 self.kind == TableKind::Edge,
@@ -1779,7 +1985,7 @@ impl TypeTable {
                 &property,
                 GROUP_LIMIT,
             )
-            .map(|counts| (counts, None))
+            .map(|counts| (counts, None)),
         };
         let (query, none) = match queries {
             Ok(queries) => queries,
@@ -1815,8 +2021,8 @@ impl TypeTable {
         }));
     }
 
-    /// Takes the grouped counts, and when grouped by a relationship the count of rows with no
-    /// neighbour. Either failing fails the grouping.
+    /// Takes the grouped counts, and when grouped by neighbours the count of rows with no
+    /// neighbour, or none with a value. Either failing fails the grouping.
     fn apply_groups(
         &mut self,
         generation: u64,
@@ -2010,8 +2216,9 @@ impl TypeTable {
             return false;
         }
         match &self.grouping {
-            // A cell edit cannot move a row to another neighbour.
-            Some(grouping) if grouping.by_relationship() => true,
+            // A cell edit cannot move a row to another neighbour, or change what its neighbours
+            // hold.
+            Some(grouping) if !grouping.by_own_property() => true,
             Some(grouping) => grouping
                 .section_of(ix)
                 .and_then(|section| grouping.sections().get(section))
@@ -2305,8 +2512,8 @@ impl TypeTable {
                 // Grouped, a new row goes first in its open section; sorted, first in the list,
                 // where it is seen. The next read places it.
                 let section = self.grouping.as_ref().map(|grouping| {
-                    let value = values.get(&grouping.property).unwrap_or(&Value::Null);
-                    grouping.section_with(value).filter(|ix| {
+                    let value = grouping.value_of_new_row(&values)?;
+                    grouping.section_with(&value).filter(|ix| {
                         grouping
                             .sections()
                             .get(*ix)
@@ -2319,7 +2526,7 @@ impl TypeTable {
                         .as_ref()
                         .and_then(|g| g.sections().get(ix))
                         .map(|section| section.range.start),
-                    // A value with no open section shows after a read.
+                    // A value with no open section, or not known yet, shows after a read.
                     Some(None) => {
                         self.newer = true;
                         cx.emit(ItemEvent::UpdateTab);
@@ -3629,10 +3836,7 @@ impl TypeTable {
     /// The icon of a filter key: the property's kind, or the relationship's direction.
     fn key_icon(&self, key: &str) -> IconName {
         if let Some((direction, _)) = builder::parse_relationship_key(key) {
-            return match direction {
-                gq_language::Direction::Outgoing => IconName::ArrowRight,
-                gq_language::Direction::Incoming => IconName::ArrowLeft,
-            };
+            return direction_icon(direction);
         }
         self.filterable()
             .iter()
@@ -4653,7 +4857,7 @@ impl TypeTable {
         let Some(section) = grouping.sections().get(index) else {
             return Vec::new();
         };
-        let property = self.property_of(&grouping.property);
+        let property = self.group_property(&grouping.property);
         let missing = section.value.is_null();
         // By a relationship: the neighbour's label (its id in the tooltip), or "No Company".
         let other_type = self
@@ -4664,6 +4868,10 @@ impl TypeTable {
             .map(|group| group.other_type.clone());
         let text = match (&other_type, missing) {
             (Some(other), true) => format!("No {other}"),
+            // By a neighbour's or an end's property, the property is not in the row: "No city".
+            (None, true) if !grouping.by_own_property() => property
+                .as_ref()
+                .map_or_else(|| "No value".to_owned(), |p| format!("No {}", p.name)),
             (None, true) => "No value".to_owned(),
             (Some(_), false) => section
                 .label
@@ -4784,18 +4992,21 @@ impl TypeTable {
         } else {
             let remaining = section.count.saturating_sub(section.range.len() as u64);
             let next = remaining.min(u64::from(page));
-            studio_ui::ds::button(
-                ("section-more", index),
-                format!("Show {next} more of {}", format_count(remaining as i64)),
-            )
-            .style(ButtonStyle::Subtle)
-            .label_size(LabelSize::XSmall)
-            .color(Color::Accent)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                let size = this.page_size(cx);
-                this.load_section(index, size, cx);
-            }))
-            .into_any_element()
+            // "Show 50 more of 120", or "Show 25 more" when the page holds the rest.
+            let label = if next < remaining {
+                format!("Show {next} more of {}", format_count(remaining as i64))
+            } else {
+                format!("Show {} more", format_count(remaining as i64))
+            };
+            studio_ui::ds::button(("section-more", index), label)
+                .style(ButtonStyle::Subtle)
+                .label_size(LabelSize::XSmall)
+                .color(Color::Accent)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let size = this.page_size(cx);
+                    this.load_section(index, size, cx);
+                }))
+                .into_any_element()
         };
         self.line_cells(
             h_flex()
@@ -5845,6 +6056,74 @@ mod tests {
             before,
             "the cell editor drew the grid"
         );
+    }
+
+    /// People by their company's city, and an edge by a property of either end: the Group menu
+    /// offers each, the section header reads the neighbour's property, and a cell edit or a new
+    /// row is placed by what the row can know.
+    #[gpui::test]
+    async fn rows_group_by_a_neighbours_or_an_ends_property(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = "node Person {\n  slug: String @key\n  name: String\n}\n\
+            node Company {\n  slug: String @key\n  city: String?\n}\n\
+            edge WorksAt: Person -> Company\n";
+        let open = |type_name: &str, cx: &mut TestAppContext| {
+            let session = session(schema, cx);
+            let type_name = type_name.to_owned();
+            let (table, cx) = cx.add_window_view(|window, cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    type_name,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            (table, cx.clone())
+        };
+        let (people, mut cx_people) = open("Person", cx);
+        let cx = &mut cx_people;
+        people.read_with(cx, |table, _| {
+            let choices = table.group_choices();
+            let keys: Vec<&str> = choices.iter().map(|(key, _)| key.as_str()).collect();
+            // A key is not offered: every row holds a value of its own.
+            assert_eq!(keys, ["name", "out:WorksAt", "out:WorksAt.city"]);
+            assert_eq!(choices[2].1, "worksAt → Company.city");
+            let menus = table.group_menus();
+            assert_eq!(menus.len(), 1);
+            assert_eq!(menus[0].label, "worksAt Company");
+            let city = table.group_property("out:WorksAt.city").unwrap();
+            assert_eq!(city.name, "city");
+        });
+        people.update(cx, |table, cx| {
+            table.set_grouping(Some("out:WorksAt.city".into()), cx)
+        });
+        cx.run_until_parked();
+        people.read_with(cx, |table, _| {
+            let grouping = table.grouping.as_ref().expect("grouped");
+            assert_eq!(grouping.property, "out:WorksAt.city");
+            assert!(!grouping.by_own_property());
+            assert!(table.can_group_by("out:WorksAt.city"));
+            assert!(!table.can_group_by("out:WorksAt.missing"));
+        });
+
+        let (works_at, mut cx_edges) = open("WorksAt", cx);
+        let cx = &mut cx_edges;
+        works_at.read_with(cx, |table, _| {
+            let choices = table.group_choices();
+            let keys: Vec<&str> = choices.iter().map(|(key, _)| key.as_str()).collect();
+            assert_eq!(keys, ["from.name", "to.city"]);
+            assert_eq!(choices[1].1, "to Company.city");
+            assert_eq!(
+                table.group_property("from.name").map(|p| p.name),
+                Some("name".to_owned())
+            );
+        });
     }
 
     /// A row draws the columns in view, one either side, the pinned first and the cursor's;

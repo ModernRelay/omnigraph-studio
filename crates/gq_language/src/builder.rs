@@ -215,15 +215,95 @@ pub fn relationship_key(group: &RelationshipGroup) -> String {
     format!("{direction}:{}", group.edge)
 }
 
-/// The direction and edge of a [`relationship_key`].
+/// The direction and edge of a [`relationship_key`]. A key with a property after the edge
+/// ([`neighbour_property_key`]) is not one.
 pub fn parse_relationship_key(key: &str) -> Option<(Direction, &str)> {
     let (direction, edge) = key.split_once(':')?;
+    if edge.contains('.') {
+        return None;
+    }
     let direction = match direction {
         "out" => Direction::Outgoing,
         "in" => Direction::Incoming,
         _ => return None,
     };
     Some((direction, edge))
+}
+
+/// One end of an edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeEnd {
+    From,
+    To,
+}
+
+/// What a grouping or a section's filter names (spec 004): the row's own property, a node's
+/// neighbours through a relationship, a property of those neighbours, or a property of an
+/// edge's endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupKey<'a> {
+    /// `title`.
+    Property(&'a str),
+    /// `out:WorksAt`.
+    Relationship(Direction, &'a str),
+    /// `out:WorksAt.city`: "people by the city of their company".
+    NeighbourProperty {
+        direction: Direction,
+        edge: &'a str,
+        property: &'a str,
+    },
+    /// `from.title`, `to.city`: an edge table by a property of one of its ends.
+    EndpointProperty { end: EdgeEnd, property: &'a str },
+}
+
+impl GroupKey<'_> {
+    /// Whether a row's own values hold the key's value, so a row can be placed and checked
+    /// against a section without reading again.
+    pub fn is_own_property(&self) -> bool {
+        matches!(self, GroupKey::Property(_))
+    }
+}
+
+/// What `key` names. Property names hold no `.` or `:`, so the forms do not overlap.
+pub fn parse_group_key(key: &str) -> GroupKey<'_> {
+    if let Some(property) = key.strip_prefix("from.") {
+        return GroupKey::EndpointProperty {
+            end: EdgeEnd::From,
+            property,
+        };
+    }
+    if let Some(property) = key.strip_prefix("to.") {
+        return GroupKey::EndpointProperty {
+            end: EdgeEnd::To,
+            property,
+        };
+    }
+    if let Some((relationship, property)) = key.split_once('.')
+        && let Some((direction, edge)) = parse_relationship_key(relationship)
+    {
+        return GroupKey::NeighbourProperty {
+            direction,
+            edge,
+            property,
+        };
+    }
+    match parse_relationship_key(key) {
+        Some((direction, edge)) => GroupKey::Relationship(direction, edge),
+        None => GroupKey::Property(key),
+    }
+}
+
+/// The key of a property of a node's neighbours through `group`: `out:WorksAt.city`.
+pub fn neighbour_property_key(group: &RelationshipGroup, property: &str) -> String {
+    format!("{}.{property}", relationship_key(group))
+}
+
+/// The key of a property of an edge's endpoint: `from.title`, `to.city`.
+pub fn endpoint_property_key(end: EdgeEnd, property: &str) -> String {
+    match end {
+        EdgeEnd::From => format!("from.{property}"),
+        EdgeEnd::To => format!("to.{property}"),
+    }
 }
 
 /// How a relationship key reads: `worksAt →`, `← knows`.
@@ -406,6 +486,44 @@ fn filter_clauses(
             clauses.push(relationship_clause(schema, var, i, filter, params)?);
             continue;
         }
+        match parse_group_key(&filter.property) {
+            GroupKey::NeighbourProperty {
+                direction,
+                edge,
+                property,
+            } => {
+                clauses.push(neighbour_property_clause(
+                    schema, var, i, filter, direction, edge, property, params,
+                )?);
+                continue;
+            }
+            // An edge's ends are `$a` and `$b` in every edge query.
+            GroupKey::EndpointProperty { end, property } => {
+                let edge = edge(schema, type_name)?;
+                let (end_var, end_type) = match end {
+                    EdgeEnd::From => ("$a", &edge.from),
+                    EdgeEnd::To => ("$b", &edge.to),
+                };
+                let node = node(schema, end_type)?;
+                let property = node
+                    .properties
+                    .iter()
+                    .find(|p| p.name == property)
+                    .ok_or_else(|| BuildError::UnknownProperty {
+                        type_name: node.name.clone(),
+                        property: property.to_owned(),
+                    })?;
+                clauses.push(property_clause(
+                    &format!("{end_var}.{}", property.name),
+                    property,
+                    filter,
+                    i,
+                    params,
+                ));
+                continue;
+            }
+            GroupKey::Property(_) | GroupKey::Relationship(..) => {}
+        }
         // The node's own id, as a filter to one row (spec 005: a table opened from the tree).
         if filter.property == ID_FILTER {
             let id = params.add(&format!("f{i}"), "String", filter.value.clone());
@@ -419,56 +537,70 @@ fn filter_clauses(
                 type_name: type_name.to_owned(),
                 property: filter.property.clone(),
             })?;
-        let target = format!("${var}.{}", property.name);
-        let clause = match filter.op {
-            FilterOp::IsEmpty => format!("{target} is null"),
-            FilterOp::IsNotEmpty => format!("{target} is not null"),
-            op => {
-                // A list is filtered by membership, so its value is one element.
-                let ty = if property.list {
-                    Property {
-                        list: false,
-                        ..property.clone()
-                    }
-                    .param_type(false)
-                } else {
-                    property.param_type(false)
-                };
-                // `in` takes a list of the property's values.
-                let ty = if op == FilterOp::In {
-                    Property {
-                        list: true,
-                        nullable: false,
-                        ..property.clone()
-                    }
-                    .param_type(false)
-                } else {
-                    ty
-                };
-                let param = params.add(&format!("f{i}"), &ty, filter.value.clone());
-                let operator = match op {
-                    FilterOp::Eq => "=",
-                    FilterOp::Ne => "!=",
-                    FilterOp::Lt => "<",
-                    FilterOp::Le => "<=",
-                    FilterOp::Gt => ">",
-                    FilterOp::Ge | FilterOp::Today | FilterOp::ThisWeek | FilterOp::Last30Days => {
-                        ">="
-                    }
-                    FilterOp::Contains => "contains",
-                    FilterOp::In => "in",
-                    FilterOp::IsEmpty
-                    | FilterOp::IsNotEmpty
-                    | FilterOp::HasAny
-                    | FilterOp::HasNone
-                    | FilterOp::RelatedTo => unreachable!(),
-                };
-                format!("{target} {operator} {param}")
-            }
-        };
-        clauses.push(clause);
+        clauses.push(property_clause(
+            &format!("${var}.{}", property.name),
+            property,
+            filter,
+            i,
+            params,
+        ));
     }
     Ok(clauses)
+}
+
+/// A filter on one property at `target` (`$n.title`, `$b.city`): its value travels as the
+/// parameter `f{i}`.
+fn property_clause(
+    target: &str,
+    property: &Property,
+    filter: &Filter,
+    i: usize,
+    params: &mut Params,
+) -> String {
+    match filter.op {
+        FilterOp::IsEmpty => format!("{target} is null"),
+        FilterOp::IsNotEmpty => format!("{target} is not null"),
+        op => {
+            // A list is filtered by membership, so its value is one element.
+            let ty = if property.list {
+                Property {
+                    list: false,
+                    ..property.clone()
+                }
+                .param_type(false)
+            } else {
+                property.param_type(false)
+            };
+            // `in` takes a list of the property's values.
+            let ty = if op == FilterOp::In {
+                Property {
+                    list: true,
+                    nullable: false,
+                    ..property.clone()
+                }
+                .param_type(false)
+            } else {
+                ty
+            };
+            let param = params.add(&format!("f{i}"), &ty, filter.value.clone());
+            let operator = match op {
+                FilterOp::Eq => "=",
+                FilterOp::Ne => "!=",
+                FilterOp::Lt => "<",
+                FilterOp::Le => "<=",
+                FilterOp::Gt => ">",
+                FilterOp::Ge | FilterOp::Today | FilterOp::ThisWeek | FilterOp::Last30Days => ">=",
+                FilterOp::Contains => "contains",
+                FilterOp::In => "in",
+                FilterOp::IsEmpty
+                | FilterOp::IsNotEmpty
+                | FilterOp::HasAny
+                | FilterOp::HasNone
+                | FilterOp::RelatedTo => unreachable!(),
+            };
+            format!("{target} {operator} {param}")
+        }
+    }
 }
 
 /// A relationship filter as a correlated block: `exists { $r0: Company  $n worksAt $r0 }`, or
@@ -497,6 +629,51 @@ fn relationship_clause(
     let block = if filter.op == FilterOp::HasNone {
         "not"
     } else {
+        "exists"
+    };
+    Ok(format!(
+        "{block} {{\n      {}\n    }}",
+        body.join("\n      ")
+    ))
+}
+
+/// A filter on a property of the node's neighbours through one relationship, as a correlated
+/// block, so a node with several such neighbours stays one row: `exists { $r0: Company
+/// $n worksAt $r0  $r0.city = $f0 }`. "Is empty" is `not { … $r0.city is not null }`: no
+/// neighbour holds a value, including when there is no neighbour.
+#[allow(clippy::too_many_arguments)]
+fn neighbour_property_clause(
+    schema: &SchemaModel,
+    var: &str,
+    i: usize,
+    filter: &Filter,
+    direction: Direction,
+    edge_name: &str,
+    property_name: &str,
+    params: &mut Params,
+) -> Result<String, BuildError> {
+    let edge = edge(schema, edge_name)?;
+    let other = format!("$r{i}");
+    let (other_type, hop) = match direction {
+        Direction::Outgoing => (&edge.to, format!("${var} {} {other}", edge.traversal())),
+        Direction::Incoming => (&edge.from, format!("{other} {} ${var}", edge.traversal())),
+    };
+    let other_node = node(schema, other_type)?;
+    let property = other_node
+        .properties
+        .iter()
+        .find(|p| p.name == property_name)
+        .ok_or_else(|| BuildError::UnknownProperty {
+            type_name: other_node.name.clone(),
+            property: property_name.to_owned(),
+        })?;
+    let target = format!("{other}.{}", property.name);
+    let mut body = vec![format!("{other}: {other_type}"), hop];
+    let block = if filter.op == FilterOp::IsEmpty {
+        body.push(format!("{target} is not null"));
+        "not"
+    } else {
+        body.push(property_clause(&target, property, filter, i, params));
         "exists"
     };
     Ok(format!(
@@ -811,6 +988,140 @@ pub fn neighbour_counts(
         "query studio_value_counts({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ $g.@id as value{label_column}, count($n) as n }}\n  order {{ {order} }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         clauses = clauses.join("\n    "),
+    );
+    Ok(BuiltQuery {
+        name: "studio_value_counts".into(),
+        text,
+        params: params.values,
+    })
+}
+
+/// How many filtered rows of a node type have a neighbour with each value of one of its
+/// properties (spec 004, grouping by a neighbour's property: "people by the city of their
+/// company"). A row counts once per value, however many of its neighbours hold it: of a
+/// row's neighbours with one value, only the one with the least `@id` is matched, since GQ's
+/// `count` counts matches. Neighbours without a value are left out; the rows with no value at
+/// all are an "is empty" count. Columns: `value`, `n`.
+pub fn neighbour_value_counts(
+    schema: &SchemaModel,
+    type_name: &str,
+    filters: &[Filter],
+    key: &str,
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
+    let GroupKey::NeighbourProperty {
+        direction,
+        edge: edge_name,
+        property: property_name,
+    } = parse_group_key(key)
+    else {
+        return Err(BuildError::UnknownEdge(key.to_owned()));
+    };
+    let node = node(schema, type_name)?;
+    let edge = edge(schema, edge_name)?;
+    let (other_type, hop, other_hop) = match direction {
+        Direction::Outgoing => (
+            &edge.to,
+            format!("$n {} $g", edge.traversal()),
+            format!("$n {} $d", edge.traversal()),
+        ),
+        Direction::Incoming => (
+            &edge.from,
+            format!("$g {} $n", edge.traversal()),
+            format!("$d {} $n", edge.traversal()),
+        ),
+    };
+    let other = self::node(schema, other_type)?;
+    let property = other
+        .properties
+        .iter()
+        .find(|p| p.name == property_name && GroupBy::allowed(p))
+        .ok_or_else(|| BuildError::UnknownProperty {
+            type_name: other.name.clone(),
+            property: property_name.to_owned(),
+        })?;
+    let mut params = Params::new();
+    let mut clauses = vec![format!("$n: {}", node.name)];
+    clauses.extend(filter_clauses(
+        schema,
+        &node.name,
+        &node.properties,
+        "n",
+        filters,
+        &mut params,
+    )?);
+    let prop = &property.name;
+    clauses.push(format!("$g: {}", other.name));
+    clauses.push(hop);
+    clauses.push(format!("$g.{prop} is not null"));
+    clauses.push(format!(
+        "not {{\n      $d: {}\n      {other_hop}\n      $d.{prop} = $g.{prop}\n      $d.@id < $g.@id\n    }}",
+        other.name
+    ));
+    let text = format!(
+        "query studio_value_counts({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ $g.{prop} as value, count($n) as n }}\n  order {{ value asc }}\n  limit {limit}\n}}\n",
+        sig = params.signature(),
+        clauses = clauses.join("\n    "),
+    );
+    Ok(BuiltQuery {
+        name: "studio_value_counts".into(),
+        text,
+        params: params.values,
+    })
+}
+
+/// How many filtered rows of an edge type have each value of a property of one of their ends
+/// (spec 004: "jobs by the city of the company"). An edge has one of each end, so it counts
+/// once; ends without a value are counted as the null value. Columns: `value`, `n`.
+pub fn endpoint_value_counts(
+    schema: &SchemaModel,
+    edge_name: &str,
+    filters: &[Filter],
+    key: &str,
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
+    let GroupKey::EndpointProperty {
+        end,
+        property: property_name,
+    } = parse_group_key(key)
+    else {
+        return Err(BuildError::UnknownProperty {
+            type_name: edge_name.to_owned(),
+            property: key.to_owned(),
+        });
+    };
+    let edge = edge(schema, edge_name)?;
+    let (end_var, end_type) = match end {
+        EdgeEnd::From => ("a", &edge.from),
+        EdgeEnd::To => ("b", &edge.to),
+    };
+    let end_node = node(schema, end_type)?;
+    let property = end_node
+        .properties
+        .iter()
+        .find(|p| p.name == property_name && GroupBy::allowed(p))
+        .ok_or_else(|| BuildError::UnknownProperty {
+            type_name: end_node.name.clone(),
+            property: property_name.to_owned(),
+        })?;
+    let mut params = Params::new();
+    let mut clauses = vec![
+        format!("$a: {}", edge.from),
+        format!("$a $e:{} $b", edge.traversal()),
+    ];
+    clauses.extend(filter_clauses(
+        schema,
+        &edge.name,
+        &edge.properties,
+        "e",
+        filters,
+        &mut params,
+    )?);
+    let text = format!(
+        "query studio_value_counts({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ ${end_var}.{prop} as value, count($e.@id) as n }}\n  order {{ value asc }}\n  limit {limit}\n}}\n",
+        sig = params.signature(),
+        clauses = clauses.join("\n    "),
+        prop = property.name,
     );
     Ok(BuiltQuery {
         name: "studio_value_counts".into(),
@@ -1867,6 +2178,130 @@ mod tests {
         let query = neighbour_counts(&schema, "Company", &[], "in:WorksAt", 200).unwrap();
         assert!(query.text.contains("$g worksAt $n"), "{}", query.text);
         assert!(neighbour_counts(&schema, "Person", &[], "name", 10).is_err());
+    }
+
+    /// A node table by each property of each neighbour, and an edge table by each property of
+    /// each end: the counts and both section filters (a value, and "no value") type-check in
+    /// the table's page and count reads.
+    #[test]
+    fn rows_group_by_a_neighbours_or_an_ends_property() {
+        let schema = dev();
+        let named = Filter {
+            property: "name".into(),
+            op: FilterOp::Contains,
+            value: json!("a"),
+        };
+        for node_type in ["Person", "Company", "Project"] {
+            for group in schema.relationships_of(node_type) {
+                let other = schema.node(&group.other_type).unwrap();
+                for property in other.properties.iter().filter(|p| GroupBy::allowed(p)) {
+                    let key = neighbour_property_key(&group, &property.name);
+                    let counts = neighbour_value_counts(
+                        &schema,
+                        node_type,
+                        std::slice::from_ref(&named),
+                        &key,
+                        200,
+                    )
+                    .unwrap();
+                    assert_compiles(&counts);
+                    assert!(counts.text.contains("$d.@id < $g.@id"), "{}", counts.text);
+                    for (op, value) in [
+                        (FilterOp::Eq, sample_property_value(property)),
+                        (FilterOp::IsEmpty, Value::Null),
+                    ] {
+                        let section = Filter {
+                            property: key.clone(),
+                            op,
+                            value,
+                        };
+                        let filters = [named.clone(), section];
+                        let page =
+                            node_page(&schema, node_type, &filters, None, &PageStart::First, 50)
+                                .unwrap();
+                        assert_compiles(&page);
+                        let block = if op == FilterOp::IsEmpty {
+                            "not {"
+                        } else {
+                            "exists {"
+                        };
+                        assert!(page.text.contains(block), "{}", page.text);
+                        assert_compiles(&node_count(&schema, node_type, &filters).unwrap());
+                    }
+                }
+            }
+        }
+        for edge_name in ["WorksAt", "Knows", "Contributes", "Owns"] {
+            let edge = schema.edge(edge_name).unwrap();
+            for (end, end_type) in [(EdgeEnd::From, &edge.from), (EdgeEnd::To, &edge.to)] {
+                let node = schema.node(end_type).unwrap();
+                for property in node.properties.iter().filter(|p| GroupBy::allowed(p)) {
+                    let key = endpoint_property_key(end, &property.name);
+                    let counts = endpoint_value_counts(&schema, edge_name, &[], &key, 200).unwrap();
+                    assert_compiles(&counts);
+                    for (op, value) in [
+                        (FilterOp::Eq, sample_property_value(property)),
+                        (FilterOp::IsEmpty, Value::Null),
+                    ] {
+                        let filters = [Filter {
+                            property: key.clone(),
+                            op,
+                            value,
+                        }];
+                        let page =
+                            edge_page(&schema, edge_name, &filters, None, &PageStart::First, 50)
+                                .unwrap();
+                        assert_compiles(&page);
+                        assert_compiles(&edge_count(&schema, edge_name, &filters).unwrap());
+                    }
+                }
+            }
+        }
+        // A neighbour's or an end's key is not a property of the row, nor a relationship.
+        assert!(neighbour_value_counts(&schema, "Person", &[], "out:WorksAt", 10).is_err());
+        assert!(endpoint_value_counts(&schema, "WorksAt", &[], "role", 10).is_err());
+        assert!(neighbour_value_counts(&schema, "Person", &[], "out:WorksAt.slug", 10).is_err());
+    }
+
+    #[test]
+    fn group_keys_name_one_kind_each() {
+        assert_eq!(parse_group_key("title"), GroupKey::Property("title"));
+        assert_eq!(
+            parse_group_key("out:WorksAt"),
+            GroupKey::Relationship(Direction::Outgoing, "WorksAt")
+        );
+        assert_eq!(
+            parse_group_key("in:WorksAt.city"),
+            GroupKey::NeighbourProperty {
+                direction: Direction::Incoming,
+                edge: "WorksAt",
+                property: "city",
+            }
+        );
+        assert_eq!(
+            parse_group_key("to.city"),
+            GroupKey::EndpointProperty {
+                end: EdgeEnd::To,
+                property: "city",
+            }
+        );
+        // A neighbour's property is not a relationship.
+        assert_eq!(parse_relationship_key("out:WorksAt.city"), None);
+        assert!(parse_group_key("title").is_own_property());
+        assert!(!parse_group_key("out:WorksAt.city").is_own_property());
+    }
+
+    /// A value of `property`'s type, for a filter on it.
+    fn sample_property_value(property: &Property) -> Value {
+        match property.kind {
+            ScalarKind::Bool => json!(true),
+            ScalarKind::Integer => json!(1),
+            ScalarKind::Date => json!("2020-01-01"),
+            _ => match &property.enum_values {
+                Some(values) => json!(values[0]),
+                None => json!("x"),
+            },
+        }
     }
 
     #[test]

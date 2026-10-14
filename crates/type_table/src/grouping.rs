@@ -4,7 +4,11 @@
 //!
 //! A node table can also be grouped by a relationship (`out:WorksAt`): one section per neighbour,
 //! named by its label, and one for the rows with none; a section's pages are narrowed with
-//! "related to" that neighbour, or "has none".
+//! "related to" that neighbour, or "has none". By a neighbour's property (`out:WorksAt.city`):
+//! one section per value some neighbour holds, and one for the rows no neighbour gives a value;
+//! a row with neighbours of two values is in both. An edge table can be grouped by a property of
+//! its source or target (`from.title`, `to.city`): every edge has one of each, so its sections
+//! divide the rows as a property's do.
 //!
 //! The table keeps every loaded row in one list, sections in order, so the cursor, editing and
 //! selection keep addressing rows by their position in it; a section knows its slice of the
@@ -13,10 +17,11 @@
 
 use std::ops::Range;
 
-use gq_language::{Filter, FilterOp, builder};
+use gq_language::builder::{self, GroupKey};
+use gq_language::{Filter, FilterOp};
 use graph_client::api::ReadOutput;
 use graph_store::Loadable;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::model::{Paging, same_value};
 
@@ -144,7 +149,26 @@ impl Grouping {
         builder::parse_relationship_key(&self.property).is_some()
     }
 
-    /// Adds the section of rows with no neighbour, last, when there are any.
+    /// Whether the rows are grouped by a property of their own, which their values hold.
+    pub fn by_own_property(&self) -> bool {
+        builder::parse_group_key(&self.property).is_own_property()
+    }
+
+    /// The value a new row is grouped under, when it is known: its own property's, and none
+    /// for a new node grouped by its neighbours, which it has none of yet. An edge's ends are
+    /// not among its values.
+    pub fn value_of_new_row(&self, values: &Map<String, Value>) -> Option<Value> {
+        match builder::parse_group_key(&self.property) {
+            GroupKey::Property(property) => {
+                Some(values.get(property).cloned().unwrap_or(Value::Null))
+            }
+            GroupKey::Relationship(..) | GroupKey::NeighbourProperty { .. } => Some(Value::Null),
+            GroupKey::EndpointProperty { .. } => None,
+        }
+    }
+
+    /// Adds the section of rows with no neighbour, or none with a value, last, when there are
+    /// any.
     pub fn add_none_section(&mut self, count: u64) {
         if let Loadable::Loaded(sections) = &mut self.sections
             && count > 0
@@ -431,6 +455,34 @@ mod tests {
         none.accept_counts(&counts(json!([])), GROUP_LIMIT);
         none.add_none_section(0);
         assert!(none.sections().is_empty(), "no section for no rows");
+    }
+
+    #[test]
+    fn a_neighbours_property_narrows_by_its_value_and_an_end_has_no_value_in_the_row() {
+        let mut grouping = Grouping::new("out:WorksAt.city");
+        assert!(!grouping.by_relationship() && !grouping.by_own_property());
+        grouping.restart();
+        grouping.accept_counts(&counts(json!([{"value": "Tokyo", "n": 58}])), GROUP_LIMIT);
+        grouping.add_none_section(38);
+        let filter = grouping.filter_for(0).unwrap();
+        assert_eq!(
+            (filter.property.as_str(), filter.op, filter.value),
+            ("out:WorksAt.city", FilterOp::Eq, json!("Tokyo"))
+        );
+        assert_eq!(grouping.filter_for(1).unwrap().op, FilterOp::IsEmpty);
+        let values = Map::from_iter([("name".to_owned(), json!("Ada"))]);
+        assert_eq!(
+            grouping.value_of_new_row(&values),
+            Some(Value::Null),
+            "a new node has no neighbours"
+        );
+
+        let ends = Grouping::new("to.city");
+        assert!(!ends.by_own_property());
+        assert_eq!(ends.value_of_new_row(&values), None);
+        let own = Grouping::new("name");
+        assert!(own.by_own_property());
+        assert_eq!(own.value_of_new_row(&values), Some(json!("Ada")));
     }
 
     #[test]
