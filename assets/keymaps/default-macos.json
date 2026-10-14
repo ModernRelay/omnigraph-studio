@@ -9,7 +9,8 @@
       "cmd-shift-n": "studio::NewWindow",
       "cmd-[": "studio::GoBack",
       "cmd-]": "studio::GoForward",
-      "cmd-q": "studio::Quit"
+      "cmd-q": "studio::Quit",
+      "cmd-alt-shift-f": "studio::ToggleFrameOverlay"
     }
   },
   {

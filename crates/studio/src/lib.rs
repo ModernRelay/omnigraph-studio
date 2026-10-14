@@ -121,6 +121,27 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
             open_settings(workspace, window, cx);
         });
+        // GPUI's frame-time overlay exists only with its `profiler` feature, which the `perf`
+        // feature turns on: frame times, then their distribution, then hidden again.
+        workspace.register_action(
+            |_workspace, _: &studio_actions::workspace::ToggleFrameOverlay, window, cx| {
+                #[cfg(feature = "perf")]
+                {
+                    let _ = cx;
+                    window.cycle_debug_frame_overlay_mode();
+                }
+                #[cfg(not(feature = "perf"))]
+                {
+                    let _ = window;
+                    _workspace.show_toast(
+                        studio_workspace::ToastKind::Info,
+                        "The frame overlay needs a build with the perf feature: \
+                         cargo run -p studio --features perf",
+                        cx,
+                    );
+                }
+            },
+        );
         workspace.register_action(|workspace, _: &OpenGraph, window, cx| {
             let handle = cx.entity().downgrade();
             workspace.toggle_modal(window, cx, |window, cx| {

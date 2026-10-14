@@ -363,6 +363,7 @@ mod tests {
                 "studio.tree_page_size",
                 "studio.canvas_max_nodes",
                 "studio.health_check_seconds",
+                "studio.show_performance",
                 "agent.command",
                 "agent.ask_before_writes",
                 "agent.omnigraph_cli",

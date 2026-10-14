@@ -250,6 +250,17 @@ than styling one-off elements.
   part through `Item::footer` (`ItemFooter { start, end }`): the table its loaded count, read
   commit and key hints; the agent its restart, agent pill and send. The document header holds
   only the tabs and the dock toggles.
+  - The connection's state reads with the server's round trip, from the last health check
+    (`Connection::latency`, no extra request): "contract 0.13 · 42 ms".
+  - With `studio.show_performance` on (off by default), the document footer ends with
+    Studio's memory and CPU, muted, in the warning colour past 2 GB or half a core:
+    "412 MB · 3% CPU". Memory is macOS's physical footprint (`proc_pid_rusage`, what
+    Activity Monitor shows) or Linux's resident set; CPU is the share of one core between
+    readings (`getrusage`). It is read every 2 s while the window is in front; the tooltip
+    adds the peak. Other platforms show CPU only.
+  - Frame times are not in the footer: an FPS counter reads 0 when idle and draws frames
+    itself. A build with the `perf` feature (GPUI's `profiler`) has its frame-time overlay,
+    `studio::ToggleFrameOverlay` (⌘⌥⇧F); other builds say how to get one.
 - **Window styles.** `studio.window_style`: `flat` splits columns with hairlines; `glass`
   floats the three columns as sheets over a soft wash, with one gap around and between them,
   and moves the traffic lights into the sidebar sheet.
@@ -332,6 +343,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-12 | With nothing focused, an action reaches only global handlers | offscreen snapshots: `studio::ToggleSidebar` and `studio::OpenGraph` did nothing until the workspace had focus | A window opens with no focus, so the workspace's handlers and key bindings are unreachable until something is clicked. The snapshot example now focuses the workspace first; the app should focus it when a window opens |
 | 2026-10-12 | Settings rows are generated in declaration order | `studio_settings` field tests (row order, sections, kinds, path writes and resets); `serde_json`'s `preserve_order` is on in the workspace graph; offscreen snapshots of the Appearance section and of searches for "page" and "agent" | Fourteen rows in four sections; `agent.env` hidden; changed rows show Reset and the nav counts them |
 | 2026-10-14 | Every setting with a control is on the page | `studio_settings` field tests (row list, kinds, one-paragraph descriptions); offscreen snapshots in a scratch data folder: a search for "agent", a path typed into OmniGraph CLI then ↵, a second run with Reset, the Ask before writes switch | `agent.ask_before_writes` and `agent.omnigraph_cli`, added for spec 013, had been hidden; text settings had no control at all (the page showed the value read-only), and no switch had been drawn. Now sixteen rows: ↵ wrote `"omnigraph_cli": "/opt/omnigraph/bin/omnigraph"` (mode 0600) and showed Reset, Reset wrote `null` and emptied the field, the switch wrote `true`. Descriptions had kept their doc comments' line breaks, and GPUI breaks lines at `/`, so paths left the descriptions |
+| 2026-10-14 | The footers show the server's round trip and, when asked, Studio's memory and CPU | `studio_workspace` test `the_process_reads_its_memory_and_cpu`; `studio_settings` tests (row list, `default.json`); `cargo clippy -p studio --features perf`; an offscreen snapshot with `show_performance` on, a table open, 4.5 s waited, then ⌘⌥⇧F | The sidebar read "environment contract 0.13 · 2 ms", the document footer ended "42 MB · 1% CPU", and the overlay key toasted the `perf` build command in a default build. The `perf` build's overlay itself was not drawn: rebuilding GPUI with `profiler` needed more disk than was free |
 | 2026-10-12 | A graph's own value reaches its views | offscreen snapshots with the new `click:x,y` step: the scope switch, then + on Table page size in the graph scope; `settings.json` after; the Person table after | `graphs."environment/knowledge".type_table_page_size` 125, `studio.type_table_page_size` still 100; the table footer reads "125 of 200" |
 | 2026-10-12 | Panes, pins and previews | `studio_workspace` pane tests (preview replaced in place and kept, pin order, close others, removal, split nesting and collapse, JSON round trip); offscreen snapshots: preview Person then Company, pin a query, split right and down, restart with restore, drag the boundary with the new `drag:` step | Company replaced Person in its place in italics; the query stayed first with a pin; both splits showed a copy of the Project table; the layout, pins and shares came back after the restart |
 | 2026-10-12 | Two graphs in one window | a second dev graph `notes` (`dev/cluster/notes.pg`, `dev/notes-seed.jsonl`); offscreen snapshots: Person and a query on `knowledge`, Open Graph, `click:` on `notes`, a Note table split in two, the switcher; then ⌃⌘] | The switcher listed both with `notes` checked and "+1 graph" in the footer; stepping back showed `knowledge` with its Person tab and the query draft |

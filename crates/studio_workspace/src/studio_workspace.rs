@@ -10,6 +10,7 @@ mod item;
 mod pane;
 mod panels;
 mod persistence;
+mod process_stats;
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -151,6 +152,13 @@ pub struct Workspace {
     /// What the CLI's files could not give, as last shown.
     cli_errors: Vec<String>,
     _settings_subscription: Subscription,
+    /// Studio's memory and CPU for the footer while `studio.show_performance` is on, read every
+    /// two seconds while the window is in front.
+    performance: Option<Performance>,
+    /// Whether this window is in front, which the memory and CPU reading waits for.
+    window_active: bool,
+    _performance: Option<Task<()>>,
+    _performance_subscription: Subscription,
     /// What was last written for this graph, so unchanged state is not rewritten.
     saved: Option<SavedWorkspace>,
     _save: Option<Task<()>>,
@@ -223,6 +231,8 @@ impl Workspace {
         // A settings file that cannot be read is named in a toast that stays until dismissed.
         let settings_subscription =
             cx.observe_global::<StudioSettings>(|this, cx| this.show_settings_error(cx));
+        let performance_subscription =
+            cx.observe_global::<StudioSettings>(|this, cx| this.watch_performance(cx));
         let window_slot = persistence::window_opened(window, cx);
         // A window with a write still running stays open until the write ends.
         let this = cx.entity().downgrade();
@@ -260,7 +270,8 @@ impl Workspace {
         // The window's graphs ask after their branch heads at once when it becomes active and a
         // poll came while no window was.
         let activation_subscription = cx.observe_window_activation(window, |this, window, cx| {
-            if !window.is_window_active() {
+            this.window_active = window.is_window_active();
+            if !this.window_active {
                 return;
             }
             let sessions: Vec<_> = this
@@ -300,6 +311,10 @@ impl Workspace {
             settings_error: None,
             cli_errors: Vec::new(),
             _settings_subscription: settings_subscription,
+            performance: None,
+            window_active: window.is_window_active(),
+            _performance: None,
+            _performance_subscription: performance_subscription,
             saved: None,
             _save: None,
             _save_check: None,
@@ -313,7 +328,85 @@ impl Workspace {
         if let Some(registry) = registry {
             this.show_cli_errors(&registry, cx);
         }
+        this.watch_performance(cx);
         this
+    }
+
+    /// Starts or stops reading Studio's memory and CPU as `studio.show_performance` says. The
+    /// reading waits while another window is in front, and costs a footer draw every two
+    /// seconds while it runs.
+    fn watch_performance(&mut self, cx: &mut Context<Self>) {
+        let on = cx
+            .try_global::<StudioSettings>()
+            .is_some_and(|settings| settings.studio.show_performance);
+        if on == self._performance.is_some() {
+            return;
+        }
+        if !on {
+            self._performance = None;
+            self.performance = None;
+            cx.notify();
+            return;
+        }
+        self._performance = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let read = this.update(cx, |this, cx| {
+                    let active = this.window_active;
+                    if active {
+                        let sample = process_stats::Sample::now();
+                        let cpu = this
+                            .performance
+                            .as_ref()
+                            .and_then(|last| sample.cpu_since(&last.sample));
+                        this.performance = Some(Performance { sample, cpu });
+                        cx.notify();
+                    }
+                });
+                if read.is_err() {
+                    return;
+                }
+                cx.background_executor().timer(PERFORMANCE_INTERVAL).await;
+            }
+        }));
+    }
+
+    /// Studio's memory and CPU, muted at the end of the footer; in the warning colour past
+    /// 2 GB or half a core.
+    fn render_performance(&self) -> Option<impl IntoElement> {
+        let reading = self.performance.as_ref()?;
+        let memory = reading.sample.memory;
+        let mut parts = Vec::new();
+        if let Some((now, _)) = memory {
+            parts.push(studio_ui::format_bytes(now));
+        }
+        if let Some(cpu) = reading.cpu {
+            parts.push(format!("{}% CPU", (cpu * 100.).round() as u32));
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        let busy = memory.is_some_and(|(now, _)| now > 2 << 30) || reading.cpu > Some(0.5);
+        let tooltip = match memory {
+            Some((now, peak)) => format!(
+                "Studio holds {} of memory, at most {} so far. CPU is the share of one core over \
+                 the last two seconds.",
+                studio_ui::format_bytes(now),
+                studio_ui::format_bytes(peak)
+            ),
+            None => "CPU is the share of one core over the last two seconds.".to_owned(),
+        };
+        Some(
+            div()
+                .id("footer-performance")
+                .flex_none()
+                .tooltip(Tooltip::text(tooltip))
+                .child(
+                    Label::new(parts.join(" · "))
+                        .size(LabelSize::XSmall)
+                        .color(if busy { Color::Warning } else { Color::Muted })
+                        .single_line(),
+                ),
+        )
     }
 
     /// The server URL and graph id the open session belongs to.
@@ -1615,11 +1708,18 @@ impl Workspace {
                     ConnectionState::ContractMismatch { .. } => Color::Warning,
                     _ => Color::Error,
                 };
+                // The server's round trip from the last health check, beside its state.
+                let state = match (&connection.state, connection.latency) {
+                    (ConnectionState::Ready, Some(latency)) => {
+                        format!("{} · {} ms", connection.state.label(), latency.as_millis())
+                    }
+                    (state, _) => state.label(),
+                };
                 (
                     color,
                     connection.server.name.clone(),
                     connection.server.url.clone(),
-                    connection.state.label(),
+                    state,
                 )
             }
             None => (
@@ -2180,7 +2280,8 @@ impl Workspace {
                         )
                         .child(studio_ui::ds::text::meta(text).single_line())
                 }))
-                .children(footer.end),
+                .children(footer.end)
+                .children(self.render_performance()),
         )
     }
 
@@ -2705,6 +2806,15 @@ impl Render for Workspace {
         .child(self.render_toasts(cx))
         .children(modal)
     }
+}
+
+/// How often the footer's memory and CPU are read.
+const PERFORMANCE_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The last reading of Studio's memory and CPU, and the CPU share since the one before.
+struct Performance {
+    sample: process_stats::Sample,
+    cpu: Option<f32>,
 }
 
 /// A dock edge being dragged.

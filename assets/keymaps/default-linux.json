@@ -9,7 +9,8 @@
       "ctrl-shift-n": "studio::NewWindow",
       "alt-left": "studio::GoBack",
       "alt-right": "studio::GoForward",
-      "ctrl-q": "studio::Quit"
+      "ctrl-q": "studio::Quit",
+      "ctrl-alt-shift-f": "studio::ToggleFrameOverlay"
     }
   },
   {

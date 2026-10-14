@@ -60,6 +60,10 @@ on `release-fast`: a key in the table's filter field, in a cell, in the query ed
 result columns, and in the Go To palette, and a table scroll. On 2026-10-14 (Apple M5 Pro, load
 average 5) each key cost 1.3 to 1.9 ms of main-thread CPU and a scroll 6 ms.
 
+In the running app, `studio.show_performance` puts Studio's memory and CPU at the end of the
+footer, and a build with `--features perf` (GPUI's `profiler`) has GPUI's frame-time overlay on
+⌘⌥⇧F (`studio::ToggleFrameOverlay`): frame times, then their distribution, then hidden.
+
 `crates/studio/examples/snapshot.rs` draws Studio offscreen against a server and measures frames:
 `measure:<n>` with `,type` (a key into the focused field), `,scroll=<dy>` or `,drag=<dx>:<dy>`.
 It prints wall time and the main thread's CPU time per frame; compare CPU times, in the same

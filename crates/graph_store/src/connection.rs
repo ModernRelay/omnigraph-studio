@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{Context, EventEmitter, Task};
 use graph_client::api::{GraphInfo, HealthOutput};
@@ -79,6 +79,9 @@ pub struct Connection {
     http: Arc<dyn HttpClient>,
     pub state: ConnectionState,
     pub health: Option<HealthOutput>,
+    /// How long the last health check took to answer: the server's round trip, shown beside
+    /// it. `None` until one answers, and after one fails.
+    pub latency: Option<Duration>,
     pub operations: BTreeSet<String>,
     pub graphs: GraphListing,
     has_token: bool,
@@ -108,6 +111,7 @@ impl Connection {
             http,
             state: ConnectionState::Idle,
             health: None,
+            latency: None,
             operations: BTreeSet::new(),
             graphs: GraphListing::Unknown,
             has_token,
@@ -194,10 +198,12 @@ impl Connection {
                 match outcome {
                     Probe::Ready {
                         health,
+                        latency,
                         operations,
                         graphs,
                     } => {
                         this.health = Some(health);
+                        this.latency = Some(latency);
                         this.operations = operations;
                         this.graphs = graphs;
                         this.state = ConnectionState::Ready;
@@ -226,8 +232,10 @@ impl Connection {
         let client = self.client.clone();
         self._health_check = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(interval).await;
+            let started = Instant::now();
             let health = client.health().await;
-            this.update(cx, |this, cx| this.apply_health_check(health, cx))
+            let latency = started.elapsed();
+            this.update(cx, |this, cx| this.apply_health_check(health, latency, cx))
                 .ok();
         }));
     }
@@ -235,8 +243,15 @@ impl Connection {
     fn apply_health_check(
         &mut self,
         health: Result<graph_client::ServerHealth, ReadError>,
+        latency: Duration,
         cx: &mut Context<Self>,
     ) {
+        let latency = health.is_ok().then_some(latency);
+        // Shown in whole milliseconds, so a change under one is not a change.
+        if latency.map(|l| l.as_millis()) != self.latency.map(|l| l.as_millis()) {
+            self.latency = latency;
+            cx.notify();
+        }
         let next = match health {
             Ok(health) if !health.contract_supported() => ConnectionState::ContractMismatch {
                 served: health.contract.clone(),
@@ -262,6 +277,7 @@ impl Connection {
 enum Probe {
     Ready {
         health: HealthOutput,
+        latency: Duration,
         operations: BTreeSet<String>,
         graphs: GraphListing,
     },
@@ -269,7 +285,10 @@ enum Probe {
 }
 
 async fn probe(client: &GraphClient) -> Probe {
-    let health = match client.health().await {
+    let started = Instant::now();
+    let health = client.health().await;
+    let latency = started.elapsed();
+    let health = match health {
         Ok(health) => health,
         Err(ReadError::Transport(error)) => {
             return Probe::Failed(ConnectionState::Unreachable(error));
@@ -292,6 +311,7 @@ async fn probe(client: &GraphClient) -> Probe {
     };
     Probe::Ready {
         health: health.health,
+        latency,
         operations,
         graphs,
     }

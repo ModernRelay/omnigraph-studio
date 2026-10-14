@@ -20,6 +20,9 @@ graph_store = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 studio_theme = { workspace = true, features = ["test-support"] }

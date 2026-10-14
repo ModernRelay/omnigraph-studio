@@ -20,6 +20,9 @@ default = ["runtime-shaders"]
 # `--no-default-features` when Xcode's Metal compiler is present, compiling them at build time
 # (specs/001-foundation/plan.md, Shipping).
 runtime-shaders = ["gpui_platform/runtime_shaders"]
+# GPUI's profiler: the frame-time overlay (`studio::ToggleFrameOverlay`) and its counters. For
+# measuring Studio itself; release bundles leave it out (docs/drawing.md).
+perf = ["gpui/profiler"]
 
 [dependencies]
 serde_json = { workspace = true }

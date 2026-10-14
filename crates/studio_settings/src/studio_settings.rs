@@ -108,6 +108,10 @@ pub struct StudioOptions {
         extend("x-section" = "Connection", "x-step" = 5)
     )]
     pub health_check_seconds: u64,
+    /// Show Studio's memory and CPU use at the end of the window's footer, read every two
+    /// seconds while the window is in front.
+    #[schemars(title = "Show memory and CPU", extend("x-section" = "Appearance"))]
+    pub show_performance: bool,
 }
 
 impl Default for StudioOptions {
@@ -118,6 +122,7 @@ impl Default for StudioOptions {
             tree_page_size: 50,
             canvas_max_nodes: 2000,
             health_check_seconds: 30,
+            show_performance: false,
         }
     }
 }

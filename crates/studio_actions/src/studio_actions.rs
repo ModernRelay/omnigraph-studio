@@ -25,6 +25,8 @@ pub mod workspace {
             ShowKeyBindings,
             /// Show Studio's log file in the file manager.
             RevealLog,
+            /// Show or hide GPUI's frame-time overlay, in a build with the `perf` feature.
+            ToggleFrameOverlay,
             /// Go back to the previous location.
             GoBack,
             /// Go forward to the next location.
