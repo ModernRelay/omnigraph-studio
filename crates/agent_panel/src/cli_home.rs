@@ -34,9 +34,6 @@ impl Drop for CliHome {
     }
 }
 
-/// How long one candidate CLI may take to answer the check.
-const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
-
 impl CliHome {
     /// Writes the conversation's directory, config and credentials. The wrapper is written by
     /// [`CliHome::use_cli`] once a CLI is chosen.
@@ -208,31 +205,22 @@ pub fn candidates(configured: Option<&str>) -> Vec<PathBuf> {
     found
 }
 
-/// What a CLI says about itself, read without a server.
+/// What a CLI says about itself, read without a server: its release and the HTTP contract it
+/// speaks (the `Omnigraph-Http-Api` value, which a server takes only when it is its own).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliFacts {
-    /// Its release, as `--version` prints it ("0.13.0").
+    /// Its release, as it reports it ("0.13.0").
     pub version: Option<String>,
-    pub contract: Contract,
-}
-
-/// The HTTP contract a CLI speaks: the `Omnigraph-Http-Api` value it sends, which a server
-/// takes only when it is its own.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Contract {
-    Speaks(String),
-    /// A release from before the contract header (0.11 and older).
-    None,
-    /// It cannot say: a release after 0.13 without `version --json`, or one that did not answer.
-    Unknown,
+    /// `None` for a CLI from before 0.13, or one that did not answer.
+    pub contract: Option<String>,
 }
 
 /// How long a CLI may take to print its version.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Reads a CLI's release and contract by running it, never a server: `version --json` reports
-/// the contract (`http_contract`, from OmniGraph 0.14); a release before that is known by its
-/// number.
+/// Reads a CLI's release and contract by running it, never a server. `version --json` reports
+/// the contract (`http_contract`, OmniGraph #987); 0.13.0, which predates it, speaks `0.13`.
+/// Studio speaks 0.13 and later only, so an older release has no contract here.
 pub async fn cli_facts(cli: &Path) -> CliFacts {
     if let Some(json) = output(cli, &["version", "--json"]).await
         && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&json)
@@ -243,14 +231,17 @@ pub async fn cli_facts(cli: &Path) -> CliFacts {
                 .get("version")
                 .and_then(|v| v.as_str())
                 .map(str::to_owned),
-            contract: Contract::Speaks(contract.to_owned()),
+            contract: Some(contract.to_owned()),
         };
     }
     let version = output(cli, &["--version"])
         .await
         .and_then(|text| release(&String::from_utf8_lossy(&text)));
     CliFacts {
-        contract: release_contract(version.as_deref()),
+        contract: version
+            .as_deref()
+            .filter(|version| version.starts_with("0.13."))
+            .map(|_| "0.13".to_owned()),
         version,
     }
 }
@@ -262,22 +253,6 @@ fn release(text: &str) -> Option<String> {
         .next()
         .is_some_and(|c| c.is_ascii_digit())
         .then(|| word.to_owned())
-}
-
-/// The contract a release from before `version --json` speaks. 0.12 brought the header with
-/// `0.12` and 0.13 changed it to `0.13`; older releases send none. A later release would say
-/// it with `version --json`, so one that does not is not known.
-fn release_contract(version: Option<&str>) -> Contract {
-    let Some(version) = version else {
-        return Contract::Unknown;
-    };
-    let mut parts = version.split('.').map(|part| part.parse::<u32>().ok());
-    match (parts.next().flatten(), parts.next().flatten()) {
-        (Some(0), Some(minor)) if minor <= 11 => Contract::None,
-        (Some(0), Some(12)) => Contract::Speaks("0.12".into()),
-        (Some(0), Some(13)) => Contract::Speaks("0.13".into()),
-        _ => Contract::Unknown,
-    }
 }
 
 /// A CLI's standard output when it exits with success within [`VERSION_TIMEOUT`].
@@ -309,18 +284,18 @@ pub enum CliChoice {
 }
 
 /// Chooses the conversation's CLI from `candidates`, in their order: the first that speaks
-/// `contract`, as the CLI itself reports it, so a slow or unavailable server never decides it. A
-/// candidate that cannot say is tried last, with a cheap read through the gateway. With no
-/// match the wrapper runs nothing and says why, rather than pointing at a CLI the server would
-/// refuse.
+/// `contract`, as the CLI itself reports it, so a slow or unavailable server never decides it.
+/// With no match the wrapper runs nothing and says why, rather than pointing at a CLI the server
+/// would refuse.
 pub async fn choose_cli(home: &CliHome, candidates: Vec<PathBuf>, contract: &str) -> CliChoice {
     let mut found = Vec::new();
     for cli in candidates {
         let facts = cli_facts(&cli).await;
         found.push((cli, facts));
     }
-    let speaks = Contract::Speaks(contract.to_owned());
-    if let Some((cli, facts)) = found.iter().find(|(_, facts)| facts.contract == speaks)
+    if let Some((cli, facts)) = found
+        .iter()
+        .find(|(_, facts)| facts.contract.as_deref() == Some(contract))
         && home.use_cli(cli).is_ok()
     {
         return CliChoice::Chosen {
@@ -328,41 +303,8 @@ pub async fn choose_cli(home: &CliHome, candidates: Vec<PathBuf>, contract: &str
             version: facts.version.clone(),
         };
     }
-    for (cli, facts) in &found {
-        if facts.contract == Contract::Unknown && home.use_cli(cli).is_ok() && answers(home).await {
-            return CliChoice::Chosen {
-                cli: cli.clone(),
-                version: facts.version.clone(),
-            };
-        }
-    }
     home.refuse(&no_cli_text(contract, &found)).ok();
     CliChoice::NoMatch { found }
-}
-
-/// Whether the wrapper answers a cheap read through the conversation's gateway.
-async fn answers(home: &CliHome) -> bool {
-    let check = smol::process::Command::new(&home.command)
-        .args([
-            "snapshot",
-            "--server",
-            "studio",
-            "--graph",
-            &home.graph,
-            "--json",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .status()
-        .fuse();
-    let timeout = smol::Timer::after(CHECK_TIMEOUT).fuse();
-    futures::pin_mut!(check, timeout);
-    futures::select! {
-        status = check => status.is_ok_and(|status| status.success()),
-        _ = timeout => false,
-    }
 }
 
 /// Why a conversation has no CLI: the contract the graph needs and each CLI found.
@@ -374,13 +316,12 @@ pub fn no_cli_text(contract: &str, found: &[(PathBuf, CliFacts)]) -> String {
         let each: Vec<String> = found
             .iter()
             .map(|(cli, facts)| {
-                let version = facts.version.as_deref().unwrap_or("of unknown version");
-                let speaks = match &facts.contract {
-                    Contract::Speaks(contract) => format!("speaks {contract}"),
-                    Contract::None => "speaks no contract".to_owned(),
-                    Contract::Unknown => "did not answer through Studio".to_owned(),
+                let what = match (&facts.version, &facts.contract) {
+                    (Some(version), Some(speaks)) => format!("{version}, which speaks {speaks}"),
+                    (Some(version), None) => format!("{version}, older than 0.13"),
+                    (None, _) => "did not say its version".to_owned(),
                 };
-                format!("{} is {version} and {speaks}", cli.display())
+                format!("{} is {what}", cli.display())
             })
             .collect();
         text.push_str(": ");
@@ -700,29 +641,13 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
 
-    /// A CLI's contract comes from the CLI: `version --json` when it has it, else its release.
-    #[test]
-    fn a_releases_contract_is_known_without_a_server() {
-        assert_eq!(release("omnigraph 0.13.0\n").as_deref(), Some("0.13.0"));
-        assert_eq!(release("usage: …"), None);
-        assert_eq!(release_contract(Some("0.11.0")), Contract::None);
-        assert_eq!(
-            release_contract(Some("0.12.0")),
-            Contract::Speaks("0.12".into())
-        );
-        assert_eq!(
-            release_contract(Some("0.13.2")),
-            Contract::Speaks("0.13".into())
-        );
-        assert_eq!(release_contract(Some("0.14.0")), Contract::Unknown);
-        assert_eq!(release_contract(None), Contract::Unknown);
-    }
-
-    /// The first candidate that speaks the graph's contract is chosen whatever a server says;
-    /// one that cannot say is tried through the gateway; with none, the wrapper runs nothing and
-    /// names each CLI found.
+    /// The first candidate that speaks the graph's contract is chosen, as the CLI reports it and
+    /// with no server behind the gateway; with none, the wrapper runs nothing and names each CLI
+    /// found.
     #[test]
     fn the_cli_that_speaks_the_contract_is_chosen_without_a_server() {
+        assert_eq!(release("omnigraph 0.13.0\n").as_deref(), Some("0.13.0"));
+        assert_eq!(release("usage: …"), None);
         let dir = std::env::temp_dir().join(format!("studio-cli-choice-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
@@ -732,8 +657,8 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path
         };
-        // Releases before `version --json` refuse it; any other command fails, as one would
-        // with no server behind the gateway.
+        // 0.11 and 0.13.0 predate `version --json`; every other command fails, as one would with
+        // no server behind the gateway.
         let old = fake(
             "omnigraph-0.11",
             r#"[ "$1" = --version ] && { echo "omnigraph 0.11.0"; exit 0; }; exit 2"#,
@@ -746,9 +671,9 @@ mod tests {
             "omnigraph-0.14",
             r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.14.0","http_contract":"0.13"}'; exit 0; }; exit 2"#,
         );
-        let unknown = fake(
+        let other = fake(
             "omnigraph-0.15",
-            r#"[ "$1" = --version ] && { echo "omnigraph 0.15.0"; exit 0; }; exit 2"#,
+            r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.15.0","http_contract":"0.15"}'; exit 0; }; exit 2"#,
         );
         let home = CliHome::write(&dir, 1, "t", "knowledge", "agent-x", "main").unwrap();
         let wrapper = || std::fs::read_to_string(&home.command).unwrap();
@@ -764,18 +689,16 @@ mod tests {
         }
         assert!(wrapper().contains(&*current.to_string_lossy()));
 
-        match choose(vec![reports.clone()]) {
+        match choose(vec![other.clone(), reports.clone()]) {
             CliChoice::Chosen { cli, .. } => assert_eq!(cli, reports),
             other => panic!("{other:?}"),
         }
 
-        // Neither the old release nor one that does not answer the check: the wrapper says why.
-        match choose(vec![old.clone(), unknown.clone()]) {
+        match choose(vec![old.clone(), other.clone()]) {
             CliChoice::NoMatch { found } => {
-                assert_eq!(found.len(), 2);
                 let text = no_cli_text("0.13", &found);
-                assert!(text.contains("0.11.0 and speaks no contract"), "{text}");
-                assert!(text.contains("did not answer"), "{text}");
+                assert!(text.contains("0.11.0, older than 0.13"), "{text}");
+                assert!(text.contains("0.15.0, which speaks 0.15"), "{text}");
             }
             other => panic!("{other:?}"),
         }
