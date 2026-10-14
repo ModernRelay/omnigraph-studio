@@ -361,16 +361,7 @@ impl Workspace {
                         return;
                     }
                     let sample = process_stats::Sample::now();
-                    let cpu = match &this.performance {
-                        Some(last) if last.paused => last.cpu,
-                        Some(last) => sample.cpu_since(&last.sample),
-                        None => None,
-                    };
-                    this.performance = Some(Performance {
-                        sample,
-                        cpu,
-                        paused: false,
-                    });
+                    this.performance = Some(Performance::next(this.performance.as_ref(), sample));
                     cx.notify();
                 });
                 if read.is_err() {
@@ -2867,6 +2858,23 @@ struct Performance {
     paused: bool,
 }
 
+impl Performance {
+    /// The reading `sample` makes after `last`: CPU since `last`, or, after a pause, the figure
+    /// shown before it, so no reading averages over time in the background.
+    fn next(last: Option<&Performance>, sample: process_stats::Sample) -> Self {
+        let cpu = match last {
+            Some(last) if last.paused => last.cpu,
+            Some(last) => sample.cpu_since(&last.sample),
+            None => None,
+        };
+        Self {
+            sample,
+            cpu,
+            paused: false,
+        }
+    }
+}
+
 /// A dock edge being dragged.
 #[derive(Clone, Copy)]
 struct DraggedDock(PanelPosition);
@@ -3298,6 +3306,42 @@ mod tests {
             studio_ui::ds::size::HEADER_STRIP
         );
         assert_eq!(height(cx, "tab-0-0"), studio_ui::ds::size::HEADER_STRIP);
+    }
+
+    /// A CPU reading measures from the one before it, never across a pause in the background:
+    /// after one, the shown figure stays until a reading made after the pause.
+    #[test]
+    fn a_cpu_reading_never_spans_a_pause() {
+        use process_stats::Sample;
+        use std::time::{Duration, Instant};
+        let at = Instant::now();
+        let sample = |secs: u64, cpu_ms: u64| Sample {
+            at: at + Duration::from_secs(secs),
+            memory: None,
+            cpu_time: Some(Duration::from_millis(cpu_ms)),
+        };
+        let first = Performance::next(None, sample(0, 0));
+        assert_eq!(first.cpu, None, "nothing to measure from yet");
+        // Half a core over two seconds.
+        let second = Performance::next(Some(&first), sample(2, 1000));
+        assert_eq!(second.cpu, Some(0.5));
+        // Then a minute in the background, with almost no CPU.
+        let paused = Performance {
+            paused: true,
+            ..second
+        };
+        let back = Performance::next(Some(&paused), sample(62, 1010));
+        assert_eq!(
+            back.cpu,
+            Some(0.5),
+            "the figure from before the pause, not 0%"
+        );
+        let after = Performance::next(Some(&back), sample(64, 1410));
+        assert_eq!(
+            after.cpu,
+            Some(0.2),
+            "measured from the reading after the pause"
+        );
     }
 
     /// Only the top-left pane's first tab on glass, with nothing before it, meets the sheet's
