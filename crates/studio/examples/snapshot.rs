@@ -16,7 +16,9 @@
 //! after notifying the workspace (or redrawing everything) and prints their times;
 //! `measure:<n>,scroll=<dy>` first scrolls at the window's centre each frame (a zoom on the
 //! canvas), and `measure:<n>,drag=<dx>:<dy>` drags from the centre by that much a frame (a pan),
-//! both back and forth every 30 frames. `SNAPSHOT_WAIT_MS` (default 1500) is how
+//! both back and forth every 30 frames; `measure:<n>,type` types a letter into the focused
+//! field and takes it back, alternately. Each also prints the main thread's CPU time per
+//! frame, which a busy machine does not inflate. `SNAPSHOT_WAIT_MS` (default 1500) is how
 //! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
 //! 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`. The run
 //! keeps its state in a fresh temporary directory unless `OMNIGRAPH_STUDIO_DATA` names one, so
@@ -30,6 +32,17 @@ use gpui::{
     MouseMoveEvent, MouseUpEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase, point,
     px, size,
 };
+
+/// The calling thread's CPU time so far.
+fn thread_cpu_time() -> Duration {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid timespec for the call to fill.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+    Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+}
 
 /// A left-button drag from `from` to `to`, in ten moves.
 fn drag(
@@ -199,11 +212,14 @@ fn main() {
                 .and_then(|n| n.parse().ok())
                 .expect("measure:<frames>");
             let mut refresh = false;
+            let mut typing = false;
             let mut scroll: Option<f32> = None;
             let mut drag: Option<(f32, f32)> = None;
             for part in parts {
                 if part == "refresh" {
                     refresh = true;
+                } else if part == "type" {
+                    typing = true;
                 } else if let Some(dy) = part.strip_prefix("scroll=") {
                     scroll = Some(dy.parse().expect("scroll=<pixels>"));
                 } else if let Some(delta) = part.strip_prefix("drag=") {
@@ -230,12 +246,21 @@ fn main() {
                 .expect("press for the drag");
             }
             let mut times = Vec::with_capacity(frames);
+            let mut cpu_times = Vec::with_capacity(frames);
             for frame in 0..frames {
                 // Back and forth every 30 frames, so the view stays where it can be measured.
                 let sign = if (frame / 30) % 2 == 0 { 1. } else { -1. };
                 cx.update_window(handle, |root, window, cx| {
                     let start = Instant::now();
-                    if let Some(dy) = scroll {
+                    let cpu_start = thread_cpu_time();
+                    if typing {
+                        // Typing into the focused field: a letter, then taking it back.
+                        let key = if frame % 2 == 0 { "a" } else { "backspace" };
+                        window.dispatch_keystroke(
+                            gpui::Keystroke::parse(key).expect("a keystroke"),
+                            cx,
+                        );
+                    } else if let Some(dy) = scroll {
                         window.dispatch_event(
                             PlatformInput::ScrollWheel(ScrollWheelEvent {
                                 position: center,
@@ -266,6 +291,7 @@ fn main() {
                     }
                     window.draw(cx).clear(cx);
                     times.push(start.elapsed());
+                    cpu_times.push(thread_cpu_time() - cpu_start);
                 })
                 .expect("draw a frame");
             }
@@ -284,20 +310,27 @@ fn main() {
                 .expect("release the drag");
             }
             times.sort();
-            let at = |q: f32| times[((times.len() - 1) as f32 * q) as usize];
-            let kind = match (scroll, drag, refresh) {
-                (Some(_), _, _) => " (scroll)",
-                (_, Some(_), _) => " (drag)",
-                (_, _, true) => " (refresh)",
+            cpu_times.sort();
+            let at = |times: &[Duration], q: f32| times[((times.len() - 1) as f32 * q) as usize];
+            let kind = match (typing, scroll, drag, refresh) {
+                (true, _, _, _) => " (type)",
+                (_, Some(_), _, _) => " (scroll)",
+                (_, _, Some(_), _) => " (drag)",
+                (_, _, _, true) => " (refresh)",
                 _ => "",
             };
+            // Wall time is what a frame took; the main thread's CPU time is the work in it,
+            // which other processes on a busy machine do not inflate.
             eprintln!(
-                "measure{kind}: {frames} frames, median {:.2?}, p90 {:.2?}, p95 {:.2?}, p99 {:.2?}, max {:.2?}",
-                at(0.5),
-                at(0.9),
-                at(0.95),
-                at(0.99),
-                at(1.)
+                "measure{kind}: {frames} frames, median {:.2?}, p90 {:.2?}, p95 {:.2?}, p99 {:.2?}, max {:.2?} | cpu median {:.2?}, p95 {:.2?}, p99 {:.2?}",
+                at(&times, 0.5),
+                at(&times, 0.9),
+                at(&times, 0.95),
+                at(&times, 0.99),
+                at(&times, 1.),
+                at(&cpu_times, 0.5),
+                at(&cpu_times, 0.95),
+                at(&cpu_times, 0.99),
             );
             continue;
         }
