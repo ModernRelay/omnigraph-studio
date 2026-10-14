@@ -34,6 +34,7 @@ use gpui::{
 };
 
 /// The calling thread's CPU time so far.
+#[cfg(unix)]
 fn thread_cpu_time() -> Duration {
     let mut now = libc::timespec {
         tv_sec: 0,
@@ -42,6 +43,13 @@ fn thread_cpu_time() -> Duration {
     // SAFETY: `now` is a valid timespec for the call to fill.
     unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
     Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+}
+
+/// Elsewhere the wall clock stands in, so CPU times equal wall times.
+#[cfg(not(unix))]
+fn thread_cpu_time() -> Duration {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
 }
 
 /// A left-button drag from `from` to `to`, in ten moves.
