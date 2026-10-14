@@ -18,7 +18,9 @@ impl Sample {
     pub fn now() -> Self {
         Self {
             at: Instant::now(),
-            memory: memory(),
+            // The system updates the peak lazily, so while memory grows it can trail the
+            // current figure; the peak is at least what is held now.
+            memory: memory().map(|(now, peak)| (now, peak.max(now))),
             cpu_time: cpu_time(),
         }
     }
