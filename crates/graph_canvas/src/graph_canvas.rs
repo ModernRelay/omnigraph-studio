@@ -1758,11 +1758,13 @@ impl GraphCanvas {
         let chips = self.chips.clone();
         canvas(
             move |bounds, window, _cx| {
-                // A new size is fitted on the next frame, once the view knows it.
+                // A new size is fitted on the next frame, once the view knows it. Only this view
+                // draws again: a whole-window refresh would redraw every cached tab and dock on
+                // each frame of a dock's glide.
                 let resized = bounds_cell.get().map(|b| b.size) != Some(bounds.size);
                 bounds_cell.set(Some(bounds));
                 if resized {
-                    window.refresh();
+                    window.request_animation_frame();
                 }
             },
             move |bounds, (), window, cx| {

@@ -108,7 +108,8 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | Date | Claim | Check | Result |
 |---|---|---|---|
 | 2026-10-11 | Layout and edge costs at 1k/10k/50k | research benchmark on this Mac | 2.2/34/254 ms per layout step; 0.14/1.3/8 ms edges per frame |
-| pending | Pan and zoom p95 < 16 ms at 10k nodes, 30k edges | spike S2 | |
+| pending | Pan and zoom p95 < 16 ms at 10k nodes, 30k edges | spike S2 | First pass 2026-10-13, debug build, not yet the claim: branch `perf-10k` of the dev graph (`dev-seed.py --people 10000`, loaded in chunks of at most 8,000 per type, the server's limit), the `knows` query's 20,534 rows drawn as 9,767 nodes, `canvas_max_nodes` 10,000, the snapshot tool's new `measure:120,drag=8:0` and `measure:120,scroll=40`. Pan p95 24.8 ms, zoom p95 25.0 ms, a notify alone p95 1.6 ms. The canvas stayed blank from about 4,000 nodes: a result's roots sit on one ring sized by their count, which at thousands of roots is wider than the view can zoom out to, so the frame time measures per-frame work over every edge with few chips on screen. Needs a release build and a result layout for many components |
+| 2026-10-13 | A result's layout grows about linearly | `layout` instrument `explore_layout_time` (debug build, results shaped as the canvas builds them); `free_room_is_found_as_testing_every_block_finds_it` (2,000 random cases against the first implementation) | Before: 0.40 s at 4,000 nodes, 2.44 s at 10,000: each column listed every chip again and tested every candidate start against every chip. After: 39 ms and 198 ms, chips kept as they are placed and room found from merged gaps |
 | 2026-10-12 | Schema landing: types on a circle by sorted name, sized by `/snapshot` counts, one arrowed line per edge type, self-loops | offscreen snapshot, `OpenCanvas`, dev graph | Company 25, Person 200, Project 40; Knows drawn as a loop on Person (superseded by the stress layout below) |
 | 2026-10-12 | The ontology reads as a map | `layout` tests (determinism, no overlaps, related types nearer than unrelated by 1.5×, hubs central, landscape, fewer crossings and shorter edges than a ring, unrelated types beside, placed types fixed); a CRM ontology (25 types, 78 relationships) measured locally; the app on that graph | Ring 668 crossings / 78.7k px edges; map 117 / 26.5k; fit shows every type named |
 | 2026-10-12 | The explorer is a compact mind map | `layout` tests (hubs split across the root's sides, neighbours in one column beyond their hub within a chip and a gap, rectangle overlap, drawn columns grow at the bottom with "+K more" last); offscreen snapshots of Goldwasser Labs → WorksAt → Ivan Hopper expanded | One aligned column of nine people and "+1 more"; Ivan's four hubs in a column beside him; nothing drawn moved |
@@ -128,6 +129,10 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | 2026-10-12 | Query results as a canvas | `gq_language` `whole_node_columns_carry_their_type`; `query_editor` `node_columns_become_a_graph_of_distinct_nodes_linked_by_row`; snapshot of `return { $p, $c }` | The result offers Canvas; a results canvas draws each node once and links the nodes of a row; it is a tab of its own and is not restored |
 
 ## Corrections
+
+- 2026-10-13 · A resize redrew the whole window on the next frame (`window.refresh`), which
+  turns off every cached tab and dock, on each frame of a dock's glide. It now asks for the
+  canvas view alone (`request_animation_frame`).
 
 - **Dotted lines froze the canvas (2026-10-13).** The dash walk carried its place in the
   pattern from piece to piece in f32. When the step left in a dash fell below the resolution

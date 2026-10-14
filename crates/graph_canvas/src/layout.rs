@@ -597,6 +597,17 @@ pub fn explore_positions(nodes: &[LayoutNode]) -> Vec<Vec2> {
     let mut position = vec![Vec2::default(); count];
     let mut fixed = vec![false; count];
     let mut placed = vec![false; count];
+    // Every placed chip's box (left, right, top, bottom), kept as chips are placed, so a column
+    // looks for room among them without listing every node again.
+    let mut taken: Vec<[f32; 4]> = Vec::with_capacity(count);
+    let chip_box = |index: usize, at: Vec2| {
+        [
+            at.x - nodes[index].space - GAP / 2.,
+            at.x + nodes[index].space + GAP / 2.,
+            at.y - CHIP_HALF_HEIGHT - GAP / 2.,
+            at.y + CHIP_HALF_HEIGHT + GAP / 2.,
+        ]
+    };
     let mut roots = 0;
     // Drawn nodes first, all of them: where a column ends is read from them.
     for index in 0..count {
@@ -604,6 +615,7 @@ pub fn explore_positions(nodes: &[LayoutNode]) -> Vec<Vec2> {
             position[index] = previous;
             fixed[index] = true;
             placed[index] = true;
+            taken.push(chip_box(index, previous));
         }
     }
     for index in 0..count {
@@ -611,6 +623,7 @@ pub fn explore_positions(nodes: &[LayoutNode]) -> Vec<Vec2> {
             position[index] = Vec2::new(roots as f32 * 900., 0.);
             roots += 1;
             placed[index] = true;
+            taken.push(chip_box(index, position[index]));
         }
         if !placed[index] {
             continue;
@@ -686,18 +699,6 @@ pub fn explore_positions(nodes: &[LayoutNode]) -> Vec<Vec2> {
             // a chip already placed (drawn earlier, or another column of this layout) is in
             // the way. A column opened later beside one that reaches past its parent would
             // otherwise land on it, and drawn chips never move.
-            let taken: Vec<[f32; 4]> = (0..count)
-                .filter(|j| placed[*j])
-                .map(|j| {
-                    let p = position[j];
-                    [
-                        p.x - nodes[j].space - GAP / 2.,
-                        p.x + nodes[j].space + GAP / 2.,
-                        p.y - CHIP_HALF_HEIGHT - GAP / 2.,
-                        p.y + CHIP_HALF_HEIGHT + GAP / 2.,
-                    ]
-                })
-                .collect();
             let mut top = match drawn_bottom[side] {
                 Some(bottom) => free_top(bottom, total, span, &taken, true),
                 None => free_top(position[index].y - total / 2., total, span, &taken, false),
@@ -705,6 +706,7 @@ pub fn explore_positions(nodes: &[LayoutNode]) -> Vec<Vec2> {
             for (&child, &x) in members.iter().zip(&xs) {
                 position[child] = Vec2::new(x, top + height[child] / 2.);
                 placed[child] = true;
+                taken.push(chip_box(child, position[child]));
                 top += height[child] + sibling_gap(height[child]);
             }
         }
@@ -718,25 +720,40 @@ pub fn explore_positions(nodes: &[LayoutNode]) -> Vec<Vec2> {
 /// that no chip crosses. A column that only grows (`downward`) starts no higher than `ideal`.
 /// Below every chip always fits, so there is always an answer.
 fn free_top(ideal: f32, total: f32, span: (f32, f32), taken: &[[f32; 4]], downward: bool) -> f32 {
-    let blocks: Vec<(f32, f32)> = taken
+    // The blocked stretches of the column's span, merged; the room is the gaps between them.
+    let mut blocks: Vec<(f32, f32)> = taken
         .iter()
         .filter(|[left, right, _, _]| *left < span.1 && *right > span.0)
         .map(|[_, _, top, bottom]| (*top, *bottom))
         .collect();
-    let fits = |start: f32| {
-        blocks
-            .iter()
-            .all(|(top, bottom)| start + total <= *top || start >= *bottom)
-    };
-    if fits(ideal) {
-        return ideal;
+    blocks.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Vec<(f32, f32)> = Vec::with_capacity(blocks.len());
+    for (top, bottom) in blocks {
+        match merged.last_mut() {
+            Some(last) if top < last.1 => last.1 = last.1.max(bottom),
+            _ => merged.push((top, bottom)),
+        }
     }
-    blocks
-        .iter()
-        .flat_map(|(top, bottom)| [*bottom, *top - total])
-        .filter(|start| (!downward || *start >= ideal) && fits(*start))
-        .min_by(|a, b| (a - ideal).abs().total_cmp(&(b - ideal).abs()))
-        .unwrap_or(ideal)
+    // Each gap from one stretch's bottom to the next one's top, and the open ends; the nearest
+    // start in a gap the column fits in.
+    let mut best: Option<f32> = None;
+    let mut consider = |low: f32, high: f32| {
+        let low = if downward { low.max(ideal) } else { low };
+        if high - low < total {
+            return;
+        }
+        let start = ideal.clamp(low, high - total);
+        if best.is_none_or(|best| (start - ideal).abs() < (best - ideal).abs()) {
+            best = Some(start);
+        }
+    };
+    let mut floor = f32::NEG_INFINITY;
+    for (top, bottom) in &merged {
+        consider(floor, *top);
+        floor = floor.max(*bottom);
+    }
+    consider(floor, f32::INFINITY);
+    best.unwrap_or(ideal)
 }
 
 /// One row of an exploration column: a chip and the room under it.
@@ -890,6 +907,116 @@ pub fn nearest_in_direction(positions: &[Vec2], from: usize, direction: Vec2) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A query result drawn as the canvas draws one (`rebuild_results`): `count` nodes, each
+    /// linked to about two others picked by a fixed sequence, roots on a ring.
+    fn result_like(count: usize) -> Vec<LayoutNode> {
+        let mut next = 7_u64;
+        let mut pick = |below: usize| {
+            next = next
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (next >> 33) as usize % below
+        };
+        let mut parent = vec![None; count];
+        for from in 0..count {
+            for _ in 0..2 {
+                let to = pick(count);
+                if from < to && parent[to].is_none() {
+                    parent[to] = Some(from);
+                }
+            }
+        }
+        let roots: Vec<usize> = (0..count).filter(|i| parent[*i].is_none()).collect();
+        let mut fixed = vec![None; count];
+        for (root, position) in roots.iter().zip(schema_positions(roots.len())) {
+            fixed[*root] = Some(position);
+        }
+        (0..count)
+            .map(|i| LayoutNode {
+                parent: parent[i],
+                kind: LayoutKind::Node,
+                space: 40.,
+                previous: fixed[i],
+            })
+            .collect()
+    }
+
+    /// Instrument for spec 006's scale check: how long a result's layout takes as it grows.
+    /// Run with `cargo test -p graph_canvas --release explore_layout_time -- --ignored
+    /// --nocapture`.
+    /// `free_top` as it was first written, testing every block for every candidate: the
+    /// oracle for the merged-gap search.
+    fn free_top_by_testing(
+        ideal: f32,
+        total: f32,
+        span: (f32, f32),
+        taken: &[[f32; 4]],
+        downward: bool,
+    ) -> f32 {
+        let blocks: Vec<(f32, f32)> = taken
+            .iter()
+            .filter(|[left, right, _, _]| *left < span.1 && *right > span.0)
+            .map(|[_, _, top, bottom]| (*top, *bottom))
+            .collect();
+        let fits = |start: f32| {
+            blocks
+                .iter()
+                .all(|(top, bottom)| start + total <= *top || start >= *bottom)
+        };
+        if fits(ideal) {
+            return ideal;
+        }
+        blocks
+            .iter()
+            .flat_map(|(top, bottom)| [*bottom, *top - total])
+            .filter(|start| (!downward || *start >= ideal) && fits(*start))
+            .min_by(|a, b| (a - ideal).abs().total_cmp(&(b - ideal).abs()))
+            .unwrap_or(ideal)
+    }
+
+    #[test]
+    fn free_room_is_found_as_testing_every_block_finds_it() {
+        let mut next = 11_u64;
+        let mut draw = |below: u32| {
+            next = next
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((next >> 33) % u64::from(below)) as f32
+        };
+        for case in 0..2_000 {
+            let taken: Vec<[f32; 4]> = (0..(case % 12))
+                .map(|_| {
+                    let (x, y) = (draw(400), draw(600));
+                    [x, x + 20. + draw(120), y, y + 10. + draw(60)]
+                })
+                .collect();
+            let span = {
+                let left = draw(400);
+                (left, left + 20. + draw(200))
+            };
+            let (ideal, total, downward) = (draw(600), 10. + draw(150), case % 3 == 0);
+            let found = free_top(ideal, total, span, &taken, downward);
+            let expected = free_top_by_testing(ideal, total, span, &taken, downward);
+            // Both answers are the nearest fitting start; on a tie either side is right.
+            assert!(
+                (found - ideal).abs() == (expected - ideal).abs(),
+                "case {case}: {found} vs {expected} (ideal {ideal}, total {total})"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "instrument: layout time by node count"]
+    fn explore_layout_time() {
+        for count in [500, 1_000, 2_000, 4_000, 10_000] {
+            let nodes = result_like(count);
+            let start = std::time::Instant::now();
+            let positions = explore_positions(&nodes);
+            eprintln!("{count} nodes: {:.2?}", start.elapsed());
+            assert_eq!(positions.len(), count);
+        }
+    }
 
     fn star(hubs: usize, per_hub: usize) -> Vec<LayoutNode> {
         let mut nodes = vec![LayoutNode {
