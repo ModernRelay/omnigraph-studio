@@ -301,8 +301,18 @@ kept answers.
 | 2026-10-13 | ↵ on an offered value types nothing into the field | Snapshot of ↵ on the first offer, before and after the fix | Before: the field read `person-000000\n`; Studio's `move_to_end` after `set_text` only propagates in a single-line editor, so the ↵ reached the field as text too. After: `person-000000`. The table's filter field had the same call. Guarded by the headless `type_table` test `enter_on_an_offered_node_picks_it_and_types_nothing`, which fails with the old call (`"person-000004\n"`) |
 | 2026-10-13 | A peek reads only what the table did not | offscreen snapshots through a request-counting proxy: the Person table (four relationship columns), then the peek and ↓ twice | Before: the peek read 4 counts and up to 4 neighbour lists for each row it showed, 22 reads in all; after: none. The peek of Grace Allen read the same before and after (contributes 2 with both projects, knows 0, worksAt 0, known by 2 with both people) |
 | 2026-10-13 | Another writer's commit shows "Newer data" within a poll | offscreen snapshots on the dev server: the Person table, then a title set from curl 25 s in, then 40 s more; and a control with the write before the table's first read | The table kept its commit's title and showed "Newer data · Refresh" with the tab's dot; in the control it read the new title and showed nothing |
+| 2026-10-14 | Typing in the filter field or a cell does not draw the grid | Main-thread CPU per frame from the snapshot tool, `release-fast`, Person (200 rows), 200 frames, before and after in the same sessions; `sample` of the filter loop; headless `typing_in_a_field_leaves_the_grid_as_it_was` and `studio_workspace` `a_tab_that_caches_its_parts_keeps_them_while_a_field_changes`, each failing with its fix undone | Before, a key in either field cost a full grid draw (10.5 ms filter, 10 ms scroll, under load); the profile put it in the grid's layout and paint, the editor's own work under 1 ms. After: filter 2.2 ms, cell 2.3 ms, query editor 3.5 ms, scroll 7.6 ms (load average 20). Undoing the per-key `notify` fails the filter assertion; drawing the editor inside the grid fails the cell assertion |
 
 ## Corrections
+
+- 2026-10-14 · Every key in the filter field or a cell drew the whole grid again: the fields
+  were inside the table's view, GPUI draws every view around a changed field, and the pane
+  drew the table cached, so the grid inside it was drawn again as well (`prepaint_view`). The
+  grid is now a view of its own (`TableGrid`), made with the table, drawn cached, and drawn
+  again when the table notifies; the table answers `caches_its_parts` so its pane draws it
+  uncached; the cell editor is drawn over its cell from outside the grid
+  (`studio_ui::OverlaySlot`); and the filter's suggestions no longer notify on every key.
+  The rules and their guards are in `docs/drawing.md`.
 
 - 2026-10-13 · Columns can be resized, which was deferred. Each header's right edge is a 6 px
   handle: drag it to set the width (48 to 1,200 px), click it twice to fit the column to its

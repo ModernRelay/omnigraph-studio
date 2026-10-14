@@ -1928,12 +1928,18 @@ impl Workspace {
     fn render_pane(&self, pane_id: PaneId, cx: &mut Context<Self>) -> AnyElement {
         let body = match self.pane(pane_id).and_then(|pane| pane.active_item()) {
             // Cached, as Zed caches each pane: the tab's view is drawn again only when it
-            // notifies, so a hover or a toast elsewhere replays it from the last frame.
+            // notifies, so a hover or a toast elsewhere replays it from the last frame. A tab
+            // that caches its own costly part is drawn uncached, or that part would be drawn
+            // again with it.
             Some(item) => div()
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()
-                .child(item.to_any().cached(cached_fill()))
+                .child(if item.caches_its_parts(cx) {
+                    item.to_any().into_any_element()
+                } else {
+                    item.to_any().cached(cached_fill()).into_any_element()
+                })
                 .into_any_element(),
             None if self.panes.len() == 1 => self.render_empty_center(cx).into_any_element(),
             None => studio_ui::ds::empty_state(IconName::Sparkle, "No tab open").into_any_element(),
@@ -3044,5 +3050,98 @@ mod tests {
             .unwrap();
         assert!(hide(cx));
         assert!(!open_now(cx));
+    }
+
+    /// A tab's costly part, drawn cached, counting its draws.
+    struct Part {
+        renders: usize,
+    }
+
+    impl Render for Part {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders += 1;
+            div().size_full()
+        }
+    }
+
+    /// Stands in for a field: notifying it is a keystroke.
+    struct Field;
+
+    impl Render for Field {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    struct Split {
+        field: Entity<Field>,
+        part: Entity<Part>,
+        caches: bool,
+        focus_handle: FocusHandle,
+    }
+
+    impl EventEmitter<ItemEvent> for Split {}
+
+    impl Focusable for Split {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for Split {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(self.field.clone())
+                .child(AnyView::from(self.part.clone()).cached(cached_fill()))
+        }
+    }
+
+    impl Item for Split {
+        fn tab_title(&self, _: &App) -> SharedString {
+            "Split".into()
+        }
+
+        fn caches_its_parts(&self) -> bool {
+            self.caches
+        }
+    }
+
+    /// A keystroke in a tab's field draws its cached part again only when the pane caches the
+    /// whole tab: GPUI draws every cached view inside a cached view that draws again. If GPUI
+    /// stops doing that, the second assertion fails and `caches_its_parts` can go.
+    #[gpui::test]
+    fn a_tab_that_caches_its_parts_keeps_them_while_a_field_changes(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let window = cx.add_window(Workspace::new);
+        for caches in [true, false] {
+            let split = window
+                .update(cx, |workspace, window, cx| {
+                    workspace.open_item(format!("split-{caches}"), window, cx, |_, cx| Split {
+                        field: cx.new(|_| Field),
+                        part: cx.new(|_| Part { renders: 0 }),
+                        caches,
+                        focus_handle: cx.focus_handle(),
+                    })
+                })
+                .unwrap()
+                .unwrap();
+            cx.run_until_parked();
+            let renders = |cx: &mut gpui::TestAppContext| {
+                split.read_with(cx, |split, cx| split.part.read(cx).renders)
+            };
+            let before = renders(cx);
+            assert!(before > 0, "the part was drawn");
+            split.update(cx, |split, cx| split.field.update(cx, |_, cx| cx.notify()));
+            cx.run_until_parked();
+            if caches {
+                assert_eq!(renders(cx), before, "the part was drawn again");
+            } else {
+                assert_eq!(renders(cx), before + 1);
+            }
+        }
     }
 }

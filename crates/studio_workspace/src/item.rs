@@ -59,6 +59,14 @@ pub trait Item: Render + Focusable + EventEmitter<ItemEvent> {
     fn footer(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<ItemFooter> {
         None
     }
+
+    /// The item draws its costly part as a cached view of its own, so its pane draws it
+    /// uncached. A cached view that draws again draws every cached view inside it again too
+    /// (GPUI's `prepaint_view`), so a keystroke in one of the item's fields would lay that part
+    /// out again if the pane cached the whole item.
+    fn caches_its_parts(&self) -> bool {
+        false
+    }
 }
 
 pub trait ItemHandle: 'static {
@@ -73,6 +81,7 @@ pub trait ItemHandle: 'static {
     fn boxed_clone(&self) -> Box<dyn ItemHandle>;
     fn serialize(&self, cx: &App) -> Option<SavedItem>;
     fn footer(&self, window: &mut Window, cx: &mut App) -> Option<ItemFooter>;
+    fn caches_its_parts(&self, cx: &App) -> bool;
 }
 
 impl<T: Item> ItemHandle for Entity<T> {
@@ -118,5 +127,9 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn footer(&self, window: &mut Window, cx: &mut App) -> Option<ItemFooter> {
         self.update(cx, |item, cx| item.footer(window, cx))
+    }
+
+    fn caches_its_parts(&self, cx: &App) -> bool {
+        self.read(cx).caches_its_parts()
     }
 }

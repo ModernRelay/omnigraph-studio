@@ -12,10 +12,12 @@ pub use studio_theme::type_color;
 mod changes;
 pub mod ds;
 pub mod motion;
+mod overlay_slot;
 mod resize;
 mod values;
 
 pub use changes::{ChangeCard, ChangeKind, PropertyRow, change_counts, change_group_header};
+pub use overlay_slot::{OverlaySlot, OverlaySlotElement};
 pub use resize::{
     COLUMN_MAX_WIDTH, COLUMN_MIN_WIDTH, ColumnDrag, ColumnResize, clamp_width, column_resize_handle,
 };

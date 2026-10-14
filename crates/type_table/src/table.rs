@@ -15,10 +15,10 @@ use std::time::Duration;
 use collections::IndexSet;
 use editor::{Editor, EditorEvent};
 use gpui::{
-    Anchor, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, Entity,
+    Anchor, AnyView, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, Entity,
     EventEmitter, FocusHandle, Focusable, KeyContext, MouseButton, MouseDownEvent, Pixels, Render,
-    ScrollStrategy, SharedString, Subscription, Task, WeakEntity, Window, anchored, deferred,
-    point,
+    ScrollStrategy, SharedString, StyleRefinement, Subscription, Task, WeakEntity, Window,
+    anchored, deferred, point,
 };
 use gq_language::{
     BuildError, BuiltQuery, Filter, FilterOp, PageStart, Property, RelationshipGroup, ScalarKind,
@@ -232,6 +232,11 @@ pub struct TypeTable {
     /// The time relative dates are read against, taken once a frame rather than once a cell
     /// (reading the local time zone is not free).
     frame_now: chrono::DateTime<chrono::Local>,
+    /// The grid as a view of its own, drawn again whenever the table notifies.
+    grid: Entity<TableGrid>,
+    /// Where the grid drew the cell being edited; the cell's editor is drawn over it from
+    /// outside the grid, so a keystroke does not draw the grid again.
+    edit_slot: studio_ui::OverlaySlot,
     /// The rows whose Blob cells were last asked for, and the pause before they are read.
     blob_rows: Option<Range<usize>>,
     _blob_wait: Option<Task<()>>,
@@ -289,6 +294,11 @@ impl Focusable for TypeTable {
 }
 
 impl Item for TypeTable {
+    /// The grid is drawn cached on its own (`TableGrid`).
+    fn caches_its_parts(&self) -> bool {
+        true
+    }
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         match &self.at_commit {
             Some(commit) => format!("{} @ {}", self.type_name, short_commit(commit)).into(),
@@ -361,6 +371,7 @@ impl TypeTable {
             editor.set_text_style_refinement(studio_ui::ds::field_text(cx));
             editor
         });
+        let grid = TableGrid::new(cx);
         let mut subscriptions = vec![
             cx.subscribe_in(&session, window, Self::on_session_event),
             cx.subscribe_in(
@@ -368,6 +379,8 @@ impl TypeTable {
                 window,
                 |this, _, event: &EditorEvent, _window, cx| match event {
                     EditorEvent::Blurred => this.cell_editor_blurred(cx),
+                    // Only a cleared notice changes what the grid shows; the editor draws
+                    // over the grid (`edit_slot`), so typing leaves the grid as it was.
                     EditorEvent::BufferEdited => {
                         if let Some(editing) = &mut this.editing
                             && editing
@@ -376,8 +389,8 @@ impl TypeTable {
                                 .is_some_and(|n| n.tone == Tone::Invalid)
                         {
                             editing.notice = None;
+                            cx.notify();
                         }
-                        cx.notify();
                     }
                     _ => {}
                 },
@@ -385,12 +398,13 @@ impl TypeTable {
             cx.subscribe(
                 &filter_editor,
                 |this, _, event: &EditorEvent, cx| match event {
+                    // No `notify`: the table draws again because the field it holds changed,
+                    // and the grid, which does not show the field, keeps its last frame.
                     EditorEvent::BufferEdited => {
                         if let Some(draft) = &mut this.filter_draft {
                             draft.error = None;
                         }
                         this.refresh_suggestions(cx);
-                        cx.notify();
                     }
                     // The offered values show only while the field has focus.
                     EditorEvent::Focused | EditorEvent::Blurred => cx.notify(),
@@ -445,6 +459,8 @@ impl TypeTable {
             frame_lines: None,
             frame_looks: Rc::default(),
             frame_now: chrono::Local::now(),
+            grid,
+            edit_slot: Default::default(),
             resizing: None,
             blob_rows: None,
             _blob_wait: None,
@@ -3782,7 +3798,8 @@ impl TypeTable {
                 }));
             }
         }
-        cx.notify();
+        // No `notify`: it would draw the grid on every key. The callers that change the draft
+        // notify; a keystroke draws the table again because its field changed.
     }
 
     /// ↑/↓ in the value field: highlights another offered value.
@@ -4382,6 +4399,8 @@ impl TypeTable {
     }
 
     fn render_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.frame_now = chrono::Local::now();
+        self.edit_slot.clear();
         if self.missing {
             return studio_ui::empty_state(
                 format!("The schema has no type {}", self.type_name),
@@ -5197,9 +5216,16 @@ impl TypeTable {
                 .property()
                 .and_then(|p| p.enum_values.as_ref())
                 .map(|values| format!("One of: {}", values.join(", ")));
+            // The editor itself is drawn over this place by the table (`edit_slot`).
             return cell
                 .bg(editor_bg)
-                .child(div().flex_1().min_w_0().child(self.cell_editor.clone()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(self.edit_slot.mark()),
+                )
                 .child(ring())
                 .child(self.render_edit_callout(editing.notice.clone(), hint, window, cx))
                 .into_any_element();
@@ -5532,7 +5558,6 @@ fn set_value(row: &mut Row, column: &str, value: Value) {
 
 impl Render for TypeTable {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.frame_now = chrono::Local::now();
         let typing =
             self.editing.is_some() || self.filter_editor.focus_handle(cx).is_focused(window);
         let mut context = KeyContext::new_with_defaults();
@@ -5545,7 +5570,7 @@ impl Render for TypeTable {
         let filter_bar = self.render_filter_bar(window, cx);
         let bulk_bar = self.render_bulk_bar(cx);
         let drafts_bar = self.render_drafts_bar(cx);
-        let body = self.render_body(cx);
+        let grid = self.grid.clone();
         v_flex()
             .key_context(context)
             .track_focus(&self.focus_handle)
@@ -5599,7 +5624,18 @@ impl Render for TypeTable {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    .child(body)
+                    .child(AnyView::from(grid).cached(StyleRefinement::default().size_full()))
+                    .when(self.editing.is_some(), |body| {
+                        body.child(
+                            self.edit_slot.overlay(
+                                div()
+                                    .size_full()
+                                    .flex()
+                                    .items_center()
+                                    .child(self.cell_editor.clone()),
+                            ),
+                        )
+                    })
                     .children(drafts_bar),
             )
             .children(self.header_menu.as_ref().map(|(menu, position, _)| {
@@ -5612,6 +5648,46 @@ impl Render for TypeTable {
                 )
                 .with_priority(1)
             }))
+    }
+}
+
+/// The table's rows and their headers, drawn as a view of their own. Typing in the filter or
+/// bulk-edit field draws the table again, as GPUI draws every view around a changed field, and
+/// a grid drawn inside it would be laid out again with it: about as much work as a scroll, on
+/// every key. Held apart and drawn cached, the grid keeps its last frame until the table
+/// notifies or the grid itself changes (a scroll, the cell being edited).
+struct TableGrid {
+    table: WeakEntity<TypeTable>,
+    _table_changed: Subscription,
+    /// How often the grid was drawn, for the test that typing leaves it alone.
+    #[cfg(test)]
+    renders: usize,
+}
+
+impl TableGrid {
+    /// Made with the table, not on its first draw: an entity made while a frame is drawn counts
+    /// as read before its own cached draw, so GPUI leaves it out of what that view depends on
+    /// and stops redrawing it when it notifies.
+    fn new(cx: &mut Context<TypeTable>) -> Entity<Self> {
+        let table = cx.entity();
+        cx.new(|cx| TableGrid {
+            table: table.downgrade(),
+            _table_changed: cx.observe(&table, |_, _, cx| cx.notify()),
+            #[cfg(test)]
+            renders: 0,
+        })
+    }
+}
+
+impl Render for TableGrid {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        self.table
+            .update(cx, |table, cx| table.render_body(cx))
+            .unwrap_or_else(|_| gpui::Empty.into_any_element())
     }
 }
 
@@ -5636,5 +5712,119 @@ impl Render for DraggedColumn {
             .border_color(cx.theme().colors().border)
             .shadow_md()
             .child(Label::new(self.title.clone()).size(LabelSize::Small))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+    use graph_store::{Connection, ServerEntry, ServerSource};
+    use http_client::{AsyncBody, FakeHttpClient, Response};
+    use serde_json::json;
+
+    /// A server with two people; every read answers with both.
+    fn session(cx: &mut TestAppContext) -> Entity<GraphSession> {
+        let http = FakeHttpClient::create(|request| async move {
+            let path = request.uri().path().to_owned();
+            let body = if path.ends_with("/schema") {
+                json!({ "schema_source": "node Person {\n  slug: String @key\n  name: String\n}\n" })
+            } else if path.ends_with("/query") {
+                json!({
+                    "query_name": "q",
+                    "target": {"branch": "main", "snapshot": null},
+                    "row_count": 2,
+                    "columns": ["n"],
+                    "rows": [
+                        {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
+                        {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
+                    ],
+                    "graph_commit_id": "c1",
+                })
+            } else {
+                json!({ "branches": ["main"] })
+            };
+            Ok(Response::builder()
+                .status(200)
+                .header(graph_client::CONTRACT_HEADER, "0.13")
+                .body(AsyncBody::from(body.to_string()))
+                .unwrap())
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx))
+    }
+
+    fn grid_renders(table: &Entity<TypeTable>, cx: &mut VisualTestContext) -> usize {
+        table.read_with(cx, |table, cx| table.grid.read(cx).renders)
+    }
+
+    /// Typing in the filter field or in a cell draws the grid no more: the field draws over
+    /// it or beside it. Anything the table announces draws it again.
+    #[gpui::test]
+    async fn typing_in_a_field_leaves_the_grid_as_it_was(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session(cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| assert_eq!(table.rows.len(), 2));
+
+        // The grid follows the table, also when it was made with the table.
+        let before = grid_renders(&table, cx);
+        table.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(grid_renders(&table, cx), before + 1);
+
+        // The first key also switches GPUI to keyboard input, which draws the whole window
+        // once; the keys after it are the ones counted.
+        table.update_in(cx, |table, window, cx| table.open_filter_draft(window, cx));
+        cx.simulate_input("A");
+        cx.run_until_parked();
+        let before = grid_renders(&table, cx);
+        cx.simulate_input("d");
+        cx.run_until_parked();
+        table.read_with(cx, |table, cx| {
+            assert_eq!(table.filter_editor.read(cx).text(cx), "Ad")
+        });
+        assert_eq!(
+            grid_renders(&table, cx),
+            before,
+            "the filter field drew the grid"
+        );
+
+        table.update_in(cx, |table, window, cx| {
+            table.filter_draft = None;
+            let col = table.columns.iter().position(|c| c.key == "name").unwrap();
+            table.start_edit(Cursor { row: 0, col }, window, cx);
+        });
+        cx.run_until_parked();
+        let before = grid_renders(&table, cx);
+        cx.simulate_input("Ada L");
+        cx.run_until_parked();
+        table.read_with(cx, |table, cx| {
+            assert_eq!(table.cell_editor.read(cx).text(cx), "Ada L")
+        });
+        assert_eq!(
+            grid_renders(&table, cx),
+            before,
+            "the cell editor drew the grid"
+        );
     }
 }
