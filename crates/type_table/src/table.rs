@@ -12,6 +12,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use collections::IndexSet;
 use editor::{Editor, EditorEvent};
 use gpui::{
     Anchor, App, ClickEvent, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle,
@@ -224,6 +225,9 @@ pub struct TypeTable {
     frame_lines: Option<Rc<Vec<Line>>>,
     /// How the lines drawn this frame look, filled by the row callback for the row styling.
     frame_looks: Rc<RefCell<HashMap<usize, RowLook>>>,
+    /// The time relative dates are read against, taken once a frame rather than once a cell
+    /// (reading the local time zone is not free).
+    frame_now: chrono::DateTime<chrono::Local>,
     /// The rows whose Blob cells were last asked for, and the pause before they are read.
     blob_rows: Option<Range<usize>>,
     _blob_wait: Option<Task<()>>,
@@ -238,7 +242,8 @@ pub struct TypeTable {
     filter_draft: Option<FilterDraft>,
     filter_editor: Entity<Editor>,
     /// Rows picked for a bulk set (⌘-click, ⇧-click), by id, and the row ⇧ extends from.
-    selection: Vec<String>,
+    /// The picked rows' ids, in the order picked; checked for every row drawn.
+    selection: IndexSet<String>,
     selection_anchor: Option<usize>,
     bulk: BulkDraft,
     bulk_editor: Entity<Editor>,
@@ -434,6 +439,7 @@ impl TypeTable {
             grouping: None,
             frame_lines: None,
             frame_looks: Rc::default(),
+            frame_now: chrono::Local::now(),
             blob_rows: None,
             _blob_wait: None,
             node_labels: HashMap::new(),
@@ -441,7 +447,7 @@ impl TypeTable {
             toolbar_menus: Default::default(),
             filter_draft: None,
             filter_editor,
-            selection: Vec::new(),
+            selection: IndexSet::default(),
             selection_anchor: None,
             bulk: BulkDraft::default(),
             drafts: DraftsBar::default(),
@@ -805,19 +811,14 @@ impl TypeTable {
                     None => (anchor.min(row)..=anchor.max(row).min(self.rows.len() - 1)).collect(),
                 };
                 for ix in between {
-                    if let Some(picked) = self.rows.get(ix)
-                        && !self.selection.contains(&picked.id)
-                    {
-                        self.selection.push(picked.id.clone());
+                    if let Some(picked) = self.rows.get(ix) {
+                        self.selection.insert(picked.id.clone());
                     }
                 }
             }
             None => {
-                match self.selection.iter().position(|picked| *picked == id) {
-                    Some(index) => {
-                        self.selection.remove(index);
-                    }
-                    None => self.selection.push(id),
+                if !self.selection.shift_remove(&id) {
+                    self.selection.insert(id);
                 }
                 self.selection_anchor = Some(row);
             }
@@ -5072,12 +5073,17 @@ impl TypeTable {
             .editing
             .as_ref()
             .filter(|e| e.row_id == row.id && e.column == column.key);
-        let state = self.cells.get(&(row.id.clone(), column.key.clone()));
+        // Most tables hold no cell state; looking one up costs two keys' copies.
+        let state = if self.cells.is_empty() {
+            None
+        } else {
+            self.cells.get(&(row.id.clone(), column.key.clone()))
+        };
         let value = row.value(&column.key);
         let mut cell = div()
             .id(ElementId::NamedInteger(
-                SharedString::from(format!("cell-{col}")),
-                ix as u64,
+                "cell".into(),
+                (ix * self.columns.len() + col) as u64,
             ))
             .relative()
             .h(px(ROW_HEIGHT))
@@ -5112,7 +5118,7 @@ impl TypeTable {
                 .into_any_element();
         }
         // Dates read relative; the exact value is the cell's tooltip.
-        let relative = crate::model::relative_value(column.property(), value, chrono::Local::now());
+        let relative = crate::model::relative_value(column.property(), value, self.frame_now);
         let shown = match &relative {
             Some((shown, _)) => shown.clone(),
             None => display_value(column.property(), value),
@@ -5439,6 +5445,7 @@ fn set_value(row: &mut Row, column: &str, value: Value) {
 
 impl Render for TypeTable {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.frame_now = chrono::Local::now();
         let typing =
             self.editing.is_some() || self.filter_editor.focus_handle(cx).is_focused(window);
         let mut context = KeyContext::new_with_defaults();
