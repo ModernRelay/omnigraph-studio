@@ -13,7 +13,10 @@
 //! `drag:<x1>,<y1>,<x2>,<y2>` presses at
 //! the first point, moves to the second in steps, and releases (`,shift` or `,cmd` held); `wait:<ms>` lets that long pass
 //! (for a write from outside to land between steps); `measure:<n>[,refresh]` draws n frames
-//! after notifying the workspace (or redrawing everything) and prints their times. `SNAPSHOT_WAIT_MS` (default 1500) is how
+//! after notifying the workspace (or redrawing everything) and prints their times;
+//! `measure:<n>,scroll=<dy>` first scrolls at the window's centre each frame (a zoom on the
+//! canvas), and `measure:<n>,drag=<dx>:<dy>` drags from the centre by that much a frame (a pan),
+//! both back and forth every 30 frames. `SNAPSHOT_WAIT_MS` (default 1500) is how
 //! long to let each step's network work finish; `SNAPSHOT_SIZE` is `WIDTHxHEIGHT` (default
 //! 1440x900). Remembered tabs are not restored unless `OMNIGRAPH_STUDIO_NO_RESTORE=0`. The run
 //! keeps its state in a fresh temporary directory unless `OMNIGRAPH_STUDIO_DATA` names one, so
@@ -24,7 +27,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyWindowHandle, Focusable as _, HeadlessAppContext, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PlatformInput, point, px, size,
+    MouseMoveEvent, MouseUpEvent, PlatformInput, ScrollDelta, ScrollWheelEvent, TouchPhase, point,
+    px, size,
 };
 
 /// A left-button drag from `from` to `to`, in ten moves.
@@ -194,28 +198,105 @@ fn main() {
                 .next()
                 .and_then(|n| n.parse().ok())
                 .expect("measure:<frames>");
-            let refresh = parts.any(|part| part == "refresh");
+            let mut refresh = false;
+            let mut scroll: Option<f32> = None;
+            let mut drag: Option<(f32, f32)> = None;
+            for part in parts {
+                if part == "refresh" {
+                    refresh = true;
+                } else if let Some(dy) = part.strip_prefix("scroll=") {
+                    scroll = Some(dy.parse().expect("scroll=<pixels>"));
+                } else if let Some(delta) = part.strip_prefix("drag=") {
+                    let (dx, dy) = delta.split_once(':').expect("drag=<dx>:<dy>");
+                    drag = Some((dx.parse().expect("drag dx"), dy.parse().expect("drag dy")));
+                }
+            }
+            // Input goes to the window's centre: each frame first handles one scroll or one move
+            // of a held button, as a frame of a real zoom or pan does, then draws.
+            let center = point(px(width / 2.), px(height / 2.));
+            if drag.is_some() {
+                cx.update_window(handle, |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::MouseDown(MouseDownEvent {
+                            button: MouseButton::Left,
+                            position: center,
+                            modifiers: Modifiers::default(),
+                            click_count: 1,
+                            first_mouse: false,
+                        }),
+                        cx,
+                    );
+                })
+                .expect("press for the drag");
+            }
             let mut times = Vec::with_capacity(frames);
-            for _ in 0..frames {
+            for frame in 0..frames {
+                // Back and forth every 30 frames, so the view stays where it can be measured.
+                let sign = if (frame / 30) % 2 == 0 { 1. } else { -1. };
                 cx.update_window(handle, |root, window, cx| {
-                    if refresh {
+                    let start = Instant::now();
+                    if let Some(dy) = scroll {
+                        window.dispatch_event(
+                            PlatformInput::ScrollWheel(ScrollWheelEvent {
+                                position: center,
+                                delta: ScrollDelta::Pixels(point(px(0.), px(dy * sign))),
+                                modifiers: Modifiers::default(),
+                                touch_phase: TouchPhase::Moved,
+                            }),
+                            cx,
+                        );
+                    } else if let Some((dx, dy)) = drag {
+                        let step = (frame % 30) as f32 + 1.;
+                        let along = if sign > 0. { step } else { 30. - step };
+                        window.dispatch_event(
+                            PlatformInput::MouseMove(MouseMoveEvent {
+                                position: point(
+                                    center.x + px(dx * along),
+                                    center.y + px(dy * along),
+                                ),
+                                pressed_button: Some(MouseButton::Left),
+                                modifiers: Modifiers::default(),
+                            }),
+                            cx,
+                        );
+                    } else if refresh {
                         window.refresh();
                     } else {
                         cx.notify(root.entity_id());
                     }
-                    let start = Instant::now();
                     window.draw(cx).clear(cx);
                     times.push(start.elapsed());
                 })
                 .expect("draw a frame");
             }
+            if drag.is_some() {
+                cx.update_window(handle, |_, window, cx| {
+                    window.dispatch_event(
+                        PlatformInput::MouseUp(MouseUpEvent {
+                            button: MouseButton::Left,
+                            position: center,
+                            modifiers: Modifiers::default(),
+                            click_count: 1,
+                        }),
+                        cx,
+                    );
+                })
+                .expect("release the drag");
+            }
             times.sort();
             let at = |q: f32| times[((times.len() - 1) as f32 * q) as usize];
+            let kind = match (scroll, drag, refresh) {
+                (Some(_), _, _) => " (scroll)",
+                (_, Some(_), _) => " (drag)",
+                (_, _, true) => " (refresh)",
+                _ => "",
+            };
             eprintln!(
-                "measure{}: {frames} frames, median {:.2?}, p90 {:.2?}, max {:.2?}",
-                if refresh { " (refresh)" } else { "" },
+                "measure{kind}: {frames} frames, median {:.2?}, p90 {:.2?}, p95 {:.2?}, p99 {:.2?}, max {:.2?}",
                 at(0.5),
                 at(0.9),
+                at(0.95),
+                at(0.99),
                 at(1.)
             );
             continue;
