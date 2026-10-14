@@ -9,7 +9,7 @@ use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Global, Task};
 use http_client::HttpClient;
 use serde::{Deserialize, Serialize};
 
-use crate::cli_config::{self, OperatorFiles};
+use crate::cli_config::{self, CliAlias, OperatorFiles};
 use crate::connection::{Connection, ServerEntry, ServerSource};
 
 /// The keychain user name Studio stores server tokens under.
@@ -53,6 +53,8 @@ pub struct ConnectionRegistry {
     cli_tokens: HashMap<String, Option<String>>,
     /// What the CLI's files could not give when last read.
     cli_errors: Vec<String>,
+    /// The CLI config's aliases, as last read.
+    aliases: Vec<CliAlias>,
     _watch: Option<Task<()>>,
 }
 
@@ -170,6 +172,7 @@ impl ConnectionRegistry {
             operator_stamp: Vec::new(),
             cli_tokens: HashMap::new(),
             cli_errors: Vec::new(),
+            aliases: Vec::new(),
             _watch: None,
         }
     }
@@ -178,6 +181,15 @@ impl ConnectionRegistry {
     /// credentials other users can read.
     pub fn cli_errors(&self) -> &[String] {
         &self.cli_errors
+    }
+
+    /// The CLI config's aliases bound to `graph` on the CLI server named `server`, by name.
+    pub fn aliases_for(&self, server: &str, graph: &str) -> Vec<CliAlias> {
+        self.aliases
+            .iter()
+            .filter(|alias| alias.server == server && alias.graph.as_deref() == Some(graph))
+            .cloned()
+            .collect()
     }
 
     /// Reads the CLI's files again whenever their stamp changes, so a server added there, a
@@ -237,6 +249,10 @@ impl ConnectionRegistry {
         let Some(servers) = files.servers else {
             return changed;
         };
+        if files.aliases != self.aliases {
+            self.aliases = files.aliases;
+            changed = true;
+        }
         let named: Vec<String> = servers
             .iter()
             .map(|(server, _)| server.name.clone())
@@ -465,6 +481,7 @@ mod tests {
                     })
                     .collect(),
             ),
+            aliases: Vec::new(),
             errors: Vec::new(),
         }
     }
@@ -571,12 +588,35 @@ mod tests {
             cx,
             OperatorFiles {
                 servers: None,
+                aliases: Vec::new(),
                 errors: vec!["could not parse config.yaml".into()],
             }
         ));
         assert!(find(cx, "a").is_some() && find(cx, "c").is_some());
         registry.read_with(cx, |registry, _| {
             assert_eq!(registry.cli_errors(), ["could not parse config.yaml"])
+        });
+
+        // Aliases are found by server and graph; one that names no graph is under none.
+        let alias = |name: &str, graph: Option<&str>| CliAlias {
+            name: name.into(),
+            server: "c".into(),
+            graph: graph.map(str::to_owned),
+            query: "find".into(),
+            args: Vec::new(),
+            params: Default::default(),
+        };
+        let mut with_aliases = files(&[("c", "http://c.test", None)]);
+        with_aliases.aliases = vec![alias("bare", None), alias("mine", Some("g"))];
+        assert!(apply(cx, with_aliases));
+        registry.read_with(cx, |registry, _| {
+            let names: Vec<_> = registry
+                .aliases_for("c", "g")
+                .into_iter()
+                .map(|alias| alias.name)
+                .collect();
+            assert_eq!(names, ["mine"]);
+            assert!(registry.aliases_for("c", "other").is_empty());
         });
     }
 }

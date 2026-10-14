@@ -20,12 +20,44 @@ pub struct CliServer {
     pub graphs: Vec<String>,
 }
 
+/// A personal alias in the CLI's config: a name bound to a stored query on a named server and
+/// graph, with default parameter values (spec 007). It carries no query text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliAlias {
+    pub name: String,
+    pub server: String,
+    /// The graph the alias names. Without one the CLI posts to the server root, a route 0.13
+    /// servers do not serve, so Studio shows such an alias under no graph.
+    pub graph: Option<String>,
+    /// The stored query's name.
+    pub query: String,
+    /// The parameters the CLI fills from positional arguments, in order.
+    pub args: Vec<String>,
+    /// Fixed parameter values.
+    pub params: serde_json::Map<String, serde_json::Value>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct OperatorConfig {
     #[serde(default)]
     servers: BTreeMap<String, ServerConfig>,
     #[serde(default)]
     profiles: BTreeMap<String, ProfileConfig>,
+    /// Read one by one: an alias Studio cannot read is left out, not the whole file.
+    #[serde(default)]
+    aliases: BTreeMap<String, serde_norway::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AliasConfig {
+    server: String,
+    #[serde(default)]
+    graph: Option<String>,
+    query: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    params: BTreeMap<String, serde_norway::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +102,8 @@ pub struct OperatorFiles {
     /// Each server, sorted by name, with the token the CLI would send it. `None` when
     /// `config.yaml` could not be read or parsed, so the servers read before stand.
     pub servers: Option<Vec<(CliServer, Option<String>)>>,
+    /// The aliases, sorted by name; empty when `servers` is `None`.
+    pub aliases: Vec<CliAlias>,
     /// What could not be read, each said once.
     pub errors: Vec<String>,
 }
@@ -78,31 +112,39 @@ pub struct OperatorFiles {
 /// config, is no servers.
 pub fn read_operator(dir: Option<&Path>) -> OperatorFiles {
     let config = match dir {
-        Some(dir) => load_servers_from(&dir.join("config.yaml")),
-        None => Ok(Vec::new()),
+        Some(dir) => load_operator_from(&dir.join("config.yaml")),
+        None => Ok((Vec::new(), Vec::new())),
     };
     let mut errors = Vec::new();
+    let mut aliases = Vec::new();
     let servers = match config {
-        Ok(servers) => Some(
-            servers
-                .into_iter()
-                .map(|server| {
-                    let token = token_in(dir, &server.name).unwrap_or_else(|error| {
-                        if !errors.contains(&error) {
-                            errors.push(error);
-                        }
-                        None
-                    });
-                    (server, token)
-                })
-                .collect(),
-        ),
+        Ok((servers, read)) => {
+            aliases = read;
+            Some(
+                servers
+                    .into_iter()
+                    .map(|server| {
+                        let token = token_in(dir, &server.name).unwrap_or_else(|error| {
+                            if !errors.contains(&error) {
+                                errors.push(error);
+                            }
+                            None
+                        });
+                        (server, token)
+                    })
+                    .collect(),
+            )
+        }
         Err(error) => {
             errors.push(error);
             None
         }
     };
-    OperatorFiles { servers, errors }
+    OperatorFiles {
+        servers,
+        aliases,
+        errors,
+    }
 }
 
 /// When `config.yaml` and `credentials` in `dir` were last written, and their sizes: a stamp
@@ -121,9 +163,16 @@ pub fn stamp(dir: Option<&Path>) -> Vec<Option<(SystemTime, u64)>> {
 }
 
 pub fn load_servers_from(path: &Path) -> Result<Vec<CliServer>, String> {
+    load_operator_from(path).map(|(servers, _)| servers)
+}
+
+/// The servers and the aliases in a CLI config file.
+fn load_operator_from(path: &Path) -> Result<(Vec<CliServer>, Vec<CliAlias>), String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), Vec::new()));
+        }
         Err(error) => return Err(format!("could not read {}: {error}", path.display())),
     };
     let config: OperatorConfig = serde_norway::from_str(&text)
@@ -145,7 +194,27 @@ pub fn load_servers_from(path: &Path) -> Result<Vec<CliServer>, String> {
             entry.graphs.push(graph.clone());
         }
     }
-    Ok(servers)
+    let aliases = config
+        .aliases
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let alias: AliasConfig = serde_norway::from_value(value).ok()?;
+            let params = alias
+                .params
+                .into_iter()
+                .filter_map(|(key, value)| Some((key, serde_json::to_value(value).ok()?)))
+                .collect();
+            Some(CliAlias {
+                name,
+                server: alias.server,
+                graph: alias.graph,
+                query: alias.query,
+                args: alias.args,
+                params,
+            })
+        })
+        .collect();
+    Ok((servers, aliases))
 }
 
 /// `intel-dev` → `OMNIGRAPH_TOKEN_INTEL_DEV`.
@@ -243,13 +312,30 @@ mod tests {
         let path = dir.join("config.yaml");
         std::fs::write(
             &path,
-            "servers:\n  local:\n    url: http://127.0.0.1:8787  # dev\n  prod: { url: https://example.com }\nprofiles:\n  dev: { server: local, default_graph: knowledge }\ndefaults:\n  output: table\n",
+            "servers:\n  local:\n    url: http://127.0.0.1:8787  # dev\n  prod: { url: https://example.com }\nprofiles:\n  dev: { server: local, default_graph: knowledge }\ndefaults:\n  output: table\naliases:\n  who: { server: local, graph: knowledge, query: who_is, args: [slug], params: { limit: 5, deep: true }, format: kv }\n  bare: { server: local, query: who_is }\n  broken: { graph: knowledge }\n",
         )
         .unwrap();
         let servers = load_servers_from(&path).unwrap();
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].name, "local");
         assert_eq!(servers[0].graphs, vec!["knowledge"]);
+        // Aliases come with their parameters; one without a server or query is left out.
+        let (_, aliases) = load_operator_from(&path).unwrap();
+        let names: Vec<_> = aliases.iter().map(|alias| alias.name.as_str()).collect();
+        assert_eq!(names, ["bare", "who"]);
+        let who = &aliases[1];
+        assert_eq!(
+            (
+                who.server.as_str(),
+                who.graph.as_deref(),
+                who.query.as_str()
+            ),
+            ("local", Some("knowledge"), "who_is")
+        );
+        assert_eq!(who.args, ["slug"]);
+        assert_eq!(who.params["limit"], serde_json::json!(5));
+        assert_eq!(who.params["deep"], serde_json::json!(true));
+        assert_eq!(aliases[0].graph, None);
         std::fs::remove_dir_all(dir).ok();
     }
 

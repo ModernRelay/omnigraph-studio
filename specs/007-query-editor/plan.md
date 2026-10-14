@@ -52,8 +52,29 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   (or `studio_graph::OpenQueryFile { path }`). A file tab is titled by the file, keyed by its
   path so it opens once, and shows the changed dot while its text differs from the file; its
   draft and path come back after a restart. The left dock's Queries panel lists the folder,
-  newest first, with New query, Open a file… and Show the folder; the palette's Queries scope
-  lists saved files no tab has open.
+  newest first; New query, Open a file… and Show the folder are icon buttons in its title
+  line. The palette's Queries scope lists saved files no tab has open.
+- **Stored queries:** the queries a server runs by name for the graph (declared in
+  `cluster.yaml`, applied with `omnigraph cluster apply`; `GET /graphs/{id}/queries` lists them
+  with typed parameters and never their text). The session reads the catalog with the graph (a
+  404 is an empty catalog) and again from the panel's refresh. The Queries panel's Stored
+  section lists them, "writes" marking a mutation, each with the CLI config's aliases for it
+  indented under it; aliases whose query the graph does not serve fold under Not served. A
+  stored query opens in a query tab without the editor: the toolbar names it and what it does,
+  the catalog's `@description` and `@instruction` sit under it, and its parameters are fields
+  typed by the catalog's kinds (a 64-bit integer is sent as typed text, so values past 2^53
+  stay exact; an unknown kind is sent as text). Run invokes it by name at the branch head or the
+  picked commit, saying it expects a read, so the server refuses one that writes; a stored
+  mutation is confirmed against the branch first, written once and logged like any write, and
+  its commit is the branch head. Explain is not offered: a plan needs the text. An alias fills
+  the parameters with its values; the tab's values come back after a restart, and a tab
+  opened before the catalog arrives takes its parameters when it does.
+- **Page layout:** as the table's (spec 004). The toolbar names what the page runs on the
+  leading side and holds the commit picker, Explain and Run on the trailing side; parameters
+  are a field grid under the editor; the result's facts (rows, time, commit, and the branch
+  when it is not the window's) and its actions (Canvas, copy hints) are the tab's part of the
+  window footer, not a strip of their own; outcomes and failures are an icon, a title, what
+  to do, and their facts.
 
 ## Decisions
 
@@ -169,8 +190,16 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 | 2026-10-12 | Run lines | offscreen snapshot of two declarations, Run clicked on the first's line | The first ran and its line read "25 rows · 96 ms". A first version ran the declaration under the old cursor: the editor reports a moved cursor after the click, so the line now sets it before running |
 | 2026-10-12 | Plan operators light their clauses | `gq_language::parts` tests over logical, physical and DataFusion details from the 0.13 dev server (the fixture checked by the compiler); offscreen snapshots hovering Expand, AntiJoin and Filter | `$p knows $f`, `not { $f worksAt $c }` and `$p.name != $f.name` lit in turn |
 | 2026-10-12 | Run loop end to end | offscreen snapshots against the dev server: example query, run, explain, parameters, confirm bar, committed and refused writes, a parse error underline, completion | As described under What landed |
+| 2026-10-14 | Stored queries are listed, opened and run by name | `graph_client` test `stored_queries_are_listed_and_invoked_by_name` (catalog kinds, `expect_mutation` either way, the conditional route, an encoded name); `graph_store` tests `stored_queries_are_read_with_the_graph_and_run_by_name` (a 404 catalog is empty, a write is logged and is the head) and `cli_servers_follow_the_cli_files` (aliases by server and graph); `query_editor` tests of the parameter kinds; offscreen snapshots against a scratch 0.13 cluster serving `people_titled` and `set_title` | The panel listed both with the `founders` alias indented and one alias under Not served; `founders` opened `people_titled` with Founder filled and ⌘↵ read 20 rows; `set_title` on person-000002 asked first, committed, toasted, and a read of the server showed the new title |
+| 2026-10-14 | The query page follows the design system | offscreen snapshots of a query tab and a stored query's tab after a run | Toolbar: name and kind leading, picker, Explain and Run trailing; parameters as fields; rows, time and commit in the window footer beside the graph and branch, no second strip |
+
 
 ## Corrections
+
+- 2026-10-14 · The query page drew its own status strip over the window's footer, with the
+  result's facts as a sentence ("25 rows 67 ms list_company on main at …") that repeated the
+  query and the branch; its parameters, confirm bar and messages used raw paddings and colours.
+  The page now takes its layout and parts from `studio_ui::ds`, and the facts are the footer's.
 
 - 2026-10-13 · The result's node graph for "Canvas" was built on every render, cloning every
   node and checking each link against every other (`links.contains`). It is built once when

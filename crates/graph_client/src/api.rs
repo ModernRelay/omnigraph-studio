@@ -144,6 +144,83 @@ pub struct QueryRequest {
     pub snapshot: Option<String>,
 }
 
+/// `POST /graphs/{id}/queries/{name}`: runs the stored query the path names. Only its inputs
+/// travel; the query's text stays on the server. `branch` and `snapshot` are exclusive.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct InvokeStoredQueryRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
+    /// The kind the caller expects; the server refuses (400) a stored query of the other kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expect_mutation: Option<bool>,
+}
+
+/// `GET /graphs/{id}/queries`: the graph's stored queries, each with typed parameters.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct QueriesCatalogOutput {
+    #[serde(default)]
+    pub queries: Vec<QueryCatalogEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct QueryCatalogEntry {
+    /// The registry name, and the last segment of the invoke route.
+    pub name: String,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    /// From the query's `@description(…)`.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// From the query's `@instruction(…)`.
+    #[serde(default)]
+    pub instruction: Option<String>,
+    /// The stored query changes data.
+    #[serde(default)]
+    pub mutation: bool,
+    #[serde(default)]
+    pub params: Vec<ParamDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ParamDescriptor {
+    pub name: String,
+    pub kind: ParamKind,
+    /// The element kind of a `list`.
+    #[serde(default)]
+    pub item_kind: Option<ParamKind>,
+    /// The dimension of a `vector`.
+    #[serde(default)]
+    pub vector_dim: Option<u32>,
+    /// The parameter may be left out.
+    #[serde(default)]
+    pub nullable: bool,
+}
+
+/// A stored-query parameter's kind, as the catalog names it (0.13). One Studio does not know
+/// is `Other`: its value is sent as text, for the server to read or refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParamKind {
+    String,
+    Bool,
+    Int,
+    #[serde(rename = "bigint")]
+    BigInt,
+    Float,
+    Date,
+    #[serde(rename = "datetime")]
+    DateTime,
+    Blob,
+    Vector,
+    List,
+    #[serde(other)]
+    Other,
+}
+
 /// The response of `POST /query`. Rows are JSON objects; a null cell's key is omitted.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReadOutput {

@@ -18,8 +18,8 @@ use url::Url;
 use crate::api::{
     BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
     BranchMergeRequest, ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitListOutput,
-    ErrorOutput, GraphListResponse, HealthOutput, QueryRequest, ReadOutput, ReadinessOutput,
-    SchemaOutput, SnapshotOutput,
+    ErrorOutput, GraphListResponse, HealthOutput, InvokeStoredQueryRequest, QueriesCatalogOutput,
+    QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotOutput,
 };
 use crate::{ApiError, CONTRACT_HEADER, IF_GRAPH_COMMIT_HEADER, SUPPORTED_CONTRACTS, WriteOutcome};
 
@@ -627,6 +627,71 @@ impl GraphClient {
         .await
     }
 
+    /// The graph's stored queries (`GET /graphs/{id}/queries`, gated by `read`).
+    pub async fn stored_queries(&self, graph: &str) -> Result<QueriesCatalogOutput, ReadError> {
+        self.read(Method::GET, &["graphs", graph, "queries"], &[], None)
+            .await
+    }
+
+    /// Runs a stored read. `request.expect_mutation` is set to `false`, so a stored query that
+    /// writes is refused by the server rather than run as a read.
+    pub async fn invoke_stored_read(
+        &self,
+        graph: &str,
+        name: &str,
+        request: &InvokeStoredQueryRequest,
+    ) -> Result<ReadOutput, ReadError> {
+        let request = InvokeStoredQueryRequest {
+            expect_mutation: Some(false),
+            ..request.clone()
+        };
+        self.read(
+            Method::POST,
+            &["graphs", graph, "queries", name],
+            &[],
+            Some(json(&request)),
+        )
+        .await
+    }
+
+    /// Runs a stored mutation on `request.branch`, sent once like every write. With `if_commit`
+    /// it lands only while the branch head is that commit.
+    pub async fn invoke_stored_write(
+        &self,
+        graph: &str,
+        name: &str,
+        request: &InvokeStoredQueryRequest,
+        if_commit: Option<&str>,
+    ) -> WriteOutcome<ChangeOutput> {
+        let request = InvokeStoredQueryRequest {
+            expect_mutation: Some(true),
+            snapshot: None,
+            ..request.clone()
+        };
+        match if_commit {
+            Some(commit) => {
+                self.write(
+                    Method::POST,
+                    &["graphs", graph, "queries", name, "if-graph-commit"],
+                    &[],
+                    Some(json(&request)),
+                    &[(IF_GRAPH_COMMIT_HEADER, commit)],
+                )
+                .await
+            }
+            None => {
+                self.write(
+                    Method::POST,
+                    &["graphs", graph, "queries", name],
+                    &[],
+                    Some(json(&request)),
+                    &[],
+                )
+                .await
+            }
+        }
+    }
+
     pub async fn branches(&self, graph: &str) -> Result<BranchListOutput, ReadError> {
         self.read(Method::GET, &["graphs", graph, "branches"], &[], None)
             .await
@@ -922,6 +987,7 @@ mod tests {
     use http_client::{AsyncBody, FakeHttpClient};
 
     use super::*;
+    use crate::api::ParamKind;
 
     fn respond(
         status: u16,
@@ -943,6 +1009,96 @@ mod tests {
 
     const CHANGE: &str =
         r#"{"branch":"main","query_name":"u","affected_nodes":1,"affected_edges":0,"commit":null}"#;
+
+    /// Stored queries: the catalog decodes (a kind Studio does not know is `Other`), a read
+    /// says it expects a read, and a write says it expects a write, drops any snapshot and, bound
+    /// to a commit, goes to the conditional route with the commit in its header. The name is one
+    /// path segment, whatever it holds.
+    #[test]
+    fn stored_queries_are_listed_and_invoked_by_name() {
+        type Sent = (String, String, Option<String>, Value);
+        let seen: Arc<std::sync::Mutex<Vec<Sent>>> = Arc::default();
+        let log = seen.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let log = log.clone();
+            async move {
+                let method = request.method().to_string();
+                let path = request.uri().path().to_owned();
+                let if_commit = request
+                    .headers()
+                    .get(IF_GRAPH_COMMIT_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let mut body = String::new();
+                request.into_body().read_to_string(&mut body).await.unwrap();
+                let body = serde_json::from_str(&body).unwrap_or(Value::Null);
+                log.lock()
+                    .unwrap()
+                    .push((method.clone(), path.clone(), if_commit, body));
+                let answer = if method == "GET" {
+                    r#"{"queries":[{"name":"find","tool_name":"find","description":"People by name","mutation":false,"params":[{"name":"name","kind":"string","nullable":false},{"name":"tags","kind":"list","item_kind":"string","nullable":true},{"name":"v","kind":"vector","vector_dim":3,"nullable":false},{"name":"x","kind":"duration","nullable":true}]}]}"#
+                } else if path.ends_with("/find") {
+                    r#"{"query_name":"find","target":{"branch":"main"},"row_count":0,"columns":[],"rows":[],"graph_commit_id":"c1"}"#
+                } else {
+                    CHANGE
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(answer))
+                    .unwrap())
+            }
+        });
+        let client = client(http);
+
+        let catalog = block_on(client.stored_queries("g")).unwrap();
+        let find = &catalog.queries[0];
+        assert_eq!(find.description.as_deref(), Some("People by name"));
+        assert!(!find.mutation);
+        let kinds: Vec<_> = find.params.iter().map(|p| p.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                ParamKind::String,
+                ParamKind::List,
+                ParamKind::Vector,
+                ParamKind::Other
+            ]
+        );
+        assert_eq!(find.params[1].item_kind, Some(ParamKind::String));
+        assert_eq!(find.params[2].vector_dim, Some(3));
+
+        let request = InvokeStoredQueryRequest {
+            params: Some(serde_json::json!({ "name": "Ada" })),
+            branch: None,
+            snapshot: Some("c0".into()),
+            expect_mutation: None,
+        };
+        let read = block_on(client.invoke_stored_read("g", "find", &request)).unwrap();
+        assert_eq!(read.graph_commit_id.as_deref(), Some("c1"));
+
+        let write = InvokeStoredQueryRequest {
+            branch: Some("main".into()),
+            ..request.clone()
+        };
+        let outcome = block_on(client.invoke_stored_write("g", "add/one", &write, Some("c1")));
+        assert!(matches!(outcome, WriteOutcome::Committed(_)));
+
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(sent[0].0, "GET");
+        assert_eq!(sent[0].1, "/graphs/g/queries");
+        assert_eq!(sent[1].1, "/graphs/g/queries/find");
+        assert_eq!(
+            sent[1].3,
+            serde_json::json!({ "params": { "name": "Ada" }, "snapshot": "c0", "expect_mutation": false })
+        );
+        assert_eq!(sent[2].1, "/graphs/g/queries/add%2Fone/if-graph-commit");
+        assert_eq!(sent[2].2.as_deref(), Some("c1"));
+        assert_eq!(
+            sent[2].3,
+            serde_json::json!({ "params": { "name": "Ada" }, "branch": "main", "expect_mutation": true })
+        );
+    }
 
     /// The gateway's forward goes to the same root with Studio's token and contract, keeps the
     /// caller's other headers and body, streams the answer back, and never leaves the root.

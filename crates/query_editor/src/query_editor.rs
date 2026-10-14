@@ -15,7 +15,12 @@ mod view;
 use std::path::PathBuf;
 
 use gpui::{App, AppContext as _, Context, Global, PathPromptOptions, Window};
-use studio_actions::graph::{NewQuery, NewQueryWithText, OpenQueryAt, OpenQueryFile, OpenSchema};
+use graph_client::api::QueryCatalogEntry;
+use graph_store::ConnectionRegistry;
+use serde_json::{Map, Value};
+use studio_actions::graph::{
+    NewQuery, NewQueryWithText, OpenQueryAt, OpenQueryFile, OpenSchema, OpenStoredQuery,
+};
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
 
@@ -65,6 +70,67 @@ fn open_file(
         editor.set_file(path, on_disk, cx);
         editor
     });
+}
+
+/// Opens the tab running the stored query `name`, or the one already open (spec 007). `values`
+/// fill the parameters (a remembered tab's, `alias` naming where they came from); without them
+/// an alias's values from the CLI config do. A query the catalog has not been read for yet opens
+/// and takes its parameters when it is.
+fn open_stored(
+    workspace: &mut Workspace,
+    name: String,
+    alias: Option<String>,
+    values: Option<Map<String, Value>>,
+    at_commit: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(session) = workspace.session().cloned() else {
+        workspace.show_toast(
+            ToastKind::Info,
+            "Open a graph first; stored queries belong to one.",
+            cx,
+        );
+        return;
+    };
+    let entry = session
+        .read(cx)
+        .stored_query(&name)
+        .unwrap_or_else(|| QueryCatalogEntry {
+            name: name.clone(),
+            tool_name: None,
+            description: None,
+            instruction: None,
+            mutation: false,
+            params: Vec::new(),
+        });
+    let values = values.or_else(|| {
+        let alias = alias.as_ref()?;
+        let session = session.read(cx);
+        let (server, graph) = (session.server_name(cx), session.graph_id.clone());
+        ConnectionRegistry::try_global(cx)?
+            .read(cx)
+            .aliases_for(&server, &graph)
+            .into_iter()
+            .find(|candidate| candidate.name == *alias && candidate.query == name)
+            .map(|alias| alias.params)
+    });
+    let number = view::next_number();
+    let opened = workspace.open_item(view::stored_key(&name), window, cx, |window, cx| {
+        let mut editor = QueryEditor::new_stored(number, session, entry, window, cx);
+        if let Some(commit) = at_commit {
+            editor.pin_to(commit, cx);
+        }
+        editor
+    });
+    let Some(editor) = opened else {
+        return;
+    };
+    if let Some(values) = values {
+        editor.update(cx, |editor, cx| {
+            editor.fill_params(alias, &values, window, cx)
+        });
+    }
 }
 
 /// Opens the schema tab, or activates it; with a type, shows its declaration.
@@ -121,6 +187,22 @@ pub fn init(cx: &mut App) {
             editor
         });
     });
+    studio_workspace::register_item_kind(cx, "stored_query", |data, workspace, window, cx| {
+        let Some(name) = data.get("name").and_then(Value::as_str) else {
+            return;
+        };
+        let text = |key: &str| data.get(key).and_then(Value::as_str).map(str::to_owned);
+        let values = data.get("values").and_then(Value::as_object).cloned();
+        open_stored(
+            workspace,
+            name.to_owned(),
+            text("alias"),
+            values,
+            text("at_commit"),
+            window,
+            cx,
+        );
+    });
     studio_workspace::register_item_kind(
         cx,
         schema_view::SCHEMA_KEY,
@@ -133,6 +215,7 @@ pub fn init(cx: &mut App) {
             let handle = cx.entity().downgrade();
             let session = workspace.session().cloned();
             let panel = cx.new(|cx| queries_panel::QueriesPanel::new(handle, session, window, cx));
+            let actions = cx.new(|cx| queries_panel::QueriesActions::new(&panel, cx));
             workspace.add_panel(
                 PanelPosition::Left,
                 queries_panel::QUERIES_PANEL,
@@ -141,6 +224,7 @@ pub fn init(cx: &mut App) {
                 panel.into(),
                 cx,
             );
+            workspace.set_panel_actions(queries_panel::QUERIES_PANEL, actions.into(), cx);
         }
         workspace.register_action(|workspace, action: &OpenQueryFile, window, cx| {
             match &action.path {
@@ -192,6 +276,17 @@ pub fn init(cx: &mut App) {
                 editor.set_text(&text, window, cx);
                 editor
             });
+        });
+        workspace.register_action(|workspace, action: &OpenStoredQuery, window, cx| {
+            open_stored(
+                workspace,
+                action.name.clone(),
+                action.alias.clone(),
+                None,
+                None,
+                window,
+                cx,
+            );
         });
         workspace.register_action(|workspace, action: &OpenSchema, window, cx| {
             open_schema(workspace, action.type_name.clone(), window, cx);

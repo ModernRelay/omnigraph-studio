@@ -13,9 +13,11 @@ use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task};
 use gq_language::{BuiltQuery, RelationshipGroup, SchemaModel, builder};
 use graph_client::api::{
     BranchCreateOutput, BranchCreateRequest, BranchMergeOutput, BranchMergeRequest, ChangeOutput,
-    ChangeRequest, CommitOutput, QueryRequest, ReadOutput, SnapshotDatasetOutput,
+    ChangeRequest, CommitOutput, InvokeStoredQueryRequest, QueryCatalogEntry, QueryRequest,
+    ReadOutput, SnapshotDatasetOutput,
 };
 use graph_client::{BlobAt, BlobCell, BlobMeta, GraphClient, ReadError, WriteOutcome};
+use serde_json::Value;
 
 use crate::connection::Connection;
 use crate::degrees::{DEGREE_BATCH, DegreeBatchKey, DegreeBatches, page_counts};
@@ -79,6 +81,8 @@ pub enum SessionEvent {
     ActivityChanged,
     /// The graph became unavailable (503) or answered again.
     AvailabilityChanged,
+    /// The graph's stored queries were read ([`GraphSession::stored_queries`]).
+    StoredQueriesChanged,
 }
 
 /// How many answers to reads pinned to a commit, and Blob cells at a commit, a session keeps.
@@ -123,6 +127,8 @@ pub struct GraphSession {
     pub schema: Loadable<Arc<SchemaModel>>,
     pub branches: Loadable<Vec<String>>,
     pub datasets: Loadable<Vec<SnapshotDatasetOutput>>,
+    /// The queries the server serves by name for this graph (spec 007), read with the schema.
+    pub stored_queries: Loadable<Arc<Vec<QueryCatalogEntry>>>,
     pub outcomes: Vec<OutcomeEntry>,
     pub reads_in_flight: usize,
     pub writes_in_flight: usize,
@@ -155,6 +161,7 @@ pub struct GraphSession {
     _schema_task: Option<Task<()>>,
     _branches_task: Option<Task<()>>,
     _datasets_task: Option<Task<()>>,
+    _stored_queries_task: Option<Task<()>>,
 }
 
 impl EventEmitter<SessionEvent> for GraphSession {}
@@ -173,6 +180,7 @@ impl GraphSession {
             schema: Loadable::NotLoaded,
             branches: Loadable::NotLoaded,
             datasets: Loadable::NotLoaded,
+            stored_queries: Loadable::NotLoaded,
             outcomes: Vec::new(),
             reads_in_flight: 0,
             writes_in_flight: 0,
@@ -193,6 +201,7 @@ impl GraphSession {
             _schema_task: None,
             _branches_task: None,
             _datasets_task: None,
+            _stored_queries_task: None,
         };
         session._head_poll = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -265,11 +274,108 @@ impl GraphSession {
         }
     }
 
-    /// Reloads the schema, the branch list and the type counts.
+    /// Reloads the schema, the branch list, the type counts and the stored queries.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.reload_schema(cx);
         self.reload_branches(cx);
         self.reload_counts(cx);
+        self.reload_stored_queries(cx);
+    }
+
+    /// Reads the graph's stored-query catalog. A server that serves none for the graph (a 404)
+    /// has an empty catalog, not a failed one.
+    pub fn reload_stored_queries(&mut self, cx: &mut Context<Self>) {
+        self.stored_queries = Loadable::Loading;
+        let client = self.client(cx);
+        let graph = self.graph_id.clone();
+        self._stored_queries_task = Some(cx.spawn(async move |this, cx| {
+            let read = client.stored_queries(&graph).await;
+            this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
+            let result = match read {
+                Ok(output) => Loadable::Loaded(Arc::new(output.queries)),
+                Err(ReadError::Refused(error)) if error.status == 404 => {
+                    Loadable::Loaded(Arc::new(Vec::new()))
+                }
+                Err(error) => Loadable::Failed(error.to_string()),
+            };
+            this.update(cx, |this, cx| {
+                this.stored_queries = result;
+                cx.emit(SessionEvent::StoredQueriesChanged);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The stored query named `name`, once the catalog is read.
+    pub fn stored_query(&self, name: &str) -> Option<QueryCatalogEntry> {
+        self.stored_queries
+            .loaded()?
+            .iter()
+            .find(|query| query.name == name)
+            .cloned()
+    }
+
+    /// Runs a stored read at `snapshot`, else at the session's branch head. The server refuses a
+    /// stored query that writes, since the request says it expects a read.
+    pub fn invoke_stored_read(
+        &mut self,
+        name: &str,
+        params: Option<Value>,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
+        let request = InvokeStoredQueryRequest {
+            params,
+            branch: snapshot.is_none().then(|| self.branch.clone()),
+            snapshot,
+            expect_mutation: Some(false),
+        };
+        let client = self.client(cx);
+        let graph = self.graph_id.clone();
+        let name = name.to_owned();
+        self.counted_read(
+            async move { client.invoke_stored_read(&graph, &name, &request).await },
+            cx,
+        )
+    }
+
+    /// Runs a stored mutation on `branch`, sent once and logged like every write; with
+    /// `if_commit` it lands only while that commit is the branch head.
+    pub fn invoke_stored_write(
+        &mut self,
+        name: &str,
+        params: Option<Value>,
+        branch: String,
+        if_commit: Option<String>,
+        description: String,
+        cx: &mut Context<Self>,
+    ) -> Task<WriteOutcome<ChangeOutput>> {
+        let client = self.client(cx);
+        let graph = self.graph_id.clone();
+        let name = name.to_owned();
+        let request = InvokeStoredQueryRequest {
+            params,
+            branch: Some(branch.clone()),
+            snapshot: None,
+            expect_mutation: Some(true),
+        };
+        self.writes_in_flight += 1;
+        cx.emit(SessionEvent::ActivityChanged);
+        let work = cx.spawn(async move |this, cx| {
+            let outcome = client
+                .invoke_stored_write(&graph, &name, &request, if_commit.as_deref())
+                .await;
+            let kind = outcome_kind(&outcome, |output: &ChangeOutput| {
+                output.commit.as_ref().map(|c| c.graph_commit_id.clone())
+            });
+            this.update(cx, |this, cx| {
+                this.finish_write(branch, description, kind, cx);
+            })
+            .ok();
+            outcome
+        });
+        Self::to_outcome(work, cx)
     }
 
     pub fn reload_schema(&mut self, cx: &mut Context<Self>) {
@@ -1498,6 +1604,129 @@ mod tests {
         assert!(probes.lock().unwrap().is_empty());
         assert_eq!(head_of(cx, "main").as_deref(), Some("c9"));
         assert_eq!(events.take(), vec![landed("main"), moved("main", "c9")]);
+    }
+
+    /// The stored-query catalog is read with the graph, and a server without one has an empty
+    /// catalog. A stored read goes to the session's branch and says it expects a read; a stored
+    /// write goes to the branch it names, says it expects a write, and is logged like any write,
+    /// its commit the branch head.
+    #[gpui::test]
+    async fn stored_queries_are_read_with_the_graph_and_run_by_name(cx: &mut TestAppContext) {
+        use futures::AsyncReadExt as _;
+        let sent: Arc<std::sync::Mutex<Vec<(String, Value)>>> = Arc::default();
+        let log = sent.clone();
+        let serves = Arc::new(AtomicBool::new(true));
+        let serving = serves.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let (log, serving) = (log.clone(), serving.clone());
+            async move {
+                let mut bytes = Vec::new();
+                request.into_body().read_to_end(&mut bytes).await.ok();
+                let (status, body) = if path.ends_with("/queries") {
+                    if serving.load(Ordering::SeqCst) {
+                        (
+                            200,
+                            serde_json::json!({ "queries": [
+                            { "name": "find", "tool_name": "find", "mutation": false,
+                              "params": [{ "name": "name", "kind": "string", "nullable": false }] },
+                            { "name": "add", "tool_name": "add", "mutation": true, "params": [] }
+                        ] }),
+                        )
+                    } else {
+                        (404, serde_json::json!({ "error": "not found" }))
+                    }
+                } else if path.contains("/queries/") {
+                    log.lock()
+                        .unwrap()
+                        .push((path.clone(), serde_json::from_slice(&bytes).unwrap()));
+                    if path.ends_with("/find") {
+                        (
+                            200,
+                            serde_json::json!({ "query_name": "find", "target": { "branch": "main" }, "row_count": 0, "rows": [], "graph_commit_id": "c4" }),
+                        )
+                    } else {
+                        (
+                            200,
+                            serde_json::json!({ "branch": "main", "query_name": "add", "affected_nodes": 1, "affected_edges": 0, "commit": { "graph_commit_id": "c5", "graph_branch": "main", "graph_manifest_version": 5, "created_at": 5, "parent_commit_id": "c4" } }),
+                        )
+                    }
+                } else {
+                    (200, serde_json::json!({ "branches": ["main"] }))
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session = cx
+            .new(|cx| GraphSession::new(connection.clone(), "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            let names: Vec<_> = session
+                .stored_queries
+                .loaded()
+                .unwrap()
+                .iter()
+                .map(|query| query.name.clone())
+                .collect();
+            assert_eq!(names, ["find", "add"]);
+            assert!(session.stored_query("add").unwrap().mutation);
+        });
+
+        let read = session.update(cx, |session, cx| {
+            session.invoke_stored_read("find", Some(serde_json::json!({ "name": "Ada" })), None, cx)
+        });
+        assert_eq!(read.await.unwrap().graph_commit_id.as_deref(), Some("c4"));
+        let write = session.update(cx, |session, cx| {
+            session.invoke_stored_write("add", None, "main".into(), None, "Run add".into(), cx)
+        });
+        assert!(matches!(write.await, WriteOutcome::Committed(_)));
+        cx.run_until_parked();
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![
+                (
+                    "/graphs/knowledge/queries/find".to_owned(),
+                    serde_json::json!({ "params": { "name": "Ada" }, "branch": "main", "expect_mutation": false })
+                ),
+                (
+                    "/graphs/knowledge/queries/add".to_owned(),
+                    serde_json::json!({ "branch": "main", "expect_mutation": true })
+                ),
+            ]
+        );
+        session.read_with(cx, |session, _| {
+            let last = session.outcomes.last().unwrap();
+            assert_eq!(last.description, "Run add");
+            assert_eq!(
+                last.outcome,
+                OutcomeKind::Committed {
+                    commit: Some("c5".into())
+                }
+            );
+            assert_eq!(session.head("main"), Some("c5"));
+        });
+
+        // A server that serves no catalog for the graph: an empty one, not a failure.
+        serves.store(false, Ordering::SeqCst);
+        session.update(cx, |session, cx| session.reload_stored_queries(cx));
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert_eq!(
+                session.stored_queries.loaded().map(|queries| queries.len()),
+                Some(0)
+            )
+        });
     }
 
     /// A branch's commit list is read once for every view that shows it, and again only after

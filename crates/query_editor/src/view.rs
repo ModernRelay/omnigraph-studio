@@ -20,7 +20,9 @@ use gpui::{
 };
 use gq_language::{QueryInfo, ResultColumn, SchemaModel, Statement, TokenKind};
 use graph_client::api::ErrorCode;
-use graph_client::api::{ChangeRequest, QueryRequest, ReadOutput};
+use graph_client::api::{
+    ChangeRequest, ParamDescriptor, ParamKind, QueryCatalogEntry, QueryRequest, ReadOutput,
+};
 use graph_client::{ReadError, WriteOutcome};
 use graph_store::{GraphSession, SessionEvent};
 use serde_json::{Map, Value};
@@ -28,7 +30,7 @@ use studio_actions::query::{CopyCell, CopyRow, Explain, Run};
 use studio_ui::{
     GridColumn, ROW_HEIGHT, format_value, grid_cell, grid_header, is_numeric, short_commit_id,
 };
-use studio_workspace::{Item, ItemEvent, SavedItem};
+use studio_workspace::{Item, ItemEvent, ItemFooter, SavedItem};
 use ui::prelude::*;
 use ui::{ContextMenu, KeyBinding, PopoverMenu, Tooltip};
 
@@ -76,6 +78,21 @@ struct Prepared {
     params: Option<Value>,
     columns: Option<Vec<ResultColumn>>,
     map: SourceMap,
+    /// The stored query to invoke by name instead of sending `text` (spec 007).
+    stored: Option<String>,
+}
+
+/// The stored query a tab runs: the server serves it by name and never sends its text, so the
+/// tab shows its description and parameters where a query tab shows its text.
+struct Stored {
+    entry: QueryCatalogEntry,
+    /// The CLI alias whose values filled the parameters.
+    alias: Option<String>,
+    /// The graph's catalog no longer lists it.
+    gone: bool,
+    /// Values for parameters the tab has no input for yet: it opened before the catalog was
+    /// read. Each fills its input when the input is made.
+    pending: Map<String, Value>,
 }
 
 /// A write waiting for the person to confirm it (constitution III, VII).
@@ -250,6 +267,8 @@ pub struct QueryEditor {
     confirm_focus: FocusHandle,
     run_task: Option<Task<()>>,
     check_task: Option<Task<()>>,
+    /// A stored query's tab (spec 007); `None` for a query written in the editor.
+    stored: Option<Stored>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -257,18 +276,21 @@ impl EventEmitter<ItemEvent> for QueryEditor {}
 
 impl Focusable for QueryEditor {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.editor.focus_handle(cx)
+        self.main_focus(cx)
     }
 }
 
 impl Item for QueryEditor {
     fn tab_title(&self, _cx: &App) -> SharedString {
-        let name = match &self.path {
-            Some(path) => path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_else(|| format!("Query {}", self.number)),
-            None => format!("Query {}", self.number),
+        let name = match (&self.stored, &self.path) {
+            (Some(stored), _) => stored.entry.name.clone(),
+            (None, path) => match path {
+                Some(path) => path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| format!("Query {}", self.number)),
+                None => format!("Query {}", self.number),
+            },
         };
         match &self.at_commit {
             Some(commit) => format!("{name} @ {}", short_commit_id(commit)).into(),
@@ -279,17 +301,25 @@ impl Item for QueryEditor {
     /// A file-backed query with changes since it was saved.
     fn is_dirty(&self, cx: &App) -> bool {
         self.writing
-            || self
-                .saved_text
-                .as_ref()
-                .is_some_and(|saved| *saved != self.editor.read(cx).text(cx))
+            || self.stored.is_none()
+                && self
+                    .saved_text
+                    .as_ref()
+                    .is_some_and(|saved| *saved != self.editor.read(cx).text(cx))
     }
 
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
-        Some(IconName::FileCode)
+        Some(if self.stored.is_some() {
+            IconName::Server
+        } else {
+            IconName::FileCode
+        })
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
+        if let Some(stored) = &self.stored {
+            return Some(stored_key(&stored.entry.name).into());
+        }
         Some(match &self.path {
             Some(path) => file_key(path).into(),
             None => format!("query:{}", self.number).into(),
@@ -298,7 +328,30 @@ impl Item for QueryEditor {
 
     /// The draft comes back after a restart (spec 007: the text is never cleared). It is
     /// written to the workspace file, never to a log.
+    /// The window's footer, as the table's: the result's facts on the leading side, what the
+    /// keyboard does with it on the trailing side.
+    fn footer(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<ItemFooter> {
+        Some(self.footer_parts(cx))
+    }
+
     fn serialize(&self, cx: &App) -> Option<SavedItem> {
+        if let Some(stored) = &self.stored {
+            // The values typed come back with the tab, as a query's text does.
+            let values: Map<String, Value> = self
+                .params
+                .iter()
+                .map(|(name, input)| (name.clone(), Value::String(input.read(cx).text(cx))))
+                .collect();
+            return Some(SavedItem {
+                kind: "stored_query".into(),
+                data: serde_json::json!({
+                    "name": stored.entry.name,
+                    "alias": stored.alias,
+                    "at_commit": self.at_commit,
+                    "values": values,
+                }),
+            });
+        }
         Some(SavedItem {
             kind: "query".into(),
             data: serde_json::json!({
@@ -314,6 +367,37 @@ impl QueryEditor {
     pub fn new(
         number: usize,
         session: Entity<GraphSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(number, session, None, window, cx)
+    }
+
+    /// A tab for the stored query `entry` (spec 007), with an input for each parameter.
+    pub fn new_stored(
+        number: usize,
+        session: Entity<GraphSession>,
+        entry: QueryCatalogEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let stored = Stored {
+            entry,
+            alias: None,
+            gone: false,
+            pending: Map::new(),
+        };
+        let mut this = Self::build(number, session, Some(stored), window, cx);
+        this.sync_stored_params(window, cx);
+        // Opened before the catalog was read, or after the query left it.
+        this.catalog_changed(window, cx);
+        this
+    }
+
+    fn build(
+        number: usize,
+        session: Entity<GraphSession>,
+        stored: Option<Stored>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -359,6 +443,7 @@ impl QueryEditor {
                     {
                         this.load_commits(cx)
                     }
+                    SessionEvent::StoredQueriesChanged => this.catalog_changed(window, cx),
                     _ => {}
                 },
             ),
@@ -391,6 +476,7 @@ impl QueryEditor {
             confirm_focus: cx.focus_handle(),
             run_task: None,
             check_task: None,
+            stored,
             _subscriptions: subscriptions,
         };
         this.parse_as_gq(cx);
@@ -557,6 +643,10 @@ impl QueryEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A stored query lives on the server; there is no text here to save.
+        if self.stored.is_some() {
+            return;
+        }
         let path = match &self.path {
             Some(path) => path.clone(),
             None => {
@@ -580,6 +670,9 @@ impl QueryEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.stored.is_some() {
+            return;
+        }
         let graph = self.session.read(cx).settings_key(cx);
         let directory = self
             .path
@@ -653,7 +746,7 @@ impl QueryEditor {
 
     /// Fills an untouched, empty editor with a read over the schema's first node type.
     fn set_example(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.example.is_some() || !self.editor.read(cx).is_empty(cx) {
+        if self.stored.is_some() || self.example.is_some() || !self.editor.read(cx).is_empty(cx) {
             return;
         }
         let Some(text) = self.schema(cx).and_then(|s| gq_language::example_read(&s)) else {
@@ -686,6 +779,7 @@ impl QueryEditor {
     }
 
     fn cursor_moved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let before = self.current_query().map(|(name, _)| name);
         let editor = self.editor.read(cx);
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         self.cursor = editor
@@ -695,6 +789,10 @@ impl QueryEditor {
             .to_offset(&snapshot)
             .0;
         self.sync_params(window, cx);
+        // The toolbar and the window's footer name the declaration under the cursor.
+        if self.current_query().map(|(name, _)| name) != before {
+            cx.emit(ItemEvent::UpdateTab);
+        }
         cx.notify();
     }
 
@@ -734,7 +832,7 @@ impl QueryEditor {
 
     /// Checks the text after typing pauses, off the main thread.
     fn schedule_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(schema) = self.schema(cx) else {
+        let Some(schema) = self.schema(cx).filter(|_| self.stored.is_none()) else {
             return;
         };
         self.check_task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -796,6 +894,8 @@ impl QueryEditor {
         self.analysis = Some(analysis);
         self.sync_params(window, cx);
         self.sync_run_lines(cx);
+        // What the declaration returns, in the window's footer, follows the check.
+        cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
 
@@ -867,6 +967,213 @@ impl QueryEditor {
         }
     }
 
+    // ---- stored queries (spec 007) ----
+
+    /// The stored query this tab runs, when it is a stored query's tab.
+    pub fn stored_name(&self) -> Option<&str> {
+        self.stored
+            .as_ref()
+            .map(|stored| stored.entry.name.as_str())
+    }
+
+    /// Where the keyboard goes in this tab: the editor; in a stored query's tab its first
+    /// parameter, else the results.
+    fn main_focus(&self, cx: &App) -> FocusHandle {
+        match &self.stored {
+            None => self.editor.focus_handle(cx),
+            Some(stored) => stored
+                .entry
+                .params
+                .iter()
+                .find_map(|param| self.params.get(&param.name))
+                .map(|input| input.focus_handle(cx))
+                .unwrap_or_else(|| self.results_focus.clone()),
+        }
+    }
+
+    /// An input for each of the stored query's parameters, kept by name like a query's.
+    fn sync_stored_params(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(stored) = &mut self.stored else {
+            return;
+        };
+        for param in stored.entry.params.clone() {
+            if self.params.contains_key(&param.name) {
+                continue;
+            }
+            let placeholder = if param.nullable {
+                "empty leaves it out"
+            } else {
+                "value"
+            };
+            let text = stored
+                .pending
+                .remove(&param.name)
+                .map(|value| value_text(&value));
+            let input = param_input(placeholder, text, window, cx);
+            self.params.insert(param.name, input);
+        }
+    }
+
+    /// Fills parameters from `values`: an alias's from the CLI config, or the text a remembered
+    /// tab held. A string goes in as it is, anything else as JSON, which the inputs read back.
+    pub fn fill_params(
+        &mut self,
+        alias: Option<String>,
+        values: &Map<String, Value>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for (name, value) in values {
+            match self.params.get(name) {
+                Some(input) => {
+                    let text = value_text(value);
+                    input.update(cx, |input, cx| input.set_text(text, window, cx));
+                }
+                None => {
+                    if let Some(stored) = &mut self.stored {
+                        stored.pending.insert(name.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        if let Some(stored) = &mut self.stored {
+            stored.alias = alias;
+        }
+        cx.notify();
+    }
+
+    /// The graph's catalog was read again: the tab takes its stored query's parameters as they
+    /// are now, or says the graph no longer serves it.
+    fn catalog_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.stored_name().map(str::to_owned) else {
+            return;
+        };
+        let session = self.session.read(cx);
+        if session.stored_queries.loaded().is_none() {
+            return;
+        }
+        let entry = session.stored_query(&name);
+        if let Some(stored) = &mut self.stored {
+            stored.gone = entry.is_none();
+            if let Some(entry) = entry {
+                stored.entry = entry;
+            }
+        }
+        self.sync_stored_params(window, cx);
+        cx.notify();
+    }
+
+    fn prepare_stored(&self, stored: &Stored, explain: bool, cx: &App) -> Result<Prepared, String> {
+        let name = &stored.entry.name;
+        if explain {
+            return Err(format!(
+                "Explain needs a query's text, and the server keeps {name}'s to itself."
+            ));
+        }
+        if stored.gone {
+            return Err(format!(
+                "This graph no longer serves the stored query {name}."
+            ));
+        }
+        let mut values = Map::new();
+        for param in &stored.entry.params {
+            let text = self
+                .params
+                .get(&param.name)
+                .map(|input| input.read(cx).text(cx))
+                .unwrap_or_default();
+            // An empty optional parameter is left out, which the catalog says it may be.
+            match gq_language::param_value(&param.name, &param_type(param), param.nullable, &text) {
+                Ok(Some(value)) => {
+                    values.insert(param.name.clone(), value);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "{error}. Fill in the parameters above, then run again."
+                    ));
+                }
+            }
+        }
+        Ok(Prepared {
+            text: String::new(),
+            name: Some(name.clone()),
+            label: name.clone(),
+            write: stored.entry.mutation,
+            statement: false,
+            params: (!values.is_empty()).then_some(Value::Object(values)),
+            columns: None,
+            map: SourceMap::default(),
+            stored: Some(name.clone()),
+        })
+    }
+
+    /// The parameters the form shows, `(name, type, nullable)`: the stored query's, else the
+    /// declaration's under the cursor.
+    fn shown_params(&self) -> Option<Vec<(String, String, bool)>> {
+        match &self.stored {
+            Some(stored) => Some(
+                stored
+                    .entry
+                    .params
+                    .iter()
+                    .map(|param| (param.name.clone(), param_type(param), param.nullable))
+                    .collect(),
+            ),
+            None => {
+                let (_, Some(info)) = self.current_query()? else {
+                    return None;
+                };
+                Some(info.params)
+            }
+        }
+    }
+
+    /// What the catalog says about a stored query, under the toolbar that names it: its
+    /// description, its instruction, and where its values came from. Nothing when it says
+    /// nothing.
+    fn render_stored_about(&self, stored: &Stored, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use studio_ui::ds::{self, space};
+        let entry = &stored.entry;
+        let mut facts = Vec::new();
+        if let Some(alias) = &stored.alias {
+            facts.push(
+                ds::meta(IconName::Link, format!("values from alias {alias}")).into_any_element(),
+            );
+        }
+        if stored.gone {
+            facts.push(
+                h_flex()
+                    .gap(px(space::XS))
+                    .child(
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::XSmall)
+                            .color(Color::Warning),
+                    )
+                    .child(ds::text::meta("This graph no longer serves it"))
+                    .into_any_element(),
+            );
+        }
+        if entry.description.is_none() && entry.instruction.is_none() && facts.is_empty() {
+            return None;
+        }
+        Some(
+            v_flex()
+                .flex_none()
+                .px(px(space::EDGE))
+                .py(px(space::LG))
+                .gap(px(space::XS))
+                .border_b_1()
+                .border_color(ds::surface::rule(cx))
+                .children(entry.description.clone().map(ds::text::body))
+                .children(entry.instruction.clone().map(ds::text::muted))
+                .when(!facts.is_empty(), |column| {
+                    column.child(ds::meta_row(facts))
+                })
+                .into_any_element(),
+        )
+    }
+
     /// The declaration under the cursor and what the last check said about it.
     fn current_query(&self) -> Option<(String, Option<QueryInfo>)> {
         let analysis = self.analysis.as_ref()?;
@@ -885,11 +1192,7 @@ impl QueryEditor {
                 continue;
             }
             let placeholder = if *nullable { "empty is null" } else { "value" };
-            let input = cx.new(|cx| {
-                let mut editor = Editor::single_line(window, cx);
-                editor.set_placeholder_text(placeholder, window, cx);
-                editor
-            });
+            let input = param_input(placeholder, None, window, cx);
             self.params.insert(name.clone(), input);
         }
     }
@@ -911,6 +1214,9 @@ impl QueryEditor {
     // ---- running ----
 
     fn prepare(&self, explain: bool, cx: &App) -> Result<Prepared, String> {
+        if let Some(stored) = &self.stored {
+            return self.prepare_stored(stored, explain, cx);
+        }
         let source = self.editor.read(cx).text(cx);
         let outline = gq_language::outline(&source);
         if let Some(statement) = outline.statement {
@@ -935,6 +1241,7 @@ impl QueryEditor {
                     prefix_len: source.len(),
                     ..Default::default()
                 },
+                stored: None,
             });
         }
         let declaration = outline
@@ -983,6 +1290,7 @@ impl QueryEditor {
                 inserted: if explained { "explain ".len() } else { 0 },
                 start: declaration.range.start,
             },
+            stored: None,
         })
     }
 
@@ -1030,6 +1338,8 @@ impl QueryEditor {
                 self.send_read(prepared, cx);
             }
         }
+        // The window's footer shows the run.
+        cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
 
@@ -1038,6 +1348,7 @@ impl QueryEditor {
             Err(message) => self.output = Output::Failed(Failure::new(message)),
             Ok(prepared) => self.send_read(prepared, cx),
         }
+        cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
 
@@ -1057,9 +1368,17 @@ impl QueryEditor {
             None => branch,
         };
         let started = Instant::now();
-        let task = self
-            .session
-            .update(cx, |session, cx| session.read_request(request, cx));
+        let task = match &prepared.stored {
+            Some(name) => {
+                let (params, snapshot) = (prepared.params.clone(), self.at_commit.clone());
+                self.session.update(cx, |session, cx| {
+                    session.invoke_stored_read(name, params, snapshot, cx)
+                })
+            }
+            None => self
+                .session
+                .update(cx, |session, cx| session.read_request(request, cx)),
+        };
         self.output = Output::Running {
             label: format!("Running {} on {branch}…", prepared.label).into(),
         };
@@ -1073,6 +1392,7 @@ impl QueryEditor {
                 this.light_plan_parts(None, cx);
                 let schema = this.session.read(cx).schema_model();
                 this.finish_read(prepared, branch, result, elapsed, schema);
+                cx.emit(ItemEvent::UpdateTab);
                 this.run_task = None;
                 cx.notify();
             })
@@ -1161,12 +1481,24 @@ impl QueryEditor {
             params: prepared.params.clone(),
             branch: (!prepared.statement).then(|| branch.clone()),
         };
-        let description = format!("Run {}", prepared.label);
+        let description = match &prepared.stored {
+            Some(name) => format!("Run stored query {name}"),
+            None => format!("Run {}", prepared.label),
+        };
         let started = Instant::now();
         // No read precondition: the person confirmed this write against the branch head.
-        let task = self.session.update(cx, |session, cx| {
-            session.write_request(request, None, description, cx)
-        });
+        let task = match &prepared.stored {
+            Some(name) => {
+                let params = prepared.params.clone();
+                let branch = branch.clone();
+                self.session.update(cx, |session, cx| {
+                    session.invoke_stored_write(name, params, branch, None, description, cx)
+                })
+            }
+            None => self.session.update(cx, |session, cx| {
+                session.write_request(request, None, description, cx)
+            }),
+        };
         self.writing = true;
         self.output = Output::Running {
             label: format!("Writing {} to {branch}…", prepared.label).into(),
@@ -1198,6 +1530,7 @@ impl QueryEditor {
                     },
                 };
                 this.note_run(name.as_deref(), note);
+                cx.emit(ItemEvent::UpdateTab);
                 this.output = Output::Written(match outcome {
                     WriteOutcome::Committed(output) => WriteResult::Committed {
                         branch: output.branch,
@@ -1222,14 +1555,14 @@ impl QueryEditor {
             .ok();
         })
         .detach();
-        let focus = self.editor.focus_handle(cx);
+        let focus = self.main_focus(cx);
         window.focus(&focus, cx);
         cx.notify();
     }
 
     fn cancel_write(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
         self.pending_write = None;
-        let focus = self.editor.focus_handle(cx);
+        let focus = self.main_focus(cx);
         window.focus(&focus, cx);
         cx.notify();
     }
@@ -1243,8 +1576,13 @@ impl QueryEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let first = self.selected.is_none();
         self.selected = Some((row, column));
         window.focus(&self.results_focus, cx);
+        if first {
+            // The footer offers copying once a cell is selected.
+            cx.emit(ItemEvent::UpdateTab);
+        }
         cx.notify();
     }
 
@@ -1282,78 +1620,223 @@ impl QueryEditor {
 
     // ---- rendering ----
 
+    fn footer_parts(&self, cx: &mut Context<Self>) -> ItemFooter {
+        use studio_ui::ds;
+        let commit_meta = |id: &'static str, commit: &str, tip: String, cx: &App| {
+            div()
+                .id(id)
+                .tooltip(Tooltip::text(tip))
+                .child(ds::meta_code(IconName::GitCommit, short_commit(commit), cx))
+                .into_any_element()
+        };
+        let mut start = Vec::new();
+        let mut end = Vec::new();
+        match &self.output {
+            Output::Rows(rows) => {
+                start.push(ds::meta(IconName::Hash, rows_label(rows.row_count)).into_any_element());
+                start.push(
+                    ds::meta(IconName::Clock, format_elapsed(rows.elapsed)).into_any_element(),
+                );
+                // Where the rows were read, when it is not the branch the footer shows: the
+                // branch changed since, and a commit pin is named by the commit itself.
+                if !rows.target.starts_with("commit ") && rows.target != self.branch(cx) {
+                    start.push(
+                        ds::meta(IconName::GitBranch, rows.target.clone()).into_any_element(),
+                    );
+                }
+                if let Some(commit) = &rows.commit {
+                    start.push(commit_meta(
+                        "read-commit",
+                        commit,
+                        format!("Read at graph commit {commit}"),
+                        cx,
+                    ));
+                }
+                if let Some(graph) = rows.graph.clone() {
+                    let title = format!("{} · result", rows.label);
+                    end.push(
+                        ds::button("result-canvas", "Canvas")
+                            .style(ButtonStyle::Subtle)
+                            .label_size(LabelSize::XSmall)
+                            .start_icon(Icon::new(IconName::GitGraph).size(IconSize::XSmall))
+                            .tooltip(Tooltip::text(format!(
+                                "Draw the result's {} nodes, linking those in the same row",
+                                graph.0.len()
+                            )))
+                            .on_click(move |_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(studio_actions::graph::ShowResultsOnCanvas {
+                                        title: title.clone(),
+                                        nodes: graph.0.clone(),
+                                        links: graph.1.clone(),
+                                    }),
+                                    cx,
+                                )
+                            })
+                            .into_any_element(),
+                    );
+                }
+                if self.selected.is_some() {
+                    let focus = &self.results_focus;
+                    end.push(ds::key_hint(&CopyCell, "Copy", focus, cx).into_any_element());
+                    end.push(ds::key_hint(&CopyRow, "Copy row", focus, cx).into_any_element());
+                }
+            }
+            Output::Plan(plan) => {
+                start.push(
+                    ds::meta(IconName::ListTree, format!("Plan of {}", plan.label))
+                        .into_any_element(),
+                );
+                start.push(
+                    ds::meta(IconName::Clock, format_elapsed(plan.elapsed)).into_any_element(),
+                );
+                if let Some(commit) = &plan.commit {
+                    start.push(commit_meta(
+                        "plan-commit",
+                        commit,
+                        format!("Planned at graph commit {commit}"),
+                        cx,
+                    ));
+                }
+            }
+            Output::Running { label } => {
+                start.push(
+                    h_flex()
+                        .gap(px(ds::space::XS))
+                        .items_center()
+                        .child(
+                            Icon::new(IconName::ArrowCircle)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(ds::text::meta(label.clone()))
+                        .into_any_element(),
+                );
+            }
+            Output::Empty | Output::Written(_) | Output::Failed(_) => {
+                if let (None, Some((name, Some(info)))) = (&self.stored, self.current_query())
+                    && !info.is_mutation
+                    && !info.columns.is_empty()
+                {
+                    start.push(
+                        ds::meta(
+                            IconName::ListTree,
+                            format!("{name} returns {} columns", info.columns.len()),
+                        )
+                        .into_any_element(),
+                    );
+                }
+                let focus = self.main_focus(cx);
+                end.push(ds::key_hint(&Run, "Run", &focus, cx).into_any_element());
+                if self.stored.is_none() {
+                    end.push(ds::key_hint(&Explain, "Explain", &focus, cx).into_any_element());
+                }
+            }
+        }
+        ItemFooter { start, end }
+    }
+
+    /// The page's toolbar, as the table's: what the page runs on the leading side (the query
+    /// under the cursor, or the stored query), the commit it reads and its actions on the
+    /// trailing side, Run last.
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let editor_focus = self.editor.focus_handle(cx);
-        let current = self.current_query();
-        let (summary, writes): (String, bool) = match &current {
-            Some((name, Some(info))) if info.is_mutation => (format!("{name} · writes"), true),
-            Some((name, Some(_))) => (format!("{name} · read"), false),
-            Some((name, None)) if !name.is_empty() => (name.clone(), false),
-            _ => (String::new(), false),
+        let focus = self.main_focus(cx);
+        let (icon, title, kind): (IconName, Option<String>, Option<&str>) = match &self.stored {
+            Some(stored) => (
+                IconName::Server,
+                Some(stored.entry.name.clone()),
+                Some(if stored.entry.mutation {
+                    "writes"
+                } else {
+                    "reads"
+                }),
+            ),
+            None => match self.current_query() {
+                Some((name, Some(info))) if !name.is_empty() => (
+                    IconName::FileCode,
+                    Some(name),
+                    Some(if info.is_mutation { "writes" } else { "reads" }),
+                ),
+                Some((name, None)) if !name.is_empty() => (IconName::FileCode, Some(name), None),
+                _ => (IconName::FileCode, None, None),
+            },
+        };
+        let tip = match &self.stored {
+            Some(_) => "A stored query: the server runs it by name, and its text stays there",
+            None => "The query under the cursor",
         };
         let busy = self.writing;
-        let file_error = self.file_error.clone();
+        let run_tip = match &self.stored {
+            Some(stored) => format!("Run {} with the values below", stored.entry.name),
+            None => "Run the query under the cursor".to_owned(),
+        };
         studio_ui::ds::toolbar(cx)
-            .px_2()
-            .when_some(file_error, |toolbar, error| {
-                toolbar.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+            .children(title.map(|title| {
+                h_flex()
+                    .id("query-title")
+                    .min_w_0()
+                    .gap(px(studio_ui::ds::space::INLINE))
+                    .items_center()
+                    .tooltip(Tooltip::text(tip))
+                    .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                    .child(studio_ui::ds::text::title(title).single_line().truncate())
+                    .children(kind.map(studio_ui::ds::text::muted))
+            }))
+            .children(self.file_error.clone().map(|error| {
+                Label::new(error)
+                    .size(LabelSize::Small)
+                    .color(Color::Error)
+                    .single_line()
+                    .truncate()
+            }))
+            .child(div().flex_1())
+            .child(self.render_snapshot_picker(cx))
+            // A stored query's plan needs its text, which the server does not send.
+            .when(self.stored.is_none(), |toolbar| {
+                toolbar.child(
+                    studio_ui::ds::button("explain", "Explain")
+                        .start_icon(Icon::new(IconName::ListTree).size(IconSize::XSmall))
+                        .key_binding(KeyBinding::for_action_in(&Explain, &focus, cx))
+                        .tooltip({
+                            let focus = focus.clone();
+                            move |_window, cx| {
+                                Tooltip::for_action_in(
+                                    "Show the plan of the query under the cursor",
+                                    &Explain,
+                                    &focus,
+                                    cx,
+                                )
+                            }
+                        })
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.explain(&Explain, window, cx)),
+                        ),
+                )
             })
             .child(
                 studio_ui::ds::button("run", "Run")
                     .style(ButtonStyle::Filled)
-                    .label_size(LabelSize::Small)
                     .start_icon(Icon::new(IconName::PlayFilled).size(IconSize::XSmall))
-                    .key_binding(KeyBinding::for_action_in(&Run, &editor_focus, cx))
+                    .key_binding(KeyBinding::for_action_in(&Run, &focus, cx))
                     .disabled(busy)
                     .tooltip({
-                        let focus = editor_focus.clone();
+                        let focus = focus.clone();
                         move |_window, cx| {
                             if busy {
                                 Tooltip::simple("A write is in flight; wait for its outcome.", cx)
                             } else {
-                                Tooltip::for_action_in(
-                                    "Run the query under the cursor",
-                                    &Run,
-                                    &focus,
-                                    cx,
-                                )
+                                Tooltip::for_action_in(run_tip.clone(), &Run, &focus, cx)
                             }
                         }
                     })
                     .on_click(cx.listener(|this, _, window, cx| this.run(&Run, window, cx))),
             )
-            .child(
-                studio_ui::ds::button("explain", "Explain")
-                    .label_size(LabelSize::Small)
-                    .start_icon(Icon::new(IconName::ListTree).size(IconSize::XSmall))
-                    .key_binding(KeyBinding::for_action_in(&Explain, &editor_focus, cx))
-                    .tooltip({
-                        let focus = editor_focus.clone();
-                        move |_window, cx| {
-                            Tooltip::for_action_in(
-                                "Show the plan of the query under the cursor",
-                                &Explain,
-                                &focus,
-                                cx,
-                            )
-                        }
-                    })
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.explain(&Explain, window, cx)),
-                    ),
-            )
-            .child(self.render_snapshot_picker(cx))
-            .child(div().flex_1())
-            .when(!summary.is_empty(), |d| {
-                d.child(Label::new(summary).size(LabelSize::Small).color(if writes {
-                    Color::Warning
-                } else {
-                    Color::Muted
-                }))
-            })
     }
 
     fn render_problems(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.stored.is_some() {
+            return None;
+        }
         let analysis = self.analysis.clone()?;
         if analysis.problems.is_empty() {
             return None;
@@ -1461,58 +1944,55 @@ impl QueryEditor {
         window.focus(&focus, cx);
     }
 
+    /// The parameters as a field grid: each name, its input and its type.
     fn render_params(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (_, Some(info)) = self.current_query()? else {
-            return None;
-        };
-        if info.params.is_empty() {
+        use studio_ui::ds::{self, size, space};
+        let params = self.shown_params()?;
+        if params.is_empty() {
             return None;
         }
         let colors = cx.theme().colors();
-        let (border, input_bg) = (colors.border_variant, colors.editor_background);
+        let (field_border, field_bg) = (colors.border, colors.editor_background);
         Some(
-            h_flex()
+            v_flex()
                 .flex_none()
-                .flex_wrap()
-                .px_2()
-                .py_1p5()
-                .gap_3()
-                .border_t_1()
-                .border_color(border)
+                .px(px(space::EDGE))
+                .py(px(space::LG))
+                .border_b_1()
+                .border_color(ds::surface::rule(cx))
                 .child(
-                    Label::new("Parameters")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                    ds::fields().children(params.iter().filter_map(|(name, ty, nullable)| {
+                        let input = self.params.get(name)?.clone();
+                        let ty = format!("{ty}{}", if *nullable { "?" } else { "" });
+                        Some(ds::field(
+                            format!("${name}"),
+                            h_flex()
+                                .gap(px(space::MD))
+                                .items_center()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .max_w(px(size::INSPECTOR_WIDTH))
+                                        .h(px(size::ROW))
+                                        .px(px(space::MD))
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(ds::radius::SM))
+                                        .border_1()
+                                        .border_color(field_border)
+                                        .bg(field_bg)
+                                        .child(input),
+                                )
+                                .child(ds::text::meta(ty).single_line()),
+                        ))
+                    })),
                 )
-                .children(info.params.iter().filter_map(|(name, ty, nullable)| {
-                    let input = self.params.get(name)?.clone();
-                    Some(
-                        h_flex()
-                            .gap_1p5()
-                            .child(Label::new(format!("${name}")).size(LabelSize::Small))
-                            .child(
-                                Label::new(format!("{ty}{}", if *nullable { "?" } else { "" }))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                div()
-                                    .w(px(180.))
-                                    .px_1p5()
-                                    .py_0p5()
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(border)
-                                    .bg(input_bg)
-                                    .child(input),
-                            ),
-                    )
-                }))
                 .into_any_element(),
         )
     }
 
     fn render_confirm(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        use studio_ui::ds::{self, size, space};
         let pending = self.pending_write.as_ref()?;
         let status = cx.theme().status();
         let (background, border) = (status.warning_background, status.warning_border);
@@ -1536,74 +2016,55 @@ impl QueryEditor {
                 .on_action(cx.listener(Self::confirm_write))
                 .on_action(cx.listener(Self::cancel_write))
                 .flex_none()
-                .px_2()
-                .py_1p5()
-                .gap_2()
+                .min_h(px(size::STRIP))
+                .px(px(space::EDGE))
+                .gap(px(space::INLINE))
+                .items_center()
                 .bg(background)
-                .border_t_1()
+                .border_b_1()
                 .border_color(border)
                 .child(
                     Icon::new(IconName::Warning)
                         .size(IconSize::Small)
                         .color(Color::Warning),
                 )
-                .child(Label::new(what).size(LabelSize::Small))
+                .child(ds::text::body(what))
                 .child(div().flex_1())
                 .child(
-                    studio_ui::ds::button("confirm-write", button)
-                        .style(ButtonStyle::Filled)
-                        .label_size(LabelSize::Small)
-                        .key_binding(KeyBinding::for_action_in(
-                            &menu::Confirm,
-                            &self.confirm_focus,
-                            cx,
-                        ))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.confirm_write(&menu::Confirm, window, cx)
-                        })),
-                )
-                .child(
-                    studio_ui::ds::button("cancel-write", "Cancel")
-                        .label_size(LabelSize::Small)
-                        .key_binding(KeyBinding::for_action_in(
-                            &menu::Cancel,
-                            &self.confirm_focus,
-                            cx,
-                        ))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.cancel_write(&menu::Cancel, window, cx)
-                        })),
+                    h_flex()
+                        .gap(px(space::XS))
+                        .child(
+                            ds::button("cancel-write", "Cancel")
+                                .key_binding(KeyBinding::for_action_in(
+                                    &menu::Cancel,
+                                    &self.confirm_focus,
+                                    cx,
+                                ))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.cancel_write(&menu::Cancel, window, cx)
+                                })),
+                        )
+                        .child(
+                            ds::button("confirm-write", button)
+                                .style(ButtonStyle::Filled)
+                                .key_binding(KeyBinding::for_action_in(
+                                    &menu::Confirm,
+                                    &self.confirm_focus,
+                                    cx,
+                                ))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.confirm_write(&menu::Confirm, window, cx)
+                                })),
+                        ),
                 )
                 .into_any_element(),
         )
     }
 
-    fn status_line(&self, cx: &mut Context<Self>) -> Div {
-        let border = cx.theme().colors().border_variant;
-        h_flex()
-            .h(px(30.))
-            .flex_none()
-            .px_2()
-            .gap_3()
-            .border_t_1()
-            .border_b_1()
-            .border_color(border)
-    }
-
     fn render_results(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match &self.output {
             Output::Empty => self.render_expected(cx),
-            Output::Running { label } => v_flex()
-                .flex_1()
-                .min_h_0()
-                .child(
-                    self.status_line(cx).child(
-                        Label::new(label.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-                )
-                .into_any_element(),
+            Output::Running { .. } => v_flex().flex_1().min_h_0().into_any_element(),
             Output::Rows(rows) => self.render_rows(rows, window, cx),
             Output::Plan(plan) => self.render_plan(plan, cx),
             Output::Written(result) => self.render_written(result, cx),
@@ -1612,12 +2073,33 @@ impl QueryEditor {
     }
 
     /// Before the first run: the columns the query under the cursor will return.
+    /// Before the first run: the columns the query under the cursor will return, or what Run
+    /// will do.
     fn render_expected(&self, cx: &mut Context<Self>) -> AnyElement {
-        let editor_focus = self.editor.focus_handle(cx);
-        let current = self.current_query();
-        let mut body = v_flex().flex_1().min_h_0();
-        match current {
-            Some((name, Some(info))) if !info.is_mutation && !info.columns.is_empty() => {
+        use studio_ui::ds;
+        let focus = self.main_focus(cx);
+        let run_hint = ds::key_hint(&Run, "Run", &focus, cx);
+        let writes = |name: &str, branch: String| {
+            ds::empty_state(IconName::Warning, format!("{name} changes data")).child(
+                ds::text::meta(format!("Run asks before it writes to {branch}")),
+            )
+        };
+        if let Some(stored) = &self.stored {
+            if stored.entry.mutation {
+                return v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(writes(&stored.entry.name, self.branch(cx)))
+                    .into_any_element();
+            }
+            return v_flex()
+                .flex_1()
+                .min_h_0()
+                .child(ds::empty_state(IconName::PlayFilled, "Results appear here").child(run_hint))
+                .into_any_element();
+        }
+        match self.current_query() {
+            Some((_, Some(info))) if !info.is_mutation && !info.columns.is_empty() => {
                 let columns: Vec<GridColumn> = info
                     .columns
                     .iter()
@@ -1629,53 +2111,28 @@ impl QueryEditor {
                                 .clamp(96., 240.)))
                     })
                     .collect();
-                body = body
-                    .child(
-                        self.status_line(cx)
-                            .child(
-                                Label::new(format!("{name} returns"))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(div().flex_1())
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .child(
-                                        Label::new("Run")
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(KeyBinding::for_action_in(&Run, &editor_focus, cx)),
-                            ),
-                    )
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
                     .child(
                         div()
                             .id("expected-columns")
                             .overflow_x_scroll()
                             .child(grid_header(&columns, px(ROW_NUMBER_WIDTH), cx)),
-                    );
+                    )
+                    .into_any_element()
             }
-            Some((name, Some(info))) if info.is_mutation => {
-                body = body.child(studio_ui::empty_state(
-                    format!("{name} changes data"),
-                    Some(
-                        format!(
-                            "Run asks before it writes to {}. Nothing runs on ⌘↵ alone.",
-                            self.branch(cx)
-                        )
-                        .into(),
-                    ),
-                ));
-            }
-            _ => {
-                body = body.child(studio_ui::empty_state(
-                    "Results appear here",
-                    Some("⌘↵ runs the query under the cursor; ⌘⇧↵ shows its plan.".into()),
-                ));
-            }
+            Some((name, Some(info))) if info.is_mutation => v_flex()
+                .flex_1()
+                .min_h_0()
+                .child(writes(&name, self.branch(cx)))
+                .into_any_element(),
+            _ => v_flex()
+                .flex_1()
+                .min_h_0()
+                .child(ds::empty_state(IconName::PlayFilled, "Results appear here").child(run_hint))
+                .into_any_element(),
         }
-        body.into_any_element()
     }
 
     fn render_rows(
@@ -1700,95 +2157,12 @@ impl QueryEditor {
             })
             .collect();
         let total: f32 = ROW_NUMBER_WIDTH + rows.widths.iter().sum::<f32>();
-        let has_selection = self.selected.is_some();
-        let commit = rows.commit.clone();
-        let status = self
-            .status_line(cx)
-            .child(Label::new(rows_label(rows.row_count)).size(LabelSize::Small))
-            .child(
-                Label::new(format_elapsed(rows.elapsed))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new(format!("{} on {}", rows.label, rows.target))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .children(commit.map(|commit| {
-                div()
-                    .id("read-commit")
-                    .child(
-                        Label::new(format!("at {}", short_commit(&commit)))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .tooltip(Tooltip::text(format!("Read at graph commit {commit}")))
-            }))
-            .child(div().flex_1())
-            .child(
-                studio_ui::ds::button("copy-cell", "Copy cell")
-                    .label_size(LabelSize::Small)
-                    .start_icon(Icon::new(IconName::Copy).size(IconSize::XSmall))
-                    .disabled(!has_selection)
-                    .key_binding(KeyBinding::for_action_in(
-                        &CopyCell,
-                        &self.results_focus,
-                        cx,
-                    ))
-                    .tooltip(move |_window, cx| {
-                        if has_selection {
-                            Tooltip::simple("Copy the selected cell's value", cx)
-                        } else {
-                            Tooltip::simple("Click a cell to select it first", cx)
-                        }
-                    })
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.copy_cell(&CopyCell, window, cx)),
-                    ),
-            )
-            .when_some(rows.graph.clone(), |status, graph| {
-                let title = format!("{} · result", rows.label);
-                status.child(
-                    studio_ui::ds::button("result-canvas", "Canvas")
-                        .label_size(LabelSize::Small)
-                        .start_icon(Icon::new(IconName::GitGraph).size(IconSize::XSmall))
-                        .tooltip(Tooltip::text(format!(
-                            "Draw the result's {} nodes, linking those in the same row",
-                            graph.0.len()
-                        )))
-                        .on_click(move |_, window, cx| {
-                            window.dispatch_action(
-                                Box::new(studio_actions::graph::ShowResultsOnCanvas {
-                                    title: title.clone(),
-                                    nodes: graph.0.clone(),
-                                    links: graph.1.clone(),
-                                }),
-                                cx,
-                            )
-                        }),
-                )
-            })
-            .child(
-                studio_ui::ds::button("copy-row", "Copy row")
-                    .label_size(LabelSize::Small)
-                    .disabled(!has_selection)
-                    .key_binding(KeyBinding::for_action_in(&CopyRow, &self.results_focus, cx))
-                    .tooltip(move |_window, cx| {
-                        if has_selection {
-                            Tooltip::simple("Copy the selected row as JSON", cx)
-                        } else {
-                            Tooltip::simple("Click a cell to select it first", cx)
-                        }
-                    })
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.copy_row(&CopyRow, window, cx)),
-                    ),
-            );
         let body = if table.rows.is_empty() {
             v_flex()
+                .flex_1()
+                .min_h_0()
                 .child(grid_header(&columns, px(ROW_NUMBER_WIDTH), cx))
-                .child(studio_ui::empty_state("No rows", None))
+                .child(studio_ui::ds::empty_state(IconName::Hash, "No rows"))
                 .into_any_element()
         } else {
             div()
@@ -1826,7 +2200,6 @@ impl QueryEditor {
             )
             .flex_1()
             .min_h_0()
-            .child(status)
             .child(body)
             .into_any_element()
     }
@@ -1890,28 +2263,9 @@ impl QueryEditor {
     }
 
     fn render_plan(&self, plan: &PlanOutput, cx: &mut Context<Self>) -> AnyElement {
-        let status = self
-            .status_line(cx)
-            .child(Label::new(format!("Plan of {}", plan.label)).size(LabelSize::Small))
-            .child(
-                Label::new(format_elapsed(plan.elapsed))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .children(plan.commit.clone().map(|commit| {
-                div()
-                    .id("plan-commit")
-                    .child(
-                        Label::new(format!("at {}", short_commit(&commit)))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .tooltip(Tooltip::text(format!("Planned at graph commit {commit}")))
-            }));
         v_flex()
             .flex_1()
             .min_h_0()
-            .child(status)
             .child(
                 uniform_list(
                     "query-plan",
@@ -1919,7 +2273,7 @@ impl QueryEditor {
                     cx.processor(|this, range, _window, cx| this.render_plan_rows(range, cx)),
                 )
                 .flex_1()
-                .py_1(),
+                .py(px(studio_ui::ds::space::XS)),
             )
             .into_any_element()
     }
@@ -2057,53 +2411,75 @@ impl QueryEditor {
     }
 
     fn render_written(&self, result: &WriteResult, cx: &mut Context<Self>) -> AnyElement {
-        let (icon, color, title, detail, diagnostic) = match result {
+        use studio_ui::ds;
+        match result {
             WriteResult::Committed {
                 branch,
                 nodes,
                 edges,
                 commit,
                 elapsed,
-            } => (
-                IconName::Check,
-                Color::Success,
-                match commit {
+            } => {
+                let title = match commit {
                     Some(_) => format!("Committed to {branch}"),
                     None => format!("Nothing changed on {branch}"),
-                },
-                format!(
-                    "{nodes} node{} and {edges} edge{} affected · {}{}",
-                    if *nodes == 1 { "" } else { "s" },
-                    if *edges == 1 { "" } else { "s" },
-                    format_elapsed(*elapsed),
-                    commit
-                        .as_ref()
-                        .map(|c| format!(" · commit {}", short_commit(c)))
-                        .unwrap_or_default()
-                ),
-                None,
-            ),
+                };
+                let count =
+                    |n: i64, one: &str| format!("{n} {one}{}", if n == 1 { "" } else { "s" });
+                let mut facts = vec![
+                    ds::meta(
+                        IconName::Hash,
+                        format!("{}, {}", count(*nodes, "node"), count(*edges, "edge")),
+                    )
+                    .into_any_element(),
+                    ds::meta(IconName::Clock, format_elapsed(*elapsed)).into_any_element(),
+                ];
+                if let Some(commit) = commit {
+                    facts.push(
+                        div()
+                            .id("write-commit")
+                            .child(ds::meta_code(IconName::GitCommit, short_commit(commit), cx))
+                            .tooltip(Tooltip::text(format!("Graph commit {commit}")))
+                            .into_any_element(),
+                    );
+                }
+                self.render_message(
+                    IconName::Check,
+                    Color::Success,
+                    title,
+                    None,
+                    facts,
+                    None,
+                    cx,
+                )
+            }
             WriteResult::Refused {
                 status,
                 message,
                 diagnostic,
-            } => (
+            } => self.render_message(
                 IconName::XCircle,
                 Color::Error,
                 format!("Refused ({status}): {message}"),
-                "Nothing was written. Your query is unchanged; fix it and run again.".to_owned(),
+                Some("Nothing was written. Your query is unchanged; fix it and run again.".into()),
+                Vec::new(),
                 diagnostic.clone(),
+                cx,
             ),
-            WriteResult::Unknown { reason } => (
+            WriteResult::Unknown { reason } => self.render_message(
                 IconName::Warning,
                 Color::Warning,
                 format!("The outcome is unknown: {reason}"),
-                "The write may or may not have landed. Check History before trying again; Studio does not retry."
-                    .to_owned(),
+                Some(
+                    "The write may or may not have landed. Check History before trying again; \
+                     Studio does not retry."
+                        .into(),
+                ),
+                Vec::new(),
                 None,
+                cx,
             ),
-        };
-        self.render_message(icon, color, title, Some(detail), diagnostic, cx)
+        }
     }
 
     fn render_failure(&self, failure: &Failure, cx: &mut Context<Self>) -> AnyElement {
@@ -2112,63 +2488,74 @@ impl QueryEditor {
             Color::Error,
             failure.title.clone(),
             failure.hint.clone(),
+            Vec::new(),
             failure.diagnostic.clone(),
             cx,
         )
     }
 
+    /// An outcome or a failure: its icon and title, then what to do, its facts and the place
+    /// in the query the server pointed at.
+    #[allow(clippy::too_many_arguments)]
     fn render_message(
         &self,
         icon: IconName,
         color: Color,
         title: String,
         detail: Option<String>,
+        facts: Vec<AnyElement>,
         diagnostic: Option<ServerDiagnostic>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        use studio_ui::ds::{self, space};
         v_flex()
             .flex_1()
             .min_h_0()
-            .p_3()
-            .gap_1p5()
+            .px(px(space::EDGE))
+            .py(px(space::LG))
             .child(
                 h_flex()
-                    .gap_2()
                     .items_start()
-                    .child(Icon::new(icon).size(IconSize::Small).color(color))
-                    .child(Label::new(title).size(LabelSize::Small)),
-            )
-            .children(detail.map(|detail| {
-                div().pl_6().child(
-                    Label::new(detail)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-            }))
-            .children(diagnostic.map(|diagnostic| {
-                let at = diagnostic.byte;
-                div().pl_6().child(
-                    studio_ui::ds::button(
-                        "server-diagnostic",
-                        format!(
-                            "{}{}",
-                            diagnostic
-                                .code
-                                .map(|c| format!("{c} · "))
-                                .unwrap_or_default(),
-                            diagnostic.message
-                        ),
+                    .gap(px(space::INLINE))
+                    .child(
+                        div()
+                            .pt(px(space::XXS))
+                            .child(Icon::new(icon).size(IconSize::Small).color(color)),
                     )
-                    .label_size(LabelSize::Small)
-                    .start_icon(Icon::new(IconName::ArrowRight).size(IconSize::XSmall))
-                    .disabled(at.is_none())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(at) = at {
-                            this.jump_to(at, window, cx);
-                        }
-                    })),
-                )
-            }))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .gap(px(space::XS))
+                            .child(ds::text::body(title))
+                            .children(detail.map(ds::text::muted))
+                            .when(!facts.is_empty(), |column| {
+                                column.child(ds::meta_row(facts))
+                            })
+                            .children(diagnostic.map(|diagnostic| {
+                                let at = diagnostic.byte;
+                                ds::button(
+                                    "server-diagnostic",
+                                    format!(
+                                        "{}{}",
+                                        diagnostic
+                                            .code
+                                            .map(|c| format!("{c} · "))
+                                            .unwrap_or_default(),
+                                        diagnostic.message
+                                    ),
+                                )
+                                .start_icon(Icon::new(IconName::ArrowRight).size(IconSize::XSmall))
+                                .disabled(at.is_none())
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        if let Some(at) = at {
+                                            this.jump_to(at, window, cx);
+                                        }
+                                    },
+                                ))
+                            })),
+                    ),
+            )
             .into_any_element()
     }
 }
@@ -2179,12 +2566,25 @@ impl Render for QueryEditor {
         if self.parsed {
             crate::syntax::language(crate::syntax::Syntax::Gq, cx);
         }
-        let border = cx.theme().colors().border;
         let toolbar = self.render_toolbar(cx).into_any_element();
         let problems = self.render_problems(cx);
         let params = self.render_params(cx);
         let confirm = self.render_confirm(cx);
         let results = self.render_results(window, cx);
+        let source = match &self.stored {
+            Some(stored) => self.render_stored_about(stored, cx),
+            None => Some(
+                div()
+                    .h(relative(0.42))
+                    .min_h(px(120.))
+                    .flex_none()
+                    .pt(px(studio_ui::ds::space::XS))
+                    .border_b_1()
+                    .border_color(studio_ui::ds::surface::rule(cx))
+                    .child(self.editor.clone())
+                    .into_any_element(),
+            ),
+        };
         v_flex()
             .key_context("QueryEditor")
             .on_action(cx.listener(Self::run))
@@ -2193,16 +2593,8 @@ impl Render for QueryEditor {
             .on_action(cx.listener(Self::save_as))
             .size_full()
             .child(toolbar)
-            .child(
-                div()
-                    .h(relative(0.42))
-                    .min_h(px(120.))
-                    .flex_none()
-                    .pt_1()
-                    .child(self.editor.clone()),
-            )
+            .children(source)
             .children(problems)
-            .child(div().h_px().w_full().flex_none().bg(border))
             .children(params)
             .children(confirm)
             .child(results)
@@ -2212,6 +2604,64 @@ impl Render for QueryEditor {
 /// The dedupe key of a tab editing `path`, so a file opens once.
 pub fn file_key(path: &std::path::Path) -> String {
     format!("query-file:{}", path.display())
+}
+
+/// A parameter's input: one line, its text at the size of the labels beside it.
+fn param_input(
+    placeholder: &str,
+    text: Option<String>,
+    window: &mut Window,
+    cx: &mut Context<QueryEditor>,
+) -> Entity<Editor> {
+    cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_placeholder_text(placeholder, window, cx);
+        editor.set_text_style_refinement(studio_ui::ds::field_text(cx));
+        if let Some(text) = text {
+            editor.set_text(text, window, cx);
+        }
+        editor
+    })
+}
+
+/// A value as a parameter input shows it: a string as it is, anything else as JSON, which the
+/// input reads back.
+fn value_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+/// The dedupe key of the tab running the stored query `name`, so it opens once.
+pub fn stored_key(name: &str) -> String {
+    format!("stored-query:{name}")
+}
+
+/// The type a stored-query parameter is read as, in the spelling `gq_language::param_value`
+/// takes. A 64-bit integer is sent as the text typed (`BigInt` is no spelling it converts), so
+/// a value past 2^53, or above the signed maximum, reaches the server exactly; the server reads
+/// either form. A kind Studio does not know is sent as text too.
+fn param_type(param: &ParamDescriptor) -> String {
+    fn scalar(kind: ParamKind) -> &'static str {
+        match kind {
+            ParamKind::String => "String",
+            ParamKind::Bool => "Bool",
+            ParamKind::Int => "I64",
+            ParamKind::BigInt => "BigInt",
+            ParamKind::Float => "F64",
+            ParamKind::Date => "Date",
+            ParamKind::DateTime => "DateTime",
+            ParamKind::Blob => "Blob",
+            ParamKind::Vector | ParamKind::List | ParamKind::Other => "Text",
+        }
+    }
+    match param.kind {
+        ParamKind::Vector => format!("Vector({})", param.vector_dim.unwrap_or_default()),
+        ParamKind::List => format!("[{}]", scalar(param.item_kind.unwrap_or(ParamKind::Other))),
+        kind => scalar(kind).to_owned(),
+    }
 }
 
 /// `dir/name.gq`, or `dir/name-2.gq` and so on when that is taken.
@@ -2330,4 +2780,87 @@ fn facts_tooltip(facts: &[(String, String)]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn param(kind: ParamKind) -> ParamDescriptor {
+        ParamDescriptor {
+            name: "p".into(),
+            kind,
+            item_kind: None,
+            vector_dim: None,
+            nullable: false,
+        }
+    }
+
+    fn sent(param: &ParamDescriptor, text: &str) -> Result<Option<Value>, String> {
+        gq_language::param_value(&param.name, &param_type(param), param.nullable, text)
+    }
+
+    /// Each catalog kind reads the text typed as the server takes it: a 64-bit integer as the
+    /// text itself, so a value past the signed maximum stays exact, and an unknown kind as text.
+    #[test]
+    fn stored_parameters_are_read_by_their_catalog_kind() {
+        assert_eq!(sent(&param(ParamKind::Int), " 42 "), Ok(Some(json!(42))));
+        assert!(sent(&param(ParamKind::Int), "forty").is_err());
+        assert_eq!(
+            sent(&param(ParamKind::BigInt), "18446744073709551615"),
+            Ok(Some(json!("18446744073709551615")))
+        );
+        assert_eq!(sent(&param(ParamKind::Float), "1.5"), Ok(Some(json!(1.5))));
+        assert_eq!(sent(&param(ParamKind::Bool), "yes"), Ok(Some(json!(true))));
+        assert_eq!(
+            sent(&param(ParamKind::Date), "2026-10-14"),
+            Ok(Some(json!("2026-10-14")))
+        );
+        assert_eq!(
+            sent(&param(ParamKind::Other), "P1D"),
+            Ok(Some(json!("P1D")))
+        );
+
+        let list = ParamDescriptor {
+            item_kind: Some(ParamKind::Int),
+            ..param(ParamKind::List)
+        };
+        assert_eq!(param_type(&list), "[I64]");
+        assert_eq!(sent(&list, "1, 2"), Ok(Some(json!([1, 2]))));
+        assert_eq!(sent(&list, "[3]"), Ok(Some(json!([3]))));
+
+        let vector = ParamDescriptor {
+            vector_dim: Some(2),
+            ..param(ParamKind::Vector)
+        };
+        assert_eq!(param_type(&vector), "Vector(2)");
+        assert_eq!(sent(&vector, "0.5, 1"), Ok(Some(json!([0.5, 1.0]))));
+
+        // Empty is no value: refused when the parameter is required, left out when it may be.
+        assert!(sent(&param(ParamKind::String), "").is_err());
+        let optional = ParamDescriptor {
+            nullable: true,
+            ..param(ParamKind::Int)
+        };
+        assert_eq!(sent(&optional, "  "), Ok(None));
+    }
+
+    /// What an input shows for a value from an alias or a remembered tab, and reads back.
+    #[test]
+    fn values_show_as_text_the_inputs_read_back() {
+        assert_eq!(value_text(&json!("Ada")), "Ada");
+        assert_eq!(value_text(&json!(5)), "5");
+        assert_eq!(value_text(&json!(["a", "b"])), r#"["a","b"]"#);
+        assert_eq!(value_text(&Value::Null), "");
+        let list = ParamDescriptor {
+            item_kind: Some(ParamKind::String),
+            ..param(ParamKind::List)
+        };
+        assert_eq!(
+            sent(&list, &value_text(&json!(["a", "b"]))),
+            Ok(Some(json!(["a", "b"])))
+        );
+    }
 }
