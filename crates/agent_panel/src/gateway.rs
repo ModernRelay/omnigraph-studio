@@ -1056,10 +1056,14 @@ mod end_to_end {
             Some(cli) => vec![PathBuf::from(cli)],
             None => cli_home::candidates(None),
         };
-        let chosen = smol::block_on(cli_home::choose_cli(&home, candidates));
+        let chosen = smol::block_on(cli_home::choose_cli(
+            &home,
+            candidates,
+            graph_client::SUPPORTED_CONTRACTS[0],
+        ));
         assert!(
-            chosen.is_some(),
-            "no omnigraph CLI answered through the gateway"
+            matches!(chosen, cli_home::CliChoice::Chosen { .. }),
+            "no omnigraph CLI speaks the graph's contract: {chosen:?}"
         );
 
         let target = ["--server", "studio", "--graph", graph.as_str()];

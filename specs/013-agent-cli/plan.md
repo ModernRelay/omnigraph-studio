@@ -159,12 +159,19 @@ Bedrock does. This closes the gap where the agent inherited the person's graph t
 
 1. `agent.omnigraph_cli` (in `settings.json`), then each `omnigraph` on PATH, then
    `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`, without duplicates.
-2. Each is tried through the conversation's gateway with
-   `omnigraph snapshot --server studio --graph <id> --json`, bounded to 20 s. The first that
-   answers stays in the wrapper. With `omnigraph version --json` (E23) this can read the contract
-   instead.
-3. If none answers, a notice in the thread names the API the graph speaks and the setting, and
-   the `omnigraph_cli` tool says the CLI is unavailable. The agent keeps the graph tools.
+2. Each says which HTTP contract it speaks, without a server: `omnigraph version --json`
+   reports `http_contract` (OmniGraph #987, E23); a release from before it is known by its
+   number (0.13.x speaks `0.13`, 0.12.x `0.12`, 0.11 and older none), each bounded to 5 s. The
+   first that speaks the contract Studio speaks goes in the wrapper, so a slow or unavailable
+   server never decides which CLI a conversation gets.
+3. A CLI that cannot say (a later release without `version --json`) is tried last through the
+   conversation's gateway with `omnigraph snapshot --server studio --graph <id> --json`,
+   bounded to 20 s.
+4. If none fits, the wrapper runs nothing and prints why, so `omnigraph_run` and the agent's
+   shell refuse rather than run a CLI the server would refuse. A notice in the thread names the
+   contract and each CLI found with its release and what it speaks, and the `omnigraph_cli`
+   tool says the CLI is unavailable. The agent keeps the graph tools. A configured
+   `agent.omnigraph_cli` that does not fit is passed over with a notice naming the one used.
 
 ### Gateway rules
 
@@ -352,8 +359,16 @@ CLI is the one they trust).
 | 2026-10-13 | The instructions fit Claude Code's cut | `a_conversation_home_holds_its_config_token_and_wrapper` | Server and conversation instructions within 2,048 characters for a CLI found, not yet found and missing, with a 120-character data directory |
 | 2026-10-13 | The panel shows `omnigraph_run` calls | Offscreen snapshot, the test agent using only `omnigraph_run` on "change please" | Schema and query rows, "Create agent/… from main · new", a "Mutate" card on the agent branch with its query, the "Agent CLI: Mutation · committed" notice and the branch banner with Review |
 | 2026-10-13 | The panel shows the agent's CLI writes | Offscreen snapshots with the test agent, which now uses `omnigraph_cli` and the real CLI on "cli" | "Create agent/… from main · Branch created", "Mutation · Committed" with the commit and 1 change, the refusal on main ending "Nothing was sent", the workspace's "Agent CLI: Mutation · committed" notice and the branch banner with Review. With `ask_before_writes`, each card waited with Allow, Always and Reject, and committed after Allow |
+| 2026-10-14 | The CLI is chosen by its contract, not a server's answer | `agent_panel` tests `a_releases_contract_is_known_without_a_server` and `the_cli_that_speaks_the_contract_is_chosen_without_a_server` (fake CLIs: 0.11 and 0.13, a 0.14 reporting `http_contract`, a 0.15 that cannot say); `--version` of ~/.local/bin/omnigraph (`omnigraph 0.13.0`) and /opt/homebrew/bin/omnigraph (`omnigraph 0.11.0`) | 0.13 chosen over 0.11 before it with no server behind the gateway; the reporting 0.14 chosen; with 0.11 and the 0.15 the wrapper ran nothing and printed each CLI and what it speaks |
+
 
 ## Corrections
+
+- 2026-10-14 · A conversation opened while the person's server was slow got Homebrew's
+  omnigraph 0.11.0 with ~/.local/bin's 0.13.0 installed, and a notice that no CLI spoke 0.13:
+  the choice was a read through the gateway, so any failure (a timeout, a server that did not
+  answer) counted against the CLI, and the wrapper kept the last one tried. The CLI's contract
+  is now read from the CLI.
 
 - 2026-10-13 · The draft put the session home in `<cwd>/.omnigraph/` and passed `OMNIGRAPH_HOME`
   in the agent's environment. A graph's conversations share one agent process and one working

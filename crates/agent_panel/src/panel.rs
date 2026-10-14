@@ -802,13 +802,16 @@ impl AgentPanel {
         if let Some(home) = cli_home.clone() {
             let configured = settings.omnigraph_cli.clone();
             tasks.push(cx.spawn(async move |this, cx| {
+                let wanted = configured.clone();
                 let chosen = cx
                     .background_spawn(async move {
-                        let candidates = cli_home::candidates(configured.as_deref());
-                        cli_home::choose_cli(&home, candidates).await
+                        let candidates = cli_home::candidates(wanted.as_deref());
+                        let contract = graph_client::SUPPORTED_CONTRACTS[0];
+                        cli_home::choose_cli(&home, candidates, contract).await
                     })
                     .await;
-                this.update(cx, |this, cx| this.cli_chosen(chosen, cx)).ok();
+                this.update(cx, |this, cx| this.cli_chosen(chosen, configured, cx))
+                    .ok();
             }));
         }
         let event_pump = cx.spawn(async move |this, cx| {
@@ -1597,21 +1600,47 @@ impl AgentPanel {
     }
 
     /// Studio found (or did not find) a CLI that speaks the graph's API for this conversation.
-    fn cli_chosen(&mut self, chosen: Option<PathBuf>, cx: &mut Context<Self>) {
-        self.cli_ready = Some(chosen.is_some());
+    /// A configured CLI it passed over, and every CLI it found when none fits, are named.
+    fn cli_chosen(
+        &mut self,
+        choice: cli_home::CliChoice,
+        configured: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let contract = graph_client::SUPPORTED_CONTRACTS[0];
+        self.cli_ready = Some(matches!(choice, cli_home::CliChoice::Chosen { .. }));
         for waiting in self.cli_waiting.drain(..) {
             waiting.send(()).ok();
         }
-        if chosen.is_none() {
-            self.entries.push(Entry::Notice {
-                text: format!(
-                    "No omnigraph CLI here speaks this graph's HTTP API ({}), so the agent \
-                     cannot reach the graph. Install a matching omnigraph CLI, or set \
-                     `agent.omnigraph_cli`.",
-                    graph_client::SUPPORTED_CONTRACTS[0]
-                ),
-                error: false,
-            });
+        match choice {
+            cli_home::CliChoice::Chosen { cli, version } => {
+                let configured = configured
+                    .filter(|path| !path.is_empty())
+                    .map(|path| cli_home::expand_home(&path));
+                if let Some(configured) = configured
+                    && std::fs::canonicalize(&configured).ok() != std::fs::canonicalize(&cli).ok()
+                {
+                    self.entries.push(Entry::Notice {
+                        text: format!(
+                            "`agent.omnigraph_cli` ({}) does not speak this graph's HTTP API \
+                             ({contract}), so the agent uses {}{}.",
+                            configured.display(),
+                            cli.display(),
+                            version.map(|v| format!(" ({v})")).unwrap_or_default()
+                        ),
+                        error: false,
+                    });
+                }
+            }
+            cli_home::CliChoice::NoMatch { found } => {
+                self.entries.push(Entry::Notice {
+                    text: format!(
+                        "{} The agent cannot reach the graph until one is.",
+                        cli_home::no_cli_text(contract, &found)
+                    ),
+                    error: false,
+                });
+            }
         }
         cx.notify();
     }
