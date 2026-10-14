@@ -574,11 +574,18 @@ impl Render for SessionsPanel {
             );
         }
         if pinned.is_empty() && recent.is_empty() && archived.is_empty() {
-            list = list.child(ds::sidebar_note(if searching {
-                "No conversation matches."
+            let note: SharedString = if searching {
+                "No conversation matches.".into()
             } else {
-                "No conversations yet. Ask the agent from the Agent tab (⌘⇧A)."
-            }));
+                match studio_ui::shortcut_text(&studio_actions::agent::OpenAgent, cx) {
+                    Some(keys) => {
+                        format!("No conversations yet. Ask the agent from the Agent tab ({keys}).")
+                            .into()
+                    }
+                    None => "No conversations yet. Ask the agent from the Agent tab.".into(),
+                }
+            };
+            list = list.child(ds::sidebar_note(note));
         }
         if !pinned.is_empty() {
             // The first label sits under the panel's own title, not a section's gap below it.

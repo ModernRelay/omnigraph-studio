@@ -456,11 +456,11 @@ impl QueryEditor {
     ) -> Self {
         let editor = cx.new(|cx| {
             let mut editor = Editor::multi_line(window, cx);
-            editor.set_placeholder_text(
-                "Write a query. ⌘↵ runs the query under the cursor.",
-                window,
-                cx,
-            );
+            let placeholder = match studio_ui::shortcut_text(&Run, cx) {
+                Some(keys) => format!("Write a query. {keys} runs the query under the cursor."),
+                None => "Write a query, then run the query under the cursor.".to_owned(),
+            };
+            editor.set_placeholder_text(&placeholder, window, cx);
             editor.set_completion_provider(Some(std::rc::Rc::new(GqCompletionProvider::new(
                 Some(session.downgrade()),
             ))));

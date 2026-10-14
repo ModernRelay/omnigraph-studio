@@ -14,7 +14,7 @@
     }
   },
   {
-    "context": "Workspace && !TextInput",
+    "context": "Workspace && !Editor",
     "bindings": {
       "?": "studio::ShowKeyBindings"
     }

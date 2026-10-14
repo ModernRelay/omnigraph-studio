@@ -387,6 +387,14 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 ## Corrections
 
+- 2026-10-14 · `?` opened the key sheet inside every text field (the query, filters, the agent's
+  composer), so it could not be typed. Its binding excluded `TextInput`, a context nothing sets;
+  it excludes `Editor` now, the context of every text field, and the keymap test refuses any
+  binding of a typing key that acts while an editor has focus, matched as dispatch matches
+  (`depth_of`). Text that names a shortcut takes it from the keymap (`studio_ui::shortcut_text`:
+  "⌘⇧A" on macOS, "Ctrl+Shift+A" elsewhere) instead of a `⌘` in a string; the Explore empty
+  state also said ↵, which edits a cell now, where exploring a row is G.
+
 - 2026-10-13 · Studio wrote its files by truncating them in place, so a crash or a full disk
   could leave an empty `session.json`, workspace file or conversation index, and the next save
   replaced it with nothing. A `settings.json` with a comment or a trailing comma loaded as

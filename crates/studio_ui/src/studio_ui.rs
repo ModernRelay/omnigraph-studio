@@ -221,11 +221,117 @@ pub fn type_mark(type_name: &str, label: &str) -> Div {
         .child(initial)
 }
 
+/// The keys bound to `action`, written as this platform writes a shortcut in text: "⌘⇧A" on
+/// macOS, "Ctrl+Shift+A" elsewhere, modifiers in the order Zed's key hints draw them. For text
+/// that names a shortcut, so it follows the keymap and the platform rather than a constant. The
+/// binding added last wins, as in dispatch, whatever context it applies in; `None` when nothing
+/// binds the action.
+pub fn shortcut_text(action: &dyn gpui::Action, cx: &App) -> Option<String> {
+    let keymap = cx.key_bindings();
+    let keymap = keymap.borrow();
+    let binding = keymap.bindings_for_action(action).last()?;
+    let style = ui::PlatformStyle::platform();
+    Some(
+        binding
+            .keystrokes()
+            .iter()
+            .map(|stroke| keystroke_text(stroke.modifiers(), stroke.key(), style))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+fn keystroke_text(modifiers: &gpui::Modifiers, key: &str, style: ui::PlatformStyle) -> String {
+    let mac = style == ui::PlatformStyle::Mac;
+    let platform = match style {
+        ui::PlatformStyle::Mac => "⌘",
+        ui::PlatformStyle::Linux => "Super",
+        ui::PlatformStyle::Windows => "Win",
+    };
+    let held = [
+        (modifiers.function, "Fn", "Fn"),
+        (modifiers.control, "⌃", "Ctrl"),
+        (modifiers.alt, "⌥", "Alt"),
+        (modifiers.platform, platform, platform),
+        (modifiers.shift, "⇧", "Shift"),
+    ];
+    let key = match (key, mac) {
+        ("enter" | "return", true) => "↵".to_owned(),
+        ("backspace", true) => "⌫".to_owned(),
+        ("delete", true) => "⌦".to_owned(),
+        ("escape", true) => "⎋".to_owned(),
+        ("tab", true) => "⇥".to_owned(),
+        ("up", _) => "↑".to_owned(),
+        ("down", _) => "↓".to_owned(),
+        ("left", _) => "←".to_owned(),
+        ("right", _) => "→".to_owned(),
+        ("escape", false) => "Esc".to_owned(),
+        ("pageup", _) => "PageUp".to_owned(),
+        ("pagedown", _) => "PageDown".to_owned(),
+        (key, _) => {
+            let mut chars = key.chars();
+            chars.next().map_or(String::new(), |first| {
+                first.to_uppercase().chain(chars).collect()
+            })
+        }
+    };
+    let mut parts: Vec<&str> = held
+        .iter()
+        .filter(|(on, _, _)| *on)
+        .map(|(_, symbol, word)| if mac { *symbol } else { *word })
+        .collect();
+    parts.push(&key);
+    parts.join(if mac { "" } else { "+" })
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A shortcut reads as the platform writes one: symbols run together on macOS, words joined
+    /// by "+" elsewhere, modifiers in the order of Zed's key hints.
+    #[test]
+    fn shortcuts_are_written_as_the_platform_writes_them() {
+        let held = |control, alt, platform, shift| gpui::Modifiers {
+            control,
+            alt,
+            platform,
+            shift,
+            function: false,
+        };
+        let mac = ui::PlatformStyle::Mac;
+        let linux = ui::PlatformStyle::Linux;
+        assert_eq!(
+            keystroke_text(&held(false, false, true, true), "a", mac),
+            "⌘⇧A"
+        );
+        assert_eq!(
+            keystroke_text(&held(false, false, true, false), "enter", mac),
+            "⌘↵"
+        );
+        assert_eq!(
+            keystroke_text(&held(true, false, true, false), "]", mac),
+            "⌃⌘]"
+        );
+        assert_eq!(
+            keystroke_text(&held(false, false, false, false), "g", mac),
+            "G"
+        );
+        assert_eq!(
+            keystroke_text(&held(true, false, false, true), "a", linux),
+            "Ctrl+Shift+A"
+        );
+        assert_eq!(
+            keystroke_text(&held(true, false, false, false), "enter", linux),
+            "Ctrl+Enter"
+        );
+        assert_eq!(
+            keystroke_text(&held(false, false, false, false), "escape", linux),
+            "Esc"
+        );
+    }
 
     #[test]
     fn formats_values_for_cells() {

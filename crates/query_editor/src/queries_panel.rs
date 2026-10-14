@@ -222,7 +222,10 @@ impl Render for QueriesPanel {
                 "queries-empty",
                 IconName::FileCode,
                 "No saved queries",
-                "⌘S in a query saves it here, for this graph",
+                match studio_ui::shortcut_text(&studio_actions::query::Save, cx) {
+                    Some(keys) => format!("{keys} in a query saves it here, for this graph"),
+                    None => "Saving a query keeps it here, for this graph".to_owned(),
+                },
             )
             .into_any_element()
         } else {

@@ -1387,7 +1387,7 @@ impl Render for RelationshipTree {
                     "explore-empty",
                     IconName::ListTree,
                     "No node",
-                    "Press ↵ on a table row, or ⌘K and Open Node, to walk its relationships",
+                    how_to_explore(cx),
                 ))
                 .into_any_element();
         }
@@ -1573,4 +1573,16 @@ impl HoverCard {
             })
             .into_any_element()
     }
+}
+
+/// How to give the tree a node, with the keys the keymap binds: explore a table row, or open a
+/// node from the command palette.
+fn how_to_explore(cx: &App) -> String {
+    let row = studio_ui::shortcut_text(&studio_actions::table::ExploreRow, cx)
+        .map(|keys| format!("Press {keys} on a table row"))
+        .unwrap_or_else(|| "Explore a table row".to_owned());
+    let palette = studio_ui::shortcut_text(&studio_actions::workspace::ToggleCommandPalette, cx)
+        .map(|keys| format!("{keys} and Open Node"))
+        .unwrap_or_else(|| "Open Node in the command palette".to_owned());
+    format!("{row}, or {palette}, to walk its relationships")
 }
