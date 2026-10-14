@@ -309,7 +309,8 @@ kept answers.
   type again. Dragged widths are kept per column key in the table's layout and saved with the
   tab. Zed's resizable columns were not used: they draw a full-height rule between every
   column, which the visual language leaves out; a line shows at the edge only on hover and
-  while dragging.
+  while dragging. The handle and its drag now live in `studio_ui` (`column_resize_handle`,
+  `ColumnResize`), which query results use too (spec 007).
 
 - 2026-10-13 · Blob images were handed to GPUI as encoded images, which GPUI decodes into its
   asset cache and keeps until asked, with a texture in every window that drew them; nothing

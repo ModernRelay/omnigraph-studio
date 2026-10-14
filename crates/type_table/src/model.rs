@@ -196,9 +196,8 @@ pub struct ColumnLayout {
     pub widths: std::collections::BTreeMap<String, u32>,
 }
 
-/// The narrowest and widest a column can be dragged to.
-pub const COLUMN_MIN_WIDTH: f32 = 48.;
-pub const COLUMN_MAX_WIDTH: f32 = 1_200.;
+#[cfg(test)]
+use studio_ui::{COLUMN_MAX_WIDTH, COLUMN_MIN_WIDTH};
 
 impl ColumnLayout {
     pub fn new(hidden: Vec<String>, order: Vec<String>) -> Self {
@@ -220,7 +219,7 @@ impl ColumnLayout {
     pub fn set_width(&mut self, key: &str, width: Option<f32>) {
         match width {
             Some(width) => {
-                let width = width.clamp(COLUMN_MIN_WIDTH, COLUMN_MAX_WIDTH).round() as u32;
+                let width = studio_ui::clamp_width(width) as u32;
                 self.widths.insert(key.to_owned(), width);
             }
             None => {

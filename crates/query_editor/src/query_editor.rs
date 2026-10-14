@@ -12,9 +12,10 @@ mod schema_view;
 mod syntax;
 mod view;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use gpui::{App, AppContext as _, Context, Global, PathPromptOptions, Window};
+use gpui::{App, AppContext as _, Context, Entity, Global, PathPromptOptions, Window};
 use graph_client::api::QueryCatalogEntry;
 use graph_store::ConnectionRegistry;
 use serde_json::{Map, Value};
@@ -45,10 +46,8 @@ fn open_file(
     text: Option<String>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) {
-    let Some(session) = workspace.session().cloned() else {
-        return;
-    };
+) -> Option<Entity<QueryEditor>> {
+    let session = workspace.session().cloned()?;
     let on_disk = std::fs::read_to_string(&path).ok();
     if on_disk.is_none() && text.is_none() {
         workspace.show_toast(
@@ -56,7 +55,7 @@ fn open_file(
             format!("{} could not be read.", path.display()),
             cx,
         );
-        return;
+        return None;
     }
     let number = view::next_number();
     let key = view::file_key(&path);
@@ -69,7 +68,7 @@ fn open_file(
         );
         editor.set_file(path, on_disk, cx);
         editor
-    });
+    })
 }
 
 /// Opens the tab running the stored query `name`, or the one already open (spec 007). `values`
@@ -84,14 +83,14 @@ fn open_stored(
     at_commit: Option<String>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) {
+) -> Option<Entity<QueryEditor>> {
     let Some(session) = workspace.session().cloned() else {
         workspace.show_toast(
             ToastKind::Info,
             "Open a graph first; stored queries belong to one.",
             cx,
         );
-        return;
+        return None;
     };
     let entry = session
         .read(cx)
@@ -123,14 +122,23 @@ fn open_stored(
         }
         editor
     });
-    let Some(editor) = opened else {
-        return;
-    };
+    let editor = opened?;
     if let Some(values) = values {
         editor.update(cx, |editor, cx| {
             editor.fill_params(alias, &values, window, cx)
         });
     }
+    Some(editor)
+}
+
+/// The result columns' dragged widths a remembered tab had.
+fn saved_widths(data: &Value) -> BTreeMap<String, f32> {
+    data.get("widths")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, width)| Some((name.clone(), width.as_f64()? as f32)))
+        .collect()
 }
 
 /// Opens the schema tab, or activates it; with a type, shows its declaration.
@@ -173,14 +181,19 @@ pub fn init(cx: &mut App) {
             .get("at_commit")
             .and_then(|commit| commit.as_str())
             .map(str::to_owned);
+        let widths = saved_widths(data);
         if let Some(path) = data.get("path").and_then(|path| path.as_str()) {
-            open_file(workspace, PathBuf::from(path), Some(text), window, cx);
+            if let Some(editor) = open_file(workspace, PathBuf::from(path), Some(text), window, cx)
+            {
+                editor.update(cx, |editor, _| editor.set_column_widths(widths));
+            }
             return;
         }
         let number = view::next_number();
         workspace.open_item(format!("query:{number}"), window, cx, |window, cx| {
             let mut editor = QueryEditor::new(number, session, window, cx);
             editor.set_text(&text, window, cx);
+            editor.set_column_widths(widths);
             if let Some(commit) = at_commit {
                 editor.pin_to(commit, cx);
             }
@@ -193,7 +206,7 @@ pub fn init(cx: &mut App) {
         };
         let text = |key: &str| data.get(key).and_then(Value::as_str).map(str::to_owned);
         let values = data.get("values").and_then(Value::as_object).cloned();
-        open_stored(
+        let opened = open_stored(
             workspace,
             name.to_owned(),
             text("alias"),
@@ -202,6 +215,10 @@ pub fn init(cx: &mut App) {
             window,
             cx,
         );
+        if let Some(editor) = opened {
+            let widths = saved_widths(data);
+            editor.update(cx, |editor, _| editor.set_column_widths(widths));
+        }
     });
     studio_workspace::register_item_kind(
         cx,
@@ -228,7 +245,9 @@ pub fn init(cx: &mut App) {
         }
         workspace.register_action(|workspace, action: &OpenQueryFile, window, cx| {
             match &action.path {
-                Some(path) => open_file(workspace, PathBuf::from(path), None, window, cx),
+                Some(path) => {
+                    open_file(workspace, PathBuf::from(path), None, window, cx);
+                }
                 None => {
                     let chosen = cx.prompt_for_paths(PathPromptOptions {
                         files: true,

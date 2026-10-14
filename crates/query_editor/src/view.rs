@@ -2,7 +2,7 @@
 //! you type and completion, then a run loop with parameters, a confirm step for writes,
 //! results, plans and outcomes under it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,9 +14,9 @@ use editor::{
     Editor, EditorEvent, HighlightKey, MultiBufferOffset, SelectionEffects, ToOffset as _,
 };
 use gpui::{
-    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle,
-    MouseButton, Render, ScrollStrategy, SharedString, Subscription, Task, UnderlineStyle,
-    UniformListScrollHandle, Window, uniform_list,
+    App, ClickEvent, ClipboardItem, Context, DragMoveEvent, Entity, EventEmitter, FocusHandle,
+    Focusable, HighlightStyle, MouseButton, MouseDownEvent, Render, ScrollStrategy, SharedString,
+    Subscription, Task, UnderlineStyle, UniformListScrollHandle, Window, uniform_list,
 };
 use gq_language::{QueryInfo, ResultColumn, SchemaModel, Statement, TokenKind};
 use graph_client::api::ErrorCode;
@@ -28,7 +28,8 @@ use graph_store::{GraphSession, SessionEvent};
 use serde_json::{Map, Value};
 use studio_actions::query::{CopyCell, CopyRow, Explain, Run};
 use studio_ui::{
-    GridColumn, ROW_HEIGHT, format_value, grid_cell, grid_header, is_numeric, short_commit_id,
+    ColumnDrag, ColumnResize, GridColumn, ROW_HEIGHT, format_value, grid_cell, grid_header,
+    is_numeric, resizable_grid_header, short_commit_id,
 };
 use studio_workspace::{Item, ItemEvent, ItemFooter, SavedItem};
 use ui::prelude::*;
@@ -261,6 +262,11 @@ pub struct QueryEditor {
     pending_write: Option<PendingWrite>,
     writing: bool,
     selected: Option<(usize, usize)>,
+    /// Result columns dragged to a width, by name: they keep it in later results and come back
+    /// with the tab.
+    column_widths: BTreeMap<String, f32>,
+    /// The result column being dragged, by position.
+    resizing: Option<ColumnResize<usize>>,
     example: Option<String>,
     results_scroll: UniformListScrollHandle,
     results_focus: FocusHandle,
@@ -349,6 +355,7 @@ impl Item for QueryEditor {
                     "alias": stored.alias,
                     "at_commit": self.at_commit,
                     "values": values,
+                    "widths": self.column_widths,
                 }),
             });
         }
@@ -358,6 +365,7 @@ impl Item for QueryEditor {
                 "text": self.editor.read(cx).text(cx),
                 "at_commit": self.at_commit,
                 "path": self.path.as_ref().map(|path| path.to_string_lossy().into_owned()),
+                "widths": self.column_widths,
             }),
         })
     }
@@ -470,6 +478,8 @@ impl QueryEditor {
             pending_write: None,
             writing: false,
             selected: None,
+            column_widths: BTreeMap::new(),
+            resizing: None,
             example: None,
             results_scroll: UniformListScrollHandle::new(),
             results_focus: cx.focus_handle(),
@@ -611,6 +621,14 @@ impl QueryEditor {
                     menu
                 }))
             })
+    }
+
+    /// Result columns' dragged widths, by name, from a remembered tab.
+    pub fn set_column_widths(&mut self, widths: BTreeMap<String, f32>) {
+        self.column_widths = widths
+            .into_iter()
+            .map(|(name, width)| (name, studio_ui::clamp_width(width)))
+            .collect();
     }
 
     /// Pins reads to a commit and refuses writes, for a query opened from History.
@@ -1435,7 +1453,12 @@ impl QueryEditor {
                 let table =
                     ResultTable::new(output.columns, &output.rows, prepared.columns.as_deref());
                 let widths = (0..table.columns.len())
-                    .map(|i| table.column_width(i))
+                    .map(|i| {
+                        self.column_widths
+                            .get(&table.columns[i])
+                            .copied()
+                            .unwrap_or_else(|| table.column_width(i))
+                    })
                     .collect();
                 let right_aligned = (0..table.columns.len())
                     .map(|i| {
@@ -2157,11 +2180,19 @@ impl QueryEditor {
             })
             .collect();
         let total: f32 = ROW_NUMBER_WIDTH + rows.widths.iter().sum::<f32>();
+        let header = || {
+            resizable_grid_header(
+                &columns,
+                px(ROW_NUMBER_WIDTH),
+                |index| Some(self.render_resize_handle(index, rows.widths[index], cx)),
+                cx,
+            )
+        };
         let body = if table.rows.is_empty() {
             v_flex()
                 .flex_1()
                 .min_h_0()
-                .child(grid_header(&columns, px(ROW_NUMBER_WIDTH), cx))
+                .child(header())
                 .child(studio_ui::ds::empty_state(IconName::Hash, "No rows"))
                 .into_any_element()
         } else {
@@ -2171,21 +2202,17 @@ impl QueryEditor {
                 .min_h_0()
                 .overflow_x_scroll()
                 .child(
-                    v_flex()
-                        .h_full()
-                        .w(px(total))
-                        .child(grid_header(&columns, px(ROW_NUMBER_WIDTH), cx))
-                        .child(
-                            uniform_list(
-                                "query-results",
-                                table.rows.len(),
-                                cx.processor(|this, range, _window, cx| {
-                                    this.render_grid_rows(range, cx)
-                                }),
-                            )
-                            .track_scroll(&self.results_scroll)
-                            .flex_1(),
-                        ),
+                    v_flex().h_full().w(px(total)).child(header()).child(
+                        uniform_list(
+                            "query-results",
+                            table.rows.len(),
+                            cx.processor(|this, range, _window, cx| {
+                                this.render_grid_rows(range, cx)
+                            }),
+                        )
+                        .track_scroll(&self.results_scroll)
+                        .flex_1(),
+                    ),
                 )
                 .into_any_element()
         };
@@ -2198,10 +2225,73 @@ impl QueryEditor {
             .on_action(
                 cx.listener(|this, _: &menu::SelectPrevious, _, cx| this.move_selection(-1, cx)),
             )
+            // A column's edge dragged anywhere over the results resizes it until released.
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<ColumnDrag>, _, cx| {
+                    this.drag_column(event, cx)
+                }),
+            )
+            .on_drop(cx.listener(|this, _: &ColumnDrag, _, cx| {
+                this.resizing = None;
+                cx.notify();
+            }))
             .flex_1()
             .min_h_0()
             .child(body)
             .into_any_element()
+    }
+
+    /// The right edge of result column `index`'s header: drag to make the column wider or
+    /// narrower, click twice to fit it to its values again.
+    fn render_resize_handle(&self, index: usize, width: f32, cx: &Context<Self>) -> AnyElement {
+        let active = self
+            .resizing
+            .as_ref()
+            .is_some_and(|resizing| resizing.column == index);
+        let on_start = cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+            this.resizing = Some(ColumnResize::new(index, event, width));
+            cx.notify();
+        });
+        let on_reset = cx.listener(move |this, _: &ClickEvent, _, cx| {
+            this.resizing = None;
+            this.resize_column(index, None, cx);
+        });
+        studio_ui::column_resize_handle(index, active, on_start, on_reset, cx).into_any_element()
+    }
+
+    fn drag_column(&mut self, event: &DragMoveEvent<ColumnDrag>, cx: &mut Context<Self>) {
+        let Some(resizing) = &self.resizing else {
+            return;
+        };
+        let (index, width) = (resizing.column, resizing.width(event));
+        self.resize_column(index, Some(width), cx);
+    }
+
+    /// Sets result column `index` to `width`, or fits it to its values again with `None`. The
+    /// width holds for that column name in later results.
+    fn resize_column(&mut self, index: usize, width: Option<f32>, cx: &mut Context<Self>) {
+        let Output::Rows(rows) = &mut self.output else {
+            return;
+        };
+        let Some(name) = rows.table.columns.get(index) else {
+            return;
+        };
+        let width = match width {
+            Some(width) => {
+                self.column_widths.insert(name.clone(), width);
+                width
+            }
+            None => {
+                self.column_widths.remove(name);
+                rows.table.column_width(index)
+            }
+        };
+        if rows.widths[index] == width {
+            return;
+        }
+        rows.widths[index] = width;
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
     }
 
     fn render_grid_rows(
@@ -2862,5 +2952,94 @@ mod tests {
             sent(&list, &value_text(&json!(["a", "b"]))),
             Ok(Some(json!(["a", "b"])))
         );
+    }
+
+    mod widths {
+        use gpui::TestAppContext;
+        use graph_store::{Connection, ServerEntry, ServerSource};
+        use http_client::{AsyncBody, FakeHttpClient, Response};
+
+        use super::*;
+
+        fn session(cx: &mut TestAppContext) -> Entity<GraphSession> {
+            let http = FakeHttpClient::create(|_| async move {
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(r#"{"branches":["main"]}"#))
+                    .unwrap())
+            });
+            let server = ServerEntry {
+                name: "dev".into(),
+                url: "http://127.0.0.1:8787".into(),
+                source: ServerSource::Environment,
+                known_graphs: Vec::new(),
+            };
+            let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx))
+        }
+
+        /// A result with `columns`, one row whose values are the column names.
+        fn finish(editor: &mut QueryEditor, columns: &[&str]) {
+            let row: Map<String, Value> = columns
+                .iter()
+                .map(|c| ((*c).to_owned(), json!(c)))
+                .collect();
+            let output: ReadOutput = serde_json::from_value(json!({
+                "query_name": "people",
+                "target": {"branch": "main"},
+                "row_count": 1,
+                "columns": columns,
+                "rows": [row],
+            }))
+            .unwrap();
+            let prepared = Prepared {
+                text: String::new(),
+                name: Some("people".into()),
+                label: "people".into(),
+                write: false,
+                statement: false,
+                params: None,
+                columns: None,
+                map: SourceMap::default(),
+                stored: None,
+            };
+            editor.finish_read(prepared, "main".into(), Ok(output), Duration::ZERO, None);
+        }
+
+        fn widths(editor: &QueryEditor) -> Vec<f32> {
+            match &editor.output {
+                Output::Rows(rows) => rows.widths.clone(),
+                _ => panic!("no rows"),
+            }
+        }
+
+        /// A result column dragged to a width keeps it in the next result that has a column of
+        /// that name, wherever it is, and in the saved tab; two clicks fit it again.
+        #[gpui::test]
+        async fn a_dragged_result_column_keeps_its_width_by_name(cx: &mut TestAppContext) {
+            cx.update(|cx| {
+                studio_theme::init_test(cx);
+                editor::init(cx);
+            });
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            editor.update(cx, |editor, cx| {
+                finish(editor, &["name", "age"]);
+                let fitted = widths(editor);
+                editor.resize_column(0, Some(studio_ui::clamp_width(250.4)), cx);
+                assert_eq!(widths(editor), vec![250., fitted[1]]);
+
+                finish(editor, &["age", "name"]);
+                assert_eq!(widths(editor), vec![fitted[1], 250.]);
+                let saved = editor.serialize(cx).unwrap();
+                assert_eq!(saved.data["widths"], json!({"name": 250.0}));
+
+                editor.resize_column(1, None, cx);
+                assert_eq!(widths(editor), vec![fitted[1], fitted[0]]);
+                assert!(editor.column_widths.is_empty());
+            });
+        }
     }
 }

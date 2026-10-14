@@ -33,7 +33,7 @@ use studio_actions::table::{
     FilterBySelection, InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp, PeekRow, RefreshTable,
     SaveDrafts, SelectNextSuggestion, SelectPreviousSuggestion, StageEdit,
 };
-use studio_ui::ROW_HEIGHT;
+use studio_ui::{ColumnDrag, ColumnResize, ROW_HEIGHT};
 use studio_workspace::{
     Item, ItemEvent, ItemFooter, SavedItem, ToastKind, Workspace, WorkspaceEvent,
 };
@@ -228,7 +228,7 @@ pub struct TypeTable {
     frame_looks: Rc<RefCell<HashMap<usize, RowLook>>>,
     /// A column being dragged wider or narrower: its key, and where the pointer and the column's
     /// width were when the drag began.
-    resizing: Option<(String, Pixels, f32)>,
+    resizing: Option<ColumnResize<String>>,
     /// The time relative dates are read against, taken once a frame rather than once a cell
     /// (reading the local time zone is not free).
     frame_now: chrono::DateTime<chrono::Local>,
@@ -642,8 +642,7 @@ impl TypeTable {
     }
 
     /// The right edge of a column's header: drag to make the column wider or narrower, click
-    /// twice to fit it to its type again. A line shows there only on hover and while dragging,
-    /// so the grid keeps no rules between columns (spec 002).
+    /// twice to fit it to its type again.
     fn render_resize_handle(
         &self,
         index: usize,
@@ -655,53 +654,28 @@ impl TypeTable {
         let active = self
             .resizing
             .as_ref()
-            .is_some_and(|(resizing, _, _)| *resizing == column.key);
-        let line = cx.theme().colors().border_focused;
-        let group = SharedString::from(format!("column-resize-{index}"));
-        div()
-            .id(("column-resize", index))
-            .group(group.clone())
-            .absolute()
-            .top_0()
-            .bottom_0()
-            .right_0()
-            .w(px(6.))
-            .cursor_col_resize()
-            .flex()
-            .justify_end()
-            .child(
-                div()
-                    .w(px(2.))
-                    .h_full()
-                    .when(active, |d| d.bg(line))
-                    .group_hover(group, |d| d.bg(line)),
-            )
-            .on_mouse_down(MouseButton::Left, {
-                let key = key.clone();
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.resizing = Some((key.clone(), event.position.x, width));
-                    cx.stop_propagation();
-                    cx.notify();
-                })
-            })
-            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                cx.stop_propagation();
-                if event.click_count() >= 2 {
-                    this.resizing = None;
-                    this.resize_column(&key, None, cx);
-                }
-            }))
-            .on_drag(ColumnDrag, |drag, _, _, cx| cx.new(|_| *drag))
-            .into_any_element()
+            .is_some_and(|resizing| resizing.column == column.key);
+        let on_start = cx.listener({
+            let key = key.clone();
+            move |this, event: &MouseDownEvent, _, cx| {
+                this.resizing = Some(ColumnResize::new(key.clone(), event, width));
+                cx.notify();
+            }
+        });
+        let on_reset = cx.listener(move |this, _: &ClickEvent, _, cx| {
+            this.resizing = None;
+            this.resize_column(&key, None, cx);
+        });
+        studio_ui::column_resize_handle(index, active, on_start, on_reset, cx).into_any_element()
     }
 
     /// Follows a column drag: the column's new width is where the pointer is now, relative to
     /// where the drag began.
     fn drag_column(&mut self, event: &DragMoveEvent<ColumnDrag>, cx: &mut Context<Self>) {
-        let Some((key, start_x, start_width)) = self.resizing.clone() else {
+        let Some(resizing) = &self.resizing else {
             return;
         };
-        let width = start_width + f32::from(event.event.position.x - start_x);
+        let (key, width) = (resizing.column.clone(), resizing.width(event));
         self.resize_column(&key, Some(width), cx);
     }
 
@@ -5540,16 +5514,6 @@ fn filter_placeholder(op: FilterOp) -> &'static str {
         FilterOp::In => "Values, separated by commas",
         FilterOp::RelatedTo => "Name or id",
         _ => "Value",
-    }
-}
-
-/// A column's right edge being dragged; what follows the pointer draws nothing.
-#[derive(Clone, Copy)]
-struct ColumnDrag;
-
-impl Render for ColumnDrag {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        gpui::Empty
     }
 }
 

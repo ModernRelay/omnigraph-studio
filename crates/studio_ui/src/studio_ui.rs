@@ -3,7 +3,7 @@
 //!
 //! Layer 2 (`docs/architecture.md`). Plan: `specs/002-app-shell/plan.md`.
 
-use gpui::{App, Div, Hsla, Pixels, SharedString};
+use gpui::{AnyElement, App, Div, Hsla, Pixels, SharedString};
 use serde_json::Value;
 use ui::prelude::*;
 
@@ -12,9 +12,13 @@ pub use studio_theme::type_color;
 mod changes;
 pub mod ds;
 pub mod motion;
+mod resize;
 mod values;
 
 pub use changes::{ChangeCard, ChangeKind, PropertyRow, change_counts, change_group_header};
+pub use resize::{
+    COLUMN_MAX_WIDTH, COLUMN_MIN_WIDTH, ColumnDrag, ColumnResize, clamp_width, column_resize_handle,
+};
 pub use values::{
     CopyableValue, format_bytes, group_digits, now_micros, relative_time, short_commit_id,
     utc_date_time,
@@ -64,14 +68,26 @@ pub const HEADER_HEIGHT: f32 = ds::size::HEADER;
 /// The header row of a grid: one line per column, the name then its type, muted, with a
 /// hairline below (spec 002, "Visual language").
 pub fn grid_header(columns: &[GridColumn], leading: Pixels, cx: &App) -> Div {
+    resizable_grid_header(columns, leading, |_| None, cx)
+}
+
+/// [`grid_header`] with what `handle` gives for a column at its right edge: a
+/// [`column_resize_handle`].
+pub fn resizable_grid_header(
+    columns: &[GridColumn],
+    leading: Pixels,
+    mut handle: impl FnMut(usize) -> Option<AnyElement>,
+    cx: &App,
+) -> Div {
     h_flex()
         .h(px(HEADER_HEIGHT))
         .flex_none()
         .border_b_1()
         .border_color(ds::surface::rule(cx))
         .child(div().w(leading).flex_none())
-        .children(columns.iter().map(|column| {
+        .children(columns.iter().enumerate().map(|(index, column)| {
             h_flex()
+                .relative()
                 .w(column.width)
                 .flex_none()
                 .px_3()
@@ -90,6 +106,7 @@ pub fn grid_header(columns: &[GridColumn], leading: Pixels, cx: &App) -> Div {
                         .color(Color::Disabled)
                         .single_line()
                 }))
+                .children(handle(index))
         }))
 }
 

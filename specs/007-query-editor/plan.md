@@ -192,9 +192,15 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 | 2026-10-12 | Run loop end to end | offscreen snapshots against the dev server: example query, run, explain, parameters, confirm bar, committed and refused writes, a parse error underline, completion | As described under What landed |
 | 2026-10-14 | Stored queries are listed, opened and run by name | `graph_client` test `stored_queries_are_listed_and_invoked_by_name` (catalog kinds, `expect_mutation` either way, the conditional route, an encoded name); `graph_store` tests `stored_queries_are_read_with_the_graph_and_run_by_name` (a 404 catalog is empty, a write is logged and is the head) and `cli_servers_follow_the_cli_files` (aliases by server and graph); `query_editor` tests of the parameter kinds; offscreen snapshots against a scratch 0.13 cluster serving `people_titled` and `set_title` | The panel listed both with the `founders` alias indented and one alias under Not served; `founders` opened `people_titled` with Founder filled and ⌘↵ read 20 rows; `set_title` on person-000002 asked first, committed, toasted, and a read of the server showed the new title |
 | 2026-10-14 | The query page follows the design system | offscreen snapshots of a query tab and a stored query's tab after a run | Toolbar: name and kind leading, picker, Explain and Run trailing; parameters as fields; rows, time and commit in the window footer beside the graph and branch, no second strip |
+| 2026-10-14 | Result columns are resized from their header's edge | `query_editor` headless test `a_dragged_result_column_keeps_its_width_by_name`; `studio_ui` test `a_drag_follows_the_pointer_within_bounds`; offscreen snapshots of `people` (slug, name, title) on the dev graph, then `drag:604,446,704,446` on name's edge and `hover:704,446` | Name went 100 px wider and title and its cells moved with it; the edge's line showed on hover. The test: the width held for `name` when the next result put it second, the tab saved `"widths": {"name": 250.0}`, and resetting fitted it to its values again |
 
 
 ## Corrections
+
+- 2026-10-14 · Result columns can be resized as the table's can: drag a header's right edge
+  (48 to 1,200 px), click it twice to fit the column to its values. A dragged width belongs to
+  the column's name, so it holds when the query is run again or changed, and it is saved with
+  the tab. The handle and the drag are `studio_ui`'s, shared with type tables.
 
 - 2026-10-14 · The query page drew its own status strip over the window's footer, with the
   result's facts as a sentence ("25 rows 67 ms list_company on main at …") that repeated the
