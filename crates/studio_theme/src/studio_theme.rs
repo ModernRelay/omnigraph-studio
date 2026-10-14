@@ -36,6 +36,14 @@ pub fn init_themes(cx: &mut App) {
     }
 }
 
+/// Zed's settings store and its base theme, without fonts or bundled themes: enough for a test
+/// window to draw Studio's views and editors.
+#[cfg(any(test, feature = "test-support"))]
+pub fn init_test(cx: &mut App) {
+    init_settings_store(cx);
+    theme_settings::init(theme::LoadThemes::JustBase, cx);
+}
+
 fn log_font_error(error: &dyn std::fmt::Display) {
     eprintln!("Studio could not load its bundled fonts: {error}");
 }

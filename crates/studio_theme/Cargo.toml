@@ -20,5 +20,9 @@ semver = { workspace = true }
 # Studio's own repository. Embed Zed's assets at compile time in every profile instead.
 util = { workspace = true, features = ["debug-embed"] }
 
+[features]
+# `init_test` for other crates' tests.
+test-support = []
+
 [lints]
 workspace = true

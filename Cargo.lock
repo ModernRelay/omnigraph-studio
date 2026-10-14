@@ -9860,7 +9860,6 @@ dependencies = [
  "studio_settings",
  "studio_theme",
  "studio_ui",
- "theme",
  "theme_settings",
  "ui",
 ]
@@ -10831,6 +10830,7 @@ dependencies = [
  "gq_language",
  "graph_client",
  "graph_store",
+ "http_client",
  "image",
  "menu",
  "objc2-core-foundation",
@@ -10838,6 +10838,7 @@ dependencies = [
  "serde_json",
  "studio_actions",
  "studio_settings",
+ "studio_theme",
  "studio_ui",
  "studio_workspace",
  "ui",

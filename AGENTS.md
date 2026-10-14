@@ -49,6 +49,14 @@ python3 script/check-layers.py   # crate layer rule; keep its table in step with
   also run `xcodebuild -downloadComponent MetalToolchain` once.
 - Linux needs the Wayland, X11, xkbcommon, fontconfig and Vulkan development packages.
 - A first build of Zed's GPUI crates needs several GB of disk. Check free space first.
+- Test keyboard behavior headlessly, as Zed does: `#[gpui::test]`, `studio_theme::init_test`
+  (feature `test-support`), `add_window_view`, `simulate_input`, `simulate_keystrokes` and
+  `advance_clock`, with `http_client::FakeHttpClient` behind the session
+  (`type_table/src/dialogs.rs` tests). Offscreen snapshots (`crates/studio/examples/snapshot.rs`)
+  check what a view looks like.
+- Write files with `studio_settings::write_atomic`, never by truncating in place.
+- A function used on one platform carries the same `cfg` as its caller, so the other platforms
+  still build.
 
 ## Rules
 

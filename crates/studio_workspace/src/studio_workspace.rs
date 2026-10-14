@@ -3001,8 +3001,7 @@ mod tests {
     #[gpui::test]
     fn a_busy_modal_stays_open_until_it_agrees(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
-            studio_theme::init_settings_store(cx);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            studio_theme::init_test(cx);
             cx.set_global(StudioSettings::default());
         });
         let window = cx.add_window(Workspace::new);

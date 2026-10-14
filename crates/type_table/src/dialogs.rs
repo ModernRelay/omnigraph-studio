@@ -1340,3 +1340,87 @@ impl Render for SaveViewModal {
             )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{KeyBinding, TestAppContext};
+    use graph_store::{Connection, ServerEntry, ServerSource};
+    use http_client::{AsyncBody, FakeHttpClient, Response};
+
+    /// A server for the dev graph that finds two people for any node search.
+    fn session(cx: &mut TestAppContext) -> Entity<GraphSession> {
+        let http = FakeHttpClient::create(|request| async move {
+            let body = if request.uri().path().ends_with("/query") {
+                r#"{"query_name":"studio_find","target":{"branch":"main","snapshot":null},
+                    "row_count":2,"columns":["id","label"],
+                    "rows":[{"id":"person-000000","label":"Radia Knuth"},
+                            {"id":"person-000004","label":"Radia Lamarr"}],
+                    "graph_commit_id":"c1"}"#
+            } else {
+                r#"{"branches":["main"]}"#
+            };
+            Ok(Response::builder()
+                .status(200)
+                .header(graph_client::CONTRACT_HEADER, "0.13")
+                .body(AsyncBody::from(body))
+                .unwrap())
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx))
+    }
+
+    /// ↵ on an offered node puts its id in the field and moves on, and types nothing: the key
+    /// that picked must not also reach the field as text.
+    #[gpui::test]
+    async fn enter_on_an_offered_node_picks_it_and_types_nothing(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            cx.bind_keys([
+                KeyBinding::new("enter", menu::Confirm, None),
+                KeyBinding::new("down", SelectNextSuggestion, Some("EdgeEndpoint > Editor")),
+            ]);
+        });
+        let session = session(cx);
+        let schema = Arc::new(
+            SchemaModel::parse(include_str!("../../../dev/cluster/knowledge.pg")).unwrap(),
+        );
+        let (modal, cx) = cx.add_window_view(|window, cx| {
+            InsertEdgeModal::new(
+                WeakEntity::new_invalid(),
+                session,
+                schema,
+                "WorksAt".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        modal.update_in(cx, |modal, window, cx| {
+            window.focus(&modal.focus_handle(cx), cx)
+        });
+        cx.simulate_input("radia");
+        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.run_until_parked();
+        modal.read_with(cx, |modal, _| {
+            assert_eq!(modal.from.suggestions.len(), 2);
+            assert_eq!(modal.from.highlighted, Some(0));
+        });
+
+        cx.simulate_keystrokes("down enter");
+        modal.read_with(cx, |modal, cx| {
+            assert_eq!(modal.from.editor.read(cx).text(cx), "person-000004");
+            assert!(modal.from.suggestions.is_empty());
+        });
+        modal.update_in(cx, |modal, window, cx| {
+            assert!(modal.to.editor.focus_handle(cx).is_focused(window));
+        });
+    }
+}
