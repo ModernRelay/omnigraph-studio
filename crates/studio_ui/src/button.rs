@@ -182,6 +182,7 @@ impl RenderOnce for Button {
                 .children(self.start_icon.map(icon))
                 .child(
                     h_flex()
+                        .debug_selector(|| "button-label".into())
                         .gap(DynamicSpacing::Base06.rems(cx))
                         .justify_between()
                         .child(
@@ -193,5 +194,73 @@ impl RenderOnce for Button {
                 )
                 .children(self.end_icon.map(icon)),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{TestAppContext, VisualTestContext};
+
+    use crate::ds;
+
+    struct Probe;
+
+    impl gpui::Render for Probe {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            use ui::prelude::*;
+            v_flex()
+                .items_start()
+                .child(
+                    div()
+                        .debug_selector(|| "button".into())
+                        .child(ds::button("b", "Views")),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "field".into())
+                        .child(ds::field_frame(false, cx).w(px(200.))),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "pill-button".into())
+                        .child(ds::pill_button("p", ui::IconName::Close, Color::Muted, cx)),
+                )
+        }
+    }
+
+    /// The design system's controls draw at their tokens: a button 28 px tall with its content
+    /// 6 px in, a field as tall as a button, a pill button round in a pill.
+    #[gpui::test]
+    fn controls_draw_at_their_sizes(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (_, cx): (_, &mut VisualTestContext) = cx.add_window_view(|_, _| Probe);
+        cx.run_until_parked();
+        let bounds = |cx: &mut VisualTestContext, selector| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} was not drawn"))
+        };
+        let button = bounds(cx, "button");
+        // A label alone: what the inset is measured to.
+        let content = bounds(cx, "button-label");
+        assert_eq!(f32::from(button.size.height), ds::size::CONTROL);
+        assert_eq!(f32::from(content.origin.x - button.origin.x), 6.);
+        assert_eq!(
+            f32::from(button.right() - content.right()),
+            6.,
+            "the inset is even"
+        );
+        assert_eq!(
+            f32::from(bounds(cx, "field").size.height),
+            ds::size::CONTROL
+        );
+        let pill = bounds(cx, "pill-button");
+        assert_eq!(
+            f32::from(pill.size.height),
+            ds::size::PILL - 2. * ds::PILL_BUTTON_GAP
+        );
     }
 }

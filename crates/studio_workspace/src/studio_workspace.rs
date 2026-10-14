@@ -1846,14 +1846,12 @@ impl Workspace {
         let hover_bg = colors.ghost_element_hover;
         let split = self.panes.len() > 1;
         let focused_pane = pane_id == self.active_pane;
-        // On glass, the first tab of the top-left pane sits in the sheet's rounded corner
-        // unless the traffic lights' space comes first (`render_pane_header`). GPUI clips a
-        // sheet's children to its rectangle, not its corners, so that tab takes the sheet's
-        // radius or its shade shows outside the curve.
-        let in_corner = studio_ui::ds::is_glass(cx)
-            && self.center.top_left() == pane_id
-            && self.left.visible()
-            && self.session.is_some();
+        let in_corner = first_tab_in_sheet_corner(
+            studio_ui::ds::is_glass(cx),
+            self.center.top_left() == pane_id,
+            self.left.visible(),
+            self.session.is_some(),
+        );
         let workspace = cx.entity().downgrade();
         let Some(pane) = self.pane(pane_id) else {
             return h_flex().into_any_element();
@@ -1877,6 +1875,7 @@ impl Workspace {
                 // content's height, so a percentage would shrink the tab to its label.
                 let tab = h_flex()
                     .id(SharedString::from(format!("tab-{pane_id}-{index}")))
+                    .debug_selector(move || format!("tab-{pane_id}-{index}"))
                     .group(group.clone())
                     .h(px(HEADER_HEIGHT))
                     .pl(px(studio_ui::ds::space::LG))
@@ -2017,6 +2016,7 @@ impl Workspace {
             HEADER_HEIGHT,
             cx,
         )
+        .debug_selector(move || format!("pane-header-{pane_id}"))
         .bg(header_bg)
         .when(
             top_left && (!self.left.visible() || self.session.is_none()),
@@ -2829,6 +2829,19 @@ impl Render for Workspace {
     }
 }
 
+/// Whether the first tab of a pane sits in the document sheet's rounded corner: on glass, in
+/// the top-left pane, unless the traffic lights' space comes first (`render_pane_header`: the
+/// sidebar hidden, or no graph open). GPUI clips a sheet's children to its rectangle, not its
+/// corners, so that tab takes the sheet's radius or its shade shows outside the curve.
+fn first_tab_in_sheet_corner(
+    glass: bool,
+    top_left_pane: bool,
+    sidebar_shown: bool,
+    graph_open: bool,
+) -> bool {
+    glass && top_left_pane && sidebar_shown && graph_open
+}
+
 /// How often the footer's memory and CPU are read.
 const PERFORMANCE_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -3236,6 +3249,59 @@ mod tests {
         fn caches_its_parts(&self) -> bool {
             self.caches
         }
+    }
+
+    /// The tab strip and its tabs are the header strip's height, under which every column's
+    /// header rule lines up.
+    #[gpui::test]
+    fn tabs_fill_the_header_strip(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_item("split", window, cx, |_, cx| Split {
+                field: cx.new(|_| Field),
+                part: cx.new(|_| Part { renders: 0 }),
+                caches: false,
+                focus_handle: cx.focus_handle(),
+            });
+        });
+        cx.run_until_parked();
+        let height = |cx: &mut gpui::VisualTestContext, selector: &'static str| {
+            f32::from(
+                cx.debug_bounds(selector)
+                    .unwrap_or_else(|| panic!("{selector} was not drawn"))
+                    .size
+                    .height,
+            )
+        };
+        assert_eq!(
+            height(cx, "pane-header-0"),
+            studio_ui::ds::size::HEADER_STRIP
+        );
+        assert_eq!(height(cx, "tab-0-0"), studio_ui::ds::size::HEADER_STRIP);
+    }
+
+    /// Only the top-left pane's first tab on glass, with nothing before it, meets the sheet's
+    /// corner.
+    #[test]
+    fn the_first_tab_meets_the_sheet_corner_only_when_nothing_comes_before_it() {
+        assert!(first_tab_in_sheet_corner(true, true, true, true));
+        assert!(!first_tab_in_sheet_corner(false, true, true, true), "flat");
+        assert!(
+            !first_tab_in_sheet_corner(true, false, true, true),
+            "another pane"
+        );
+        assert!(
+            !first_tab_in_sheet_corner(true, true, false, true),
+            "traffic lights first"
+        );
+        assert!(
+            !first_tab_in_sheet_corner(true, true, true, false),
+            "traffic lights first"
+        );
     }
 
     /// A keystroke in a tab's field draws its cached part again only when the pane caches the
