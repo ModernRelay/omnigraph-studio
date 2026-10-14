@@ -1909,29 +1909,9 @@ impl GraphCanvas {
         let capped = self.scene.capped.clone();
         let cap = self.node_cap(cx);
         // Floating pills are white cards in the light theme, like the chips.
-        let surface = if cx.theme().appearance.is_light() {
-            gpui::white()
-        } else {
-            cx.theme().colors().elevated_surface_background
-        };
-        let border = cx.theme().colors().border_variant;
-        // Floating pills: round, a hairline, a soft float shadow.
-        // The canvas's floating controls share the segmented control's shape: 28 px tall, its
-        // radius, its inset, so the mode switch, search and zoom read as one family.
-        let panel = |id: &'static str| {
-            h_flex()
-                .id(id)
-                .h(px(28.))
-                .gap(px(studio_ui::ds::space::XXS))
-                .px(px(studio_ui::ds::space::XXS))
-                .items_center()
-                .rounded(px(studio_ui::ds::radius::SM + studio_ui::ds::space::XXS))
-                .bg(surface)
-                .border_1()
-                .border_color(border)
-                .shadow(studio_ui::ds::elevation::float())
-                .occlude()
-        };
+        // The canvas's floating controls: the mode switch (the segmented control), search and
+        // zoom read as one family, each concentric around what it holds.
+        let panel = |id: &'static str| studio_ui::ds::float_bar(id, cx);
         let mode = self.mode;
         v_flex()
             .absolute()
@@ -1996,6 +1976,8 @@ impl GraphCanvas {
                         d.child(
                             panel("canvas-newer").child(
                                 studio_ui::ds::button("canvas-refresh", "Newer data · Refresh")
+                                    // The bar is sized around Zed's default buttons.
+                                    .size(ui::ButtonSize::Default)
                                     .label_size(LabelSize::Small)
                                     .tooltip(Tooltip::text(
                                         "The branch moved since this exploration was read",

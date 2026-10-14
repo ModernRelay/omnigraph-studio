@@ -70,6 +70,8 @@ python3 script/check-layers.py   # crate layer rule; keep its table in step with
   `docs/deferred-engine-changes.md`, and design against today's API.
 - Never add a second copy of GPUI (GPUI Kit, `gpui-pre`, `gpui-ce`, crates.io `gpui`).
 - Never retry a write automatically. Never log tokens, query text or row data.
+- Size nested rounded surfaces with `ds::radius::around`/`within`, never by hand: concentric
+  corners, and Zed's buttons are always `radius::BUTTON` (spec 002, Visual language).
 - Keep a keystroke from drawing more than it changed (`docs/drawing.md`): no field inside a
   large view, large parts as cached views made with their tab, `notify` only for state the
   view draws, and a draw-count test for every costly view.

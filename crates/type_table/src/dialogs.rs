@@ -790,12 +790,10 @@ impl InsertEdgeModal {
             let pick = cx.listener(move |this, index: &usize, window, cx| {
                 this.pick(end, *index, window, cx)
             });
-            v_flex()
+            studio_ui::ds::row_list()
                 .id(("endpoint-suggestions", end as usize))
                 .max_h(px(208.))
                 .overflow_y_scroll()
-                .p_1()
-                .rounded_md()
                 .border_1()
                 .border_color(colors.border_variant)
                 .children(endpoint.offers.rows(

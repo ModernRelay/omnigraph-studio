@@ -80,7 +80,8 @@ impl Offers {
                     .h(px(26.))
                     .px_2()
                     .gap_2()
-                    .rounded_sm()
+                    // A row of a `ds::row_list`, which is concentric around this radius.
+                    .rounded(px(studio_ui::ds::radius::XS))
                     .cursor_pointer()
                     .when(self.highlighted == Some(index), |row| row.bg(highlight))
                     .hover(|row| row.bg(highlight))

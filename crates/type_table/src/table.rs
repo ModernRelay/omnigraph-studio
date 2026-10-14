@@ -4146,7 +4146,7 @@ impl TypeTable {
             };
             // The filter being written is the pill it will become, outlined while it is open.
             let pill = h_flex()
-                .h(px(26.))
+                .h(px(studio_ui::ds::PILL_HEIGHT))
                 .flex_none()
                 .rounded_full()
                 .border_1()
@@ -4261,28 +4261,38 @@ impl TypeTable {
                 .child(
                     h_flex()
                         .h_full()
-                        .px(px(studio_ui::ds::space::XS))
+                        .pl(px(studio_ui::ds::space::XS))
+                        // The pill's border is the rest of the gap.
+                        .pr(px(studio_ui::ds::PILL_BUTTON_GAP - 1.))
                         .gap(px(studio_ui::ds::space::XXS))
                         .items_center()
                         .child(
-                            IconButton::new("apply-filter", IconName::Check)
-                                .icon_size(IconSize::XSmall)
-                                .icon_color(Color::Accent)
-                                .tooltip(Tooltip::text("Add this filter (↵)"))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.apply_filter_draft(window, cx)
-                                })),
+                            studio_ui::ds::pill_button(
+                                "apply-filter",
+                                IconName::Check,
+                                Color::Accent,
+                                cx,
+                            )
+                            .tooltip(Tooltip::text("Add this filter (↵)"))
+                            .on_click(cx.listener(
+                                |this, _, window, cx| this.apply_filter_draft(window, cx),
+                            )),
                         )
                         .child(
-                            IconButton::new("cancel-filter", IconName::Close)
-                                .icon_size(IconSize::XSmall)
-                                .icon_color(Color::Muted)
-                                .tooltip(Tooltip::text("Discard this filter (Esc)"))
-                                .on_click(cx.listener(|this, _, window, cx| {
+                            studio_ui::ds::pill_button(
+                                "cancel-filter",
+                                IconName::Close,
+                                Color::Muted,
+                                cx,
+                            )
+                            .tooltip(Tooltip::text("Discard this filter (Esc)"))
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
                                     this.filter_draft = None;
                                     window.focus(&this.focus_handle, cx);
                                     cx.notify();
-                                })),
+                                },
+                            )),
                         ),
                 );
             bar = bar.child(pill).children(
@@ -4326,15 +4336,13 @@ impl TypeTable {
                         .offset(point(px(-4.), px(28.)))
                         .snap_to_window_with_margin(px(8.))
                         .child(
-                            v_flex()
+                            studio_ui::ds::row_list()
                                 .id("filter-suggestions")
                                 .occlude()
                                 .min_w(px(220.))
                                 .max_w(px(360.))
                                 .max_h(px(260.))
                                 .overflow_y_scroll()
-                                .p_1()
-                                .rounded_md()
                                 .border_1()
                                 .border_color(border)
                                 .bg(bg)

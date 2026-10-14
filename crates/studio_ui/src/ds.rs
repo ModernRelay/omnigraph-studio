@@ -45,16 +45,35 @@ pub mod space {
     pub const PAGE: f32 = XXL;
 }
 
-/// Corner radii. Nested surfaces stay concentric: inner = outer - padding (better-ui).
+/// Corner radii. Nested surfaces stay concentric: a surface holding rounded children has their
+/// radius plus the gap between its edge and theirs ([`around`]); a child takes its container's
+/// radius minus that gap ([`within`]). The same radius on both reads as a mistake: the gap is
+/// narrower along the sides than at the corners. Write nested radii with these, not sums.
 pub mod radius {
-    /// Key caps, chips, code blocks.
+    /// Key caps, chips, code blocks, the rows of a [`super::row_list`].
     pub const XS: f32 = 4.;
-    /// Rows, buttons, fields.
+    /// Rows, fields, segments.
     pub const SM: f32 = 6.;
     /// Cards.
     pub const MD: f32 = 10.;
-    /// Glass sheets: a card inset by `space::XS` inside one uses `MD`.
+    /// Glass sheets.
     pub const LG: f32 = 14.;
+    /// Zed's buttons, `ds::button` and `ds::icon_button` among them (`ButtonLike`'s
+    /// `rounded_sm`). A button takes no other radius, so a surface around buttons is sized
+    /// from this.
+    pub const BUTTON: f32 = 4.;
+
+    /// The radius of a surface whose children have radius `inner` and sit `gap` inside its
+    /// edge (its border and padding).
+    pub const fn around(inner: f32, gap: f32) -> f32 {
+        inner + gap
+    }
+
+    /// The radius of a child `gap` inside a surface of radius `outer`; square when the gap is
+    /// wider than the radius.
+    pub const fn within(outer: f32, gap: f32) -> f32 {
+        if outer > gap { outer - gap } else { 0. }
+    }
 }
 
 /// Fixed sizes.
@@ -699,7 +718,7 @@ pub fn filter_pill(
     };
     h_flex()
         .id(id.clone())
-        .h(px(26.))
+        .h(px(PILL_HEIGHT))
         .flex_none()
         .rounded_full()
         .border_1()
@@ -728,17 +747,85 @@ pub fn filter_pill(
         .child(
             div()
                 .h_full()
-                .px(px(space::XS))
+                .pl(px(space::XS))
+                // The pill's border is the rest of the gap.
+                .pr(px(PILL_BUTTON_GAP - 1.))
                 .flex()
                 .items_center()
                 .child(
-                    IconButton::new("remove", IconName::Close)
-                        .icon_size(IconSize::XSmall)
-                        .icon_color(Color::Muted)
+                    pill_button("remove", IconName::Close, Color::Muted, cx)
                         .tooltip(Tooltip::text("Remove this filter"))
                         .on_click(on_remove),
                 ),
         )
+}
+
+/// The height of a [`filter_pill`] and the pill being written.
+pub const PILL_HEIGHT: f32 = 26.;
+/// How far a [`pill_button`] sits inside its pill's edge, its border included: the pill's end
+/// pads by this less the border.
+pub const PILL_BUTTON_GAP: f32 = space::XS;
+
+/// An icon button at a pill's end, [`PILL_BUTTON_GAP`] inside it: round, so its fill follows
+/// the pill's round end (`radius::within(PILL_HEIGHT / 2, gap)` is its own half height) where
+/// Zed's 4 px button would sit square in it.
+pub fn pill_button(
+    id: impl Into<ElementId>,
+    icon: IconName,
+    color: Color,
+    cx: &App,
+) -> Stateful<Div> {
+    let size = PILL_HEIGHT - 2. * PILL_BUTTON_GAP;
+    let hover = cx.theme().colors().ghost_element_hover;
+    let active = cx.theme().colors().ghost_element_active;
+    div()
+        .id(id.into())
+        .size(px(size))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .cursor_pointer()
+        .hover(move |style| style.bg(hover))
+        .active(move |style| style.bg(active))
+        .child(Icon::new(icon).size(IconSize::XSmall).color(color))
+}
+
+/// A padded list of rounded rows, as a field's offers: rows of radius `radius::XS`, the list
+/// concentric around them. The caller adds the fill, border and shadow.
+pub fn row_list() -> Div {
+    v_flex()
+        .p(px(space::XS))
+        .rounded(px(radius::around(radius::XS, space::XS)))
+}
+
+/// A floating group of controls over a canvas: 28 px tall, a hairline, a float shadow, holding
+/// Zed's default-size (22 px) buttons, so they sit 3 px inside its edge and its radius is
+/// theirs plus that.
+pub fn float_bar(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
+    const HEIGHT: f32 = 28.;
+    const BUTTON: f32 = 22.;
+    let gap = (HEIGHT - BUTTON) / 2.;
+    let colors = cx.theme().colors();
+    let fill = if cx.theme().appearance.is_light() {
+        gpui::white()
+    } else {
+        colors.elevated_surface_background
+    };
+    h_flex()
+        .id(id.into())
+        .h(px(HEIGHT))
+        .gap(px(space::XXS))
+        // The border is part of the gap.
+        .px(px(gap - 1.))
+        .items_center()
+        .rounded(px(radius::around(radius::BUTTON, gap)))
+        .bg(fill)
+        .border_1()
+        .border_color(colors.border_variant)
+        .shadow(elevation::float())
+        .occlude()
 }
 
 /// The widest a [`tag`] grows before its label truncates.
@@ -765,13 +852,12 @@ pub fn tag(label: impl Into<SharedString>, cx: &App) -> Div {
 }
 
 /// A segmented control: a sunken track holding [`segment`]s, for a choice of two to four.
-/// Concentric: the track's radius is a segment's plus its padding.
 pub fn segmented(cx: &App) -> Div {
     h_flex()
         .flex_none()
         .p(px(space::XXS))
         .gap(px(space::XXS))
-        .rounded(px(radius::SM + space::XXS))
+        .rounded(px(radius::around(radius::SM, space::XXS)))
         .bg(surface::sunken(cx).blend(gpui::black().opacity(0.03)))
 }
 
@@ -1267,7 +1353,7 @@ pub fn context_chip(
         .pr(px(space::LG))
         .rounded(px(radius::MD))
         .bg(gpui::black().opacity(0.035))
-        .child(tile(icon))
+        .child(tile(icon).rounded(px(radius::within(radius::MD, space::SM))))
         .child(
             v_flex()
                 .child(text::body(title).single_line())
@@ -1426,5 +1512,26 @@ impl RenderOnce for TimelineEntry {
                             .map(|nested| div().pb(px(space::MD)).child(nested)),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The nested pairs the design system draws stay concentric (`radius::around`/`within`).
+    #[test]
+    fn nested_radii_are_concentric() {
+        // A card `space::XS` inside a glass sheet.
+        assert_eq!(radius::within(radius::LG, space::XS), radius::MD);
+        // A segment in its track; a context chip's tile; a row in a row list.
+        assert_eq!(radius::around(radius::SM, space::XXS), 8.);
+        assert_eq!(radius::within(radius::MD, space::SM), radius::XS);
+        assert_eq!(radius::around(radius::XS, space::XS), 8.);
+        // A pill button's half height is the pill's less the gap: round in its round end.
+        let button = PILL_HEIGHT - 2. * PILL_BUTTON_GAP;
+        assert_eq!(radius::within(PILL_HEIGHT / 2., PILL_BUTTON_GAP), button / 2.);
+        // A gap wider than the radius leaves the child square.
+        assert_eq!(radius::within(radius::XS, space::XL), 0.);
     }
 }
