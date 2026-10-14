@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gq_language::{ResultColumn, SchemaModel};
 use serde_json::{Map, Value};
@@ -65,6 +65,7 @@ impl ResultTable {
         let mut nodes: Vec<ResultNode> = Vec::new();
         let mut index: HashMap<(String, String), usize> = HashMap::new();
         let mut links: Vec<(usize, usize)> = Vec::new();
+        let mut linked: HashSet<(usize, usize)> = HashSet::new();
         for row in &self.rows {
             let mut previous: Option<usize> = None;
             for (value, node_type) in row.iter().zip(&self.node_types) {
@@ -91,7 +92,7 @@ impl ResultTable {
                 });
                 if let Some(previous) = previous
                     && previous != at
-                    && !links.contains(&(previous, at))
+                    && linked.insert((previous, at))
                 {
                     links.push((previous, at));
                 }

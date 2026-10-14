@@ -35,8 +35,8 @@ use ui::{ContextMenu, KeyBinding, PopoverMenu, Tooltip};
 use crate::analysis::Analysis;
 use crate::completion::GqCompletionProvider;
 use crate::results::{
-    PlanItem, ResultTable, ServerDiagnostic, SourceMap, copy_text, format_elapsed, is_plan,
-    plan_items, rows_label, server_diagnostic, short_commit, type_label,
+    PlanItem, ResultGraph, ResultTable, ServerDiagnostic, SourceMap, copy_text, format_elapsed,
+    is_plan, plan_items, rows_label, server_diagnostic, short_commit, type_label,
 };
 
 /// How long typing pauses before the source is checked again.
@@ -99,6 +99,8 @@ enum Output {
 struct RowsOutput {
     label: String,
     table: ResultTable,
+    /// The result's nodes and links for the canvas, built once when the result arrived.
+    graph: Option<Arc<ResultGraph>>,
     widths: Vec<f32>,
     right_aligned: Vec<bool>,
     row_count: i64,
@@ -1069,7 +1071,8 @@ impl QueryEditor {
             this.update(cx, |this, cx| {
                 // A new output replaces the plan whose operator lit the text.
                 this.light_plan_parts(None, cx);
-                this.finish_read(prepared, branch, result, elapsed);
+                let schema = this.session.read(cx).schema_model();
+                this.finish_read(prepared, branch, result, elapsed, schema);
                 this.run_task = None;
                 cx.notify();
             })
@@ -1083,6 +1086,7 @@ impl QueryEditor {
         branch: String,
         result: Result<ReadOutput, ReadError>,
         elapsed: Duration,
+        schema: Option<Arc<SchemaModel>>,
     ) {
         let note = match &result {
             Ok(output) => RunNote {
@@ -1122,8 +1126,10 @@ impl QueryEditor {
                             .is_some_and(|row| is_numeric(&row[i]))
                     })
                     .collect();
+                let graph = schema.and_then(|schema| table.graph(&schema)).map(Arc::new);
                 Output::Rows(RowsOutput {
                     label: prepared.label,
+                    graph,
                     table,
                     widths,
                     right_aligned,
@@ -1741,34 +1747,28 @@ impl QueryEditor {
                         cx.listener(|this, _, window, cx| this.copy_cell(&CopyCell, window, cx)),
                     ),
             )
-            .when_some(
-                self.session
-                    .read(cx)
-                    .schema_model()
-                    .and_then(|schema| rows.table.graph(&schema)),
-                |status, (nodes, links)| {
-                    let title = format!("{} · result", rows.label);
-                    status.child(
-                        studio_ui::ds::button("result-canvas", "Canvas")
-                            .label_size(LabelSize::Small)
-                            .start_icon(Icon::new(IconName::GitGraph).size(IconSize::XSmall))
-                            .tooltip(Tooltip::text(format!(
-                                "Draw the result's {} nodes, linking those in the same row",
-                                nodes.len()
-                            )))
-                            .on_click(move |_, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(studio_actions::graph::ShowResultsOnCanvas {
-                                        title: title.clone(),
-                                        nodes: nodes.clone(),
-                                        links: links.clone(),
-                                    }),
-                                    cx,
-                                )
-                            }),
-                    )
-                },
-            )
+            .when_some(rows.graph.clone(), |status, graph| {
+                let title = format!("{} · result", rows.label);
+                status.child(
+                    studio_ui::ds::button("result-canvas", "Canvas")
+                        .label_size(LabelSize::Small)
+                        .start_icon(Icon::new(IconName::GitGraph).size(IconSize::XSmall))
+                        .tooltip(Tooltip::text(format!(
+                            "Draw the result's {} nodes, linking those in the same row",
+                            graph.0.len()
+                        )))
+                        .on_click(move |_, window, cx| {
+                            window.dispatch_action(
+                                Box::new(studio_actions::graph::ShowResultsOnCanvas {
+                                    title: title.clone(),
+                                    nodes: graph.0.clone(),
+                                    links: graph.1.clone(),
+                                }),
+                                cx,
+                            )
+                        }),
+                )
+            })
             .child(
                 studio_ui::ds::button("copy-row", "Copy row")
                     .label_size(LabelSize::Small)

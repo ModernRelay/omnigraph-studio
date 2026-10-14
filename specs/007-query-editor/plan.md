@@ -172,6 +172,10 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 ## Corrections
 
+- 2026-10-13 · The result's node graph for "Canvas" was built on every render, cloning every
+  node and checking each link against every other (`links.contains`). It is built once when
+  the result arrives, with a set for the links.
+
 - 2026-10-12 · Design said a mutation's run button "asks once per tab". The editor asks every
   time: each ⌘↵ on a write shows the confirm bar, and only ↵ on the bar or its button sends it.
   Asking once per tab would let the second ⌘↵ write on its own.
