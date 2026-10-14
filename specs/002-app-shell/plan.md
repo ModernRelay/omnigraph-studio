@@ -276,6 +276,13 @@ than styling one-off elements.
   `ds::float_bar` (the canvas's floating controls, 7 px around 22 px buttons 3 px in),
   `ds::pill_button` (round, 4 px inside a pill's round end) and the context chip's tile. The
   `ds` test `nested_radii_are_concentric` pins the pairs.
+- **Control sizes, in code.** `size::CONTROL` (28 px: a medium button, a field, a segmented
+  track, a floating bar, a tile) and `size::PILL` (26 px: a filter, a composer's picker, a
+  dock's title tab); a segment is a control less its track's inset. Every single-line field is
+  `ds::field_frame` (a hairline box at a control's height, the error border when invalid)
+  around `ds::field_input`, and every search box is `ds::search_field`, so fields line up
+  with the buttons beside them: the settings search and text fields, the history and review
+  searches, and the dialogs' fields.
 - **Tabs** fill the 36 px strip (an explicit height: the right-click wrapper lays a tab out at
   its content's height, so `h_full` would shrink it to its label); the active tab joins the
   document, inactive ones sit on the strip's rule.

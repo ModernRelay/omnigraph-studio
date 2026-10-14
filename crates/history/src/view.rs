@@ -832,20 +832,8 @@ impl Render for HistoryView {
             (true, Some(at)) => Some(format!("{}/{}", at + 1, self.matches.len())),
             (true, None) => Some("No match".to_owned()),
         };
-        let search = h_flex()
+        let search = studio_ui::ds::search_field(self.search.clone(), cx)
             .w(px(if self.compact { 200. } else { 240. }))
-            .h(px(26.))
-            .px_2()
-            .gap_1p5()
-            .items_center()
-            .rounded(px(studio_ui::ds::radius::SM))
-            .bg(studio_ui::ds::surface::sunken(cx))
-            .child(
-                Icon::new(IconName::MagnifyingGlass)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(div().flex_1().child(self.search.clone()))
             .children(counter.map(studio_ui::ds::text::meta));
         let summary = match self.state {
             State::Ready if count > self.own_count => {

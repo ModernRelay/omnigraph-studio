@@ -4146,7 +4146,7 @@ impl TypeTable {
             };
             // The filter being written is the pill it will become, outlined while it is open.
             let pill = h_flex()
-                .h(px(studio_ui::ds::PILL_HEIGHT))
+                .h(px(studio_ui::ds::size::PILL))
                 .flex_none()
                 .rounded_full()
                 .border_1()

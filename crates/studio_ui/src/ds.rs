@@ -90,8 +90,12 @@ pub mod size {
     /// chip (an enum value, a relationship) inside a row.
     pub const ROW: f32 = 28.;
     pub const HEADER: f32 = 30.;
-    /// A sidebar row.
+    /// A sidebar row, and a row of a [`super::row_list`].
     pub const SIDEBAR_ROW: f32 = 26.;
+    /// A control: a medium button, a field, a segmented track, a floating bar, a tile.
+    pub const CONTROL: f32 = 28.;
+    /// A pill: a filter, a composer's picker, a dock's title tab.
+    pub const PILL: f32 = 26.;
     /// A thread's or feed's gutter, where each entry's icon sits.
     pub const GUTTER: f32 = 24.;
     /// A row of an activity feed: taller than a data row, as a feed is read, not scanned.
@@ -623,7 +627,7 @@ pub fn title_tab(
 ) -> Stateful<Div> {
     h_flex()
         .id(id.into())
-        .h(px(26.))
+        .h(px(size::PILL))
         .px(px(space::MD))
         .gap(px(space::SM))
         .items_center()
@@ -685,6 +689,42 @@ pub fn icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
         .icon_size(IconSize::Small)
 }
 
+/// A text field's frame: a hairline box at a control's height, so a field lines up with the
+/// buttons beside it, around an editor and an icon or a counter. `invalid` draws the error
+/// border. Every single-line field in Studio is one.
+pub fn field_frame(invalid: bool, cx: &App) -> Div {
+    let colors = cx.theme().colors();
+    h_flex()
+        .h(px(size::CONTROL))
+        .px(px(space::MD))
+        .gap(px(space::SM))
+        .items_center()
+        .rounded(px(radius::SM))
+        .border_1()
+        .border_color(if invalid {
+            cx.theme().status().error_border
+        } else {
+            colors.border
+        })
+        .bg(colors.editor_background)
+}
+
+/// A field's editor, filling what its [`field_frame`] leaves.
+pub fn field_input(editor: impl IntoElement) -> Div {
+    div().flex_1().min_w_0().child(editor)
+}
+
+/// A search field: a [`field_frame`] led by a magnifying glass.
+pub fn search_field(editor: impl IntoElement, cx: &App) -> Div {
+    field_frame(false, cx)
+        .child(
+            Icon::new(IconName::MagnifyingGlass)
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+        )
+        .child(field_input(editor))
+}
+
 /// The text of a single-line field that sits among `Small` labels (a filter value, a search
 /// box): an editor's text at the label's size rather than the body size.
 pub fn field_text(cx: &App) -> gpui::TextStyleRefinement {
@@ -718,7 +758,7 @@ pub fn filter_pill(
     };
     h_flex()
         .id(id.clone())
-        .h(px(PILL_HEIGHT))
+        .h(px(size::PILL))
         .flex_none()
         .rounded_full()
         .border_1()
@@ -760,14 +800,12 @@ pub fn filter_pill(
         )
 }
 
-/// The height of a [`filter_pill`] and the pill being written.
-pub const PILL_HEIGHT: f32 = 26.;
 /// How far a [`pill_button`] sits inside its pill's edge, its border included: the pill's end
 /// pads by this less the border.
 pub const PILL_BUTTON_GAP: f32 = space::XS;
 
 /// An icon button at a pill's end, [`PILL_BUTTON_GAP`] inside it: round, so its fill follows
-/// the pill's round end (`radius::within(PILL_HEIGHT / 2, gap)` is its own half height) where
+/// the pill's round end (`radius::within(size::PILL / 2, gap)` is its own half height) where
 /// Zed's 4 px button would sit square in it.
 pub fn pill_button(
     id: impl Into<ElementId>,
@@ -775,12 +813,12 @@ pub fn pill_button(
     color: Color,
     cx: &App,
 ) -> Stateful<Div> {
-    let size = PILL_HEIGHT - 2. * PILL_BUTTON_GAP;
+    let diameter = size::PILL - 2. * PILL_BUTTON_GAP;
     let hover = cx.theme().colors().ghost_element_hover;
     let active = cx.theme().colors().ghost_element_active;
     div()
         .id(id.into())
-        .size(px(size))
+        .size(px(diameter))
         .flex_none()
         .flex()
         .items_center()
@@ -804,9 +842,9 @@ pub fn row_list() -> Div {
 /// Zed's default-size (22 px) buttons, so they sit 3 px inside its edge and its radius is
 /// theirs plus that.
 pub fn float_bar(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
-    const HEIGHT: f32 = 28.;
+    // Zed's default-size button.
     const BUTTON: f32 = 22.;
-    let gap = (HEIGHT - BUTTON) / 2.;
+    let gap = (size::CONTROL - BUTTON) / 2.;
     let colors = cx.theme().colors();
     let fill = if cx.theme().appearance.is_light() {
         gpui::white()
@@ -815,7 +853,7 @@ pub fn float_bar(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
     };
     h_flex()
         .id(id.into())
-        .h(px(HEIGHT))
+        .h(px(size::CONTROL))
         .gap(px(space::XXS))
         // The border is part of the gap.
         .px(px(gap - 1.))
@@ -872,7 +910,7 @@ pub fn segment(
     let raised = cx.theme().colors().editor_background;
     h_flex()
         .id(id.into())
-        .h(px(24.))
+        .h(px(size::CONTROL - 2. * space::XXS))
         .px(px(space::MD + space::XXS))
         .items_center()
         .rounded(px(radius::SM))
@@ -1230,7 +1268,7 @@ impl RenderOnce for ActivityRow {
 /// An icon on a small tile, as a card or entry leads with one.
 pub fn tile(icon: IconName) -> Div {
     div()
-        .size(px(28.))
+        .size(px(size::CONTROL))
         .flex_none()
         .flex()
         .items_center()
@@ -1296,7 +1334,7 @@ pub fn number_badge(value: impl Into<SharedString>, hue: f32) -> Div {
 pub fn pill(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
     h_flex()
         .id(id.into())
-        .h(px(26.))
+        .h(px(size::PILL))
         .px(px(space::MD))
         .gap(px(space::XS))
         .items_center()
@@ -1317,7 +1355,7 @@ pub fn round_button(
     let colors = cx.theme().colors();
     div()
         .id(id.into())
-        .size(px(28.))
+        .size(px(size::CONTROL))
         .flex_none()
         .flex()
         .items_center()
@@ -1529,8 +1567,11 @@ mod tests {
         assert_eq!(radius::within(radius::MD, space::SM), radius::XS);
         assert_eq!(radius::around(radius::XS, space::XS), 8.);
         // A pill button's half height is the pill's less the gap: round in its round end.
-        let button = PILL_HEIGHT - 2. * PILL_BUTTON_GAP;
-        assert_eq!(radius::within(PILL_HEIGHT / 2., PILL_BUTTON_GAP), button / 2.);
+        let button = size::PILL - 2. * PILL_BUTTON_GAP;
+        assert_eq!(
+            radius::within(size::PILL / 2., PILL_BUTTON_GAP),
+            button / 2.
+        );
         // A gap wider than the radius leaves the child square.
         assert_eq!(radius::within(radius::XS, space::XL), 0.);
     }

@@ -12,7 +12,7 @@ use gpui::{
 };
 use serde_json::Value;
 use studio_settings::{FieldKind, Scope, SettingField, StudioSettings};
-use studio_ui::ds::{self, radius, size, space};
+use studio_ui::ds::{self, space};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use theme::ThemeRegistry;
 use ui::prelude::*;
@@ -160,23 +160,13 @@ impl SettingsView {
 
     /// Text field `index`'s control: the field, which Enter writes.
     fn text_control(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
-        h_flex()
+        ds::field_frame(false, cx)
             .key_context("SettingsField")
             .w(px(260.))
-            .h(px(size::SIDEBAR_ROW))
-            .px(px(space::MD))
-            .rounded(px(radius::SM))
-            .border_1()
-            .border_color(cx.theme().colors().border)
             .on_action(cx.listener(move |this, _: &menu::Confirm, window, cx| {
                 this.write_text(index, window, cx)
             }))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(self.text_inputs[index].editor.clone()),
-            )
+            .child(ds::field_input(self.text_inputs[index].editor.clone()))
             .into_any_element()
     }
 }
@@ -629,22 +619,7 @@ impl Render for SettingsView {
                             )
                             .child(div().flex_1())
                             .children(self.render_scope(cx))
-                            .child(
-                                h_flex()
-                                    .w(px(220.))
-                                    .h(px(size::SIDEBAR_ROW))
-                                    .px(px(space::MD))
-                                    .gap(px(space::SM))
-                                    .rounded(px(radius::SM))
-                                    .border_1()
-                                    .border_color(cx.theme().colors().border)
-                                    .child(
-                                        Icon::new(IconName::MagnifyingGlass)
-                                            .size(IconSize::XSmall)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(div().flex_1().child(self.search.clone())),
-                            )
+                            .child(ds::search_field(self.search.clone(), cx).w(px(220.)))
                             .child(
                                 studio_ui::ds::icon_button("reveal-settings", IconName::Folder)
                                     .icon_size(IconSize::Small)

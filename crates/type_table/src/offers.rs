@@ -77,7 +77,7 @@ impl Offers {
                 let on_pick = on_pick.clone();
                 h_flex()
                     .id((id, index))
-                    .h(px(26.))
+                    .h(px(studio_ui::ds::size::SIDEBAR_ROW))
                     .px_2()
                     .gap_2()
                     // A row of a `ds::row_list`, which is concentric around this radius.

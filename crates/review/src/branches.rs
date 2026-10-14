@@ -325,13 +325,7 @@ impl Render for BranchList {
 // ---- dialogs ----
 
 fn field(editor: &Entity<Editor>, cx: &App) -> Div {
-    div()
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .border_1()
-        .border_color(cx.theme().colors().border)
-        .child(editor.clone())
+    studio_ui::ds::field_frame(false, cx).child(studio_ui::ds::field_input(editor.clone()))
 }
 
 /// "New branch": a name, created from the current branch, then switched to.

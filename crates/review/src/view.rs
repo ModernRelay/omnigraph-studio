@@ -1009,22 +1009,7 @@ impl ReviewView {
                     menu
                 }))
             });
-        let search = h_flex()
-            .w(px(280.))
-            .h(px(28.))
-            .px_2()
-            .gap_1p5()
-            .items_center()
-            .rounded_md()
-            .border_1()
-            .border_color(border)
-            .bg(cx.theme().colors().editor_background)
-            .child(
-                Icon::new(IconName::MagnifyingGlass)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(div().flex_1().child(self.search.clone()));
+        let search = studio_ui::ds::search_field(self.search.clone(), cx).w(px(280.));
 
         v_flex()
             .flex_none()

@@ -66,19 +66,7 @@ fn frame(cx: &App) -> Div {
 }
 
 fn field_box(editor: &Entity<Editor>, invalid: bool, cx: &App) -> impl IntoElement {
-    let colors = cx.theme().colors();
-    div()
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .border_1()
-        .border_color(if invalid {
-            cx.theme().status().error_border
-        } else {
-            colors.border
-        })
-        .bg(colors.editor_background)
-        .child(editor.clone())
+    studio_ui::ds::field_frame(invalid, cx).child(studio_ui::ds::field_input(editor.clone()))
 }
 
 /// The form for a new node, generated from the node's shape: the key first, then required
