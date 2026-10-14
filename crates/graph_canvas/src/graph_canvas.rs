@@ -590,7 +590,7 @@ impl GraphCanvas {
             }
         }
         let roots: Vec<usize> = (0..count).filter(|i| parent[*i].is_none()).collect();
-        let ring = layout::schema_positions(roots.len());
+        let ring = layout::result_root_positions(roots.len());
         let mut fixed = vec![None; count];
         for (root, position) in roots.iter().zip(ring) {
             fixed[*root] = Some(position);

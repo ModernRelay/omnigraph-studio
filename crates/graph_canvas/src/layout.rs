@@ -564,6 +564,29 @@ pub fn schema_positions(count: usize) -> Vec<Vec2> {
     }
 }
 
+/// Where a query result's roots stand (spec 006): a ring for a few, as the ontology's types
+/// do; a landscape grid for more, since a ring sized for thousands of roots is wider than the
+/// canvas can zoom out to and its middle, all the view shows, is empty. Each root's subtree
+/// then grows beside it, moved to free room where it would land on another.
+pub fn result_root_positions(count: usize) -> Vec<Vec2> {
+    const RING_MAX: usize = 12;
+    const ACROSS: f32 = 640.;
+    const DOWN: f32 = 200.;
+    if count <= RING_MAX {
+        return schema_positions(count);
+    }
+    // Columns for a grid about 16:9 on screen, given each cell's shape.
+    let columns = ((count as f32 * 16. / 9. * DOWN / ACROSS).sqrt().ceil() as usize).max(1);
+    let rows = count.div_ceil(columns);
+    let origin = Vec2::new(
+        -(columns as f32 - 1.) * ACROSS / 2.,
+        -(rows as f32 - 1.) * DOWN / 2.,
+    );
+    (0..count)
+        .map(|i| origin + Vec2::new((i % columns) as f32 * ACROSS, (i / columns) as f32 * DOWN))
+        .collect()
+}
+
 const RELAX_ITERATIONS: usize = 60;
 const GAP: f32 = 6.;
 
@@ -929,7 +952,7 @@ mod tests {
         }
         let roots: Vec<usize> = (0..count).filter(|i| parent[*i].is_none()).collect();
         let mut fixed = vec![None; count];
-        for (root, position) in roots.iter().zip(schema_positions(roots.len())) {
+        for (root, position) in roots.iter().zip(result_root_positions(roots.len())) {
             fixed[*root] = Some(position);
         }
         (0..count)
@@ -973,6 +996,27 @@ mod tests {
             .filter(|start| (!downward || *start >= ideal) && fits(*start))
             .min_by(|a, b| (a - ideal).abs().total_cmp(&(b - ideal).abs()))
             .unwrap_or(ideal)
+    }
+
+    #[test]
+    fn many_result_roots_stand_in_a_landscape_grid_a_view_can_hold() {
+        assert_eq!(result_root_positions(5), schema_positions(5));
+        let roots = result_root_positions(4_000);
+        let (min, max) = extent(&roots, |_| 0.).unwrap();
+        let (width, height) = (max.x - min.x, max.y - min.y);
+        // Wider than tall, and within what the canvas shows at its smallest zoom (0.05) on a
+        // 1,300-pixel view, unlike a ring of 4,000.
+        assert!(width > height, "{width} × {height}");
+        assert!(width < 1_300. / 0.05 * 2., "{width}");
+        let ring = schema_positions(4_000);
+        let (ring_min, ring_max) = extent(&ring, |_| 0.).unwrap();
+        assert!(ring_max.x - ring_min.x > 4. * width);
+        // Every root has its own cell.
+        let distinct: std::collections::HashSet<(i32, i32)> = roots
+            .iter()
+            .map(|p| (p.x.round() as i32, p.y.round() as i32))
+            .collect();
+        assert_eq!(distinct.len(), 4_000);
     }
 
     #[test]
