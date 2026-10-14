@@ -7,9 +7,8 @@ explorer, a GQ query editor with stored queries, branch review and merge, commit
 agent panel.
 
 The UI is built on [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui), the
-Rust UI framework [Zed](https://github.com/zed-industries/zed) is written in, together with
-Zed's UI, editor and theme crates. GPUI draws every frame on the GPU, through Metal on macOS and
-Vulkan (wgpu) on Linux; there is no web view or browser engine.
+Rust UI framework from Zed, with its editor, UI and theme crates. GPUI draws every frame on the
+GPU, through Metal on macOS and Vulkan (wgpu) on Linux; there is no web view or browser engine.
 
 ![Studio opening a person's relationships in the explorer, then the Person table grouped by company](docs/images/explore.gif)
 
@@ -123,7 +122,7 @@ depend on each other.
 | 1 | `studio_settings`, `studio_theme` |
 | 0 | `studio_actions`: every action type |
 
-Zed's crates come from git at one release tag (`docs/zed-pin.md`). The tree-sitter grammars for
+GPUI and its crates come from git at one release tag (`docs/zed-pin.md`). The tree-sitter grammars for
 `.gq` and `.pg` are in `grammars/`. `docs/architecture.md` describes the data flow and the state
 model.
 
@@ -153,7 +152,7 @@ what is deferred, and a dated validation log of the checks behind each claim.
 |---|---|
 | `.specify/memory/constitution.md` | Principles every change follows |
 | `specs/` | One plan per feature |
-| `docs/` | Architecture, Zed pin, deferred engine changes |
+| `docs/` | Architecture, the GPUI pin, deferred engine changes |
 | `crates/` | The workspace; `crates/studio` is the binary |
 | `grammars/` | Tree-sitter grammars for `.gq` and `.pg` |
 | `assets/` | Default keymaps and settings |
