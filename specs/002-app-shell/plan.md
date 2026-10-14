@@ -252,7 +252,7 @@ than styling one-off elements.
   only the tabs and the dock toggles.
   - The connection's state reads with the server's round trip, from the last health check
     (`Connection::latency`, no extra request): "contract 0.13 · 42 ms".
-  - With `studio.show_performance` on (off by default), the document footer ends with
+  - With `studio.show_performance` on (the default since 2026-10-14), the document footer ends with
     Studio's memory and CPU, muted, in the warning colour past 2 GB or half a core:
     "412 MB · 3% CPU". Memory is macOS's physical footprint (`proc_pid_rusage`, what
     Activity Monitor shows) or Linux's resident set; CPU is the share of one core between

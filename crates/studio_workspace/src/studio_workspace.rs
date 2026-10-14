@@ -152,8 +152,8 @@ pub struct Workspace {
     /// What the CLI's files could not give, as last shown.
     cli_errors: Vec<String>,
     _settings_subscription: Subscription,
-    /// Studio's memory and CPU for the footer while `studio.show_performance` is on, read every
-    /// two seconds while the window is in front.
+    /// Studio's memory and CPU for the footer while `studio.show_performance` is on (the
+    /// default), read every two seconds while the window is in front.
     performance: Option<Performance>,
     /// Whether this window is in front, which the memory and CPU reading waits for.
     window_active: bool,
