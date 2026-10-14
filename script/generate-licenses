@@ -29,7 +29,7 @@ assets = [p for p in packages
 print(os.path.dirname(os.path.dirname(os.path.dirname(assets[0]["manifest_path"]))))
 ')
 
-config=$(mktemp -t studio-about)
+config=$(mktemp "${TMPDIR:-/tmp}/studio-about.XXXXXX")
 trap 'rm -f "$config"' EXIT
 python3 - deny.toml > "$config" <<'PY'
 import sys, tomllib

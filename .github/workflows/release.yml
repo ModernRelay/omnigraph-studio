@@ -49,6 +49,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The scripts read TOML with Python's tomllib (3.11+); Ubuntu 22.04 has 3.10.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: The tag names the workspace version
         if: github.event_name == 'push'
         shell: bash
