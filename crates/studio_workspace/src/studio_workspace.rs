@@ -178,10 +178,11 @@ const SAVE_CHECK: Duration = Duration::from_millis(250);
 const SAVE_DELAY: Duration = Duration::from_millis(500);
 /// Height of a column's header strip (spec 002, after Delta).
 const STRIP_HEIGHT: f32 = studio_ui::ds::size::STRIP;
+const HEADER_HEIGHT: f32 = studio_ui::ds::size::HEADER_STRIP;
 /// Room for the window's traffic lights at the left of the first header strip.
 const TRAFFIC_LIGHTS_WIDTH: f32 = 76.;
 /// The traffic lights' offset from the top of that strip: centers the 16-point buttons in it.
-const TRAFFIC_LIGHTS_TOP: f32 = (STRIP_HEIGHT - 16.) / 2.;
+const TRAFFIC_LIGHTS_TOP: f32 = (HEADER_HEIGHT - 16.) / 2.;
 /// How many visited tabs ⌘[ remembers.
 const NAV_HISTORY: usize = 100;
 /// A dock panel inside a scrolling host of its own. The host is what is cached (a cached view
@@ -1552,11 +1553,16 @@ impl Workspace {
     /// A header or footer strip of a column (spec 002, after Delta): fixed height, and a place
     /// to drag the window from. As in Zed's title bar, the move starts on the first mouse move
     /// after a press, so clicks on the strip's buttons still land.
-    fn strip(&self, id: impl Into<ElementId>, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn strip(
+        &self,
+        id: impl Into<ElementId>,
+        height: f32,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         h_flex()
             .id(id)
             .window_control_area(WindowControlArea::Drag)
-            .h(px(STRIP_HEIGHT))
+            .h(px(height))
             .w_full()
             .flex_none()
             .items_center()
@@ -1587,7 +1593,7 @@ impl Workspace {
         let panel = colors.panel_background;
         let hairline = studio_ui::ds::surface::rule(cx);
         let header = self
-            .strip("sidebar-header", cx)
+            .strip("sidebar-header", HEADER_HEIGHT, cx)
             .pr_2()
             .gap_0p5()
             .when(!studio_ui::ds::is_glass(cx), |d| {
@@ -1780,7 +1786,7 @@ impl Workspace {
                             .color(Color::Muted),
                     ),
             );
-        self.strip("sidebar-footer", cx)
+        self.strip("sidebar-footer", STRIP_HEIGHT, cx)
             .px(px(studio_ui::ds::space::XS))
             .border_t_1()
             .border_color(hairline)
@@ -1840,6 +1846,14 @@ impl Workspace {
         let hover_bg = colors.ghost_element_hover;
         let split = self.panes.len() > 1;
         let focused_pane = pane_id == self.active_pane;
+        // On glass, the first tab of the top-left pane sits in the sheet's rounded corner
+        // unless the traffic lights' space comes first (`render_pane_header`). GPUI clips a
+        // sheet's children to its rectangle, not its corners, so that tab takes the sheet's
+        // radius or its shade shows outside the curve.
+        let in_corner = studio_ui::ds::is_glass(cx)
+            && self.center.top_left() == pane_id
+            && self.left.visible()
+            && self.session.is_some();
         let workspace = cx.entity().downgrade();
         let Some(pane) = self.pane(pane_id) else {
             return h_flex().into_any_element();
@@ -1864,7 +1878,7 @@ impl Workspace {
                 let tab = h_flex()
                     .id(SharedString::from(format!("tab-{pane_id}-{index}")))
                     .group(group.clone())
-                    .h(px(STRIP_HEIGHT))
+                    .h(px(HEADER_HEIGHT))
                     .pl(px(studio_ui::ds::space::LG))
                     .pr(px(studio_ui::ds::space::SM))
                     .gap(px(studio_ui::ds::space::MD))
@@ -1873,6 +1887,9 @@ impl Workspace {
                     .relative()
                     .border_r_1()
                     .border_color(hairline)
+                    .when(in_corner && index == 0, |tab| {
+                        tab.rounded_tl(px(studio_ui::ds::radius::LG))
+                    })
                     .when(selected, |tab| tab.bg(editor_bg))
                     .when(!selected, |tab| {
                         tab.bg(inactive_bg)
@@ -1995,32 +2012,36 @@ impl Workspace {
                 );
             }
         }
-        self.strip(SharedString::from(format!("pane-header-{pane_id}")), cx)
-            .bg(header_bg)
-            .when(
-                top_left && (!self.left.visible() || self.session.is_none()),
-                |strip| {
-                    strip.child(
-                        div()
-                            .w(px(TRAFFIC_LIGHTS_WIDTH))
-                            .h_full()
-                            .flex_none()
-                            .border_b_1()
-                            .border_color(hairline),
-                    )
-                },
-            )
-            .child(self.render_tabs(pane_id, cx))
-            .child(
-                h_flex()
-                    .flex_1()
-                    .h_full()
-                    .justify_end()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(hairline)
-                    .child(context),
-            )
+        self.strip(
+            SharedString::from(format!("pane-header-{pane_id}")),
+            HEADER_HEIGHT,
+            cx,
+        )
+        .bg(header_bg)
+        .when(
+            top_left && (!self.left.visible() || self.session.is_none()),
+            |strip| {
+                strip.child(
+                    div()
+                        .w(px(TRAFFIC_LIGHTS_WIDTH))
+                        .h_full()
+                        .flex_none()
+                        .border_b_1()
+                        .border_color(hairline),
+                )
+            },
+        )
+        .child(self.render_tabs(pane_id, cx))
+        .child(
+            h_flex()
+                .flex_1()
+                .h_full()
+                .justify_end()
+                .items_center()
+                .border_b_1()
+                .border_color(hairline)
+                .child(context),
+        )
     }
 
     /// One pane: its header and its active tab. Pressing anywhere in it makes it the active
@@ -2257,7 +2278,7 @@ impl Workspace {
             );
         let has_start = !footer.start.is_empty();
         Some(
-            self.strip("center-footer", cx)
+            self.strip("center-footer", STRIP_HEIGHT, cx)
                 .pl(px(studio_ui::ds::space::XS))
                 .pr(px(studio_ui::ds::space::EDGE))
                 .gap(px(studio_ui::ds::space::LG))
@@ -2325,7 +2346,7 @@ impl Workspace {
                         .border_color(hairline)
                         .child(
                             h_flex()
-                                .h(px(studio_ui::ds::size::STRIP))
+                                .h(px(HEADER_HEIGHT))
                                 .flex_none()
                                 .px(px(studio_ui::ds::space::SM))
                                 .gap(px(studio_ui::ds::space::SM))
@@ -2454,7 +2475,7 @@ impl Workspace {
                 .flex_none()
                 .child(resize_handle(PanelPosition::Right))
                 .child(
-                    self.strip("right-dock-header", cx)
+                    self.strip("right-dock-header", HEADER_HEIGHT, cx)
                         .px(px(studio_ui::ds::space::SM))
                         .border_b_1()
                         .border_color(hairline)
@@ -2511,7 +2532,7 @@ impl Workspace {
         // Under the header strips, so a toast never covers a document's footer or composer.
         v_flex()
             .absolute()
-            .top(px(STRIP_HEIGHT + 8.))
+            .top(px(HEADER_HEIGHT + 8.))
             .right_3()
             .gap_2()
             .children(self.toasts.iter().map(|toast| {

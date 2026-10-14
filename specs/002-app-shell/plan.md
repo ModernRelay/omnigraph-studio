@@ -227,9 +227,9 @@ strips and states built from them); the "Design system" tab (`studio::OpenDesign
 every specimen in the current theme and window style. Features compose `ds` components rather
 than styling one-off elements.
 
-- **Columns, not bars.** No global title bar or status bar. Each column has its own 40 px
-  header strip and the sidebar and document their own footer strip, so the rules line up across
-  the window. Strips are window drag areas; as in Zed, a move starts on the first mouse move
+- **Columns, not bars.** No global title bar or status bar. Each column has its own 36 px
+  header strip (`size::HEADER_STRIP`) and the sidebar and document their own 40 px footer strip
+  (`size::STRIP`), so the rules line up across the window. Strips are window drag areas; as in Zed, a move starts on the first mouse move
   after a press, so clicks on strip buttons land.
 - **Panels in docks** (`studio_workspace::panels`, after Zed's `Panel`/`Dock` and Obsidian's
   side docks). A panel is a view with an id, a title and an icon; features add one with
@@ -265,12 +265,17 @@ than styling one-off elements.
   floats the three columns as sheets over a soft wash, with one gap around and between them,
   and moves the traffic lights into the sidebar sheet.
 - **Hairlines.** `ds::surface::rule`, never a solid border; dashed between rows on glass.
-- **Tabs** fill the 40 px strip (an explicit height: the right-click wrapper lays a tab out at
+- **Sheet corners.** GPUI clips a glass sheet's children to its rectangle, not its rounded
+  corners, so a child with a fill flush in a corner takes the sheet's radius (`radius::LG`):
+  the first tab of the top-left pane, when the sidebar is shown.
+- **Tabs** fill the 36 px strip (an explicit height: the right-click wrapper lays a tab out at
   its content's height, so `h_full` would shrink it to its label); the active tab joins the
   document, inactive ones sit on the strip's rule.
-- **Buttons.** `ds::button` and `ds::icon_button` (Zed's medium size: 28 px, an 8 px inset)
-  for every button in a toolbar, strip, panel, card footer or dialog, so a hover or pressed
-  fill has room around its label. Buttons inside a dense row (a filter pill's segments, a
+- **Buttons.** `ds::button` (28 px, a 6 px inset) and `ds::icon_button` (Zed's medium size,
+  28 px square) for every button in a toolbar, strip, panel, card footer or dialog, so a hover
+  or pressed fill has room around its label. Zed fixes a button's padding by its size (8 px
+  for medium) and keeps its colours private, so `ds::button` is Studio's own `Button`: Zed's
+  `ButtonLike` (colours and states) at 28 px around its own icon, label and key row. Buttons inside a dense row (a filter pill's segments, a
   tab's close, a tree row's toggle, an inline Fix or Run, the sidebar header's icons) keep
   Zed's compact default.
 - **Text sizes.** The window's rem size is `ui_font_size` (16 px by default), as in Zed, so
@@ -343,7 +348,8 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-12 | With nothing focused, an action reaches only global handlers | offscreen snapshots: `studio::ToggleSidebar` and `studio::OpenGraph` did nothing until the workspace had focus | A window opens with no focus, so the workspace's handlers and key bindings are unreachable until something is clicked. The snapshot example now focuses the workspace first; the app should focus it when a window opens |
 | 2026-10-12 | Settings rows are generated in declaration order | `studio_settings` field tests (row order, sections, kinds, path writes and resets); `serde_json`'s `preserve_order` is on in the workspace graph; offscreen snapshots of the Appearance section and of searches for "page" and "agent" | Fourteen rows in four sections; `agent.env` hidden; changed rows show Reset and the nav counts them |
 | 2026-10-14 | Every setting with a control is on the page | `studio_settings` field tests (row list, kinds, one-paragraph descriptions); offscreen snapshots in a scratch data folder: a search for "agent", a path typed into OmniGraph CLI then ↵, a second run with Reset, the Ask before writes switch | `agent.ask_before_writes` and `agent.omnigraph_cli`, added for spec 013, had been hidden; text settings had no control at all (the page showed the value read-only), and no switch had been drawn. Now sixteen rows: ↵ wrote `"omnigraph_cli": "/opt/omnigraph/bin/omnigraph"` (mode 0600) and showed Reset, Reset wrote `null` and emptied the field, the switch wrote `true`. Descriptions had kept their doc comments' line breaks, and GPUI breaks lines at `/`, so paths left the descriptions |
-| 2026-10-14 | The footers show the server's round trip and, when asked, Studio's memory and CPU | `studio_workspace` test `the_process_reads_its_memory_and_cpu`; `studio_settings` tests (row list, `default.json`); `cargo clippy -p studio --features perf`; an offscreen snapshot with `show_performance` on, a table open, 4.5 s waited, then ⌘⌥⇧F | The sidebar read "environment contract 0.13 · 2 ms", the document footer ended "42 MB · 1% CPU", and the overlay key toasted the `perf` build command in a default build. The `perf` build's overlay itself was not drawn: rebuilding GPUI with `profiler` needed more disk than was free |
+| 2026-10-14 | The footers show the server's round trip and, when asked, Studio's memory and CPU | `studio_workspace` test `the_process_reads_its_memory_and_cpu`; `studio_settings` tests (row list, `default.json`); `cargo clippy -p studio --features perf`; an offscreen snapshot with `show_performance` on, a table open, 4.5 s waited, then ⌘⌥⇧F | The sidebar read "environment contract 0.13 · 2 ms", the document footer ended "42 MB · 1% CPU", and the overlay key toasted the `perf` build command in a default build. A `release-fast` build with `--features perf` then drew the overlay after ⌘⌥⇧F (frame time, 1% and 10% slowest, maximum, frames) |
+| 2026-10-14 | Glass corners, button padding and the tab strip | Offscreen snapshots in glass with two tabs and the pointer on the first, the edge dialog, and a query in flat; corners cropped at 2× from every sheet | The first tab's shade had a square corner outside the document sheet's curve, faint at rest and plain on hover; now it follows the curve. Every other corner of the sidebar, document and inspector sheets, including the footer switcher under the pointer, was already clean. Buttons read with 6 px insets at 28 px; header strips are 36 px, footers 40 |
 | 2026-10-12 | A graph's own value reaches its views | offscreen snapshots with the new `click:x,y` step: the scope switch, then + on Table page size in the graph scope; `settings.json` after; the Person table after | `graphs."environment/knowledge".type_table_page_size` 125, `studio.type_table_page_size` still 100; the table footer reads "125 of 200" |
 | 2026-10-12 | Panes, pins and previews | `studio_workspace` pane tests (preview replaced in place and kept, pin order, close others, removal, split nesting and collapse, JSON round trip); offscreen snapshots: preview Person then Company, pin a query, split right and down, restart with restore, drag the boundary with the new `drag:` step | Company replaced Person in its place in italics; the query stayed first with a pin; both splits showed a copy of the Project table; the layout, pins and shares came back after the restart |
 | 2026-10-12 | Two graphs in one window | a second dev graph `notes` (`dev/cluster/notes.pg`, `dev/notes-seed.jsonl`); offscreen snapshots: Person and a query on `knowledge`, Open Graph, `click:` on `notes`, a Note table split in two, the switcher; then ⌃⌘] | The switcher listed both with `notes` checked and "+1 graph" in the footer; stepping back showed `knowledge` with its Person tab and the query draft |

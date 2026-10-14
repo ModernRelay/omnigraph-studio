@@ -157,9 +157,9 @@ impl Render for DesignGallery {
             .child(text::code("Code · hb1.01M4R…EP12CTBE", cx));
 
         // The left dock: a header strip of icon tabs, the active panel, then the connection.
-        let strip = || {
+        let strip = |height: f32| {
             h_flex()
-                .h(px(size::STRIP))
+                .h(px(height))
                 .flex_none()
                 .px(px(space::SM))
                 .gap(px(space::XXS))
@@ -180,7 +180,7 @@ impl Render for DesignGallery {
                 }
             })
             .child(
-                strip()
+                strip(size::HEADER_STRIP)
                     .border_b_1()
                     .border_color(surface::rule(cx))
                     .children(
@@ -228,7 +228,7 @@ impl Render for DesignGallery {
                     )),
             )
             .child(
-                strip()
+                strip(size::STRIP)
                     .px(px(space::MD))
                     .gap(px(space::SM))
                     .border_t_1()
@@ -245,7 +245,7 @@ impl Render for DesignGallery {
             );
         // The right and bottom docks' tabs: title tabs, the active one on a pill.
         let dock_tabs = h_flex()
-            .h(px(size::STRIP))
+            .h(px(size::HEADER_STRIP))
             .px(px(space::SM))
             .gap(px(space::XS))
             .items_center()

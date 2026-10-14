@@ -15,6 +15,8 @@ use studio_settings::{StudioSettings, WindowStyle};
 use ui::prelude::*;
 use ui::{Tooltip, rems_from_px};
 
+pub use crate::button::Button;
+
 // ---- tokens ----
 
 /// The spacing scale, in pixels, and the roles it is used for. Every gap and padding in Studio
@@ -57,7 +59,11 @@ pub mod radius {
 
 /// Fixed sizes.
 pub mod size {
-    /// Every column's header and footer strip, so their rules line up across the window.
+    /// Every column's header strip (its tabs or its title), so the rules under them line up
+    /// across the window.
+    pub const HEADER_STRIP: f32 = 36.;
+    /// Every column's footer strip, and a bar across a document (a write to confirm), so the
+    /// rules over them line up.
     pub const STRIP: f32 = 40.;
     /// A surface's toolbar.
     pub const TOOLBAR: f32 = 48.;
@@ -645,13 +651,12 @@ pub fn meta_code(icon: IconName, value: impl Into<SharedString>, cx: &App) -> Di
         .child(text::code(value, cx).color(Color::Muted).single_line())
 }
 
-/// A button in a toolbar, strip, panel or dialog: Zed's medium size (28 px tall, an 8 px
-/// inset) with a small label, so its hover and pressed fills have room around the label. A
-/// button inside a dense row (a pill segment, a tree row, a tab) keeps Zed's compact default.
+/// A button in a toolbar, strip, panel or dialog: 28 px tall with a 6 px inset and a small
+/// label, so its hover and pressed fills have room around the label without padding it out
+/// (`crate::button`). A button inside a dense row (a pill segment, a tree row, a tab) takes
+/// Zed's compact sizes through `.size`.
 pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
-    Button::new(id, label)
-        .size(ButtonSize::Medium)
-        .label_size(LabelSize::Small)
+    Button::new(id, label).label_size(LabelSize::Small)
 }
 
 /// [`button`] for an icon alone: a 28 px square.
@@ -1001,7 +1006,9 @@ pub fn empty_state(icon: IconName, title: impl Into<SharedString>) -> Div {
 }
 
 /// A raised glass sheet: a translucent fill over the wash, a light outline, and layered soft
-/// shadows instead of a border.
+/// shadows instead of a border. GPUI clips its children to the sheet's rectangle, not its
+/// rounded corners, so a child with a background flush in a corner takes the sheet's radius
+/// there (`radius::LG`).
 pub fn sheet(_cx: &App) -> Div {
     div()
         .rounded(px(radius::LG))

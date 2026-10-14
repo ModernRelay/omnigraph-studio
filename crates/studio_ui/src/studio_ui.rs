@@ -9,6 +9,7 @@ use ui::prelude::*;
 
 pub use studio_theme::type_color;
 
+mod button;
 mod changes;
 pub mod ds;
 pub mod motion;
