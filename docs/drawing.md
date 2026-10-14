@@ -34,7 +34,9 @@ Measured against Zed v1.23.2 (`crates/gpui/src/window.rs`, `view.rs`):
   does not notify a view the field is not inside; the view around the field draws again
   anyway.
 - Work done for each drawn row or cell scales with what is shown, never with what is loaded
-  (spec 004, table performance).
+  (spec 004, table performance). A grid wider than its view draws only the columns in view,
+  one either side, and the ones the cursor or an editor needs; the rest are empty cells at
+  their width, so the scroll range does not change.
 
 ## Guards
 
@@ -44,6 +46,7 @@ the interaction and asserts the count:
 | Guard | Holds |
 | --- | --- |
 | `type_table` `typing_in_a_field_leaves_the_grid_as_it_was` | The grid follows the table's `notify`; typing in the filter field or a cell does not draw it |
+| `type_table` `rows_draw_only_the_columns_in_view` | A 21-column type draws the pinned column and those in view; scrolled to the end, the last; the cursor's column always |
 | `query_editor` `typing_in_the_query_leaves_the_results_as_they_were` | The result area follows the tab's `notify`; typing in the query does not draw it |
 | `studio_workspace` `a_tab_that_caches_its_parts_keeps_them_while_a_field_changes` | A tab that caches its parts keeps them while a field changes; a cached tab draws them again, which is the GPUI behavior the opt-out exists for |
 

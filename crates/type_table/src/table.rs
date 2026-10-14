@@ -4579,6 +4579,7 @@ impl TypeTable {
                 line_count,
                 cx.processor(|this, range: Range<usize>, window, cx| {
                     this.note_looks(range.clone());
+                    let drawn = this.drawn_columns(window, cx);
                     let Some(lines) = this.frame_lines.clone() else {
                         if this.more_error.is_none()
                             && this
@@ -4588,7 +4589,9 @@ impl TypeTable {
                             cx.defer_in(window, |this, _, cx| this.load_more(cx));
                         }
                         this.want_blob_metas(range.clone(), cx);
-                        return range.map(|ix| this.render_row(ix, window, cx)).collect();
+                        return range
+                            .map(|ix| this.render_row(ix, &drawn, window, cx))
+                            .collect();
                     };
                     let range = range.start.min(lines.len())..range.end.min(lines.len());
                     let shown = &lines[range.clone()];
@@ -4623,7 +4626,7 @@ impl TypeTable {
                     shown
                         .iter()
                         .map(|line| match *line {
-                            Line::Row(row) => this.render_row(row, window, cx),
+                            Line::Row(row) => this.render_row(row, &drawn, window, cx),
                             Line::Header(index) => this.render_section_header(index, cx),
                             Line::More(index) => this.render_section_more(index, cx),
                             Line::OtherValues => this.render_other_values(),
@@ -5094,9 +5097,11 @@ impl TypeTable {
             .into_any_element()
     }
 
+    /// A row's cells; a column `drawn` leaves out is an empty cell at its width.
     fn render_row(
         &self,
         ix: usize,
+        drawn: &[bool],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
@@ -5104,8 +5109,59 @@ impl TypeTable {
             return Vec::new();
         };
         (0..self.columns.len())
-            .map(|col| self.render_cell(ix, col, row, window, cx))
+            .map(|col| {
+                if drawn.get(col).copied().unwrap_or(true) {
+                    self.render_cell(ix, col, row, window, cx)
+                } else {
+                    div().into_any_element()
+                }
+            })
             .collect()
+    }
+
+    /// The columns rows draw this frame: the pinned first, those in the horizontal view with
+    /// one either side so a quick scroll shows no empty column, the cursor's and the edited
+    /// cell's. A row lays out each cell it draws, so a wide type would otherwise pay for every
+    /// column on every scroll (`docs/drawing.md`).
+    fn drawn_columns(&self, window: &Window, cx: &App) -> Vec<bool> {
+        let count = self.columns.len();
+        let handle = &self.table_state.read(cx).horizontal_scroll_handle;
+        let viewport = handle.bounds().size.width;
+        if viewport <= px(0.) {
+            return vec![true; count];
+        }
+        let rem = window.rem_size();
+        let widths = self.widths.read(cx);
+        let total = widths.scrollable_width(1, rem);
+        let shown_left = -handle.offset().x;
+        let shown_right = shown_left + viewport;
+        let in_view: Vec<bool> = (0..count)
+            .map(|col| {
+                col == 0 || {
+                    let left = total - widths.scrollable_width(col, rem);
+                    let right = total - widths.scrollable_width(col + 1, rem);
+                    right > shown_left && left < shown_right
+                }
+            })
+            .collect();
+        let mut drawn: Vec<bool> = (0..count)
+            .map(|col| {
+                in_view[col]
+                    || in_view.get(col + 1).copied().unwrap_or(false)
+                    || (col > 1 && in_view[col - 1])
+            })
+            .collect();
+        let edited = self.editing.as_ref().and_then(|editing| {
+            self.columns
+                .iter()
+                .position(|column| column.key == editing.column)
+        });
+        for col in self.cursor.map(|c| c.col).into_iter().chain(edited) {
+            if let Some(drawn) = drawn.get_mut(col) {
+                *drawn = true;
+            }
+        }
+        drawn
     }
 
     fn render_cell(
@@ -5672,32 +5728,38 @@ mod tests {
     use http_client::{AsyncBody, FakeHttpClient, Response};
     use serde_json::json;
 
-    /// A server with two people; every read answers with both.
-    fn session(cx: &mut TestAppContext) -> Entity<GraphSession> {
-        let http = FakeHttpClient::create(|request| async move {
-            let path = request.uri().path().to_owned();
-            let body = if path.ends_with("/schema") {
-                json!({ "schema_source": "node Person {\n  slug: String @key\n  name: String\n}\n" })
-            } else if path.ends_with("/query") {
-                json!({
-                    "query_name": "q",
-                    "target": {"branch": "main", "snapshot": null},
-                    "row_count": 2,
-                    "columns": ["n"],
-                    "rows": [
-                        {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
-                        {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
-                    ],
-                    "graph_commit_id": "c1",
-                })
-            } else {
-                json!({ "branches": ["main"] })
-            };
-            Ok(Response::builder()
-                .status(200)
-                .header(graph_client::CONTRACT_HEADER, "0.13")
-                .body(AsyncBody::from(body.to_string()))
-                .unwrap())
+    const PEOPLE: &str = "node Person {\n  slug: String @key\n  name: String\n}\n";
+
+    /// A server with `schema` and two people; every read answers with both.
+    fn session(schema: &str, cx: &mut TestAppContext) -> Entity<GraphSession> {
+        let schema: Arc<str> = schema.into();
+        let http = FakeHttpClient::create(move |request| {
+            let schema = schema.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                let body = if path.ends_with("/schema") {
+                    json!({ "schema_source": &*schema })
+                } else if path.ends_with("/query") {
+                    json!({
+                        "query_name": "q",
+                        "target": {"branch": "main", "snapshot": null},
+                        "row_count": 2,
+                        "columns": ["n"],
+                        "rows": [
+                            {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
+                            {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
+                        ],
+                        "graph_commit_id": "c1",
+                    })
+                } else {
+                    json!({ "branches": ["main"] })
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
         });
         let server = ServerEntry {
             name: "dev".into(),
@@ -5721,7 +5783,7 @@ mod tests {
             studio_theme::init_test(cx);
             editor::init(cx);
         });
-        let session = session(cx);
+        let session = session(PEOPLE, cx);
         let (table, cx) = cx.add_window_view(|window, cx| {
             TypeTable::new(
                 WeakEntity::new_invalid(),
@@ -5775,5 +5837,58 @@ mod tests {
             before,
             "the cell editor drew the grid"
         );
+    }
+
+    /// A row draws the columns in view, one either side, the pinned first and the cursor's;
+    /// the rest are empty at their width.
+    #[gpui::test]
+    async fn rows_draw_only_the_columns_in_view(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let properties: String = (1..=20).map(|i| format!("  p{i:02}: String?\n")).collect();
+        let schema = format!("node Person {{\n  slug: String @key\n{properties}}}\n");
+        let session = session(&schema, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let drawn = |cx: &mut gpui::VisualTestContext| {
+            table.update_in(cx, |table, window, cx| table.drawn_columns(window, cx))
+        };
+        let shown = drawn(cx);
+        assert_eq!(shown.len(), 21);
+        assert!(
+            shown[0] && shown[1],
+            "the pinned column and the first in view"
+        );
+        assert!(!shown[20], "a column far right of the view: {shown:?}");
+
+        // Scrolled to the far end, the last column shows and the first after the pinned
+        // one does not.
+        table.update_in(cx, |table, window, cx| {
+            let rem = window.rem_size();
+            let total = table.widths.read(cx).scrollable_width(1, rem);
+            let handle = table.table_state.read(cx).horizontal_scroll_handle.clone();
+            let viewport = handle.bounds().size.width;
+            handle.set_offset(point(-(total - viewport), px(0.)));
+        });
+        let shown = drawn(cx);
+        assert!(shown[0] && shown[20], "{shown:?}");
+        assert!(!shown[1], "{shown:?}");
+
+        // The cursor's column is drawn wherever it is.
+        table.update_in(cx, |table, _, _| {
+            table.cursor = Some(Cursor { row: 0, col: 1 })
+        });
+        assert!(drawn(cx)[1]);
     }
 }
