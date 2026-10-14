@@ -1,14 +1,15 @@
 # OmniGraph Studio
 
-A native desktop client for [OmniGraph](https://github.com/ModernRelay/omnigraph) graphs,
-written in Rust. It connects to an OmniGraph server over HTTP and provides a table per node and
-edge type, a relationship explorer, a GQ query editor, branch review and merge, commit history
-and an agent panel.
+A native, GPU-rendered desktop client for
+[OmniGraph](https://github.com/ModernRelay/omnigraph) graphs, written in Rust. It connects to
+an OmniGraph server over HTTP and provides a table per node and edge type, a relationship
+explorer, a GQ query editor with stored queries, branch review and merge, commit history and an
+agent panel.
 
 The UI is built on [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui), the
-GPU-accelerated Rust UI framework [Zed](https://github.com/zed-industries/zed) is written in,
-together with Zed's UI, editor and theme crates. GPUI draws the interface itself; there is no
-web view.
+Rust UI framework [Zed](https://github.com/zed-industries/zed) is written in, together with
+Zed's UI, editor and theme crates. GPUI draws every frame on the GPU, through Metal on macOS and
+Vulkan (wgpu) on Linux; there is no web view or browser engine.
 
 ![Studio opening a person's relationships in the explorer, then the Person table grouped by company](docs/images/explore.gif)
 
@@ -23,8 +24,9 @@ notes say how to open one. To build from source instead, see below.
 Requirements:
 
 - Rust 1.98.1, installed by `rust-toolchain.toml`.
-- macOS: full Xcode (Metal shader compiler). Linux: the Wayland, X11 and Vulkan development
-  packages listed in `.github/workflows/ci.yml`.
+- macOS: the Command Line Tools (GPUI compiles its Metal shaders when Studio starts); full
+  Xcode to compile them into a release build (`script/bundle-mac`). Linux: the Wayland, X11 and
+  Vulkan development packages listed in `.github/workflows/ci.yml`.
 - An OmniGraph 0.13 server. For the sample graph, the `omnigraph` and `omnigraph-server` 0.13
   binaries on `PATH`.
 
