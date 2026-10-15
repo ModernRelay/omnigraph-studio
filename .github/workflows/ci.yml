@@ -44,7 +44,8 @@ jobs:
       - run: cargo fmt --all --check
       # `--keep-going` reports every crate's problems in one run.
       - run: cargo clippy --workspace --all-targets --keep-going -- -D warnings
-      - run: cargo test --workspace
+      # `--no-fail-fast` runs every test binary, so one run reports every failure.
+      - run: cargo test --workspace --no-fail-fast
       - name: Bundle (debug build; ad hoc signature on macOS)
         shell: bash
         run: script/bundle-${{ runner.os == 'macOS' && 'mac' || runner.os == 'Windows' && 'windows' || 'linux' }} --debug

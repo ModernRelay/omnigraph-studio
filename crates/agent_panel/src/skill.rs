@@ -135,7 +135,12 @@ mod tests {
                     on_disk.push(if relative == Path::new("SKILL.md") {
                         "GUIDE.md".to_owned()
                     } else {
-                        relative.to_string_lossy().into_owned()
+                        // FILES names paths with `/`, as the skill's folders do everywhere.
+                        relative
+                            .components()
+                            .map(|part| part.as_os_str().to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join("/")
                     });
                 }
             }

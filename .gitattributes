@@ -1,2 +1,5 @@
+# Text is checked out with LF everywhere: files Studio embeds (include_str!) and the tests that
+# read them see the same bytes on Windows as on macOS and Linux.
+* text=auto eol=lf
 grammars/tree-sitter-gq/src/** linguist-generated=true
 grammars/tree-sitter-pg/src/** linguist-generated=true
