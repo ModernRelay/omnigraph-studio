@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "agent_panel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -1736,7 +1736,7 @@ dependencies = [
 
 [[package]]
 name = "command_palette"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "editor",
  "gpui",
@@ -4128,7 +4128,7 @@ dependencies = [
 
 [[package]]
 name = "gq_language"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "omnigraph-compiler",
@@ -4147,7 +4147,7 @@ dependencies = [
 
 [[package]]
 name = "graph_canvas"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpui",
  "gq_language",
@@ -4162,7 +4162,7 @@ dependencies = [
 
 [[package]]
 name = "graph_client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -4176,7 +4176,7 @@ dependencies = [
 
 [[package]]
 name = "graph_store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -4342,7 +4342,7 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "history"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "editor",
  "gpui",
@@ -4912,7 +4912,7 @@ dependencies = [
 
 [[package]]
 name = "inspectors"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpui",
  "graph_client",
@@ -7970,7 +7970,7 @@ dependencies = [
 
 [[package]]
 name = "query_editor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clock",
@@ -8435,7 +8435,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "relationship_tree"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpui",
  "gq_language",
@@ -8531,7 +8531,7 @@ dependencies = [
 
 [[package]]
 name = "review"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "editor",
  "gpui",
@@ -9790,7 +9790,7 @@ dependencies = [
 
 [[package]]
 name = "studio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent_panel",
  "command_palette",
@@ -9828,7 +9828,7 @@ dependencies = [
 
 [[package]]
 name = "studio_actions"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpui",
  "schemars 1.0.4",
@@ -9837,7 +9837,7 @@ dependencies = [
 
 [[package]]
 name = "studio_settings"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpui",
  "schemars 1.0.4",
@@ -9850,7 +9850,7 @@ dependencies = [
 
 [[package]]
 name = "studio_theme"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assets",
  "gpui",
@@ -9864,7 +9864,7 @@ dependencies = [
 
 [[package]]
 name = "studio_ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpui",
  "serde_json",
@@ -9877,7 +9877,7 @@ dependencies = [
 
 [[package]]
 name = "studio_workspace"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "gpui",
  "graph_store",
@@ -10784,7 +10784,7 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-gq"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -10808,7 +10808,7 @@ source = "git+https://github.com/tree-sitter/tree-sitter?rev=43623ec9bf0eaaf7113
 
 [[package]]
 name = "tree-sitter-pg"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cc",
  "tree-sitter",
@@ -10851,7 +10851,7 @@ dependencies = [
 
 [[package]]
 name = "type_table"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "collections",
