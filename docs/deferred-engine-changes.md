@@ -31,9 +31,19 @@ one is picked up it goes through OmniGraph's own RFC process.
 | E23 | `omnigraph version --json` with the HTTP contract ([#977](https://github.com/ModernRelay/omnigraph/issues/977)) | 013 | Each installed CLI is tested once against the gateway |
 | E24 | Unix-socket transport for `--server` ([#979](https://github.com/ModernRelay/omnigraph/issues/979)) | 013 | Codex reaches the gateway only with network access the person grants |
 
-Already on OmniGraph main but not in 0.13.0, used only when a server advertises them:
+On OmniGraph main (checked 2026-10-15 at `fe69c039`, server version 0.14.0, not yet released;
+the HTTP contract header is still `0.13`), each to be used only when a server's `/openapi.json`
+advertises it. Studio uses none of them yet.
 
-| ID | Feature | Spec |
-|---|---|---|
-| R1 | Blob writes (`PUT`/`DELETE /graphs/{id}/blob`) | 004 |
-| R2 | Unpublished commits (`as_commit`, publish, drop): staged edits as proposals, merge preview | 004, 008 |
+| ID | Feature | Operation | Spec |
+|---|---|---|---|
+| R1 | Blob writes | `cluster_putBlob`, `cluster_clearBlob` | 004 |
+| R2 | Unpublished commits: `as_commit` on writes and merges, publish, drop, `GET /commits?unpublished=` | `cluster_publishCommit`, `cluster_dropCommit` | 004, 008 |
+| E6 | Paged graph diff between two branches or commits, and a branch's diff since its merge base, with `before`/`after` images and `kind`/`type`/`op` filters | `cluster_getDiff`, `cluster_getBranchDiff` | 008 |
+| E7 | Merge base of two branches | `cluster_getMergeBase` | 008 |
+| E8 | Merge preview: `dry_run` on `POST /branches/merge` ("nothing is written"; refused with `as_commit`) | `cluster_mergeBranches` with `dry_run` | 008 |
+| E23 | `omnigraph version --json` with the HTTP contract (#987) | CLI | 013 |
+| E24 | Unix-socket transport for `--server` (#988) | CLI | 013 |
+
+Also new on main: unattached snapshots (`as unattached branch`; `CommitOutput.kind` and
+`published`, `GET /commits?unattached=`), and `ReadOutput.page` for a paged `branch diff` read.

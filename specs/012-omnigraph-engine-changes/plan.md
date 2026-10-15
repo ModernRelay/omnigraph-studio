@@ -1,6 +1,7 @@
 # 012: OmniGraph engine changes
 
-Status: deferred · 2026-10-11. Nothing here is built now; Studio ships against the 0.13
+Status: deferred · 2026-10-11; E6, E7, E8, E23 and E24 landed on OmniGraph main by 2026-10-15
+(see "On OmniGraph main, 2026-10-15"), none of them released yet. Studio ships against the 0.13
 contract (constitution X). When a change is picked up it becomes an OmniGraph RFC and issue in
 `ModernRelay/omnigraph`, follows that repository's invariants and test ownership, and Studio
 adopts it only when a server's OpenAPI document advertises it.
@@ -44,6 +45,25 @@ OmniGraph `v0.13.0` unless noted; line numbers from the research at main `680fdf
   ops, unbounded), `query_inspected` (`#[doc(hidden)]`), `plan_schema`, `list_commits`.
 - On OmniGraph main, not in 0.13.0: Blob `PUT`/`DELETE`, commit publish and drop, merge
   `as_commit` (unpublished commits).
+
+## On OmniGraph main, 2026-10-15
+
+Checked at main `fe69c039` (server 0.14.0, unreleased; latest release v0.13.0) by diffing its
+`openapi.json` with v0.13.0's. The contract header is still `0.13` and every change is
+additive, so Studio works against a 0.14 server unchanged; `graph_client` ignores fields it does
+not know.
+
+- Landed: E6 (`GET /diff?from=&to=` between branches or commits, `GET /branches/diff?source=&target=`
+  since the merge base; paged, pinned to the commits of the first page, `before`/`after`
+  images, `kind`/`type`/`op` filters), E7 (`GET /branches/merge-base`), E8 (`dry_run` on
+  merge: classification and validation only, "nothing is written", a conflict is the same 409),
+  E23 (#987) and E24 (#988), with R1 and R2 as before.
+- New beside them: unattached snapshots (`as unattached branch`), so `CommitOutput` gains
+  `kind`, `published` and `root_commit_id`, and `GET /commits` gains `unpublished` and
+  `unattached` filters; `ReadOutput.page` for a paged `branch diff` read.
+- Still open: E1–E5 (#980), E9 (branch list is names only), E10 (`GET /commits` has no limit or
+  cursor), E11 (`ReadOutput.columns` is still names), E12–E19, E20 (#978), E21
+  (`BranchCreateRequest` is still `name` and `from`), E22 (#976).
 
 ## The changes
 
@@ -198,6 +218,7 @@ proposal and to preview a merge. Used only when the server advertises
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-15 | What OmniGraph main serves that 0.13.0 does not | `openapi.json` at `v0.13.0` and at main `fe69c039`, diffed by operation id, schema properties and parameters; issues #976–#980 | New: `cluster_getDiff`, `cluster_getBranchDiff`, `cluster_getMergeBase`, `cluster_putBlob`, `cluster_clearBlob`, `cluster_publishCommit`, `cluster_dropCommit`, OAuth resource metadata; `dry_run` and `as_commit` on merge; commit kinds and filters; `ReadOutput.page`. Contract header still `0.13`. #977 and #979 closed by #987 and #988; #976, #978 and #980 open |
 | 2026-10-11 | Route list at 0.13.0 and main | parsed `openapi.json` at `v0.13.0` and main | 0.13.0 lacks Blob PUT/DELETE and commit publish/drop |
 | 2026-10-11 | `BranchMergeRequest` at 0.13.0 | parsed `openapi.json` at `v0.13.0` | `source`, `target`, `delete_branch`, `settings`; no `as_commit` |
 | 2026-10-11 | `CommitOutput` at 0.13.0 | parsed `openapi.json` at `v0.13.0` | No `published` field; `GET /commits` takes `branch` only |
