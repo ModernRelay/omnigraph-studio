@@ -106,6 +106,8 @@ serde_path_to_error = "0.1"
 # libyaml port.
 serde_norway = "0.9"
 thiserror = "2"
+# Unix sockets on Windows 10 and later, for the agent's tool socket.
+uds_windows = "1.1"
 url = "2"
 
 # Zed patches crates.io crates in its own workspace. Patches do not carry over to a crate that

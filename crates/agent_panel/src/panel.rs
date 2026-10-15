@@ -639,6 +639,15 @@ impl AgentPanel {
     }
 
     fn start(&mut self, cx: &mut Context<Self>) {
+        // The agent's `omnigraph` wrapper is a shell script (`cli_home`); Windows needs one of
+        // its own, with its own quoting, before an agent may run there.
+        if cfg!(windows) {
+            self.fail_start(
+                "The agent panel is not available on Windows yet; the rest of Studio is.".into(),
+                cx,
+            );
+            return;
+        }
         let settings = StudioSettings::get(cx).agent.clone();
         if settings.command.is_empty() {
             self.state = State::Setup;

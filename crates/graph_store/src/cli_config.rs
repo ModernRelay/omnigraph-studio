@@ -84,7 +84,7 @@ pub fn operator_dir() -> Option<PathBuf> {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::home_dir()
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
@@ -341,6 +341,7 @@ mod tests {
 
     /// Both files are read together; a config that does not parse keeps the servers read
     /// before, and a stamp tells a rewritten file from an untouched one.
+    #[cfg(unix)]
     #[test]
     fn reads_servers_with_their_tokens_and_stamps_the_files() {
         use std::os::unix::fs::PermissionsExt;
@@ -402,6 +403,7 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn reads_a_token_section_and_refuses_open_permissions() {
         use std::os::unix::fs::PermissionsExt;

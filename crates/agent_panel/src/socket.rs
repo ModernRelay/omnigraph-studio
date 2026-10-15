@@ -5,16 +5,18 @@
 //! The socket lives in a short per-user runtime directory only the person can enter (`0700`),
 //! so no other local user can reach it, and it is removed when the agent session ends. Unix
 //! socket paths are limited to about 104 bytes on macOS, which Studio's data directory can
-//! exceed, so the socket does not live there.
+//! exceed, so the socket does not live there. Windows 10 and later have Unix sockets too
+//! (`uds_windows`); there the directory is in the person's own temporary folder.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::channel::{mpsc, oneshot};
-use futures::{AsyncBufReadExt as _, AsyncWriteExt as _, FutureExt, StreamExt as _};
+use futures::{
+    AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, FutureExt, StreamExt as _,
+};
 use serde_json::Value;
 use smol::io::BufReader;
-use smol::net::unix::{UnixListener, UnixStream};
 
 use crate::mcp::{self, Incoming};
 
@@ -29,7 +31,64 @@ pub struct ToolRequest {
 /// A bound socket. Dropping it removes the socket file.
 pub struct ToolSocket {
     pub path: PathBuf,
-    listener: Option<UnixListener>,
+    listener: Option<sys::Listener>,
+}
+
+/// Unix sockets as each system offers them: an accepted connection's two halves, and a
+/// blocking stream for the proxy.
+#[cfg(unix)]
+mod sys {
+    use std::path::Path;
+
+    pub use smol::net::unix::UnixListener as Listener;
+    pub use std::os::unix::net::UnixStream as BlockingStream;
+
+    pub fn bind(path: &Path) -> std::io::Result<Listener> {
+        Listener::bind(path)
+    }
+
+    pub async fn accept(
+        listener: &Listener,
+    ) -> std::io::Result<(smol::net::unix::UnixStream, smol::net::unix::UnixStream)> {
+        let (stream, _) = listener.accept().await?;
+        Ok((stream.clone(), stream))
+    }
+}
+
+#[cfg(windows)]
+mod sys {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use smol::Async;
+    pub use uds_windows::UnixStream as BlockingStream;
+
+    /// `uds_windows`'s listener has no socket handle the reactor can wait on, so a
+    /// non-blocking one is polled; the agent connects once, at its start.
+    pub struct Listener(uds_windows::UnixListener);
+
+    pub fn bind(path: &Path) -> std::io::Result<Listener> {
+        let listener = uds_windows::UnixListener::bind(path)?;
+        listener.set_nonblocking(true)?;
+        Ok(Listener(listener))
+    }
+
+    pub async fn accept(
+        listener: &Listener,
+    ) -> std::io::Result<(Async<BlockingStream>, Async<BlockingStream>)> {
+        loop {
+            match listener.0.accept() {
+                Ok((stream, _)) => {
+                    let reader = stream.try_clone()?;
+                    return Ok((Async::new(reader)?, Async::new(stream)?));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    smol::Timer::after(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
 }
 
 impl Drop for ToolSocket {
@@ -50,10 +109,11 @@ const PROGRESS_EVERY: std::time::Duration = if cfg!(test) {
 /// Longest socket path Studio binds: macOS allows 104 bytes including the terminator.
 const MAX_SOCKET_PATH: usize = 100;
 
-/// Where tool sockets live: the per-user temporary directory on macOS (already private to the
-/// user), `$XDG_RUNTIME_DIR` on Linux, else a private directory under the temporary directory.
+/// Where tool sockets live: the per-user temporary directory on macOS and Windows (already
+/// private to the person), `$XDG_RUNTIME_DIR` on Linux, else a private directory under the
+/// temporary directory.
 pub fn socket_dir() -> PathBuf {
-    if cfg!(target_os = "macos") {
+    if cfg!(any(target_os = "macos", windows)) {
         return std::env::temp_dir().join("omnigraph-studio");
     }
     if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
@@ -66,6 +126,7 @@ pub fn socket_dir() -> PathBuf {
 /// Creates `dir` with mode `0700`, or accepts it only if it is a real directory owned by this
 /// user with mode `0700`. A shared temporary directory could hold a directory or symlink
 /// someone else planted.
+#[cfg(unix)]
 fn private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 
@@ -95,6 +156,20 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The person's temporary folder on Windows is under their profile, which only they can open;
+/// the directory inherits that.
+#[cfg(windows)]
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    if !std::fs::symlink_metadata(dir)?.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
 impl ToolSocket {
     /// Binds a fresh socket in `dir`, which must be (or becomes) private to this user.
     pub fn bind(dir: &Path) -> std::io::Result<Self> {
@@ -111,7 +186,7 @@ impl ToolSocket {
             )));
         }
         std::fs::remove_file(&path).ok();
-        let listener = UnixListener::bind(&path)?;
+        let listener = sys::bind(&path)?;
         Ok(Self {
             path,
             listener: Some(listener),
@@ -130,9 +205,10 @@ impl ToolSocket {
         async move {
             let Some(listener) = listener else { return };
             let mut connections = Vec::new();
-            while let Ok((stream, _)) = listener.accept().await {
+            while let Ok((reader, writer)) = sys::accept(&listener).await {
                 connections.push(smol::spawn(serve_connection(
-                    stream,
+                    reader,
+                    writer,
                     tools.clone(),
                     instructions.clone(),
                 )));
@@ -142,12 +218,12 @@ impl ToolSocket {
 }
 
 async fn serve_connection(
-    stream: UnixStream,
+    reader: impl AsyncRead + Unpin + Send + 'static,
+    mut writer: impl AsyncWrite + Unpin + Send + 'static,
     tools: mpsc::UnboundedSender<ToolRequest>,
     instructions: std::sync::Arc<str>,
 ) {
     let (replies_tx, mut replies_rx) = mpsc::unbounded::<Value>();
-    let mut writer = stream.clone();
     let write = smol::spawn(async move {
         while let Some(reply) = replies_rx.next().await {
             let mut line = serde_json::to_string(&reply).unwrap_or_default();
@@ -159,7 +235,7 @@ async fn serve_connection(
         }
     });
 
-    let mut lines = BufReader::new(stream).lines();
+    let mut lines = BufReader::new(reader).lines();
     let mut calls = Vec::new();
     while let Some(Ok(line)) = lines.next().await {
         if line.trim().is_empty() {
@@ -229,9 +305,8 @@ async fn serve_connection(
 /// side closes. Holds no token and runs no logic.
 pub fn proxy(socket: &Path) -> std::io::Result<()> {
     use std::io::{Read as _, Write as _};
-    use std::os::unix::net::UnixStream;
 
-    let stream = UnixStream::connect(socket)?;
+    let stream = sys::BlockingStream::connect(socket)?;
     let mut to_socket = stream.try_clone()?;
     let mut from_socket = stream;
     let upstream = std::thread::spawn(move || {
@@ -285,8 +360,12 @@ mod tests {
             let mut socket = ToolSocket::bind(&socket_dir()).expect("bind the tool socket");
             let (tools_tx, mut tools_rx) = mpsc::unbounded();
             let _serve = smol::spawn(socket.serve(tools_tx, String::new()));
-            let stream = UnixStream::connect(&socket.path).await.unwrap();
-            let mut writer = stream.clone();
+            let path = socket.path.clone();
+            let stream = smol::unblock(move || sys::BlockingStream::connect(path))
+                .await
+                .unwrap();
+            let mut writer = smol::Unblock::new(stream.try_clone().unwrap());
+            let stream = smol::Unblock::new(stream);
             let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"omnigraph_run","arguments":{"args":[]},"_meta":{"progressToken":7}}}"#;
             writer
                 .write_all(format!("{call}\n").as_bytes())
@@ -318,6 +397,7 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
     #[test]
     fn refuses_a_directory_others_can_enter() {
         use std::os::unix::fs::PermissionsExt as _;

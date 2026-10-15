@@ -201,6 +201,7 @@ dependencies = [
  "studio_settings",
  "studio_ui",
  "studio_workspace",
+ "uds_windows",
  "ui",
  "url",
 ]

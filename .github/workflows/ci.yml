@@ -15,9 +15,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, ubuntu-24.04]
+        os: [macos-15, ubuntu-24.04, windows-2025]
     runs-on: ${{ matrix.os }}
     steps:
+      # Zed's checkout has paths past Windows's 260-character limit; git fetches it.
+      - name: Long paths
+        if: runner.os == 'Windows'
+        run: |
+          git config --global core.longpaths true
+          echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
+        shell: bash
       - uses: actions/checkout@v4
       - name: Linux packages
         if: runner.os == 'Linux'
@@ -38,7 +45,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - name: Bundle (debug build; ad hoc signature on macOS)
-        run: script/bundle-${{ runner.os == 'macOS' && 'mac' || 'linux' }} --debug
+        shell: bash
+        run: script/bundle-${{ runner.os == 'macOS' && 'mac' || runner.os == 'Windows' && 'windows' || 'linux' }} --debug
 
   structure:
     runs-on: ubuntu-24.04
