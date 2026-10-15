@@ -88,11 +88,11 @@ fn cpu_time() -> Option<Duration> {
     None
 }
 
-#[cfg(test)]
+// Memory and CPU are read on macOS and Linux only.
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_process_reads_its_memory_and_cpu() {
         let before = Sample::now();

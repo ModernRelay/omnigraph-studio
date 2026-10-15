@@ -42,7 +42,8 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # `--keep-going` reports every crate's problems in one run.
+      - run: cargo clippy --workspace --all-targets --keep-going -- -D warnings
       - run: cargo test --workspace
       - name: Bundle (debug build; ad hoc signature on macOS)
         shell: bash
