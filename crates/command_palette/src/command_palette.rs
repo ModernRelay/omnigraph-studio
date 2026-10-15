@@ -20,8 +20,8 @@ use std::time::Duration;
 use editor::{Editor, EditorEvent};
 use gpui::{
     Action, App, Context, DismissEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    KeyBinding, Keystroke, Render, ScrollStrategy, SharedString, Subscription, Task,
-    UniformListScrollHandle, WeakEntity, Window, uniform_list,
+    Render, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity,
+    Window, uniform_list,
 };
 use gq_language::builder::node_search;
 use graph_store::{GraphSession, Loadable};
@@ -43,7 +43,6 @@ use studio_workspace::ModalView;
 /// the keymap already does.
 pub fn init(cx: &mut App) {
     recent::load(cx);
-    bind_default_keys(cx);
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &ToggleCommandPalette, window, cx| {
             open(workspace, Mode::Picker(Scope::All), window, cx);
@@ -191,8 +190,9 @@ impl Mode {
         }
     }
 
-    fn empty(self, typed: bool) -> &'static str {
+    fn empty(self, typed: bool, searching: bool) -> &'static str {
         match self {
+            Mode::Picker(Scope::Nodes | Scope::All) if searching => "Searching nodes…",
             Mode::Picker(Scope::Nodes) if !typed => "Type an id or a name to find nodes.",
             Mode::Picker(Scope::Nodes) => "No node matches.",
             Mode::Picker(Scope::Types) => "No type matches.",
@@ -217,30 +217,6 @@ const NODE_SEARCH_DELAY: Duration = Duration::from_millis(150);
 /// Nodes found per type, and in all.
 const NODES_PER_TYPE: u32 = 5;
 const NODES_SHOWN: usize = 30;
-
-fn bind_default_keys(cx: &mut App) {
-    let keys: &[&str] = if cfg!(target_os = "macos") {
-        &["cmd-k", "cmd-shift-p"]
-    } else {
-        &["ctrl-k", "ctrl-shift-p"]
-    };
-    let mut missing = Vec::new();
-    for key in keys {
-        let Ok(keystroke) = Keystroke::parse(key) else {
-            continue;
-        };
-        let bound = cx
-            .all_bindings_for_input(std::slice::from_ref(&keystroke))
-            .iter()
-            .any(|binding| {
-                binding.predicate().is_none() && binding.action().partial_eq(&ToggleCommandPalette)
-            });
-        if !bound {
-            missing.push(KeyBinding::new(key, ToggleCommandPalette, None));
-        }
-    }
-    cx.bind_keys(missing);
-}
 
 /// What a row does when run.
 enum Row {
@@ -304,6 +280,9 @@ pub struct CommandPalette {
     selected: usize,
     scroll: UniformListScrollHandle,
     node_search: Option<Task<()>>,
+    /// Nodes are being looked up for the current text: from the keystroke, through the pause,
+    /// until every type has answered.
+    searching: bool,
     /// What each node type answered, shown again or narrowed without a read.
     answers: Answers,
     _subscription: Subscription,
@@ -400,6 +379,7 @@ impl CommandPalette {
             selected: 0,
             scroll: UniformListScrollHandle::new(),
             node_search: None,
+            searching: false,
             answers: Answers::default(),
             _subscription: subscription,
         };
@@ -419,6 +399,7 @@ impl CommandPalette {
         };
         if text.chars().count() < 2 {
             self.node_search = None;
+            self.searching = false;
             self.rows.truncate(self.fixed);
             self.candidates.truncate(self.fixed);
             self.update_matches(cx);
@@ -438,6 +419,7 @@ impl CommandPalette {
             .collect();
         if !narrowed.is_empty() && narrowed.iter().all(|(_, rows)| rows.is_some()) {
             self.node_search = None;
+            self.searching = false;
             let found = narrowed
                 .into_iter()
                 .map(|(type_name, rows)| (type_name, rows.unwrap_or_default()))
@@ -445,6 +427,8 @@ impl CommandPalette {
             self.set_nodes(found, cx);
             return;
         }
+        self.searching = true;
+        cx.notify();
         self.node_search = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(NODE_SEARCH_DELAY).await;
             let pending = session.update(cx, |session, cx| {
@@ -503,6 +487,7 @@ impl CommandPalette {
                     this.answers
                         .keep(type_name, text.clone(), rows, NODES_PER_TYPE as usize);
                 }
+                this.searching = false;
                 this.set_nodes(found, cx);
             })
             .ok();
@@ -921,6 +906,8 @@ impl Render for CommandPalette {
             colors.border_variant,
         );
         let count = self.matches.len();
+        // Only a scope that shows nodes waits on them.
+        let searching = self.searching && self.mode.scope().is_some_and(Scope::searches_nodes);
         let list = if count == 0 {
             div()
                 .h(px(ROW_HEIGHT * 2.))
@@ -928,9 +915,12 @@ impl Render for CommandPalette {
                 .items_center()
                 .justify_center()
                 .child(
-                    Label::new(self.mode.empty(!self.query.read(cx).is_empty(cx)))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
+                    Label::new(
+                        self.mode
+                            .empty(!self.query.read(cx).is_empty(cx), searching),
+                    )
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
                 )
                 .into_any_element()
         } else {
@@ -998,7 +988,16 @@ impl Render for CommandPalette {
                             .size(IconSize::Small)
                             .color(Color::Muted),
                     )
-                    .child(div().flex_1().child(self.query.clone())),
+                    .child(div().flex_1().child(self.query.clone()))
+                    .when(searching, |row| {
+                        row.child(
+                            div()
+                                .id("palette-searching")
+                                .debug_selector(|| "palette-searching".into())
+                                .child(studio_ui::ds::spinner())
+                                .tooltip(ui::Tooltip::text("Searching nodes on the server")),
+                        )
+                    }),
             )
             .children(tabs)
             .child(div().h_px().w_full().bg(border_variant))
@@ -1016,11 +1015,16 @@ impl Render for CommandPalette {
                             .color(Color::Muted)
                             .truncate()
                     })))
-                    .child(
-                        Label::new(format!("{count} {}", self.mode.noun(count)))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
+                    // No "0 nodes" while the nodes are still to come.
+                    .when(!(searching && count == 0), |footer| {
+                        footer.child(
+                            div().debug_selector(|| "palette-count".into()).child(
+                                Label::new(format!("{count} {}", self.mode.noun(count)))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                    })
                     .when(typed && self.mode != Mode::Keys, |footer| {
                         footer.child(studio_ui::ds::key_hint(&AskAgent, "Ask", &focus, cx))
                     }),
@@ -1030,7 +1034,123 @@ impl Render for CommandPalette {
 
 #[cfg(test)]
 mod tests {
-    use super::hidden;
+    use std::sync::Arc;
+
+    use gpui::{TestAppContext, VisualTestContext};
+    use graph_store::{Connection, ServerEntry, ServerSource};
+    use http_client::{AsyncBody, FakeHttpClient, Response};
+    use serde_json::json;
+
+    use super::*;
+
+    struct Host {
+        palette: Option<Entity<CommandPalette>>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().children(self.palette.clone())
+        }
+    }
+
+    /// A server whose graph has people; every read finds Ada.
+    fn session(cx: &mut TestAppContext) -> Entity<GraphSession> {
+        let schema: Arc<str> = "node Person {\n  slug: String @key\n  name: String\n}\n".into();
+        let http = FakeHttpClient::create(move |request| {
+            let schema = schema.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                let body = if path.ends_with("/schema") {
+                    json!({ "schema_source": &*schema })
+                } else if path.ends_with("/query") {
+                    json!({
+                        "query_name": "studio_find",
+                        "target": {"branch": "main", "snapshot": null},
+                        "row_count": 1,
+                        "columns": ["id", "label"],
+                        "rows": [{"id": "ada", "label": "Ada Lovelace"}],
+                        "graph_commit_id": "c1",
+                    })
+                } else {
+                    json!({ "branches": ["main"] })
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    // `graph_client::CONTRACT_HEADER`.
+                    .header("omnigraph-http-api", "0.13")
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx))
+    }
+
+    /// From the keystroke until the server answers, the palette says it is looking for
+    /// nodes: a turning circle in the field, and "Searching nodes…" rather than "No node
+    /// matches" while nothing has come back.
+    #[gpui::test]
+    async fn the_palette_shows_it_is_searching_nodes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session(cx);
+        cx.run_until_parked();
+        // The palette is made in a window already drawn, as the workspace makes it: it reads
+        // what the focused element offers.
+        let (host, cx): (_, &mut VisualTestContext) =
+            cx.add_window_view(|_, _| Host { palette: None });
+        cx.run_until_parked();
+        let palette = host.update_in(cx, |host, window, cx| {
+            let palette = cx.new(|cx| {
+                CommandPalette::new(
+                    Mode::Picker(Scope::Nodes),
+                    Some(session),
+                    WeakEntity::new_invalid(),
+                    Vec::new(),
+                    Vec::new(),
+                    window,
+                    cx,
+                )
+            });
+            host.palette = Some(palette.clone());
+            cx.notify();
+            palette
+        });
+        cx.run_until_parked();
+        palette.update_in(cx, |palette, window, cx| {
+            palette
+                .query
+                .update(cx, |query, cx| query.set_text("Ad", window, cx))
+        });
+        cx.run_until_parked();
+        palette.read_with(cx, |palette, _| {
+            assert!(palette.searching);
+            assert!(palette.matches.is_empty());
+            assert_eq!(palette.mode.empty(true, true), "Searching nodes…");
+        });
+        assert!(cx.debug_bounds("palette-searching").is_some(), "no spinner");
+        assert!(
+            cx.debug_bounds("palette-count").is_none(),
+            "a count of none"
+        );
+
+        cx.executor().advance_clock(NODE_SEARCH_DELAY);
+        cx.run_until_parked();
+        palette.read_with(cx, |palette, _| {
+            assert!(!palette.searching);
+            assert_eq!(palette.matches.len(), 1, "Ada was found");
+        });
+        assert!(cx.debug_bounds("palette-searching").is_none());
+        assert!(cx.debug_bounds("palette-count").is_some());
+    }
 
     #[test]
     fn rows_that_cannot_work_in_studio_are_hidden() {

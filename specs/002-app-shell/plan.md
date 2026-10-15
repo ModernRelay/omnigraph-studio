@@ -133,10 +133,13 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   starts with one of the old, `gq_language::builder::search_narrows`), its rows are filtered
   in the palette by the query's own predicate (`search_matches`); text typed back to after a
   backspace shows its answer again. The earlier node rows stay, ranked against the new text,
-  until the new answer replaces them.
+  until the new answer replaces them. From the keystroke until every type has answered, a
+  turning circle (`ds::spinner`) sits at the end of the search field in All and Nodes, an
+  empty list reads "Searching nodes…" instead of "No node matches", and the footer leaves
+  out its count until something has come back.
 - Opens in one frame with no animation (constitution VII).
-- Landed 2026-10-12: ⌘K and ⌘⇧P (Ctrl elsewhere; each bound in `init` only when the keymap
-  does not already bind it). Rows are humanized action names (`studio_graph::OpenType` → "Graph:
+- Landed 2026-10-12: ⌘K and ⌘⇧P (Ctrl elsewhere), bound by the default keymaps, so a person's
+  keymap can unbind them. Rows are humanized action names (`studio_graph::OpenType` → "Graph:
   open type"), fuzzy matched with word-start and run bonuses, each with the binding that wins
   where the person was and the action's doc comment in the footer. Recently run rows come first
   (`command-palette.json` in Studio's data directory, read off the main thread and written on
@@ -369,6 +372,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-14 | ⌘K and ⌘P say when they are still looking for nodes | `command_palette` test `the_palette_shows_it_is_searching_nodes` (a fake server; the circle and "Searching nodes…" from the keystroke, no count of none, then the node rows and no circle once it answers; fails without the flag); offscreen snapshots on the dev graph through a proxy that held each node search for 3 s: ⌘K, ⌘3 then "ad"; ⌘K then "ad" | Nodes: the circle at the field's end, "Searching nodes…", no "0 nodes". All: the matching commands at once, with the circle until the nodes came. Before, both showed nothing, and Nodes said "No node matches." while it waited |
 | 2026-10-13 | The palette's selected row is never clipped | offscreen snapshots: ⌘P, ⌘2, "Person" (one row), and ⌘K "open" with ↓↓ | Before, the list's height was its rows alone while its padding sat inside it, so the rows overflowed by 8 px and scrolling to the selection hid the top of the single row under the tabs. The height now includes the padding; the row sits whole with even space, and longer lists keep theirs |
 | 2026-10-12 | Links open a graph, a node or a query without running anything | `studio` `deep_link` tests (each route, missing parts, other schemes, unknown routes, text over 64 KB); offscreen snapshots through `studio::OpenLink`: a query link to `notes`, a node link with a scheme-less server, a link to an unknown server | `notes` opened beside `knowledge` with a Query 1 tab holding the text and no rows; Donald Dijkstra in Explore and the inspector; "Studio does not know the server https://elsewhere.example…" and nothing opened |
 | 2026-10-11 | Fork sources exist at the tag | `git ls-tree v1.23.2 crates/workspace/src crates/picker/src crates/command_palette/src` | Present, as listed above |

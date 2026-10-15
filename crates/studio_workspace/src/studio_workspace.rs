@@ -32,10 +32,7 @@ use studio_actions::workspace::{
 };
 use studio_settings::StudioSettings;
 use ui::prelude::*;
-use ui::{
-    ButtonLike, CommonAnimationExt as _, ContextMenu, Indicator, PopoverMenu, Tooltip,
-    right_click_menu,
-};
+use ui::{ButtonLike, ContextMenu, Indicator, PopoverMenu, Tooltip, right_click_menu};
 
 pub use item::{Item, ItemEvent, ItemFooter, ItemHandle};
 pub use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};
@@ -2314,12 +2311,7 @@ impl Workspace {
                         .gap(px(studio_ui::ds::space::XS))
                         .items_center()
                         .flex_none()
-                        .child(
-                            Icon::new(IconName::ArrowCircle)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted)
-                                .with_rotate_animation(2),
-                        )
+                        .child(studio_ui::ds::spinner())
                         .child(studio_ui::ds::text::meta(text).single_line())
                 }))
                 .children(footer.end)

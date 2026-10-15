@@ -1776,11 +1776,7 @@ impl QueryEditor {
                     h_flex()
                         .gap(px(ds::space::XS))
                         .items_center()
-                        .child(
-                            Icon::new(IconName::ArrowCircle)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        )
+                        .child(ds::spinner())
                         .child(ds::text::meta(label.clone()))
                         .into_any_element(),
                 );

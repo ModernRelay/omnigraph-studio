@@ -13,7 +13,7 @@ use gpui::{
 };
 use studio_settings::{StudioSettings, WindowStyle};
 use ui::prelude::*;
-use ui::{Tooltip, rems_from_px};
+use ui::{CommonAnimationExt as _, Tooltip, rems_from_px};
 
 pub use crate::button::Button;
 
@@ -683,6 +683,15 @@ pub fn meta_code(icon: IconName, value: impl Into<SharedString>, cx: &App) -> Di
 /// Zed's compact sizes through `.size`.
 pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
     Button::new(id, label).label_size(LabelSize::Small)
+}
+
+/// Work under way that the person waits on (a search, a run, rows being read): a small turning
+/// circle, muted, beside or in place of what it will fill.
+pub fn spinner() -> impl IntoElement {
+    Icon::new(IconName::ArrowCircle)
+        .size(IconSize::XSmall)
+        .color(Color::Muted)
+        .with_rotate_animation(2)
 }
 
 /// [`button`] inside a [`float_bar`]: Zed's default size, `size::BAR_BUTTON` tall.

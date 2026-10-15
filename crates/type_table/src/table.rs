@@ -5713,12 +5713,7 @@ impl TypeTable {
             );
         }
         if self.loading_more {
-            start.push(
-                Icon::new(IconName::ArrowCircle)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted)
-                    .into_any_element(),
-            );
+            start.push(studio_ui::ds::spinner().into_any_element());
         }
         if let Some(error) = self.more_error.clone() {
             start.push(
