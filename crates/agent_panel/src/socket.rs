@@ -60,11 +60,12 @@ mod sys {
     use std::path::Path;
     use std::time::Duration;
 
-    use smol::Async;
+    use smol::Unblock;
     pub use uds_windows::UnixStream as BlockingStream;
 
-    /// `uds_windows`'s listener has no socket handle the reactor can wait on, so a
-    /// non-blocking one is polled; the agent connects once, at its start.
+    /// `uds_windows`'s sockets are not ones the reactor can wait on, so the listener is polled
+    /// (the agent connects once, at its start) and a connection's halves read and write on
+    /// blocking threads.
     pub struct Listener(uds_windows::UnixListener);
 
     pub fn bind(path: &Path) -> std::io::Result<Listener> {
@@ -75,12 +76,14 @@ mod sys {
 
     pub async fn accept(
         listener: &Listener,
-    ) -> std::io::Result<(Async<BlockingStream>, Async<BlockingStream>)> {
+    ) -> std::io::Result<(Unblock<BlockingStream>, Unblock<BlockingStream>)> {
         loop {
             match listener.0.accept() {
                 Ok((stream, _)) => {
+                    // An accepted socket takes the listener's non-blocking mode.
+                    stream.set_nonblocking(false)?;
                     let reader = stream.try_clone()?;
-                    return Ok((Async::new(reader)?, Async::new(stream)?));
+                    return Ok((Unblock::new(reader), Unblock::new(stream)));
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     smol::Timer::after(Duration::from_millis(50)).await;
