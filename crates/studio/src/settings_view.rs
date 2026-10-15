@@ -7,8 +7,8 @@
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString, Subscription,
-    Window,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle, Render,
+    SharedString, StyledText, Subscription, Window,
 };
 use serde_json::Value;
 use studio_settings::{FieldKind, Scope, SettingField, StudioSettings};
@@ -508,7 +508,8 @@ impl Render for SettingsView {
             })
             .collect();
         let path = studio_settings::settings_path();
-        let error = studio_settings::file_error(cx);
+        let settings_problems = studio_settings::settings_problems(cx);
+        let keymap_problems = studio_settings::keymap_problems(cx).to_vec();
         let rule = ds::surface::rule(cx);
         let changed_word = if scope == Scope::All {
             "changed"
@@ -661,20 +662,102 @@ impl Render for SettingsView {
                                         let path = path.clone();
                                         move |_, _, cx| cx.reveal_path(&path)
                                     }),
+                            )
+                            .child(
+                                studio_ui::ds::icon_button("reveal-keymap", IconName::Keyboard)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text(format!(
+                                        "Show keymap.json, your shortcuts · {}",
+                                        studio_settings::keymap_path().display()
+                                    )))
+                                    .on_click(|_, _, cx| show_keymap_file(cx)),
                             ),
                     )
-                    .children(error.map(|e| {
-                        div().w_full().max_w(px(720.)).child(
-                            Callout::new()
-                                .severity(Severity::Error)
-                                .icon(IconName::Warning)
-                                .title("settings.json could not be applied")
-                                .description(e),
-                        )
-                    }))
+                    .children(file_problems(
+                        "settings.json",
+                        settings_problems,
+                        |cx| cx.reveal_path(&studio_settings::settings_path()),
+                        cx,
+                    ))
+                    .children(file_problems(
+                        "keymap.json",
+                        keymap_problems,
+                        show_keymap_file,
+                        cx,
+                    ))
                     .child(body),
             )
     }
+}
+
+/// Shows `keymap.json`, written first with a starting point when the person has none.
+fn show_keymap_file(cx: &mut App) {
+    match crate::keymaps::user_keymap_file() {
+        Ok(path) => cx.reveal_path(&path),
+        Err(error) => log::error!("keymap.json could not be written: {error}"),
+    }
+}
+
+/// A file's problems, one line each, with a button that shows the file. Nothing when there
+/// are none.
+fn file_problems(
+    file: &'static str,
+    problems: Vec<String>,
+    show: fn(&mut App),
+    cx: &App,
+) -> Option<impl IntoElement> {
+    let title = match problems.len() {
+        0 => return None,
+        1 => format!("A problem in {file}"),
+        count => format!("{count} problems in {file}"),
+    };
+    Some(
+        div().w_full().max_w(px(720.)).child(
+            Callout::new()
+                .severity(Severity::Warning)
+                .icon(IconName::Warning)
+                .title(title)
+                .description_slot(
+                    v_flex()
+                        .gap(px(space::XS))
+                        .children(problems.iter().map(|problem| problem_text(problem, cx))),
+                )
+                .actions_slot(
+                    ds::button(
+                        SharedString::from(format!("show-{file}")),
+                        format!("Show {file}"),
+                    )
+                    .on_click(move |_, _, cx| show(cx)),
+                ),
+        ),
+    )
+}
+
+/// A problem as the tab shows it: muted text, each `code` span in the text colour on a faint
+/// fill, its backticks dropped.
+fn problem_text(problem: &str, cx: &App) -> impl IntoElement {
+    let mut text = String::with_capacity(problem.len());
+    let mut spans = Vec::new();
+    let mut open = None;
+    for c in problem.chars() {
+        if c == '`' {
+            match open.take() {
+                Some(start) => spans.push(start..text.len()),
+                None => open = Some(text.len()),
+            }
+        } else {
+            text.push(c);
+        }
+    }
+    let code = HighlightStyle {
+        color: Some(cx.theme().colors().text),
+        background_color: Some(ds::surface::tag(cx)),
+        ..HighlightStyle::default()
+    };
+    div()
+        .text_ui_sm(cx)
+        .text_color(cx.theme().colors().text_muted)
+        .child(StyledText::new(text).with_highlights(spans.into_iter().map(|span| (span, code))))
 }
 
 #[cfg(test)]

@@ -52,7 +52,7 @@ Without the environment variables, Studio reads servers and tokens from the `omn
 | `OMNIGRAPH_STUDIO_TOKEN` | Its bearer token |
 | `OMNIGRAPH_STUDIO_GRAPH` | Opens this graph on that server at launch |
 | `OMNIGRAPH_STUDIO_BRANCH` | The branch to open (default `main`) |
-| `OMNIGRAPH_STUDIO_DATA` | Settings and session directory (default `~/Library/Application Support/OmniGraph Studio`, or `$XDG_CONFIG_HOME/omnigraph-studio`) |
+| `OMNIGRAPH_STUDIO_DATA` | Directory of `settings.json`, `keymap.json` and the session (default `~/Library/Application Support/OmniGraph Studio`, or `$XDG_CONFIG_HOME/omnigraph-studio`) |
 
 Packaging: `script/bundle-mac` builds an app bundle and a DMG, ad hoc signed unless a signing
 identity is configured; `script/bundle-linux` builds a tarball with a `.desktop` entry.
@@ -81,6 +81,10 @@ identity is configured; `script/bundle-linux` builds a tarball with a `.desktop`
 - **Shell.** Command palette (⌘K), go to type or node (⌘P), split panes, several windows
   restored on launch, the schema's `.pg` source, a storage inspector, and `omnigraph-studio://`
   links that open a graph, node or query without running anything. `?` lists every binding.
+- **Settings and shortcuts.** A settings tab (⌘,) generated from the settings schema, with
+  per-graph values. `settings.json` and `keymap.json` (Zed's keymap format, over Studio's
+  defaults) may hold comments, are read again when saved, and list every problem by line; a
+  change from the tab rewrites only the setting it touches.
 
 ## How Studio uses OmniGraph
 

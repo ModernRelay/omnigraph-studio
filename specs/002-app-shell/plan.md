@@ -112,6 +112,15 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   ⌘[ / ⌘] back and forward, `?` key sheet (outside text fields).
 - In lists and tables: J/K or ↑/↓, ↵ open, Space peek, Esc steps back one level (close editor,
   then peek, then clear selection).
+- The person's `keymap.json` in the data directory loads after Zed's keymap and Studio's, in
+  Zed's format, so its bindings win; `null` removes a key and comments are allowed. Studio reads
+  it again when it changes (checked every two seconds) and rebinds from the defaults up, then
+  sets the menus again, since a menu's shortcuts are fixed when it is set. A binding that does
+  not load is listed on the settings tab and in a toast ("`cmd-k` in the `Workspace` section:
+  didn't find an action named …") while the rest apply; a file that does not parse keeps the
+  bindings in effect. The settings tab's keyboard button shows the file, writing it first when
+  there is none: an empty `Workspace` section and Studio's bindings as a commented reference.
+  Every binding comes from these three files; no crate binds keys in code.
 
 ### Command palette (`command_palette`, forked from Zed's `picker` + `command_palette`)
 
@@ -160,6 +169,19 @@ second line shows it (`omnigraph branch create feature-x --from main`).
 - One typed document with serde defaults in `assets/settings/default.json`, the user file
   `settings.json` in the app config directory, and per-graph overrides.
 - Watched on disk; parse errors become a notification that names the line.
+  - Built: the file is the person's text (`studio_settings::document`). It may hold comments
+    and trailing commas. A value that does not fit costs only its own setting, which takes its
+    default; a key no setting reads is reported. Every problem is listed with its path and
+    line on the settings tab ("`studio.canvas_max_nodes` (line 5) was not applied: invalid
+    value: integer `-1`, expected a whole number, 0 or more") and summed up in a toast. Inside
+    a list, an element with a bad part (one saved view) is set aside alone; a list with a
+    wrong element (a number in the agent's command) is set aside whole. A change from the tab
+    reads the file again, then rewrites only the settings it touches, in place, with Zed's
+    `settings_json` editor: comments, order, unknown keys and values that did not fit stay. A
+    new key goes in first, so a comment above the object's first key stays with it; a setting
+    put back to its default is removed, and so is an object that leaves empty, so a later
+    change to a default reaches the person. An edit from another program that the watch has
+    not read yet survives the change and applies with it.
 - A settings window (⌘,) generated from the same schema: search box, left nav, rows of title,
   one-line description and control, "Reset to default" per row. Forked in spirit from Zed's
   `settings_ui`; rows are generated, not hand-written.
@@ -203,7 +225,8 @@ waits for it is not dropped.
 - A file Studio wrote but cannot parse is set aside as `<name>.unreadable-<seconds>` before
   anything replaces it (workspace, session and conversation files). A `settings.json` that
   does not parse keeps the settings in effect and refuses changes from the settings tab until
-  it reads again, so the person's text is never replaced by defaults.
+  it reads again, so the person's text is never replaced by defaults. A change is written
+  into the file as it is on disk at that moment, never over it.
 - The data directory is the person's unless the binary is Cargo's build output (`cargo run`,
   an example): that uses "OmniGraph Studio Dev" (`omnigraph-studio-dev` on Linux). A bundled
   app is the person's whichever profile built it. `OMNIGRAPH_STUDIO_DATA` overrides both; the
@@ -372,6 +395,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-14 | `settings.json` keeps the person's text, and `keymap.json` rebinds keys | `studio_settings` `document` tests (comments and trailing commas, a syntax error's line, each value that does not fit costing only its setting, a saved view set aside alone, edits in place, a new key above a comment's key, defaults removed, a bad value kept until its setting changes, graph entries); `studio` `settings_apply` (`a_change_keeps_the_persons_text`: a hand edit with a comment written before the change and not yet read stays and applies; only chosen keys are written; a broken file refuses the change unchanged) and `keymaps` (`the_persons_keymap_wins_and_is_read_again`: a key added, `null` taking ⌘K from the palette and from the shortcut text, an unknown action reported, a broken save keeping the bindings, a second save restoring Studio's); offscreen snapshot of the settings tab in a scratch data folder with three bad values and a bad binding | All pass. The tab listed "3 problems in settings.json" (the font size, a misspelled `stuido`, a negative node limit) and "A problem in keymap.json" with each path and line; Interface font size showed 16. Before, a comment or one wrong value read as a file that could not be applied, the first change wrote every default into the file, and a change within two seconds of a hand edit wrote over it |
 | 2026-10-14 | ⌘K and ⌘P say when they are still looking for nodes | `command_palette` test `the_palette_shows_it_is_searching_nodes` (a fake server; the circle and "Searching nodes…" from the keystroke, no count of none, then the node rows and no circle once it answers; fails without the flag); offscreen snapshots on the dev graph through a proxy that held each node search for 3 s: ⌘K, ⌘3 then "ad"; ⌘K then "ad" | Nodes: the circle at the field's end, "Searching nodes…", no "0 nodes". All: the matching commands at once, with the circle until the nodes came. Before, both showed nothing, and Nodes said "No node matches." while it waited |
 | 2026-10-13 | The palette's selected row is never clipped | offscreen snapshots: ⌘P, ⌘2, "Person" (one row), and ⌘K "open" with ↓↓ | Before, the list's height was its rows alone while its padding sat inside it, so the rows overflowed by 8 px and scrolling to the selection hid the top of the single row under the tabs. The height now includes the padding; the row sits whole with even space, and longer lists keep theirs |
 | 2026-10-12 | Links open a graph, a node or a query without running anything | `studio` `deep_link` tests (each route, missing parts, other schemes, unknown routes, text over 64 KB); offscreen snapshots through `studio::OpenLink`: a query link to `notes`, a node link with a scheme-less server, a link to an unknown server | `notes` opened beside `knowledge` with a Query 1 tab holding the text and no rows; Donald Dijkstra in Explore and the inspector; "Studio does not know the server https://elsewhere.example…" and nothing opened |
@@ -402,6 +426,14 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-13 | A panic message loses quoted text | `studio` test `a_panic_message_loses_the_text_it_quotes` | ``'é'`` and `` `Ada Lovelace's notes` `` become `'…'` and `` `…` ``; messages over 300 characters are cut |
 
 ## Corrections
+
+- 2026-10-14 · `settings.json` was Studio's file in all but name. Each change serialized every
+  setting over it, so the first one wrote all the defaults (a later default never reached the
+  person), and a change made before the two-second watch had read a hand edit wrote over that
+  edit. One value of the wrong type made the whole file unreadable, and a misspelled key did
+  nothing without a word. Changes now edit the text in place, each value stands alone and every
+  problem is listed. There was also no way to change a shortcut: `keymap.json` now loads over
+  Studio's keymap.
 
 - 2026-10-14 · A review of the footer and control changes found: a settings text field lost
   typing when a switch was pressed before the field heard it lost focus, and a scope switch

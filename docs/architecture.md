@@ -84,8 +84,12 @@ a 412 reopens the draft.
 
 - Actions are declared in `studio_actions` and bound in `assets/keymaps/default-{macos,linux,
   windows}.json` with key contexts (`TypeTable`, `Canvas`, `QueryEditor`, `Review`, `Tree`).
+  The person's `keymap.json` loads over them and is read again when it changes; no crate binds
+  keys in code, since a reload rebinds from the files alone.
 - Settings are one typed document: built-in defaults, then the user file, then per-graph
-  overrides. The settings window is generated from the same schema (spec 002).
+  overrides. The settings window is generated from the same schema (spec 002). The user file
+  is the person's text: comments allowed, a value that does not fit costs only its setting,
+  and writes edit only the keys that changed (`studio_settings::document`).
 - `studio_theme` registers Studio's `ThemeSettingsProvider` and adds graph tokens: one color per
   node type, edge colors, diff colors. It starts from Zed's base themes.
 

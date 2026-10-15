@@ -2,6 +2,10 @@
 //! Studio's data directory. Theme and font keys pass through to Zed's settings store, which Zed's
 //! `ui`, `theme_settings` and `editor` read; Studio's own keys live under `studio`.
 //!
+//! The file is the person's text: it may hold comments, a value that does not fit costs only its
+//! own setting, and Studio's writes change only the settings that changed ([`document`]). The
+//! problems of `keymap.json` are kept here too, so the settings tab and the toast show both files.
+//!
 //! Layer 1 (`docs/architecture.md`).
 
 use std::collections::BTreeMap;
@@ -13,8 +17,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{ParseStatus, SettingsStore};
 
+mod document;
 mod fields;
 mod files;
+
+pub use document::Reading;
 
 pub use files::{Access, set_aside, write_atomic};
 
@@ -288,9 +295,14 @@ impl Global for StudioSettings {}
 
 struct SettingsFileState {
     modified: Option<SystemTime>,
+    /// Why the file could not be read at all (its syntax), or why the last change was not saved.
     error: Option<String>,
-    /// The file exists but does not parse, so Studio must not overwrite it.
-    unreadable: bool,
+    /// Each value in the file that was not applied and each key that does nothing.
+    problems: Vec<String>,
+    /// Each binding in `keymap.json` that was not loaded, or why the file could not be read.
+    keymap: Vec<String>,
+    /// False for settings held in memory by a test: every change is refused.
+    writable: bool,
 }
 
 impl Global for SettingsFileState {}
@@ -389,6 +401,11 @@ pub fn settings_path() -> PathBuf {
     data_dir().join("settings.json")
 }
 
+/// The person's key bindings, loaded over Studio's defaults (spec 002).
+pub fn keymap_path() -> PathBuf {
+    data_dir().join("keymap.json")
+}
+
 impl StudioSettings {
     pub fn get(cx: &App) -> &Self {
         cx.global::<Self>()
@@ -447,9 +464,21 @@ impl StudioSettings {
         }
     }
 
-    /// Parses a settings file; unknown keys are ignored, missing keys take defaults.
+    /// Reads a settings file: comments and trailing commas are allowed, missing keys take
+    /// defaults, and a value that does not fit takes its default and is reported with every key
+    /// that does nothing. An error is a file whose syntax is broken.
+    pub fn read(text: &str) -> Result<Reading, String> {
+        document::read(text)
+    }
+
+    /// The settings of a file that has no problem at all.
     pub fn parse(text: &str) -> Result<Self, String> {
-        serde_json::from_str(text).map_err(|error| error.to_string())
+        let reading = Self::read(text)?;
+        if reading.problems.is_empty() {
+            Ok(reading.settings)
+        } else {
+            Err(reading.problems.join("\n"))
+        }
     }
 
     /// The keys Zed's settings store understands.
@@ -482,49 +511,114 @@ impl StudioSettings {
 
 /// Loads the settings file and applies it. Call after `settings::init`.
 pub fn init(cx: &mut App) {
-    let (settings, modified, error) = read_file();
-    let unreadable = settings.is_none() && error.is_some();
+    let (reading, modified, error) = read_file();
+    let (settings, problems) = match reading {
+        Some(reading) => (reading.settings, reading.problems),
+        None => (StudioSettings::default(), Vec::new()),
+    };
     cx.set_global(SettingsFileState {
         modified,
         error,
-        unreadable,
+        problems,
+        keymap: Vec::new(),
+        writable: true,
     });
-    apply(settings.unwrap_or_default(), cx);
+    apply(settings, cx);
     watch(cx);
 }
 
-/// Default settings for a test, held in memory: every write is refused as for an unreadable
-/// file, so no test reaches the settings file.
+/// Default settings for a test, held in memory: every change is refused, so no test reaches
+/// the settings file.
 #[cfg(any(test, feature = "test-support"))]
 pub fn init_test(cx: &mut App) {
     cx.set_global(SettingsFileState {
         modified: None,
         error: None,
-        unreadable: true,
+        problems: Vec::new(),
+        keymap: Vec::new(),
+        writable: false,
     });
     cx.set_global(StudioSettings::default());
 }
 
-/// The last problem reading `settings.json`, for a notification.
+/// What is wrong with `settings.json` and `keymap.json`, in a sentence or two for a toast, as
+/// plain text; the settings tab lists each problem ([`settings_problems`], [`keymap_problems`]).
 pub fn file_error(cx: &App) -> Option<String> {
-    cx.global::<SettingsFileState>().error.clone()
+    let state = cx.global::<SettingsFileState>();
+    let summary = |file: &str, problems: &[String]| match problems {
+        [] => None,
+        [problem] => Some(format!("{file}: {}", problem.replace('`', ""))),
+        problems => Some(format!(
+            "{file} has {} problems; the rest of it applies.",
+            problems.len()
+        )),
+    };
+    let settings = match &state.error {
+        Some(error) => Some(error.clone()),
+        None => summary("settings.json", &state.problems),
+    };
+    let keymap = summary("keymap.json", &state.keymap);
+    match (settings, keymap) {
+        (Some(settings), Some(keymap)) => Some(format!("{settings}\n{keymap}")),
+        (settings, keymap) => settings.or(keymap),
+    }
 }
 
-/// The settings in the file, or `None` with the problem when it exists but cannot be parsed.
-/// A missing file is the defaults.
-fn read_file() -> (Option<StudioSettings>, Option<SystemTime>, Option<String>) {
+/// Everything wrong with `settings.json`: why it could not be read or saved, then each value
+/// that was not applied and each key that does nothing.
+pub fn settings_problems(cx: &App) -> Vec<String> {
+    let state = cx.global::<SettingsFileState>();
+    state.error.iter().chain(&state.problems).cloned().collect()
+}
+
+/// Each binding in `keymap.json` that was not loaded, or why the file could not be read.
+pub fn keymap_problems(cx: &App) -> &[String] {
+    &cx.global::<SettingsFileState>().keymap
+}
+
+/// Records what loading `keymap.json` found, for the toast and the settings tab.
+pub fn set_keymap_problems(problems: Vec<String>, cx: &mut App) {
+    if cx.global::<SettingsFileState>().keymap == problems {
+        return;
+    }
+    cx.global_mut::<SettingsFileState>().keymap = problems;
+    notify(cx);
+}
+
+/// The same settings again, so what shows the files' problems (the workspace's toast, the
+/// settings tab) hears of a change in them.
+fn notify(cx: &mut App) {
+    let unchanged = StudioSettings::get(cx).clone();
+    cx.set_global(unchanged);
+    cx.refresh_windows();
+}
+
+/// What the settings file says, or `None` with the problem when its syntax is broken. A missing
+/// file is the defaults.
+fn read_file() -> (Option<Reading>, Option<SystemTime>, Option<String>) {
     let path = settings_path();
     let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     match std::fs::read_to_string(&path) {
-        Ok(text) => match StudioSettings::parse(&text) {
-            Ok(settings) => (Some(settings), modified, None),
+        Ok(text) => match StudioSettings::read(&text) {
+            Ok(reading) => (Some(reading), modified, None),
             Err(error) => (
                 None,
                 modified,
-                Some(format!("{} could not be read: {error}", path.display())),
+                Some(format!(
+                    "{} could not be read: {error}. The settings in effect stay until it reads \
+                     again.",
+                    path.display()
+                )),
             ),
         },
-        Err(_) => (Some(StudioSettings::default()), modified, None),
+        Err(_) => (
+            Some(Reading {
+                settings: StudioSettings::default(),
+                problems: Vec::new(),
+            }),
+            modified,
+            None,
+        ),
     }
 }
 
@@ -541,38 +635,69 @@ fn apply(settings: StudioSettings, cx: &mut App) {
     cx.refresh_windows();
 }
 
-/// Writes the settings file and applies it. A file Studio could not parse is not overwritten:
-/// the person's text, comments and all, may hold what they meant, so the change is refused
-/// until the file reads again.
+/// Applies a change and writes it into the settings file. The file is read again first, so an
+/// edit another program made since Studio last read it stays, and only the settings the change
+/// touches are rewritten ([`document::edit`]); comments, order and every other key are kept.
+/// A file whose syntax is broken is not written: the person's text may hold what they meant, so
+/// the change is refused until the file reads again.
 pub fn update(cx: &mut App, f: impl FnOnce(&mut StudioSettings)) {
     let path = settings_path();
-    if cx.global::<SettingsFileState>().unreadable {
-        cx.global_mut::<SettingsFileState>().error = Some(format!(
-            "{} could not be read, so the change was not saved. Fix the file and try again.",
-            path.display()
-        ));
-        // The same settings again, so whatever shows the file's problem (the workspace's
-        // toast) hears of it.
-        let unchanged = StudioSettings::get(cx).clone();
-        cx.set_global(unchanged);
-        cx.refresh_windows();
+    let old = StudioSettings::get(cx).clone();
+    let mut new = old.clone();
+    f(&mut new);
+    if !cx.global::<SettingsFileState>().writable {
+        notify(cx);
         return;
     }
-    let mut settings = StudioSettings::get(cx).clone();
-    f(&mut settings);
-    // Private: `agent.env` may hold a model provider's key.
-    let written = serde_json::to_string_pretty(&settings)
-        .map_err(|e| e.to_string())
-        .and_then(|text| {
-            write_atomic(&path, text.as_bytes(), Access::Private).map_err(|e| e.to_string())
-        });
-    let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-    cx.set_global(SettingsFileState {
-        modified,
-        error: written.err(),
-        unreadable: false,
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error.to_string()),
+    };
+    let edited = text.and_then(|text| {
+        let edited = document::edit(&text, &old, &new)?;
+        Ok((edited != text, edited))
     });
-    apply(settings, cx);
+    let (changed, edited) = match edited {
+        Ok(edited) => edited,
+        Err(error) => {
+            let state = cx.global_mut::<SettingsFileState>();
+            state.error = Some(format!(
+                "{} could not be read, so the change was not saved: {error}. Fix the file and \
+                 try again.",
+                path.display()
+            ));
+            // They were found in an earlier version of the file.
+            state.problems.clear();
+            notify(cx);
+            return;
+        }
+    };
+    // Private: `agent.env` may hold a model provider's key.
+    let written = if changed {
+        write_atomic(&path, edited.as_bytes(), Access::Private)
+            .map_err(|error| format!("{} could not be saved: {error}", path.display()))
+    } else {
+        Ok(())
+    };
+    let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    // What the file says now, written or already so, edits from elsewhere included: the watch
+    // takes this time as read. When the write failed, the change applies until Studio quits
+    // and the error says so.
+    let reading = written
+        .is_ok()
+        .then(|| StudioSettings::read(&edited).ok())
+        .flatten();
+    let state = cx.global_mut::<SettingsFileState>();
+    state.modified = modified;
+    state.error = written.err();
+    match reading {
+        Some(reading) => {
+            state.problems = reading.problems;
+            apply(reading.settings, cx);
+        }
+        None => apply(new, cx),
+    }
 }
 
 /// Reloads the file when another program changes it (checked every two seconds).
@@ -584,18 +709,22 @@ fn watch(cx: &mut App) {
             let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
             let changed = cx.update(|cx| cx.global::<SettingsFileState>().modified != modified);
             if changed {
-                // A file that no longer parses keeps the settings in effect; the problem is
-                // shown until the file reads again.
-                let (settings, modified, error) = read_file();
+                let (reading, modified, error) = read_file();
                 cx.update(|cx| {
-                    cx.set_global(SettingsFileState {
-                        modified,
-                        unreadable: settings.is_none(),
-                        error,
-                    });
-                    match settings {
-                        Some(settings) => apply(settings, cx),
-                        None => cx.refresh_windows(),
+                    let state = cx.global_mut::<SettingsFileState>();
+                    state.modified = modified;
+                    state.error = error;
+                    match reading {
+                        Some(reading) => {
+                            state.problems = reading.problems;
+                            apply(reading.settings, cx);
+                        }
+                        // Broken syntax keeps the settings in effect; the problem is shown
+                        // until the file reads again, without those of an earlier version.
+                        None => {
+                            state.problems.clear();
+                            notify(cx);
+                        }
                     }
                 });
             }
@@ -658,11 +787,16 @@ mod tests {
     }
 
     #[test]
-    fn missing_keys_take_defaults_and_unknown_keys_are_ignored() {
-        let settings = StudioSettings::parse(
+    fn missing_keys_take_defaults_and_unknown_keys_are_reported() {
+        let reading = StudioSettings::read(
             r#"{"ui_font_size": 13, "extra": 1, "studio": {"tree_page_size": 20}}"#,
         )
         .unwrap();
+        assert_eq!(
+            reading.problems,
+            ["`extra` (line 1) is not a setting, so it does nothing."]
+        );
+        let settings = reading.settings;
         assert_eq!(settings.ui_font_size, 13.);
         assert_eq!(settings.studio.tree_page_size, 20);
         assert_eq!(settings.studio.type_table_page_size, 100);
