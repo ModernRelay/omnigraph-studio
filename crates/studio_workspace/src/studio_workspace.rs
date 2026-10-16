@@ -2221,7 +2221,9 @@ impl Workspace {
                     )
                     .size(ButtonSize::None)
                     .icon_size(IconSize::XSmall)
-                    .when(!selected, |button| button.visible_on_hover(group.clone()))
+                    // On hover only, the active tab's too, as Zed's `show_close_button: hover`:
+                    // its slot stays, so the title sits evenly between the tab's edges.
+                    .visible_on_hover(group.clone())
                     .tooltip(|_, cx| Tooltip::for_action("Close", &CloseActiveItem, cx))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.close_in(pane_id, index, window, cx)
@@ -2965,7 +2967,8 @@ impl Workspace {
             HEADER_HEIGHT,
             cx,
         )
-        .pl(px(studio_ui::ds::space::LG))
+        // The title on the edge the panel's own toolbar and rows start at.
+        .pl(px(studio_ui::ds::space::EDGE))
         .pr(px(studio_ui::ds::space::SM))
         .gap(px(studio_ui::ds::space::XS))
         .border_b_1()

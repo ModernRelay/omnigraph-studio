@@ -404,14 +404,18 @@ than styling one-off elements.
   its content's height, so `h_full` would shrink it to its label); the active tab joins the
   document, inactive ones sit on the strip's rule. A tab is laid out as Zed's `Tab`: 4 px
   padding and gaps, a 12 px slot before its icon and title for its state dot (unsaved, newer
-  data) and a 14 px slot after them for its close or pin button, both kept when empty. The
+  data) and a 14 px slot after them for its close or pin button, both kept when empty; the
+  close button shows only under the pointer, the active tab's too (Zed's
+  `show_close_button: hover`), so a title sits evenly between its tab's edges. The
   strip's Back/Forward and its end buttons sit in Zed's regions: 6 px padding, 4 px gaps, 22 px
-  buttons with 14 px icons, as do a dock header's zoom and hide.
-- **Buttons.** `ds::button` (28 px, a 6 px inset) and `ds::icon_button` (Zed's medium size,
-  28 px square) for every button in a toolbar, strip, panel, card footer or dialog, so a hover
-  or pressed fill has room around its label. Zed fixes a button's padding by its size (8 px
-  for medium) and keeps its colours private, so `ds::button` is Studio's own `Button`: Zed's
-  `ButtonLike` (colours and states) at 28 px around its own icon, label and key row. Buttons inside a dense row (a filter pill's segments, a
+  buttons with 14 px icons, as do a dock header's zoom and hide; a dock header's title starts
+  16 px in, the edge its panel's toolbar and rows start at.
+- **Buttons.** `ds::button` (28 px, Zed's medium 8 px inset) and `ds::icon_button` (Zed's
+  medium size, 28 px square) for every button in a toolbar, panel, card footer or dialog, so a
+  hover or pressed fill has room around its label; the header strips and the status bar hold
+  Zed's 22 px buttons with 14 px icons. Zed keeps its button colours private, so `ds::button`
+  is Studio's own `Button`: Zed's `ButtonLike` (colours and states) at 28 px around its own
+  icon, label and key row. Buttons inside a dense row (a filter pill's segments, a
   tab's close, a tree row's toggle, an inline Fix or Run, the sidebar header's icons) keep
   Zed's compact default.
 - **Text sizes.** The window's rem size is `ui_font_size` (16 px by default), as in Zed, so
@@ -477,6 +481,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-16 | Buttons at Zed's insets; a tab's title centred | `studio_ui` `controls_draw_at_their_sizes` (8 px each side, red at 6 before the change); offscreen snapshots: two tabs with the pointer on the inactive one, the table toolbar, the insert dialog, the bottom dock | The active tab had 21 px before its icon and 8 after its ×; with × under the pointer only, 21 and 23, as Zed's. Toolbar and dialog buttons read with Zed's 8 px; a dock header's title now starts on its toolbar's 16 px edge (it was 12) |
 | 2026-10-16 | The sidebar toggle at the status bar's start; tabs drag in the app | `studio` `windows_leave_the_titlebar_drag_to_the_app` (red before the option was set); offscreen snapshots with the sidebar shown and hidden, the ontology browsing Company into Nodes, Activity empty | In the app, dragging a tab moved the window: AppKit owned the title bar's band, where Studio's tabs sit. The toggle reads filled with the sidebar shown and empty with it hidden; the sidebar's list starts 6 px under its header; Nodes and Activity did what their specs say, their empty states now naming where a type is clicked and showing Activity's icon |
 | 2026-10-16 | Strips at Zed's heights; tabs, regions and sidebar rows on Zed's spacing | `studio_workspace` `tabs_fill_the_header_strip` (tab and status bar at the new heights) and the workspace suite; offscreen snapshots of two tables, then one with the bottom panel, compared with Zed's and the Claude app's measurements | Strips 32 px, status bar 30. The sidebar's labels now start on one edge whatever leads them (they were 4 px apart between the view rows' icons and the type marks); the Claude app's sidebar rows are 26 px apart, as Studio's already were. No two panel buttons share an icon (Graph and Nodes were both `Table`, Branches and History near twins); "Delete" and the memory readout, 4 px apart, read as one phrase until a rule split them |
 | 2026-10-16 | Vitesse Refined Light is bundled and the default | `studio_theme` test `studio_themes_are_listed_and_read_as_families`; `studio` `settings_apply` (the light mode resolves "Vitesse Refined Light" through Studio's startup); the bundled file's SHA-256 equals the copy Zed installed (`9731fc19…2998`); offscreen snapshots of a table with the inspector and History, and a query | Green accents and lit panel buttons, Vitesse's syntax colours in the query; One Light before |

@@ -1,8 +1,8 @@
-//! Studio's text button, what `ds::button` makes: Zed's `Button` with 6 px either side of its
-//! content where Zed's medium button has 8. Zed fixes a button's padding by its size and keeps
-//! its colours to itself, so this draws Zed's `ButtonLike` (colours, hover, press, focus,
-//! toggled and disabled states) at a medium button's height around its own row: the start
-//! icon, the label, a key binding and the end icon, coloured as Zed's `Button` colours them.
+//! Studio's text button, what `ds::button` makes: Zed's `Button`, with a medium button's 8 px
+//! either side of its content. Zed keeps a button's colours to itself, so this draws Zed's
+//! `ButtonLike` (colours, hover, press, focus, toggled and disabled states) at a medium
+//! button's height around its own row: the start icon, the label, a key binding and the end
+//! icon, coloured as Zed's `Button` colours them.
 
 use gpui::{AnyView, App, ClickEvent, CursorStyle, DefiniteLength, ElementId, FocusHandle, Window};
 use ui::prelude::*;
@@ -144,8 +144,8 @@ impl ButtonCommon for Button {
 
 impl RenderOnce for Button {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        // A medium or large button: Zed's small padding (4 px) at its own height, and 2 px
-        // more inside, so 6. Smaller sizes are Zed's as they are.
+        // A medium or large button: Zed's small padding (4 px) at its own height, and 4 px
+        // more inside, so Zed's medium 8. Smaller sizes are Zed's as they are.
         let (base, inset) = match self.size {
             ButtonSize::Large => (
                 self.base
@@ -177,7 +177,7 @@ impl RenderOnce for Button {
         };
         base.child(
             h_flex()
-                .when(inset, |row| row.px(DynamicSpacing::Base02.rems(cx)))
+                .when(inset, |row| row.px(DynamicSpacing::Base04.rems(cx)))
                 .gap(DynamicSpacing::Base04.rems(cx))
                 .children(self.start_icon.map(icon))
                 .child(
@@ -314,13 +314,13 @@ mod tests {
                 .unwrap_or_else(|| panic!("{selector} was not drawn"))
         };
         let button = bounds(cx, "button");
-        // A label alone: what the inset is measured to.
+        // A label alone: what the inset is measured to, Zed's medium button's 8 px.
         let content = bounds(cx, "button-label");
         assert_eq!(f32::from(button.size.height), ds::size::CONTROL);
-        assert_eq!(f32::from(content.origin.x - button.origin.x), 6.);
+        assert_eq!(f32::from(content.origin.x - button.origin.x), 8.);
         assert_eq!(
             f32::from(button.right() - content.right()),
-            6.,
+            8.,
             "the inset is even"
         );
         assert_eq!(
