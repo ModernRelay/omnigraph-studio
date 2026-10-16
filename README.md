@@ -15,8 +15,10 @@ GPU, through Metal on macOS and Vulkan (wgpu) on Linux; there is no web view or 
 ## Download
 
 [Releases](https://github.com/ModernRelay/omnigraph-studio/releases) have a macOS DMG (Apple
-silicon) and Linux tarballs (x86_64, arm64). macOS builds are not notarized yet; the release
-notes say how to open one. To build from source instead, see below.
+silicon), Linux tarballs (x86_64, arm64) and a Windows zip (x86_64, Windows 10 1809 or later).
+macOS builds are not notarized and the Windows build is not signed yet; the release notes say
+how to open them. On Windows the agent panel is not available yet. To build from source
+instead, see below.
 
 ## Quick start
 
@@ -52,7 +54,7 @@ Without the environment variables, Studio reads servers and tokens from the `omn
 | `OMNIGRAPH_STUDIO_TOKEN` | Its bearer token |
 | `OMNIGRAPH_STUDIO_GRAPH` | Opens this graph on that server at launch |
 | `OMNIGRAPH_STUDIO_BRANCH` | The branch to open (default `main`) |
-| `OMNIGRAPH_STUDIO_DATA` | Directory of `settings.json`, `keymap.json` and the session (default `~/Library/Application Support/OmniGraph Studio`, or `$XDG_CONFIG_HOME/omnigraph-studio`) |
+| `OMNIGRAPH_STUDIO_DATA` | Directory of `settings.json`, `keymap.json` and the session (default `~/Library/Application Support/OmniGraph Studio`, `%APPDATA%\OmniGraph Studio` on Windows, or `$XDG_CONFIG_HOME/omnigraph-studio`) |
 
 Packaging: `script/bundle-mac` builds an app bundle and a DMG, ad hoc signed unless a signing
 identity is configured; `script/bundle-linux` builds a tarball with a `.desktop` entry.
@@ -164,10 +166,11 @@ what is deferred, and a dated validation log of the checks behind each claim.
 
 ## Status
 
-Built against OmniGraph 0.13; macOS is the primary platform and Linux builds in CI. Not
-implemented:
+Built against OmniGraph 0.13; macOS is the primary platform, and Linux and Windows build and
+test in CI. Not implemented:
 
-- Windows support, signed and notarized releases, auto-update.
+- Signed and notarized releases, a Windows installer, auto-update.
+- The agent panel on Windows.
 - OIDC sign-in; Studio authenticates with bearer tokens.
 - Approvals and comments on reviews.
 - Features that depend on deferred engine changes ([spec 012](specs/012-omnigraph-engine-changes/plan.md)).

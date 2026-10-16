@@ -71,9 +71,10 @@ states its responsibility, so the graph is visible before the code is.
 
 ### CI
 
-`ci.yml` runs on macOS (Apple Silicon) and Ubuntu: `cargo fmt --check`, `cargo clippy -D
-warnings`, `cargo test`, and `cargo deny check`. Windows joins once the app runs on macOS and
-Linux. CI caches `~/.cargo/git` and `target/` keyed on `Cargo.lock`.
+`ci.yml` runs on macOS (Apple Silicon), Ubuntu and Windows (2025): `cargo fmt --check`,
+`cargo clippy -D warnings` (with `--keep-going`, so one run reports every crate), `cargo test`
+(with `--no-fail-fast`), and `cargo deny check`. On Windows git checks Zed out with long paths
+through its own CLI. CI caches `~/.cargo/git` and `target/` keyed on `Cargo.lock`.
 
 ### Shipping (after 002)
 
@@ -91,7 +92,14 @@ Linux. CI caches `~/.cargo/git` and `target/` keyed on `Cargo.lock`.
   Tools they compile when Studio starts, as in a debug build.
 - Linux: `script/bundle-linux` builds a tarball (`bin/`, a `.desktop` entry, `LICENSE`).
   A release runs on glibc 2.35 (Ubuntu 22.04, Debian 12) and later: it is built on Ubuntu 22.04,
-  and the script refuses a binary that needs a newer glibc. AppImage later. Windows: later.
+  and the script refuses a binary that needs a newer glibc. AppImage later.
+- Windows: `script/bundle-windows`, run in Git Bash, builds a zip (`omnigraph-studio.exe`,
+  `LICENSE`, `THIRD-PARTY-NOTICES.md`) for Windows 10 1809 and later, the first Windows with Unix
+  sockets, which the agent's tool socket uses (`uds_windows`). A release build opens no console
+  window. The executable is not signed, has no icon yet, and there is no installer. Settings live
+  in `%APPDATA%\OmniGraph Studio`. `.gitattributes` checks text out with LF everywhere, so the
+  files Studio embeds are the same bytes on every system. The agent panel says it is not
+  available on Windows: its `omnigraph` wrapper is a shell script (spec 013).
 - Every bundle carries `THIRD-PARTY-NOTICES.md` beside `LICENSE`: the licences of the fonts,
   icons and themes Studio embeds from Zed's assets, then every crate linked into the app on the
   three shipped targets. `script/generate-licenses` writes it with cargo-about 0.9.2, accepting
@@ -99,10 +107,10 @@ Linux. CI caches `~/.cargo/git` and `target/` keyed on `Cargo.lock`.
   (`script/licenses/about.toml` clarifies `language_core`, which declares none). A release
   bundle needs it; a debug bundle has it when cargo-about is installed. CI's `deny` job
   generates it on every change.
-- CI bundles the debug build on both systems so the scripts keep working.
+- CI bundles the debug build on all three systems so the scripts keep working.
 - Releases: pushing a tag `v<version>` that names the workspace version runs
-  `.github/workflows/release.yml`. It bundles release builds for macOS (Apple silicon) and Linux
-  (x86_64 and arm64) and publishes a GitHub Release with the files, `SHA256SUMS` and install
+  `.github/workflows/release.yml`. It bundles release builds for macOS (Apple silicon), Linux
+  (x86_64 and arm64) and Windows (x86_64) and publishes a GitHub Release with the files, `SHA256SUMS` and install
   notes; 0.x releases are marked pre-release. The macOS build is signed and notarized when the
   workflow's Apple secrets are set, and signed ad hoc otherwise. Run by hand
   (`workflow_dispatch`), the workflow builds the same files and publishes nothing, to check a
@@ -133,7 +141,7 @@ Linux. CI caches `~/.cargo/git` and `target/` keyed on `Cargo.lock`.
 
 ## Deferred
 
-- Windows CI and packaging, until macOS and Linux run.
+- A Windows installer, a signed executable and its icon.
 - Auto-update, until there is a first signed release.
 - Engine change E19 (publish `omnigraph-compiler` to crates.io again), [spec 012](../012-omnigraph-engine-changes/plan.md). Until then the
   compiler is a git dependency on tag `v0.13.0`.
@@ -142,6 +150,7 @@ Linux. CI caches `~/.cargo/git` and `target/` keyed on `Cargo.lock`.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-16 | Studio builds, tests and bundles on Windows | CI on `windows-2025` for PR #1: `cargo clippy --workspace --all-targets --keep-going -D warnings`, `cargo test --workspace --no-fail-fast`, `script/bundle-windows --debug` | All pass, the GPUI headless tests (`keymaps`, `settings_apply`) and the tool socket's tests among them; the zip `omnigraph-studio-0.2.0-windows-x86_64.zip` was written. Three fixes on the way: a test module's import unused on Windows, `Async` refusing `uds_windows` streams (the halves are `Unblock` now), and CRLF checkouts plus `\` separators in the skill test |
 | 2026-10-11 | Newest stable Zed is v1.23.2 | `gh api repos/zed-industries/zed/releases` | v1.23.2, 2026-10-07; v1.24.1-pre is a prerelease |
 | 2026-10-11 | Zed toolchain at the tag | `git show v1.23.2:rust-toolchain.toml` | `1.98.1` |
 | 2026-10-11 | `ui` license and dependencies | `git show v1.23.2:crates/ui/Cargo.toml` | GPL-3.0-or-later; gpui, component, theme, icons, menu, ui_macros, gpui_util + third party |

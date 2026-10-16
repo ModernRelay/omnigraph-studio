@@ -298,7 +298,9 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 
 ## Deferred
 
-- Windows: the proxy uses Unix sockets. Windows support waits for a named-pipe transport.
+- Windows: the tool socket uses Unix sockets there too (`uds_windows`, Windows 10 1809 and
+  later), but the agent's `omnigraph` wrapper is a shell script (spec 013), so the panel says it
+  is not available on Windows until a `cmd` wrapper with its own quoting exists.
 - Agent-attributed commits: commits are recorded under the person's actor. Recording "on
   behalf of an agent" needs an engine change, E20 in `docs/deferred-engine-changes.md`.
 - Steering (ending a turn at the next tool boundary for a queued message): Zed does it only for

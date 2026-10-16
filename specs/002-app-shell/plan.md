@@ -228,7 +228,9 @@ waits for it is not dropped.
   it reads again, so the person's text is never replaced by defaults. A change is written
   into the file as it is on disk at that moment, never over it.
 - The data directory is the person's unless the binary is Cargo's build output (`cargo run`,
-  an example): that uses "OmniGraph Studio Dev" (`omnigraph-studio-dev` on Linux). A bundled
+  an example): that uses "OmniGraph Studio Dev" (`omnigraph-studio-dev` on Linux). The data
+  directory is `%APPDATA%\OmniGraph Studio` on Windows (`OmniGraph Studio Dev` for a development
+  run). A bundled
   app is the person's whichever profile built it. `OMNIGRAPH_STUDIO_DATA` overrides both; the
   snapshot tool sets a fresh temporary directory when it is unset. With restoring off, Studio
   saves no tabs or window bounds.
