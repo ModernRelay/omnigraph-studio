@@ -20,7 +20,10 @@ if [[ "${1:-}" == "--reset" ]]; then
   rm -rf "$DATA"
 fi
 
-version=$("$CLI" version | head -1)
+# The whole output, then its first line: with `| head -1` the CLI can panic writing its second
+# line into a closed pipe, which `pipefail` turns into a failed start.
+version=$("$CLI" version)
+version=${version%%$'\n'*}
 if [[ "$version" != "omnigraph 0.13."* ]]; then
   echo "dev-server needs OmniGraph 0.13; found: $version (set OMNIGRAPH_BIN)" >&2
   exit 1
