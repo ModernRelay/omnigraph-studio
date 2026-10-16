@@ -144,8 +144,7 @@ impl Render for TypesList {
             .as_deref()
             .is_some_and(|key| key.starts_with("canvas:"));
         let view_row = |id: &'static str, label: &'static str, icon: IconName| {
-            studio_ui::ds::SidebarRow::new(id, label)
-                .start(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+            studio_ui::ds::SidebarRow::new(id, label).icon(icon)
         };
         let mut list = v_flex()
             .w_full()

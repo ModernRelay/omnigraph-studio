@@ -44,9 +44,8 @@ impl Render for HistoryPanel {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         match &self.view {
             Some(view) => div().size_full().child(view.clone()).into_any_element(),
-            None => {
-                studio_ui::ds::empty_state(IconName::GitGraph, "No graph open").into_any_element()
-            }
+            None => studio_ui::ds::empty_state(IconName::HistoryRerun, "No graph open")
+                .into_any_element(),
         }
     }
 }

@@ -159,11 +159,7 @@ impl BranchList {
                 move |_, _, _| {
                     let (when, tooltip) = detail.clone().unzip();
                     let row = studio_ui::ds::SidebarRow::new(("branch", index), name.clone())
-                        .start(
-                            Icon::new(IconName::GitBranch)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        )
+                        .icon(IconName::GitBranch)
                         .selected(current)
                         .when_some(when, |row, when| {
                             row.end(studio_ui::ds::sidebar_count(when))
@@ -278,11 +274,7 @@ impl Render for BranchList {
         };
         let new_button = studio_ui::ds::SidebarRow::new("new-branch", "New branch…")
             .muted(true)
-            .start(
-                Icon::new(IconName::Plus)
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
-            )
+            .icon(IconName::Plus)
             .tooltip_fn({
                 let current = current.clone();
                 move |_, cx| {

@@ -108,7 +108,7 @@ pub fn init(cx: &mut App) {
             PanelPosition::Left,
             "types",
             "Graph",
-            IconName::Table,
+            IconName::Blocks,
             types.into(),
             cx,
         );

@@ -79,14 +79,14 @@ pub mod radius {
 /// Fixed sizes.
 pub mod size {
     /// Every column's header strip (its tabs or its title), so the rules under them line up
-    /// across the window.
-    pub const HEADER_STRIP: f32 = 36.;
+    /// across the window: Zed's tab bar (`Tab::container_height`).
+    pub const HEADER_STRIP: f32 = 32.;
     /// Every column's footer strip, and a bar across a document (a write to confirm), so the
     /// rules over them line up.
     pub const STRIP: f32 = 40.;
     /// The window's status bar, after Zed's: the docks' panel buttons and the open tab's facts,
-    /// with room for a control inside it.
-    pub const STATUS_BAR: f32 = 32.;
+    /// a [`BAR_BUTTON`] with 4 px above and below it.
+    pub const STATUS_BAR: f32 = 30.;
     /// A surface's toolbar.
     pub const TOOLBAR: f32 = 48.;
     /// A data row and a data header: dense enough to scan a page at a glance, with room for a
@@ -95,6 +95,9 @@ pub mod size {
     pub const HEADER: f32 = 30.;
     /// A sidebar row, and a row of a [`super::row_list`].
     pub const SIDEBAR_ROW: f32 = 26.;
+    /// The slot a sidebar row's icon or type mark sits in, so every label of a list starts on
+    /// one edge whatever leads it.
+    pub const ROW_ICON: f32 = 16.;
     /// A control: a medium button, a field, a segmented track, a floating bar, a tile.
     pub const CONTROL: f32 = 28.;
     /// A button inside a floating bar ([`super::bar_button`]): Zed's default size, 3 px inside
@@ -453,9 +456,15 @@ impl SidebarRow {
         self
     }
 
+    /// What leads the label (a type mark, a status dot), centered in the row's icon slot.
     pub fn start(mut self, start: impl IntoElement) -> Self {
         self.start = Some(start.into_any_element());
         self
+    }
+
+    /// A muted icon leading the label, at the size every sidebar list uses.
+    pub fn icon(self, icon: IconName) -> Self {
+        self.start(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
     }
 
     pub fn end(mut self, end: impl IntoElement) -> Self {
@@ -523,7 +532,7 @@ impl RenderOnce for SidebarRow {
                 row.hover(move |style| style.bg(hover_bg))
             })
             .when_some(self.tooltip, |row, tooltip| row.tooltip(tooltip))
-            .children(self.start)
+            .children(self.start.map(row_icon))
             .child(
                 Label::new(self.label)
                     .size(LabelSize::Small)
@@ -562,6 +571,17 @@ pub fn sidebar_count(text: impl Into<SharedString>) -> Label {
     text::meta(text)
 }
 
+/// A sidebar row's icon slot ([`size::ROW_ICON`]), with what leads the label centered in it.
+fn row_icon(start: impl IntoElement) -> Div {
+    div()
+        .size(px(size::ROW_ICON))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(start)
+}
+
 /// An empty sidebar section: one dim row with an icon and a word or two; how to fill it goes
 /// in the tooltip.
 pub fn sidebar_placeholder(
@@ -579,11 +599,9 @@ pub fn sidebar_placeholder(
         .gap(px(space::MD))
         .items_center()
         .tooltip(Tooltip::text(tooltip))
-        .child(
-            Icon::new(icon)
-                .size(IconSize::XSmall)
-                .color(Color::Disabled),
-        )
+        .child(row_icon(
+            Icon::new(icon).size(IconSize::Small).color(Color::Disabled),
+        ))
         .child(
             Label::new(label.into())
                 .size(LabelSize::Small)

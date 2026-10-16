@@ -100,7 +100,7 @@ impl Item for HistoryView {
     }
 
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
-        Some(IconName::GitGraph)
+        Some(IconName::HistoryRerun)
     }
 
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
@@ -847,7 +847,7 @@ impl Render for HistoryView {
             .when(!self.compact, |header| {
                 header
                     .child(
-                        Icon::new(IconName::GitGraph)
+                        Icon::new(IconName::HistoryRerun)
                             .size(IconSize::Small)
                             .color(Color::Muted),
                     )

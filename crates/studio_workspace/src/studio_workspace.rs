@@ -190,6 +190,9 @@ const SAVE_DELAY: Duration = Duration::from_millis(500);
 /// columns (after Zed's).
 const HEADER_HEIGHT: f32 = studio_ui::ds::size::HEADER_STRIP;
 const STATUS_BAR_HEIGHT: f32 = studio_ui::ds::size::STATUS_BAR;
+/// A tab's slots before and after its content, as Zed's `Tab`: its state dot, its close button.
+const TAB_START_SLOT: f32 = 12.;
+const TAB_END_SLOT: f32 = 14.;
 /// How far a zoomed pane or panel sits inside the document area, as Zed's `zoomed_padding`.
 const ZOOM_INSET: f32 = studio_ui::ds::size::SHEET_GAP;
 /// Room for the window's traffic lights at the left of the first header strip.
@@ -1559,7 +1562,7 @@ impl Workspace {
             PanelPosition::Bottom,
             ACTIVITY_PANEL,
             "Activity",
-            IconName::HistoryRerun,
+            IconName::BoltOutlined,
             view,
             cx,
         );
@@ -1889,7 +1892,7 @@ impl Workspace {
         };
         let workspace = cx.entity().downgrade();
         h_flex()
-            .gap(px(studio_ui::ds::space::XXS))
+            .gap(px(studio_ui::ds::space::XS))
             .children(dock.panels.iter().enumerate().map(|(index, panel)| {
                 let lit = dock.open && index == dock.active;
                 let id = panel.id.clone();
@@ -2172,6 +2175,41 @@ impl Workspace {
                 // With a split, the active pane's tab reads at full strength and the others'
                 // active tabs are muted, so the focused document is clear.
                 let strong = selected && (!split || focused_pane);
+                // As Zed's `Tab`: a slot before the content for the tab's state (unsaved,
+                // newer data) and one after it for its close or pin button, both kept when
+                // empty so the tabs' contents line up.
+                let indicator = if dirty {
+                    Some(Indicator::dot().color(Color::Warning))
+                } else if stale {
+                    Some(Indicator::dot().color(Color::Muted))
+                } else {
+                    None
+                };
+                let end_button = if pinned {
+                    IconButton::new(
+                        SharedString::from(format!("unpin-{pane_id}-{index}")),
+                        IconName::Pin,
+                    )
+                    .size(ButtonSize::None)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Unpin"))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.toggle_pin(pane_id, index, cx)),
+                    )
+                } else {
+                    IconButton::new(
+                        SharedString::from(format!("close-{pane_id}-{index}")),
+                        IconName::Close,
+                    )
+                    .size(ButtonSize::None)
+                    .icon_size(IconSize::XSmall)
+                    .when(!selected, |button| button.visible_on_hover(group.clone()))
+                    .tooltip(|_, cx| Tooltip::for_action("Close", &CloseActiveItem, cx))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.close_in(pane_id, index, window, cx)
+                    }))
+                };
                 // The strip's height, not `h_full`: the right-click wrapper lays out at its
                 // content's height, so a percentage would shrink the tab to its label.
                 let tab = h_flex()
@@ -2179,9 +2217,8 @@ impl Workspace {
                     .debug_selector(move || format!("tab-{pane_id}-{index}"))
                     .group(group.clone())
                     .h(px(HEADER_HEIGHT))
-                    .pl(px(studio_ui::ds::space::LG))
-                    .pr(px(studio_ui::ds::space::SM))
-                    .gap(px(studio_ui::ds::space::MD))
+                    .px(px(studio_ui::ds::space::XS))
+                    .gap(px(studio_ui::ds::space::XS))
                     .items_center()
                     .flex_none()
                     .relative()
@@ -2206,54 +2243,35 @@ impl Workspace {
                             )
                     })
                     .cursor_pointer()
-                    .children(
-                        item.tab_icon(cx)
-                            .map(|icon| Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)),
+                    .child(
+                        h_flex()
+                            .size(px(TAB_START_SLOT))
+                            .flex_none()
+                            .justify_center()
+                            .children(indicator),
                     )
                     .child(
-                        Label::new(item.tab_title(cx))
-                            .size(LabelSize::Small)
-                            .color(if strong { Color::Default } else { Color::Muted })
-                            .when(preview, |label| label.italic())
-                            .single_line(),
+                        h_flex()
+                            .gap(px(studio_ui::ds::space::XS))
+                            .items_center()
+                            .children(item.tab_icon(cx).map(|icon| {
+                                Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)
+                            }))
+                            .child(
+                                Label::new(item.tab_title(cx))
+                                    .size(LabelSize::Small)
+                                    .color(if strong { Color::Default } else { Color::Muted })
+                                    .when(preview, |label| label.italic())
+                                    .single_line(),
+                            ),
                     )
-                    .when(dirty, |tab| {
-                        tab.child(Indicator::dot().color(Color::Warning))
-                    })
-                    .when(stale && !dirty, |tab| {
-                        tab.child(Indicator::dot().color(Color::Muted))
-                    })
-                    .map(|tab| {
-                        if pinned {
-                            tab.child(
-                                IconButton::new(
-                                    SharedString::from(format!("unpin-{pane_id}-{index}")),
-                                    IconName::Pin,
-                                )
-                                .icon_size(IconSize::XSmall)
-                                .icon_color(Color::Muted)
-                                .tooltip(Tooltip::text("Unpin"))
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| this.toggle_pin(pane_id, index, cx),
-                                )),
-                            )
-                        } else {
-                            tab.child(
-                                IconButton::new(
-                                    SharedString::from(format!("close-{pane_id}-{index}")),
-                                    IconName::Close,
-                                )
-                                .icon_size(IconSize::XSmall)
-                                .when(!selected, |button| button.visible_on_hover(group))
-                                .tooltip(|_, cx| Tooltip::for_action("Close", &CloseActiveItem, cx))
-                                .on_click(cx.listener(
-                                    move |this, _, window, cx| {
-                                        this.close_in(pane_id, index, window, cx)
-                                    },
-                                )),
-                            )
-                        }
-                    })
+                    .child(
+                        h_flex()
+                            .size(px(TAB_END_SLOT))
+                            .flex_none()
+                            .justify_center()
+                            .child(end_button),
+                    )
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         if event.click_count() == 2
                             && let Some(pane) = this.pane_mut(pane_id)
@@ -2359,8 +2377,8 @@ impl Workspace {
         let nav = h_flex()
             .h_full()
             .flex_none()
-            .px(px(studio_ui::ds::space::XS))
-            .gap(px(studio_ui::ds::space::XXS))
+            .px(px(studio_ui::ds::space::SM))
+            .gap(px(studio_ui::ds::space::XS))
             .items_center()
             .border_b_1()
             .border_r_1()
@@ -2408,8 +2426,8 @@ impl Workspace {
         h_flex()
             .h_full()
             .flex_none()
-            .px(px(studio_ui::ds::space::XS))
-            .gap(px(studio_ui::ds::space::XXS))
+            .px(px(studio_ui::ds::space::SM))
+            .gap(px(studio_ui::ds::space::XS))
             .items_center()
             .border_b_1()
             .border_l_1()
@@ -2682,7 +2700,7 @@ impl Workspace {
         });
         let left = h_flex()
             .min_w_0()
-            .gap(px(studio_ui::ds::space::MD))
+            .gap(px(studio_ui::ds::space::XS))
             .items_center()
             .overflow_hidden()
             .when(shown && !self.left.panels.is_empty(), |bar| {
@@ -2694,6 +2712,11 @@ impl Workspace {
             .when(has_start, |bar| bar.child(studio_ui::ds::divider_v(cx)))
             .children(footer.start);
         let docks_right = shown && !(self.bottom.panels.is_empty() && self.right.panels.is_empty());
+        let has_end = !footer.end.is_empty();
+        let performance = self.render_performance();
+        // Zed's 4 px between the left side's items, which are chips with padding of their own;
+        // the right side's are bare text, so they keep 8 px, and a rule sets the window's
+        // readout apart from the tab's facts.
         let right = h_flex()
             .flex_none()
             .gap(px(studio_ui::ds::space::MD))
@@ -2707,7 +2730,10 @@ impl Workspace {
                     .child(studio_ui::ds::text::meta(text).single_line())
             }))
             .children(footer.end)
-            .children(self.render_performance())
+            .when(has_end && performance.is_some(), |bar| {
+                bar.child(studio_ui::ds::divider_v(cx))
+            })
+            .children(performance)
             .when(docks_right, |bar| {
                 bar.child(studio_ui::ds::divider_v(cx))
                     .child(self.render_panel_buttons(PanelPosition::Bottom, cx))
@@ -2918,7 +2944,8 @@ impl Workspace {
             HEADER_HEIGHT,
             cx,
         )
-        .px(px(studio_ui::ds::space::SM))
+        .pl(px(studio_ui::ds::space::LG))
+        .pr(px(studio_ui::ds::space::SM))
         .gap(px(studio_ui::ds::space::XS))
         .border_b_1()
         .border_color(hairline)
@@ -2927,7 +2954,7 @@ impl Workspace {
         })
         .children(dock.active_panel().map(dock_title))
         .child(
-            studio_ui::ds::icon_button(
+            IconButton::new(
                 SharedString::from(format!("zoom-dock-{position:?}")),
                 if zoomed {
                     IconName::Minimize
@@ -2935,7 +2962,7 @@ impl Workspace {
                     IconName::Maximize
                 },
             )
-            .icon_size(IconSize::XSmall)
+            .icon_size(IconSize::Small)
             .tooltip(move |_, cx| {
                 Tooltip::for_action(if zoomed { "Zoom out" } else { "Zoom in" }, &ToggleZoom, cx)
             })
@@ -2949,11 +2976,11 @@ impl Workspace {
             })),
         )
         .child(
-            studio_ui::ds::icon_button(
+            IconButton::new(
                 SharedString::from(format!("hide-dock-{position:?}")),
                 IconName::Close,
             )
-            .icon_size(IconSize::XSmall)
+            .icon_size(IconSize::Small)
             .tooltip(move |_, cx| {
                 Tooltip::for_action(hide_label, toggle_action(position).as_ref(), cx)
             })

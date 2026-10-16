@@ -136,11 +136,7 @@ impl QueriesPanel {
                         .unwrap_or_else(|| format!("Run {} on the server", query.name));
                     body = body.child(
                         ds::SidebarRow::new(("stored-query", index), query.name.clone())
-                            .start(
-                                Icon::new(IconName::Server)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            )
+                            .icon(IconName::Server)
                             .when(query.mutation, |row| row.end(ds::sidebar_count("writes")))
                             .tooltip(tooltip)
                             .on_click(move |_, window, cx| {
@@ -252,11 +248,7 @@ impl Render for QueriesPanel {
                                 path: Some(path.to_string_lossy().into_owned()),
                             };
                             studio_ui::ds::SidebarRow::new(("saved-query", index), name)
-                                .start(
-                                    Icon::new(IconName::FileCode)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Muted),
-                                )
+                                .icon(IconName::FileCode)
                                 .end(studio_ui::ds::sidebar_count(when))
                                 .tooltip(path.display().to_string())
                                 .on_click(move |_, window, cx| {
@@ -341,11 +333,7 @@ fn alias_row(index: usize, alias: &CliAlias) -> AnyElement {
         .pl(px(studio_ui::ds::space::XL))
         .child(
             studio_ui::ds::SidebarRow::new(("stored-alias", index), alias.name.clone())
-                .start(
-                    Icon::new(IconName::Link)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                )
+                .icon(IconName::Link)
                 .end(studio_ui::ds::sidebar_count("alias"))
                 .tooltip(format!(
                     "Alias from the CLI config: {} with its values",

@@ -262,7 +262,7 @@ impl Render for DesignGallery {
             ))
             .child(ds::title_tab(
                 "g-activity",
-                IconName::HistoryRerun,
+                IconName::BoltOutlined,
                 "Activity",
                 false,
                 true,

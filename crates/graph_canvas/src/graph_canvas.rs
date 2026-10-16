@@ -291,8 +291,13 @@ impl Item for GraphCanvas {
         }
     }
 
+    /// The icons of the Graph panel's rows: the explorer is a walk from a node, the ontology
+    /// and a query's result nodes are a map.
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
-        Some(IconName::GitGraph)
+        Some(match self.mode {
+            Mode::Explore => IconName::Crosshair,
+            Mode::Schema | Mode::Results => IconName::GitGraph,
+        })
     }
 
     fn dedupe_key(&self, cx: &App) -> Option<SharedString> {

@@ -53,7 +53,7 @@ pub fn init(cx: &mut App) {
                 PanelPosition::Bottom,
                 "history",
                 "History",
-                IconName::GitGraph,
+                IconName::HistoryRerun,
                 panel.into(),
                 cx,
             );

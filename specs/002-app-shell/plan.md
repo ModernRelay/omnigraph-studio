@@ -91,11 +91,18 @@ title bar; Ragnor's choice over a Zed-style title bar) over one status bar acros
   for the next time; pressing any other shows its panel and opens its dock. The tooltip names
   the panel, or "Hide sidebar" (inspector, bottom panel) with the key. A hidden sidebar comes
   back from its icons; before, only ⌘B did.
-- The status bar (32 px, `ds::size::STATUS_BAR`) reads, after the left dock's buttons: the
+- The status bar (30 px, `ds::size::STATUS_BAR`: Zed's 22 px buttons with 4 px around them)
+  reads, after the left dock's buttons: the
   server chip (state and round trip; the graph switcher), the graph chip and the branch menu,
   then the open tab's own facts (`Item::footer`); at the right, what is running, the tab's
   controls, Studio's memory and CPU, then the bottom and right docks' buttons. Groups are split
-  by Zed's divider (`ds::divider_v`). On glass it sits on the wash under the sheets.
+  by Zed's divider (`ds::divider_v`). As in Zed, the panel buttons and the left side's chips are
+  4 px apart; the right side's bare text keeps 8 px. On glass it sits on the wash under the
+  sheets.
+- Every panel has its own icon: Graph `Blocks`, Explore `ListTree`, Queries `FileCode`, Branches
+  `GitBranch`, Conversations `ZedAssistant`; Nodes `Table`, History `HistoryRerun` (its tab and
+  header too), Activity `BoltOutlined`. Zed draws `GitGraph` and `GitBranch` nearly alike, so
+  `GitGraph` is left to the ontology map.
 - Back and Forward are kept per pane, as Zed's `NavHistory`: a pane records the tab it leaves,
   its arrows (and ⌘[ / ⌘] for the active pane) step through the tabs it showed, skipping closed
   ones, and a new pane starts with none. An arrow with nowhere to go is disabled.
@@ -317,9 +324,9 @@ strips and states built from them); the "Design system" tab (`studio::OpenDesign
 every specimen in the current theme and window style. Features compose `ds` components rather
 than styling one-off elements.
 
-- **Column headers, one status bar.** No title bar. Each column has its own 36 px header strip
-  (`size::HEADER_STRIP`), so the rules line up across the window, over one 32 px status bar
-  across it (`size::STATUS_BAR`, after Zed's). Header strips are window drag areas; as in Zed, a
+- **Column headers, one status bar.** No title bar. Each column has its own 32 px header strip
+  (`size::HEADER_STRIP`, Zed's tab bar), so the rules line up across the window, over one 30 px
+  status bar across it (`size::STATUS_BAR`, after Zed's). Header strips are window drag areas; as in Zed, a
   move starts on the first mouse move after a press, so clicks on strip buttons land.
 - **Panels in docks** (`studio_workspace::panels`, after Zed's `Panel`/`Dock` and Obsidian's
   side docks). A panel is a view with an id, a title and an icon; features add one with
@@ -386,9 +393,13 @@ than styling one-off elements.
   searches, the dialogs' fields, the review editor's fields and the query's parameters. A
   filter among a sidebar's rows (the conversations') is `ds::sidebar_search` instead: a
   sunken row as tall as the rows, its text on their edge, with no border.
-- **Tabs** fill the 36 px strip (an explicit height: the right-click wrapper lays a tab out at
+- **Tabs** fill the 32 px strip (an explicit height: the right-click wrapper lays a tab out at
   its content's height, so `h_full` would shrink it to its label); the active tab joins the
-  document, inactive ones sit on the strip's rule.
+  document, inactive ones sit on the strip's rule. A tab is laid out as Zed's `Tab`: 4 px
+  padding and gaps, a 12 px slot before its icon and title for its state dot (unsaved, newer
+  data) and a 14 px slot after them for its close or pin button, both kept when empty. The
+  strip's Back/Forward and its end buttons sit in Zed's regions: 6 px padding, 4 px gaps, 22 px
+  buttons with 14 px icons, as do a dock header's zoom and hide.
 - **Buttons.** `ds::button` (28 px, a 6 px inset) and `ds::icon_button` (Zed's medium size,
   28 px square) for every button in a toolbar, strip, panel, card footer or dialog, so a hover
   or pressed fill has room around its label. Zed fixes a button's padding by its size (8 px
@@ -399,7 +410,9 @@ than styling one-off elements.
 - **Text sizes.** The window's rem size is `ui_font_size` (16 px by default), as in Zed, so
   every `ui` size scales with it. Body text is `Small`; labels, counts and metadata `XSmall`.
 - **Sidebar rows.** `ds::SidebarRow`: section labels muted, not bold; the selected row a grey
-  pill; counts muted and right-aligned. Footnotes become tooltips.
+  pill; counts muted and right-aligned. Footnotes become tooltips. What leads a label (an icon
+  through `SidebarRow::icon`, at 14 px, or a type mark) sits in one 16 px slot
+  (`size::ROW_ICON`), so every list's labels start on one edge, 36 px in.
 - **Context once.** The branch appears once, in the document footer's branch menu.
 - **Tables.** Like Linear: a 48 px toolbar, a one-line header (name, then the type muted, 30
   px), 28 px rows split by hairlines, no column rules, the cursor as a ring and the selected row
@@ -457,6 +470,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-16 | Strips at Zed's heights; tabs, regions and sidebar rows on Zed's spacing | `studio_workspace` `tabs_fill_the_header_strip` (tab and status bar at the new heights) and the workspace suite; offscreen snapshots of two tables, then one with the bottom panel, compared with Zed's and the Claude app's measurements | Strips 32 px, status bar 30. The sidebar's labels now start on one edge whatever leads them (they were 4 px apart between the view rows' icons and the type marks); the Claude app's sidebar rows are 26 px apart, as Studio's already were. No two panel buttons share an icon (Graph and Nodes were both `Table`, Branches and History near twins); "Delete" and the memory readout, 4 px apart, read as one phrase until a rule split them |
 | 2026-10-16 | Vitesse Refined Light is bundled and the default | `studio_theme` test `studio_themes_are_listed_and_read_as_families`; `studio` `settings_apply` (the light mode resolves "Vitesse Refined Light" through Studio's startup); the bundled file's SHA-256 equals the copy Zed installed (`9731fc19…2998`); offscreen snapshots of a table with the inspector and History, and a query | Green accents and lit panel buttons, Vitesse's syntax colours in the query; One Light before |
 | 2026-10-16 | Tabs scroll, drag and drop as Zed's | `studio_workspace` tests `dropped_tabs_move_within_and_between_panes_and_split_at_an_edge`, `a_drop_near_an_edge_splits_toward_it`, `pane` `dragged_tabs_move_within_their_group_and_arrive_unpinned`; offscreen snapshots: nine tabs; Person and Company with a `drag:` from the Company tab to the document's right edge | Nine tabs in the strip with "+", split and zoom at its end; the drag split the document: Person on the left, Company on the right with the end buttons, the left pane without them |
 | 2026-10-16 | Panels move between docks; the bottom panel spans as its layout says; zoom | `studio_workspace` tests `a_panel_goes_where_the_settings_place_it` (placed at its add, home again when the setting goes, the menu's move), `the_bottom_panel_spans_as_its_layout_says` (contained: the window less the inspector; full: the window), `zoom_covers_the_document_area_until_toggled_or_hidden`, `a_graphs_docks_come_back_with_it`, `panels` `a_taken_panel_leaves_the_others_as_they_were`; offscreen snapshots: `full` with History and the inspector, Explore placed in the right dock with the menu on the Graph button, a zoomed pane | History ran under the sidebar and the inspector; Explore showed in the right dock with its icon at the bar's right end; the menu read "✓ Dock Left, Dock Bottom, Dock Right" with no tooltip over it; the zoomed table covered the document area inside an 8 px inset, its arrows after the traffic lights' room |
