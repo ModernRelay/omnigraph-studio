@@ -25,7 +25,7 @@ use studio_actions::agent::{Allow, AllowAlways, ClearQueue, Reject, Restart, Sen
 use studio_actions::graph::ReviewBranch;
 use studio_settings::StudioSettings;
 use studio_ui::ds;
-use studio_workspace::{Item, ItemEvent, ItemFooter, SavedItem, Workspace};
+use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
 use ui::{
     Callout, CircularProgress, CommonAnimationExt as _, ContextMenu, Indicator, KeyBinding,
@@ -462,58 +462,6 @@ impl Item for AgentPanel {
                 Some(id) => serde_json::json!({ "session": id }),
                 None => Value::Null,
             },
-        })
-    }
-
-    /// Delta's composer footer, borderless and quiet: the agent at work, how full its context
-    /// is, its options (mode, effort, more), the model it runs, a new conversation, then send or
-    /// stop. Send fills in only when there is something to send.
-    fn footer(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<ItemFooter> {
-        let running = matches!(self.state, State::Prompting { .. });
-        let can_send = matches!(
-            self.state,
-            State::Ready { .. } | State::Idle | State::Exited { .. } | State::Starting
-        ) && !self.composer.read(cx).text(cx).trim().is_empty();
-        let send_or_stop = if running {
-            ds::round_button("stop", IconName::Stop, false, cx)
-                .tooltip(|_, cx| Tooltip::for_action("Stop", &Stop, cx))
-                .on_click(cx.listener(|this, _, window, cx| this.stop(&Stop, window, cx)))
-        } else {
-            ds::round_button("send", IconName::Send, can_send, cx)
-                .tooltip(|_, cx| Tooltip::for_action("Send", &Send, cx))
-                .on_click(cx.listener(|this, _, window, cx| this.send(&Send, window, cx)))
-        };
-        let mut end = Vec::new();
-        if running {
-            end.push(
-                h_flex()
-                    .gap(px(ds::space::XS))
-                    .items_center()
-                    .child(
-                        Icon::new(IconName::ArrowCircle)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted)
-                            .with_rotate_animation(2),
-                    )
-                    .child(ds::text::meta("Working"))
-                    .into_any_element(),
-            );
-        }
-        end.extend(self.render_usage(cx));
-        end.extend(self.render_options(cx));
-        if matches!(self.state, State::Exited { .. }) {
-            end.push(
-                ds::icon_button("restart", IconName::RotateCw)
-                    .icon_color(Color::Muted)
-                    .tooltip(|_, cx| Tooltip::for_action("Start the agent again", &Restart, cx))
-                    .on_click(cx.listener(|this, _, window, cx| this.restart(&Restart, window, cx)))
-                    .into_any_element(),
-            );
-        }
-        end.push(send_or_stop.into_any_element());
-        Some(ItemFooter {
-            start: Vec::new(),
-            end,
         })
     }
 }
@@ -1806,8 +1754,7 @@ fn proxy_executable(current: PathBuf) -> PathBuf {
     current
 }
 
-/// The last eight characters of a graph commit id, as the activity log shows it.
-/// One of the agent's session options as the footer shows it, with a value chosen but not yet
+/// One of the agent's session options as the composer shows it, with a value chosen but not yet
 /// confirmed standing in for the agent's.
 #[derive(Clone)]
 struct OptionView {
@@ -1894,9 +1841,9 @@ impl OptionView {
         })
     }
 
-    /// The icon a footer picker shows before the value, or `None` for an option that belongs
+    /// The icon a composer picker shows before the value, or `None` for an option that belongs
     /// under More options. The model's icon is its provider's, chosen by the caller.
-    fn footer_icon(&self) -> Option<IconName> {
+    fn picker_icon(&self) -> Option<IconName> {
         let Choice::Select { .. } = &self.choice else {
             return None;
         };
@@ -1987,7 +1934,7 @@ impl OptionView {
     }
 }
 
-/// A footer picker: the option's icon and current value, borderless, opening its values. The
+/// A composer picker: the option's icon and current value, borderless, opening its values. The
 /// model's menu also holds the agent: a new conversation, and choosing another agent.
 fn option_picker(
     option: OptionView,
@@ -2079,7 +2026,7 @@ fn select_values(
     }
 }
 
-/// The longest value name a footer picker shows before it is cut.
+/// The longest value name a composer picker shows before it is cut.
 const OPTION_NAME_CHARS: usize = 32;
 /// The longest conversation title a tab shows.
 const TAB_TITLE_CHARS: usize = 28;
@@ -2282,7 +2229,7 @@ impl Render for AgentPanel {
             (session.graph_id.clone(), session.branch.clone())
         };
         // The prompt, inline under the thread as Delta writes it: the next message's gutter and
-        // the editor. The agent and send are in the footer strip.
+        // the editor, then the controls that send it.
         let composer = div()
             .id("composer")
             .key_context("AgentComposer")
@@ -2305,7 +2252,8 @@ impl Render for AgentPanel {
                         .color(Color::Muted),
                 ),
                 div().text_sm().child(self.composer.clone()),
-            ));
+            ))
+            .child(self.render_composer_controls(cx));
 
         v_flex()
             .key_context("AgentPanel")
@@ -2327,6 +2275,62 @@ impl Render for AgentPanel {
 }
 
 impl AgentPanel {
+    /// The composer's controls under the prompt, as Delta's composer footer and Zed's message
+    /// editor keep them with the text they send: the agent at work, how full its context is,
+    /// its options (mode, effort, more), the model it runs, then send or stop. Send fills in
+    /// only when there is something to send. They are the composer's, not the status bar's,
+    /// which holds facts about the open tab.
+    fn render_composer_controls(&self, cx: &mut Context<Self>) -> Div {
+        let running = matches!(self.state, State::Prompting { .. });
+        let can_send = matches!(
+            self.state,
+            State::Ready { .. } | State::Idle | State::Exited { .. } | State::Starting
+        ) && !self.composer.read(cx).text(cx).trim().is_empty();
+        let send_or_stop = if running {
+            ds::round_button("stop", IconName::Stop, false, cx)
+                .tooltip(|_, cx| Tooltip::for_action("Stop", &Stop, cx))
+                .on_click(cx.listener(|this, _, window, cx| this.stop(&Stop, window, cx)))
+        } else {
+            ds::round_button("send", IconName::Send, can_send, cx)
+                .tooltip(|_, cx| Tooltip::for_action("Send", &Send, cx))
+                .on_click(cx.listener(|this, _, window, cx| this.send(&Send, window, cx)))
+        };
+        let mut end = Vec::new();
+        if running {
+            end.push(
+                h_flex()
+                    .gap(px(ds::space::XS))
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::ArrowCircle)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted)
+                            .with_rotate_animation(2),
+                    )
+                    .child(ds::text::meta("Working"))
+                    .into_any_element(),
+            );
+        }
+        end.extend(self.render_usage(cx));
+        end.extend(self.render_options(cx));
+        if matches!(self.state, State::Exited { .. }) {
+            end.push(
+                ds::icon_button("restart", IconName::RotateCw)
+                    .icon_color(Color::Muted)
+                    .tooltip(|_, cx| Tooltip::for_action("Start the agent again", &Restart, cx))
+                    .on_click(cx.listener(|this, _, window, cx| this.restart(&Restart, window, cx)))
+                    .into_any_element(),
+            );
+        }
+        end.push(send_or_stop.into_any_element());
+        h_flex()
+            .justify_end()
+            .items_center()
+            .gap(px(ds::space::XS))
+            .pt(px(ds::space::SM))
+            .children(end)
+    }
+
     /// The agent's name, a dot for its state and what the state means.
     fn status(&self) -> (String, Color, &'static str) {
         match &self.state {
@@ -3227,7 +3231,7 @@ impl AgentPanel {
             .into_any_element()
     }
 
-    /// The agent's options in the footer (spec 011), as icon and value with no chrome: its mode
+    /// The agent's options in the composer (spec 011), as icon and value with no chrome: its mode
     /// and reasoning level in the agent's order, then everything else (switches, profiles)
     /// behind one More options menu, then the model, last as in Delta, whose menu also holds
     /// the agent. Before the agent offers a model, the agent's name and state stand there.
@@ -3243,14 +3247,14 @@ impl AgentPanel {
         };
         let (shown, more): (Vec<_>, Vec<_>) = options
             .into_iter()
-            .partition(|option| option.footer_icon().is_some());
+            .partition(|option| option.picker_icon().is_some());
         let (models, shown): (Vec<_>, Vec<_>) = shown.into_iter().partition(OptionView::is_model);
         let (agent_name, dot, state) = self.status();
 
         let mut pickers: Vec<AnyElement> = shown
             .into_iter()
             .map(|option| {
-                let icon = option.footer_icon().unwrap_or(IconName::Circle);
+                let icon = option.picker_icon().unwrap_or(IconName::Circle);
                 option_picker(option, Icon::new(icon), &panel, None)
             })
             .collect();

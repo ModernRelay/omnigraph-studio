@@ -268,7 +268,10 @@ As in Zed's agent panel (checked in `agent_ui` at `v1.23.2`), and only through s
 - **Options.** The options an agent returns from `session/new` and `session/load`, and later in
   `config_option_update`, are its model, mode, reasoning level and the like. Studio advertises
   `session.configOptions.boolean`, so an on/off option comes as a switch rather than an On/Off
-  menu. The footer follows Delta's: borderless, an icon and the value, no chevrons. The mode
+  menu. The controls sit in the composer, on a row under the prompt (as Zed's message editor
+  keeps them with the text they send; the window's status bar holds only facts about the open
+  tab), and read as Delta's composer footer: borderless, an icon and the value, no chevrons,
+  ending with send or stop. The mode
   (a person-check mark) and the reasoning level (a thinking mark, "High") show in the agent's
   order; every other option (switches such as Fast mode, agent profiles) sits behind one ⋯
   "More options" menu whose tooltip lists their values, so an agent with many options does not
@@ -330,6 +333,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 | 2026-10-12 | The Conversations panel reads clean | Offscreen snapshots after "looks messy": a pinned, three recent and an archived conversation; Search open with "comp"; a hovered row | Search, More and + on the title line; one text edge for every row; no times on rows (the tooltip read "you last wrote 12m ago"); "Archived 1 ›" at the end; the search field framed on the rows' edge |
 | 2026-10-13 | The thread lays out only what shows and follows the newest reply | Read `gpui/src/elements/list.rs` (`ListState::splice`, `remeasure_items`, `FollowMode::Tail`, `scroll_to_end`) at `v1.23.2`; offscreen snapshots with the test agent: three questions in a 1300×800 window, then an empty conversation | The view stood at the end of the third reply, its markdown at full height (lists, inline code and the code block), the earlier turns above it; the empty conversation still showed "Ask about the graph" |
 | 2026-10-14 | Typing in the composer does not grow with the conversation | Snapshot tool on `release-fast` with the test agent in a scratch data folder: one and three markdown replies, a click into the composer, then 200 keys | 0.85 ms of main-thread CPU a key beside one reply, 0.93 ms beside three: the composer and the thread are one view, but the thread's `list` lays out only the replies that show. No change needed. `studio_agent::Ask` leaves focus off the composer, so the measurement clicks into it first |
+| 2026-10-16 | Send and the options sit under the prompt | Offscreen snapshot of a conversation tab with text in the composer | Once the status bar became one bar across the window, the composer's controls had landed at the window's bottom edge; they now end the composer, right-aligned under the prompt, and the status bar shows the graph and branch alone |
 
 ## Corrections
 
