@@ -184,6 +184,20 @@ new branch's first manifest names that commit's table pins and lineage, publishe
 009. *Today:* History opens a read-only query or table at a commit; a branch starts from a
 branch head.
 
+### Writes
+
+**E25. A mutation that both adds and removes.** Rule D2 keeps one mutation constructive
+(insert, update) or destructive (delete), never both (`docs/dev/writes.md:376-379` at OmniGraph
+main), so replacing a relationship from a node is two commits, and a `@card(..1)` replacement
+must delete before it inserts. One write holding both, staged and published once, would make it
+one commit. *Waits:* 014. *Today:* Studio saves the two parts as two ordered commits and names
+both, or saves through a branch and a merge when the person asks for one change.
+
+**E26. Edge update.** Edge types have no update (T16; `docs/user/mutations/index.md:90-92`): a
+keyed edge changes by inserting its key again, an unkeyed one by delete and insert, which gives
+it a new id. *Waits:* 014. *Today:* an unkeyed edge's properties save as delete and insert, and
+Studio says its id changes.
+
 ### Already on OmniGraph main, not in 0.13.0
 
 **R1. Blob writes** (`PUT`/`DELETE /graphs/{id}/blob`). Studio offers Blob upload and clear only

@@ -44,6 +44,7 @@ Add tasks, contracts or data-model files only for large features.
 | 011 | [Agent panel](011-agent-panel/plan.md) | implemented |
 | 012 | [OmniGraph engine changes](012-omnigraph-engine-changes/plan.md) | deferred |
 | 013 | [The agent uses the OmniGraph CLI](013-agent-cli/plan.md) | implemented |
+| 014 | [Node pages, editing in place, and long text](014-node-pages/plan.md) | draft |
 
 Each plan's first line holds its full status. 012 is not scheduled: it records every OmniGraph change Studio would use, what Studio does
 without it, and which plan waits on it. Each feature plan's Deferred section names its IDs.
