@@ -6,7 +6,6 @@ use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;
 
 pub struct ActivityLog {
-    workspace: WeakEntity<Workspace>,
     session: Option<Entity<GraphSession>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -21,7 +20,6 @@ impl ActivityLog {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut this = Self {
-            workspace: workspace.clone(),
             session: None,
             _subscriptions: Vec::new(),
         };
@@ -53,7 +51,6 @@ impl ActivityLog {
 
 impl Render for ActivityLog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let _ = &self.workspace;
         let entries = self
             .session
             .as_ref()
@@ -68,7 +65,7 @@ impl Render for ActivityLog {
             .py(px(studio_ui::ds::space::XS))
             .when(entries.is_empty(), |d| {
                 d.child(studio_ui::ds::empty_state(
-                    IconName::ListTree,
+                    IconName::BoltOutlined,
                     "No writes yet",
                 ))
             })

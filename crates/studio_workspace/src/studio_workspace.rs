@@ -1813,22 +1813,16 @@ impl Workspace {
         let panel = colors.panel_background;
         let hairline = studio_ui::ds::surface::rule(cx);
         // The column's header is its panel's own, as a Zed panel draws its header: the panel's
-        // title and its buttons. Panels are switched from the status bar.
+        // title and its buttons. Panels are switched, and the sidebar shown and hidden, from
+        // the status bar.
         let header = self
             .strip("sidebar-header", HEADER_HEIGHT, cx)
-            .pr_2()
-            .gap_0p5()
+            .pr(px(studio_ui::ds::space::SM))
+            .gap(px(studio_ui::ds::space::XS))
             .when(!studio_ui::ds::is_glass(cx), |d| {
                 d.border_b_1().border_color(hairline)
             })
             .child(div().w(px(TRAFFIC_LIGHTS_WIDTH)).flex_none())
-            .child(
-                IconButton::new("toggle-sidebar", IconName::ThreadsSidebarLeftOpen)
-                    .icon_size(IconSize::Small)
-                    .tooltip(|_, cx| Tooltip::for_action("Hide sidebar", &ToggleSidebar, cx))
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx)),
-            )
-            .child(div().w(px(studio_ui::ds::space::SM)))
             .children(self.left.active_panel().map(dock_title))
             .child(
                 IconButton::new("search", IconName::MagnifyingGlass)
@@ -1870,6 +1864,29 @@ impl Workspace {
             .child(header)
             .child(body)
             .child(resize_handle(PanelPosition::Left))
+    }
+
+    /// The status bar's first button, as Zed's sidebar toggle: shows or hides the sidebar, its
+    /// icon drawn as the sidebar is.
+    fn render_sidebar_toggle(&self) -> impl IntoElement {
+        let open = self.left.open;
+        IconButton::new(
+            "toggle-sidebar",
+            if open {
+                IconName::ThreadsSidebarLeftOpen
+            } else {
+                IconName::ThreadsSidebarLeftClosed
+            },
+        )
+        .icon_size(IconSize::Small)
+        .tooltip(move |_, cx| {
+            Tooltip::for_action(
+                if open { "Hide sidebar" } else { "Show sidebar" },
+                &ToggleSidebar,
+                cx,
+            )
+        })
+        .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx))
     }
 
     /// A dock's panels as buttons in the status bar, as Zed's `PanelButtons`: one icon each.
@@ -2273,6 +2290,8 @@ impl Workspace {
                             .child(end_button),
                     )
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        // The strip's own double click zooms the window; a tab's keeps it.
+                        cx.stop_propagation();
                         if event.click_count() == 2
                             && let Some(pane) = this.pane_mut(pane_id)
                         {
@@ -2704,7 +2723,9 @@ impl Workspace {
             .items_center()
             .overflow_hidden()
             .when(shown && !self.left.panels.is_empty(), |bar| {
-                bar.child(self.render_panel_buttons(PanelPosition::Left, cx))
+                bar.child(self.render_sidebar_toggle())
+                    .child(studio_ui::ds::divider_v(cx))
+                    .child(self.render_panel_buttons(PanelPosition::Left, cx))
                     .child(studio_ui::ds::divider_v(cx))
             })
             .child(self.render_server_switcher(cx))
@@ -2963,8 +2984,14 @@ impl Workspace {
                 },
             )
             .icon_size(IconSize::Small)
+            // ⇧⎋ ends any zoom but zooms the active pane, not this dock, so only "Zoom out"
+            // shows it.
             .tooltip(move |_, cx| {
-                Tooltip::for_action(if zoomed { "Zoom out" } else { "Zoom in" }, &ToggleZoom, cx)
+                if zoomed {
+                    Tooltip::for_action("Zoom out", &ToggleZoom, cx)
+                } else {
+                    Tooltip::simple("Zoom in", cx)
+                }
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.zoomed = if zoomed {
@@ -2990,10 +3017,17 @@ impl Workspace {
 
     /// A panel's content, drawn as it was made for: a side panel in its scrolling host, a
     /// bottom panel cached at the dock's size (it scrolls itself), whichever dock it is in now.
+    /// A sidebar panel's list starts below its header by the inset its selected row has from
+    /// the column's sides.
     fn panel_body(&self, panel: &PanelEntry) -> AnyElement {
         match panel.home {
             PanelPosition::Bottom => panel.view.clone().cached(cached_fill()).into_any_element(),
-            PanelPosition::Left | PanelPosition::Right => self.hosted(&panel.view),
+            PanelPosition::Left => div()
+                .size_full()
+                .pt(px(studio_ui::ds::space::SM))
+                .child(self.hosted(&panel.view))
+                .into_any_element(),
+            PanelPosition::Right => self.hosted(&panel.view),
         }
     }
 

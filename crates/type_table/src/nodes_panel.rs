@@ -68,8 +68,11 @@ impl Render for NodesPanel {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         match &self.table {
             Some(table) => div().size_full().child(table.clone()).into_any_element(),
-            None => studio_ui::ds::empty_state(IconName::Table, "Click a type to browse it")
-                .into_any_element(),
+            None => studio_ui::ds::empty_state(
+                IconName::Table,
+                "Click a type on the ontology to browse it here",
+            )
+            .into_any_element(),
         }
     }
 }

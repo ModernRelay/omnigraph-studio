@@ -64,13 +64,13 @@ a 412 reopens the draft.
 
 ```
 ┌───────────────┬──────────────────────────────────────────┬───────────────────┐
-│ ●●● ◧ Graph  ⌕│ ← → │ Person │ Company │ query.gq        │ Inspector       × │
+│ ●●●  Graph   ⌕│ ← → │ Person │ Company │ query.gq        │ Inspector       × │
 │ Types   12 480│                                          │  fields, edges    │
 │ Relationships │            active item                   │                   │
 │               ├──────────────────────────────────────────┤                   │
 │               │ History                               ×  │                   │
 ├───────────────┴──────────────────────────────────────────┴───────────────────┤
-│ ▦ ≡ ⎘ ⑂ ✦ │ ● env · 0.13 · 31 ms │ graph / ⑂ main │ tab facts … 41 MB │ ▦ ⌥ ◷ │ ⓘ │
+│ ◧ │ ▦ ≡ ⎘ ⑂ ✦ │ ● env · 0.13 · 31 ms │ graph / ⑂ main │ tab facts … 41 MB │ ▦ ◷ ⚡ │ ⓘ │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -80,9 +80,9 @@ a 412 reopens the draft.
   Conversations. Right dock: inspector. Bottom dock: Nodes, History, Activity.
 - Center: panes of items (type table, canvas, query editor, review, commit); each pane's tab
   strip starts with its own Back and Forward.
-- Status bar, after Zed's: every panel's button (the left dock's at the left, the bottom and
-  right docks' at the right), the connection chip, graph and branch, the tab's facts, running
-  work, memory and CPU. A button's right-click menu moves its panel to another dock
+- Status bar, after Zed's: the sidebar toggle, every panel's button (the left dock's at the
+  left, the bottom and right docks' at the right), the connection chip, graph and branch, the
+  tab's facts, running work, memory and CPU. A button's right-click menu moves its panel to another dock
   (`panels.<id>.dock` in the settings); `studio.bottom_dock_layout` says where the bottom dock
   spans; ⇧⎋ zooms the active pane.
 

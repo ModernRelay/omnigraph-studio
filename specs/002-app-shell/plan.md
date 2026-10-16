@@ -91,8 +91,11 @@ title bar; Ragnor's choice over a Zed-style title bar) over one status bar acros
   for the next time; pressing any other shows its panel and opens its dock. The tooltip names
   the panel, or "Hide sidebar" (inspector, bottom panel) with the key. A hidden sidebar comes
   back from its icons; before, only ⌘B did.
+- The status bar's first button is the sidebar toggle, as Zed's: its icon drawn as the sidebar
+  is (shown or hidden), then a divider. The sidebar's header has no toggle of its own: the
+  traffic lights' room, the panel's title and search.
 - The status bar (30 px, `ds::size::STATUS_BAR`: Zed's 22 px buttons with 4 px around them)
-  reads, after the left dock's buttons: the
+  reads, after the sidebar toggle and the left dock's buttons: the
   server chip (state and round trip; the graph switcher), the graph chip and the branch menu,
   then the open tab's own facts (`Item::footer`); at the right, what is running, the tab's
   controls, Studio's memory and CPU, then the bottom and right docks' buttons. Groups are split
@@ -327,7 +330,11 @@ than styling one-off elements.
 - **Column headers, one status bar.** No title bar. Each column has its own 32 px header strip
   (`size::HEADER_STRIP`, Zed's tab bar), so the rules line up across the window, over one 30 px
   status bar across it (`size::STATUS_BAR`, after Zed's). Header strips are window drag areas; as in Zed, a
-  move starts on the first mouse move after a press, so clicks on strip buttons land.
+  move starts on the first mouse move after a press, so clicks on strip buttons land, and a
+  press on a tab drags the tab. The window leaves that band to the app
+  (`WindowOptions::app_owns_titlebar_drag`, as Zed's windows): otherwise AppKit drags the window
+  from anywhere in the transparent title bar's height, tabs included. A tab's double click keeps
+  it and stops there; the strip's own zooms the window.
 - **Panels in docks** (`studio_workspace::panels`, after Zed's `Panel`/`Dock` and Obsidian's
   side docks). A panel is a view with an id, a title and an icon; features add one with
   `Workspace::add_panel(position, …)` and show it with `activate_panel`. A dock (left, right,
@@ -470,6 +477,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-16 | The sidebar toggle at the status bar's start; tabs drag in the app | `studio` `windows_leave_the_titlebar_drag_to_the_app` (red before the option was set); offscreen snapshots with the sidebar shown and hidden, the ontology browsing Company into Nodes, Activity empty | In the app, dragging a tab moved the window: AppKit owned the title bar's band, where Studio's tabs sit. The toggle reads filled with the sidebar shown and empty with it hidden; the sidebar's list starts 6 px under its header; Nodes and Activity did what their specs say, their empty states now naming where a type is clicked and showing Activity's icon |
 | 2026-10-16 | Strips at Zed's heights; tabs, regions and sidebar rows on Zed's spacing | `studio_workspace` `tabs_fill_the_header_strip` (tab and status bar at the new heights) and the workspace suite; offscreen snapshots of two tables, then one with the bottom panel, compared with Zed's and the Claude app's measurements | Strips 32 px, status bar 30. The sidebar's labels now start on one edge whatever leads them (they were 4 px apart between the view rows' icons and the type marks); the Claude app's sidebar rows are 26 px apart, as Studio's already were. No two panel buttons share an icon (Graph and Nodes were both `Table`, Branches and History near twins); "Delete" and the memory readout, 4 px apart, read as one phrase until a rule split them |
 | 2026-10-16 | Vitesse Refined Light is bundled and the default | `studio_theme` test `studio_themes_are_listed_and_read_as_families`; `studio` `settings_apply` (the light mode resolves "Vitesse Refined Light" through Studio's startup); the bundled file's SHA-256 equals the copy Zed installed (`9731fc19…2998`); offscreen snapshots of a table with the inspector and History, and a query | Green accents and lit panel buttons, Vitesse's syntax colours in the query; One Light before |
 | 2026-10-16 | Tabs scroll, drag and drop as Zed's | `studio_workspace` tests `dropped_tabs_move_within_and_between_panes_and_split_at_an_edge`, `a_drop_near_an_edge_splits_toward_it`, `pane` `dragged_tabs_move_within_their_group_and_arrive_unpinned`; offscreen snapshots: nine tabs; Person and Company with a `drag:` from the Company tab to the document's right edge | Nine tabs in the strip with "+", split and zoom at its end; the drag split the document: Person on the left, Company on the right with the end buttons, the left pane without them |

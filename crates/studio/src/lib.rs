@@ -178,6 +178,10 @@ pub fn window_options(bounds: Option<gpui::Bounds<gpui::Pixels>>, cx: &App) -> W
             )),
         }),
         app_id: Some("com.modernrelay.omnigraph-studio".into()),
+        // As Zed's windows: the header strips sit where a title bar would be and move the
+        // window themselves (`Window::start_window_move`), so AppKit must not drag it from
+        // that band, which would move the window from a tab being dragged.
+        app_owns_titlebar_drag: true,
         ..Default::default()
     }
 }
@@ -461,5 +465,20 @@ fn tell(cx: &mut App, kind: ToastKind, message: String) {
             })
             .ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Studio's header strips are where a title bar would be, and the workspace moves the window
+    /// from them itself. Were AppKit to own that band, a press on a tab would drag the window.
+    #[gpui::test]
+    fn windows_leave_the_titlebar_drag_to_the_app(cx: &mut gpui::TestAppContext) {
+        let bounds = gpui::Bounds::new(gpui::point(px(0.), px(0.)), size(px(1440.), px(900.)));
+        let options = cx.update(|cx| window_options(Some(bounds), cx));
+        assert!(options.app_owns_titlebar_drag);
+        assert!(options.is_movable, "moved from its header strips");
     }
 }
