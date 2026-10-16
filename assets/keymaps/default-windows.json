@@ -181,6 +181,15 @@
     }
   },
   {
+    "context": "EdgeSearch > Editor",
+    "bindings": {
+      "up": "studio_table::SelectPreviousSuggestion",
+      "down": "studio_table::SelectNextSuggestion",
+      "enter": "menu::Confirm",
+      "escape": "menu::Cancel"
+    }
+  },
+  {
     "context": "EdgeEndpoint > Editor",
     "bindings": {
       "up": "studio_table::SelectPreviousSuggestion",

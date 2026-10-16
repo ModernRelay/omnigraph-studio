@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use editor::Editor;
+use editor::{Editor, EditorEvent};
 use gpui::{
     App, ClipboardItem, Context, Entity, Focusable as _, Render, SharedString, Subscription, Task,
     Window,
@@ -19,6 +19,7 @@ use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Map, Value};
 use studio_actions::graph::{OpenBlob, OpenNodePage, PeekNode};
 use studio_actions::node::{CancelField, ExpandField, SaveField};
+use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 use ui::prelude::*;
 use ui::{ContextMenu, Indicator, PopoverMenu, Switch, ToggleState, Tooltip, rems_from_px};
 
@@ -27,7 +28,7 @@ use crate::blob::{
 };
 use crate::model::{
     FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, display_value, format_count, node_rows,
-    reads_as_markdown, same_value, short_commit,
+    reads_as_markdown, same_value, save_result, short_commit,
 };
 use graph_client::{BlobCell, BlobMeta};
 
@@ -78,6 +79,9 @@ impl PeekSubject {
 pub struct Neighbour {
     pub id: String,
     pub label: Option<String>,
+    /// The edge that relates it, which removing the relationship names; `None` when it was
+    /// read without it (a table's chips).
+    pub edge_id: Option<String>,
 }
 
 /// What the table already read about one of the row's relationship groups, at the peek's
@@ -123,6 +127,25 @@ struct FieldEdit {
     _blur: Subscription,
 }
 
+/// Adding a relationship from the node: the search over the other type and what it found.
+struct AddEdge {
+    /// The relationship group it adds to.
+    index: usize,
+    editor: Entity<Editor>,
+    found: Loadable<Vec<Neighbour>>,
+    highlighted: usize,
+    _search: Option<Task<()>>,
+    _changed: Subscription,
+}
+
+/// One relationship written from the node.
+enum EdgeChange {
+    /// To the node with this id.
+    Add(String),
+    /// The edge with this id.
+    Remove(String),
+}
+
 /// Saving a value to a file: how far it got, or how it ended.
 #[derive(Debug, Clone)]
 enum SaveState {
@@ -154,6 +177,14 @@ pub struct NodePeek {
     edits: HashMap<String, FieldEdit>,
     /// Properties whose write is out, shown with their new value and a dot.
     saving: HashSet<String>,
+    /// A relationship being added.
+    adding: Option<AddEdge>,
+    /// The edge whose × was pressed once: the next press removes it.
+    removing: Option<String>,
+    /// Relationship groups with a write out.
+    edge_writes: HashSet<usize>,
+    /// Why a group's last write did not land.
+    group_notices: HashMap<usize, Notice>,
     _tasks: Vec<Task<()>>,
     _subscription: Subscription,
 }
@@ -234,6 +265,7 @@ impl NodePeek {
                 && *branch == session.read(cx).branch
                 && !this.holds_commit
                 && this.saving.is_empty()
+                && this.edge_writes.is_empty()
                 && this.snapshot.as_ref().is_some_and(|pin| pin != head)
             {
                 this.newer = true;
@@ -258,6 +290,10 @@ impl NodePeek {
             markdown: HashMap::new(),
             edits: HashMap::new(),
             saving: HashSet::new(),
+            adding: None,
+            removing: None,
+            edge_writes: HashSet::new(),
+            group_notices: HashMap::new(),
             _tasks: Vec::new(),
             _subscription: subscription,
         };
@@ -1210,6 +1246,345 @@ impl NodePeek {
         }
     }
 
+    // ---- relationships (spec 014) ----
+
+    /// Whether this view adds and removes a node's relationships: a node read at the head.
+    fn edits_relationships(&self) -> bool {
+        matches!(self.subject, PeekSubject::Node { .. })
+            && !self.holds_commit
+            && self.values.loaded().is_some()
+    }
+
+    /// The edge properties a new relationship of this group must be given; such a one is added
+    /// from its own table, whose form asks for them.
+    fn required_edge_properties(&self, index: usize) -> Vec<String> {
+        let (Some(schema), Some(group)) = (&self.schema, self.groups.get(index)) else {
+            return Vec::new();
+        };
+        schema
+            .edge(&group.group.edge)
+            .map(|edge| {
+                edge.properties
+                    .iter()
+                    .filter(|p| !p.nullable && !p.is_key)
+                    .map(|p| p.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether the group holds at most one neighbour (`@card(..1)` seen from its source).
+    fn holds_one(&self, index: usize) -> bool {
+        let (Some(schema), Some(group)) = (&self.schema, self.groups.get(index)) else {
+            return false;
+        };
+        group.group.direction == Direction::Outgoing
+            && schema
+                .edge(&group.group.edge)
+                .is_some_and(|edge| edge.at_most_one)
+    }
+
+    /// "+ Add": a search over the other type, this node already the relationship's end.
+    fn start_add(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .adding
+            .as_ref()
+            .is_some_and(|adding| adding.index == index)
+        {
+            return;
+        }
+        let Some(group) = self.groups.get(index) else {
+            return;
+        };
+        let other = group.group.other_type.clone();
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text(&format!("Search {other} by name or id…"), window, cx);
+            editor.set_text_style_refinement(studio_ui::ds::field_text(cx));
+            editor
+        });
+        let changed = cx.subscribe_in(&editor, window, |this, _, event: &EditorEvent, _, cx| {
+            if let EditorEvent::BufferEdited = event {
+                this.search(cx);
+            }
+        });
+        window.focus(&editor.focus_handle(cx), cx);
+        self.removing = None;
+        self.group_notices.remove(&index);
+        self.adding = Some(AddEdge {
+            index,
+            editor,
+            found: Loadable::NotLoaded,
+            highlighted: 0,
+            _search: None,
+            _changed: changed,
+        });
+        if let Some(group) = self.groups.get(index)
+            && !group.expanded
+        {
+            self.toggle_group(index, cx);
+        }
+        self.search(cx);
+        cx.notify();
+    }
+
+    /// Reads the other type's nodes matching what is typed, eight at a time, after a pause.
+    fn search(&mut self, cx: &mut Context<Self>) {
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        let Some(adding) = self.adding.as_mut() else {
+            return;
+        };
+        let Some(group) = self.groups.get(adding.index) else {
+            return;
+        };
+        let text = adding.editor.read(cx).text(cx);
+        let query = match builder::node_search(&schema, &group.group.other_type, text.trim(), 8) {
+            Ok(query) => query,
+            Err(error) => {
+                adding.found = Loadable::Failed(error.to_string());
+                return;
+            }
+        };
+        let session = self.session.downgrade();
+        adding._search = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COUNT_DELAY).await;
+            let Ok(read) = session.update(cx, |session, cx| session.read(&query, None, cx)) else {
+                return;
+            };
+            let result = read.await;
+            this.update(cx, |this, cx| {
+                if let Some(adding) = this.adding.as_mut() {
+                    adding.found = match result {
+                        Ok(output) => Loadable::Loaded(neighbours_from(&output.rows)),
+                        Err(error) => Loadable::Failed(error.to_string()),
+                    };
+                    adding.highlighted = 0;
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn move_match(&mut self, step: isize, cx: &mut Context<Self>) {
+        if let Some(adding) = self.adding.as_mut()
+            && let Loadable::Loaded(found) = &adding.found
+            && !found.is_empty()
+        {
+            let last = found.len() as isize - 1;
+            adding.highlighted = (adding.highlighted as isize + step).clamp(0, last) as usize;
+            cx.notify();
+        }
+    }
+
+    fn cancel_add(&mut self, cx: &mut Context<Self>) {
+        self.adding = None;
+        cx.notify();
+    }
+
+    /// Adds the relationship to the highlighted node; on a group that holds one, it replaces
+    /// the one there, which is removed first so the limit holds (rule D2 makes that two
+    /// commits).
+    fn add_highlighted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(adding) = self.adding.as_ref() else {
+            return;
+        };
+        let Some(picked) = adding
+            .found
+            .loaded()
+            .and_then(|found| found.get(adding.highlighted))
+            .cloned()
+        else {
+            return;
+        };
+        let index = adding.index;
+        self.adding = None;
+        let replaced = self
+            .holds_one(index)
+            .then(|| {
+                self.groups[index]
+                    .neighbours
+                    .loaded()
+                    .and_then(|shown| shown.first())
+                    .and_then(|first| first.edge_id.clone())
+            })
+            .flatten();
+        self.write_edge(index, EdgeChange::Add(picked.id), replaced, window, cx);
+    }
+
+    /// The first click on a neighbour's × asks; the second removes the relationship.
+    fn press_remove(
+        &mut self,
+        index: usize,
+        edge_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.removing.as_deref() == Some(edge_id.as_str()) {
+            self.removing = None;
+            self.write_edge(index, EdgeChange::Remove(edge_id), None, window, cx);
+        } else {
+            self.removing = Some(edge_id);
+            cx.notify();
+        }
+    }
+
+    /// Writes one relationship change, after removing `first` when it is given, each as its
+    /// own commit; the group is read again at the view's commit, which follows its own
+    /// commits.
+    fn write_edge(
+        &mut self,
+        index: usize,
+        change: EdgeChange,
+        first: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (PeekSubject::Node { id, .. }, Some(schema)) =
+            (self.subject.clone(), self.schema.clone())
+        else {
+            return;
+        };
+        let Some(group) = self.groups.get(index).map(|group| group.group.clone()) else {
+            return;
+        };
+        let mut queries = Vec::new();
+        if let Some(edge_id) = &first {
+            queries.push((
+                builder::delete_edge(&schema, &group.edge, edge_id),
+                "Replace",
+            ));
+        }
+        queries.push(match &change {
+            EdgeChange::Add(other) => {
+                let (from, to) = match group.direction {
+                    Direction::Outgoing => (id.as_str(), other.as_str()),
+                    Direction::Incoming => (other.as_str(), id.as_str()),
+                };
+                (
+                    builder::insert_edge(&schema, &group.edge, from, to, &[]),
+                    "Add",
+                )
+            }
+            EdgeChange::Remove(edge_id) => (
+                builder::delete_edge(&schema, &group.edge, edge_id),
+                "Remove",
+            ),
+        });
+        let mut built = Vec::new();
+        for (query, verb) in queries {
+            match query {
+                Ok(query) => built.push((query, verb)),
+                Err(error) => {
+                    self.group_notices
+                        .insert(index, Notice::new(Tone::Invalid, error.to_string()));
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        let branch = self.session.read(cx).branch.clone();
+        let other = match &change {
+            EdgeChange::Add(other) => other.clone(),
+            EdgeChange::Remove(_) => group.other_type.clone(),
+        };
+        self.edge_writes.insert(index);
+        self.group_notices.remove(&index);
+        let session = self.session.clone();
+        let edge = group.edge.clone();
+        // Detached: closing the page or moving the peek never cancels a write.
+        cx.spawn_in(window, async move |this, cx| {
+            let mut outcome = None;
+            for (query, verb) in built {
+                let description = format!("{verb} {edge} of {id} · {other}");
+                let write = session.update(cx, |session, cx| {
+                    session.write(&query, None, description, cx)
+                });
+                let result = save_result(&write.await, &branch);
+                let landed = matches!(result, SaveResult::Saved { .. });
+                outcome = Some(result);
+                if !landed {
+                    break;
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.edge_writes.remove(&index);
+                match outcome {
+                    Some(SaveResult::Saved { commit, parent }) => {
+                        if parent.is_some() && parent == this.snapshot {
+                            this.snapshot = Some(commit);
+                        } else {
+                            this.newer = true;
+                        }
+                    }
+                    Some(SaveResult::NoMatch) => {
+                        this.group_notices.insert(
+                            index,
+                            Notice::new(
+                                Tone::Conflict,
+                                "Nothing changed: it was already so, or changed elsewhere",
+                            ),
+                        );
+                    }
+                    Some(SaveResult::Refused(notice) | SaveResult::Unknown(notice)) => {
+                        this.group_notices.insert(index, notice);
+                    }
+                    None => {}
+                }
+                this.reload_group(index, cx);
+                if this.saving.is_empty() && this.edge_writes.is_empty() {
+                    this.compare_head(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Reads a group's count and neighbours again at the view's commit.
+    fn reload_group(&mut self, index: usize, cx: &mut Context<Self>) {
+        let PeekSubject::Node { type_name, id } = self.subject.clone() else {
+            return;
+        };
+        let Some(group) = self.groups.get_mut(index) else {
+            return;
+        };
+        group.count = Loadable::Loading;
+        group.neighbours = Loadable::NotLoaded;
+        group.expanded = false;
+        group.more = None;
+        let session = self.session.downgrade();
+        let snapshot = self.snapshot.clone();
+        let relationship = group.group.clone();
+        group._task = Some(cx.spawn(async move |this, cx| {
+            let Ok(count) = session.update(cx, |session, cx| {
+                session.degree(&type_name, &relationship, &id, snapshot, cx)
+            }) else {
+                return;
+            };
+            let result = count.await;
+            this.update(cx, |this, cx| {
+                let count = match result {
+                    Ok(n) => Loadable::Loaded(i64::try_from(n).unwrap_or(i64::MAX)),
+                    Err(error) => Loadable::Failed(error),
+                };
+                let open = matches!(count, Loadable::Loaded(n) if n > 0);
+                if let Some(group) = this.groups.get_mut(index) {
+                    group.count = count;
+                }
+                if open {
+                    this.toggle_group(index, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     fn copy(&mut self, name: String, value: &Value, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(crate::model::copy_text(value)));
         self.copied = Some(name);
@@ -1577,10 +1952,6 @@ impl NodePeek {
             .notice
             .as_ref()
             .is_some_and(|notice| matches!(notice.tone, Tone::Invalid | Tone::Refused));
-        let notice_color = |tone: Tone| match tone {
-            Tone::Refused | Tone::Invalid => Color::Error,
-            Tone::Conflict | Tone::Unknown => Color::Warning,
-        };
         let branch = self.session.read(cx).branch.clone();
         let keys = if lines {
             format!("↵ save · ⇧↵ line break · ⌘⇧↵ editor · esc cancel · write · {branch}")
@@ -1702,8 +2073,13 @@ impl NodePeek {
                     Loadable::Failed(error) => Some(error.clone()),
                     _ => None,
                 };
+                let header_group = SharedString::from(format!("peek-group-{index}"));
+                let add = self
+                    .edits_relationships()
+                    .then(|| self.render_add_button(index, header_group.clone(), cx));
                 let header = h_flex()
                     .id(("peek-group", index))
+                    .group(header_group)
                     .px_1()
                     .py_0p5()
                     .gap_1p5()
@@ -1732,18 +2108,225 @@ impl NodePeek {
                             .color(Color::Muted),
                     )
                     .child(div().flex_1())
+                    .when(self.edge_writes.contains(&index), |header| {
+                        header.child(Indicator::dot().color(Color::Warning))
+                    })
+                    .children(add)
                     .child(
                         Label::new(count)
                             .size(LabelSize::Small)
                             .color(Color::Muted)
                             .buffer_font(cx),
                     );
+                let adding = self
+                    .adding
+                    .as_ref()
+                    .filter(|adding| adding.index == index)
+                    .map(|adding| self.render_add_row(adding, cx));
+                let notice = self.group_notices.get(&index).map(|notice| {
+                    h_flex()
+                        .pl(px(22.))
+                        .gap_1p5()
+                        .child(Indicator::dot().color(notice_color(notice.tone)))
+                        .child(
+                            Label::new(notice.message.clone())
+                                .size(LabelSize::XSmall)
+                                .color(notice_color(notice.tone)),
+                        )
+                });
                 let body = group
                     .expanded
                     .then(|| self.render_neighbours(index, group, cx));
-                v_flex().child(header).children(body)
+                v_flex()
+                    .child(header)
+                    .children(adding)
+                    .children(notice)
+                    .children(body)
             }))
             .into_any_element()
+    }
+
+    /// A group's "+": a search for the node to relate; a relationship that needs properties
+    /// opens its own table, whose form asks for them.
+    fn render_add_button(
+        &self,
+        index: usize,
+        header: SharedString,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let group = &self.groups[index].group;
+        let required = self.required_edge_properties(index);
+        let replaces = self.holds_one(index)
+            && matches!(self.groups[index].count, Loadable::Loaded(n) if n > 0);
+        let tooltip = if !required.is_empty() {
+            format!(
+                "{} needs {}: add it in its table",
+                group.edge,
+                required.join(", ")
+            )
+        } else if replaces {
+            format!("Replace the {}", group.other_type)
+        } else {
+            format!("Add a {}", group.other_type)
+        };
+        let edge = group.edge.clone();
+        IconButton::new(("peek-add", index), IconName::Plus)
+            .icon_size(IconSize::XSmall)
+            .icon_color(Color::Muted)
+            .when(!self.page, |button| button.visible_on_hover(header))
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                if required.is_empty() {
+                    this.start_add(index, window, cx);
+                } else {
+                    window.dispatch_action(
+                        Box::new(studio_actions::graph::OpenType {
+                            type_name: edge.clone(),
+                            at_commit: None,
+                            filter_id: None,
+                            via: None,
+                            preview: false,
+                        }),
+                        cx,
+                    );
+                }
+            }))
+            .into_any_element()
+    }
+
+    /// The search a "+" opens: what is typed, the nodes it finds (↑↓, ↵ adds), and the branch
+    /// the relationship is written to.
+    fn render_add_row(&self, adding: &AddEdge, cx: &mut Context<Self>) -> AnyElement {
+        let index = adding.index;
+        let other = self.groups[index].group.other_type.clone();
+        let hover = cx.theme().colors().element_hover;
+        let selected = cx.theme().colors().element_selected;
+        let branch = self.session.read(cx).branch.clone();
+        let replaces = self.holds_one(index)
+            && matches!(self.groups[index].count, Loadable::Loaded(n) if n > 0);
+        let found = match &adding.found {
+            Loadable::Loaded(found) if found.is_empty() => Label::new("No match")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element(),
+            Loadable::Loaded(found) => v_flex()
+                .children(found.iter().enumerate().map(|(n, node)| {
+                    let highlighted = n == adding.highlighted;
+                    h_flex()
+                        .id(SharedString::from(format!("peek-found-{index}-{n}")))
+                        .px_1()
+                        .py_0p5()
+                        .gap_2()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .when(highlighted, |row| row.bg(selected))
+                        .when(!highlighted, |row| row.hover(move |s| s.bg(hover)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(adding) = this.adding.as_mut() {
+                                adding.highlighted = n;
+                            }
+                            this.add_highlighted(window, cx);
+                        }))
+                        .child(studio_ui::type_swatch(&other))
+                        .child(
+                            Label::new(node.label.clone().unwrap_or_else(|| node.id.clone()))
+                                .size(LabelSize::Small)
+                                .truncate(),
+                        )
+                        .when(node.label.is_some(), |row| {
+                            row.child(
+                                Label::new(node.id.clone())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            )
+                        })
+                }))
+                .into_any_element(),
+            Loadable::Failed(error) => Label::new(error.clone())
+                .size(LabelSize::XSmall)
+                .color(Color::Error)
+                .into_any_element(),
+            _ => Label::new("Searching…")
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element(),
+        };
+        let keys = if replaces {
+            format!("↑↓ choose · ↵ replace · esc cancel · write · {branch}")
+        } else {
+            format!("↑↓ choose · ↵ add · esc cancel · write · {branch}")
+        };
+        v_flex()
+            .key_context("EdgeSearch")
+            .on_action(cx.listener(|this, _: &SelectNextSuggestion, _, cx| this.move_match(1, cx)))
+            .on_action(
+                cx.listener(|this, _: &SelectPreviousSuggestion, _, cx| this.move_match(-1, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &menu::Confirm, window, cx| this.add_highlighted(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel_add(cx)))
+            .pl(px(22.))
+            .py(px(studio_ui::ds::space::XS))
+            .gap(px(studio_ui::ds::space::XS))
+            .child(
+                studio_ui::ds::field_frame(false, cx)
+                    .child(
+                        Icon::new(IconName::MagnifyingGlass)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(studio_ui::ds::field_input(adding.editor.clone())),
+            )
+            .child(found)
+            .child(Label::new(keys).size(LabelSize::XSmall).color(Color::Muted))
+            .into_any_element()
+    }
+
+    /// A neighbour's ×, shown under the pointer: the first press asks, the second removes the
+    /// relationship (the node stays).
+    fn render_remove(
+        &self,
+        index: usize,
+        n: usize,
+        edge_id: String,
+        row: SharedString,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let asked = self.removing.as_deref() == Some(edge_id.as_str());
+        let edge = self.groups[index].group.edge.clone();
+        if asked {
+            return studio_ui::ds::button(
+                SharedString::from(format!("peek-remove-{index}-{n}")),
+                "Remove",
+            )
+            .style(ButtonStyle::Tinted(ui::TintColor::Error))
+            .size(ButtonSize::Compact)
+            .label_size(LabelSize::XSmall)
+            .tooltip(Tooltip::text(format!(
+                "Remove this {edge}; both nodes stay"
+            )))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.press_remove(index, edge_id.clone(), window, cx)
+            }))
+            .into_any_element();
+        }
+        IconButton::new(
+            SharedString::from(format!("peek-remove-{index}-{n}")),
+            IconName::Close,
+        )
+        .icon_size(IconSize::XSmall)
+        .icon_color(Color::Muted)
+        .visible_on_hover(row)
+        .tooltip(Tooltip::text(format!("Remove this {edge}")))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            cx.stop_propagation();
+            this.press_remove(index, edge_id.clone(), window, cx)
+        }))
+        .into_any_element()
     }
 
     fn render_neighbours(&self, index: usize, group: &Group, cx: &mut Context<Self>) -> AnyElement {
@@ -1804,12 +2387,22 @@ impl NodePeek {
                             .into_any_element()
                     }
                 });
+                let removes = self.edits_relationships();
                 v_flex()
                     .pl(px(22.))
                     .children(neighbours.iter().enumerate().map(|(n, neighbour)| {
                         let (peek, page) = node_actions(&other, &neighbour.id, at_commit.clone());
+                        let row_group = SharedString::from(format!("peek-neighbour-{index}-{n}"));
+                        let remove = neighbour
+                            .edge_id
+                            .clone()
+                            .filter(|_| removes)
+                            .map(|edge_id| {
+                                self.render_remove(index, n, edge_id, row_group.clone(), cx)
+                            });
                         h_flex()
                             .id(SharedString::from(format!("peek-neighbour-{index}-{n}")))
+                            .group(row_group)
                             .px_1()
                             .py_0p5()
                             .gap_2()
@@ -1846,6 +2439,8 @@ impl NodePeek {
                                         .truncate(),
                                 )
                             })
+                            .child(div().flex_1())
+                            .children(remove)
                     }))
                     .children(show_more)
                     .into_any_element()
@@ -1939,6 +2534,15 @@ fn node_actions(type_name: &str, id: &str, at_commit: Option<String>) -> (PeekNo
     )
 }
 
+/// A notice's colour: red for what was refused or cannot be sent, amber for a conflict or an
+/// unknown outcome.
+fn notice_color(tone: Tone) -> Color {
+    match tone {
+        Tone::Refused | Tone::Invalid => Color::Error,
+        Tone::Conflict | Tone::Unknown => Color::Warning,
+    }
+}
+
 /// How far Zed's editor sets its text in from its left edge without a gutter: the font's
 /// descent, its gutter margin (`GutterDimensions::default_gutter_margin`).
 fn editor_inset(window: &Window, cx: &App) -> gpui::Pixels {
@@ -1967,6 +2571,10 @@ fn neighbours_from(rows: &Value) -> Vec<Neighbour> {
                     Some(Neighbour {
                         id: row.get("id")?.as_str()?.to_owned(),
                         label: row.get("label").and_then(Value::as_str).map(str::to_owned),
+                        edge_id: row
+                            .get("edge_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
                     })
                 })
                 .collect()
@@ -2168,6 +2776,58 @@ mod tests {
             assert_eq!(view.snapshot.as_deref(), Some("c2"), "its own commit");
             assert!(!view.newer, "its own write does not make it behind");
             assert!(view.saving.is_empty() && view.edits.is_empty());
+        });
+    }
+
+    const KNOWS: &str =
+        "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n";
+
+    /// A relationship is removed on the second press of its ×, as its own commit, which the
+    /// view moves to (spec 014).
+    #[gpui::test]
+    async fn a_relationship_is_removed_on_the_second_press(cx: &mut TestAppContext) {
+        let (view, cx) = page(session(KNOWS, cx), cx);
+        view.update_in(cx, |view, window, cx| {
+            assert!(!view.groups.is_empty(), "Person knows Person");
+            view.press_remove(0, "e1".into(), window, cx);
+            assert_eq!(view.removing.as_deref(), Some("e1"), "the first press asks");
+            assert!(view.edge_writes.is_empty(), "nothing is written yet");
+            view.press_remove(0, "e1".into(), window, cx);
+            assert!(view.edge_writes.contains(&0), "the second press writes");
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.removing.is_none() && view.edge_writes.is_empty());
+            assert_eq!(view.snapshot.as_deref(), Some("c2"), "its own commit");
+            assert!(!view.newer && view.group_notices.is_empty());
+        });
+    }
+
+    /// A relationship is added to the node chosen in the search, with this node at the end
+    /// its group points from; a refusal stays on the group with its reason.
+    #[gpui::test]
+    async fn a_refused_relationship_says_why_on_its_group(cx: &mut TestAppContext) {
+        let refused = json!({ "error": "__dst 'p9' not found in Person", "code": "bad_request" });
+        let (view, cx) = page(session_answering(KNOWS, 400, refused, cx), cx);
+        view.update_in(cx, |view, window, cx| {
+            view.start_add(0, window, cx);
+            let adding = view.adding.as_mut().unwrap();
+            adding.found = Loadable::Loaded(vec![Neighbour {
+                id: "p9".into(),
+                label: None,
+                edge_id: None,
+            }]);
+            view.add_highlighted(window, cx);
+            assert!(view.adding.is_none(), "the search closes on a choice");
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let notice = view
+                .group_notices
+                .get(&0)
+                .expect("the refusal stays on the group");
+            assert_eq!(notice.tone, Tone::Refused);
+            assert_eq!(view.snapshot.as_deref(), Some("c1"), "nothing was written");
         });
     }
 

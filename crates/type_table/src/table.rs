@@ -2825,6 +2825,7 @@ impl TypeTable {
                             .map(|(id, label)| Neighbour {
                                 id: id.clone(),
                                 label: label.clone(),
+                                edge_id: None,
                             })
                             .collect()
                     });

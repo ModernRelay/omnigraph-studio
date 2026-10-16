@@ -1,6 +1,6 @@
 # 014: Node pages, editing in place, and long text
 
-Status: in progress; parts 1 and 3 (the page, markdown, the text editor) and editing a field in place built · 2026-10-16
+Status: in progress; parts 1 and 3, editing a field in place, and adding and removing relationships built · 2026-10-16
 
 ## Problem
 
@@ -164,6 +164,18 @@ Four parts, built in this order; each lands on its own.
 
 ### 4. Relationships from the node
 
+- **Built so far**: a group's "+" (always on the page, under the pointer in the peek) opens a
+  search over the other type, eight matches by name or id; ↑↓ choose and ↵ adds, written at
+  once as one commit with this node at the end its group points from. On an outgoing
+  `@card(..1)` group with a neighbour, ↵ replaces it: the old one is removed first, then the new
+  one added, two commits (rule D2). A neighbour's × (under the pointer) turns into "Remove" on
+  the first press and removes the relationship on the second; the node stays. Neighbour rows
+  now carry their edge's id (`$e.@id as edge_id` in the neighbours read). A relationship type
+  that needs properties is added from its own table, which the "+" opens. A refusal or a write
+  that matched nothing stays on the group with its reason; the group is read again at the
+  view's commit, which follows its own commits. Not yet: the table's relationship cell picker,
+  editing edge properties, and refusing to remove the last edge of a `@card(1..)` group before
+  saving.
 - Each relationship section on the page and in the peek has **+ Add**: a search over the other
   type (by label and id, as `InsertEdgeModal` searches today) with this node already the
   endpoint; picking a node adds a draft entry, and an edge type with properties asks for them
@@ -214,6 +226,7 @@ Four parts, built in this order; each lands on its own.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-16 | Relationships are added and removed from the node | `gq_language` `relationship_queries_compile_in_both_directions` (the neighbours read returns `$e.@id as edge_id` and compiles); `type_table` `a_relationship_is_removed_on_the_second_press`, `a_refused_relationship_says_why_on_its_group`; `$e.@id` read through the 0.13 server with `omnigraph query`; offscreen snapshots of Radia Knuth's page: "+" on worksAt, "Liskov", ↵, then × twice on Liskov Systems; the CLI read three, then two workplaces | The search listed four Liskov companies with the first highlighted and "↑↓ choose · ↵ add · esc cancel · write · main"; ↵ made worksAt 3 with Liskov Systems listed; the first × press read "Remove", the second made it 2 again |
 | 2026-10-16 | A text property opens in its own editor with a live preview | `type_table` `a_saved_text_is_bound_to_the_value_read_and_leaves_the_tab_clean` (typed text over the value read at `c1`), `a_text_changed_elsewhere_is_kept_and_offered_both_ways` (a write matching nothing), `a_refused_text_is_kept_with_the_reason`; offscreen snapshots of Keyset paging's body: the split editor, a line typed, ⌘S; the CLI read the new body, and it was set back | The preview followed the typed line; ⌘S toasted "Set body of keyset-paging · committed to main" and cleared the tab's dot, while the Note table's tab took its newer-data dot |
 | 2026-10-16 | A field edits in place and saves value-bound | `type_table` `a_saved_field_moves_the_view_to_its_own_commit` and `a_refused_field_opens_again_with_its_text_and_reason` (a 403: old value back, the field open with the typed text and a refusal), both on a page made before the schema was read; offscreen snapshots of Project Fable 36: the editor over `name`, then ↵; the CLI read the new name, and it was set back | The editor's text sits on the values' edge once the frame reaches back by its padding, border and Zed's editor inset (the font's descent, its gutter margin); the hint reads "↵ save · ⇧↵ line break · esc cancel · write · main"; after ↵ the title and the field read the new name at the page's own commit, with no "Newer data". A page restored before the schema was read used to fail with "The schema is still loading."; it now reads its node when the schema arrives |
 | 2026-10-16 | Text values read as markdown | `studio_ui` `text` tests (plain values such as `foo_bar_baz` and `3 < 4` stay plain; headings, emphasis, lists, line breaks, links and code are markup; a cell's first line drops the markup); `type_table` `a_text_cell_shows_its_markdowns_first_line` (keys, enums and lists are not parsed); offscreen snapshots of the `notes` graph after giving two notes a markdown and a multi-line body (`dev/notes-seed.jsonl`) | The page renders the heading, bold, inline code, the list and the link, headings near the body's size (Zed's agent style); the peek keeps the plain body's three lines; capitals measure the same as the labels beside them once the size is set on the element around the markdown, since GPUI's text runs carry no size; the table cell reads "Keyset paging…" |

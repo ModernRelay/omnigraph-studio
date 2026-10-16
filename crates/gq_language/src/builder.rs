@@ -1390,8 +1390,8 @@ pub struct Narrow<'a> {
 }
 
 /// One page of a node's neighbours through a relationship group, with the neighbour's label
-/// and the edge's properties (spec 005). Columns: `id`, `label` (when the other type has one),
-/// then `e_<property>` for each projectable edge property.
+/// and the edge's properties (spec 005). Columns: `id`, `edge_id` (the edge's own id), `label`
+/// (when the other type has one), then `e_<property>` for each projectable edge property.
 pub fn neighbours(
     schema: &SchemaModel,
     node_type: &str,
@@ -1413,7 +1413,8 @@ pub fn neighbours(
         "String",
         Value::String(after.unwrap_or("").to_owned()),
     );
-    let mut columns = vec!["$m.@id as id".to_owned()];
+    // The edge's own id too, which removing one relationship names.
+    let mut columns = vec!["$m.@id as id".to_owned(), "$e.@id as edge_id".to_owned()];
     if let Some(label) = other.label_property()
         && Some(label) != other.key.as_deref()
     {
@@ -2613,18 +2614,19 @@ mod tests {
         let schema = dev();
         for group in schema.relationships_of("Person") {
             assert_compiles(&degree(&schema, "Person", &group, "person-000000").unwrap());
-            assert_compiles(
-                &neighbours(
-                    &schema,
-                    "Person",
-                    &group,
-                    "person-000000",
-                    None,
-                    Narrow::default(),
-                    50,
-                )
-                .unwrap(),
-            );
+            let page = neighbours(
+                &schema,
+                "Person",
+                &group,
+                "person-000000",
+                None,
+                Narrow::default(),
+                50,
+            )
+            .unwrap();
+            assert_compiles(&page);
+            // Each neighbour comes with the edge that relates it, which removing it names.
+            assert!(page.text.contains("$e.@id as edge_id"), "{}", page.text);
         }
         for group in schema.relationships_of("Company") {
             let search = Narrow {
