@@ -9869,6 +9869,7 @@ name = "studio_ui"
 version = "0.2.1"
 dependencies = [
  "gpui",
+ "pulldown-cmark",
  "serde_json",
  "studio_actions",
  "studio_settings",
@@ -10864,6 +10865,7 @@ dependencies = [
  "graph_store",
  "http_client",
  "image",
+ "markdown",
  "menu",
  "objc2-core-foundation",
  "objc2-core-graphics",

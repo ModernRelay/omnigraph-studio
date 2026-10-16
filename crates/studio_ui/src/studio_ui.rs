@@ -15,6 +15,7 @@ pub mod ds;
 pub mod motion;
 mod overlay_slot;
 mod resize;
+pub mod text;
 mod values;
 
 pub use changes::{ChangeCard, ChangeKind, PropertyRow, change_counts, change_group_header};

@@ -1,6 +1,6 @@
 # 014: Node pages, editing in place, and long text
 
-Status: in progress; part 1 (the page and opening it) built · 2026-10-16
+Status: in progress; part 1 (the page and opening it) and markdown reading built · 2026-10-16
 
 ## Problem
 
@@ -200,6 +200,7 @@ Four parts, built in this order; each lands on its own.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-16 | Text values read as markdown | `studio_ui` `text` tests (plain values such as `foo_bar_baz` and `3 < 4` stay plain; headings, emphasis, lists, line breaks, links and code are markup; a cell's first line drops the markup); `type_table` `a_text_cell_shows_its_markdowns_first_line` (keys, enums and lists are not parsed); offscreen snapshots of the `notes` graph after giving two notes a markdown and a multi-line body (`dev/notes-seed.jsonl`) | The page renders the heading, bold, inline code, the list and the link, headings near the body's size (Zed's agent style); the peek keeps the plain body's three lines; capitals measure the same as the labels beside them once the size is set on the element around the markdown, since GPUI's text runs carry no size; the table cell reads "Keyset paging…" |
 | 2026-10-16 | Part 1: a node's page and the ways to open it | `type_table` `a_nodes_page_reads_it_and_names_its_tab` (label as the tab title, one tab per node and commit, remembered and restored, a held page never newer); `studio_workspace` `an_asked_for_peek_shows_the_inspector_that_selection_leaves_hidden`; offscreen snapshots of Radia Knuth's page and of a peek | The page lists every property and opens every non-empty relationship group; the tab reads "Radia Knuth"; the peek has ↗ beside Explore and the footer "⌘↵ Open"; a peek asked for while the right dock was hidden shows it |
 | 2026-10-16 | The flows above are today's | A read of `type_table`, `relationship_tree`, `graph_canvas`, `inspectors`, `review` and the keymaps, citing file and line | As listed under "What exists today" |
 | 2026-10-16 | 0.13 keeps unknown annotations and the compiler exposes them per property | `docs/user/schema/index.md:139` at OmniGraph main; `git show v0.13.0:crates/omnigraph-compiler/src/schema/ast.rs` | "retained as metadata"; `PropDecl { name, prop_type, annotations }` |

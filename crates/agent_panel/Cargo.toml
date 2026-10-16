@@ -21,10 +21,10 @@ gq_language = { workspace = true }
 httparse = { workspace = true }
 graph_client = { workspace = true }
 graph_store = { workspace = true }
-# Zed's markdown renderer for agent replies; `editor` already builds it.
 menu = { workspace = true }
 percent-encoding = { workspace = true }
-markdown = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+# Zed's markdown renderer for agent replies; `editor` already builds it.
+markdown = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 smol = { workspace = true }

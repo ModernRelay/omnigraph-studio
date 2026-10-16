@@ -10,6 +10,7 @@ use std::time::Duration;
 use gpui::{App, ClipboardItem, Context, Entity, Render, SharedString, Subscription, Task, Window};
 use gq_language::{Direction, RelationshipGroup, SchemaModel, builder};
 use graph_store::{GraphSession, Loadable, SessionEvent};
+use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Map, Value};
 use studio_actions::graph::{OpenBlob, OpenNodePage, PeekNode};
 use ui::prelude::*;
@@ -18,7 +19,9 @@ use ui::{Tooltip, rems_from_px};
 use crate::blob::{
     IMAGE_MAX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, save_value, suggested_file_name,
 };
-use crate::model::{FROM_COLUMN, TO_COLUMN, display_value, format_count, node_rows, short_commit};
+use crate::model::{
+    FROM_COLUMN, TO_COLUMN, display_value, format_count, node_rows, reads_as_markdown, short_commit,
+};
 use graph_client::{BlobCell, BlobMeta};
 
 /// First neighbours shown under an expanded relationship group.
@@ -128,6 +131,8 @@ pub struct NodePeek {
     holds_commit: bool,
     /// Drawn as a node's page rather than the inspector's peek.
     page: bool,
+    /// Text values with markup, rendered as markdown: by property, the text and its view.
+    markdown: HashMap<String, (String, Entity<Markdown>)>,
     _tasks: Vec<Task<()>>,
     _subscription: Subscription,
 }
@@ -214,6 +219,7 @@ impl NodePeek {
             newer: false,
             holds_commit: false,
             page,
+            markdown: HashMap::new(),
             _tasks: Vec::new(),
             _subscription: subscription,
         };
@@ -927,7 +933,33 @@ impl NodePeek {
         }
     }
 
-    fn render_properties(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Keeps one markdown view per text value with markup, made again only when its text
+    /// changes; a value that reads as itself draws as a label.
+    fn sync_markdown(&mut self, cx: &mut Context<Self>) {
+        let Loadable::Loaded(values) = &self.values else {
+            self.markdown.clear();
+            return;
+        };
+        let wanted: Vec<(String, String)> = self
+            .property_rows()
+            .into_iter()
+            .filter_map(|(name, property, _)| {
+                let text = values.get(&name)?.as_str()?;
+                (reads_as_markdown(property.as_ref()?) && !studio_ui::text::is_plain(text))
+                    .then(|| (name, text.to_owned()))
+            })
+            .collect();
+        self.markdown
+            .retain(|name, (text, _)| wanted.iter().any(|(n, t)| n == name && t == text));
+        for (name, text) in wanted {
+            self.markdown.entry(name).or_insert_with(|| {
+                let source: SharedString = text.clone().into();
+                (text, cx.new(|cx| Markdown::new(source, None, None, cx)))
+            });
+        }
+    }
+
+    fn render_properties(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let values = match &self.values {
             Loadable::Loaded(values) => values.clone(),
             Loadable::Failed(error) => {
@@ -983,15 +1015,30 @@ impl NodePeek {
                                         .truncate(),
                                 ),
                             )
-                            .child(div().flex_1().min_w_0().child(
-                                Label::new(shown).size(LabelSize::Small).color(
-                                    if value.is_null() {
-                                        Color::Disabled
-                                    } else {
-                                        Color::Default
-                                    },
-                                ),
-                            ))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(match self.markdown.get(&name) {
+                                        // GPUI's text takes its size from the element around
+                                        // it, so the labels' size is set there too.
+                                        Some((_, view)) => div()
+                                            .text_size(ui::TextSize::Small.rems(cx))
+                                            .child(MarkdownElement::new(
+                                                view.clone(),
+                                                value_style(window, cx),
+                                            ))
+                                            .into_any_element(),
+                                        None => Label::new(shown)
+                                            .size(LabelSize::Small)
+                                            .color(if value.is_null() {
+                                                Color::Disabled
+                                            } else {
+                                                Color::Default
+                                            })
+                                            .into_any_element(),
+                                    }),
+                            )
                             .when(copied, |d| {
                                 d.child(
                                     Label::new("Copied")
@@ -1265,6 +1312,17 @@ fn node_actions(type_name: &str, id: &str, at_commit: Option<String>) -> (PeekNo
     )
 }
 
+/// A text value rendered as markdown as an agent reply is, with headings near the body's size,
+/// at the size of the labels beside it and its soft line breaks kept, so plain lines stay lines
+/// (spec 014).
+fn value_style(window: &Window, cx: &App) -> MarkdownStyle {
+    let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+    style.base_text_style.font_size = ui::TextSize::Small.rems(cx).into();
+    style.base_text_style.line_height = gpui::relative(1.5);
+    style.soft_break_as_hard_break = true;
+    style
+}
+
 fn neighbours_from(rows: &Value) -> Vec<Neighbour> {
     rows.as_array()
         .map(|rows| {
@@ -1289,7 +1347,8 @@ fn section(title: &'static str) -> impl IntoElement {
 }
 
 impl Render for NodePeek {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_markdown(cx);
         let type_name = self.subject.type_name().to_owned();
         let id = self.subject.id().to_owned();
         let label = self.label();
@@ -1298,7 +1357,7 @@ impl Render for NodePeek {
         // The peek opens the node's page; the page is it.
         let open_page = (!page).then(|| self.open_page_action()).flatten();
         let has_properties = !self.property_rows().is_empty();
-        let properties = self.render_properties(cx);
+        let properties = self.render_properties(window, cx);
         // A node's relationships are listed once the node is read: while it loads, or when it
         // does not exist at this commit, an empty list would say its type has none.
         let relationships = (matches!(self.subject, PeekSubject::Node { .. })

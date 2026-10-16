@@ -35,6 +35,8 @@ repository = "https://github.com/ModernRelay/omnigraph-studio"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFData", "CFCGTypes"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGAffineTransform", "CGBitmapContext", "CGColorSpace", "CGContext", "CGDataProvider", "CGImage", "CGPDFDocument", "CGPDFPage"] }
+# CommonMark, the parser Zed's `markdown` renders with: text values read as markdown (spec 014).
+pulldown-cmark = { version = "0.13", default-features = false }
 # Studio crates
 tree-sitter-gq = { path = "grammars/tree-sitter-gq" }
 tree-sitter-pg = { path = "grammars/tree-sitter-pg" }
@@ -72,6 +74,7 @@ util = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 http_client = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 reqwest_client = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 editor = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
+markdown = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 language = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 multi_buffer = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 settings = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }

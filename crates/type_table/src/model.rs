@@ -526,7 +526,22 @@ pub fn display_value(property: Option<&Property>, value: &Value) -> String {
     if property.is_some_and(|p| p.kind == ScalarKind::Blob) {
         return "Blob".into();
     }
+    // A text value reads as markdown (spec 014): a cell shows its first line, markup removed.
+    if let (Some(property), Some(text)) = (property, value.as_str())
+        && reads_as_markdown(property)
+    {
+        return studio_ui::text::first_line(text);
+    }
     studio_ui::format_value(value)
+}
+
+/// Whether a property's values read as markdown: a single text value that is neither a key nor
+/// an enum (spec 014).
+pub fn reads_as_markdown(property: &Property) -> bool {
+    property.kind == ScalarKind::Text
+        && !property.list
+        && !property.is_key
+        && property.enum_values.is_none()
 }
 
 /// What a date or time cell shows, and the exact value for its tooltip (spec 004: "dates
@@ -1426,6 +1441,35 @@ mod tests {
         assert!(same_value(&json!(1), &json!(1.0)));
         assert!(!same_value(&json!(["a"]), &json!(["b"])));
         assert_eq!(display_value(None, &Value::Null), "—");
+    }
+
+    /// A text value reads as markdown: a cell shows its first line without its markup. Keys,
+    /// enums and lists are shown as they are (spec 014).
+    #[test]
+    fn a_text_cell_shows_its_markdowns_first_line() {
+        let title = prop("Person", "title");
+        assert_eq!(display_value(Some(&title), &json!("Founder")), "Founder");
+        assert_eq!(
+            display_value(Some(&title), &json!("**Founder** of\nAcme")),
+            "Founder of…"
+        );
+        assert_eq!(
+            display_value(Some(&title), &json!("# CTO\n\nSince 2020")),
+            "CTO…"
+        );
+        assert_eq!(
+            display_value(Some(&prop("Person", "slug")), &json!("**p1**")),
+            "**p1**",
+            "a key is not parsed"
+        );
+        assert_eq!(
+            display_value(Some(&prop("Project", "status")), &json!("active")),
+            "active"
+        );
+        assert!(
+            !reads_as_markdown(&prop("Person", "tags")),
+            "a list is not parsed"
+        );
     }
 
     #[test]
