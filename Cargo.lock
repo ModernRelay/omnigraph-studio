@@ -9857,6 +9857,7 @@ dependencies = [
  "gpui",
  "release_channel",
  "semver",
+ "serde_json",
  "settings",
  "theme",
  "theme_settings",

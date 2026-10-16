@@ -7,9 +7,47 @@
 //! settings store and `theme_settings`. So Studio runs Zed's own bootstrap here: the release
 //! channel, the settings store with Zed's defaults, the bundled themes and fonts.
 
-use gpui::{App, Hsla};
+use std::borrow::Cow;
 
-pub use assets::Assets;
+use gpui::{App, AssetSource, Hsla, SharedString};
+
+/// Themes Studio bundles beside Zed's, by asset path (`assets/themes/` in this repository, with
+/// their notices in `assets/themes/LICENSES`). Zed's theme loader lists `themes/` and loads each
+/// family, so these are registered with Zed's own.
+const STUDIO_THEMES: &[(&str, &[u8])] = &[(
+    "themes/vitesse-refined/vitesse-theme-refined.json",
+    include_bytes!("../../../assets/themes/vitesse-refined/vitesse-theme-refined.json"),
+)];
+
+/// Zed's assets (fonts, icons, themes, keymaps), and Studio's own themes.
+pub struct Assets;
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        match STUDIO_THEMES.iter().find(|(own, _)| *own == path) {
+            Some((_, bytes)) => Ok(Some(Cow::Borrowed(bytes))),
+            None => assets::Assets.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
+        let mut list = assets::Assets.list(path)?;
+        list.extend(
+            STUDIO_THEMES
+                .iter()
+                .filter(|(own, _)| own.starts_with(path))
+                .map(|(own, _)| SharedString::from(*own)),
+        );
+        Ok(list)
+    }
+}
+
+impl Assets {
+    /// Loads Zed's bundled fonts into the text system.
+    pub fn load_fonts(&self, cx: &App) -> gpui::Result<()> {
+        assets::Assets.load_fonts(cx)
+    }
+}
 
 /// Sets up the release channel and Zed's settings store with Zed's defaults. Put the user's
 /// settings into the store next, then call [`init_themes`].
@@ -64,7 +102,44 @@ pub fn type_color(type_name: &str) -> Hsla {
 
 #[cfg(test)]
 mod tests {
-    use super::type_color;
+    use super::*;
+
+    /// Studio's themes are listed with Zed's, so Zed's loader registers them, and each parses
+    /// as a theme family with its themes named.
+    #[test]
+    fn studio_themes_are_listed_and_read_as_families() {
+        let listed = Assets.list("themes/").unwrap();
+        assert!(
+            listed.iter().any(|path| path.ends_with("one/one.json")),
+            "Zed's"
+        );
+        for (path, bytes) in STUDIO_THEMES {
+            assert!(listed.iter().any(|listed| listed == path), "{path} listed");
+            assert_eq!(Assets.load(path).unwrap().as_deref(), Some(*bytes));
+            let family: serde_json::Value = serde_json::from_slice(bytes).expect(path);
+            assert!(
+                family["themes"]
+                    .as_array()
+                    .is_some_and(|themes| !themes.is_empty())
+            );
+        }
+        let names: Vec<String> = STUDIO_THEMES
+            .iter()
+            .flat_map(|(_, bytes)| {
+                let family: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                family["themes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|theme| theme["name"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "Vitesse Refined Light"),
+            "{names:?}"
+        );
+    }
 
     #[test]
     fn a_type_name_always_gets_the_same_tint() {

@@ -101,7 +101,8 @@ through its own CLI. CI caches `~/.cargo/git` and `target/` keyed on `Cargo.lock
   files Studio embeds are the same bytes on every system. The agent panel says it is not
   available on Windows: its `omnigraph` wrapper is a shell script (spec 013).
 - Every bundle carries `THIRD-PARTY-NOTICES.md` beside `LICENSE`: the licences of the fonts,
-  icons and themes Studio embeds from Zed's assets, then every crate linked into the app on the
+  icons and themes Studio embeds from Zed's assets, the themes Studio bundles itself
+  (`assets/themes/LICENSES`: Vitesse Theme Refined and Vitesse, MIT), then every crate linked into the app on the
   three shipped targets. `script/generate-licenses` writes it with cargo-about 0.9.2, accepting
   the licences `deny.toml` allows; a crate whose licence cannot be read fails the run
   (`script/licenses/about.toml` clarifies `language_core`, which declares none). A release

@@ -53,7 +53,7 @@ impl Default for ThemeChoice {
     fn default() -> Self {
         Self {
             mode: ThemeMode::System,
-            light: "One Light".into(),
+            light: "Vitesse Refined Light".into(),
             dark: "One Dark".into(),
         }
     }

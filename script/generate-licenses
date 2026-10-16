@@ -58,6 +58,12 @@ mkdir -p "$(dirname "$out")"
     echo '```'
   done
   echo
+  echo "## Themes Studio bundles"
+  echo
+  echo '```'
+  cat assets/themes/LICENSES
+  echo '```'
+  echo
   cargo about generate --locked --fail -c "$config" \
     --manifest-path crates/studio/Cargo.toml script/licenses/template.md.hbs
 } > "$out"

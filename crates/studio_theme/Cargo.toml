@@ -24,5 +24,8 @@ util = { workspace = true, features = ["debug-embed"] }
 # `init_test` for other crates' tests.
 test-support = []
 
+[dev-dependencies]
+serde_json = { workspace = true }
+
 [lints]
 workspace = true

@@ -47,7 +47,11 @@ fn settings_choose_the_active_theme(cx: &mut HeadlessAppContext, data: &Path) {
     let app = cx.update(|cx| cx.to_async());
     app.update(|cx| studio_settings::update(cx, |s| s.theme.mode = ThemeMode::Light));
     cx.run_until_parked();
-    assert_eq!(cx.update(|cx| cx.theme().name.to_string()), "One Light");
+    assert_eq!(
+        cx.update(|cx| cx.theme().name.to_string()),
+        "Vitesse Refined Light",
+        "Studio's bundled default light theme"
+    );
 
     app.update(|cx| {
         studio_settings::update(cx, |s| {

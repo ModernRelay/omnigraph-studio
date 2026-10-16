@@ -258,6 +258,12 @@ second line shows it (`omnigraph branch create feature-x --from main`).
     shared one. Views read the values in effect through `GraphSession::options`.
 - `studio_theme` implements `theme::ThemeSettingsProvider` from these settings: UI font,
   buffer font, sizes, density.
+- The default light theme is Vitesse Refined Light (2026-10-16; it was One Light), the theme
+  Ragnor uses in Zed. Studio bundles its family unchanged from the Zed extension
+  `vitesse-theme-refined` 0.5.0 (MIT, Colin Lienard, after Anthony Fu's MIT Vitesse) as
+  `assets/themes/vitesse-refined/`; `studio_theme::Assets` lists Studio's themes beside Zed's, so
+  Zed's loader registers them before the first window, and all five appear in the theme menus.
+  The dark default stays One Dark.
 
 ### Modals
 
@@ -451,6 +457,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-16 | Vitesse Refined Light is bundled and the default | `studio_theme` test `studio_themes_are_listed_and_read_as_families`; `studio` `settings_apply` (the light mode resolves "Vitesse Refined Light" through Studio's startup); the bundled file's SHA-256 equals the copy Zed installed (`9731fc19…2998`); offscreen snapshots of a table with the inspector and History, and a query | Green accents and lit panel buttons, Vitesse's syntax colours in the query; One Light before |
 | 2026-10-16 | Tabs scroll, drag and drop as Zed's | `studio_workspace` tests `dropped_tabs_move_within_and_between_panes_and_split_at_an_edge`, `a_drop_near_an_edge_splits_toward_it`, `pane` `dragged_tabs_move_within_their_group_and_arrive_unpinned`; offscreen snapshots: nine tabs; Person and Company with a `drag:` from the Company tab to the document's right edge | Nine tabs in the strip with "+", split and zoom at its end; the drag split the document: Person on the left, Company on the right with the end buttons, the left pane without them |
 | 2026-10-16 | Panels move between docks; the bottom panel spans as its layout says; zoom | `studio_workspace` tests `a_panel_goes_where_the_settings_place_it` (placed at its add, home again when the setting goes, the menu's move), `the_bottom_panel_spans_as_its_layout_says` (contained: the window less the inspector; full: the window), `zoom_covers_the_document_area_until_toggled_or_hidden`, `a_graphs_docks_come_back_with_it`, `panels` `a_taken_panel_leaves_the_others_as_they_were`; offscreen snapshots: `full` with History and the inspector, Explore placed in the right dock with the menu on the Graph button, a zoomed pane | History ran under the sidebar and the inspector; Explore showed in the right dock with its icon at the bar's right end; the menu read "✓ Dock Left, Dock Bottom, Dock Right" with no tooltip over it; the zoomed table covered the document area inside an 8 px inset, its arrows after the traffic lights' room |
 | 2026-10-16 | Docks are switched from a status bar, and each pane keeps its own back and forward | `studio_workspace` tests `panel_buttons_show_their_panel_and_hide_the_dock_it_shows`, `back_and_forward_walk_the_active_panes_own_tabs`, `tabs_fill_the_header_strip` (the status bar's height), `pane` `a_pane_steps_back_and_forward_through_the_tabs_it_showed`; offscreen snapshots on the dev graph, flat and glass, with the bottom panel, with the sidebar hidden and a row peeked | One status bar across the window: the five sidebar panels' icons at the left (Graph lit), the server, graph and branch, the tab's facts, memory and CPU, then Nodes, History and Activity and, with a row peeked, the inspector (lit). Column headers show their panel's title; each pane's strip starts with ← → (← enabled after a second tab, → disabled). With the sidebar hidden its icons stay in the bar |
