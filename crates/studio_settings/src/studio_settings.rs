@@ -80,6 +80,39 @@ pub enum WindowStyle {
     Glass,
 }
 
+/// Where the bottom panel spans, as Zed's `bottom_dock_layout`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BottomDockLayout {
+    /// Under the document only.
+    #[default]
+    Contained,
+    /// Across the whole window, under the sidebar and the inspector too.
+    Full,
+    /// Under the sidebar and the document; the inspector keeps its full height.
+    LeftAligned,
+    /// Under the document and the inspector; the sidebar keeps its full height.
+    RightAligned,
+}
+
+/// A dock, as a panel's placement names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DockSide {
+    Left,
+    Right,
+    Bottom,
+}
+
+/// Where a panel sits when the person moved it from its own dock (its status-bar button's
+/// right-click menu), as Zed's per-panel `dock` setting.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct PanelPlacement {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dock: Option<DockSide>,
+}
+
 /// Studio's own settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -87,6 +120,10 @@ pub struct StudioOptions {
     /// Columns on solid panels, or the document as a sheet over a faint wash.
     #[schemars(title = "Window style", extend("x-section" = "Appearance"))]
     pub window_style: WindowStyle,
+    /// Where the bottom panel spans: under the document, across the window, or with the
+    /// sidebar or the inspector beside it.
+    #[schemars(title = "Bottom panel", extend("x-section" = "Appearance"))]
+    pub bottom_dock_layout: BottomDockLayout,
     /// Rows read per page in type tables.
     #[schemars(
         title = "Table page size",
@@ -125,6 +162,7 @@ impl Default for StudioOptions {
     fn default() -> Self {
         Self {
             window_style: WindowStyle::default(),
+            bottom_dock_layout: BottomDockLayout::default(),
             type_table_page_size: 100,
             tree_page_size: 50,
             canvas_max_nodes: 2000,
@@ -273,6 +311,10 @@ pub struct StudioSettings {
     /// Per-graph overrides, keyed by [`graph_key`]; edited in the settings tab's graph scope.
     #[schemars(extend("x-hidden" = true))]
     pub graphs: BTreeMap<String, GraphOverrides>,
+    /// Panels moved from their own dock, by panel id (`explore`, `history`, …); edited from a
+    /// panel's button in the status bar.
+    #[schemars(extend("x-hidden" = true))]
+    pub panels: BTreeMap<String, PanelPlacement>,
 }
 
 impl Default for StudioSettings {
@@ -287,6 +329,7 @@ impl Default for StudioSettings {
             studio: StudioOptions::default(),
             agent: AgentSettings::default(),
             graphs: BTreeMap::new(),
+            panels: BTreeMap::new(),
         }
     }
 }

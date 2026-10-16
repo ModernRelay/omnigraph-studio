@@ -19,6 +19,33 @@ pub enum PanelPosition {
 }
 
 impl PanelPosition {
+    pub const ALL: [PanelPosition; 3] = [Self::Left, Self::Bottom, Self::Right];
+
+    /// As the menu that moves a panel names it.
+    pub fn label(self) -> &'static str {
+        match self {
+            PanelPosition::Left => "Dock Left",
+            PanelPosition::Right => "Dock Right",
+            PanelPosition::Bottom => "Dock Bottom",
+        }
+    }
+
+    pub fn side(self) -> studio_settings::DockSide {
+        match self {
+            PanelPosition::Left => studio_settings::DockSide::Left,
+            PanelPosition::Right => studio_settings::DockSide::Right,
+            PanelPosition::Bottom => studio_settings::DockSide::Bottom,
+        }
+    }
+
+    pub fn from_side(side: studio_settings::DockSide) -> Self {
+        match side {
+            studio_settings::DockSide::Left => PanelPosition::Left,
+            studio_settings::DockSide::Right => PanelPosition::Right,
+            studio_settings::DockSide::Bottom => PanelPosition::Bottom,
+        }
+    }
+
     pub fn default_size(self) -> f32 {
         match self {
             PanelPosition::Left => 264.,
@@ -28,11 +55,13 @@ impl PanelPosition {
     }
 }
 
-/// One panel: what it is called, its icon in the dock's tabs, and its view.
+/// One panel: what it is called, its icon in the status bar, and its view.
 pub struct PanelEntry<V = AnyView> {
     pub id: SharedString,
     pub title: SharedString,
     pub icon: IconName,
+    /// The dock its feature put it in; it goes back there unless the person moved it.
+    pub home: PanelPosition,
     pub view: V,
     /// Small buttons on the right of the panel's title line (search, new), as Delta and Zed
     /// put a list's actions in its header.
@@ -114,12 +143,20 @@ impl<V> Dock<V> {
     }
 
     pub fn remove(&mut self, id: &str) {
-        if let Some(index) = self.position_of(id) {
-            self.panels.remove(index);
-            if self.active >= self.panels.len() {
-                self.active = self.panels.len().saturating_sub(1);
-            }
-        }
+        self.take(id);
+    }
+
+    /// Takes a panel out, to put it in another dock. The active panel stays active, or its
+    /// neighbor becomes so.
+    pub fn take(&mut self, id: &str) -> Option<PanelEntry<V>> {
+        let index = self.position_of(id)?;
+        let active = self.active_id();
+        let panel = self.panels.remove(index);
+        self.active = match active.and_then(|active| self.position_of(&active)) {
+            Some(still) => still,
+            None => index.min(self.panels.len().saturating_sub(1)),
+        };
+        Some(panel)
     }
 
     /// Makes `id` the active panel and opens the dock; false when the dock has no such panel.
@@ -144,9 +181,29 @@ mod tests {
             id: id.to_owned().into(),
             title: id.to_owned().into(),
             icon: IconName::Table,
+            home: PanelPosition::Left,
             view: (),
             actions: None,
         }
+    }
+
+    #[test]
+    fn a_taken_panel_leaves_the_others_as_they_were() {
+        let mut dock = Dock::new(PanelPosition::Bottom, true);
+        for id in ["nodes", "history", "activity"] {
+            dock.insert(panel(id));
+        }
+        dock.activate("activity");
+        let taken = dock.take("history").expect("history is there");
+        assert_eq!(taken.id.as_ref(), "history");
+        assert_eq!(
+            dock.active_id().as_deref(),
+            Some("activity"),
+            "still active"
+        );
+        dock.take("activity");
+        assert_eq!(dock.active_id().as_deref(), Some("nodes"), "its neighbor");
+        assert!(dock.take("activity").is_none());
     }
 
     #[test]

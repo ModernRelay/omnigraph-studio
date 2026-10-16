@@ -45,6 +45,8 @@ pub mod workspace {
             ToggleInspector,
             /// Show or hide the bottom panel: nodes, history and the activity log.
             ToggleActivity,
+            /// Zoom the active pane over the document area, or end a zoom.
+            ToggleZoom,
             /// Connect to a server or open a graph.
             OpenGraph,
             /// Reload the schema, branches and counts of the open graph.

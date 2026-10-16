@@ -101,6 +101,23 @@ title bar; Ragnor's choice over a Zed-style title bar) over one status bar acros
   ones, and a new pane starts with none. An arrow with nowhere to go is disabled.
 - ⌘J is the bottom panel (View → Bottom Panel), which holds Nodes, History and the activity
   log; it was labeled "Activity".
+- A panel moves to another dock from its button's right-click menu (Dock Left, Dock Bottom,
+  Dock Right, the current one checked), as in Zed. The choice is a setting,
+  `panels.<id>.dock`, written into `settings.json` in place; moving a panel back to its own
+  dock removes it. Panels are placed when they are added and moved when the setting changes, a
+  shown panel staying shown where it lands. A panel is drawn as its feature made it wherever it
+  sits: a side panel in its scrolling host, a bottom panel cached at the dock's size.
+- `studio.bottom_dock_layout` ("Bottom panel" on the settings tab) is Zed's: `contained` (under
+  the document, the default), `full` (across the window), `left_aligned` (under the sidebar and
+  the document) and `right_aligned` (under the document and the inspector). On glass a bottom
+  panel outside the document is a sheet of its own.
+- ⇧⎋ (`studio::ToggleZoom`) zooms the active pane over the document area, with Zed's 8 px
+  inset, a border and a float shadow; the right and bottom docks' headers have a zoom button
+  too. Pressing it again, showing a tab of another pane, or hiding the zoomed dock ends the
+  zoom. A zoomed header keeps room for the traffic lights.
+- Each graph keeps its own docks: showing a graph again from the switcher brings back its docks
+  as it left them (open, active panel, size), not the shown graph's; before, only a graph
+  opened fresh read its saved docks.
 
 ### Drawing cost
 
@@ -422,6 +439,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-16 | Panels move between docks; the bottom panel spans as its layout says; zoom | `studio_workspace` tests `a_panel_goes_where_the_settings_place_it` (placed at its add, home again when the setting goes, the menu's move), `the_bottom_panel_spans_as_its_layout_says` (contained: the window less the inspector; full: the window), `zoom_covers_the_document_area_until_toggled_or_hidden`, `a_graphs_docks_come_back_with_it`, `panels` `a_taken_panel_leaves_the_others_as_they_were`; offscreen snapshots: `full` with History and the inspector, Explore placed in the right dock with the menu on the Graph button, a zoomed pane | History ran under the sidebar and the inspector; Explore showed in the right dock with its icon at the bar's right end; the menu read "✓ Dock Left, Dock Bottom, Dock Right" with no tooltip over it; the zoomed table covered the document area inside an 8 px inset, its arrows after the traffic lights' room |
 | 2026-10-16 | Docks are switched from a status bar, and each pane keeps its own back and forward | `studio_workspace` tests `panel_buttons_show_their_panel_and_hide_the_dock_it_shows`, `back_and_forward_walk_the_active_panes_own_tabs`, `tabs_fill_the_header_strip` (the status bar's height), `pane` `a_pane_steps_back_and_forward_through_the_tabs_it_showed`; offscreen snapshots on the dev graph, flat and glass, with the bottom panel, with the sidebar hidden and a row peeked | One status bar across the window: the five sidebar panels' icons at the left (Graph lit), the server, graph and branch, the tab's facts, memory and CPU, then Nodes, History and Activity and, with a row peeked, the inspector (lit). Column headers show their panel's title; each pane's strip starts with ← → (← enabled after a second tab, → disabled). With the sidebar hidden its icons stay in the bar |
 | 2026-10-14 | `settings.json` keeps the person's text, and `keymap.json` rebinds keys | `studio_settings` `document` tests (comments and trailing commas, a syntax error's line, each value that does not fit costing only its setting, a saved view set aside alone, edits in place, a new key above a comment's key, defaults removed, a bad value kept until its setting changes, graph entries); `studio` `settings_apply` (`a_change_keeps_the_persons_text`: a hand edit with a comment written before the change and not yet read stays and applies; only chosen keys are written; a broken file refuses the change unchanged) and `keymaps` (`the_persons_keymap_wins_and_is_read_again`: a key added, `null` taking ⌘K from the palette and from the shortcut text, an unknown action reported, a broken save keeping the bindings, a second save restoring Studio's); offscreen snapshot of the settings tab in a scratch data folder with three bad values and a bad binding | All pass. The tab listed "3 problems in settings.json" (the font size, a misspelled `stuido`, a negative node limit) and "A problem in keymap.json" with each path and line; Interface font size showed 16. Before, a comment or one wrong value read as a file that could not be applied, the first change wrote every default into the file, and a change within two seconds of a hand edit wrote over it |
 | 2026-10-14 | ⌘K and ⌘P say when they are still looking for nodes | `command_palette` test `the_palette_shows_it_is_searching_nodes` (a fake server; the circle and "Searching nodes…" from the keystroke, no count of none, then the node rows and no circle once it answers; fails without the flag); offscreen snapshots on the dev graph through a proxy that held each node search for 3 s: ⌘K, ⌘3 then "ad"; ⌘K then "ad" | Nodes: the circle at the field's end, "Searching nodes…", no "0 nodes". All: the matching commands at once, with the circle until the nodes came. Before, both showed nothing, and Nodes said "No node matches." while it waited |
@@ -454,6 +472,9 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-13 | A panic message loses quoted text | `studio` test `a_panic_message_loses_the_text_it_quotes` | ``'é'`` and `` `Ada Lovelace's notes` `` become `'…'` and `` `…` ``; messages over 300 characters are cut |
 
 ## Corrections
+
+- 2026-10-16 · Switching graphs in a window kept the docks of the graph shown before: a graph's
+  saved docks were read only when it opened fresh. Showing a parked graph now applies its own.
 
 - 2026-10-16 · A hidden sidebar had no button to bring it back (only ⌘B, the View menu or the
   palette did); ⌘J and its button were labeled "Activity" but toggled the whole bottom panel,

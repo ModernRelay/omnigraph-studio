@@ -22,6 +22,7 @@
   {
     "context": "Workspace",
     "bindings": {
+      "shift-escape": "studio::ToggleZoom",
       "ctrl-w": "studio::CloseActiveItem",
       "ctrl-tab": "studio::ActivateNextItem",
       "ctrl-shift-tab": "studio::ActivatePreviousItem",

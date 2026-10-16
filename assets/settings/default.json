@@ -11,6 +11,7 @@
   "ui_density": "default",
   "studio": {
     "window_style": "flat",
+    "bottom_dock_layout": "contained",
     "type_table_page_size": 100,
     "tree_page_size": 50,
     "canvas_max_nodes": 2000,
@@ -23,5 +24,6 @@
     "ask_before_writes": false,
     "omnigraph_cli": null
   },
-  "graphs": {}
+  "graphs": {},
+  "panels": {}
 }

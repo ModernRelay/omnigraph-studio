@@ -359,6 +359,7 @@ mod tests {
                 "buffer_font_size",
                 "ui_density",
                 "studio.window_style",
+                "studio.bottom_dock_layout",
                 "studio.type_table_page_size",
                 "studio.tree_page_size",
                 "studio.canvas_max_nodes",
@@ -368,7 +369,7 @@ mod tests {
                 "agent.ask_before_writes",
                 "agent.omnigraph_cli",
             ],
-            "agent.env, a map, is edited in settings.json only"
+            "agent.env, a map, and panels are edited in settings.json or elsewhere"
         );
         assert_eq!(
             sections(),

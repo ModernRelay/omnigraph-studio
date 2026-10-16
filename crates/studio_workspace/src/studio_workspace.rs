@@ -30,8 +30,9 @@ use studio_actions::workspace::{
     ActivatePreviousGraph, ActivatePreviousItem, ActivatePreviousPane, CloseActiveItem,
     CloseAllItems, CloseGraph, CloseOtherItems, GoBack, GoForward, KeepPreviewTab, Refresh,
     SplitDown, SplitRight, ToggleActivity, ToggleInspector, TogglePinTab, ToggleSidebar,
+    ToggleZoom,
 };
-use studio_settings::StudioSettings;
+use studio_settings::{BottomDockLayout, StudioSettings};
 use ui::prelude::*;
 use ui::{ButtonLike, ContextMenu, Indicator, PopoverMenu, Tooltip, right_click_menu};
 
@@ -104,6 +105,13 @@ struct ParkedGraph {
     saved: Option<SavedWorkspace>,
 }
 
+/// What fills the document area while zoomed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Zoomed {
+    Pane(PaneId),
+    Dock(PanelPosition),
+}
+
 pub struct Workspace {
     session: Option<Entity<GraphSession>>,
     /// The other graphs open in this window, and every open graph's session in the order they
@@ -127,6 +135,8 @@ pub struct Workspace {
     left: Dock,
     right: Dock,
     bottom: Dock,
+    /// A pane or a dock drawn over the whole document area, as Zed zooms one (⇧⎋).
+    zoomed: Option<Zoomed>,
     modal: Option<ActiveModal>,
     /// Each dock panel's scrolling host, by the panel view's entity: the host is cached, so a
     /// panel is drawn again only when it notifies.
@@ -172,6 +182,8 @@ const SAVE_DELAY: Duration = Duration::from_millis(500);
 /// columns (after Zed's).
 const HEADER_HEIGHT: f32 = studio_ui::ds::size::HEADER_STRIP;
 const STATUS_BAR_HEIGHT: f32 = studio_ui::ds::size::STATUS_BAR;
+/// How far a zoomed pane or panel sits inside the document area, as Zed's `zoomed_padding`.
+const ZOOM_INSET: f32 = studio_ui::ds::size::SHEET_GAP;
 /// Room for the window's traffic lights at the left of the first header strip.
 const TRAFFIC_LIGHTS_WIDTH: f32 = 76.;
 /// The traffic lights' offset from the top of that strip: centers the 16-point buttons in it.
@@ -214,6 +226,7 @@ fn cached_fill() -> gpui::StyleRefinement {
 
 /// The id of the right dock's inspector panel.
 const INSPECTOR_PANEL: &str = "inspector";
+const ACTIVITY_PANEL: &str = "activity";
 
 impl EventEmitter<WorkspaceEvent> for Workspace {}
 
@@ -232,8 +245,13 @@ impl Focusable for Workspace {
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // A settings file that cannot be read is named in a toast that stays until dismissed.
-        let settings_subscription =
-            cx.observe_global::<StudioSettings>(|this, cx| this.show_settings_error(cx));
+        // A moved panel goes where the settings now place it, and the frame follows the layout
+        // settings (the bottom panel's span).
+        let settings_subscription = cx.observe_global::<StudioSettings>(|this, cx| {
+            this.show_settings_error(cx);
+            this.place_panels(cx);
+            cx.notify();
+        });
         let performance_subscription =
             cx.observe_global::<StudioSettings>(|this, cx| this.watch_performance(cx));
         let window_slot = persistence::window_opened(window, cx);
@@ -302,6 +320,7 @@ impl Workspace {
             left: Dock::new(PanelPosition::Left, true),
             right: Dock::new(PanelPosition::Right, true),
             bottom: Dock::new(PanelPosition::Bottom, false),
+            zoomed: None,
             modal: None,
             dock_hosts: HashMap::new(),
             toasts: Vec::new(),
@@ -514,17 +533,12 @@ impl Workspace {
         }));
     }
 
-    /// Reopens the tabs and panels remembered for the open graph.
-    fn restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((url, graph)) = self.graph_key(cx) else {
-            return;
-        };
-        let Some(saved) = persistence::load(&url, &graph) else {
-            return;
-        };
+    /// The docks a graph's saved state names: open or hidden, their sizes and active panels.
+    fn apply_docks(&mut self, saved: &SavedWorkspace) {
         self.left.open = saved.sidebar_open;
         self.right.open = saved.inspector_open;
         self.bottom.open = saved.activity_open;
+        self.zoomed = None;
         for (dock, size) in [
             (&mut self.left, saved.left_size),
             (&mut self.right, saved.right_size),
@@ -545,6 +559,17 @@ impl Workspace {
                 dock.open = open;
             }
         }
+    }
+
+    /// Reopens the tabs and panels remembered for the open graph.
+    fn restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((url, graph)) = self.graph_key(cx) else {
+            return;
+        };
+        let Some(saved) = persistence::load(&url, &graph) else {
+            return;
+        };
+        self.apply_docks(&saved);
         // A file from before splits has its tabs at the top level: one pane.
         let (layout, panes) = if saved.panes.is_empty() {
             let pane = SavedPane {
@@ -683,7 +708,10 @@ impl Workspace {
         self.save_now(cx);
         let session = self.session.take()?;
         self._session_subscription = None;
-        self.right.remove(INSPECTOR_PANEL);
+        if let Some(position) = self.dock_of(INSPECTOR_PANEL) {
+            self.dock_mut(position).remove(INSPECTOR_PANEL);
+        }
+        self.zoomed = None;
         // A modal open now must not hand the focus back to a tab of this graph.
         if let Some(modal) = &mut self.modal {
             modal.previous_focus = None;
@@ -703,6 +731,10 @@ impl Workspace {
         self.center = parked.center;
         self.active_pane = parked.active_pane;
         self.next_pane = parked.next_pane;
+        // Its docks as it left them, not the docks of the graph shown before.
+        if let Some(saved) = &parked.saved {
+            self.apply_docks(saved);
+        }
         self.saved = parked.saved;
         self.subscribe_session(parked.session, window, cx);
         let index = self.pane(self.active_pane).map_or(0, |p| p.active);
@@ -1063,6 +1095,10 @@ impl Workspace {
             }
             return;
         };
+        // Showing a tab of another pane than the zoomed one brings the panes back.
+        if matches!(self.zoomed, Some(Zoomed::Pane(zoomed)) if zoomed != pane_id) {
+            self.zoomed = None;
+        }
         self.active_pane = pane_id;
         if let Some(pane) = self.pane_mut(pane_id) {
             if record
@@ -1171,6 +1207,9 @@ impl Workspace {
         if !self.center.remove(id) {
             return;
         }
+        if self.zoomed == Some(Zoomed::Pane(id)) {
+            self.zoomed = None;
+        }
         self.panes.retain(|pane| pane.id != id);
         if self.active_pane == id {
             let position = order.iter().position(|p| *p == id).unwrap_or_default();
@@ -1243,7 +1282,9 @@ impl Workspace {
         }
     }
 
-    /// Adds a panel to a dock, or replaces the view of the panel with the same id there.
+    /// Adds a panel to its dock, or replaces the view of the panel with the same id there.
+    /// `position` is its own dock; it goes to another when the person moved it there
+    /// (`panels.<id>.dock` in the settings).
     pub fn add_panel(
         &mut self,
         position: PanelPosition,
@@ -1253,15 +1294,91 @@ impl Workspace {
         view: AnyView,
         cx: &mut Context<Self>,
     ) {
+        let id = id.into();
         self.host_for(&view, cx);
-        self.dock_mut(position).insert(PanelEntry {
-            id: id.into(),
+        let dock = self
+            .dock_of(&id)
+            .unwrap_or_else(|| placed(&id, position, cx));
+        self.dock_mut(dock).insert(PanelEntry {
+            id,
             title: title.into(),
             icon,
+            home: position,
             view,
             actions: None,
         });
         cx.notify();
+    }
+
+    /// The dock that holds a panel.
+    fn dock_of(&self, id: &str) -> Option<PanelPosition> {
+        [&self.left, &self.right, &self.bottom]
+            .into_iter()
+            .find(|dock| dock.position_of(id).is_some())
+            .map(|dock| dock.position)
+    }
+
+    /// Moves a panel to another dock, as Zed moves a panel whose `dock` setting changed: a panel
+    /// that showed keeps showing there, opening that dock.
+    fn move_panel(&mut self, id: &str, to: PanelPosition, cx: &mut Context<Self>) {
+        let Some(from) = self.dock_of(id) else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        let dock = self.dock_mut(from);
+        let shown = dock.open && dock.active_id().as_deref() == Some(id);
+        let Some(panel) = dock.take(id) else {
+            return;
+        };
+        if self.zoomed == Some(Zoomed::Dock(from)) && self.dock_mut(from).panels.is_empty() {
+            self.zoomed = None;
+        }
+        let target = self.dock_mut(to);
+        target.insert(panel);
+        if shown {
+            target.activate(id);
+        }
+        cx.notify();
+    }
+
+    /// Puts every panel where the settings place it, after they change.
+    fn place_panels(&mut self, cx: &mut Context<Self>) {
+        let moves: Vec<(SharedString, PanelPosition)> = [&self.left, &self.right, &self.bottom]
+            .into_iter()
+            .flat_map(|dock| {
+                dock.panels.iter().filter_map(|panel| {
+                    let to = placed(&panel.id, panel.home, cx);
+                    (to != dock.position).then(|| (panel.id.clone(), to))
+                })
+            })
+            .collect();
+        for (id, to) in moves {
+            self.move_panel(&id, to, cx);
+        }
+    }
+
+    /// The person's choice from a panel button's menu: moves the panel and remembers where, or
+    /// forgets the choice when the panel goes back to its own dock.
+    fn dock_panel(&mut self, id: SharedString, to: PanelPosition, cx: &mut Context<Self>) {
+        let home = [&self.left, &self.right, &self.bottom]
+            .into_iter()
+            .flat_map(|dock| dock.panels.iter())
+            .find(|panel| panel.id == id)
+            .map(|panel| panel.home);
+        let Some(home) = home else {
+            return;
+        };
+        self.move_panel(&id, to, cx);
+        let key = id.to_string();
+        studio_settings::update(cx, move |settings| {
+            if to == home {
+                settings.panels.remove(&key);
+            } else {
+                settings.panels.entry(key).or_default().dock = Some(to.side());
+            }
+        });
     }
 
     /// Makes sure a dock panel has its cached host, dropping hosts of panels gone from the
@@ -1312,35 +1429,47 @@ impl Workspace {
         match view {
             Some(view) => {
                 self.host_for(&view, cx);
-                self.right.insert(PanelEntry {
+                let position = self
+                    .dock_of(INSPECTOR_PANEL)
+                    .unwrap_or_else(|| placed(INSPECTOR_PANEL, PanelPosition::Right, cx));
+                let dock = self.dock_mut(position);
+                dock.insert(PanelEntry {
                     id: INSPECTOR_PANEL.into(),
                     title: "Inspector".into(),
                     icon: IconName::Info,
+                    home: PanelPosition::Right,
                     view,
                     actions: None,
                 });
                 // Selection shows the inspector but never reopens a dock the user closed.
-                let open = self.right.open;
-                self.right.activate(INSPECTOR_PANEL);
-                self.right.open = open;
+                let open = dock.open;
+                dock.activate(INSPECTOR_PANEL);
+                dock.open = open;
             }
-            None => self.right.remove(INSPECTOR_PANEL),
+            None => {
+                if let Some(position) = self.dock_of(INSPECTOR_PANEL) {
+                    self.dock_mut(position).remove(INSPECTOR_PANEL);
+                }
+            }
         }
         cx.notify();
     }
 
     /// The activity log: the bottom dock's panel.
     pub fn set_activity_view(&mut self, view: AnyView, cx: &mut Context<Self>) {
-        let open = self.bottom.open;
+        let position = self
+            .dock_of(ACTIVITY_PANEL)
+            .unwrap_or_else(|| placed(ACTIVITY_PANEL, PanelPosition::Bottom, cx));
+        let open = self.dock_mut(position).open;
         self.add_panel(
             PanelPosition::Bottom,
-            "activity",
+            ACTIVITY_PANEL,
             "Activity",
             IconName::HistoryRerun,
             view,
             cx,
         );
-        self.bottom.open = open;
+        self.dock_mut(position).open = open;
     }
 
     // ---- modals and toasts ----
@@ -1619,7 +1748,7 @@ impl Workspace {
         let body = v_flex().id("sidebar-panel").flex_1().min_h_0().children(
             self.left
                 .active_panel()
-                .map(|panel| div().size_full().child(self.hosted(&panel.view))),
+                .map(|panel| div().size_full().child(self.panel_body(panel))),
         );
         let glass = studio_ui::ds::is_glass(cx);
         let column = if glass {
@@ -1658,34 +1787,86 @@ impl Workspace {
             PanelPosition::Right => "Hide inspector",
             PanelPosition::Bottom => "Hide bottom panel",
         };
+        let workspace = cx.entity().downgrade();
         h_flex()
             .gap(px(studio_ui::ds::space::XXS))
             .children(dock.panels.iter().enumerate().map(|(index, panel)| {
                 let lit = dock.open && index == dock.active;
                 let id = panel.id.clone();
                 let title = panel.title.clone();
+                let icon = panel.icon;
                 let tooltip_id = id.clone();
-                IconButton::new(SharedString::from(format!("panel-button-{id}")), panel.icon)
-                    .icon_size(IconSize::Small)
-                    .toggle_state(lit)
-                    .tooltip(move |_, cx| {
-                        if lit {
-                            Tooltip::for_action(hide_label, toggle_action(position).as_ref(), cx)
-                        } else {
-                            Tooltip::for_action(
-                                title.clone(),
-                                &studio_actions::workspace::ActivatePanel {
-                                    id: tooltip_id.to_string(),
-                                },
-                                cx,
-                            )
-                        }
+                let workspace = workspace.clone();
+                let this = cx.entity().downgrade();
+                let (anchor, attach) = match position {
+                    PanelPosition::Left => (gpui::Anchor::BottomLeft, gpui::Anchor::TopLeft),
+                    PanelPosition::Bottom | PanelPosition::Right => {
+                        (gpui::Anchor::BottomRight, gpui::Anchor::TopRight)
+                    }
+                };
+                let button_id = id.clone();
+                // As Zed's panel buttons: the right-click menu moves the panel to another dock,
+                // and no tooltip covers it while it is open.
+                right_click_menu(SharedString::from(format!("panel-menu-{id}")))
+                    .anchor(anchor)
+                    .attach(attach)
+                    .trigger(move |menu_open, _, _| {
+                        let title = title.clone();
+                        let tooltip_id = tooltip_id.clone();
+                        let id = button_id.clone();
+                        let this = this.clone();
+                        IconButton::new(
+                            SharedString::from(format!("panel-button-{id}-{}", lit as u8)),
+                            icon,
+                        )
+                        .icon_size(IconSize::Small)
+                        .toggle_state(lit)
+                        .when(!menu_open, |button| {
+                            button.tooltip(move |_, cx| {
+                                if lit {
+                                    Tooltip::for_action(
+                                        hide_label,
+                                        toggle_action(position).as_ref(),
+                                        cx,
+                                    )
+                                } else {
+                                    Tooltip::for_action(
+                                        title.clone(),
+                                        &studio_actions::workspace::ActivatePanel {
+                                            id: tooltip_id.to_string(),
+                                        },
+                                        cx,
+                                    )
+                                }
+                            })
+                        })
+                        .on_click(move |_, _, cx| {
+                            this.update(cx, |w, cx| w.press_panel_button(position, &id, cx))
+                                .ok();
+                        })
                     })
-                    .on_click(
-                        cx.listener(move |this, _, _, cx| {
-                            this.press_panel_button(position, &id, cx)
-                        }),
-                    )
+                    .menu(move |window, cx| {
+                        let workspace = workspace.clone();
+                        let id = id.clone();
+                        ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            for to in PanelPosition::ALL {
+                                let workspace = workspace.clone();
+                                let id = id.clone();
+                                menu = menu.toggleable_entry(
+                                    to.label(),
+                                    to == position,
+                                    IconPosition::Start,
+                                    None,
+                                    move |_, cx| {
+                                        workspace
+                                            .update(cx, |w, cx| w.dock_panel(id.clone(), to, cx))
+                                            .ok();
+                                    },
+                                );
+                            }
+                            menu
+                        })
+                    })
             }))
     }
 
@@ -1694,11 +1875,28 @@ impl Workspace {
     fn press_panel_button(&mut self, position: PanelPosition, id: &str, cx: &mut Context<Self>) {
         let dock = self.dock_mut(position);
         if dock.open && dock.active_id().as_deref() == Some(id) {
-            dock.open = false;
-            cx.notify();
+            self.set_dock_open(position, false, cx);
         } else {
             self.activate_panel(id, cx);
         }
+    }
+
+    /// Opens or hides a dock; hiding the zoomed one ends the zoom.
+    fn set_dock_open(&mut self, position: PanelPosition, open: bool, cx: &mut Context<Self>) {
+        self.dock_mut(position).open = open;
+        if !open && self.zoomed == Some(Zoomed::Dock(position)) {
+            self.zoomed = None;
+        }
+        cx.notify();
+    }
+
+    /// ⇧⎋: zooms the active pane over the document area, or ends any zoom.
+    fn toggle_zoom(&mut self, cx: &mut Context<Self>) {
+        self.zoomed = match self.zoomed {
+            Some(_) => None,
+            None => Some(Zoomed::Pane(self.active_pane)),
+        };
+        cx.notify();
     }
 
     /// The server this window is connected to: a status dot, the server and its state, as
@@ -1969,6 +2167,7 @@ impl Workspace {
         };
         let hairline = studio_ui::ds::surface::rule(cx);
         let top_left = self.center.top_left() == pane_id;
+        let zoomed = self.zoomed == Some(Zoomed::Pane(pane_id));
         let (can_back, can_forward) = self.pane(pane_id).map_or((false, false), |pane| {
             (pane.can_step(true), pane.can_step(false))
         });
@@ -2017,11 +2216,11 @@ impl Workspace {
         .debug_selector(move || format!("pane-header-{pane_id}"))
         .bg(header_bg)
         .when(
-            top_left && (!self.left.visible() || self.session.is_none()),
+            zoomed || (top_left && (!self.left.visible() || self.session.is_none())),
             |strip| {
                 strip.child(
                     div()
-                        .w(px(TRAFFIC_LIGHTS_WIDTH))
+                        .w(px(lights_room(zoomed, cx)))
                         .h_full()
                         .flex_none()
                         .border_b_1()
@@ -2088,6 +2287,10 @@ impl Workspace {
             let Member::Pane(id) = member else {
                 unreachable!()
             };
+            // A zoomed pane is drawn over the document area instead (`render_zoomed`).
+            if self.zoomed == Some(Zoomed::Pane(*id)) {
+                return div().size_full().into_any_element();
+            }
             return self.render_pane(*id, cx);
         };
         let axis = *axis;
@@ -2339,11 +2542,14 @@ impl Workspace {
         )
     }
 
-    fn render_center(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        let (editor_background, panel_background) =
-            (colors.editor_background, colors.panel_background);
-        let hairline = studio_ui::ds::surface::rule(cx);
+    /// The document column: its panes, and the bottom dock when it sits under the document
+    /// alone (`studio.bottom_dock_layout` "contained").
+    fn render_center(
+        &self,
+        bottom: Option<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let editor_background = cx.theme().colors().editor_background;
         let center = self.center.clone();
         let body =
             div()
@@ -2363,56 +2569,152 @@ impl Workspace {
             .min_w_0()
             .h_full()
             .child(body)
-            .when(self.bottom.visible(), |d| {
-                d.child(
-                    v_flex()
-                        .h(px(self.bottom.size))
-                        .relative()
-                        .flex_none()
-                        .overflow_hidden()
-                        .when(!studio_ui::ds::is_glass(cx), |d| d.bg(panel_background))
-                        .border_t_1()
-                        .border_color(hairline)
-                        .child(
-                            h_flex()
-                                .h(px(HEADER_HEIGHT))
-                                .flex_none()
-                                .px(px(studio_ui::ds::space::SM))
-                                .gap(px(studio_ui::ds::space::SM))
-                                .items_center()
-                                .border_b_1()
-                                .border_color(hairline)
-                                .children(self.bottom.active_panel().map(dock_title))
-                                .child(
-                                    studio_ui::ds::icon_button(
-                                        "close-bottom-dock",
-                                        IconName::Close,
-                                    )
-                                    .icon_size(IconSize::XSmall)
-                                    .tooltip(|_, cx| {
-                                        Tooltip::for_action(
-                                            "Hide bottom panel",
-                                            &ToggleActivity,
-                                            cx,
-                                        )
-                                    })
-                                    .on_click(
-                                        |_, window, cx| {
-                                            window.dispatch_action(Box::new(ToggleActivity), cx)
-                                        },
-                                    ),
-                                ),
-                        )
-                        .child(
-                            div().flex_1().min_h_0().children(
-                                self.bottom
-                                    .active_panel()
-                                    .map(|p| p.view.clone().cached(cached_fill())),
-                            ),
-                        )
-                        .child(resize_handle(PanelPosition::Bottom)),
-                )
+            .children(bottom)
+    }
+
+    /// The bottom dock: its panel's header, then the panel. `alone` when it is not inside the
+    /// document column, so on glass it is a sheet of its own.
+    fn render_bottom_dock(&self, alone: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.bottom.visible() || self.zoomed == Some(Zoomed::Dock(PanelPosition::Bottom)) {
+            return None;
+        }
+        let panel = self.bottom.active_panel()?;
+        let glass = studio_ui::ds::is_glass(cx);
+        let hairline = studio_ui::ds::surface::rule(cx);
+        let panel_background = cx.theme().colors().panel_background;
+        let column = if glass && alone {
+            studio_ui::ds::sheet(cx)
+        } else {
+            div()
+        };
+        Some(
+            column
+                .id("bottom-dock")
+                .debug_selector(|| "bottom-dock".into())
+                .flex()
+                .flex_col()
+                .h(px(self.bottom.size))
+                .w_full()
+                .relative()
+                .flex_none()
+                .overflow_hidden()
+                .when(!glass, |d| d.bg(panel_background))
+                .when(!(glass && alone), |d| d.border_t_1().border_color(hairline))
+                .child(self.render_dock_header(PanelPosition::Bottom, cx))
+                .child(div().flex_1().min_h_0().child(self.panel_body(panel)))
+                .child(resize_handle(PanelPosition::Bottom))
+                .into_any_element(),
+        )
+    }
+
+    /// A right or bottom dock's header strip: its panel's title and buttons, then zoom and
+    /// hide.
+    fn render_dock_header(&self, position: PanelPosition, cx: &mut Context<Self>) -> Stateful<Div> {
+        let hairline = studio_ui::ds::surface::rule(cx);
+        let dock = match position {
+            PanelPosition::Left => &self.left,
+            PanelPosition::Right => &self.right,
+            PanelPosition::Bottom => &self.bottom,
+        };
+        let zoomed = self.zoomed == Some(Zoomed::Dock(position));
+        let hide_label = match position {
+            PanelPosition::Left => "Hide sidebar",
+            PanelPosition::Right => "Hide inspector",
+            PanelPosition::Bottom => "Hide bottom panel",
+        };
+        self.strip(
+            SharedString::from(format!("dock-header-{position:?}")),
+            HEADER_HEIGHT,
+            cx,
+        )
+        .px(px(studio_ui::ds::space::SM))
+        .gap(px(studio_ui::ds::space::XS))
+        .border_b_1()
+        .border_color(hairline)
+        .when(zoomed, |strip| {
+            strip.child(div().w(px(lights_room(true, cx))).flex_none())
+        })
+        .children(dock.active_panel().map(dock_title))
+        .child(
+            studio_ui::ds::icon_button(
+                SharedString::from(format!("zoom-dock-{position:?}")),
+                if zoomed {
+                    IconName::Minimize
+                } else {
+                    IconName::Maximize
+                },
+            )
+            .icon_size(IconSize::XSmall)
+            .tooltip(move |_, cx| {
+                Tooltip::for_action(if zoomed { "Zoom out" } else { "Zoom in" }, &ToggleZoom, cx)
             })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.zoomed = if zoomed {
+                    None
+                } else {
+                    Some(Zoomed::Dock(position))
+                };
+                cx.notify();
+            })),
+        )
+        .child(
+            studio_ui::ds::icon_button(
+                SharedString::from(format!("hide-dock-{position:?}")),
+                IconName::Close,
+            )
+            .icon_size(IconSize::XSmall)
+            .tooltip(move |_, cx| {
+                Tooltip::for_action(hide_label, toggle_action(position).as_ref(), cx)
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.set_dock_open(position, false, cx))),
+        )
+    }
+
+    /// A panel's content, drawn as it was made for: a side panel in its scrolling host, a
+    /// bottom panel cached at the dock's size (it scrolls itself), whichever dock it is in now.
+    fn panel_body(&self, panel: &PanelEntry) -> AnyElement {
+        match panel.home {
+            PanelPosition::Bottom => panel.view.clone().cached(cached_fill()).into_any_element(),
+            PanelPosition::Left | PanelPosition::Right => self.hosted(&panel.view),
+        }
+    }
+
+    /// What is zoomed, over the document area with Zed's inset: a pane with its tabs, or a
+    /// dock's panel with its header.
+    fn render_zoomed(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let content = match self.zoomed? {
+            Zoomed::Pane(id) => self.render_pane(id, cx),
+            Zoomed::Dock(position) => {
+                let dock = match position {
+                    PanelPosition::Left => &self.left,
+                    PanelPosition::Right => &self.right,
+                    PanelPosition::Bottom => &self.bottom,
+                };
+                let panel = dock.active_panel()?;
+                v_flex()
+                    .size_full()
+                    .child(self.render_dock_header(position, cx))
+                    .child(div().flex_1().min_h_0().child(self.panel_body(panel)))
+                    .into_any_element()
+            }
+        };
+        let colors = cx.theme().colors();
+        Some(
+            v_flex()
+                .id("zoomed")
+                .debug_selector(|| "zoomed".into())
+                .absolute()
+                .inset(px(ZOOM_INSET))
+                .bg(colors.editor_background)
+                .border_1()
+                .border_color(colors.border)
+                .rounded(px(studio_ui::ds::radius::LG))
+                .shadow(studio_ui::ds::elevation::float())
+                .overflow_hidden()
+                .occlude()
+                .child(content)
+                .into_any_element(),
+        )
     }
 
     /// No tab open: an icon, one line, and what fills the page (Zed's empty panels).
@@ -2479,14 +2781,13 @@ impl Workspace {
             )
             .into_any_element()
     }
-    /// The right dock: a header strip with its panels' tabs, then the active panel.
+    /// The right dock: its panel's header, then the panel.
     fn render_right_dock(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        if !self.right.visible() {
+        if !self.right.visible() || self.zoomed == Some(Zoomed::Dock(PanelPosition::Right)) {
             return None;
         }
-        let panel = self.hosted(&self.right.active_panel()?.view);
-        let colors = cx.theme().colors();
-        let editor_background = colors.editor_background;
+        let panel = self.panel_body(self.right.active_panel()?);
+        let editor_background = cx.theme().colors().editor_background;
         let hairline = studio_ui::ds::surface::rule(cx);
         let column = if studio_ui::ds::is_glass(cx) {
             studio_ui::ds::sheet(cx)
@@ -2505,23 +2806,7 @@ impl Workspace {
                 .h_full()
                 .flex_none()
                 .child(resize_handle(PanelPosition::Right))
-                .child(
-                    self.strip("right-dock-header", HEADER_HEIGHT, cx)
-                        .px(px(studio_ui::ds::space::SM))
-                        .border_b_1()
-                        .border_color(hairline)
-                        .children(self.right.active_panel().map(dock_title))
-                        .child(
-                            studio_ui::ds::icon_button("close-right-dock", IconName::Close)
-                                .icon_size(IconSize::XSmall)
-                                .tooltip(|_, cx| {
-                                    Tooltip::for_action("Hide inspector", &ToggleInspector, cx)
-                                })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(ToggleInspector), cx)
-                                }),
-                        ),
-                )
+                .child(self.render_dock_header(PanelPosition::Right, cx))
                 .child(div().flex_1().min_h_0().child(panel)),
         )
     }
@@ -2777,17 +3062,15 @@ impl Render for Workspace {
             }))
             .on_drag_move(cx.listener(Self::resize_dock))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
-                this.left.open = !this.left.open;
-                cx.notify();
+                this.set_dock_open(PanelPosition::Left, !this.left.open, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| {
-                this.right.open = !this.right.open;
-                cx.notify();
+                this.set_dock_open(PanelPosition::Right, !this.right.open, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleActivity, _, cx| {
-                this.bottom.open = !this.bottom.open;
-                cx.notify();
+                this.set_dock_open(PanelPosition::Bottom, !this.bottom.open, cx)
             }))
+            .on_action(cx.listener(|this, _: &ToggleZoom, _, cx| this.toggle_zoom(cx)))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| {
                 if let Some(session) = &this.session {
                     session.update(cx, |s, cx| s.reload(cx));
@@ -2826,7 +3109,9 @@ impl Render for Workspace {
         // inspector are three sheets with one gap around and between them, over the bar on the
         // wash. Flat: columns split by hairlines.
         let glass = studio_ui::ds::is_glass(cx);
-        let sidebar_shown = self.left.visible() && self.session.is_some();
+        let sidebar_shown = self.left.visible()
+            && self.session.is_some()
+            && self.zoomed != Some(Zoomed::Dock(PanelPosition::Left));
         let gap = px(studio_ui::ds::size::SHEET_GAP);
         let lights = traffic_light_position(glass);
         if self.traffic_lights != Some(lights) {
@@ -2839,15 +3124,69 @@ impl Render for Workspace {
             .pane(self.active_pane)
             .and_then(|pane| pane.active_item())
             .and_then(|item| item.footer(window, cx));
-        root.child(
+        // Where the bottom dock spans, as Zed's `bottom_dock_layout`.
+        let layout = cx
+            .try_global::<StudioSettings>()
+            .map(|settings| settings.studio.bottom_dock_layout)
+            .unwrap_or_default();
+        let contained = layout == BottomDockLayout::Contained;
+        let bottom = self.render_bottom_dock(!contained, cx);
+        let sidebar = sidebar_shown.then(|| self.render_sidebar(cx).into_any_element());
+        let right = self
+            .render_right_dock(cx)
+            .map(IntoElement::into_any_element);
+        let row = || {
             h_flex()
                 .flex_1()
                 .min_h_0()
                 .w_full()
-                .when(glass, |d| d.p(gap).pb_0().gap(gap))
-                .when(sidebar_shown, |d| d.child(self.render_sidebar(cx)))
-                .child(self.render_center(cx))
-                .children(self.render_right_dock(cx)),
+                .when(glass, |d| d.gap(gap))
+        };
+        let column = || {
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .when(glass, |d| d.gap(gap))
+        };
+        let docks = match layout {
+            BottomDockLayout::Contained => row()
+                .children(sidebar)
+                .child(self.render_center(bottom, cx))
+                .children(right),
+            BottomDockLayout::Full => row().child(
+                column()
+                    .child(
+                        row()
+                            .children(sidebar)
+                            .child(self.render_center(None, cx))
+                            .children(right),
+                    )
+                    .children(bottom),
+            ),
+            BottomDockLayout::LeftAligned => row()
+                .child(
+                    column()
+                        .child(row().children(sidebar).child(self.render_center(None, cx)))
+                        .children(bottom),
+                )
+                .children(right),
+            BottomDockLayout::RightAligned => row().children(sidebar).child(
+                column()
+                    .child(row().child(self.render_center(None, cx)).children(right))
+                    .children(bottom),
+            ),
+        };
+        root.child(
+            div()
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .relative()
+                .when(glass, |d| d.p(gap).pb_0())
+                .child(docks)
+                .children(self.render_zoomed(cx)),
         )
         .child(self.render_status_bar(footer, cx))
         .child(self.render_toasts(cx))
@@ -2872,6 +3211,28 @@ fn dock_title(panel: &PanelEntry) -> impl IntoElement {
         )
         .child(div().flex_1())
         .children(panel.actions.clone())
+}
+
+/// Room for the traffic lights at the start of a header strip at the window's top left; a
+/// zoomed one starts inside the zoom's inset, the lights where the window style puts them.
+fn lights_room(zoomed: bool, cx: &App) -> f32 {
+    if !zoomed {
+        return TRAFFIC_LIGHTS_WIDTH;
+    }
+    let gap = if studio_ui::ds::is_glass(cx) {
+        studio_ui::ds::size::SHEET_GAP
+    } else {
+        0.
+    };
+    TRAFFIC_LIGHTS_WIDTH + gap - ZOOM_INSET
+}
+
+/// The dock a panel goes in: where the settings place it, else its own.
+fn placed(id: &str, home: PanelPosition, cx: &App) -> PanelPosition {
+    cx.try_global::<StudioSettings>()
+        .and_then(|settings| settings.panels.get(id))
+        .and_then(|placement| placement.dock)
+        .map_or(home, PanelPosition::from_side)
 }
 
 /// The action that shows or hides a dock.
@@ -3403,6 +3764,158 @@ mod tests {
             );
             workspace.press_panel_button(PanelPosition::Left, "types", cx);
             assert_eq!(left(workspace), (true, Some("types".into())));
+        });
+    }
+
+    fn add_panels(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
+        for (position, id) in [
+            (PanelPosition::Left, "types"),
+            (PanelPosition::Left, "explore"),
+            (PanelPosition::Bottom, "history"),
+            (PanelPosition::Right, "inspector"),
+        ] {
+            let view = cx.new(|_| Field);
+            workspace.add_panel(position, id, id, IconName::Table, view.into(), cx);
+        }
+    }
+
+    fn placed_in(workspace: &Workspace, id: &str) -> Option<PanelPosition> {
+        workspace.dock_of(id)
+    }
+
+    /// A panel goes where the settings place it, moves when they change, and goes back to its
+    /// own dock when they no longer name one; one that showed keeps showing where it lands. The
+    /// menu on its button moves it at once.
+    #[gpui::test]
+    fn a_panel_goes_where_the_settings_place_it(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            let mut settings = StudioSettings::default();
+            settings.panels.insert(
+                "explore".into(),
+                studio_settings::PanelPlacement {
+                    dock: Some(studio_settings::DockSide::Bottom),
+                },
+            );
+            cx.set_global(settings);
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, _, cx| {
+            add_panels(workspace, cx);
+            assert_eq!(placed_in(workspace, "explore"), Some(PanelPosition::Bottom));
+            assert_eq!(placed_in(workspace, "types"), Some(PanelPosition::Left));
+            workspace.activate_panel("explore", cx);
+            assert!(workspace.bottom.open);
+        });
+        // The setting goes: explore goes home, still showing.
+        cx.update(|_, cx| cx.set_global(StudioSettings::default()));
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, _, cx| {
+            assert_eq!(placed_in(workspace, "explore"), Some(PanelPosition::Left));
+            assert_eq!(workspace.left.active_id().as_deref(), Some("explore"));
+            assert!(workspace.left.open);
+            // The menu: the inspector to the left dock, beside the others.
+            workspace.dock_panel("inspector".into(), PanelPosition::Left, cx);
+            assert_eq!(placed_in(workspace, "inspector"), Some(PanelPosition::Left));
+            assert!(workspace.right.panels.is_empty());
+        });
+    }
+
+    /// ⇧⎋ zooms the active pane over the document area and back; a zoomed dock ends its zoom
+    /// when it is hidden.
+    #[gpui::test]
+    fn zoom_covers_the_document_area_until_toggled_or_hidden(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            add_panels(workspace, cx);
+            workspace.open_item("a", window, cx, |_, cx| Split {
+                field: cx.new(|_| Field),
+                part: cx.new(|_| Part { renders: 0 }),
+                caches: false,
+                focus_handle: cx.focus_handle(),
+            });
+            workspace.toggle_zoom(cx);
+            assert_eq!(workspace.zoomed, Some(Zoomed::Pane(workspace.active_pane)));
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("zoomed").is_some(), "drawn over the panes");
+        workspace.update_in(cx, |workspace, _, cx| {
+            workspace.toggle_zoom(cx);
+            assert_eq!(workspace.zoomed, None);
+            workspace.activate_panel("history", cx);
+            workspace.zoomed = Some(Zoomed::Dock(PanelPosition::Bottom));
+            workspace.set_dock_open(PanelPosition::Bottom, false, cx);
+            assert_eq!(
+                workspace.zoomed, None,
+                "hiding the zoomed dock ends the zoom"
+            );
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("zoomed").is_none());
+    }
+
+    /// As Zed's `bottom_dock_layout`: contained, the bottom panel spans the document only;
+    /// full, the whole window, under the inspector too.
+    #[gpui::test]
+    fn the_bottom_panel_spans_as_its_layout_says(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, _, cx| {
+            add_panels(workspace, cx);
+            workspace.activate_panel("history", cx);
+            workspace.activate_panel("inspector", cx);
+        });
+        cx.run_until_parked();
+        let width = |cx: &mut gpui::VisualTestContext, selector: &'static str| {
+            f32::from(cx.debug_bounds(selector).expect(selector).size.width)
+        };
+        let window = width(cx, "status-bar");
+        let contained = width(cx, "bottom-dock");
+        let inspector = workspace.read_with(cx, |workspace, _| workspace.right.size);
+        assert_eq!(contained, window - inspector, "beside the inspector");
+
+        cx.update(|_, cx| {
+            let mut settings = StudioSettings::default();
+            settings.studio.bottom_dock_layout = BottomDockLayout::Full;
+            cx.set_global(settings);
+        });
+        cx.run_until_parked();
+        assert_eq!(width(cx, "bottom-dock"), window, "across the window");
+    }
+
+    /// A graph's saved docks come back with it, so a graph shown again (parked, then shown)
+    /// has its own docks, not the docks of the graph shown before.
+    #[gpui::test]
+    fn a_graphs_docks_come_back_with_it(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, _, cx| {
+            add_panels(workspace, cx);
+            let saved = SavedWorkspace {
+                sidebar_open: false,
+                inspector_open: false,
+                activity_open: true,
+                bottom_panel: Some("history".into()),
+                bottom_size: Some(240.),
+                ..workspace.snapshot(cx)
+            };
+            workspace.zoomed = Some(Zoomed::Pane(workspace.active_pane));
+            workspace.apply_docks(&saved);
+            assert!(!workspace.left.open && !workspace.right.open && workspace.bottom.open);
+            assert_eq!(workspace.bottom.active_id().as_deref(), Some("history"));
+            assert_eq!(workspace.bottom.size, 240.);
+            assert_eq!(workspace.zoomed, None);
         });
     }
 
