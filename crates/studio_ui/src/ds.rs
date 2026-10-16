@@ -84,6 +84,9 @@ pub mod size {
     /// Every column's footer strip, and a bar across a document (a write to confirm), so the
     /// rules over them line up.
     pub const STRIP: f32 = 40.;
+    /// The window's status bar, after Zed's: the docks' panel buttons and the open tab's facts,
+    /// with room for a control inside it.
+    pub const STATUS_BAR: f32 = 32.;
     /// A surface's toolbar.
     pub const TOOLBAR: f32 = 48.;
     /// A data row and a data header: dense enough to scan a page at a glance, with room for a
@@ -616,6 +619,16 @@ pub fn toolbar(cx: &App) -> Div {
 /// A short vertical hairline between groups in a strip (Delta's footer: context | facts).
 pub fn rule_v(cx: &App) -> Div {
     div().w(px(1.)).h(px(16.)).flex_none().bg(surface::rule(cx))
+}
+
+/// The divider between groups of the status bar, as Zed's: a short vertical line in the border
+/// colour, which a hairline's lighter colour would lose against the bar.
+pub fn divider_v(cx: &App) -> Div {
+    div()
+        .w(px(1.))
+        .h(px(16.))
+        .flex_none()
+        .bg(cx.theme().colors().border)
 }
 
 /// A panel's tab in a dock's header strip: its icon and title, the active one dark and, when

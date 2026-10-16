@@ -63,22 +63,26 @@ a 412 reopens the draft.
 ## The window frame
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│ server ▸ graph ▸ branch ▾ ▸ snapshot          ⌘K            write · branch  │
-├───────────────┬──────────────────────────────────────────┬───────────────────┤
-│ Types   12 480│ [Person] [Graph] [query.gq] [Review→main]│ Inspector         │
-│ Branches      │                                          │  fields, edges,   │
-│ Saved queries │            active item                   │  history of row   │
-│ Tree          │                                          │                   │
+┌───────────────┬──────────────────────────────────────────┬───────────────────┐
+│ ●●● ◧ Graph  ⌕│ ← → │ Person │ Company │ query.gq        │ Inspector       × │
+│ Types   12 480│                                          │  fields, edges    │
+│ Relationships │            active item                   │                   │
+│               ├──────────────────────────────────────────┤                   │
+│               │ History                               ×  │                   │
 ├───────────────┴──────────────────────────────────────────┴───────────────────┤
-│ ● ready · contract 0.13 · act-alice · 1 query running                        │
+│ ▦ ≡ ⎘ ⑂ ✦ │ ● env · 0.13 · 31 ms │ graph / ⑂ main │ tab facts … 41 MB │ ▦ ⌥ ◷ │ ⓘ │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- Left dock: types with counts, branches, saved queries, relationship tree.
-- Center: panes of items (type table, canvas, query editor, review, commit, inspector tab).
-- Right dock: inspector / peek. Bottom dock: history graph, activity log.
-- Status bar: connection chip, contract, actor, background activity.
+- Each column's header is its panel's own (title and buttons); the first holds the traffic
+  lights. There is no title bar.
+- Left dock: Graph (types and relationships with counts), Explore, Queries, Branches,
+  Conversations. Right dock: inspector. Bottom dock: Nodes, History, Activity.
+- Center: panes of items (type table, canvas, query editor, review, commit); each pane's tab
+  strip starts with its own Back and Forward.
+- Status bar, after Zed's: every panel's button (the left dock's at the left, the bottom and
+  right docks' at the right), the connection chip, graph and branch, the tab's facts, running
+  work, memory and CPU.
 
 ## Actions, keymaps, settings, theme
 

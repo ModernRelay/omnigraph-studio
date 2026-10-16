@@ -59,7 +59,7 @@ pub fn set(cx: &mut App) {
             MenuItem::separator(),
             MenuItem::action("Sidebar", ToggleSidebar),
             MenuItem::action("Inspector", ToggleInspector),
-            MenuItem::action("Activity", ToggleActivity),
+            MenuItem::action("Bottom Panel", ToggleActivity),
             MenuItem::separator(),
             MenuItem::action("Split Right", SplitRight),
             MenuItem::action("Split Down", SplitDown),

@@ -39,11 +39,11 @@ pub mod workspace {
             ActivateNextItem,
             /// Activate the previous tab.
             ActivatePreviousItem,
-            /// Show or hide the sidebar.
+            /// Show or hide the sidebar, the left dock.
             ToggleSidebar,
-            /// Show or hide the inspector.
+            /// Show or hide the inspector, the right dock.
             ToggleInspector,
-            /// Show or hide the activity log.
+            /// Show or hide the bottom panel: nodes, history and the activity log.
             ToggleActivity,
             /// Connect to a server or open a graph.
             OpenGraph,
@@ -60,8 +60,9 @@ pub mod workspace {
         pub url: String,
     }
 
-    /// Show a panel in its dock: `explore`, `types`, `branches`, `inspector`, `activity`,
-    /// `history`.
+    /// Show a panel in its dock, as its button in the status bar does: `types`, `explore`,
+    /// `queries`, `branches`, `agent-conversations`, `inspector`, `nodes`, `history`,
+    /// `activity`.
     #[derive(Clone, Debug, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
     #[action(namespace = studio)]
     pub struct ActivatePanel {

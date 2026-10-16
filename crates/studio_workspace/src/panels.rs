@@ -1,7 +1,8 @@
 //! Panels and docks (spec 002, "Panels"), after Zed's `Panel`/`Dock` and Obsidian's views in
 //! side docks: a panel is a view with an id, a title and an icon; a dock at the left, right or
-//! bottom holds panels, shows one at a time, and opens or closes as a whole. Every dock draws
-//! the same bounded chrome: a header strip with its panels' tabs, then the active panel.
+//! bottom holds panels, shows one at a time, and opens or closes as a whole. A dock draws its
+//! active panel under a header strip with that panel's title and buttons; panels are switched
+//! from their icons in the status bar, as Zed's `PanelButtons`.
 //!
 //! Documents (type tables, queries, history) are items in the center, not panels.
 

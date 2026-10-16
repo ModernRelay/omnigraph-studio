@@ -1,7 +1,8 @@
 //! Panes and the split tree of the document area (spec 002, "Frame"), after Zed's `Pane` and
 //! `PaneGroup` at `v1.23.2`: a pane is a row of tabs with one active; pinned tabs come first and
 //! are kept by "close others"; one tab may be a preview, which the next preview replaces in
-//! place until it is kept. Panes sit in a tree of horizontal and vertical splits.
+//! place until it is kept. Each pane keeps its own back and forward trail, as Zed's
+//! `NavHistory` does. Panes sit in a tree of horizontal and vertical splits.
 //!
 //! The logic here is plain data, generic over the tab type, so it is tested without a window.
 
@@ -9,6 +10,9 @@ use gpui::EntityId;
 use serde::{Deserialize, Serialize};
 
 pub type PaneId = usize;
+
+/// How many tabs a pane's back trail remembers.
+const HISTORY: usize = 100;
 
 /// What a pane needs from a tab.
 pub trait Tab {
@@ -23,6 +27,10 @@ pub struct Pane<T> {
     pub pinned: usize,
     /// The preview tab, replaced by the next preview opened in this pane.
     pub preview: Option<EntityId>,
+    /// Tabs this pane showed before its active one, most recent last (Back), and those
+    /// stepped back from (Forward). A tab closed since is skipped when stepping.
+    pub back: Vec<EntityId>,
+    pub forward: Vec<EntityId>,
 }
 
 impl<T: Tab> Pane<T> {
@@ -33,7 +41,62 @@ impl<T: Tab> Pane<T> {
             active: 0,
             pinned: 0,
             preview: None,
+            back: Vec::new(),
+            forward: Vec::new(),
         }
+    }
+
+    /// Notes that the pane leaves the tab `left` for another: Back returns to it, and the
+    /// Forward trail is forgotten.
+    pub fn record(&mut self, left: EntityId) {
+        self.back.retain(|visited| *visited != left);
+        self.back.push(left);
+        if self.back.len() > HISTORY {
+            self.back.remove(0);
+        }
+        self.forward.clear();
+    }
+
+    /// Whether Back (or Forward) has a tab of this pane to go to.
+    pub fn can_step(&self, back: bool) -> bool {
+        let active = self.active_item().map(Tab::tab_id);
+        let trail = if back { &self.back } else { &self.forward };
+        trail
+            .iter()
+            .any(|id| Some(*id) != active && self.position(*id).is_some())
+    }
+
+    /// Steps back (or forward): the index of the tab to show, with the active tab moved to the
+    /// other trail; tabs closed since are dropped. `None` when there is nowhere to go.
+    pub fn step(&mut self, back: bool) -> Option<usize> {
+        let active = self.active_item().map(Tab::tab_id);
+        loop {
+            let next = if back {
+                self.back.pop()
+            } else {
+                self.forward.pop()
+            }?;
+            let Some(index) = self.position(next) else {
+                continue;
+            };
+            if Some(next) == active {
+                continue;
+            }
+            if let Some(active) = active {
+                if back {
+                    self.forward.push(active);
+                } else {
+                    self.back.push(active);
+                }
+            }
+            return Some(index);
+        }
+    }
+
+    /// Forgets a tab that will not come back (a preview replaced in place).
+    pub fn forget(&mut self, id: EntityId) {
+        self.back.retain(|visited| *visited != id);
+        self.forward.retain(|visited| *visited != id);
     }
 
     pub fn position(&self, id: EntityId) -> Option<usize> {
@@ -343,6 +406,46 @@ mod tests {
         fn tab_id(&self) -> EntityId {
             EntityId::from(self.0)
         }
+    }
+
+    /// A pane's trail, as Zed's per-pane history: Back returns to the tabs it showed, Forward
+    /// undoes that, a new visit forgets Forward, and closed tabs are skipped.
+    #[test]
+    fn a_pane_steps_back_and_forward_through_the_tabs_it_showed() {
+        let mut pane = Pane::new(0);
+        for id in 1..=3 {
+            pane.add(T(id), false);
+        }
+        let id = |n: u64| EntityId::from(n);
+        // Showed 1, then 2, then 3.
+        pane.active = 0;
+        pane.record(id(1));
+        pane.active = 1;
+        pane.record(id(2));
+        pane.active = 2;
+        assert!(pane.can_step(true) && !pane.can_step(false));
+
+        let to = pane.step(true).unwrap();
+        assert_eq!(to, 1, "back to 2");
+        pane.active = to;
+        let to = pane.step(true).unwrap();
+        assert_eq!(to, 0, "back to 1");
+        pane.active = to;
+        assert!(!pane.can_step(true), "nothing before 1");
+        assert_eq!(pane.step(true), None);
+        let to = pane.step(false).unwrap();
+        assert_eq!(to, 1, "forward to 2");
+        pane.active = to;
+
+        // A new visit forgets Forward.
+        pane.record(id(2));
+        pane.active = 2;
+        assert!(!pane.can_step(false));
+
+        // A tab closed since is skipped.
+        pane.remove(1);
+        let to = pane.step(true).unwrap();
+        assert_eq!(pane.items[to], T(1), "2 is gone, so back goes to 1");
     }
 
     fn ids(pane: &Pane<T>) -> Vec<u64> {

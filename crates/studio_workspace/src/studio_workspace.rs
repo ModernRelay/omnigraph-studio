@@ -1,6 +1,7 @@
-//! The window frame (spec 002): a title bar with server, graph and branch; a sidebar of
-//! sections; a center pane of tabs; an inspector on the right; an activity log at the bottom;
-//! a status bar; a modal layer and toasts.
+//! The window frame (spec 002): columns with header strips (a sidebar dock on the left, panes
+//! of tabs in the center over a bottom dock, an inspector dock on the right) over one status
+//! bar that holds every panel's button, the server, graph and branch, and the tab's facts, as
+//! Zed lays out its docks and status bar; a modal layer and toasts.
 //!
 //! Layer 4 (`docs/architecture.md`). A small version of Zed's `workspace` crate, written for
 //! Studio rather than forked: Studio has no projects, collaboration or Zed database. Feature
@@ -100,8 +101,6 @@ struct ParkedGraph {
     center: Member,
     active_pane: PaneId,
     next_pane: PaneId,
-    back: Vec<EntityId>,
-    forward: Vec<EntityId>,
     saved: Option<SavedWorkspace>,
 }
 
@@ -140,10 +139,6 @@ pub struct Workspace {
     drag_pending: bool,
     /// Where the traffic lights were last placed; they move with the window style.
     traffic_lights: Option<Point<Pixels>>,
-    /// Tabs visited before the active one, most recent last (⌘[), and those stepped back
-    /// from (⌘]).
-    back: Vec<EntityId>,
-    forward: Vec<EntityId>,
     /// The settings file problem last shown, so a toast appears once per problem.
     settings_error: Option<String>,
     /// What the CLI's files could not give, as last shown.
@@ -173,9 +168,10 @@ pub struct Workspace {
 /// How often, at most, the workspace's state is compared with what was last written.
 const SAVE_CHECK: Duration = Duration::from_millis(250);
 const SAVE_DELAY: Duration = Duration::from_millis(500);
-/// Height of a column's header strip (spec 002, after Delta).
-const STRIP_HEIGHT: f32 = studio_ui::ds::size::STRIP;
+/// Height of a column's header strip (spec 002, after Delta), and of the status bar under the
+/// columns (after Zed's).
 const HEADER_HEIGHT: f32 = studio_ui::ds::size::HEADER_STRIP;
+const STATUS_BAR_HEIGHT: f32 = studio_ui::ds::size::STATUS_BAR;
 /// Room for the window's traffic lights at the left of the first header strip.
 const TRAFFIC_LIGHTS_WIDTH: f32 = 76.;
 /// The traffic lights' offset from the top of that strip: centers the 16-point buttons in it.
@@ -191,8 +187,6 @@ pub fn traffic_light_position(glass: bool) -> Point<Pixels> {
     };
     point(gap + px(12.), gap + px(TRAFFIC_LIGHTS_TOP))
 }
-/// How many visited tabs ⌘[ remembers.
-const NAV_HISTORY: usize = 100;
 /// A dock panel inside a scrolling host of its own. The host is what is cached (a cached view
 /// needs a definite size, which a panel measured by its content lacks), as Zed caches each dock
 /// and pane: a panel that notifies marks its host dirty and is drawn again; otherwise the frame
@@ -316,8 +310,6 @@ impl Workspace {
             focus_handle: cx.focus_handle(),
             drag_pending: false,
             traffic_lights: None,
-            back: Vec::new(),
-            forward: Vec::new(),
             settings_error: None,
             cli_errors: Vec::new(),
             _settings_subscription: settings_subscription,
@@ -702,8 +694,6 @@ impl Workspace {
             center: std::mem::replace(&mut self.center, Member::Pane(0)),
             active_pane: std::mem::replace(&mut self.active_pane, 0),
             next_pane: std::mem::replace(&mut self.next_pane, 1),
-            back: std::mem::take(&mut self.back),
-            forward: std::mem::take(&mut self.forward),
             saved: self.saved.take(),
         })
     }
@@ -713,8 +703,6 @@ impl Workspace {
         self.center = parked.center;
         self.active_pane = parked.active_pane;
         self.next_pane = parked.next_pane;
-        self.back = parked.back;
-        self.forward = parked.forward;
         self.saved = parked.saved;
         self.subscribe_session(parked.session, window, cx);
         let index = self.pane(self.active_pane).map_or(0, |p| p.active);
@@ -1004,8 +992,8 @@ impl Workspace {
         let (index, replaced) = pane.add(item, preview);
         if let Some(replaced) = replaced {
             let id = replaced.item_id();
+            pane.forget(id);
             self._item_subscriptions.retain(|(item, _)| *item != id);
-            self.back.retain(|visited| *visited != id);
         }
         self.activate_in(pane_id, index, true, window, cx);
     }
@@ -1052,7 +1040,8 @@ impl Workspace {
         self.activate_in(self.active_pane, index, true, window, cx);
     }
 
-    /// Activates a pane's tab; `record` remembers the tab left for ⌘[ and forgets the ⌘] trail.
+    /// Activates a pane's tab; `record` notes the tab that pane leaves for its Back trail and
+    /// forgets its Forward trail.
     fn activate_in(
         &mut self,
         pane_id: PaneId,
@@ -1074,19 +1063,14 @@ impl Workspace {
             }
             return;
         };
-        if record
-            && let Some(current) = self.active_item().map(|item| item.item_id())
-            && current != next
-        {
-            self.back.retain(|visited| *visited != current);
-            self.back.push(current);
-            if self.back.len() > NAV_HISTORY {
-                self.back.remove(0);
-            }
-            self.forward.clear();
-        }
         self.active_pane = pane_id;
         if let Some(pane) = self.pane_mut(pane_id) {
+            if record
+                && let Some(current) = pane.active_item().map(|item| item.item_id())
+                && current != next
+            {
+                pane.record(current);
+            }
             pane.active = index;
             let focus = pane.items[index].focus_handle(cx);
             window.focus(&focus, cx);
@@ -1094,33 +1078,19 @@ impl Workspace {
         cx.notify();
     }
 
-    /// ⌘[ and ⌘]: the previous or next tab in the order they were visited, across panes,
-    /// skipping closed ones.
-    fn navigate(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
-        loop {
-            let next = if back {
-                self.back.pop()
-            } else {
-                self.forward.pop()
-            };
-            let Some(id) = next else { return };
-            let Some((pane, index)) = self.find_item(id) else {
-                continue;
-            };
-            let current = self.active_item().map(|item| item.item_id());
-            if current == Some(id) {
-                continue;
-            }
-            if let Some(current) = current {
-                if back {
-                    self.forward.push(current);
-                } else {
-                    self.back.push(current);
-                }
-            }
-            self.activate_in(pane, index, false, window, cx);
+    /// Back and Forward (⌘[ and ⌘], and the arrows at the start of a pane's tabs): the tab a
+    /// pane showed before, or the one it stepped back from, as Zed keeps history per pane.
+    fn navigate(
+        &mut self,
+        pane_id: PaneId,
+        back: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.pane_mut(pane_id).and_then(|pane| pane.step(back)) else {
             return;
-        }
+        };
+        self.activate_in(pane_id, index, false, window, cx);
     }
 
     /// Closes a tab of the active pane; one with unsaved work or a write in flight asks first.
@@ -1610,6 +1580,8 @@ impl Workspace {
         let colors = cx.theme().colors();
         let panel = colors.panel_background;
         let hairline = studio_ui::ds::surface::rule(cx);
+        // The column's header is its panel's own, as a Zed panel draws its header: the panel's
+        // title and its buttons. Panels are switched from the status bar.
         let header = self
             .strip("sidebar-header", HEADER_HEIGHT, cx)
             .pr_2()
@@ -1625,8 +1597,7 @@ impl Workspace {
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleSidebar), cx)),
             )
             .child(div().w(px(studio_ui::ds::space::SM)))
-            .child(self.render_icon_tabs(&self.left, cx))
-            .child(div().flex_1())
+            .children(self.left.active_panel().map(dock_title))
             .child(
                 IconButton::new("search", IconName::MagnifyingGlass)
                     .icon_size(IconSize::Small)
@@ -1644,21 +1615,12 @@ impl Workspace {
                         )
                     }),
             );
-        // The panel's title stays put; its content scrolls in its cached host.
-        let body =
-            v_flex()
-                .id("sidebar-panel")
-                .flex_1()
-                .min_h_0()
-                .children(self.left.active_panel().map(|panel| {
-                    v_flex()
-                        .size_full()
-                        .child(studio_ui::ds::section_header(
-                            panel.title.clone(),
-                            panel.actions.clone().map(IntoElement::into_any_element),
-                        ))
-                        .child(div().flex_1().min_h_0().child(self.hosted(&panel.view)))
-                }));
+        // The content scrolls in its cached host.
+        let body = v_flex().id("sidebar-panel").flex_1().min_h_0().children(
+            self.left
+                .active_panel()
+                .map(|panel| div().size_full().child(self.hosted(&panel.view))),
+        );
         let glass = studio_ui::ds::is_glass(cx);
         let column = if glass {
             studio_ui::ds::sheet(cx)
@@ -1675,54 +1637,74 @@ impl Workspace {
             .flex_none()
             .child(header)
             .child(body)
-            .child(self.render_sidebar_footer(cx))
             .child(resize_handle(PanelPosition::Left))
     }
 
-    /// A dock's panels as icon tabs (the left dock, as Obsidian and Delta switch sidebar modes):
-    /// the active one pressed, each named in its tooltip.
-    fn render_icon_tabs(&self, dock: &Dock, cx: &mut Context<Self>) -> impl IntoElement {
+    /// A dock's panels as buttons in the status bar, as Zed's `PanelButtons`: one icon each.
+    /// The active panel of an open dock is lit, and clicking it hides the dock; clicking any
+    /// other shows its panel, opening the dock.
+    fn render_panel_buttons(
+        &self,
+        position: PanelPosition,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let dock = match position {
+            PanelPosition::Left => &self.left,
+            PanelPosition::Right => &self.right,
+            PanelPosition::Bottom => &self.bottom,
+        };
+        let hide_label = match position {
+            PanelPosition::Left => "Hide sidebar",
+            PanelPosition::Right => "Hide inspector",
+            PanelPosition::Bottom => "Hide bottom panel",
+        };
         h_flex()
             .gap(px(studio_ui::ds::space::XXS))
-            .when(dock.panels.len() > 1, |tabs| {
-                tabs.children(dock.panels.iter().enumerate().map(|(index, panel)| {
-                    let id = panel.id.clone();
-                    let title = panel.title.clone();
-                    IconButton::new(("dock-tab", index), panel.icon)
-                        .icon_size(IconSize::Small)
-                        .toggle_state(index == dock.active)
-                        .tooltip(Tooltip::text(title))
-                        .on_click(cx.listener(move |this, _, _, cx| this.activate_panel(&id, cx)))
-                }))
-            })
-    }
-
-    /// A dock's panels as title tabs (the right and bottom docks), or its one panel's title.
-    fn render_title_tabs(&self, dock: &Dock, cx: &mut Context<Self>) -> impl IntoElement {
-        let choice = dock.panels.len() > 1;
-        h_flex()
-            .h_full()
-            .gap(px(studio_ui::ds::space::XS))
-            .items_center()
             .children(dock.panels.iter().enumerate().map(|(index, panel)| {
+                let lit = dock.open && index == dock.active;
                 let id = panel.id.clone();
-                studio_ui::ds::title_tab(
-                    ("dock-title", index),
-                    panel.icon,
-                    panel.title.clone(),
-                    index == dock.active,
-                    choice,
-                    cx,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| this.activate_panel(&id, cx)))
+                let title = panel.title.clone();
+                let tooltip_id = id.clone();
+                IconButton::new(SharedString::from(format!("panel-button-{id}")), panel.icon)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(lit)
+                    .tooltip(move |_, cx| {
+                        if lit {
+                            Tooltip::for_action(hide_label, toggle_action(position).as_ref(), cx)
+                        } else {
+                            Tooltip::for_action(
+                                title.clone(),
+                                &studio_actions::workspace::ActivatePanel {
+                                    id: tooltip_id.to_string(),
+                                },
+                                cx,
+                            )
+                        }
+                    })
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.press_panel_button(position, &id, cx)
+                        }),
+                    )
             }))
     }
 
-    /// The server this window is connected to, as Delta's sidebar footer shows the account: a
-    /// status dot, the server and its state. Clicking opens "Open a graph". The graph and branch
-    /// are in the document column's footer, on the same baseline.
-    fn render_sidebar_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let hairline = studio_ui::ds::surface::rule(cx);
+    /// A panel's status-bar button: hides the dock when the panel is the one it shows, else
+    /// shows the panel, opening its dock.
+    fn press_panel_button(&mut self, position: PanelPosition, id: &str, cx: &mut Context<Self>) {
+        let dock = self.dock_mut(position);
+        if dock.open && dock.active_id().as_deref() == Some(id) {
+            dock.open = false;
+            cx.notify();
+        } else {
+            self.activate_panel(id, cx);
+        }
+    }
+
+    /// The server this window is connected to: a status dot, the server and its state, as
+    /// Delta's sidebar shows the account. It opens the graph switcher: the graphs open in this
+    /// window, another graph, closing this one.
+    fn render_server_switcher(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (color, server, url, state) = match &self.session {
             Some(session) => {
                 let connection = session.read(cx).connection.read(cx);
@@ -1769,29 +1751,20 @@ impl Workspace {
             })
             .collect();
         let trigger = ButtonLike::new("graph-switcher")
-            .full_width()
             .tooltip(Tooltip::text(format!("{url} · {state} · Switch graph")))
             .child(
                 h_flex()
-                    .w_full()
                     .px(px(studio_ui::ds::space::XS))
                     .gap(px(studio_ui::ds::space::SM))
                     .items_center()
                     .child(Indicator::dot().color(color))
-                    .child(
-                        Label::new(server)
-                            .size(LabelSize::Small)
-                            .single_line()
-                            .truncate(),
-                    )
+                    .child(Label::new(server).size(LabelSize::Small).single_line())
                     .child(
                         Label::new(state)
                             .size(LabelSize::Small)
                             .color(Color::Muted)
-                            .single_line()
-                            .truncate(),
+                            .single_line(),
                     )
-                    .child(div().flex_1())
                     .when(others > 0, |row| {
                         row.child(studio_ui::ds::sidebar_count(format!(
                             "+{others} graph{}",
@@ -1804,45 +1777,38 @@ impl Workspace {
                             .color(Color::Muted),
                     ),
             );
-        self.strip("sidebar-footer", STRIP_HEIGHT, cx)
-            .px(px(studio_ui::ds::space::XS))
-            .border_t_1()
-            .border_color(hairline)
-            .child(
-                PopoverMenu::new("graph-switcher-menu")
-                    .full_width(true)
-                    .anchor(gpui::Anchor::BottomLeft)
-                    .trigger(trigger)
-                    .menu(move |window, cx| {
-                        let entries = entries.clone();
+        PopoverMenu::new("graph-switcher-menu")
+            .anchor(gpui::Anchor::BottomLeft)
+            .trigger(trigger)
+            .menu(move |window, cx| {
+                let entries = entries.clone();
+                let workspace = workspace.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    if !entries.is_empty() {
+                        menu = menu.header("Open in this window");
+                    }
+                    for (id, label, shown) in entries {
                         let workspace = workspace.clone();
-                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                            if !entries.is_empty() {
-                                menu = menu.header("Open in this window");
-                            }
-                            for (id, label, shown) in entries {
-                                let workspace = workspace.clone();
-                                menu = menu.toggleable_entry(
-                                    label,
-                                    shown,
-                                    IconPosition::Start,
-                                    None,
-                                    move |window, cx| {
-                                        workspace
-                                            .update(cx, |w, cx| w.show_graph(id, window, cx))
-                                            .ok();
-                                    },
-                                );
-                            }
-                            menu.separator()
-                                .action(
-                                    "Open Another Graph…",
-                                    Box::new(studio_actions::workspace::OpenGraph),
-                                )
-                                .action("Close Graph", Box::new(CloseGraph))
-                        }))
-                    }),
-            )
+                        menu = menu.toggleable_entry(
+                            label,
+                            shown,
+                            IconPosition::Start,
+                            None,
+                            move |window, cx| {
+                                workspace
+                                    .update(cx, |w, cx| w.show_graph(id, window, cx))
+                                    .ok();
+                            },
+                        );
+                    }
+                    menu.separator()
+                        .action(
+                            "Open Another Graph…",
+                            Box::new(studio_actions::workspace::OpenGraph),
+                        )
+                        .action("Close Graph", Box::new(CloseGraph))
+                }))
+            })
     }
 
     /// A pane's tabs, as Delta draws them: text tabs separated by hairlines, the active one
@@ -1992,9 +1958,8 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// A pane's header strip: its tabs, then, on the top-right pane, the toggles of the right
-    /// and bottom docks. The top-left pane makes room for the traffic lights when the sidebar
-    /// is hidden.
+    /// A pane's header strip, as Zed's tab bar starts: Back and Forward for this pane, then its
+    /// tabs. The top-left pane makes room for the traffic lights when the sidebar is hidden.
     fn render_pane_header(&self, pane_id: PaneId, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let header_bg = if studio_ui::ds::is_glass(cx) {
@@ -2003,32 +1968,47 @@ impl Workspace {
             colors.editor_background.blend(gpui::black().opacity(0.02))
         };
         let hairline = studio_ui::ds::surface::rule(cx);
-        let top_right = self.center.top_right() == pane_id;
         let top_left = self.center.top_left() == pane_id;
-        let mut context = h_flex().gap_1().items_center().pr_1();
-        if top_right {
-            context = context.child(
-                studio_ui::ds::icon_button("toggle-activity", IconName::ListTree)
-                    .icon_size(IconSize::Small)
-                    .toggle_state(self.bottom.open)
-                    .tooltip(|_, cx| Tooltip::for_action("Activity", &ToggleActivity, cx))
-                    .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleActivity), cx)),
-            );
-            if !self.right.panels.is_empty() {
-                context = context.child(
-                    studio_ui::ds::icon_button(
-                        "toggle-inspector",
-                        IconName::ThreadsSidebarRightOpen,
-                    )
-                    .icon_size(IconSize::Small)
-                    .toggle_state(self.right.open)
-                    .tooltip(|_, cx| Tooltip::for_action("Inspector", &ToggleInspector, cx))
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(ToggleInspector), cx)
-                    }),
-                );
-            }
-        }
+        let (can_back, can_forward) = self.pane(pane_id).map_or((false, false), |pane| {
+            (pane.can_step(true), pane.can_step(false))
+        });
+        let nav_button = |back: bool, cx: &mut Context<Self>| {
+            let (icon, label, enabled): (_, &'static str, _) = if back {
+                (IconName::ArrowLeft, "Go back", can_back)
+            } else {
+                (IconName::ArrowRight, "Go forward", can_forward)
+            };
+            IconButton::new(
+                SharedString::from(format!(
+                    "{}-{pane_id}",
+                    if back { "go-back" } else { "go-forward" }
+                )),
+                icon,
+            )
+            .icon_size(IconSize::Small)
+            .disabled(!enabled)
+            .tooltip(move |_, cx| {
+                if back {
+                    Tooltip::for_action(label, &GoBack, cx)
+                } else {
+                    Tooltip::for_action(label, &GoForward, cx)
+                }
+            })
+            .on_click(
+                cx.listener(move |this, _, window, cx| this.navigate(pane_id, back, window, cx)),
+            )
+        };
+        let nav = h_flex()
+            .h_full()
+            .flex_none()
+            .px(px(studio_ui::ds::space::XS))
+            .gap(px(studio_ui::ds::space::XXS))
+            .items_center()
+            .border_b_1()
+            .border_r_1()
+            .border_color(hairline)
+            .child(nav_button(true, cx))
+            .child(nav_button(false, cx));
         self.strip(
             SharedString::from(format!("pane-header-{pane_id}")),
             HEADER_HEIGHT,
@@ -2049,17 +2029,9 @@ impl Workspace {
                 )
             },
         )
+        .child(nav)
         .child(self.render_tabs(pane_id, cx))
-        .child(
-            h_flex()
-                .flex_1()
-                .h_full()
-                .justify_end()
-                .items_center()
-                .border_b_1()
-                .border_color(hairline)
-                .child(context),
-        )
+        .child(div().flex_1().h_full().border_b_1().border_color(hairline))
     }
 
     /// One pane: its header and its active tab. Pressing anywhere in it makes it the active
@@ -2188,142 +2160,186 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The document column's footer, after Delta's: where the open tab reads and writes (graph
-    /// and branch, the branch a menu), the tab's own facts, then what is running and the tab's
-    /// controls. It sits on the same baseline as the sidebar's footer.
-    fn render_center_footer(
+    /// The window's status bar, after Zed's: the left dock's panel buttons, then where the open
+    /// tab reads and writes (the server, the graph, the branch, a menu each) and the tab's own
+    /// facts; at the right, what is running, the tab's controls, Studio's memory and CPU, then
+    /// the bottom and right docks' panel buttons.
+    fn render_status_bar(
         &self,
         footer: Option<ItemFooter>,
         cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
+    ) -> impl IntoElement {
+        let status_background = cx.theme().colors().status_bar_background;
+        let glass = studio_ui::ds::is_glass(cx);
+        let hairline = studio_ui::ds::surface::rule(cx);
+        let footer = footer.unwrap_or_default();
+        let has_start = !footer.start.is_empty();
+        let shown = self.session.is_some();
+        let running = self.session.as_ref().and_then(|session| {
+            let s = session.read(cx);
+            match (s.reads_in_flight, s.writes_in_flight) {
+                (0, 0) => None,
+                (reads, 0) => Some(format!(
+                    "{reads} quer{} running",
+                    if reads == 1 { "y" } else { "ies" }
+                )),
+                (_, writes) => Some(format!("Writing ({writes})…")),
+            }
+        });
+        let left = h_flex()
+            .min_w_0()
+            .gap(px(studio_ui::ds::space::MD))
+            .items_center()
+            .overflow_hidden()
+            .when(shown && !self.left.panels.is_empty(), |bar| {
+                bar.child(self.render_panel_buttons(PanelPosition::Left, cx))
+                    .child(studio_ui::ds::divider_v(cx))
+            })
+            .child(self.render_server_switcher(cx))
+            .children(self.render_graph_and_branch(cx))
+            .when(has_start, |bar| bar.child(studio_ui::ds::divider_v(cx)))
+            .children(footer.start);
+        let docks_right = shown && !(self.bottom.panels.is_empty() && self.right.panels.is_empty());
+        let right = h_flex()
+            .flex_none()
+            .gap(px(studio_ui::ds::space::MD))
+            .items_center()
+            .children(running.map(|text| {
+                h_flex()
+                    .gap(px(studio_ui::ds::space::XS))
+                    .items_center()
+                    .flex_none()
+                    .child(studio_ui::ds::spinner())
+                    .child(studio_ui::ds::text::meta(text).single_line())
+            }))
+            .children(footer.end)
+            .children(self.render_performance())
+            .when(docks_right, |bar| {
+                bar.child(studio_ui::ds::divider_v(cx))
+                    .child(self.render_panel_buttons(PanelPosition::Bottom, cx))
+                    .child(self.render_panel_buttons(PanelPosition::Right, cx))
+            });
+        h_flex()
+            .id("status-bar")
+            .debug_selector(|| "status-bar".into())
+            .h(px(STATUS_BAR_HEIGHT))
+            .w_full()
+            .flex_none()
+            .px(px(if glass {
+                studio_ui::ds::size::SHEET_GAP
+            } else {
+                studio_ui::ds::space::XS
+            }))
+            .gap(px(studio_ui::ds::space::MD))
+            .items_center()
+            .justify_between()
+            .when(!glass, |bar| {
+                bar.bg(status_background)
+                    .border_t_1()
+                    .border_color(hairline)
+            })
+            .child(left)
+            .child(right)
+    }
+
+    /// The graph the open tab reads, and its branch: a chip that opens another graph, then the
+    /// branch menu.
+    fn render_graph_and_branch(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let session = self.session.as_ref()?;
         let s = session.read(cx);
         let graph = s.graph_id.clone();
         let branch = s.branch.clone();
         let unavailable = s.unavailable.clone();
         let branches = s.branches.loaded().cloned().unwrap_or_default();
-        let running = match (s.reads_in_flight, s.writes_in_flight) {
-            (0, 0) => None,
-            (reads, 0) => Some(format!(
-                "{reads} quer{} running",
-                if reads == 1 { "y" } else { "ies" }
-            )),
-            (_, writes) => Some(format!("Writing ({writes})…")),
-        };
         let session_for_menu = session.clone();
-        let footer = footer.unwrap_or_default();
-        let hairline = studio_ui::ds::surface::rule(cx);
-        let context = h_flex()
-            .gap(px(studio_ui::ds::space::XS))
-            .items_center()
-            .flex_none()
-            .child(
-                h_flex()
-                    .id("footer-graph")
-                    .h(px(24.))
-                    .px(px(studio_ui::ds::space::SM))
-                    .gap(px(studio_ui::ds::space::SM))
-                    .items_center()
-                    .rounded(px(studio_ui::ds::radius::SM))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
-                    .map(|button| match unavailable.clone() {
-                        Some(reason) => button.tooltip(Tooltip::text(format!(
-                            "This graph is unavailable: {reason}. Reads resume when it is ready."
-                        ))),
-                        None => button.tooltip(|_, cx| {
-                            Tooltip::for_action(
-                                "Open another graph",
-                                &studio_actions::workspace::OpenGraph,
-                                cx,
-                            )
-                        }),
-                    })
-                    .child(
-                        Icon::new(IconName::DatabaseZap)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .when(unavailable.is_some(), |button| {
-                        button.child(Indicator::dot().color(Color::Warning))
-                    })
-                    .child(Label::new(graph).size(LabelSize::Small).single_line())
-                    .on_click(|_, window, cx| {
-                        window.dispatch_action(Box::new(studio_actions::workspace::OpenGraph), cx)
-                    }),
-            )
-            .child(
-                Label::new("/")
-                    .size(LabelSize::Small)
-                    .color(Color::Disabled),
-            )
-            .child(
-                PopoverMenu::new("branch-menu")
-                    .anchor(gpui::Anchor::BottomLeft)
-                    .trigger(
-                        studio_ui::ds::button("branch", branch.clone())
-                            .label_size(LabelSize::Small)
-                            .style(ButtonStyle::Subtle)
-                            .tooltip(Tooltip::text(format!(
-                                "Reads and edits in this window use {branch}. Switch branch."
-                            )))
-                            .start_icon(
-                                Icon::new(IconName::GitBranch)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .end_icon(
-                                Icon::new(IconName::ChevronUpDown)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                    )
-                    .menu(move |window, cx| {
-                        let session = session_for_menu.clone();
-                        let branches = branches.clone();
-                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                            menu = menu.header("Branches");
-                            for branch in branches {
-                                let session = session.clone();
-                                let name = branch.clone();
-                                menu = menu.entry(branch, None, move |_, cx| {
-                                    session.update(cx, |s, cx| s.set_branch(name.clone(), cx));
-                                });
-                            }
-                            menu
-                        }))
-                    }),
-            );
-        let has_start = !footer.start.is_empty();
         Some(
-            self.strip("center-footer", STRIP_HEIGHT, cx)
-                .pl(px(studio_ui::ds::space::XS))
-                .pr(px(studio_ui::ds::space::EDGE))
-                .gap(px(studio_ui::ds::space::LG))
-                .border_t_1()
-                .border_color(hairline)
-                .child(context)
-                .when(has_start, |strip| strip.child(studio_ui::ds::rule_v(cx)))
-                .children(footer.start)
-                .child(div().flex_1())
-                .children(running.map(|text| {
+            h_flex()
+                .gap(px(studio_ui::ds::space::XS))
+                .items_center()
+                .flex_none()
+                .child(
                     h_flex()
-                        .gap(px(studio_ui::ds::space::XS))
+                        .id("footer-graph")
+                        .h(px(studio_ui::ds::size::BAR_BUTTON))
+                        .px(px(studio_ui::ds::space::SM))
+                        .gap(px(studio_ui::ds::space::SM))
                         .items_center()
-                        .flex_none()
-                        .child(studio_ui::ds::spinner())
-                        .child(studio_ui::ds::text::meta(text).single_line())
-                }))
-                .children(footer.end)
-                .children(self.render_performance()),
+                        .rounded(px(studio_ui::ds::radius::BUTTON))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                        .map(|button| match unavailable.clone() {
+                            Some(reason) => button.tooltip(Tooltip::text(format!(
+                                "This graph is unavailable: {reason}. Reads resume when it is \
+                                 ready."
+                            ))),
+                            None => button.tooltip(|_, cx| {
+                                Tooltip::for_action(
+                                    "Open another graph",
+                                    &studio_actions::workspace::OpenGraph,
+                                    cx,
+                                )
+                            }),
+                        })
+                        .child(
+                            Icon::new(IconName::DatabaseZap)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .when(unavailable.is_some(), |button| {
+                            button.child(Indicator::dot().color(Color::Warning))
+                        })
+                        .child(Label::new(graph).size(LabelSize::Small).single_line())
+                        .on_click(|_, window, cx| {
+                            window
+                                .dispatch_action(Box::new(studio_actions::workspace::OpenGraph), cx)
+                        }),
+                )
+                .child(
+                    Label::new("/")
+                        .size(LabelSize::Small)
+                        .color(Color::Disabled),
+                )
+                .child(
+                    PopoverMenu::new("branch-menu")
+                        .anchor(gpui::Anchor::BottomLeft)
+                        .trigger(
+                            studio_ui::ds::button("branch", branch.clone())
+                                .label_size(LabelSize::Small)
+                                .style(ButtonStyle::Subtle)
+                                .tooltip(Tooltip::text(format!(
+                                    "Reads and edits in this window use {branch}. Switch branch."
+                                )))
+                                .start_icon(
+                                    Icon::new(IconName::GitBranch)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .end_icon(
+                                    Icon::new(IconName::ChevronUpDown)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                        .menu(move |window, cx| {
+                            let session = session_for_menu.clone();
+                            let branches = branches.clone();
+                            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                menu = menu.header("Branches");
+                                for branch in branches {
+                                    let session = session.clone();
+                                    let name = branch.clone();
+                                    menu = menu.entry(branch, None, move |_, cx| {
+                                        session.update(cx, |s, cx| s.set_branch(name.clone(), cx));
+                                    });
+                                }
+                                menu
+                            }))
+                        }),
+                ),
         )
     }
 
-    fn render_center(
-        &self,
-        footer: Option<ItemFooter>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_center(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let (editor_background, panel_background) =
             (colors.editor_background, colors.panel_background);
@@ -2366,8 +2382,7 @@ impl Workspace {
                                 .items_center()
                                 .border_b_1()
                                 .border_color(hairline)
-                                .child(self.render_title_tabs(&self.bottom, cx))
-                                .child(div().flex_1())
+                                .children(self.bottom.active_panel().map(dock_title))
                                 .child(
                                     studio_ui::ds::icon_button(
                                         "close-bottom-dock",
@@ -2375,7 +2390,11 @@ impl Workspace {
                                     )
                                     .icon_size(IconSize::XSmall)
                                     .tooltip(|_, cx| {
-                                        Tooltip::for_action("Hide", &ToggleActivity, cx)
+                                        Tooltip::for_action(
+                                            "Hide bottom panel",
+                                            &ToggleActivity,
+                                            cx,
+                                        )
                                     })
                                     .on_click(
                                         |_, window, cx| {
@@ -2394,7 +2413,6 @@ impl Workspace {
                         .child(resize_handle(PanelPosition::Bottom)),
                 )
             })
-            .children(self.render_center_footer(footer, cx))
     }
 
     /// No tab open: an icon, one line, and what fills the page (Zed's empty panels).
@@ -2492,12 +2510,13 @@ impl Workspace {
                         .px(px(studio_ui::ds::space::SM))
                         .border_b_1()
                         .border_color(hairline)
-                        .child(self.render_title_tabs(&self.right, cx))
-                        .child(div().flex_1())
+                        .children(self.right.active_panel().map(dock_title))
                         .child(
                             studio_ui::ds::icon_button("close-right-dock", IconName::Close)
                                 .icon_size(IconSize::XSmall)
-                                .tooltip(|_, cx| Tooltip::for_action("Hide", &ToggleInspector, cx))
+                                .tooltip(|_, cx| {
+                                    Tooltip::for_action("Hide inspector", &ToggleInspector, cx)
+                                })
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(Box::new(ToggleInspector), cx)
                                 }),
@@ -2528,14 +2547,9 @@ impl Workspace {
         match event.drag(cx).0 {
             PanelPosition::Left => self.left.resize(x - gap, width),
             PanelPosition::Right => self.right.resize(width - gap - x, width),
-            PanelPosition::Bottom => {
-                let footer = if self.session.is_some() {
-                    STRIP_HEIGHT
-                } else {
-                    0.
-                };
-                self.bottom.resize(height - gap - footer - y, height)
-            }
+            PanelPosition::Bottom => self
+                .bottom
+                .resize(height - gap - STATUS_BAR_HEIGHT - y, height),
         }
         cx.notify();
     }
@@ -2755,10 +2769,12 @@ impl Render for Workspace {
                     this.activate_panel(&action.id, cx)
                 },
             ))
-            .on_action(cx.listener(|this, _: &GoBack, window, cx| this.navigate(true, window, cx)))
-            .on_action(
-                cx.listener(|this, _: &GoForward, window, cx| this.navigate(false, window, cx)),
-            )
+            .on_action(cx.listener(|this, _: &GoBack, window, cx| {
+                this.navigate(this.active_pane, true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &GoForward, window, cx| {
+                this.navigate(this.active_pane, false, window, cx)
+            }))
             .on_drag_move(cx.listener(Self::resize_dock))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.left.open = !this.left.open;
@@ -2805,9 +2821,10 @@ impl Render for Workspace {
             )
             .with_priority(1)
         });
-        // Columns, each with its own header and footer strip, as Delta lays out its window.
-        // Glass: the sidebar, the document and the inspector are three sheets with one gap
-        // around and between them. Flat: columns split by hairlines.
+        // Columns, each with its own header strip, over one status bar across the window, as
+        // Zed lays out its docks over its status bar. Glass: the sidebar, the document and the
+        // inspector are three sheets with one gap around and between them, over the bar on the
+        // wash. Flat: columns split by hairlines.
         let glass = studio_ui::ds::is_glass(cx);
         let sidebar_shown = self.left.visible() && self.session.is_some();
         let gap = px(studio_ui::ds::size::SHEET_GAP);
@@ -2827,13 +2844,42 @@ impl Render for Workspace {
                 .flex_1()
                 .min_h_0()
                 .w_full()
-                .when(glass, |d| d.p(gap).gap(gap))
+                .when(glass, |d| d.p(gap).pb_0().gap(gap))
                 .when(sidebar_shown, |d| d.child(self.render_sidebar(cx)))
-                .child(self.render_center(footer, cx))
+                .child(self.render_center(cx))
                 .children(self.render_right_dock(cx)),
         )
+        .child(self.render_status_bar(footer, cx))
         .child(self.render_toasts(cx))
         .children(modal)
+    }
+}
+
+/// A dock's header for its active panel, as a Zed panel draws its own: the panel's title, then
+/// its buttons (search, new).
+fn dock_title(panel: &PanelEntry) -> impl IntoElement {
+    h_flex()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .gap(px(studio_ui::ds::space::SM))
+        .items_center()
+        .child(
+            Label::new(panel.title.clone())
+                .size(LabelSize::Small)
+                .single_line()
+                .truncate(),
+        )
+        .child(div().flex_1())
+        .children(panel.actions.clone())
+}
+
+/// The action that shows or hides a dock.
+fn toggle_action(position: PanelPosition) -> Box<dyn Action> {
+    match position {
+        PanelPosition::Left => Box::new(ToggleSidebar),
+        PanelPosition::Right => Box::new(ToggleInspector),
+        PanelPosition::Bottom => Box::new(ToggleActivity),
     }
 }
 
@@ -3280,7 +3326,7 @@ mod tests {
     }
 
     /// The tab strip and its tabs are the header strip's height, under which every column's
-    /// header rule lines up.
+    /// header rule lines up; the status bar has its own height.
     #[gpui::test]
     fn tabs_fill_the_header_strip(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -3310,6 +3356,95 @@ mod tests {
             studio_ui::ds::size::HEADER_STRIP
         );
         assert_eq!(height(cx, "tab-0-0"), studio_ui::ds::size::HEADER_STRIP);
+        assert_eq!(height(cx, "status-bar"), studio_ui::ds::size::STATUS_BAR);
+    }
+
+    /// As Zed's panel buttons: a button shows its panel and opens the dock; pressed again while
+    /// its panel shows, it hides the dock, which keeps that panel for the next time.
+    #[gpui::test]
+    fn panel_buttons_show_their_panel_and_hide_the_dock_it_shows(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, _, cx| {
+            for id in ["types", "explore"] {
+                let view = cx.new(|_| Field);
+                workspace.add_panel(
+                    PanelPosition::Left,
+                    id,
+                    id,
+                    IconName::Table,
+                    view.into(),
+                    cx,
+                );
+            }
+            let left = |w: &Workspace| (w.left.open, w.left.active_id());
+            assert_eq!(left(workspace), (true, Some("types".into())));
+
+            workspace.press_panel_button(PanelPosition::Left, "explore", cx);
+            assert_eq!(
+                left(workspace),
+                (true, Some("explore".into())),
+                "shows explore"
+            );
+            workspace.press_panel_button(PanelPosition::Left, "explore", cx);
+            assert_eq!(
+                left(workspace),
+                (false, Some("explore".into())),
+                "hides the dock"
+            );
+            workspace.press_panel_button(PanelPosition::Left, "explore", cx);
+            assert_eq!(
+                left(workspace),
+                (true, Some("explore".into())),
+                "opens it again"
+            );
+            workspace.press_panel_button(PanelPosition::Left, "types", cx);
+            assert_eq!(left(workspace), (true, Some("types".into())));
+        });
+    }
+
+    /// Back and Forward walk the tabs the active pane showed, as Zed's per-pane history: a new
+    /// pane starts with none, and stepping in it leaves the other pane's trail alone.
+    #[gpui::test]
+    fn back_and_forward_walk_the_active_panes_own_tabs(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            for key in ["a", "b"] {
+                workspace.open_item(key, window, cx, |_, cx| Split {
+                    field: cx.new(|_| Field),
+                    part: cx.new(|_| Part { renders: 0 }),
+                    caches: false,
+                    focus_handle: cx.focus_handle(),
+                });
+            }
+            let first = workspace.active_pane;
+            let active = |w: &Workspace| w.pane(w.active_pane).map(|p| p.active);
+            assert_eq!(active(workspace), Some(1), "b shows");
+            workspace.navigate(first, true, window, cx);
+            assert_eq!(active(workspace), Some(0), "back to a");
+            workspace.navigate(first, false, window, cx);
+            assert_eq!(active(workspace), Some(1), "forward to b");
+
+            workspace.split(SplitDirection::Right, window, cx);
+            let second = workspace.active_pane;
+            assert_ne!(second, first);
+            assert!(
+                !workspace.pane(second).unwrap().can_step(true),
+                "a new pane has no trail"
+            );
+            workspace.navigate(second, true, window, cx);
+            assert!(
+                workspace.pane(first).unwrap().can_step(true),
+                "the first pane keeps its trail"
+            );
+        });
     }
 
     /// A CPU reading measures from the one before it, never across a pause in the background:

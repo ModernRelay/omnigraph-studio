@@ -51,8 +51,8 @@ Steps:
 3. One window can hold several graph sessions as tabs; a second window is "New Window" (⌘⇧N).
 
 Built (`studio_workspace::pane`): the document area is a tree of panes (`Member`, splits with
-shares that drag to resize). Each pane has its own tab strip; the top-right pane carries the
-dock toggles and the top-left one makes room for the traffic lights. ⌘\ and ⌘⇧\ split right
+shares that drag to resize). Each pane has its own tab strip, which starts with that pane's Back
+and Forward buttons; the top-left one makes room for the traffic lights. ⌘\ and ⌘⇧\ split right
 and down with a copy of the active tab (reopened from its saved form), ⌘⌥→/← move between
 panes, a pane that loses its last tab closes. Pinned tabs come first with a pin instead of a
 close button and survive "Close others" and "Close all"; a tab's right-click menu has the
@@ -63,7 +63,7 @@ closes. The workspace file saves each pane's tabs, active tab and pinned count, 
 and the active pane; a file from before splits restores as one pane.
 
 Built (several graphs in one window): opening another graph parks the shown one with its panes,
-tabs and back/forward trail, saved first; the sidebar footer is the switcher ("Open in this
+tabs and their back/forward trails, saved first; the status bar's server chip is the switcher ("Open in this
 window", the shown graph checked, Open Another Graph…, Close Graph) and reads "+N graphs" when
 more are open; ⌃⌘] and ⌃⌘[ step through them. Closing a graph saves its tabs (opening it
 again brings them back) and shows the one opened before; a graph with a write still running
@@ -80,6 +80,28 @@ another window opens. Quitting keeps every window. A new window (⌘⇧N) asks f
 opens where the last moved window was. A `session.json` from before held one window's graphs
 and is read as one window.
 
+Built (docks and status bar, after Zed's, 2026-10-16): the window keeps its column headers (no
+title bar; Ragnor's choice over a Zed-style title bar) over one status bar across the window.
+- Each column's header is its panel's own, as a Zed panel draws its header: the active panel's
+  title and its buttons (search, new). The sidebar's header also holds the traffic lights, the
+  hide button and search; the inspector's and the bottom panel's end with a hide button.
+- Panels are switched from the status bar, as Zed's `PanelButtons`: one icon per panel, the left
+  dock's at the far left, the bottom dock's then the right dock's at the far right. The active
+  panel of an open dock is lit (accent icon); pressing it hides the dock, which keeps that panel
+  for the next time; pressing any other shows its panel and opens its dock. The tooltip names
+  the panel, or "Hide sidebar" (inspector, bottom panel) with the key. A hidden sidebar comes
+  back from its icons; before, only ⌘B did.
+- The status bar (32 px, `ds::size::STATUS_BAR`) reads, after the left dock's buttons: the
+  server chip (state and round trip; the graph switcher), the graph chip and the branch menu,
+  then the open tab's own facts (`Item::footer`); at the right, what is running, the tab's
+  controls, Studio's memory and CPU, then the bottom and right docks' buttons. Groups are split
+  by Zed's divider (`ds::divider_v`). On glass it sits on the wash under the sheets.
+- Back and Forward are kept per pane, as Zed's `NavHistory`: a pane records the tab it leaves,
+  its arrows (and ⌘[ / ⌘] for the active pane) step through the tabs it showed, skipping closed
+  ones, and a new pane starts with none. An arrow with nowhere to go is disabled.
+- ⌘J is the bottom panel (View → Bottom Panel), which holds Nodes, History and the activity
+  log; it was labeled "Activity".
+
 ### Drawing cost
 
 GPUI rebuilds the whole window on every frame that draws, except views marked cached (Zed caches
@@ -88,20 +110,22 @@ a scrolling host of its own (a cached view needs a definite size, which a panel 
 content lacks; the host has one and scrolls the panel). A cached view is drawn again only when it
 or a view inside it notifies, or when a setting changes (which redraws every window); otherwise
 the frame replays it. A hover, a toast or an agent's streamed reply therefore redraws only what
-changed. The left panel's title stays put above its scrolling content. The snapshot example's
+changed. A dock panel's title is in its column's header, above its scrolling content. The snapshot example's
 `measure:<n>[,refresh]` step times frames after notifying the workspace, or redrawing all. The
 workspace itself renders whenever anything inside it notifies, so it compares its state with
 what was last saved at most every 250 ms rather than serializing every tab on every frame.
 
 ### Window chrome
 
-- Transparent title bar with traffic lights; the title area shows
-  `server ▸ graph ▸ branch ▾ ▸ snapshot`. The branch menu switches branch for the active tab.
-- Right side of the title: `write · <branch>` whenever the active item can write; a read-only
-  chip when the actor cannot write or the item is pinned to an older commit.
-- Status bar left: connection chip (`ready`, `connecting…`, `contract mismatch`,
-  `unauthorized`, `unreachable`), contract version, actor. Right: one activity slot ("2 queries
-  running", "Publishing…"), which opens the activity log.
+- Transparent title bar with no title area: the traffic lights sit in the first column's
+  header (the sidebar's, else the top-left pane's), and every header strip moves the window.
+- Status bar left: the docks' panel buttons, then the connection chip (`ready`,
+  `connecting…`, `contract mismatch`, `unauthorized`, `unreachable`, with the contract and the
+  round trip), the graph and the branch menu, which switches branch for the window. Right: what
+  is running ("2 queries running", "Writing (1)…"), memory and CPU, the other docks' buttons.
+- Not built: the actor in the status bar; a `write · <branch>` chip whenever the active item can
+  write, and a read-only chip when the actor cannot write or the item is pinned to an older
+  commit.
 
 ### Actions and keys
 
@@ -258,33 +282,34 @@ strips and states built from them); the "Design system" tab (`studio::OpenDesign
 every specimen in the current theme and window style. Features compose `ds` components rather
 than styling one-off elements.
 
-- **Columns, not bars.** No global title bar or status bar. Each column has its own 36 px
-  header strip (`size::HEADER_STRIP`) and the sidebar and document their own 40 px footer strip
-  (`size::STRIP`), so the rules line up across the window. Strips are window drag areas; as in Zed, a move starts on the first mouse move
-  after a press, so clicks on strip buttons land.
+- **Column headers, one status bar.** No title bar. Each column has its own 36 px header strip
+  (`size::HEADER_STRIP`), so the rules line up across the window, over one 32 px status bar
+  across it (`size::STATUS_BAR`, after Zed's). Header strips are window drag areas; as in Zed, a
+  move starts on the first mouse move after a press, so clicks on strip buttons land.
 - **Panels in docks** (`studio_workspace::panels`, after Zed's `Panel`/`Dock` and Obsidian's
   side docks). A panel is a view with an id, a title and an icon; features add one with
   `Workspace::add_panel(position, …)` and show it with `activate_panel`. A dock (left, right,
-  bottom) shows one panel at a time, opens and closes as a whole, and draws the same chrome for
-  every panel: a header strip with its tabs, then the active panel. The left dock (264 px)
-  switches panels with icon tabs (Types, Explore, Branches); the right (340 px, the inspector)
-  and bottom (the activity log) docks use title tabs and a close button. Selection fills the
-  inspector without reopening a dock the user closed. Each dock's open state and active panel
-  are remembered per graph. Documents are tabs in the center, not panels. A left panel may put
-  small buttons on its title line, on the label's baseline (`Workspace::set_panel_actions`,
-  drawn by `ds::section_header`), as Delta and Zed put a list's search and "new" there rather
-  than as rows in the list; the Conversations panel does (spec 011).
-- **Footers, after Delta.** The sidebar footer holds the connection: a status dot, the server
-  and its state, opening "Open a graph" (Delta's account). The document footer holds where the
-  open tab reads and writes, graph / branch with the branch menu (Delta's repo / branch), then
-  the tab's own facts; at the end what is running and the tab's controls. A tab supplies its
-  part through `Item::footer` (`ItemFooter { start, end }`): the table its loaded count, read
-  commit and key hints; the agent its restart, agent pill and send. The document header holds
-  only the tabs and the dock toggles.
+  bottom) shows one panel at a time, opens and closes as a whole, and draws its active panel
+  under a header strip with that panel's title and buttons. Panels are switched from their
+  icons in the status bar (Zed's `PanelButtons`); the left dock is 264 px, the right (the
+  inspector) 340 px, and the right and bottom docks' headers end with a hide button. Selection
+  fills the inspector without reopening a dock the user closed. Each dock's open state and
+  active panel are remembered per graph. Documents are tabs in the center, not panels. A panel
+  may put small buttons in its header, on the title's line (`Workspace::set_panel_actions`), as
+  Delta and Zed put a list's search and "new" there rather than as rows in the list; the
+  Conversations panel does (spec 011).
+- **Status bar, after Zed's** (until 2026-10-16 two footers, after Delta's). One bar across the
+  window: the left dock's panel buttons, the connection (a status dot, the server and its
+  state, opening the graph switcher), where the open tab reads and writes (graph / branch with
+  the branch menu), then the tab's own facts; at the end what is running, the tab's controls,
+  memory and CPU, and the bottom and right docks' panel buttons. A tab supplies its part through
+  `Item::footer` (`ItemFooter { start, end }`): the table its loaded count, read commit and key
+  hints; the agent its restart, agent pill and send. A pane's header holds its Back and Forward
+  and its tabs.
   - The connection's state reads with the server's round trip, from the last health check
     (`Connection::latency`, no extra request): "contract 0.13 · 42 ms". It is timed on the
     background executor, so a busy main thread does not lengthen it.
-  - With `studio.show_performance` on (the default since 2026-10-14), the document footer ends with
+  - With `studio.show_performance` on (the default since 2026-10-14), the status bar ends with
     Studio's memory and CPU, muted, in the warning colour past 2 GB or half a core:
     "412 MB · 3% CPU". Memory is macOS's physical footprint (`proc_pid_rusage`, what
     Activity Monitor shows) or Linux's resident set. CPU is Studio's own process, every
@@ -397,6 +422,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-16 | Docks are switched from a status bar, and each pane keeps its own back and forward | `studio_workspace` tests `panel_buttons_show_their_panel_and_hide_the_dock_it_shows`, `back_and_forward_walk_the_active_panes_own_tabs`, `tabs_fill_the_header_strip` (the status bar's height), `pane` `a_pane_steps_back_and_forward_through_the_tabs_it_showed`; offscreen snapshots on the dev graph, flat and glass, with the bottom panel, with the sidebar hidden and a row peeked | One status bar across the window: the five sidebar panels' icons at the left (Graph lit), the server, graph and branch, the tab's facts, memory and CPU, then Nodes, History and Activity and, with a row peeked, the inspector (lit). Column headers show their panel's title; each pane's strip starts with ← → (← enabled after a second tab, → disabled). With the sidebar hidden its icons stay in the bar |
 | 2026-10-14 | `settings.json` keeps the person's text, and `keymap.json` rebinds keys | `studio_settings` `document` tests (comments and trailing commas, a syntax error's line, each value that does not fit costing only its setting, a saved view set aside alone, edits in place, a new key above a comment's key, defaults removed, a bad value kept until its setting changes, graph entries); `studio` `settings_apply` (`a_change_keeps_the_persons_text`: a hand edit with a comment written before the change and not yet read stays and applies; only chosen keys are written; a broken file refuses the change unchanged) and `keymaps` (`the_persons_keymap_wins_and_is_read_again`: a key added, `null` taking ⌘K from the palette and from the shortcut text, an unknown action reported, a broken save keeping the bindings, a second save restoring Studio's); offscreen snapshot of the settings tab in a scratch data folder with three bad values and a bad binding | All pass. The tab listed "3 problems in settings.json" (the font size, a misspelled `stuido`, a negative node limit) and "A problem in keymap.json" with each path and line; Interface font size showed 16. Before, a comment or one wrong value read as a file that could not be applied, the first change wrote every default into the file, and a change within two seconds of a hand edit wrote over it |
 | 2026-10-14 | ⌘K and ⌘P say when they are still looking for nodes | `command_palette` test `the_palette_shows_it_is_searching_nodes` (a fake server; the circle and "Searching nodes…" from the keystroke, no count of none, then the node rows and no circle once it answers; fails without the flag); offscreen snapshots on the dev graph through a proxy that held each node search for 3 s: ⌘K, ⌘3 then "ad"; ⌘K then "ad" | Nodes: the circle at the field's end, "Searching nodes…", no "0 nodes". All: the matching commands at once, with the circle until the nodes came. Before, both showed nothing, and Nodes said "No node matches." while it waited |
 | 2026-10-13 | The palette's selected row is never clipped | offscreen snapshots: ⌘P, ⌘2, "Person" (one row), and ⌘K "open" with ↓↓ | Before, the list's height was its rows alone while its padding sat inside it, so the rows overflowed by 8 px and scrolling to the selection hid the top of the single row under the tabs. The height now includes the padding; the row sits whole with even space, and longer lists keep theirs |
@@ -428,6 +454,12 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-13 | A panic message loses quoted text | `studio` test `a_panic_message_loses_the_text_it_quotes` | ``'é'`` and `` `Ada Lovelace's notes` `` become `'…'` and `` `…` ``; messages over 300 characters are cut |
 
 ## Corrections
+
+- 2026-10-16 · A hidden sidebar had no button to bring it back (only ⌘B, the View menu or the
+  palette did); ⌘J and its button were labeled "Activity" but toggled the whole bottom panel,
+  which opened on Nodes; and the docs drew a title bar with server, graph and branch that was
+  never built. The status bar now holds every panel's button, the bottom panel is named so, and
+  the frame is described as it is.
 
 - 2026-10-14 · `settings.json` was Studio's file in all but name. Each change serialized every
   setting over it, so the first one wrote all the defaults (a later default never reached the
