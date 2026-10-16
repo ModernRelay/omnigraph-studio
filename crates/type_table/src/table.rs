@@ -5995,52 +5995,8 @@ impl Render for DraggedColumn {
 mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
-    use graph_store::{Connection, ServerEntry, ServerSource};
-    use http_client::{AsyncBody, FakeHttpClient, Response};
-    use serde_json::json;
 
-    const PEOPLE: &str = "node Person {\n  slug: String @key\n  name: String\n}\n";
-
-    /// A server with `schema` and two people; every read answers with both.
-    fn session(schema: &str, cx: &mut TestAppContext) -> Entity<GraphSession> {
-        let schema: Arc<str> = schema.into();
-        let http = FakeHttpClient::create(move |request| {
-            let schema = schema.clone();
-            async move {
-                let path = request.uri().path().to_owned();
-                let body = if path.ends_with("/schema") {
-                    json!({ "schema_source": &*schema })
-                } else if path.ends_with("/query") {
-                    json!({
-                        "query_name": "q",
-                        "target": {"branch": "main", "snapshot": null},
-                        "row_count": 2,
-                        "columns": ["n"],
-                        "rows": [
-                            {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
-                            {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
-                        ],
-                        "graph_commit_id": "c1",
-                    })
-                } else {
-                    json!({ "branches": ["main"] })
-                };
-                Ok(Response::builder()
-                    .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
-                    .body(AsyncBody::from(body.to_string()))
-                    .unwrap())
-            }
-        });
-        let server = ServerEntry {
-            name: "dev".into(),
-            url: "http://127.0.0.1:8787".into(),
-            source: ServerSource::Environment,
-            known_graphs: Vec::new(),
-        };
-        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
-        cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx))
-    }
+    use crate::test_support::{PEOPLE, session};
 
     fn grid_renders(table: &Entity<TypeTable>, cx: &mut VisualTestContext) -> usize {
         table.read_with(cx, |table, cx| table.grid.read(cx).renders)

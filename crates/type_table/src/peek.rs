@@ -3,24 +3,31 @@
 //! at full size as a node's page in a tab of its own. Every read is pinned to the commit the row
 //! was read at, or to the first read when the node was opened by id (constitution II).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{App, ClipboardItem, Context, Entity, Render, SharedString, Subscription, Task, Window};
+use editor::Editor;
+use gpui::{
+    App, ClipboardItem, Context, Entity, Focusable as _, Render, SharedString, Subscription, Task,
+    Window,
+};
+use gq_language::input::{edit_text, parse_input};
 use gq_language::{Direction, RelationshipGroup, SchemaModel, builder};
 use graph_store::{GraphSession, Loadable, SessionEvent};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Map, Value};
 use studio_actions::graph::{OpenBlob, OpenNodePage, PeekNode};
+use studio_actions::node::{CancelField, SaveField};
 use ui::prelude::*;
-use ui::{Tooltip, rems_from_px};
+use ui::{ContextMenu, Indicator, PopoverMenu, Switch, ToggleState, Tooltip, rems_from_px};
 
 use crate::blob::{
     IMAGE_MAX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, save_value, suggested_file_name,
 };
 use crate::model::{
-    FROM_COLUMN, TO_COLUMN, display_value, format_count, node_rows, reads_as_markdown, short_commit,
+    FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, display_value, format_count, node_rows,
+    reads_as_markdown, same_value, save_result, short_commit,
 };
 use graph_client::{BlobCell, BlobMeta};
 
@@ -106,6 +113,16 @@ struct BlobSlot {
     _save: Option<Task<()>>,
 }
 
+/// One property being edited in place (spec 014): its editor, the value it was read at, which
+/// the save is bound to, and why the last save did not land.
+struct FieldEdit {
+    property: gq_language::Property,
+    old: Value,
+    editor: Entity<Editor>,
+    notice: Option<Notice>,
+    _blur: Subscription,
+}
+
 /// Saving a value to a file: how far it got, or how it ended.
 #[derive(Debug, Clone)]
 enum SaveState {
@@ -133,6 +150,10 @@ pub struct NodePeek {
     page: bool,
     /// Text values with markup, rendered as markdown: by property, the text and its view.
     markdown: HashMap<String, (String, Entity<Markdown>)>,
+    /// Properties being edited; a changed one stays open until it is saved or cancelled.
+    edits: HashMap<String, FieldEdit>,
+    /// Properties whose write is out, shown with their new value and a dot.
+    saving: HashSet<String>,
     _tasks: Vec<Task<()>>,
     _subscription: Subscription,
 }
@@ -195,9 +216,24 @@ impl NodePeek {
     ) -> Self {
         let schema = session.read(cx).schema_model();
         let subscription = cx.subscribe(&session, |this: &mut Self, session, event, cx| {
+            // A view made before the schema was read (a page restored at start) reads its node
+            // once the schema is in.
+            if let SessionEvent::SchemaChanged = event
+                && this.schema.is_none()
+            {
+                this.schema = session.read(cx).schema_model();
+                if this.schema.is_some() && this.values.loaded().is_none() {
+                    this.load_node(cx);
+                }
+                cx.notify();
+                return;
+            }
+            // While its own writes are out the view compares when they end: the head may be its
+            // own commit.
             if let SessionEvent::HeadMoved { branch, head } = event
                 && *branch == session.read(cx).branch
                 && !this.holds_commit
+                && this.saving.is_empty()
                 && this.snapshot.as_ref().is_some_and(|pin| pin != head)
             {
                 this.newer = true;
@@ -220,6 +256,8 @@ impl NodePeek {
             holds_commit: false,
             page,
             markdown: HashMap::new(),
+            edits: HashMap::new(),
+            saving: HashSet::new(),
             _tasks: Vec::new(),
             _subscription: subscription,
         };
@@ -885,6 +923,261 @@ impl NodePeek {
         cx.notify();
     }
 
+    // ---- editing (spec 014) ----
+
+    /// Whether this view edits `property` in place: a node's property, read at the head, of a
+    /// kind a table cell edits too.
+    fn edits_property(&self, property: &gq_language::Property) -> bool {
+        matches!(self.subject, PeekSubject::Node { .. })
+            && !self.holds_commit
+            && property.editable_in_cell()
+            && self.values.loaded().is_some()
+    }
+
+    fn value_of(&self, name: &str) -> Value {
+        self.values
+            .loaded()
+            .and_then(|values| values.get(name))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// Opens a property's editor with its value, or focuses it when it is open.
+    fn start_edit(
+        &mut self,
+        property: gq_language::Property,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = property.name.clone();
+        if let Some(edit) = self.edits.get(&name) {
+            window.focus(&edit.editor.focus_handle(cx), cx);
+            return;
+        }
+        if !self.edits_property(&property) || self.saving.contains(&name) {
+            return;
+        }
+        let old = self.value_of(&name);
+        let text = edit_text(&old);
+        // Text, which reads as markdown, takes line breaks (⇧↵); other values are one line.
+        let lines = reads_as_markdown(&property);
+        let editor = cx.new(|cx| {
+            let mut editor = if lines {
+                Editor::auto_height(1, 16, window, cx)
+            } else {
+                Editor::single_line(window, cx)
+            };
+            editor.set_text(text, window, cx);
+            editor.set_placeholder_text(&property.display_type(), window, cx);
+            editor.set_text_style_refinement(studio_ui::ds::field_text(cx));
+            editor
+        });
+        let focus = editor.focus_handle(cx);
+        let left = name.clone();
+        let blur = cx.on_blur(&focus, window, move |this, _, cx| {
+            this.left_field(&left, cx)
+        });
+        window.focus(&focus, cx);
+        self.edits.insert(
+            name,
+            FieldEdit {
+                property,
+                old,
+                editor,
+                notice: None,
+                _blur: blur,
+            },
+        );
+        cx.notify();
+    }
+
+    /// Leaving a field closes it when nothing changed; a changed one stays open, as the draft it
+    /// is, until it is saved or cancelled. Nothing is written by leaving a field.
+    fn left_field(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(edit) = self.edits.get(name) else {
+            return;
+        };
+        let text = edit.editor.read(cx).text(cx);
+        let unchanged =
+            parse_input(&edit.property, &text).is_ok_and(|value| same_value(&value, &edit.old));
+        if unchanged && edit.notice.is_none() {
+            self.edits.remove(name);
+            cx.notify();
+        }
+    }
+
+    /// The open field that has the keyboard.
+    fn focused_field(&self, window: &Window, cx: &App) -> Option<String> {
+        self.edits
+            .iter()
+            .find(|(_, edit)| edit.editor.focus_handle(cx).is_focused(window))
+            .map(|(name, _)| name.clone())
+    }
+
+    fn on_save_field(&mut self, _: &SaveField, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(name) = self.focused_field(window, cx) {
+            self.save_field(&name, window, cx);
+        }
+    }
+
+    fn on_cancel_field(&mut self, _: &CancelField, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(name) = self.focused_field(window, cx) {
+            self.edits.remove(&name);
+            cx.notify();
+        }
+    }
+
+    /// ↵: writes the field's text, parsed for its type; an unchanged value sends nothing.
+    fn save_field(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(edit) = self.edits.get_mut(name) else {
+            return;
+        };
+        let text = edit.editor.read(cx).text(cx);
+        let new = match parse_input(&edit.property, &text) {
+            Ok(value) => value,
+            Err(message) => {
+                edit.notice = Some(Notice::new(Tone::Invalid, message));
+                cx.notify();
+                return;
+            }
+        };
+        let Some(edit) = self.edits.remove(name) else {
+            return;
+        };
+        if same_value(&new, &edit.old) {
+            cx.notify();
+            return;
+        }
+        self.write_value(edit.property, edit.old, new, text, window, cx);
+    }
+
+    /// Writes one property bound to the value it was read at, as a table cell saves (spec 004):
+    /// it changes nothing if the value changed elsewhere meanwhile.
+    fn write_value(
+        &mut self,
+        property: gq_language::Property,
+        old: Value,
+        new: Value,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let PeekSubject::Node { type_name, id } = self.subject.clone() else {
+            return;
+        };
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        let name = property.name.clone();
+        let query = match builder::update_cell(&schema, &type_name, &name, &id, &old, &new) {
+            Ok(query) => query,
+            Err(error) => {
+                let notice = Notice::new(Tone::Invalid, error.to_string());
+                self.reopen(property, old, text, notice, window, cx);
+                return;
+            }
+        };
+        // The new value shows, with a dot, while the write is out.
+        if let Loadable::Loaded(values) = &mut self.values {
+            values.insert(name.clone(), new);
+        }
+        self.saving.insert(name.clone());
+        let branch = self.session.read(cx).branch.clone();
+        let description = format!("Set {name} of {id}");
+        let write = self.session.update(cx, |session, cx| {
+            session.write(&query, None, description, cx)
+        });
+        // Detached: closing the page or moving the peek never cancels a write.
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = write.await;
+            let result = save_result(&outcome, &branch);
+            this.update_in(cx, |this, window, cx| {
+                this.finish_write(property, old, text, result, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_write(
+        &mut self,
+        property: gq_language::Property,
+        old: Value,
+        text: String,
+        result: SaveResult,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = property.name.clone();
+        self.saving.remove(&name);
+        match result {
+            SaveResult::Saved { commit, parent } => {
+                // Made on the commit shown, the view holds the new commit's state; otherwise
+                // someone else committed in between and the view is behind.
+                if parent.is_some() && parent == self.snapshot {
+                    self.snapshot = Some(commit);
+                } else {
+                    self.newer = true;
+                }
+            }
+            SaveResult::NoMatch => {
+                self.restore(&name, old.clone());
+                self.newer = true;
+                let notice = Notice::new(
+                    Tone::Conflict,
+                    "Changed elsewhere while you were editing; Refresh reads it now",
+                );
+                self.reopen(property, old, text, notice, window, cx);
+            }
+            SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
+                self.restore(&name, old.clone());
+                self.reopen(property, old, text, notice, window, cx);
+            }
+        }
+        if self.saving.is_empty() {
+            self.compare_head(cx);
+        }
+        cx.notify();
+    }
+
+    fn restore(&mut self, name: &str, value: Value) {
+        if let Loadable::Loaded(values) = &mut self.values {
+            values.insert(name.to_owned(), value);
+        }
+    }
+
+    /// Opens the field again with what was typed and why it did not land (constitution III).
+    fn reopen(
+        &mut self,
+        property: gq_language::Property,
+        old: Value,
+        text: String,
+        notice: Notice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = property.name.clone();
+        self.start_edit(property, window, cx);
+        if let Some(edit) = self.edits.get_mut(&name) {
+            edit.old = old;
+            edit.notice = Some(notice);
+            edit.editor
+                .update(cx, |editor, cx| editor.set_text(text, window, cx));
+        }
+    }
+
+    /// Whether the branch moved past the commit shown, once this view's writes are in.
+    fn compare_head(&mut self, cx: &mut Context<Self>) {
+        if self.holds_commit {
+            return;
+        }
+        let session = self.session.read(cx);
+        if let (Some(head), Some(pin)) = (session.head(&session.branch), self.snapshot.as_deref()) {
+            self.newer = head != pin;
+        }
+    }
+
     fn copy(&mut self, name: String, value: &Value, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(crate::model::copy_text(value)));
         self.copied = Some(name);
@@ -991,7 +1284,24 @@ impl NodePeek {
                             _ => name.clone(),
                         };
                         let copied = self.copied.as_deref() == Some(name.as_str());
-                        let shown = display_value(property.as_ref(), &value);
+                        let editable = property.as_ref().is_some_and(|p| self.edits_property(p));
+                        let editing = self.edits.contains_key(&name);
+                        let saving = self.saving.contains(&name);
+                        // An enum is a menu of its values and a boolean a switch, each saving
+                        // as it is chosen; other values open an editor on a click.
+                        let picker = property
+                            .as_ref()
+                            .filter(|_| editable && !editing && !saving)
+                            .and_then(|p| self.render_picker(index, p, &value, cx));
+                        let opens_editor = editable && picker.is_none() && !editing && !saving;
+                        let body = match (self.edits.get(&name), picker) {
+                            (Some(edit), _) => self.render_field_edit(edit, window, cx),
+                            (None, Some(picker)) => picker,
+                            (None, None) => {
+                                self.render_value(&name, property.as_ref(), &value, window, cx)
+                            }
+                        };
+                        let edit_property = property.clone();
                         let copy_name = name.clone();
                         let copy_value = value.clone();
                         h_flex()
@@ -1001,44 +1311,52 @@ impl NodePeek {
                             .gap_2()
                             .items_start()
                             .rounded_sm()
-                            .hover(move |s| s.bg(hover))
-                            .cursor_pointer()
-                            .tooltip(Tooltip::text(format!("{ty} · click to copy")))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.copy(copy_name.clone(), &copy_value, cx)
+                            .when(!editing, |row| row.hover(move |s| s.bg(hover)))
+                            .when(opens_editor || !editable, |row| row.cursor_pointer())
+                            .when(!editing, |row| {
+                                row.tooltip(Tooltip::text(if opens_editor {
+                                    format!("{ty} · click to edit")
+                                } else if editable {
+                                    ty.clone()
+                                } else {
+                                    format!("{ty} · click to copy")
+                                }))
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if opens_editor {
+                                    if let Some(property) = edit_property.clone() {
+                                        this.start_edit(property, window, cx);
+                                    }
+                                } else if !editable {
+                                    this.copy(copy_name.clone(), &copy_value, cx)
+                                }
                             }))
                             .child(
-                                div().w(px(label_width)).flex_none().child(
-                                    Label::new(title)
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                        .truncate(),
-                                ),
-                            )
-                            .child(
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(match self.markdown.get(&name) {
-                                        // GPUI's text takes its size from the element around
-                                        // it, so the labels' size is set there too.
-                                        Some((_, view)) => div()
-                                            .text_size(ui::TextSize::Small.rems(cx))
-                                            .child(MarkdownElement::new(
-                                                view.clone(),
-                                                value_style(window, cx),
-                                            ))
-                                            .into_any_element(),
-                                        None => Label::new(shown)
+                                    .w(px(label_width))
+                                    .flex_none()
+                                    .pt(px(if editing {
+                                        studio_ui::ds::space::SM
+                                    } else {
+                                        0.
+                                    }))
+                                    .child(
+                                        Label::new(title)
                                             .size(LabelSize::Small)
-                                            .color(if value.is_null() {
-                                                Color::Disabled
-                                            } else {
-                                                Color::Default
-                                            })
-                                            .into_any_element(),
-                                    }),
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    ),
                             )
+                            .child(div().flex_1().min_w_0().child(body))
+                            .when(saving, |row| {
+                                row.child(
+                                    div()
+                                        .id(("peek-saving", index))
+                                        .pt(px(6.))
+                                        .tooltip(Tooltip::text("Saving…"))
+                                        .child(Indicator::dot().color(Color::Warning)),
+                                )
+                            })
                             .when(copied, |d| {
                                 d.child(
                                     Label::new("Copied")
@@ -1048,6 +1366,244 @@ impl NodePeek {
                             })
                     }),
             )
+            .into_any_element()
+    }
+
+    /// A value as it reads: markdown when it has markup, else a label.
+    fn render_value(
+        &self,
+        name: &str,
+        property: Option<&gq_language::Property>,
+        value: &Value,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match self.markdown.get(name) {
+            // GPUI's text takes its size from the element around it, so the labels' size is
+            // set there too.
+            Some((_, view)) => div()
+                .text_size(ui::TextSize::Small.rems(cx))
+                .child(MarkdownElement::new(view.clone(), value_style(window, cx)))
+                .into_any_element(),
+            None => Label::new(display_value(property, value))
+                .size(LabelSize::Small)
+                .color(if value.is_null() {
+                    Color::Disabled
+                } else {
+                    Color::Default
+                })
+                .into_any_element(),
+        }
+    }
+
+    /// An enum's menu of values or a boolean's switch, each writing as it is chosen; `None` for
+    /// a property edited as text.
+    fn render_picker(
+        &self,
+        index: usize,
+        property: &gq_language::Property,
+        value: &Value,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if property.list {
+            return None;
+        }
+        let this = cx.entity().downgrade();
+        if let Some(options) = property.enum_values.clone() {
+            let current = value.as_str().map(str::to_owned);
+            let nullable = property.nullable;
+            let property = property.clone();
+            let shown = current.clone().unwrap_or_else(|| "—".into());
+            // The menu's label on the values' edge: the button's own padding sits outside it.
+            return Some(
+                div()
+                    .ml(px(-studio_ui::ds::space::XS))
+                    .child(
+                        PopoverMenu::new(SharedString::from(format!("peek-enum-{index}")))
+                            .trigger(
+                                studio_ui::ds::button(
+                                    SharedString::from(format!("peek-enum-button-{index}")),
+                                    shown,
+                                )
+                                .style(ButtonStyle::Subtle)
+                                .size(ButtonSize::Compact)
+                                .label_size(LabelSize::Small)
+                                .end_icon(
+                                    Icon::new(IconName::ChevronDown)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                            )
+                            .anchor(gpui::Anchor::TopLeft)
+                            .menu(move |window, cx| {
+                                let (this, property, options, current) = (
+                                    this.clone(),
+                                    property.clone(),
+                                    options.clone(),
+                                    current.clone(),
+                                );
+                                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                    let choose = |chosen: Value| {
+                                        let (this, property) = (this.clone(), property.clone());
+                                        move |window: &mut Window, cx: &mut App| {
+                                            this.update(cx, |this, cx| {
+                                                let old = this.value_of(&property.name);
+                                                if !same_value(&old, &chosen) {
+                                                    let text = edit_text(&chosen);
+                                                    this.write_value(
+                                                        property.clone(),
+                                                        old,
+                                                        chosen.clone(),
+                                                        text,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }
+                                            })
+                                            .ok();
+                                        }
+                                    };
+                                    for option in &options {
+                                        menu = menu.toggleable_entry(
+                                            option.clone(),
+                                            current.as_deref() == Some(option.as_str()),
+                                            IconPosition::Start,
+                                            None,
+                                            choose(Value::String(option.clone())),
+                                        );
+                                    }
+                                    if nullable {
+                                        menu = menu.separator().toggleable_entry(
+                                            "None",
+                                            current.is_none(),
+                                            IconPosition::Start,
+                                            None,
+                                            choose(Value::Null),
+                                        );
+                                    }
+                                    menu
+                                }))
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if property.kind == gq_language::ScalarKind::Bool {
+            let on = value.as_bool().unwrap_or(false);
+            let property = property.clone();
+            return Some(
+                Switch::new(("peek-switch", index), on.into())
+                    .on_click(move |state, window, cx| {
+                        let chosen = Value::Bool(*state == ToggleState::Selected);
+                        this.update(cx, |this, cx| {
+                            let old = this.value_of(&property.name);
+                            let text = edit_text(&chosen);
+                            this.write_value(property.clone(), old, chosen, text, window, cx);
+                        })
+                        .ok();
+                    })
+                    .into_any_element(),
+            );
+        }
+        None
+    }
+
+    /// An open field: its editor, a clear button for a nullable value, why the last save did
+    /// not land, and the keys with the branch it writes to.
+    fn render_field_edit(
+        &self,
+        edit: &FieldEdit,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let lines = reads_as_markdown(&edit.property);
+        let invalid = edit
+            .notice
+            .as_ref()
+            .is_some_and(|notice| matches!(notice.tone, Tone::Invalid | Tone::Refused));
+        let notice_color = |tone: Tone| match tone {
+            Tone::Refused | Tone::Invalid => Color::Error,
+            Tone::Conflict | Tone::Unknown => Color::Warning,
+        };
+        let branch = self.session.read(cx).branch.clone();
+        let keys = if lines {
+            format!("↵ save · ⇧↵ line break · esc cancel · write · {branch}")
+        } else {
+            format!("↵ save · esc cancel · write · {branch}")
+        };
+        let clear = (edit.property.nullable && !edit.old.is_null()).then(|| {
+            let (property, old) = (edit.property.clone(), edit.old.clone());
+            IconButton::new(
+                SharedString::from(format!("peek-clear-{}", edit.property.name)),
+                IconName::Close,
+            )
+            .icon_size(IconSize::XSmall)
+            .icon_color(Color::Muted)
+            .tooltip(Tooltip::text("Set to none"))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.edits.remove(&property.name);
+                this.write_value(
+                    property.clone(),
+                    old.clone(),
+                    Value::Null,
+                    String::new(),
+                    window,
+                    cx,
+                );
+            }))
+        });
+        let hint = edit
+            .property
+            .enum_values
+            .as_ref()
+            .map(|values| format!("One of: {}", values.join(", ")));
+        // The frame reaches past the values' edge by its padding, its border and the editor's
+        // own inset, so the text stays where it read before the edit.
+        let reach = px(studio_ui::ds::space::MD + 1.) + editor_inset(window, cx);
+        v_flex()
+            .key_context("NodeField")
+            .w_full()
+            .gap(px(studio_ui::ds::space::XXS))
+            .child(
+                studio_ui::ds::field_frame(invalid, cx)
+                    .ml(-reach)
+                    .when(lines, |frame| {
+                        frame
+                            .h_auto()
+                            .min_h(px(studio_ui::ds::size::CONTROL))
+                            .py(px(studio_ui::ds::space::XS))
+                            .items_start()
+                    })
+                    .child(studio_ui::ds::field_input(edit.editor.clone()))
+                    .children(clear),
+            )
+            .children(edit.notice.clone().map(|notice| {
+                let unknown = notice.tone == Tone::Unknown;
+                h_flex()
+                    .gap_1p5()
+                    .child(Indicator::dot().color(notice_color(notice.tone)))
+                    .child(
+                        Label::new(notice.message)
+                            .size(LabelSize::XSmall)
+                            .color(notice_color(notice.tone)),
+                    )
+                    // Whether the save landed is in the branch's history.
+                    .when(unknown, |row| {
+                        row.child(
+                            studio_ui::ds::button("peek-open-history", "Open history")
+                                .style(ButtonStyle::Subtle)
+                                .label_size(LabelSize::XSmall)
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(studio_actions::graph::OpenHistory),
+                                        cx,
+                                    )
+                                }),
+                        )
+                    })
+            }))
+            .children(hint.map(|hint| Label::new(hint).size(LabelSize::XSmall).color(Color::Muted)))
+            .child(Label::new(keys).size(LabelSize::XSmall).color(Color::Muted))
             .into_any_element()
     }
 
@@ -1312,6 +1868,15 @@ fn node_actions(type_name: &str, id: &str, at_commit: Option<String>) -> (PeekNo
     )
 }
 
+/// How far Zed's editor sets its text in from its left edge without a gutter: the font's
+/// descent, its gutter margin (`GutterDimensions::default_gutter_margin`).
+fn editor_inset(window: &Window, cx: &App) -> gpui::Pixels {
+    let font = window.text_style().font();
+    let size = ui::TextSize::Small.rems(cx).to_pixels(window.rem_size());
+    let text = cx.text_system();
+    -text.descent(text.resolve_font(&font), size)
+}
+
 /// A text value rendered as markdown as an agent reply is, with headings near the body's size,
 /// at the size of the labels beside it and its soft line breaks kept, so plain lines stay lines
 /// (spec 014).
@@ -1367,6 +1932,8 @@ impl Render for NodePeek {
         let is_node = matches!(self.subject, PeekSubject::Node { .. });
         v_flex()
             .id("node-peek")
+            .on_action(cx.listener(Self::on_save_field))
+            .on_action(cx.listener(Self::on_cancel_field))
             .w_full()
             .map(|view| {
                 if page {
@@ -1477,5 +2044,73 @@ impl NodePeek {
     /// Whether this peek shows `id` of `type_name`.
     pub fn shows(&self, id: &str, _cx: &App) -> bool {
         self.subject.id() == id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, VisualTestContext};
+    use serde_json::json;
+
+    use crate::test_support::{PEOPLE, session, session_answering};
+
+    fn page(
+        session: Entity<GraphSession>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<NodePeek>, &mut VisualTestContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            NodePeek::page(session, "Person".into(), "p1".into(), None, cx)
+        });
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    fn edit_name(view: &Entity<NodePeek>, to: &str, cx: &mut VisualTestContext) {
+        view.update_in(cx, |view, window, cx| {
+            let name = view.schema.as_ref().unwrap().node("Person").unwrap();
+            let property = name.property("name").unwrap().clone();
+            view.start_edit(property, window, cx);
+            let editor = view.edits["name"].editor.clone();
+            editor.update(cx, |editor, cx| editor.set_text(to, window, cx));
+            view.save_field("name", window, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    /// A saved field shows its new value, and the view moves to its own commit without
+    /// calling itself behind (spec 014).
+    #[gpui::test]
+    async fn a_saved_field_moves_the_view_to_its_own_commit(cx: &mut TestAppContext) {
+        let (view, cx) = page(session(PEOPLE, cx), cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.as_deref(), Some("c1"))
+        });
+        edit_name(&view, "Ada Lovelace", cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.value_of("name"), json!("Ada Lovelace"));
+            assert_eq!(view.snapshot.as_deref(), Some("c2"), "its own commit");
+            assert!(!view.newer, "its own write does not make it behind");
+            assert!(view.saving.is_empty() && view.edits.is_empty());
+        });
+    }
+
+    /// A refused write puts the old value back and opens the field again with what was typed
+    /// and why (constitution III).
+    #[gpui::test]
+    async fn a_refused_field_opens_again_with_its_text_and_reason(cx: &mut TestAppContext) {
+        let refused = json!({ "error": "policy denied", "code": "forbidden" });
+        let (view, cx) = page(session_answering(PEOPLE, 403, refused, cx), cx);
+        edit_name(&view, "Ada Lovelace", cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.value_of("name"), json!("Ada"), "nothing was written");
+            let edit = &view.edits["name"];
+            assert_eq!(edit.editor.read(cx).text(cx), "Ada Lovelace");
+            assert_eq!(edit.notice.as_ref().map(|n| n.tone), Some(Tone::Refused));
+        });
     }
 }

@@ -62,6 +62,14 @@
     }
   },
   {
+    "context": "NodeField > Editor",
+    "bindings": {
+      "enter": "studio_node::SaveField",
+      "shift-enter": "editor::Newline",
+      "escape": "studio_node::CancelField"
+    }
+  },
+  {
     "context": "AgentComposer > Editor",
     "bindings": {
       "enter": "studio_agent::Send",

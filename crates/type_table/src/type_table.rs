@@ -15,6 +15,8 @@ mod pdf;
 mod peek;
 mod suggest;
 mod table;
+#[cfg(test)]
+mod test_support;
 mod types_list;
 
 use gpui::{App, AppContext as _, Context, Entity, Window};

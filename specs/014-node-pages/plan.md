@@ -1,6 +1,6 @@
 # 014: Node pages, editing in place, and long text
 
-Status: in progress; part 1 (the page and opening it) and markdown reading built · 2026-10-16
+Status: in progress; part 1 (the page and opening it), markdown reading and editing a field in place built · 2026-10-16
 
 ## Problem
 
@@ -111,6 +111,14 @@ Four parts, built in this order; each lands on its own.
 
 ### 2. Edit where you read: typed fields and one draft per branch
 
+- **Built first, before the shared draft**: on the page and in the peek a click on a value
+  opens it in place, its text on the edge it read at; ↵ saves (a value-bound update, as a cell
+  saves), Esc puts it back, and text, which reads as markdown, takes a line break on ⇧↵ (as the
+  agent composer). An enum is a menu of its values and a boolean a switch, each saving as it is
+  chosen; a nullable value has × to set none. A changed field stays open until it is saved or
+  cancelled, so leaving it writes nothing and loses nothing; a refused, conflicting or unknown
+  save opens the field again with what was typed and why. A saved field moves the view to its
+  own commit. The shared draft below replaces the open-field state.
 - **One draft per branch**, the `graph_store::Draft` that `docs/architecture.md` describes:
   entries keyed by type, id and property (or by edge), each holding the value it was read at
   (so saves stay value-bound) and the new value. Table cells, peek fields and page fields read
@@ -200,6 +208,7 @@ Four parts, built in this order; each lands on its own.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-16 | A field edits in place and saves value-bound | `type_table` `a_saved_field_moves_the_view_to_its_own_commit` and `a_refused_field_opens_again_with_its_text_and_reason` (a 403: old value back, the field open with the typed text and a refusal), both on a page made before the schema was read; offscreen snapshots of Project Fable 36: the editor over `name`, then ↵; the CLI read the new name, and it was set back | The editor's text sits on the values' edge once the frame reaches back by its padding, border and Zed's editor inset (the font's descent, its gutter margin); the hint reads "↵ save · ⇧↵ line break · esc cancel · write · main"; after ↵ the title and the field read the new name at the page's own commit, with no "Newer data". A page restored before the schema was read used to fail with "The schema is still loading."; it now reads its node when the schema arrives |
 | 2026-10-16 | Text values read as markdown | `studio_ui` `text` tests (plain values such as `foo_bar_baz` and `3 < 4` stay plain; headings, emphasis, lists, line breaks, links and code are markup; a cell's first line drops the markup); `type_table` `a_text_cell_shows_its_markdowns_first_line` (keys, enums and lists are not parsed); offscreen snapshots of the `notes` graph after giving two notes a markdown and a multi-line body (`dev/notes-seed.jsonl`) | The page renders the heading, bold, inline code, the list and the link, headings near the body's size (Zed's agent style); the peek keeps the plain body's three lines; capitals measure the same as the labels beside them once the size is set on the element around the markdown, since GPUI's text runs carry no size; the table cell reads "Keyset paging…" |
 | 2026-10-16 | Part 1: a node's page and the ways to open it | `type_table` `a_nodes_page_reads_it_and_names_its_tab` (label as the tab title, one tab per node and commit, remembered and restored, a held page never newer); `studio_workspace` `an_asked_for_peek_shows_the_inspector_that_selection_leaves_hidden`; offscreen snapshots of Radia Knuth's page and of a peek | The page lists every property and opens every non-empty relationship group; the tab reads "Radia Knuth"; the peek has ↗ beside Explore and the footer "⌘↵ Open"; a peek asked for while the right dock was hidden shows it |
 | 2026-10-16 | The flows above are today's | A read of `type_table`, `relationship_tree`, `graph_canvas`, `inspectors`, `review` and the keymaps, citing file and line | As listed under "What exists today" |

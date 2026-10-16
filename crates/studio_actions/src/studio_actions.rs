@@ -364,6 +364,20 @@ pub mod table {
     );
 }
 
+pub mod node {
+    use gpui::actions;
+
+    actions!(
+        studio_node,
+        [
+            /// Save the node field being edited.
+            SaveField,
+            /// Put the node field being edited back as it was.
+            CancelField,
+        ]
+    );
+}
+
 pub mod tree {
     use gpui::actions;
 
