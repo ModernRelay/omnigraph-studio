@@ -87,6 +87,10 @@ pub mod workspace {
             SplitRight,
             /// Split the document area, with a copy of the active tab below.
             SplitDown,
+            /// Split the document area, with a copy of the active tab on the left.
+            SplitLeft,
+            /// Split the document area, with a copy of the active tab above.
+            SplitUp,
             /// Move to the next pane of a split.
             ActivateNextPane,
             /// Move to the previous pane of a split.

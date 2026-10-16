@@ -183,6 +183,40 @@ impl<T: Tab> Pane<T> {
         Some(item)
     }
 
+    /// Moves the tab at `from` to where the tab at `to` is (a tab dropped on another), within
+    /// its own group: a pinned tab among the pinned, any other among the rest. Returns its new
+    /// index; the active tab stays active.
+    pub fn move_to(&mut self, from: usize, to: usize) -> usize {
+        if from >= self.items.len() {
+            return from;
+        }
+        let active = self.active_item().map(Tab::tab_id);
+        let (low, high) = if from < self.pinned {
+            (0, self.pinned - 1)
+        } else {
+            (self.pinned, self.items.len() - 1)
+        };
+        let to = to.clamp(low, high);
+        let item = self.items.remove(from);
+        self.items.insert(to, item);
+        if let Some(active) = active.and_then(|a| self.position(a)) {
+            self.active = active;
+        }
+        to
+    }
+
+    /// Inserts a tab taken from another pane at `index` among the unpinned tabs (the end when
+    /// past them), kept rather than a preview. Returns its index; the active tab stays active.
+    pub fn insert_at(&mut self, item: T, index: usize) -> usize {
+        let active = self.active_item().map(Tab::tab_id);
+        let index = index.clamp(self.pinned, self.items.len());
+        self.items.insert(index, item);
+        if let Some(active) = active.and_then(|a| self.position(a)) {
+            self.active = active;
+        }
+        index
+    }
+
     /// The unpinned tabs other than the one at `keep`, for "Close others".
     pub fn others(&self, keep: usize) -> Vec<EntityId> {
         self.unpinned(|index| index != keep)
@@ -406,6 +440,30 @@ mod tests {
         fn tab_id(&self) -> EntityId {
             EntityId::from(self.0)
         }
+    }
+
+    /// A dragged tab lands where the tab it is dropped on was, within its own group, and a tab
+    /// from another pane lands among the unpinned ones; the active tab stays active.
+    #[test]
+    fn dragged_tabs_move_within_their_group_and_arrive_unpinned() {
+        let mut pane = Pane::new(0);
+        for id in 1..=4 {
+            pane.add(T(id), false);
+        }
+        pane.toggle_pin(0); // 1 pinned
+        pane.active = 2; // T(3)
+        let ids = |pane: &Pane<T>| pane.items.iter().map(|t| t.0).collect::<Vec<_>>();
+        assert_eq!(pane.move_to(3, 1), 1, "4 onto 2");
+        assert_eq!(ids(&pane), [1, 4, 2, 3]);
+        assert_eq!(pane.items[pane.active], T(3), "3 stays active");
+        assert_eq!(pane.move_to(2, 0), 1, "not among the pinned");
+        assert_eq!(ids(&pane), [1, 2, 4, 3]);
+        assert_eq!(pane.move_to(0, 3), 0, "a pinned tab stays pinned");
+
+        assert_eq!(pane.insert_at(T(9), 0), 1, "after the pinned tab");
+        assert_eq!(pane.insert_at(T(8), 99), 5, "at the end");
+        assert_eq!(ids(&pane), [1, 9, 2, 4, 3, 8]);
+        assert_eq!(pane.items[pane.active], T(3));
     }
 
     /// A pane's trail, as Zed's per-pane history: Back returns to the tabs it showed, Forward

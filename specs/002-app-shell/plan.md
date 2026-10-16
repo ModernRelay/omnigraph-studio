@@ -118,6 +118,18 @@ title bar; Ragnor's choice over a Zed-style title bar) over one status bar acros
 - Each graph keeps its own docks: showing a graph again from the switcher brings back its docks
   as it left them (open, active panel, size), not the shown graph's; before, only a graph
   opened fresh read its saved docks.
+- Tabs, after Zed's tab bar. A strip's tabs scroll when they do not fit, and the active tab is
+  brought into view when it changes. The active pane's strip ends with three buttons: "+" (New
+  Query, Open Query File…, Go to Type or Node…, History), a split menu (Split Right, Left, Up,
+  Down; `studio::SplitLeft` and `SplitUp` are new) and zoom. A middle click closes a tab that is
+  not pinned. A tab drags: dropped on a tab it takes that place within its group (pinned or
+  not); dropped after a strip's tabs it goes to the end of that pane, moving between panes; and
+  dropped on a pane's content within a fifth of the shorter side from an edge it splits a new
+  pane off on that side with the tab, the half it will take shaded while dragging. A pane a drop
+  leaves empty closes, and a pane's only tab dropped at its own edge stays. A press on a tab
+  starts the tab's drag, never a window move. Not built: Zed's per-item position in the
+  history (an entry restores the tab, not a scroll position inside it), and Zed's new tab on a
+  double click at the strip's empty end (here that zooms the window, as a title bar's does).
 
 ### Drawing cost
 
@@ -439,6 +451,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-16 | Tabs scroll, drag and drop as Zed's | `studio_workspace` tests `dropped_tabs_move_within_and_between_panes_and_split_at_an_edge`, `a_drop_near_an_edge_splits_toward_it`, `pane` `dragged_tabs_move_within_their_group_and_arrive_unpinned`; offscreen snapshots: nine tabs; Person and Company with a `drag:` from the Company tab to the document's right edge | Nine tabs in the strip with "+", split and zoom at its end; the drag split the document: Person on the left, Company on the right with the end buttons, the left pane without them |
 | 2026-10-16 | Panels move between docks; the bottom panel spans as its layout says; zoom | `studio_workspace` tests `a_panel_goes_where_the_settings_place_it` (placed at its add, home again when the setting goes, the menu's move), `the_bottom_panel_spans_as_its_layout_says` (contained: the window less the inspector; full: the window), `zoom_covers_the_document_area_until_toggled_or_hidden`, `a_graphs_docks_come_back_with_it`, `panels` `a_taken_panel_leaves_the_others_as_they_were`; offscreen snapshots: `full` with History and the inspector, Explore placed in the right dock with the menu on the Graph button, a zoomed pane | History ran under the sidebar and the inspector; Explore showed in the right dock with its icon at the bar's right end; the menu read "✓ Dock Left, Dock Bottom, Dock Right" with no tooltip over it; the zoomed table covered the document area inside an 8 px inset, its arrows after the traffic lights' room |
 | 2026-10-16 | Docks are switched from a status bar, and each pane keeps its own back and forward | `studio_workspace` tests `panel_buttons_show_their_panel_and_hide_the_dock_it_shows`, `back_and_forward_walk_the_active_panes_own_tabs`, `tabs_fill_the_header_strip` (the status bar's height), `pane` `a_pane_steps_back_and_forward_through_the_tabs_it_showed`; offscreen snapshots on the dev graph, flat and glass, with the bottom panel, with the sidebar hidden and a row peeked | One status bar across the window: the five sidebar panels' icons at the left (Graph lit), the server, graph and branch, the tab's facts, memory and CPU, then Nodes, History and Activity and, with a row peeked, the inspector (lit). Column headers show their panel's title; each pane's strip starts with ← → (← enabled after a second tab, → disabled). With the sidebar hidden its icons stay in the bar |
 | 2026-10-14 | `settings.json` keeps the person's text, and `keymap.json` rebinds keys | `studio_settings` `document` tests (comments and trailing commas, a syntax error's line, each value that does not fit costing only its setting, a saved view set aside alone, edits in place, a new key above a comment's key, defaults removed, a bad value kept until its setting changes, graph entries); `studio` `settings_apply` (`a_change_keeps_the_persons_text`: a hand edit with a comment written before the change and not yet read stays and applies; only chosen keys are written; a broken file refuses the change unchanged) and `keymaps` (`the_persons_keymap_wins_and_is_read_again`: a key added, `null` taking ⌘K from the palette and from the shortcut text, an unknown action reported, a broken save keeping the bindings, a second save restoring Studio's); offscreen snapshot of the settings tab in a scratch data folder with three bad values and a bad binding | All pass. The tab listed "3 problems in settings.json" (the font size, a misspelled `stuido`, a negative node limit) and "A problem in keymap.json" with each path and line; Interface font size showed 16. Before, a comment or one wrong value read as a file that could not be applied, the first change wrote every default into the file, and a change within two seconds of a hand edit wrote over it |

@@ -13,6 +13,7 @@ mod panels;
 mod persistence;
 mod process_stats;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
@@ -20,8 +21,8 @@ use std::time::Duration;
 use gpui::{
     Action, AnyView, App, ClickEvent, Context, DismissEvent, Div, DragMoveEvent, ElementId, Entity,
     EntityId, EventEmitter, FocusHandle, Focusable, MouseButton, Pixels, Point, Render,
-    SharedString, Stateful, Subscription, Task, WeakEntity, Window, WindowControlArea, deferred,
-    div, point,
+    ScrollHandle, SharedString, Stateful, Subscription, Task, WeakEntity, Window,
+    WindowControlArea, deferred, div, point,
 };
 use graph_store::{ConnectionRegistry, ConnectionState, GraphSession, OutcomeKind, SessionEvent};
 use studio_actions::graph::{OpenCommit, OpenHistory};
@@ -29,8 +30,8 @@ use studio_actions::workspace::{
     ActivateItem, ActivateLastItem, ActivateNextGraph, ActivateNextItem, ActivateNextPane,
     ActivatePreviousGraph, ActivatePreviousItem, ActivatePreviousPane, CloseActiveItem,
     CloseAllItems, CloseGraph, CloseOtherItems, GoBack, GoForward, KeepPreviewTab, Refresh,
-    SplitDown, SplitRight, ToggleActivity, ToggleInspector, TogglePinTab, ToggleSidebar,
-    ToggleZoom,
+    SplitDown, SplitLeft, SplitRight, SplitUp, ToggleActivity, ToggleInspector, TogglePinTab,
+    ToggleSidebar, ToggleZoom,
 };
 use studio_settings::{BottomDockLayout, StudioSettings};
 use ui::prelude::*;
@@ -137,6 +138,13 @@ pub struct Workspace {
     bottom: Dock,
     /// A pane or a dock drawn over the whole document area, as Zed zooms one (⇧⎋).
     zoomed: Option<Zoomed>,
+    /// Each pane's tab strip scroll, and the tab it was last scrolled to show.
+    tab_scrolls: RefCell<HashMap<PaneId, ScrollHandle>>,
+    tabs_scrolled_to: RefCell<HashMap<PaneId, EntityId>>,
+    /// Where a dragged tab would land: a pane, split toward an edge or not.
+    drop_target: Option<(PaneId, Option<SplitDirection>)>,
+    /// A press landed on a tab: its strip does not start a window move.
+    press_on_tab: bool,
     modal: Option<ActiveModal>,
     /// Each dock panel's scrolling host, by the panel view's entity: the host is cached, so a
     /// panel is drawn again only when it notifies.
@@ -321,6 +329,10 @@ impl Workspace {
             right: Dock::new(PanelPosition::Right, true),
             bottom: Dock::new(PanelPosition::Bottom, false),
             zoomed: None,
+            tab_scrolls: RefCell::default(),
+            tabs_scrolled_to: RefCell::default(),
+            drop_target: None,
+            press_on_tab: false,
             modal: None,
             dock_hosts: HashMap::new(),
             toasts: Vec::new(),
@@ -1250,6 +1262,88 @@ impl Workspace {
         self.activate_in(new, index, true, window, cx);
     }
 
+    /// A tab dropped on a tab (`Some(index)`) or after a strip's tabs (`None`): moved within its
+    /// pane, or into another pane, which shows it. A pane left with no tab closes.
+    fn drop_tab(
+        &mut self,
+        dragged: &DraggedTab,
+        to_pane: PaneId,
+        to_index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.drop_target = None;
+        let Some((from_pane, from_index)) = self.find_item(dragged.item) else {
+            return;
+        };
+        if from_pane == to_pane {
+            let Some(pane) = self.pane_mut(to_pane) else {
+                return;
+            };
+            pane.keep(dragged.item);
+            let to = to_index.unwrap_or(pane.items.len().saturating_sub(1));
+            let index = pane.move_to(from_index, to);
+            self.activate_in(to_pane, index, true, window, cx);
+            return;
+        }
+        let Some(item) = self.pane_mut(from_pane).and_then(|pane| {
+            pane.forget(dragged.item);
+            pane.remove(from_index)
+        }) else {
+            return;
+        };
+        let Some(pane) = self.pane_mut(to_pane) else {
+            return;
+        };
+        let index = pane.insert_at(item, to_index.unwrap_or(usize::MAX));
+        if self
+            .pane(from_pane)
+            .is_some_and(|pane| pane.items.is_empty())
+        {
+            self.remove_pane(from_pane);
+        }
+        self.activate_in(to_pane, index, true, window, cx);
+    }
+
+    /// A tab dropped near a pane's edge: a new pane on that side holds it, as Zed splits on a
+    /// drop. The only tab of a pane dropped on its own pane stays.
+    fn drop_split(
+        &mut self,
+        dragged: &DraggedTab,
+        at: PaneId,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((from_pane, from_index)) = self.find_item(dragged.item) else {
+            return;
+        };
+        if from_pane == at && self.pane(at).is_some_and(|pane| pane.items.len() < 2) {
+            return;
+        }
+        let new = self.next_pane;
+        if !self.center.split(at, new, direction) {
+            return;
+        }
+        self.next_pane += 1;
+        let Some(item) = self.pane_mut(from_pane).and_then(|pane| {
+            pane.forget(dragged.item);
+            pane.remove(from_index)
+        }) else {
+            return;
+        };
+        let mut pane = Pane::new(new);
+        pane.insert_at(item, 0);
+        self.panes.push(pane);
+        if self
+            .pane(from_pane)
+            .is_some_and(|pane| pane.items.is_empty())
+        {
+            self.remove_pane(from_pane);
+        }
+        self.activate_in(new, 0, true, window, cx);
+    }
+
     /// Moves to the next (or previous) pane in reading order.
     fn activate_pane_step(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         let order = self.center.panes();
@@ -1686,11 +1780,17 @@ impl Workspace {
             .on_mouse_down_out(cx.listener(|this, _, _, _| this.drag_pending = false))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| this.drag_pending = false),
+                cx.listener(|this, _, _, _| {
+                    this.drag_pending = false;
+                    this.press_on_tab = false;
+                }),
             )
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| this.drag_pending = true),
+                cx.listener(|this, _, _, _| {
+                    // A tab under the press keeps it for its own drag.
+                    this.drag_pending = !std::mem::take(&mut this.press_on_tab);
+                }),
             )
             .on_mouse_move(cx.listener(|this, _, window, _| {
                 if this.drag_pending {
@@ -2038,10 +2138,29 @@ impl Workspace {
         let Some(pane) = self.pane(pane_id) else {
             return h_flex().into_any_element();
         };
+        let drop_bg = colors.drop_target_background;
+        // Tabs past the strip's width scroll, as Zed's do; the active tab is brought into view
+        // when it changes.
+        let scroll = self
+            .tab_scrolls
+            .borrow_mut()
+            .entry(pane_id)
+            .or_default()
+            .clone();
+        let active_id = pane.active_item().map(|item| item.item_id());
+        if self.tabs_scrolled_to.borrow().get(&pane_id).copied() != active_id {
+            scroll.scroll_to_item(pane.active);
+            self.tabs_scrolled_to
+                .borrow_mut()
+                .insert(pane_id, active_id.unwrap_or(EntityId::from(0)));
+        }
         h_flex()
+            .id(SharedString::from(format!("tabs-{pane_id}")))
             .h_full()
+            .flex_1()
             .min_w_0()
-            .overflow_hidden()
+            .overflow_x_scroll()
+            .track_scroll(&scroll)
             .children(pane.items.iter().enumerate().map(|(index, item)| {
                 let selected = index == pane.active;
                 let pinned = pane.is_pinned(index);
@@ -2142,6 +2261,32 @@ impl Workspace {
                             pane.keep(item_id);
                         }
                         this.activate_in(pane_id, index, true, window, cx)
+                    }))
+                    // A press on a tab starts a drag of the tab, never a window move.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, _| this.press_on_tab = true),
+                    )
+                    // As in Zed, a middle click closes a tab that is not pinned.
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |this, _, window, cx| {
+                            if !pinned {
+                                this.close_in(pane_id, index, window, cx);
+                            }
+                        }),
+                    )
+                    .on_drag(
+                        DraggedTab {
+                            item: item_id,
+                            title: item.tab_title(cx),
+                            icon: item.tab_icon(cx),
+                        },
+                        |tab, _, _, cx| cx.new(|_| tab.clone()),
+                    )
+                    .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(drop_bg))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+                        this.drop_tab(dragged, pane_id, Some(index), window, cx)
                     }));
                 let workspace = workspace.clone();
                 right_click_menu(SharedString::from(format!("tab-menu-{pane_id}-{index}")))
@@ -2153,6 +2298,20 @@ impl Workspace {
                         })
                     })
             }))
+            // The strip after the tabs: a dropped tab goes to the end, as Zed's.
+            .child(
+                div()
+                    .id(SharedString::from(format!("tabs-end-{pane_id}")))
+                    .flex_1()
+                    .min_w(px(24.))
+                    .h_full()
+                    .border_b_1()
+                    .border_color(hairline)
+                    .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(drop_bg))
+                    .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+                        this.drop_tab(dragged, pane_id, None, window, cx)
+                    })),
+            )
             .into_any_element()
     }
 
@@ -2230,7 +2389,88 @@ impl Workspace {
         )
         .child(nav)
         .child(self.render_tabs(pane_id, cx))
-        .child(div().flex_1().h_full().border_b_1().border_color(hairline))
+        .children(
+            (pane_id == self.active_pane && self.session.is_some())
+                .then(|| self.render_pane_buttons(pane_id, cx)),
+        )
+    }
+
+    /// The end of the active pane's tab strip, as Zed's tab bar ends: a new-tab menu, a split
+    /// menu and zoom.
+    fn render_pane_buttons(&self, pane_id: PaneId, cx: &mut Context<Self>) -> impl IntoElement {
+        let hairline = studio_ui::ds::surface::rule(cx);
+        let zoomed = self.zoomed == Some(Zoomed::Pane(pane_id));
+        let menu_button = |id: &'static str, icon: IconName, tooltip: &'static str| {
+            IconButton::new(SharedString::from(format!("{id}-{pane_id}")), icon)
+                .icon_size(IconSize::Small)
+                .tooltip(Tooltip::text(tooltip))
+        };
+        h_flex()
+            .h_full()
+            .flex_none()
+            .px(px(studio_ui::ds::space::XS))
+            .gap(px(studio_ui::ds::space::XXS))
+            .items_center()
+            .border_b_1()
+            .border_l_1()
+            .border_color(hairline)
+            .child(
+                PopoverMenu::new(SharedString::from(format!("new-tab-menu-{pane_id}")))
+                    .anchor(gpui::Anchor::TopRight)
+                    .trigger(menu_button("new-tab", IconName::Plus, "New…"))
+                    .menu(|window, cx| {
+                        Some(ContextMenu::build(window, cx, |menu, _, _| {
+                            menu.action("New Query", Box::new(studio_actions::graph::NewQuery))
+                                .action(
+                                    "Open Query File…",
+                                    Box::new(studio_actions::graph::OpenQueryFile::default()),
+                                )
+                                .separator()
+                                .action(
+                                    "Go to Type or Node…",
+                                    Box::new(studio_actions::workspace::GoTo),
+                                )
+                                .action("History", Box::new(studio_actions::graph::OpenHistory))
+                        }))
+                    }),
+            )
+            .child(
+                PopoverMenu::new(SharedString::from(format!("split-menu-{pane_id}")))
+                    .anchor(gpui::Anchor::TopRight)
+                    .trigger(menu_button("split", IconName::Split, "Split pane"))
+                    .menu(|window, cx| {
+                        Some(ContextMenu::build(window, cx, |menu, _, _| {
+                            menu.action("Split Right", Box::new(SplitRight))
+                                .action("Split Left", Box::new(SplitLeft))
+                                .action("Split Up", Box::new(SplitUp))
+                                .action("Split Down", Box::new(SplitDown))
+                        }))
+                    }),
+            )
+            .child(
+                IconButton::new(
+                    SharedString::from(format!("zoom-pane-{pane_id}")),
+                    IconName::Maximize,
+                )
+                .icon_size(IconSize::Small)
+                .toggle_state(zoomed)
+                .selected_icon(IconName::Minimize)
+                .tooltip(move |_, cx| {
+                    Tooltip::for_action(
+                        if zoomed { "Zoom out" } else { "Zoom in" },
+                        &ToggleZoom,
+                        cx,
+                    )
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.zoomed = if zoomed {
+                        None
+                    } else {
+                        Some(Zoomed::Pane(pane_id))
+                    };
+                    cx.notify();
+                })),
+            )
     }
 
     /// One pane: its header and its active tab. Pressing anywhere in it makes it the active
@@ -2254,6 +2494,57 @@ impl Workspace {
             None if self.panes.len() == 1 => self.render_empty_center(cx).into_any_element(),
             None => studio_ui::ds::empty_state(IconName::Sparkle, "No tab open").into_any_element(),
         };
+        // A tab dragged over the content: near an edge it splits the pane that way, as Zed's
+        // drop targets (a fifth of the shorter side); elsewhere it moves into this pane.
+        let drop_bg = cx.theme().colors().drop_target_background;
+        let overlay = self
+            .drop_target
+            .filter(|(target, _)| *target == pane_id && cx.has_active_drag())
+            .map(|(_, direction)| {
+                let area = div().absolute().bg(drop_bg);
+                match direction {
+                    None => area.inset_0(),
+                    Some(SplitDirection::Left) => area.top_0().bottom_0().left_0().w_1_2(),
+                    Some(SplitDirection::Right) => area.top_0().bottom_0().right_0().w_1_2(),
+                    Some(SplitDirection::Up) => area.left_0().right_0().top_0().h_1_2(),
+                    Some(SplitDirection::Down) => area.left_0().right_0().bottom_0().h_1_2(),
+                }
+            });
+        let body = div()
+            .id(SharedString::from(format!("pane-body-{pane_id}")))
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .relative()
+            .child(body)
+            .children(overlay)
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<DraggedTab>, _, cx| {
+                    let inside = event.bounds.contains(&event.event.position);
+                    let target = if inside {
+                        Some((pane_id, drop_edge(event.bounds, event.event.position)))
+                    } else if this
+                        .drop_target
+                        .is_some_and(|(target, _)| target == pane_id)
+                    {
+                        None
+                    } else {
+                        return;
+                    };
+                    if this.drop_target != target {
+                        this.drop_target = target;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
+                let direction = this.drop_target.take().and_then(|(_, direction)| direction);
+                match direction {
+                    Some(direction) => this.drop_split(dragged, pane_id, direction, window, cx),
+                    None => this.drop_tab(dragged, pane_id, None, window, cx),
+                }
+            }));
         v_flex()
             .id(SharedString::from(format!("pane-{pane_id}")))
             .size_full()
@@ -3016,6 +3307,12 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &SplitDown, window, cx| {
                 this.split(SplitDirection::Down, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &SplitLeft, window, cx| {
+                this.split(SplitDirection::Left, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SplitUp, window, cx| {
+                this.split(SplitDirection::Up, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ActivateNextPane, window, cx| {
                 this.activate_pane_step(true, window, cx)
             }))
@@ -3287,6 +3584,55 @@ impl Performance {
 }
 
 /// A dock edge being dragged.
+/// A tab being dragged: to another place in its strip, another pane, or a pane's edge.
+#[derive(Clone)]
+struct DraggedTab {
+    item: EntityId,
+    title: SharedString,
+    icon: Option<IconName>,
+}
+
+impl Render for DraggedTab {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        h_flex()
+            .h(px(studio_ui::ds::size::CONTROL))
+            .px(px(studio_ui::ds::space::LG))
+            .gap(px(studio_ui::ds::space::MD))
+            .items_center()
+            .bg(colors.elevated_surface_background)
+            .border_1()
+            .border_color(colors.border)
+            .rounded(px(studio_ui::ds::radius::BUTTON))
+            .shadow(studio_ui::ds::elevation::float())
+            .children(
+                self.icon
+                    .map(|icon| Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)),
+            )
+            .child(Label::new(self.title.clone()).size(LabelSize::Small))
+    }
+}
+
+/// The edge a tab dropped at `point` splits toward: one within a fifth of the shorter side of
+/// `bounds`, the nearest; none in the middle, where the tab moves into the pane.
+fn drop_edge(bounds: gpui::Bounds<Pixels>, point: Point<Pixels>) -> Option<SplitDirection> {
+    let reach = f32::from(bounds.size.width.min(bounds.size.height)) * 0.2;
+    let left = f32::from(point.x - bounds.origin.x);
+    let top = f32::from(point.y - bounds.origin.y);
+    let right = f32::from(bounds.size.width) - left;
+    let bottom = f32::from(bounds.size.height) - top;
+    [
+        (left, SplitDirection::Left),
+        (right, SplitDirection::Right),
+        (top, SplitDirection::Up),
+        (bottom, SplitDirection::Down),
+    ]
+    .into_iter()
+    .filter(|(distance, _)| *distance < reach)
+    .min_by(|a, b| a.0.total_cmp(&b.0))
+    .map(|(_, direction)| direction)
+}
+
 #[derive(Clone, Copy)]
 struct DraggedDock(PanelPosition);
 
@@ -3917,6 +4263,103 @@ mod tests {
             assert_eq!(workspace.bottom.size, 240.);
             assert_eq!(workspace.zoomed, None);
         });
+    }
+
+    fn open_tab(
+        workspace: &mut Workspace,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> EntityId {
+        workspace
+            .open_item(key.to_owned(), window, cx, |_, cx| Split {
+                field: cx.new(|_| Field),
+                part: cx.new(|_| Part { renders: 0 }),
+                caches: false,
+                focus_handle: cx.focus_handle(),
+            })
+            .map(|item| item.entity_id())
+            .expect("opened")
+    }
+
+    fn dragged(item: EntityId) -> DraggedTab {
+        DraggedTab {
+            item,
+            title: "tab".into(),
+            icon: None,
+        }
+    }
+
+    /// As Zed's tab drops: on a tab of its pane a tab takes that place; on another pane's strip
+    /// it moves there and shows; a pane left with no tab closes; near a pane's edge it splits
+    /// a new pane off with the tab.
+    #[gpui::test]
+    fn dropped_tabs_move_within_and_between_panes_and_split_at_an_edge(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let a = open_tab(workspace, "a", window, cx);
+            let b = open_tab(workspace, "b", window, cx);
+            let c = open_tab(workspace, "c", window, cx);
+            let first = workspace.active_pane;
+            let order = |w: &Workspace, pane: PaneId| -> Vec<EntityId> {
+                w.pane(pane)
+                    .unwrap()
+                    .items
+                    .iter()
+                    .map(|i| i.item_id())
+                    .collect()
+            };
+            workspace.drop_tab(&dragged(c), first, Some(0), window, cx);
+            assert_eq!(order(workspace, first), [c, a, b], "c takes a's place");
+
+            // A tab dropped at an edge splits a pane off with it.
+            workspace.drop_split(&dragged(b), first, SplitDirection::Right, window, cx);
+            let second = workspace.active_pane;
+            assert_ne!(second, first);
+            assert_eq!(order(workspace, second), [b]);
+            assert_eq!(order(workspace, first), [c, a]);
+
+            // Onto the other pane's strip: it moves there; the emptied pane closes.
+            workspace.drop_tab(&dragged(b), first, None, window, cx);
+            assert_eq!(order(workspace, first), [c, a, b]);
+            assert!(workspace.pane(second).is_none(), "an empty pane closes");
+            assert_eq!(workspace.panes.len(), 1);
+
+            // The only tab of a pane dropped at that pane's own edge stays where it is.
+            workspace.drop_split(&dragged(b), first, SplitDirection::Down, window, cx);
+            let lone = workspace.active_pane;
+            assert_eq!(order(workspace, lone), [b]);
+            workspace.drop_split(&dragged(b), lone, SplitDirection::Right, window, cx);
+            assert_eq!(workspace.panes.len(), 2, "no pane split off");
+            assert_eq!(order(workspace, lone), [b]);
+        });
+    }
+
+    #[test]
+    fn a_drop_near_an_edge_splits_toward_it() {
+        let bounds = gpui::Bounds::new(point(px(0.), px(0.)), gpui::size(px(1000.), px(500.)));
+        let at = |x: f32, y: f32| drop_edge(bounds, point(px(x), px(y)));
+        // A fifth of the shorter side: 100 px.
+        assert_eq!(at(50., 250.), Some(SplitDirection::Left));
+        assert_eq!(at(950., 250.), Some(SplitDirection::Right));
+        assert_eq!(at(500., 20.), Some(SplitDirection::Up));
+        assert_eq!(at(500., 480.), Some(SplitDirection::Down));
+        assert_eq!(
+            at(500., 250.),
+            None,
+            "the middle moves the tab into the pane"
+        );
+        assert_eq!(
+            at(30., 20.),
+            Some(SplitDirection::Up),
+            "the nearest edge wins"
+        );
     }
 
     /// Back and Forward walk the tabs the active pane showed, as Zed's per-pane history: a new
