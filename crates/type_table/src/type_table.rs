@@ -17,12 +17,16 @@ mod suggest;
 mod table;
 #[cfg(test)]
 mod test_support;
+mod text_editor;
 mod types_list;
+mod write;
 
 use gpui::{App, AppContext as _, Context, Entity, Window};
 use gq_language::{Filter, FilterOp};
 use serde_json::Value;
-use studio_actions::graph::{BrowseType, OpenBlob, OpenNode, OpenNodePage, OpenType, PeekNode};
+use studio_actions::graph::{
+    BrowseType, OpenBlob, OpenNode, OpenNodePage, OpenTextEditor, OpenType, PeekNode,
+};
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
 
@@ -31,6 +35,7 @@ pub use dialogs::{DeleteRowModal, InsertRowModal};
 pub use node_page::NodePage;
 pub use peek::{NodePeek, PeekSubject};
 pub use table::{Cursor, TypeTable};
+pub use text_editor::TextEditor;
 pub use types_list::TypesList;
 
 /// Registers this surface with every new workspace: the left dock's Types panel, `OpenType`,
@@ -62,6 +67,22 @@ pub fn init(cx: &mut App) {
                 at_commit: text("at_commit"),
             };
             open_node_page(workspace, &action, window, cx);
+        }
+    });
+    // A text property's editor comes back reading the node at the head.
+    studio_workspace::register_item_kind(cx, "text", |data, workspace, window, cx| {
+        let text = |key: &str| data.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+        if let (Some(type_name), Some(id), Some(property)) =
+            (text("type_name"), text("id"), text("property"))
+        {
+            let action = OpenTextEditor {
+                type_name,
+                id,
+                property,
+                read_at: None,
+                text: None,
+            };
+            open_text_editor(workspace, &action, window, cx);
         }
     });
     studio_workspace::register_item_kind(cx, "type_table", |data, workspace, window, cx| {
@@ -192,6 +213,9 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, action: &OpenNodePage, window, cx| {
             open_node_page(workspace, action, window, cx);
         });
+        workspace.register_action(|workspace, action: &OpenTextEditor, window, cx| {
+            open_text_editor(workspace, action, window, cx);
+        });
     })
     .detach();
 }
@@ -269,6 +293,30 @@ fn peek_node(
         peek
     });
     workspace.set_inspector(Some(peek.into()), cx);
+}
+
+/// Opens a text property in its editor, or shows the tab it is in.
+pub fn open_text_editor(
+    workspace: &mut Workspace,
+    action: &OpenTextEditor,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Option<Entity<TextEditor>> {
+    let session = workspace.session().cloned()?;
+    let key = TextEditor::key(&action.type_name, &action.id, &action.property);
+    let action = action.clone();
+    workspace.open_item(key, window, cx, move |window, cx| {
+        TextEditor::new(
+            session,
+            action.type_name,
+            action.id,
+            action.property,
+            action.read_at,
+            action.text,
+            window,
+            cx,
+        )
+    })
 }
 
 /// Opens a node's page in a tab, or shows the tab it is in.

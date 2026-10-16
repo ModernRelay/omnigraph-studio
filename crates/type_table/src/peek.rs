@@ -18,7 +18,7 @@ use graph_store::{GraphSession, Loadable, SessionEvent};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Map, Value};
 use studio_actions::graph::{OpenBlob, OpenNodePage, PeekNode};
-use studio_actions::node::{CancelField, SaveField};
+use studio_actions::node::{CancelField, ExpandField, SaveField};
 use ui::prelude::*;
 use ui::{ContextMenu, Indicator, PopoverMenu, Switch, ToggleState, Tooltip, rems_from_px};
 
@@ -27,7 +27,7 @@ use crate::blob::{
 };
 use crate::model::{
     FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, display_value, format_count, node_rows,
-    reads_as_markdown, same_value, save_result, short_commit,
+    reads_as_markdown, same_value, short_commit,
 };
 use graph_client::{BlobCell, BlobMeta};
 
@@ -1020,6 +1020,35 @@ impl NodePeek {
         }
     }
 
+    /// ⌘⇧↵: the text field in an editor of its own, read at the commit it was being edited at
+    /// so its save stays bound to what was read, with what was typed so far.
+    fn on_expand_field(&mut self, _: &ExpandField, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(name) = self.focused_field(window, cx) {
+            self.expand(&name, window, cx);
+        }
+    }
+
+    fn expand(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let PeekSubject::Node { type_name, id } = self.subject.clone() else {
+            return;
+        };
+        let typed = self
+            .edits
+            .remove(name)
+            .map(|edit| edit.editor.read(cx).text(cx));
+        window.dispatch_action(
+            Box::new(studio_actions::graph::OpenTextEditor {
+                type_name,
+                id,
+                property: name.to_owned(),
+                read_at: self.snapshot.clone(),
+                text: typed,
+            }),
+            cx,
+        );
+        cx.notify();
+    }
+
     fn on_cancel_field(&mut self, _: &CancelField, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(name) = self.focused_field(window, cx) {
             self.edits.remove(&name);
@@ -1069,10 +1098,19 @@ impl NodePeek {
             return;
         };
         let name = property.name.clone();
-        let query = match builder::update_cell(&schema, &type_name, &name, &id, &old, &new) {
-            Ok(query) => query,
+        let write = match crate::write::write_property(
+            &self.session,
+            &schema,
+            &type_name,
+            &id,
+            &name,
+            &old,
+            &new,
+            cx,
+        ) {
+            Ok(write) => write,
             Err(error) => {
-                let notice = Notice::new(Tone::Invalid, error.to_string());
+                let notice = Notice::new(Tone::Invalid, error);
                 self.reopen(property, old, text, notice, window, cx);
                 return;
             }
@@ -1081,16 +1119,10 @@ impl NodePeek {
         if let Loadable::Loaded(values) = &mut self.values {
             values.insert(name.clone(), new);
         }
-        self.saving.insert(name.clone());
-        let branch = self.session.read(cx).branch.clone();
-        let description = format!("Set {name} of {id}");
-        let write = self.session.update(cx, |session, cx| {
-            session.write(&query, None, description, cx)
-        });
+        self.saving.insert(name);
         // Detached: closing the page or moving the peek never cancels a write.
         cx.spawn_in(window, async move |this, cx| {
-            let outcome = write.await;
-            let result = save_result(&outcome, &branch);
+            let result = write.await;
             this.update_in(cx, |this, window, cx| {
                 this.finish_write(property, old, text, result, window, cx)
             })
@@ -1304,8 +1336,14 @@ impl NodePeek {
                         let edit_property = property.clone();
                         let copy_name = name.clone();
                         let copy_value = value.clone();
+                        // Text opens in the editor from a button the row shows on hover.
+                        let expands =
+                            opens_editor && property.as_ref().is_some_and(reads_as_markdown);
+                        let group = SharedString::from(format!("peek-property-{index}"));
+                        let expand_name = name.clone();
                         h_flex()
                             .id(("peek-property", index))
+                            .group(group.clone())
                             .px_1()
                             .py_0p5()
                             .gap_2()
@@ -1348,6 +1386,24 @@ impl NodePeek {
                                     ),
                             )
                             .child(div().flex_1().min_w_0().child(body))
+                            .when(expands, |row| {
+                                row.child(
+                                    IconButton::new(
+                                        ("peek-open-editor", index),
+                                        IconName::Maximize,
+                                    )
+                                    .icon_size(IconSize::XSmall)
+                                    .icon_color(Color::Muted)
+                                    .visible_on_hover(group.clone())
+                                    .tooltip(Tooltip::text("Open in the editor"))
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.expand(&expand_name, window, cx)
+                                        },
+                                    )),
+                                )
+                            })
                             .when(saving, |row| {
                                 row.child(
                                     div()
@@ -1527,7 +1583,7 @@ impl NodePeek {
         };
         let branch = self.session.read(cx).branch.clone();
         let keys = if lines {
-            format!("↵ save · ⇧↵ line break · esc cancel · write · {branch}")
+            format!("↵ save · ⇧↵ line break · ⌘⇧↵ editor · esc cancel · write · {branch}")
         } else {
             format!("↵ save · esc cancel · write · {branch}")
         };
@@ -1575,7 +1631,22 @@ impl NodePeek {
                             .items_start()
                     })
                     .child(studio_ui::ds::field_input(edit.editor.clone()))
-                    .children(clear),
+                    .children(clear)
+                    .children(lines.then(|| {
+                        let name = edit.property.name.clone();
+                        IconButton::new(
+                            SharedString::from(format!("peek-expand-{name}")),
+                            IconName::Maximize,
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(|_, cx| {
+                            Tooltip::for_action("Open in the editor", &ExpandField, cx)
+                        })
+                        .on_click(
+                            cx.listener(move |this, _, window, cx| this.expand(&name, window, cx)),
+                        )
+                    })),
             )
             .children(edit.notice.clone().map(|notice| {
                 let unknown = notice.tone == Tone::Unknown;
@@ -1934,6 +2005,7 @@ impl Render for NodePeek {
             .id("node-peek")
             .on_action(cx.listener(Self::on_save_field))
             .on_action(cx.listener(Self::on_cancel_field))
+            .on_action(cx.listener(Self::on_expand_field))
             .w_full()
             .map(|view| {
                 if page {

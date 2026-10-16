@@ -254,6 +254,20 @@ pub mod graph {
         pub id: String,
     }
 
+    /// Open a node's text property in an editor of its own with its preview, read at a commit
+    /// (the one a field was being edited at) or the branch head, showing text already typed.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct OpenTextEditor {
+        pub type_name: String,
+        pub id: String,
+        pub property: String,
+        #[serde(default)]
+        pub read_at: Option<String>,
+        #[serde(default)]
+        pub text: Option<String>,
+    }
+
     /// Open one node as a page in its own tab, read at the branch head or at a commit.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
@@ -374,6 +388,10 @@ pub mod node {
             SaveField,
             /// Put the node field being edited back as it was.
             CancelField,
+            /// Open the text field being edited in an editor of its own, with its preview.
+            ExpandField,
+            /// Save the text in the editor.
+            SaveText,
         ]
     );
 }
