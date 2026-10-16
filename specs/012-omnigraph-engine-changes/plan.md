@@ -198,6 +198,13 @@ keyed edge changes by inserting its key again, an unkeyed one by delete and inse
 it a new id. *Waits:* 014. *Today:* an unkeyed edge's properties save as delete and insert, and
 Studio says its id changes.
 
+**E27. Annotation-only schema changes.** Schema migration v1 refuses changing a property's
+annotations other than `@description` and `@instruction` ("changing annotations beyond
+@description/@instruction is not supported in schema migration v1", `omnigraph schema plan`
+0.13.0). An annotation with no built-in behaviour (a display hint such as `@format("text")`)
+changes no data and no index, so it could apply as metadata. *Waits:* 014. *Today:* Studio
+reads every String as markdown; a hint can be declared only on a new property or type.
+
 ### Already on OmniGraph main, not in 0.13.0
 
 **R1. Blob writes** (`PUT`/`DELETE /graphs/{id}/blob`). Studio offers Blob upload and clear only

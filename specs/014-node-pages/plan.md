@@ -124,16 +124,19 @@ Four parts, built in this order; each lands on its own.
 
 ### 3. Long text and markdown
 
-- A String property is **markdown** when its schema says `@format("markdown")`: an unknown
-  annotation, which 0.13 keeps and Studio reads through the compiler's `PropDecl.annotations`.
-  Nothing is inferred from the text. Every other String is plain text.
-- **In a table** a long or markdown value shows its first line, markdown marks removed; ↵
-  edits short text in the cell; for markdown or text with a line break, ↵ opens the editor
+- **Every String value is read as markdown.** Studio parses it as CommonMark (the parser of
+  Zed's `markdown`) and renders what it finds. Plain text has no markup, so it renders as
+  itself; a value with headings, lists, links, emphasis or code renders them. Keys, ids and
+  enum values are not parsed. Soft line breaks render as line breaks, so plain text keeps its
+  lines. What is stored is always the raw text: rendering never rewrites a value, and an edit
+  saves exactly what was typed.
+- **In a table** a value shows its first line, markup removed by the same parse; ↵ edits a
+  one-line value in the cell; for a value with a line break or markup, ↵ opens the editor
   (below) and the cell shows the draft's first line with a dot.
-- **On the page** markdown renders (Zed's `markdown`, as agent replies render). A click on it
-  or ↵ edits it in place: Zed's `Editor` in full mode, soft-wrapped, growing with its text,
-  highlighted with `tree-sitter-md`; ⌘↵ or leaving it ends the edit into the draft. A
-  segmented Edit · Preview · Split switch sits on the field's corner.
+- **On the page** a value renders (Zed's `markdown`, as agent replies render). A click on it or
+  ↵ edits it in place: Zed's `Editor` in full mode, soft-wrapped, growing with its text,
+  highlighted with `tree-sitter-md`; ⌘↵ or leaving it ends the edit into the draft. A segmented
+  Edit · Preview · Split switch sits on the field's corner.
 - **Expand** (⤢ on a text field, or ⌘⇧↵) opens the property as its own tab, the editor with a
   live preview beside it, as Zed's markdown preview to the side. It writes to the same draft
   entry; closing it keeps the entry.
@@ -168,7 +171,7 @@ Four parts, built in this order; each lands on its own.
 | ⌘↵ opens the page everywhere; ↵ keeps each surface's own action | ↵ opens the page in tables | ↵ editing a cell is the spreadsheet convention people bring; changing it would break every table edit for one open |
 | Click selects, ↵ or a double click edits | Click edits (today) | Click-to-edit makes selecting, copying and opening a chip impossible with the mouse, and causes accidental edits |
 | One draft per branch, ↵ saves the field now | Every change saves on its own; drafts only | Quick single edits stay one keystroke; a mixed edit across the table and the page still publishes once; nothing is written by leaving a field |
-| `@format("markdown")` in the schema | Detect markdown from the text; a Studio setting per property | The schema travels with the graph and is read by every client; detection guesses; a setting lives on one machine |
+| Every String renders as markdown, parsed from its text | `@format("markdown")` in the schema; a Studio setting per property | Plain text renders as itself, so parsing everything costs nothing for text without markup; 0.13 refuses adding an annotation to an existing property, so a schema marker would reach only properties declared with it from the start; a setting lives on one machine |
 | Zed's `editor` and `markdown`, not `markdown_preview` | `markdown_preview` | It needs Zed's `workspace` and `project`, which Studio replaced |
 | D2 saves as two ordered commits, with "Save as one change" through a branch | Refuse mixed drafts | People edit relationships as one thought; the engine's documented way to make mixed work one result is a branch |
 
@@ -184,6 +187,9 @@ Four parts, built in this order; each lands on its own.
   or on edit-on-↵ alone.
 - Node history on the page (the commits that touched this node) waits on a per-entity change
   query (E6).
+- An opt-out for text that must not be read as markdown (identifiers with `*` or `_`, code):
+  `@format("text")` on a property, which 0.13 accepts on a new property or type but refuses to
+  add to an existing one (Validation log). E27 would let annotation-only changes apply.
 
 ## Validation log
 
@@ -192,6 +198,8 @@ Four parts, built in this order; each lands on its own.
 | 2026-10-16 | The flows above are today's | A read of `type_table`, `relationship_tree`, `graph_canvas`, `inspectors`, `review` and the keymaps, citing file and line | As listed under "What exists today" |
 | 2026-10-16 | 0.13 keeps unknown annotations and the compiler exposes them per property | `docs/user/schema/index.md:139` at OmniGraph main; `git show v0.13.0:crates/omnigraph-compiler/src/schema/ast.rs` | "retained as metadata"; `PropDecl { name, prop_type, annotations }` |
 | 2026-10-16 | D2 and edge update rules | `docs/dev/writes.md:376-379`, `docs/user/mutations/index.md:90-92` at OmniGraph main | One mutation constructive or destructive; edges have no update |
+| 2026-10-16 | 0.13 keeps a property annotation it does not know, but only from the start | `omnigraph` 0.13.0 on a scratch graph: `init` with `body: String? @format("markdown")`, `schema show`; `schema plan` adding the annotation to an existing property, then a new property and a new type carrying it | `init` and `schema show` keep it verbatim; adding it to `Note.body`: "supported: no … changing annotations beyond @description/@instruction is not supported in schema migration v1"; a new property or type with it: "supported: yes" |
+| 2026-10-16 | Plain text keeps its lines when rendered as markdown | `crates/markdown/src/markdown.rs:3292-3295` at Zed `v1.23.2` | `MarkdownStyle::soft_break_as_hard_break` renders a soft break as a line break |
 | 2026-10-16 | `markdown_preview` cannot be used as it is | `crates/markdown_preview/Cargo.toml` at Zed `v1.23.2` | Depends on `workspace` and `project` |
 
 ## Corrections

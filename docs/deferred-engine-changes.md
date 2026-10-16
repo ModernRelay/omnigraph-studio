@@ -32,6 +32,7 @@ one is picked up it goes through OmniGraph's own RFC process.
 | E24 | Unix-socket transport for `--server` ([#979](https://github.com/ModernRelay/omnigraph/issues/979)) | 013 | Codex reaches the gateway only with network access the person grants |
 | E25 | One mutation that both adds and removes (lift rule D2 for one write) | 014 | A relationship replacement saves as two ordered commits, or through a branch and a merge |
 | E26 | Edge update (T16) | 014 | An unkeyed edge's properties save as delete and insert, with a new id |
+| E27 | Annotation-only schema changes (a display hint on an existing property) | 014 | Every String reads as markdown; a hint can go only on a new property or type |
 
 On OmniGraph main (checked 2026-10-15 at `fe69c039`, server version 0.14.0, not yet released;
 the HTTP contract header is still `0.13`), each to be used only when a server's `/openapi.json`
