@@ -193,14 +193,16 @@ pub fn candidates(configured: Option<&str>) -> Vec<PathBuf> {
     }
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
-            push(dir.join("omnigraph"));
+            push(dir.join(CLI_NAME));
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        push(PathBuf::from(home).join(".local/bin/omnigraph"));
+    if let Some(home) = std::env::home_dir() {
+        push(home.join(".local/bin").join(CLI_NAME));
     }
-    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
-        push(Path::new(dir).join("omnigraph"));
+    if cfg!(unix) {
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+            push(Path::new(dir).join(CLI_NAME));
+        }
     }
     found
 }
@@ -596,35 +598,61 @@ pub async fn run(
     (text, failed)
 }
 
+/// The CLI's file name: `omnigraph`, or `omnigraph.exe` on Windows.
+const CLI_NAME: &str = if cfg!(windows) {
+    "omnigraph.exe"
+} else {
+    "omnigraph"
+};
+
+#[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::metadata(path)
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
+/// On Windows a program is a file; its name says what runs it.
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
+}
+
 pub fn expand_home(path: &str) -> PathBuf {
-    match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
-        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+    match (path.strip_prefix("~/"), std::env::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest),
         _ => PathBuf::from(path),
     }
 }
 
+#[cfg(unix)]
 fn private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 
-/// Writes `path` with `mode` from the start, so a secret is never readable by others.
+/// On Windows the conversation's directory inherits the person's own profile permissions.
+#[cfg(not(unix))]
+fn private_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Writes `path` with `mode` from the start, so a secret is never readable by others. On
+/// Windows the file inherits its folder's permissions, which are the person's own.
 fn write_file(path: &Path, text: &str, mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
+    let mut file = options.open(path)?;
     // An existing file keeps its old mode on open; set it.
-    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
     file.write_all(text.as_bytes())
 }
 
@@ -636,7 +664,8 @@ fn yaml_string(text: &str) -> String {
     serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into())
 }
 
-#[cfg(test)]
+// The tests run fake CLIs, which are shell scripts.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;

@@ -375,8 +375,8 @@ impl BlobView {
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
-        let directory = std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join("Downloads"))
+        let directory = std::env::home_dir()
+            .map(|home| home.join("Downloads"))
             .filter(|dir| dir.is_dir())
             .unwrap_or_else(std::env::temp_dir);
         let chosen = cx.prompt_for_new_path(&directory, Some(&self.file_name()));

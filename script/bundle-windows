@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Build a Windows zip of OmniGraph Studio in target/bundle (spec 001, "Shipping"):
+#
+#   omnigraph-studio-<version>-windows-<arch>/
+#     omnigraph-studio.exe
+#     LICENSE
+#     THIRD-PARTY-NOTICES.md
+#
+#   script/bundle-windows            # release build
+#   script/bundle-windows --debug    # the debug build, to check the layout quickly
+#
+# Runs in Git Bash on Windows, as GitHub's Windows runners provide it. Unzip anywhere and run
+# omnigraph-studio.exe; Studio keeps its settings in %APPDATA%\OmniGraph Studio. An installer is
+# not built yet, and the executable is not signed.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$ROOT"
+
+profile=release
+case "${1:-}" in
+  --debug) profile=debug ;;
+  "") ;;
+  *) echo "usage: script/bundle-windows [--debug]" >&2; exit 2 ;;
+esac
+
+case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) ;;
+  *) echo "bundle-windows runs on Windows, in Git Bash" >&2; exit 1 ;;
+esac
+
+# Windows's Python is `python`; the scripts this one runs call `python3`.
+if ! command -v python3 >/dev/null 2>&1; then
+  python3() { python "$@"; }
+  export -f python3
+fi
+
+version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+case "$(uname -m)" in
+  x86_64) arch=x86_64 ;;
+  aarch64 | arm64) arch=aarch64 ;;
+  *) arch=$(uname -m) ;;
+esac
+name="omnigraph-studio-$version-windows-$arch"
+
+if [[ "$profile" == release ]]; then
+  cargo build --locked --release -p studio --bin omnigraph-studio
+else
+  cargo build --locked -p studio --bin omnigraph-studio
+fi
+
+out="$ROOT/target/bundle"
+staging=$(mktemp -d)
+trap 'rm -rf "$staging"' EXIT
+dir="$staging/$name"
+mkdir -p "$dir"
+cp "target/$profile/omnigraph-studio.exe" "$dir/omnigraph-studio.exe"
+cp LICENSE "$dir/"
+# Third-party notices (script/generate-licenses): a release needs them; a debug bundle has them
+# when cargo-about is installed.
+if [[ "$profile" == release ]] || cargo about --version >/dev/null 2>&1; then
+  script/generate-licenses "$dir/THIRD-PARTY-NOTICES.md" >/dev/null
+fi
+
+mkdir -p "$out"
+rm -f "$out/$name.zip"
+python3 -c 'import shutil, sys; shutil.make_archive(sys.argv[1], "zip", sys.argv[2], sys.argv[3])' \
+  "$out/$name" "$staging" "$name"
+echo "$out/$name.zip"

@@ -8,7 +8,7 @@ name: Release
 # publishing them, to check a release before tagging it.
 #
 # macOS builds are signed and notarized when the Apple secrets below are set, and signed ad hoc
-# otherwise. Linux builds are tarballs.
+# otherwise. Linux builds are tarballs, the Windows build a zip.
 #
 #   APPLE_CERTIFICATE_P12        base64 of a "Developer ID Application" certificate (.p12)
 #   APPLE_CERTIFICATE_PASSWORD   its export password
@@ -43,10 +43,19 @@ jobs:
             target: linux-x86_64
           - os: ubuntu-22.04-arm
             target: linux-aarch64
+          - os: windows-2025
+            target: windows-x86_64
     runs-on: ${{ matrix.os }}
     env:
       SIGNED: ${{ secrets.APPLE_CERTIFICATE_P12 != '' }}
     steps:
+      # Zed's checkout has paths past Windows's 260-character limit; git fetches it.
+      - name: Long paths
+        if: runner.os == 'Windows'
+        run: |
+          git config --global core.longpaths true
+          echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"
+        shell: bash
       - uses: actions/checkout@v4
 
       # The scripts read TOML with Python's tomllib (3.11+); Ubuntu 22.04 has 3.10.
@@ -112,13 +121,14 @@ jobs:
           echo "STUDIO_NOTARY_PROFILE=studio-notary" >> "$GITHUB_ENV"
 
       - name: Bundle (release build)
-        run: script/bundle-${{ runner.os == 'macOS' && 'mac' || 'linux' }}
+        shell: bash
+        run: script/bundle-${{ runner.os == 'macOS' && 'mac' || runner.os == 'Windows' && 'windows' || 'linux' }}
 
       - name: Collect
         shell: bash
         run: |
           mkdir -p dist
-          cp target/bundle/*.dmg target/bundle/*.tar.gz dist/ 2>/dev/null || true
+          cp target/bundle/*.dmg target/bundle/*.tar.gz target/bundle/*.zip dist/ 2>/dev/null || true
           ls -la dist
 
       - uses: actions/upload-artifact@v4
@@ -163,12 +173,15 @@ jobs:
           | \`OmniGraph-Studio-$version-arm64.dmg\` | macOS 11 or later, Apple silicon |
           | \`omnigraph-studio-$version-linux-x86_64.tar.gz\` | Linux x86_64, glibc 2.35 or later (Ubuntu 22.04, Debian 12 and later); Wayland or X11, Vulkan |
           | \`omnigraph-studio-$version-linux-aarch64.tar.gz\` | Linux arm64, glibc 2.35 or later; Wayland or X11, Vulkan |
+          | \`omnigraph-studio-$version-windows-x86_64.zip\` | Windows 10 (1809) or later, x86_64 |
 
           \`SHA256SUMS\` lists every file's checksum. Each download carries \`LICENSE\` (GPL-3.0-or-later) and \`THIRD-PARTY-NOTICES.md\`, the licences of the crates, fonts, icons and themes it includes.
 
           $mac
 
           On Linux, unpack the tarball and run \`bin/omnigraph-studio\`; copy its \`share/\` into \`~/.local/share\` to list Studio, with its icon, in a launcher.
+
+          On Windows, unzip anywhere and run \`omnigraph-studio.exe\`. It is not signed, so SmartScreen may ask first: choose More info, then Run anyway. The agent panel is not available on Windows yet.
 
           Studio connects to an OmniGraph 0.13 server; see the README for connecting and for a sample graph.
           NOTES

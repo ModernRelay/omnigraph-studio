@@ -378,8 +378,8 @@ impl NodePeek {
         };
         let id = self.subject.id().to_owned();
         let name = suggested_file_name(&id, &slot.property, &slot.head);
-        let directory = std::env::var_os("HOME")
-            .map(|home| std::path::PathBuf::from(home).join("Downloads"))
+        let directory = std::env::home_dir()
+            .map(|home| home.join("Downloads"))
             .filter(|dir| dir.is_dir())
             .unwrap_or_else(std::env::temp_dir);
         let chosen = cx.prompt_for_new_path(&directory, Some(&name));

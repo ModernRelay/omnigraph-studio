@@ -1,5 +1,8 @@
 //! OmniGraph Studio.
 
+// A release build on Windows opens no console window beside the app's own.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use gpui::App;
 
 fn main() {

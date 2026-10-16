@@ -308,8 +308,8 @@ struct SettingsFileState {
 impl Global for SettingsFileState {}
 
 /// Studio's data directory, for every crate: `OMNIGRAPH_STUDIO_DATA`, else
-/// `~/Library/Application Support/OmniGraph Studio` on macOS, `$XDG_CONFIG_HOME/omnigraph-studio`
-/// elsewhere. A binary run from a Cargo build directory (`cargo run`, an example) uses a
+/// `~/Library/Application Support/OmniGraph Studio` on macOS, `%APPDATA%\OmniGraph Studio` on
+/// Windows, `$XDG_CONFIG_HOME/omnigraph-studio` elsewhere. A binary run from a Cargo build directory (`cargo run`, an example) uses a
 /// sibling directory ending in "Dev" instead, so a development run never rewrites the tabs,
 /// drafts and conversations of the app the person uses. A bundled app is not a development run,
 /// whichever profile built it.
@@ -320,9 +320,17 @@ pub fn data_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
     let dev = std::env::current_exe().is_ok_and(|exe| is_build_output(&exe));
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = std::env::home_dir().unwrap_or_default();
+    if cfg!(windows) {
+        return std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData").join("Roaming"))
+            .join(if dev {
+                "OmniGraph Studio Dev"
+            } else {
+                "OmniGraph Studio"
+            });
+    }
     if cfg!(target_os = "macos") {
         home.join("Library/Application Support").join(if dev {
             "OmniGraph Studio Dev"
