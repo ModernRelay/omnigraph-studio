@@ -1552,6 +1552,15 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Opens the inspector's dock on the inspector. An explicit peek (Space, a click) shows it
+    /// even when the person hid the dock; a peek that follows the cursor does not.
+    pub fn reveal_inspector(&mut self, cx: &mut Context<Self>) {
+        if let Some(position) = self.dock_of(INSPECTOR_PANEL) {
+            self.dock_mut(position).activate(INSPECTOR_PANEL);
+            cx.notify();
+        }
+    }
+
     /// The activity log: the bottom dock's panel.
     pub fn set_activity_view(&mut self, view: AnyView, cx: &mut Context<Self>) {
         let position = self
@@ -4132,6 +4141,31 @@ mod tests {
 
     /// As Zed's panel buttons: a button shows its panel and opens the dock; pressed again while
     /// its panel shows, it hides the dock, which keeps that panel for the next time.
+    /// Selection fills the inspector without reopening a dock the person hid; a peek asked for
+    /// (Space, a click) shows it.
+    #[gpui::test]
+    fn an_asked_for_peek_shows_the_inspector_that_selection_leaves_hidden(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            cx.set_global(StudioSettings::default());
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, _, cx| {
+            workspace.set_dock_open(PanelPosition::Right, false, cx);
+            let view = cx.new(|_| Field);
+            workspace.set_inspector(Some(view.into()), cx);
+            assert!(!workspace.right.open, "selection leaves the dock hidden");
+            assert_eq!(
+                workspace.right.active_id().as_deref(),
+                Some(INSPECTOR_PANEL)
+            );
+            workspace.reveal_inspector(cx);
+            assert!(workspace.right.open, "an asked-for peek shows it");
+        });
+    }
+
     #[gpui::test]
     fn panel_buttons_show_their_panel_and_hide_the_dock_it_shows(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {

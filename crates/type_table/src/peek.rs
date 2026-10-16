@@ -1,6 +1,7 @@
-//! The peek in the inspector (spec 004): one row's properties, copyable, and for a node its
-//! relationship groups with counts and first neighbours. Every read is pinned to the commit the
-//! row was read at, or to the first read when the node was opened by id (constitution II).
+//! The node view (specs 004, 014): one row's properties, copyable, and for a node its
+//! relationship groups with counts and neighbours. It shows as the peek in the inspector, and
+//! at full size as a node's page in a tab of its own. Every read is pinned to the commit the row
+//! was read at, or to the first read when the node was opened by id (constitution II).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,9 +11,9 @@ use gpui::{App, ClipboardItem, Context, Entity, Render, SharedString, Subscripti
 use gq_language::{Direction, RelationshipGroup, SchemaModel, builder};
 use graph_store::{GraphSession, Loadable, SessionEvent};
 use serde_json::{Map, Value};
-use studio_actions::graph::{OpenBlob, OpenNode};
-use ui::Tooltip;
+use studio_actions::graph::{OpenBlob, OpenNodePage, PeekNode};
 use ui::prelude::*;
+use ui::{Tooltip, rems_from_px};
 
 use crate::blob::{
     IMAGE_MAX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, save_value, suggested_file_name,
@@ -22,6 +23,13 @@ use graph_client::{BlobCell, BlobMeta};
 
 /// First neighbours shown under an expanded relationship group.
 pub const NEIGHBOUR_LIMIT: u32 = 8;
+
+/// Neighbours a page reads at a time under each relationship group, with "Show more" for the
+/// next (constitution IX).
+const PAGE_NEIGHBOURS: u32 = 50;
+
+/// The widest a page's text runs, as a document's measure.
+const PAGE_WIDTH: f32 = 760.;
 
 /// Debounce before relationship counts are read, so moving the cursor quickly through rows
 /// does not send a burst of reads.
@@ -78,6 +86,8 @@ struct Group {
     count: Loadable<i64>,
     expanded: bool,
     neighbours: Loadable<Vec<Neighbour>>,
+    /// The next page of neighbours being read (a page's "Show more").
+    more: Option<Task<()>>,
     _task: Option<Task<()>>,
 }
 
@@ -116,6 +126,8 @@ pub struct NodePeek {
     newer: bool,
     /// The peek shows a commit chosen on purpose (a table opened at a commit), not the head.
     holds_commit: bool,
+    /// Drawn as a node's page rather than the inspector's peek.
+    page: bool,
     _tasks: Vec<Task<()>>,
     _subscription: Subscription,
 }
@@ -132,6 +144,48 @@ impl NodePeek {
         snapshot: Option<String>,
         known: HashMap<String, KnownRelation>,
         debounce: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(
+            session, subject, values, snapshot, known, debounce, false, cx,
+        )
+    }
+
+    /// A node's page: the node read by id at `at_commit`, held there, or at the branch head.
+    pub fn page(
+        session: Entity<GraphSession>,
+        type_name: String,
+        id: String,
+        at_commit: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let holds = at_commit.is_some();
+        let subject = PeekSubject::Node { type_name, id };
+        let mut page = Self::build(
+            session,
+            subject,
+            None,
+            at_commit,
+            HashMap::new(),
+            false,
+            true,
+            cx,
+        );
+        if holds {
+            page.hold_commit();
+        }
+        page
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        session: Entity<GraphSession>,
+        subject: PeekSubject,
+        values: Option<Map<String, Value>>,
+        snapshot: Option<String>,
+        known: HashMap<String, KnownRelation>,
+        debounce: bool,
+        page: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let schema = session.read(cx).schema_model();
@@ -159,6 +213,7 @@ impl NodePeek {
             copied: None,
             newer: false,
             holds_commit: false,
+            page,
             _tasks: Vec::new(),
             _subscription: subscription,
         };
@@ -175,6 +230,63 @@ impl NodePeek {
 
     pub fn subject(&self) -> &PeekSubject {
         &self.subject
+    }
+
+    /// What names the node: its label, or its id until it is read or when it has none.
+    pub fn title(&self) -> String {
+        self.label().unwrap_or_else(|| self.subject.id().to_owned())
+    }
+
+    /// The branch moved past the commit shown.
+    pub fn is_newer(&self) -> bool {
+        self.newer
+    }
+
+    /// The commit a node opened from this view is read at: the one it holds, else the head.
+    fn held_commit(&self) -> Option<String> {
+        self.holds_commit.then(|| self.snapshot.clone()).flatten()
+    }
+
+    /// Opening this node's page, at the commit the view holds or the head; `None` for an edge.
+    fn open_page_action(&self) -> Option<OpenNodePage> {
+        let PeekSubject::Node { type_name, id } = &self.subject else {
+            return None;
+        };
+        Some(OpenNodePage {
+            type_name: type_name.clone(),
+            id: id.clone(),
+            at_commit: self.held_commit(),
+        })
+    }
+
+    /// Neighbours read at a time under a group.
+    fn neighbour_limit(&self) -> u32 {
+        if self.page {
+            PAGE_NEIGHBOURS
+        } else {
+            NEIGHBOUR_LIMIT
+        }
+    }
+
+    /// Whether a group with `count` neighbours opens by itself: a small one in the peek, every
+    /// one that has any on a page.
+    fn opens_by_itself(&self, count: i64) -> bool {
+        count > 0 && (self.page || count <= i64::from(NEIGHBOUR_LIMIT))
+    }
+
+    fn label(&self) -> Option<String> {
+        let values = self.values.loaded()?;
+        if let PeekSubject::Edge { .. } = &self.subject {
+            let from = values.get(FROM_COLUMN)?.as_str()?;
+            let to = values.get(TO_COLUMN)?.as_str()?;
+            return Some(format!("{from} → {to}"));
+        }
+        let schema = self.schema.as_ref()?;
+        let node = schema.node(self.subject.type_name())?;
+        let label = node.label_property()?;
+        (Some(label) != node.key.as_deref())
+            .then(|| values.get(label)?.as_str().map(str::to_owned))
+            .flatten()
     }
 
     /// The peek shows the commit it was given whatever the branch does: no Refresh is offered.
@@ -594,6 +706,7 @@ impl NodePeek {
                 count: Loadable::Loading,
                 expanded: false,
                 neighbours: Loadable::NotLoaded,
+                more: None,
                 _task: None,
             })
             .collect();
@@ -606,7 +719,7 @@ impl NodePeek {
                     group.neighbours = Loadable::Loaded(first);
                 }
                 // A small group shows its neighbours without a click, as below.
-                if known.count > 0 && known.count <= i64::from(NEIGHBOUR_LIMIT) {
+                if self.opens_by_itself(known.count) {
                     self.toggle_group(index, cx);
                 }
                 continue;
@@ -628,15 +741,15 @@ impl NodePeek {
                 };
                 let result = count.await;
                 this.update(cx, |this, cx| {
+                    let count = match result {
+                        Ok(n) => Loadable::Loaded(i64::try_from(n).unwrap_or(i64::MAX)),
+                        Err(error) => Loadable::Failed(error),
+                    };
+                    let opens = matches!(count, Loadable::Loaded(n) if this.opens_by_itself(n));
                     if let Some(group) = this.groups.get_mut(index) {
-                        group.count = match result {
-                            Ok(n) => Loadable::Loaded(i64::try_from(n).unwrap_or(i64::MAX)),
-                            Err(error) => Loadable::Failed(error),
-                        };
+                        group.count = count;
                         // A small group shows its neighbours without a click.
-                        let small = matches!(group.count, Loadable::Loaded(n)
-                            if n > 0 && n <= i64::from(NEIGHBOUR_LIMIT));
-                        if small && !group.expanded {
+                        if opens && !group.expanded {
                             this.toggle_group(index, cx);
                         }
                     }
@@ -655,6 +768,7 @@ impl NodePeek {
         let Some(schema) = self.schema.clone() else {
             return;
         };
+        let limit = self.neighbour_limit();
         let Some(group) = self.groups.get_mut(index) else {
             return;
         };
@@ -670,7 +784,7 @@ impl NodePeek {
             &id,
             None,
             builder::Narrow::default(),
-            NEIGHBOUR_LIMIT,
+            limit,
         ) {
             Ok(query) => query,
             Err(error) => {
@@ -699,6 +813,68 @@ impl NodePeek {
         });
         if let Some(group) = self.groups.get_mut(index) {
             group._task = Some(task);
+        }
+        cx.notify();
+    }
+
+    /// Reads a group's next page of neighbours, after the last one shown.
+    fn show_more(&mut self, index: usize, cx: &mut Context<Self>) {
+        let PeekSubject::Node { type_name, id } = self.subject.clone() else {
+            return;
+        };
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        let Some(group) = self.groups.get(index) else {
+            return;
+        };
+        let Some(after) = group
+            .neighbours
+            .loaded()
+            .and_then(|shown| shown.last())
+            .map(|last| last.id.clone())
+        else {
+            return;
+        };
+        if group.more.is_some() {
+            return;
+        }
+        let query = match builder::neighbours(
+            &schema,
+            &type_name,
+            &group.group,
+            &id,
+            Some(&after),
+            builder::Narrow::default(),
+            PAGE_NEIGHBOURS,
+        ) {
+            Ok(query) => query,
+            Err(_) => return,
+        };
+        let snapshot = self.snapshot.clone();
+        let read = self
+            .session
+            .update(cx, |session, cx| session.read(&query, snapshot, cx));
+        let task = cx.spawn(async move |this, cx| {
+            let result = read.await;
+            this.update(cx, |this, cx| {
+                if let Some(group) = this.groups.get_mut(index) {
+                    group.more = None;
+                    match result {
+                        Ok(output) => {
+                            if let Loadable::Loaded(shown) = &mut group.neighbours {
+                                shown.extend(neighbours_from(&output.rows));
+                            }
+                        }
+                        Err(error) => group.neighbours = Loadable::Failed(error.to_string()),
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        if let Some(group) = self.groups.get_mut(index) {
+            group.more = Some(task);
         }
         cx.notify();
     }
@@ -769,6 +945,7 @@ impl NodePeek {
         };
         let hover = cx.theme().colors().element_hover;
         let rows = self.property_rows();
+        let label_width = if self.page { 160. } else { 96. };
         v_flex()
             .gap_0p5()
             .children(
@@ -799,7 +976,7 @@ impl NodePeek {
                                 this.copy(copy_name.clone(), &copy_value, cx)
                             }))
                             .child(
-                                div().w(px(96.)).flex_none().child(
+                                div().w(px(label_width)).flex_none().child(
                                     Label::new(title)
                                         .size(LabelSize::Small)
                                         .color(Color::Muted)
@@ -914,13 +1091,49 @@ impl NodePeek {
                     _ => None,
                 };
                 let other = group.group.other_type.clone();
+                let at_commit = self.held_commit();
+                let show_more = more.map(|more| {
+                    let label = format!("+{} more", format_count(more));
+                    if self.page {
+                        let reading = group.more.is_some();
+                        studio_ui::ds::button(
+                            SharedString::from(format!("peek-more-{index}")),
+                            if reading {
+                                "Reading…".to_owned()
+                            } else {
+                                label
+                            },
+                        )
+                        .style(ButtonStyle::Subtle)
+                        .label_size(LabelSize::XSmall)
+                        .disabled(reading)
+                        .on_click(cx.listener(move |this, _, _, cx| this.show_more(index, cx)))
+                        .into_any_element()
+                    } else {
+                        // The peek shows the first few; the page lists them all.
+                        let open = self.open_page_action();
+                        div()
+                            .id(SharedString::from(format!("peek-more-{index}")))
+                            .px_1()
+                            .cursor_pointer()
+                            .tooltip(Tooltip::text("Open the node's page to see them all"))
+                            .on_click(move |_, window, cx| {
+                                if let Some(open) = open.clone() {
+                                    window.dispatch_action(Box::new(open), cx)
+                                }
+                            })
+                            .child(
+                                Label::new(format!("{label} · Open page"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .into_any_element()
+                    }
+                });
                 v_flex()
                     .pl(px(22.))
                     .children(neighbours.iter().enumerate().map(|(n, neighbour)| {
-                        let action = OpenNode {
-                            type_name: other.clone(),
-                            id: neighbour.id.clone(),
-                        };
+                        let (peek, page) = node_actions(&other, &neighbour.id, at_commit.clone());
                         h_flex()
                             .id(SharedString::from(format!("peek-neighbour-{index}-{n}")))
                             .px_1()
@@ -930,11 +1143,15 @@ impl NodePeek {
                             .hover(move |s| s.bg(hover))
                             .cursor_pointer()
                             .tooltip(Tooltip::text(format!(
-                                "Open {} in the inspector",
+                                "Peek {} · ⌘-click opens its page",
                                 neighbour.id
                             )))
-                            .on_click(move |_, window, cx| {
-                                window.dispatch_action(Box::new(action.clone()), cx)
+                            .on_click(move |event, window, cx| {
+                                if event.modifiers().platform {
+                                    window.dispatch_action(Box::new(page.clone()), cx)
+                                } else {
+                                    window.dispatch_action(Box::new(peek.clone()), cx)
+                                }
                             })
                             .child(studio_ui::type_swatch(&other))
                             .child(
@@ -956,13 +1173,7 @@ impl NodePeek {
                                 )
                             })
                     }))
-                    .children(more.map(|more| {
-                        div().px_1().child(
-                            Label::new(format!("+{} more", format_count(more)))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                    }))
+                    .children(show_more)
                     .into_any_element()
             }
             Loadable::Failed(error) => div()
@@ -993,12 +1204,10 @@ impl NodePeek {
         };
         let values = self.values.loaded()?;
         let hover = cx.theme().colors().element_hover;
+        let at_commit = self.held_commit();
         let endpoint = |label: &'static str, ty: &String, key: &str| {
             let id = values.get(key).and_then(Value::as_str)?.to_owned();
-            let action = OpenNode {
-                type_name: ty.clone(),
-                id: id.clone(),
-            };
+            let (peek, page) = node_actions(ty, &id, at_commit.clone());
             Some(
                 h_flex()
                     .id(label)
@@ -1008,8 +1217,13 @@ impl NodePeek {
                     .rounded_sm()
                     .hover(move |s| s.bg(hover))
                     .cursor_pointer()
-                    .on_click(move |_, window, cx| {
-                        window.dispatch_action(Box::new(action.clone()), cx)
+                    .tooltip(Tooltip::text(format!("Peek {id} · ⌘-click opens its page")))
+                    .on_click(move |event, window, cx| {
+                        if event.modifiers().platform {
+                            window.dispatch_action(Box::new(page.clone()), cx)
+                        } else {
+                            window.dispatch_action(Box::new(peek.clone()), cx)
+                        }
                     })
                     .child(
                         div()
@@ -1033,6 +1247,22 @@ impl NodePeek {
                 .into_any_element(),
         )
     }
+}
+
+/// Peeking a node and opening its page, at the commit the view holds or the head.
+fn node_actions(type_name: &str, id: &str, at_commit: Option<String>) -> (PeekNode, OpenNodePage) {
+    (
+        PeekNode {
+            type_name: type_name.to_owned(),
+            id: id.to_owned(),
+            at_commit: at_commit.clone(),
+        },
+        OpenNodePage {
+            type_name: type_name.to_owned(),
+            id: id.to_owned(),
+            at_commit,
+        },
+    )
 }
 
 fn neighbours_from(rows: &Value) -> Vec<Neighbour> {
@@ -1062,20 +1292,11 @@ impl Render for NodePeek {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let type_name = self.subject.type_name().to_owned();
         let id = self.subject.id().to_owned();
-        let label = self.values.loaded().and_then(|values| {
-            if let PeekSubject::Edge { .. } = &self.subject {
-                let from = values.get(FROM_COLUMN)?.as_str()?;
-                let to = values.get(TO_COLUMN)?.as_str()?;
-                return Some(format!("{from} → {to}"));
-            }
-            let schema = self.schema.as_ref()?;
-            let node = schema.node(&type_name)?;
-            let label = node.label_property()?;
-            (Some(label) != node.key.as_deref())
-                .then(|| values.get(label)?.as_str().map(str::to_owned))
-                .flatten()
-        });
+        let label = self.label();
         let at = self.snapshot.clone();
+        let page = self.page;
+        // The peek opens the node's page; the page is it.
+        let open_page = (!page).then(|| self.open_page_action()).flatten();
         let has_properties = !self.property_rows().is_empty();
         let properties = self.render_properties(cx);
         // A node's relationships are listed once the node is read: while it loads, or when it
@@ -1088,8 +1309,17 @@ impl Render for NodePeek {
         v_flex()
             .id("node-peek")
             .w_full()
-            .p_4()
-            .gap_1p5()
+            .map(|view| {
+                if page {
+                    // A page reads at a document's width, with its margins.
+                    view.max_w(px(PAGE_WIDTH))
+                        .px(px(studio_ui::ds::space::PAGE))
+                        .py(px(studio_ui::ds::space::XL))
+                        .gap_2()
+                } else {
+                    view.p_4().gap_1p5()
+                }
+            })
             .child(
                 h_flex()
                     .gap_1p5()
@@ -1100,6 +1330,15 @@ impl Render for NodePeek {
                             .color(Color::Muted),
                     )
                     .child(div().flex_1())
+                    .children(open_page.map(|open| {
+                        IconButton::new("peek-open-page", IconName::ArrowUpRight)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Open the node's page"))
+                            .on_click(move |_, window, cx| {
+                                window.dispatch_action(Box::new(open.clone()), cx)
+                            })
+                    }))
                     .when(is_node, |header| {
                         let explore = studio_actions::graph::ShowNodeOnCanvas {
                             type_name: type_name.clone(),
@@ -1122,7 +1361,11 @@ impl Render for NodePeek {
             )
             .child(
                 Label::new(label.unwrap_or_else(|| id.clone()))
-                    .size(LabelSize::Large)
+                    .size(if page {
+                        LabelSize::Custom(rems_from_px(22_f32))
+                    } else {
+                        LabelSize::Large
+                    })
                     .weight(gpui::FontWeight::MEDIUM),
             )
             .child(

@@ -151,6 +151,7 @@
       "right": "studio_table::MoveRight",
       "enter": "studio_table::EditCell",
       "space": "studio_table::PeekRow",
+      "cmd-enter": "studio_table::OpenRowPage",
       "g": "studio_table::ExploreRow",
       "cmd-c": "studio_table::CopyCell",
       "cmd-backspace": "studio_table::DeleteRow",
@@ -199,7 +200,8 @@
       "enter": "studio_tree::OpenSelected",
       "alt-right": "studio_tree::ExpandAll",
       "alt-left": "studio_tree::CollapseAll",
-      "cmd-enter": "studio_tree::OpenTable"
+      "cmd-enter": "studio_tree::OpenPage",
+      "alt-enter": "studio_tree::OpenTable"
     }
   },
   {
@@ -231,6 +233,7 @@
       "up": "studio_canvas::MoveUp",
       "down": "studio_canvas::MoveDown",
       "space": "studio_canvas::PeekSelected",
+      "cmd-enter": "studio_canvas::OpenSelectedPage",
       "f": "studio_canvas::FocusSelected",
       "[": "studio_canvas::WalkBack",
       "]": "studio_canvas::WalkForward",

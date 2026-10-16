@@ -30,8 +30,8 @@ use smallvec::SmallVec;
 use studio_actions::graph::{OpenNode, ShowNodeOnCanvas};
 use studio_actions::graph::{OpenType, PeekNode};
 use studio_actions::tree::{
-    ClearFilter, Collapse, CollapseAll, Expand, ExpandAll, OpenSelected, OpenTable, PeekSelected,
-    RerootHere, SelectNext, SelectPrevious, ShowOnCanvas, ToggleEmptyGroups,
+    ClearFilter, Collapse, CollapseAll, Expand, ExpandAll, OpenPage, OpenSelected, OpenTable,
+    PeekSelected, RerootHere, SelectNext, SelectPrevious, ShowOnCanvas, ToggleEmptyGroups,
 };
 use studio_ui::type_swatch;
 use studio_workspace::{PanelPosition, Workspace, WorkspaceEvent};
@@ -535,12 +535,31 @@ impl RelationshipTree {
             Box::new(PeekNode {
                 type_name: node.type_name,
                 id: node.id,
+                at_commit: None,
             }),
             cx,
         );
     }
 
-    /// ⌘↵: a node's own type table filtered to it; on a relationship group, the other type's
+    /// ⌘↵: the selected node's page (spec 014); a relationship group, which has no page,
+    /// opens its table as ⌥↵ does.
+    fn open_page(&mut self, _: &OpenPage, window: &mut Window, cx: &mut Context<Self>) {
+        match self.selected_entry().map(|entry| &entry.kind) {
+            Some(EntryKind::Node { node, .. } | EntryKind::Cycle { node, .. }) => {
+                window.dispatch_action(
+                    Box::new(studio_actions::graph::OpenNodePage {
+                        type_name: node.type_name.clone(),
+                        id: node.id.clone(),
+                        at_commit: None,
+                    }),
+                    cx,
+                );
+            }
+            _ => self.open_table(&OpenTable, window, cx),
+        }
+    }
+
+    /// ⌥↵: a node's own type table filtered to it; on a relationship group, the other type's
     /// table filtered to the nodes related to this one.
     fn open_table(&mut self, _: &OpenTable, window: &mut Window, cx: &mut Context<Self>) {
         let action = match self.selected_entry().map(|entry| &entry.kind) {
@@ -1374,6 +1393,7 @@ impl Render for RelationshipTree {
             .on_action(cx.listener(Self::clear_filter))
             .on_action(cx.listener(Self::peek_selected))
             .on_action(cx.listener(Self::open_table))
+            .on_action(cx.listener(Self::open_page))
             .on_action(cx.listener(Self::toggle_empty_groups))
             .on_key_down(cx.listener(Self::key_down));
 

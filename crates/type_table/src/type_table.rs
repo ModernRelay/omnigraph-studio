@@ -8,6 +8,7 @@ mod blob_view;
 mod dialogs;
 mod grouping;
 pub mod model;
+mod node_page;
 mod nodes_panel;
 mod offers;
 mod pdf;
@@ -19,12 +20,13 @@ mod types_list;
 use gpui::{App, AppContext as _, Context, Entity, Window};
 use gq_language::{Filter, FilterOp};
 use serde_json::Value;
-use studio_actions::graph::{BrowseType, OpenBlob, OpenNode, OpenType, PeekNode};
+use studio_actions::graph::{BrowseType, OpenBlob, OpenNode, OpenNodePage, OpenType, PeekNode};
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
 
 pub use blob_view::BlobView;
 pub use dialogs::{DeleteRowModal, InsertRowModal};
+pub use node_page::NodePage;
 pub use peek::{NodePeek, PeekSubject};
 pub use table::{Cursor, TypeTable};
 pub use types_list::TypesList;
@@ -46,6 +48,18 @@ pub fn init(cx: &mut App) {
                 at_commit: text("at_commit"),
             };
             open_blob(workspace, &action, window, cx);
+        }
+    });
+    // A node's page comes back at the head, or at the commit it held.
+    studio_workspace::register_item_kind(cx, "node", |data, workspace, window, cx| {
+        let text = |key: &str| data.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+        if let (Some(type_name), Some(id)) = (text("type_name"), text("id")) {
+            let action = OpenNodePage {
+                type_name,
+                id,
+                at_commit: text("at_commit"),
+            };
+            open_node_page(workspace, &action, window, cx);
         }
     });
     studio_workspace::register_item_kind(cx, "type_table", |data, workspace, window, cx| {
@@ -158,19 +172,23 @@ pub fn init(cx: &mut App) {
             workspace.activate_panel(nodes_panel::NODES_PANEL, cx);
         });
         workspace.register_action(|workspace, action: &PeekNode, _window, cx| {
-            open_node(
+            peek_node(
                 workspace,
-                &OpenNode {
-                    type_name: action.type_name.clone(),
-                    id: action.id.clone(),
-                },
+                &action.type_name,
+                &action.id,
+                action.at_commit.clone(),
                 cx,
-            )
+            );
+            // A peek asked for shows the inspector, even when its dock was hidden.
+            workspace.reveal_inspector(cx);
         });
         workspace.register_action(|workspace, action: &OpenNode, _window, cx| {
-            open_node(workspace, action, cx);
+            peek_node(workspace, &action.type_name, &action.id, None, cx);
             // The relationship tree reveals the node too (spec 005).
             cx.propagate();
+        });
+        workspace.register_action(|workspace, action: &OpenNodePage, window, cx| {
+            open_node_page(workspace, action, window, cx);
         });
     })
     .detach();
@@ -217,18 +235,57 @@ pub(crate) fn table_key(type_name: &str, at_commit: Option<&str>) -> String {
     }
 }
 
-/// Shows one node in the inspector, read at the branch head.
-fn open_node(workspace: &mut Workspace, action: &OpenNode, cx: &mut Context<Workspace>) {
+/// Shows one node in the inspector, read at the branch head or held at `at_commit`.
+fn peek_node(
+    workspace: &mut Workspace,
+    type_name: &str,
+    id: &str,
+    at_commit: Option<String>,
+    cx: &mut Context<Workspace>,
+) {
     let Some(session) = workspace.session().cloned() else {
         return;
     };
     let subject = PeekSubject::Node {
-        type_name: action.type_name.clone(),
-        id: action.id.clone(),
+        type_name: type_name.to_owned(),
+        id: id.to_owned(),
     };
-    let peek =
-        cx.new(|cx| NodePeek::new(session, subject, None, None, Default::default(), false, cx));
+    let holds = at_commit.is_some();
+    let peek = cx.new(|cx| {
+        let mut peek = NodePeek::new(
+            session,
+            subject,
+            None,
+            at_commit,
+            Default::default(),
+            false,
+            cx,
+        );
+        if holds {
+            peek.hold_commit();
+        }
+        peek
+    });
     workspace.set_inspector(Some(peek.into()), cx);
+}
+
+/// Opens a node's page in a tab, or shows the tab it is in.
+pub fn open_node_page(
+    workspace: &mut Workspace,
+    action: &OpenNodePage,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Option<Entity<NodePage>> {
+    let session = workspace.session().cloned()?;
+    let key = NodePage::key(&action.type_name, &action.id, action.at_commit.as_deref());
+    let (type_name, id, at_commit) = (
+        action.type_name.clone(),
+        action.id.clone(),
+        action.at_commit.clone(),
+    );
+    workspace.open_item(key, window, cx, move |_window, cx| {
+        NodePage::new(session, type_name, id, at_commit, cx)
+    })
 }
 
 /// Opens a Blob value in a tab of its own, or shows the tab it is in.

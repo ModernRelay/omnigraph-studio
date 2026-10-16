@@ -235,12 +235,15 @@ pub mod graph {
         pub at_commit: Option<String>,
     }
 
-    /// Show one node in the inspector without revealing it in the tree.
+    /// Show one node in the inspector without revealing it in the tree, read at the branch
+    /// head or held at a commit.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]
     pub struct PeekNode {
         pub type_name: String,
         pub id: String,
+        #[serde(default)]
+        pub at_commit: Option<String>,
     }
 
     /// Open one node in the inspector and the relationship tree.
@@ -249,6 +252,16 @@ pub mod graph {
     pub struct OpenNode {
         pub type_name: String,
         pub id: String,
+    }
+
+    /// Open one node as a page in its own tab, read at the branch head or at a commit.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct OpenNodePage {
+        pub type_name: String,
+        pub id: String,
+        #[serde(default)]
+        pub at_commit: Option<String>,
     }
 
     /// Open a new query tab with this text. It is not run.
@@ -329,6 +342,8 @@ pub mod table {
             Cancel,
             /// Show the selected row in the inspector.
             PeekRow,
+            /// Open the selected row's node as a page.
+            OpenRowPage,
             /// Explore the graph from the row under the cursor, on the canvas.
             ExploreRow,
             /// Reload the table from the branch head.
@@ -379,6 +394,8 @@ pub mod tree {
             PeekSelected,
             /// Open a table filtered to the selected node, or to its neighbours in a group.
             OpenTable,
+            /// Open the selected node's page, or a relationship group's table.
+            OpenPage,
             /// Show or hide relationship groups with no relationships.
             ToggleEmptyGroups,
         ]
@@ -471,6 +488,8 @@ pub mod canvas {
             MoveDown,
             /// Show the selected node in the inspector.
             PeekSelected,
+            /// Open the selected node's page.
+            OpenSelectedPage,
             /// Center and zoom on the selected node.
             FocusSelected,
             /// Select the node the selected one was reached from.

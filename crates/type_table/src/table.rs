@@ -30,8 +30,8 @@ use graph_store::{GraphSession, Loadable, SessionEvent};
 use serde_json::Value;
 use studio_actions::table::{
     AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyCell, DeleteRow, EditCell, ExploreRow,
-    FilterBySelection, InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp, PeekRow, RefreshTable,
-    SaveDrafts, SelectNextSuggestion, SelectPreviousSuggestion, StageEdit,
+    FilterBySelection, InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp, OpenRowPage, PeekRow,
+    RefreshTable, SaveDrafts, SelectNextSuggestion, SelectPreviousSuggestion, StageEdit,
 };
 use studio_ui::{ColumnDrag, ColumnResize, ROW_HEIGHT};
 use studio_workspace::{
@@ -2729,10 +2729,20 @@ impl TypeTable {
         row: usize,
         col: usize,
         modifiers: gpui::Modifiers,
+        clicks: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let cursor = Cursor { row, col };
+        // A double click on a node's key opens its page (spec 014); the first click peeked it.
+        if clicks >= 2
+            && self.kind == TableKind::Node
+            && matches!(self.columns[col].role, ColumnRole::Key)
+        {
+            self.set_cursor(cursor, window, cx);
+            self.open_row_page(row, window, cx);
+            return;
+        }
         // ⌘-click picks a row for a bulk set; ⇧-click picks the rows from the last one picked.
         if modifiers.secondary() || modifiers.shift {
             self.pick_rows(row, modifiers.shift, cx);
@@ -2842,11 +2852,39 @@ impl TypeTable {
         if let Some(workspace) = self.workspace.upgrade() {
             let view = peek.clone();
             workspace.update(cx, |workspace, cx| {
-                workspace.set_inspector(Some(view.into()), cx)
+                workspace.set_inspector(Some(view.into()), cx);
+                // A peek asked for (Space, ↵, a click) shows the inspector even when its dock
+                // is hidden; one that follows the cursor does not reopen it.
+                if !debounce {
+                    workspace.reveal_inspector(cx);
+                }
             });
         }
         self.peek = Some((id, peek));
         cx.notify();
+    }
+
+    /// Opens a node row's page, at the commit the table holds or the branch head.
+    fn open_row_page(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.kind != TableKind::Node {
+            return;
+        }
+        let Some(row) = self.rows.get(row) else {
+            return;
+        };
+        window.dispatch_action(
+            Box::new(studio_actions::graph::OpenNodePage {
+                type_name: self.type_name.clone(),
+                id: row.id.clone(),
+                at_commit: self.at_commit.clone(),
+            }),
+            cx,
+        );
+    }
+
+    fn on_open_row_page(&mut self, _: &OpenRowPage, window: &mut Window, cx: &mut Context<Self>) {
+        let row = self.cursor.map_or(0, |cursor| cursor.row);
+        self.open_row_page(row, window, cx);
     }
 
     fn close_peek(&mut self, cx: &mut Context<Self>) {
@@ -5491,7 +5529,7 @@ impl TypeTable {
                 .child(self.render_relation_cell(row, &column.key, group, available, cx))
                 .when(is_cursor, |cell| cell.child(ring()))
                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    this.click_cell(ix, col, event.modifiers(), window, cx)
+                    this.click_cell(ix, col, event.modifiers(), event.click_count(), window, cx)
                 }))
                 .into_any_element();
         }
@@ -5582,7 +5620,7 @@ impl TypeTable {
         cell.children(dot.map(|color| Indicator::dot().color(color)))
             .child(content)
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                this.click_cell(ix, col, event.modifiers(), window, cx)
+                this.click_cell(ix, col, event.modifiers(), event.click_count(), window, cx)
             }))
             .into_any_element()
     }
@@ -5739,9 +5777,11 @@ impl TypeTable {
         let mut hints = h_flex().gap_4().items_center();
         hints = match (self.editing.is_some(), self.kind) {
             // A table pinned to a commit only reads.
-            (false, _) if self.at_commit.is_some() => {
-                hints.child(studio_ui::ds::key_hint(&PeekRow, "Peek", &focus, cx))
-            }
+            (false, _) if self.at_commit.is_some() => hints
+                .child(studio_ui::ds::key_hint(&PeekRow, "Peek", &focus, cx))
+                .when(self.kind == TableKind::Node, |hints| {
+                    hints.child(studio_ui::ds::key_hint(&OpenRowPage, "Open", &focus, cx))
+                }),
             (true, _) => hints
                 .child(studio_ui::ds::key_hint(&ConfirmEdit, "Save", &focus, cx))
                 .child(studio_ui::ds::key_hint(
@@ -5754,6 +5794,7 @@ impl TypeTable {
             (false, TableKind::Node) => hints
                 .child(studio_ui::ds::key_hint(&EditCell, "Edit", &focus, cx))
                 .child(studio_ui::ds::key_hint(&PeekRow, "Peek", &focus, cx))
+                .child(studio_ui::ds::key_hint(&OpenRowPage, "Open", &focus, cx))
                 .child(studio_ui::ds::key_hint(&ExploreRow, "Explore", &focus, cx))
                 .child(studio_ui::ds::key_hint(&InsertRow, "Row", &focus, cx))
                 .child(studio_ui::ds::key_hint(&DeleteRow, "Delete", &focus, cx)),
@@ -5838,6 +5879,7 @@ impl Render for TypeTable {
             .on_action(cx.listener(|this, _: &SaveDrafts, window, cx| this.save_drafts(window, cx)))
             .on_action(cx.listener(Self::on_cancel))
             .on_action(cx.listener(Self::on_peek))
+            .on_action(cx.listener(Self::on_open_row_page))
             .on_action(cx.listener(Self::on_explore))
             .on_action(cx.listener(|this, _: &RefreshTable, window, cx| this.refresh(window, cx)))
             .on_action(cx.listener(Self::on_insert))
@@ -6066,6 +6108,37 @@ mod tests {
             before,
             "the cell editor drew the grid"
         );
+    }
+
+    /// A node's page reads the node by id and names its tab by the node's label; it is one tab
+    /// per node and commit, and comes back after a restart as it was (spec 014).
+    #[gpui::test]
+    async fn a_nodes_page_reads_it_and_names_its_tab(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let session = session(PEOPLE, cx);
+        cx.run_until_parked();
+        let page = cx.new(|cx| {
+            crate::NodePage::new(session.clone(), "Person".into(), "p1".into(), None, cx)
+        });
+        cx.run_until_parked();
+        page.read_with(cx, |page, cx| {
+            assert_eq!(page.tab_title(cx).as_ref(), "Ada", "the label, once read");
+            assert_eq!(page.dedupe_key(cx).as_deref(), Some("node:Person:p1"));
+            let saved = page.serialize(cx).expect("a page is remembered");
+            assert_eq!(saved.kind, "node");
+            assert_eq!(saved.data["type_name"], "Person");
+            assert_eq!(saved.data["id"], "p1");
+            assert!(saved.data["at_commit"].is_null(), "it reads the head");
+        });
+        let held = cx.new(|cx| {
+            crate::NodePage::new(session, "Person".into(), "p1".into(), Some("c0".into()), cx)
+        });
+        cx.run_until_parked();
+        held.read_with(cx, |page, cx| {
+            assert_eq!(page.dedupe_key(cx).as_deref(), Some("node:Person:p1@c0"));
+            assert_eq!(page.serialize(cx).unwrap().data["at_commit"], "c0");
+            assert!(!page.is_stale(cx), "a page held at a commit is never newer");
+        });
     }
 
     /// People by their company's city, and an edge by a property of either end: the Group menu

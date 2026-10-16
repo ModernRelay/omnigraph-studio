@@ -30,8 +30,8 @@ use graph_store::{
 };
 use studio_actions::canvas::{
     ClearSelection, CollapseNode, ExpandNode, FitToWindow, FocusSelected, MoveDown, MoveLeft,
-    MoveRight, MoveUp, PeekSelected, ResetLayout, SelectAll, WalkBack, WalkForward, ZoomIn,
-    ZoomOut,
+    MoveRight, MoveUp, OpenSelectedPage, PeekSelected, ResetLayout, SelectAll, WalkBack,
+    WalkForward, ZoomIn, ZoomOut,
 };
 use studio_actions::graph::{
     OpenCanvas, OpenNode, OpenOntology, OpenType, PeekNode, ShowNodeOnCanvas, ShowResultsOnCanvas,
@@ -1168,6 +1168,7 @@ impl GraphCanvas {
             Box::new(PeekNode {
                 type_name: node.type_name,
                 id: node.id,
+                at_commit: None,
             }),
             cx,
         );
@@ -1693,6 +1694,29 @@ impl GraphCanvas {
                 Box::new(PeekNode {
                     type_name: node.type_name.clone(),
                     id: node.id.clone(),
+                    at_commit: None,
+                }),
+                cx,
+            );
+        }
+    }
+
+    /// ⌘↵: the selected node's page (spec 014).
+    fn open_selected_page(
+        &mut self,
+        _: &OpenSelectedPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.selected_index() else {
+            return;
+        };
+        if let SceneKind::Node { node, .. } = &self.scene.nodes[index].kind {
+            window.dispatch_action(
+                Box::new(studio_actions::graph::OpenNodePage {
+                    type_name: node.type_name.clone(),
+                    id: node.id.clone(),
+                    at_commit: None,
                 }),
                 cx,
             );
@@ -2313,6 +2337,7 @@ impl Render for GraphCanvas {
             .on_action(cx.listener(Self::walk_back))
             .on_action(cx.listener(Self::walk_forward))
             .on_action(cx.listener(Self::peek_selected))
+            .on_action(cx.listener(Self::open_selected_page))
             .on_action(cx.listener(Self::focus_selected))
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::clear_selection))

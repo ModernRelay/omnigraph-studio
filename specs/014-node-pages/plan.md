@@ -1,6 +1,6 @@
 # 014: Node pages, editing in place, and long text
 
-Status: draft · 2026-10-16
+Status: in progress; part 1 (the page and opening it) built · 2026-10-16
 
 ## Problem
 
@@ -82,9 +82,10 @@ Four parts, built in this order; each lands on its own.
 
 - **The node view** is one component in two densities: the **peek** in the right dock (as
   today, now editable) and the **node page**, a tab (item kind `node`, keyed by graph, branch,
-  type and id, so opening it again activates it). Both read at the commit of the surface they
-  were opened from: `PeekNode` and `OpenNode` carry that surface's pin, and the head only when
-  the surface reads the head.
+  type and id, and by commit when it holds one, so opening it again activates it). A surface
+  that holds a commit (a table or history opened at a commit) opens the peek and the page held
+  at that commit (`PeekNode.at_commit`, `OpenNodePage.at_commit`); a surface that reads the
+  head opens them at the head.
 - **The page**, top to bottom: the type mark, the node's label and `#id`, the commit and
   branch, "Newer data · Refresh"; the actions Explore (G), Open in table, Delete; the
   properties, each a labelled field with its `@description` as help; long text and markdown at
@@ -96,9 +97,13 @@ Four parts, built in this order; each lands on its own.
     passive selection, which still never reopens a dock the person closed).
   - ↵ is the surface's own action, as today: edit in a table, open in the tree, expand on the
     canvas.
-  - ⌘↵ opens the node page, from a table row, a tree node, a canvas node, the peek's header
-    (an Open button, ⤢) and the command palette. The tree's ⌘↵ (open the node's table) moves
-    to its menu as "Open in table".
+  - ⌘↵ opens the node page, from a table row, a tree node and a canvas node; the peek's header
+    has an Open button (↗), and the footer's key hints read "⌘↵ Open". On a tree's
+    relationship group, which has no page, ⌘↵ opens its table as before; "Open in table" for a
+    node moves to ⌥↵ (the tree has no row menu).
+  - In the peek and on the page a neighbour or an endpoint is a link: a click peeks it, ⌘-click
+    opens its page. The peek's "+N more" reads "+N more · Open page" and opens the page, which
+    lists a group's neighbours 50 at a time with "+N more" reading the next.
   - In a table, a click selects a cell; ↵ or a double click edits it (as a spreadsheet;
     typing to edit is deferred). A double click on the key cell opens the page.
   - In a relationship cell each chip is a link: a click peeks that node, ⌘-click opens its
@@ -195,6 +200,7 @@ Four parts, built in this order; each lands on its own.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-16 | Part 1: a node's page and the ways to open it | `type_table` `a_nodes_page_reads_it_and_names_its_tab` (label as the tab title, one tab per node and commit, remembered and restored, a held page never newer); `studio_workspace` `an_asked_for_peek_shows_the_inspector_that_selection_leaves_hidden`; offscreen snapshots of Radia Knuth's page and of a peek | The page lists every property and opens every non-empty relationship group; the tab reads "Radia Knuth"; the peek has ↗ beside Explore and the footer "⌘↵ Open"; a peek asked for while the right dock was hidden shows it |
 | 2026-10-16 | The flows above are today's | A read of `type_table`, `relationship_tree`, `graph_canvas`, `inspectors`, `review` and the keymaps, citing file and line | As listed under "What exists today" |
 | 2026-10-16 | 0.13 keeps unknown annotations and the compiler exposes them per property | `docs/user/schema/index.md:139` at OmniGraph main; `git show v0.13.0:crates/omnigraph-compiler/src/schema/ast.rs` | "retained as metadata"; `PropDecl { name, prop_type, annotations }` |
 | 2026-10-16 | D2 and edge update rules | `docs/dev/writes.md:376-379`, `docs/user/mutations/index.md:90-92` at OmniGraph main | One mutation constructive or destructive; edges have no update |
