@@ -25,6 +25,7 @@ instead, see below.
 Requirements:
 
 - Rust 1.98.1, installed by `rust-toolchain.toml`.
+- CMake, which builds wasmtime's C API for Zed's tree-sitter (`brew install cmake` on macOS).
 - macOS: the Command Line Tools (GPUI compiles its Metal shaders when Studio starts); full
   Xcode to compile them into a release build (`script/bundle-mac`). Linux: the Wayland, X11 and
   Vulkan development packages listed in `.github/workflows/ci.yml`.
