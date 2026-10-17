@@ -31,6 +31,14 @@ pub(crate) fn committed(commit: &str, parent: &str) -> Value {
     })
 }
 
+/// The two people every read answers with.
+fn people() -> Value {
+    json!([
+        {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
+        {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
+    ])
+}
+
 /// As [`session`], with every write answered by `write_status` and `write_body`.
 pub(crate) fn session_answering(
     schema: &str,
@@ -38,10 +46,30 @@ pub(crate) fn session_answering(
     write_body: Value,
     cx: &mut TestAppContext,
 ) -> Entity<GraphSession> {
+    serve(schema, people(), write_status, write_body, cx)
+}
+
+/// As [`session`], every read answering with `rows` (each `{"n": {…}}`).
+pub(crate) fn session_reading(
+    schema: &str,
+    rows: Value,
+    cx: &mut TestAppContext,
+) -> Entity<GraphSession> {
+    serve(schema, rows, 200, committed("c2", "c1"), cx)
+}
+
+fn serve(
+    schema: &str,
+    rows: Value,
+    write_status: u16,
+    write_body: Value,
+    cx: &mut TestAppContext,
+) -> Entity<GraphSession> {
     let schema: Arc<str> = schema.into();
+    let rows: Arc<Value> = Arc::new(rows);
     let write_body: Arc<Value> = Arc::new(write_body);
     let http = FakeHttpClient::create(move |request| {
-        let (schema, write_body) = (schema.clone(), write_body.clone());
+        let (schema, rows, write_body) = (schema.clone(), rows.clone(), write_body.clone());
         async move {
             let path = request.uri().path().to_owned();
             let (status, body) = if path.ends_with("/schema") {
@@ -52,12 +80,9 @@ pub(crate) fn session_answering(
                     json!({
                         "query_name": "q",
                         "target": {"branch": "main", "snapshot": null},
-                        "row_count": 2,
+                        "row_count": rows.as_array().map_or(0, Vec::len),
                         "columns": ["n"],
-                        "rows": [
-                            {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
-                            {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
-                        ],
+                        "rows": &*rows,
                         "graph_commit_id": "c1",
                     }),
                 )

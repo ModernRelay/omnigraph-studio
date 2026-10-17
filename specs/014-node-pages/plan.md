@@ -143,9 +143,9 @@ Four parts, built in this order; each lands on its own.
   enum values are not parsed. Soft line breaks render as line breaks, so plain text keeps its
   lines. What is stored is always the raw text: rendering never rewrites a value, and an edit
   saves exactly what was typed.
-- **In a table** a value shows its first line, markup removed by the same parse; ↵ edits a
-  one-line value in the cell; for a value with a line break or markup, ↵ opens the editor
-  (below) and the cell shows the draft's first line with a dot.
+- **In a table** a value shows its first line, markup removed by the same parse; ↵ or a click
+  edits a one-line value in the cell; a value with a line break or markup opens in the editor
+  (below), read at the table's commit, since a one-line cell editor would flatten it.
 - **On the page** a value renders (Zed's `markdown`, as agent replies render). A click on it or
   ↵ edits it in place: Zed's `Editor` in full mode, soft-wrapped, growing with its text,
   highlighted with `tree-sitter-md`; ⌘↵ or leaving it ends the edit into the draft. A segmented
@@ -226,6 +226,7 @@ Four parts, built in this order; each lands on its own.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-16 | A text cell with lines or markup opens in the editor | `type_table` `a_text_cell_with_lines_opens_in_the_editor_not_the_cell`; an offscreen click on keyset-paging's body cell in the `notes` graph | The click opened "Keyset paging · body" in the editor; a plain name still edits in its cell |
 | 2026-10-16 | Relationships are added and removed from the node | `gq_language` `relationship_queries_compile_in_both_directions` (the neighbours read returns `$e.@id as edge_id` and compiles); `type_table` `a_relationship_is_removed_on_the_second_press`, `a_refused_relationship_says_why_on_its_group`; `$e.@id` read through the 0.13 server with `omnigraph query`; offscreen snapshots of Radia Knuth's page: "+" on worksAt, "Liskov", ↵, then × twice on Liskov Systems; the CLI read three, then two workplaces | The search listed four Liskov companies with the first highlighted and "↑↓ choose · ↵ add · esc cancel · write · main"; ↵ made worksAt 3 with Liskov Systems listed; the first × press read "Remove", the second made it 2 again |
 | 2026-10-16 | A text property opens in its own editor with a live preview | `type_table` `a_saved_text_is_bound_to_the_value_read_and_leaves_the_tab_clean` (typed text over the value read at `c1`), `a_text_changed_elsewhere_is_kept_and_offered_both_ways` (a write matching nothing), `a_refused_text_is_kept_with_the_reason`; offscreen snapshots of Keyset paging's body: the split editor, a line typed, ⌘S; the CLI read the new body, and it was set back | The preview followed the typed line; ⌘S toasted "Set body of keyset-paging · committed to main" and cleared the tab's dot, while the Note table's tab took its newer-data dot |
 | 2026-10-16 | A field edits in place and saves value-bound | `type_table` `a_saved_field_moves_the_view_to_its_own_commit` and `a_refused_field_opens_again_with_its_text_and_reason` (a 403: old value back, the field open with the typed text and a refusal), both on a page made before the schema was read; offscreen snapshots of Project Fable 36: the editor over `name`, then ↵; the CLI read the new name, and it was set back | The editor's text sits on the values' edge once the frame reaches back by its padding, border and Zed's editor inset (the font's descent, its gutter margin); the hint reads "↵ save · ⇧↵ line break · esc cancel · write · main"; after ↵ the title and the field read the new name at the page's own commit, with no "Newer data". A page restored before the schema was read used to fail with "The schema is still loading."; it now reads its node when the schema arrives |

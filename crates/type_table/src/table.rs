@@ -49,8 +49,8 @@ use crate::model::{
     ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN, Row, SaveResult,
     TableKind, Tone, changed_elsewhere, chips_that_fit, copy_text, count_of, display_value,
     edge_columns, edge_rows, edit_text, filter_parts, format_count, insert_position, node_columns,
-    node_rows, parse_filter_list, parse_filter_value, parse_input, preset_start, relation_sample,
-    row_matches, same_value, save_result, short_commit,
+    node_rows, parse_filter_list, parse_filter_value, parse_input, preset_start, reads_as_markdown,
+    relation_sample, row_matches, same_value, save_result, short_commit,
 };
 use crate::offers::Offers;
 use crate::peek::{KnownRelation, NEIGHBOUR_LIMIT, Neighbour, NodePeek, PeekSubject};
@@ -2915,6 +2915,26 @@ impl TypeTable {
             return;
         }
         let old = row.value(&column.key).clone();
+        // Text with markup or more than one line opens in the editor with its preview (spec
+        // 014): a one-line cell editor would flatten it. It reads the value at the table's
+        // commit, so its save stays bound to what the cell shows.
+        if let (Some(property), Some(text)) = (column.property(), old.as_str())
+            && reads_as_markdown(property)
+            && !studio_ui::text::is_plain(text)
+            && !matches!(self.cells.get(&key), Some(CellState::Draft { .. }))
+        {
+            window.dispatch_action(
+                Box::new(studio_actions::graph::OpenTextEditor {
+                    type_name: self.type_name.clone(),
+                    id: row.id.clone(),
+                    property: property.name.clone(),
+                    read_at: self.paging.pinned.clone(),
+                    text: None,
+                }),
+                cx,
+            );
+            return;
+        }
         let (text, notice) = match self.cells.remove(&key) {
             Some(CellState::Draft { text, notice }) => (text, notice),
             _ => (edit_text(&old), None),
@@ -6065,6 +6085,40 @@ mod tests {
             before,
             "the cell editor drew the grid"
         );
+    }
+
+    /// A text cell with more than one line or with markup is not edited in the one-line cell
+    /// editor, which would flatten it: it opens in the text editor (spec 014). A plain value
+    /// edits in the cell.
+    #[gpui::test]
+    async fn a_text_cell_with_lines_opens_in_the_editor_not_the_cell(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let rows = serde_json::json!([
+            {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
+            {"n": {"@id": "p2", "slug": "p2", "name": "first line\nsecond line"}},
+        ]);
+        let session = crate::test_support::session_reading(PEOPLE, rows, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            let col = table.columns.iter().position(|c| c.key == "name").unwrap();
+            table.start_edit(Cursor { row: 1, col }, window, cx);
+            assert!(table.editing.is_none(), "two lines go to the text editor");
+            table.start_edit(Cursor { row: 0, col }, window, cx);
+            assert!(table.editing.is_some(), "a plain value edits in the cell");
+        });
     }
 
     /// A node's page reads the node by id and names its tab by the node's label; it is one tab
