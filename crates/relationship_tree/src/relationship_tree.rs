@@ -66,6 +66,9 @@ pub fn init(cx: &mut App) {
         );
         let actions = cx.new(|cx| ExploreActions::new(&tree, cx));
         workspace.set_panel_actions(EXPLORE_PANEL, actions.into(), cx);
+        // Shown from its button or its key, the tree takes the keyboard.
+        let focused = tree.clone();
+        workspace.set_panel_focus(EXPLORE_PANEL, move |cx| Some(focused.focus_handle(cx)), cx);
         workspace.register_action(move |workspace, action: &OpenNode, window, cx| {
             if let Some(session) = workspace.session().cloned() {
                 workspace.activate_panel(EXPLORE_PANEL, cx);

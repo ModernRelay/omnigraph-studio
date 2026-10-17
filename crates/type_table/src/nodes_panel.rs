@@ -2,7 +2,10 @@
 //! under the canvas. A click on a type in the canvas browses it here; the table is the ordinary
 //! type table, editing included.
 
-use gpui::{AppContext as _, Context, Entity, Render, Subscription, WeakEntity, Window};
+use gpui::{
+    AppContext as _, Context, Entity, FocusHandle, Focusable as _, Render, Subscription,
+    WeakEntity, Window,
+};
 use graph_store::GraphSession;
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;
@@ -61,6 +64,13 @@ impl NodesPanel {
         let name = type_name.to_owned();
         self.table = Some(cx.new(|cx| TypeTable::new(workspace, session, name, None, window, cx)));
         cx.notify();
+    }
+}
+
+impl NodesPanel {
+    /// The table's focus, which takes the keyboard when the panel is shown from its button.
+    pub fn focus(&self, cx: &App) -> Option<FocusHandle> {
+        self.table.as_ref().map(|table| table.focus_handle(cx))
     }
 }
 

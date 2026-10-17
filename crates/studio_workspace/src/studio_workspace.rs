@@ -1403,6 +1403,7 @@ impl Workspace {
             home: position,
             view,
             actions: None,
+            focus: None,
         });
         cx.notify();
     }
@@ -1511,6 +1512,37 @@ impl Workspace {
         cx.notify();
     }
 
+    /// What takes the keyboard when the panel is shown from its button or its key.
+    pub fn set_panel_focus(
+        &mut self,
+        id: &str,
+        focus: impl Fn(&App) -> Option<FocusHandle> + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let focus: panels::PanelFocus = std::rc::Rc::new(focus);
+        for dock in [&mut self.left, &mut self.right, &mut self.bottom] {
+            if let Some(index) = dock.position_of(id) {
+                dock.panels[index].focus = Some(focus.clone());
+                break;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Shows a panel, as [`Self::activate_panel`], and gives it the keyboard when it takes it:
+    /// a panel asked for by its button or its key, as Zed focuses a dock's panel.
+    pub fn show_panel(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_panel(id, cx);
+        let focus = [&self.left, &self.right, &self.bottom]
+            .into_iter()
+            .find_map(|dock| dock.panels.iter().find(|panel| panel.id.as_ref() == id))
+            .and_then(|panel| panel.focus.clone())
+            .and_then(|focus| focus(cx));
+        if let Some(focus) = focus {
+            window.focus(&focus, cx);
+        }
+    }
+
     /// Shows a panel: makes it its dock's active panel and opens the dock.
     pub fn activate_panel(&mut self, id: &str, cx: &mut Context<Self>) {
         for dock in [&mut self.left, &mut self.right, &mut self.bottom] {
@@ -1537,6 +1569,7 @@ impl Workspace {
                     home: PanelPosition::Right,
                     view,
                     actions: None,
+                    focus: None,
                 });
                 // Selection shows the inspector but never reopens a dock the user closed.
                 let open = dock.open;
@@ -1974,9 +2007,11 @@ impl Workspace {
                                 }
                             })
                         })
-                        .on_click(move |_, _, cx| {
-                            this.update(cx, |w, cx| w.press_panel_button(position, &id, cx))
-                                .ok();
+                        .on_click(move |_, window, cx| {
+                            this.update(cx, |w, cx| {
+                                w.press_panel_button(position, &id, window, cx)
+                            })
+                            .ok();
                         })
                     })
                     .menu(move |window, cx| {
@@ -2006,12 +2041,18 @@ impl Workspace {
 
     /// A panel's status-bar button: hides the dock when the panel is the one it shows, else
     /// shows the panel, opening its dock.
-    fn press_panel_button(&mut self, position: PanelPosition, id: &str, cx: &mut Context<Self>) {
+    fn press_panel_button(
+        &mut self,
+        position: PanelPosition,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let dock = self.dock_mut(position);
         if dock.open && dock.active_id().as_deref() == Some(id) {
             self.set_dock_open(position, false, cx);
         } else {
-            self.activate_panel(id, cx);
+            self.show_panel(id, window, cx);
         }
     }
 
@@ -3457,8 +3498,8 @@ impl Render for Workspace {
                 this.close_clean(ids, window, cx);
             }))
             .on_action(cx.listener(
-                |this, action: &studio_actions::workspace::ActivatePanel, _, cx| {
-                    this.activate_panel(&action.id, cx)
+                |this, action: &studio_actions::workspace::ActivatePanel, window, cx| {
+                    this.show_panel(&action.id, window, cx)
                 },
             ))
             .on_action(cx.listener(|this, _: &GoBack, window, cx| {
@@ -4245,7 +4286,7 @@ mod tests {
             cx.set_global(StudioSettings::default());
         });
         let (workspace, cx) = cx.add_window_view(Workspace::new);
-        workspace.update_in(cx, |workspace, _, cx| {
+        workspace.update_in(cx, |workspace, window, cx| {
             for id in ["types", "explore"] {
                 let view = cx.new(|_| Field);
                 workspace.add_panel(
@@ -4257,28 +4298,37 @@ mod tests {
                     cx,
                 );
             }
+            // Explore has keys of its own: showing it from its button gives it the keyboard,
+            // as Zed focuses a dock's panel.
+            let explore_focus = cx.focus_handle();
+            let provided = explore_focus.clone();
+            workspace.set_panel_focus("explore", move |_| Some(provided.clone()), cx);
             let left = |w: &Workspace| (w.left.open, w.left.active_id());
             assert_eq!(left(workspace), (true, Some("types".into())));
 
-            workspace.press_panel_button(PanelPosition::Left, "explore", cx);
+            workspace.press_panel_button(PanelPosition::Left, "explore", window, cx);
             assert_eq!(
                 left(workspace),
                 (true, Some("explore".into())),
                 "shows explore"
             );
-            workspace.press_panel_button(PanelPosition::Left, "explore", cx);
+            assert!(
+                explore_focus.is_focused(window),
+                "and gives it the keyboard"
+            );
+            workspace.press_panel_button(PanelPosition::Left, "explore", window, cx);
             assert_eq!(
                 left(workspace),
                 (false, Some("explore".into())),
                 "hides the dock"
             );
-            workspace.press_panel_button(PanelPosition::Left, "explore", cx);
+            workspace.press_panel_button(PanelPosition::Left, "explore", window, cx);
             assert_eq!(
                 left(workspace),
                 (true, Some("explore".into())),
                 "opens it again"
             );
-            workspace.press_panel_button(PanelPosition::Left, "types", cx);
+            workspace.press_panel_button(PanelPosition::Left, "types", window, cx);
             assert_eq!(left(workspace), (true, Some("types".into())));
         });
     }

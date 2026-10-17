@@ -190,6 +190,12 @@ pub fn init(cx: &mut App) {
             nodes.clone().into(),
             cx,
         );
+        let focused = nodes.clone();
+        workspace.set_panel_focus(
+            nodes_panel::NODES_PANEL,
+            move |cx| focused.read(cx).focus(cx),
+            cx,
+        );
         workspace.register_action(move |workspace, action: &BrowseType, window, cx| {
             nodes.update(cx, |panel, cx| panel.browse(&action.type_name, window, cx));
             workspace.activate_panel(nodes_panel::NODES_PANEL, cx);

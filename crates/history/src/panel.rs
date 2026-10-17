@@ -1,7 +1,10 @@
 //! History in the bottom dock (spec 009): the window's branch, rows only, rebuilt when the
 //! window opens another graph. A commit opens in its own tab.
 
-use gpui::{AppContext as _, Context, Entity, Render, Subscription, WeakEntity, Window};
+use gpui::{
+    AppContext as _, Context, Entity, FocusHandle, Focusable as _, Render, Subscription,
+    WeakEntity, Window,
+};
 use graph_store::GraphSession;
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;
@@ -11,6 +14,13 @@ use crate::view::HistoryView;
 pub(crate) struct HistoryPanel {
     view: Option<Entity<HistoryView>>,
     _subscription: Option<Subscription>,
+}
+
+impl HistoryPanel {
+    /// The list's focus, which takes the keyboard when the panel is shown from its button.
+    pub(crate) fn focus(&self, cx: &App) -> Option<FocusHandle> {
+        self.view.as_ref().map(|view| view.focus_handle(cx))
+    }
 }
 
 impl HistoryPanel {

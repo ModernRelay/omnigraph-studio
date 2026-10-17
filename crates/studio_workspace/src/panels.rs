@@ -6,7 +6,9 @@
 //!
 //! Documents (type tables, queries, history) are items in the center, not panels.
 
-use gpui::{AnyView, SharedString};
+use std::rc::Rc;
+
+use gpui::{AnyView, App, FocusHandle, SharedString};
 use serde::{Deserialize, Serialize};
 use ui::IconName;
 
@@ -66,7 +68,13 @@ pub struct PanelEntry<V = AnyView> {
     /// Small buttons on the right of the panel's title line (search, new), as Delta and Zed
     /// put a list's actions in its header.
     pub actions: Option<V>,
+    /// What takes the keyboard when the panel is shown from its button or its key, as Zed
+    /// focuses a dock's panel; `None` for a panel with no keys of its own.
+    pub focus: Option<PanelFocus>,
 }
+
+/// The panel's focus as it is now (its view may be replaced, as when the graph changes).
+pub type PanelFocus = Rc<dyn Fn(&App) -> Option<FocusHandle>>;
 
 /// The panels at one position.
 pub struct Dock<V = AnyView> {
@@ -124,6 +132,9 @@ impl<V> Dock<V> {
             Some(index) => {
                 if panel.actions.is_none() {
                     panel.actions = self.panels[index].actions.take();
+                }
+                if panel.focus.is_none() {
+                    panel.focus = self.panels[index].focus.take();
                 }
                 self.panels[index] = panel;
             }
@@ -184,6 +195,7 @@ mod tests {
             home: PanelPosition::Left,
             view: (),
             actions: None,
+            focus: None,
         }
     }
 

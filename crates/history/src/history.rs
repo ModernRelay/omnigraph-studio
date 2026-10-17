@@ -54,9 +54,10 @@ pub fn init(cx: &mut App) {
                 "history",
                 "History",
                 IconName::HistoryRerun,
-                panel.into(),
+                panel.clone().into(),
                 cx,
             );
+            workspace.set_panel_focus("history", move |cx| panel.read(cx).focus(cx), cx);
         }
         workspace.register_action(|workspace, _: &OpenHistory, window, cx| {
             let Some(session) = workspace.session().cloned() else {
