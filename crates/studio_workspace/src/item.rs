@@ -2,8 +2,8 @@
 //! `workspace::Item`.
 
 use gpui::{
-    AnyElement, AnyView, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    Render, SharedString, Window,
+    Action, AnyElement, AnyView, App, Context, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, Render, SharedString, Window,
 };
 use ui::IconName;
 
@@ -17,14 +17,42 @@ pub enum ItemEvent {
     Close,
 }
 
-/// What a tab shows in the document column's footer strip (spec 002, after Delta's footers):
-/// facts about the open document after the workspace's graph and branch at the start, and the
-/// tab's controls and key hints at the end. The workspace draws the strip, so every tab's footer
-/// sits on the same baseline as the sidebar's.
+/// What a tab adds to the status bar (spec 002): a few facts after the graph and branch, as
+/// Zed's status items, and the keys it answers, which the bar lists in a panel behind one
+/// button rather than spelling them out. A tab's controls belong in the tab.
 #[derive(Default)]
 pub struct ItemFooter {
     pub start: Vec<AnyElement>,
     pub end: Vec<AnyElement>,
+    pub keys: Vec<KeyHint>,
+}
+
+/// One key a tab answers, as its keys panel lists it: what it does, and the action whose
+/// binding is shown, looked up from `focus` so the tab's own context decides it.
+pub struct KeyHint {
+    pub label: SharedString,
+    pub action: Box<dyn Action>,
+    pub focus: FocusHandle,
+}
+
+impl KeyHint {
+    pub fn new(label: impl Into<SharedString>, action: &dyn Action, focus: &FocusHandle) -> Self {
+        Self {
+            label: label.into(),
+            action: action.boxed_clone(),
+            focus: focus.clone(),
+        }
+    }
+}
+
+impl Clone for KeyHint {
+    fn clone(&self) -> Self {
+        Self {
+            label: self.label.clone(),
+            action: self.action.boxed_clone(),
+            focus: self.focus.clone(),
+        }
+    }
 }
 
 pub trait Item: Render + Focusable + EventEmitter<ItemEvent> {

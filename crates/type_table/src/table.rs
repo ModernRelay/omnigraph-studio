@@ -35,7 +35,7 @@ use studio_actions::table::{
 };
 use studio_ui::{ColumnDrag, ColumnResize, ROW_HEIGHT};
 use studio_workspace::{
-    Item, ItemEvent, ItemFooter, SavedItem, ToastKind, Workspace, WorkspaceEvent,
+    Item, ItemEvent, ItemFooter, KeyHint, SavedItem, ToastKind, Workspace, WorkspaceEvent,
 };
 use ui::prelude::*;
 use ui::{
@@ -5869,44 +5869,9 @@ impl TypeTable {
     /// read at, then the keys that act on the cursor, as key caps (spec 002: layout, not
     /// sentences).
     fn footer_parts(&self, cx: &mut Context<Self>) -> ItemFooter {
-        let loaded = match (&self.count, self.rows.len()) {
-            (_, 0) => None,
-            (Loadable::Loaded(total), n) if self.filters.is_empty() => Some(format!(
-                "{} of {}",
-                format_count(n as i64),
-                format_count(*total)
-            )),
-            (_, n) => Some(format_count(n as i64)),
-        };
+        // The status bar names only what is happening: the row count is in the toolbar, and the
+        // keys are behind its keyboard button.
         let mut start = Vec::new();
-        if let Some(loaded) = loaded {
-            start.push(
-                div()
-                    .id("loaded-rows")
-                    .tooltip(Tooltip::text(if self.paging.exhausted {
-                        "Every row is loaded"
-                    } else {
-                        "Rows loaded so far; more load as you scroll"
-                    }))
-                    .child(studio_ui::ds::meta(IconName::Hash, loaded))
-                    .into_any_element(),
-            );
-        }
-        if let Some(commit) = self.paging.pinned.clone() {
-            start.push(
-                div()
-                    .id("pinned-commit")
-                    .tooltip(Tooltip::text(format!(
-                        "Every page of this table is read at commit {commit}"
-                    )))
-                    .child(studio_ui::ds::meta_code(
-                        IconName::GitCommit,
-                        short_commit(&commit),
-                        cx,
-                    ))
-                    .into_any_element(),
-            );
-        }
         if self.loading_more {
             start.push(studio_ui::ds::spinner().into_any_element());
         }
@@ -5931,38 +5896,46 @@ impl TypeTable {
             );
         }
         let focus = self.focus_handle.clone();
-        let mut hints = h_flex().gap_4().items_center();
-        hints = match (self.editing.is_some(), self.kind) {
+        let key =
+            |label: &str, action: &dyn gpui::Action| KeyHint::new(label.to_owned(), action, &focus);
+        let keys = match (self.editing.is_some(), self.kind) {
+            (true, _) => vec![
+                key("Save", &ConfirmEdit),
+                key("Keep as draft", &StageEdit),
+                key("Cancel", &Cancel),
+            ],
             // A table pinned to a commit only reads.
-            (false, _) if self.at_commit.is_some() => hints
-                .child(studio_ui::ds::key_hint(&PeekRow, "Peek", &focus, cx))
-                .when(self.kind == TableKind::Node, |hints| {
-                    hints.child(studio_ui::ds::key_hint(&OpenRowPage, "Open", &focus, cx))
-                }),
-            (true, _) => hints
-                .child(studio_ui::ds::key_hint(&ConfirmEdit, "Save", &focus, cx))
-                .child(studio_ui::ds::key_hint(
-                    &StageEdit,
-                    "Keep as draft",
-                    &focus,
-                    cx,
-                ))
-                .child(studio_ui::ds::key_hint(&Cancel, "Cancel", &focus, cx)),
-            (false, TableKind::Node) => hints
-                .child(studio_ui::ds::key_hint(&EditCell, "Edit", &focus, cx))
-                .child(studio_ui::ds::key_hint(&PeekRow, "Peek", &focus, cx))
-                .child(studio_ui::ds::key_hint(&OpenRowPage, "Open", &focus, cx))
-                .child(studio_ui::ds::key_hint(&ExploreRow, "Explore", &focus, cx))
-                .child(studio_ui::ds::key_hint(&InsertRow, "Row", &focus, cx))
-                .child(studio_ui::ds::key_hint(&DeleteRow, "Delete", &focus, cx)),
-            (false, TableKind::Edge) => hints
-                .child(studio_ui::ds::key_hint(&PeekRow, "Peek", &focus, cx))
-                .child(studio_ui::ds::key_hint(&InsertRow, "Row", &focus, cx))
-                .child(studio_ui::ds::key_hint(&DeleteRow, "Delete", &focus, cx)),
+            (false, kind) if self.at_commit.is_some() => {
+                let mut keys = vec![key("Peek", &PeekRow), key("Copy", &CopyCell)];
+                if kind == TableKind::Node {
+                    keys.insert(1, key("Open page", &OpenRowPage));
+                }
+                keys
+            }
+            (false, TableKind::Node) => vec![
+                key("Edit", &EditCell),
+                key("Peek", &PeekRow),
+                key("Open page", &OpenRowPage),
+                key("Explore", &ExploreRow),
+                key("Copy", &CopyCell),
+                key("Filter by this value", &FilterBySelection),
+                key("New row", &InsertRow),
+                key("Delete row", &DeleteRow),
+                key("Save drafts", &SaveDrafts),
+                key("Refresh", &RefreshTable),
+            ],
+            (false, TableKind::Edge) => vec![
+                key("Peek", &PeekRow),
+                key("Copy", &CopyCell),
+                key("New row", &InsertRow),
+                key("Delete row", &DeleteRow),
+                key("Refresh", &RefreshTable),
+            ],
         };
         ItemFooter {
             start,
-            end: vec![hints.into_any_element()],
+            end: Vec::new(),
+            keys,
         }
     }
 }

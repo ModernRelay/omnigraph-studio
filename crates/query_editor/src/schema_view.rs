@@ -7,8 +7,7 @@ use editor::scroll::Autoscroll;
 use editor::{Editor, MultiBufferOffset, SelectionEffects};
 use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString};
 use graph_store::{GraphSession, Loadable, SessionEvent};
-use studio_ui::ds;
-use studio_workspace::{Item, ItemEvent, ItemFooter, SavedItem};
+use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 
 use crate::syntax::{Syntax, language};
@@ -51,23 +50,6 @@ impl Item for SchemaView {
         Some(SavedItem {
             kind: SCHEMA_KEY.into(),
             data: serde_json::Value::Null,
-        })
-    }
-
-    fn footer(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<ItemFooter> {
-        let schema = self.session.read(cx).schema_model()?;
-        let count =
-            |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-        Some(ItemFooter {
-            start: vec![
-                ds::text::meta(format!(
-                    "{} · {}",
-                    count(schema.nodes.len(), "type", "types"),
-                    count(schema.edges.len(), "relationship", "relationships"),
-                ))
-                .into_any_element(),
-            ],
-            end: vec![ds::text::meta("Read-only").into_any_element()],
         })
     }
 }

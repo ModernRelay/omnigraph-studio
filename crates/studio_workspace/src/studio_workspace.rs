@@ -37,7 +37,7 @@ use studio_settings::{BottomDockLayout, StudioSettings};
 use ui::prelude::*;
 use ui::{ButtonLike, ContextMenu, Indicator, PopoverMenu, Tooltip, right_click_menu};
 
-pub use item::{Item, ItemEvent, ItemFooter, ItemHandle};
+pub use item::{Item, ItemEvent, ItemFooter, ItemHandle, KeyHint};
 pub use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};
 pub use panels::{Dock, PanelEntry, PanelPosition};
 pub use persistence::{
@@ -2714,7 +2714,8 @@ impl Workspace {
         let status_background = cx.theme().colors().status_bar_background;
         let glass = studio_ui::ds::is_glass(cx);
         let hairline = studio_ui::ds::surface::rule(cx);
-        let footer = footer.unwrap_or_default();
+        let mut footer = footer.unwrap_or_default();
+        let keys = std::mem::take(&mut footer.keys);
         let has_start = !footer.start.is_empty();
         let shown = self.session.is_some();
         let running = self.session.as_ref().and_then(|session| {
@@ -2762,6 +2763,33 @@ impl Workspace {
                     .child(studio_ui::ds::text::meta(text).single_line())
             }))
             .children(footer.end)
+            // The tab's keys, behind one button: the bar names facts, not shortcuts.
+            .when(!keys.is_empty(), |bar| {
+                bar.child(
+                    PopoverMenu::new("keys-panel")
+                        .anchor(gpui::Anchor::BottomRight)
+                        .attach(gpui::Anchor::TopRight)
+                        .trigger_with_tooltip(
+                            IconButton::new("keys", IconName::Keyboard).icon_size(IconSize::Small),
+                            Tooltip::text("Keys for this tab"),
+                        )
+                        // Zed's context menu: each key is an entry that runs it, its binding
+                        // read in the tab's own context.
+                        .menu(move |window, cx| {
+                            let keys = keys.clone();
+                            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                if let Some(first) = keys.first() {
+                                    menu = menu.context(first.focus.clone());
+                                }
+                                menu = menu.header("Keys");
+                                for key in &keys {
+                                    menu = menu.action(key.label.clone(), key.action.boxed_clone());
+                                }
+                                menu
+                            }))
+                        }),
+                )
+            })
             .when(has_end && performance.is_some(), |bar| {
                 bar.child(studio_ui::ds::divider_v(cx))
             })

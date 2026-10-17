@@ -19,7 +19,7 @@ use graph_store::{GraphSession, Loadable};
 use serde_json::json;
 use studio_actions::canvas::{ActualSize, FitToWindow, ZoomIn, ZoomOut};
 use studio_ui::ds;
-use studio_workspace::{Item, ItemEvent, ItemFooter, SavedItem};
+use studio_workspace::{Item, ItemEvent, ItemFooter, KeyHint, SavedItem};
 use ui::Tooltip;
 use ui::prelude::*;
 
@@ -842,7 +842,17 @@ impl Item for BlobView {
                     .into_any_element(),
             );
         }
-        Some(ItemFooter { start, end })
+        let keys = if zoomable {
+            let focus = &self.focus_handle;
+            vec![
+                KeyHint::new("Zoom in", &ZoomIn, focus),
+                KeyHint::new("Zoom out", &ZoomOut, focus),
+                KeyHint::new("Actual size", &ActualSize, focus),
+            ]
+        } else {
+            Vec::new()
+        };
+        Some(ItemFooter { start, end, keys })
     }
 }
 

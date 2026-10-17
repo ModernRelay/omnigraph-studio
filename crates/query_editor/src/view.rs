@@ -27,12 +27,12 @@ use graph_client::api::{
 use graph_client::{ReadError, WriteOutcome};
 use graph_store::{GraphSession, SessionEvent};
 use serde_json::{Map, Value};
-use studio_actions::query::{CopyCell, CopyRow, Explain, Run};
+use studio_actions::query::{CopyCell, CopyRow, Explain, Run, Save, SaveAs};
 use studio_ui::{
     ColumnDrag, ColumnResize, GridColumn, ROW_HEIGHT, format_value, grid_cell, grid_header,
     is_numeric, resizable_grid_header, short_commit_id,
 };
-use studio_workspace::{Item, ItemEvent, ItemFooter, SavedItem};
+use studio_workspace::{Item, ItemEvent, ItemFooter, KeyHint, SavedItem};
 use ui::prelude::*;
 use ui::{ContextMenu, KeyBinding, PopoverMenu, Tooltip};
 
@@ -1694,18 +1694,29 @@ impl QueryEditor {
 
     fn footer_parts(&self, cx: &mut Context<Self>) -> ItemFooter {
         use studio_ui::ds;
-        let commit_meta = |id: &'static str, commit: &str, tip: String, cx: &App| {
-            div()
-                .id(id)
-                .tooltip(Tooltip::text(tip))
-                .child(ds::meta_code(IconName::GitCommit, short_commit(commit), cx))
-                .into_any_element()
-        };
         let mut start = Vec::new();
         let mut end = Vec::new();
+        // The editor's keys, then the result's: the status bar lists them behind its keyboard
+        // button.
+        let editor_focus = self.editor.focus_handle(cx);
+        let mut keys = vec![
+            KeyHint::new("Run the query under the cursor", &Run, &editor_focus),
+            KeyHint::new("Show its plan", &Explain, &editor_focus),
+            KeyHint::new("Save", &Save, &editor_focus),
+            KeyHint::new("Save as…", &SaveAs, &editor_focus),
+        ];
         match &self.output {
             Output::Rows(rows) => {
-                start.push(ds::meta(IconName::Hash, rows_label(rows.row_count)).into_any_element());
+                // The commit it was read at is the count's tooltip, not a fact of its own.
+                start.push(
+                    div()
+                        .id("read-rows")
+                        .when_some(rows.commit.clone(), |fact, commit| {
+                            fact.tooltip(Tooltip::text(format!("Read at graph commit {commit}")))
+                        })
+                        .child(ds::meta(IconName::Hash, rows_label(rows.row_count)))
+                        .into_any_element(),
+                );
                 start.push(
                     ds::meta(IconName::Clock, format_elapsed(rows.elapsed)).into_any_element(),
                 );
@@ -1716,14 +1727,7 @@ impl QueryEditor {
                         ds::meta(IconName::GitBranch, rows.target.clone()).into_any_element(),
                     );
                 }
-                if let Some(commit) = &rows.commit {
-                    start.push(commit_meta(
-                        "read-commit",
-                        commit,
-                        format!("Read at graph commit {commit}"),
-                        cx,
-                    ));
-                }
+
                 if let Some(graph) = rows.graph.clone() {
                     let title = format!("{} · result", rows.label);
                     end.push(
@@ -1750,26 +1754,26 @@ impl QueryEditor {
                 }
                 if self.selected.is_some() {
                     let focus = &self.results_focus;
-                    end.push(ds::key_hint(&CopyCell, "Copy", focus, cx).into_any_element());
-                    end.push(ds::key_hint(&CopyRow, "Copy row", focus, cx).into_any_element());
+                    keys.push(KeyHint::new("Copy cell", &CopyCell, focus));
+                    keys.push(KeyHint::new("Copy row", &CopyRow, focus));
                 }
             }
             Output::Plan(plan) => {
                 start.push(
-                    ds::meta(IconName::ListTree, format!("Plan of {}", plan.label))
+                    div()
+                        .id("plan-of")
+                        .when_some(plan.commit.clone(), |fact, commit| {
+                            fact.tooltip(Tooltip::text(format!("Planned at graph commit {commit}")))
+                        })
+                        .child(ds::meta(
+                            IconName::ListTree,
+                            format!("Plan of {}", plan.label),
+                        ))
                         .into_any_element(),
                 );
                 start.push(
                     ds::meta(IconName::Clock, format_elapsed(plan.elapsed)).into_any_element(),
                 );
-                if let Some(commit) = &plan.commit {
-                    start.push(commit_meta(
-                        "plan-commit",
-                        commit,
-                        format!("Planned at graph commit {commit}"),
-                        cx,
-                    ));
-                }
             }
             Output::Running { label } => {
                 start.push(
@@ -1804,7 +1808,7 @@ impl QueryEditor {
                 }
             }
         }
-        ItemFooter { start, end }
+        ItemFooter { start, end, keys }
     }
 
     /// The page's toolbar, as the table's: what the page runs on the leading side (the query
