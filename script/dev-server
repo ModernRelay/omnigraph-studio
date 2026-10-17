@@ -6,7 +6,8 @@
 #   script/dev-server            # first run applies the cluster and loads dev/seed.jsonl
 #   script/dev-server --reset    # start again from an empty graph
 #
-# Needs OmniGraph 0.13 (`omnigraph` and `omnigraph-server`). Data lives in dev/.data.
+# Needs `omnigraph` and `omnigraph-server` speaking HTTP contract 0.13: OmniGraph 0.13, or 0.14
+# built from main. Data lives in dev/.data.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -20,9 +21,15 @@ if [[ "${1:-}" == "--reset" ]]; then
   rm -rf "$DATA"
 fi
 
-version=$("$CLI" version | head -1)
-if [[ "$version" != "omnigraph 0.13."* ]]; then
-  echo "dev-server needs OmniGraph 0.13; found: $version (set OMNIGRAPH_BIN)" >&2
+# Studio speaks HTTP contract 0.13. CLIs after 0.13.0 print the contract they speak (0.14 still
+# speaks 0.13); 0.13.0 prints only its version.
+version=$("$CLI" version)
+contract=$(sed -n 's/^http-contract //p' <<< "$version")
+if [[ -z "$contract" && "$version" == "omnigraph 0.13."* ]]; then
+  contract=0.13
+fi
+if [[ "$contract" != "0.13" ]]; then
+  echo "dev-server needs OmniGraph speaking HTTP contract 0.13; found: ${version%%$'\n'*}${contract:+, http-contract $contract} (set OMNIGRAPH_BIN)" >&2
   exit 1
 fi
 

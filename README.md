@@ -28,8 +28,8 @@ Requirements:
 - macOS: the Command Line Tools (GPUI compiles its Metal shaders when Studio starts); full
   Xcode to compile them into a release build (`script/bundle-mac`). Linux: the Wayland, X11 and
   Vulkan development packages listed in `.github/workflows/ci.yml`.
-- An OmniGraph 0.13 server. For the sample graph, the `omnigraph` and `omnigraph-server` 0.13
-  binaries on `PATH`.
+- An OmniGraph server that speaks HTTP contract 0.13: 0.13, or 0.14 built from main. For the
+  sample graph, its `omnigraph` and `omnigraph-server` binaries on `PATH`.
 
 Run against the sample graph (200 people, 25 companies, 40 projects):
 
