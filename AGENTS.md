@@ -45,8 +45,12 @@ cargo deny check
 python3 script/check-layers.py   # crate layer rule; keep its table in step with docs/architecture.md
 ```
 
-- macOS needs full Xcode for the Metal shader compiler (`xcrun -sdk macosx metal`). On macOS 26,
-  also run `xcodebuild -downloadComponent MetalToolchain` once.
+- macOS needs the Command Line Tools: the default `runtime-shaders` feature compiles GPUI's Metal
+  shaders when Studio starts. `script/bundle-mac` compiles them at build time when full Xcode's
+  Metal compiler is present (`xcrun -sdk macosx metal`); on macOS 26, also run
+  `xcodebuild -downloadComponent MetalToolchain` once.
+- Every platform needs CMake: Zed's `language` crate turns on tree-sitter's `wasm` feature, whose
+  `wasmtime-c-api-impl` build runs `cmake`. CI runners have it; a fresh Mac does not.
 - Linux needs the Wayland, X11, xkbcommon, fontconfig and Vulkan development packages.
 - A first build of Zed's GPUI crates needs several GB of disk. Check free space first.
 - Test keyboard behavior headlessly, as Zed does: `#[gpui::test]`, `studio_theme::init_test`
