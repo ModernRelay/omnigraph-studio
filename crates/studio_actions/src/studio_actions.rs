@@ -392,6 +392,8 @@ pub mod node {
             ExpandField,
             /// Save the text in the editor.
             SaveText,
+            /// Save every unsaved change of the node shown as one commit.
+            SaveNodeDrafts,
         ]
     );
 }

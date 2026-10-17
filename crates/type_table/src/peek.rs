@@ -14,11 +14,11 @@ use gpui::{
 };
 use gq_language::input::{edit_text, parse_input};
 use gq_language::{Direction, RelationshipGroup, SchemaModel, builder};
-use graph_store::{GraphSession, Loadable, SessionEvent};
+use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Map, Value};
 use studio_actions::graph::{OpenBlob, OpenNodePage, PeekNode};
-use studio_actions::node::{CancelField, ExpandField, SaveField};
+use studio_actions::node::{CancelField, ExpandField, SaveField, SaveNodeDrafts};
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 use ui::prelude::*;
 use ui::{ContextMenu, Indicator, PopoverMenu, Switch, ToggleState, Tooltip, rems_from_px};
@@ -185,6 +185,11 @@ pub struct NodePeek {
     edge_writes: HashSet<usize>,
     /// Why a group's last write did not land.
     group_notices: HashMap<usize, Notice>,
+    /// The node's drafts being saved together.
+    saving_drafts: bool,
+    /// Why the drafts' last save did not land; the second press of Discard drops them.
+    drafts_notice: Option<Notice>,
+    confirm_discard: bool,
     _tasks: Vec<Task<()>>,
     _subscription: Subscription,
 }
@@ -247,6 +252,11 @@ impl NodePeek {
     ) -> Self {
         let schema = session.read(cx).schema_model();
         let subscription = cx.subscribe(&session, |this: &mut Self, session, event, cx| {
+            // Its node's drafts are the session's, kept from a table or another view too.
+            if let SessionEvent::DraftsChanged = event {
+                cx.notify();
+                return;
+            }
             // A view made before the schema was read (a page restored at start) reads its node
             // once the schema is in.
             if let SessionEvent::SchemaChanged = event
@@ -294,6 +304,9 @@ impl NodePeek {
             removing: None,
             edge_writes: HashSet::new(),
             group_notices: HashMap::new(),
+            saving_drafts: false,
+            drafts_notice: None,
+            confirm_discard: false,
             _tasks: Vec::new(),
             _subscription: subscription,
         };
@@ -978,6 +991,51 @@ impl NodePeek {
             .unwrap_or(Value::Null)
     }
 
+    fn draft_key(&self, name: &str) -> Option<DraftKey> {
+        let PeekSubject::Node { type_name, id } = &self.subject else {
+            return None;
+        };
+        Some(DraftKey {
+            type_name: type_name.clone(),
+            id: id.clone(),
+            property: name.to_owned(),
+        })
+    }
+
+    /// The property's unsaved value, kept in the session's drafts.
+    fn draft_of(&self, name: &str, cx: &App) -> Option<DraftEntry> {
+        let key = self.draft_key(name)?;
+        self.session.read(cx).draft(&key).cloned()
+    }
+
+    /// The node's unsaved values, by property.
+    fn node_drafts(&self, cx: &App) -> Vec<(String, DraftEntry)> {
+        let PeekSubject::Node { type_name, id } = &self.subject else {
+            return Vec::new();
+        };
+        self.session
+            .read(cx)
+            .drafts()
+            .filter(|(key, _)| key.type_name == *type_name && key.id == *id)
+            .map(|(key, entry)| (key.property.clone(), entry.clone()))
+            .collect()
+    }
+
+    fn put_draft(&mut self, name: &str, old: Value, text: String, cx: &mut Context<Self>) {
+        if let Some(key) = self.draft_key(name) {
+            self.session.update(cx, |session, cx| {
+                session.set_draft(key, DraftEntry { old, text }, cx)
+            });
+        }
+    }
+
+    fn drop_draft(&mut self, name: &str, cx: &mut Context<Self>) {
+        if let Some(key) = self.draft_key(name) {
+            self.session
+                .update(cx, |session, cx| session.remove_draft(&key, cx));
+        }
+    }
+
     /// Opens a property's editor with its value, or focuses it when it is open.
     fn start_edit(
         &mut self,
@@ -994,7 +1052,11 @@ impl NodePeek {
             return;
         }
         let old = self.value_of(&name);
-        let text = edit_text(&old);
+        // A draft opens with its text; the save binds to the value the view shows.
+        let text = self
+            .draft_of(&name, cx)
+            .map(|draft| draft.text)
+            .unwrap_or_else(|| edit_text(&old));
         // Text, which reads as markdown, takes line breaks (⇧↵); other values are one line.
         let lines = reads_as_markdown(&property);
         let editor = cx.new(|cx| {
@@ -1027,19 +1089,29 @@ impl NodePeek {
         cx.notify();
     }
 
-    /// Leaving a field closes it when nothing changed; a changed one stays open, as the draft it
-    /// is, until it is saved or cancelled. Nothing is written by leaving a field.
+    /// Leaving a field closes it: a changed value is kept as a draft, the session's (spec 014),
+    /// which a table of the type shows too and ⌘S saves with the node's others; one typed back
+    /// to what the node holds lets the draft go. Nothing is written by leaving a field.
     fn left_field(&mut self, name: &str, cx: &mut Context<Self>) {
         let Some(edit) = self.edits.get(name) else {
             return;
         };
+        // A field with a notice stays open, so its reason stays in view.
+        if edit.notice.is_some() {
+            return;
+        }
         let text = edit.editor.read(cx).text(cx);
         let unchanged =
             parse_input(&edit.property, &text).is_ok_and(|value| same_value(&value, &edit.old));
-        if unchanged && edit.notice.is_none() {
-            self.edits.remove(name);
-            cx.notify();
+        let old = edit.old.clone();
+        self.edits.remove(name);
+        if unchanged {
+            self.drop_draft(name, cx);
+        } else {
+            self.put_draft(name, old, text, cx);
+            self.confirm_discard = false;
         }
+        cx.notify();
     }
 
     /// The open field that has the keyboard.
@@ -1071,7 +1143,8 @@ impl NodePeek {
         let typed = self
             .edits
             .remove(name)
-            .map(|edit| edit.editor.read(cx).text(cx));
+            .map(|edit| edit.editor.read(cx).text(cx))
+            .or_else(|| self.draft_of(name, cx).map(|draft| draft.text));
         window.dispatch_action(
             Box::new(studio_actions::graph::OpenTextEditor {
                 type_name,
@@ -1181,6 +1254,7 @@ impl NodePeek {
         self.saving.remove(&name);
         match result {
             SaveResult::Saved { commit, parent } => {
+                self.drop_draft(&name, cx);
                 // Made on the commit shown, the view holds the new commit's state; otherwise
                 // someone else committed in between and the view is behind.
                 if parent.is_some() && parent == self.snapshot {
@@ -1585,6 +1659,191 @@ impl NodePeek {
         }));
     }
 
+    /// ⌘S: the node's drafts as one mutation, bound to the values the view shows, so one commit.
+    /// A draft that does not parse opens instead, and nothing is sent.
+    fn save_drafts(&mut self, _: &SaveNodeDrafts, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving_drafts || !self.edits_relationships() {
+            return;
+        }
+        // An open field joins the others.
+        let open: Vec<String> = self.edits.keys().cloned().collect();
+        for name in open {
+            self.left_field(&name, cx);
+        }
+        let (PeekSubject::Node { type_name, id }, Some(schema)) =
+            (self.subject.clone(), self.schema.clone())
+        else {
+            return;
+        };
+        let mut cells = Vec::new();
+        for (name, draft) in self.node_drafts(cx) {
+            let Some(property) = schema
+                .node(&type_name)
+                .and_then(|node| node.property(&name))
+                .cloned()
+            else {
+                continue;
+            };
+            let old = self.value_of(&name);
+            match parse_input(&property, &draft.text) {
+                Ok(new) if same_value(&new, &old) => self.drop_draft(&name, cx),
+                Ok(new) => cells.push((name, old, new)),
+                Err(message) => {
+                    let notice = Notice::new(Tone::Invalid, message);
+                    self.reopen(property, old, draft.text, notice, window, cx);
+                    return;
+                }
+            }
+        }
+        if cells.is_empty() {
+            cx.notify();
+            return;
+        }
+        let row = builder::RowEdit {
+            id: id.clone(),
+            cells: cells.clone(),
+        };
+        let query = match builder::update_rows(&schema, &type_name, &[row]) {
+            Ok(query) => query,
+            Err(error) => {
+                self.drafts_notice = Some(Notice::new(Tone::Invalid, error.to_string()));
+                cx.notify();
+                return;
+            }
+        };
+        let branch = self.session.read(cx).branch.clone();
+        let description = format!("Save {} changes of {id}", cells.len());
+        let write = self.session.update(cx, |session, cx| {
+            session.write(&query, None, description, cx)
+        });
+        self.saving_drafts = true;
+        self.drafts_notice = None;
+        for (name, _, _) in &cells {
+            self.saving.insert(name.clone());
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let result = save_result(&write.await, &branch);
+            this.update(cx, |this, cx| {
+                this.saving_drafts = false;
+                for (name, _, _) in &cells {
+                    this.saving.remove(name);
+                }
+                match result {
+                    SaveResult::Saved { commit, parent } => {
+                        for (name, _, new) in cells {
+                            this.restore(&name, new);
+                            this.drop_draft(&name, cx);
+                        }
+                        if parent.is_some() && parent == this.snapshot {
+                            this.snapshot = Some(commit);
+                        } else {
+                            this.newer = true;
+                        }
+                    }
+                    SaveResult::NoMatch => {
+                        this.newer = true;
+                        this.drafts_notice = Some(Notice::new(
+                            Tone::Conflict,
+                            "A value changed elsewhere; nothing was written and your changes \
+                             are kept. Refresh reads it now.",
+                        ));
+                    }
+                    SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
+                        this.drafts_notice = Some(notice);
+                    }
+                }
+                if this.saving.is_empty() && this.edge_writes.is_empty() {
+                    this.compare_head(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Drops the node's drafts, on the second press of Discard.
+    fn discard_drafts(&mut self, cx: &mut Context<Self>) {
+        if !self.confirm_discard {
+            self.confirm_discard = true;
+            cx.notify();
+            return;
+        }
+        self.confirm_discard = false;
+        self.drafts_notice = None;
+        for (name, _) in self.node_drafts(cx) {
+            self.drop_draft(&name, cx);
+        }
+        cx.notify();
+    }
+
+    /// The bar a node with drafts shows under its title: how many, Discard, and Save (⌘S), one
+    /// commit to the branch.
+    fn render_drafts_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let count = self.node_drafts(cx).len();
+        if count == 0 && !self.saving_drafts {
+            return None;
+        }
+        let branch = self.session.read(cx).branch.clone();
+        let label = match count {
+            1 => "1 change not saved".to_owned(),
+            n => format!("{n} changes not saved"),
+        };
+        Some(
+            h_flex()
+                .gap(px(studio_ui::ds::space::SM))
+                .items_center()
+                .child(Indicator::dot().color(Color::Accent))
+                .child(Label::new(label).size(LabelSize::Small))
+                .children(self.drafts_notice.as_ref().map(|notice| {
+                    Label::new(notice.message.clone())
+                        .size(LabelSize::XSmall)
+                        .color(notice_color(notice.tone))
+                }))
+                .child(div().flex_1())
+                .child(
+                    studio_ui::ds::button(
+                        "peek-discard-drafts",
+                        if self.confirm_discard {
+                            "Discard them"
+                        } else {
+                            "Discard"
+                        },
+                    )
+                    .style(if self.confirm_discard {
+                        ButtonStyle::Tinted(ui::TintColor::Error)
+                    } else {
+                        ButtonStyle::Subtle
+                    })
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| this.discard_drafts(cx))),
+                )
+                .child(
+                    studio_ui::ds::button(
+                        "peek-save-drafts",
+                        if self.saving_drafts {
+                            "Saving…"
+                        } else {
+                            "Save"
+                        },
+                    )
+                    .style(ButtonStyle::Filled)
+                    .size(ButtonSize::Compact)
+                    .label_size(LabelSize::Small)
+                    .disabled(self.saving_drafts)
+                    .tooltip(move |_, cx| {
+                        Tooltip::for_action(format!("One commit to {branch}"), &SaveNodeDrafts, cx)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.save_drafts(&SaveNodeDrafts, window, cx)
+                    })),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn copy(&mut self, name: String, value: &Value, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(crate::model::copy_text(value)));
         self.copied = Some(name);
@@ -1694,15 +1953,30 @@ impl NodePeek {
                         let editable = property.as_ref().is_some_and(|p| self.edits_property(p));
                         let editing = self.edits.contains_key(&name);
                         let saving = self.saving.contains(&name);
+                        // An unsaved value shows what was typed, with a dot, and opens on a click.
+                        let draft = (editable && !editing && !saving)
+                            .then(|| self.draft_of(&name, cx))
+                            .flatten();
                         // An enum is a menu of its values and a boolean a switch, each saving
                         // as it is chosen; other values open an editor on a click.
                         let picker = property
                             .as_ref()
-                            .filter(|_| editable && !editing && !saving)
+                            .filter(|_| editable && !editing && !saving && draft.is_none())
                             .and_then(|p| self.render_picker(index, p, &value, cx));
                         let opens_editor = editable && picker.is_none() && !editing && !saving;
                         let body = match (self.edits.get(&name), picker) {
                             (Some(edit), _) => self.render_field_edit(edit, window, cx),
+                            (None, _) if draft.is_some() => {
+                                let text = draft.as_ref().map(|d| d.text.clone()).unwrap_or_default();
+                                h_flex()
+                                    .gap(px(studio_ui::ds::space::SM))
+                                    .child(
+                                        Label::new(if text.trim().is_empty() { "—".to_owned() } else { studio_ui::text::first_line(&text) })
+                                            .size(LabelSize::Small),
+                                    )
+                                    .child(Indicator::dot().color(Color::Accent))
+                                    .into_any_element()
+                            }
                             (None, Some(picker)) => picker,
                             (None, None) => {
                                 self.render_value(&name, property.as_ref(), &value, window, cx)
@@ -1727,7 +2001,12 @@ impl NodePeek {
                             .when(!editing, |row| row.hover(move |s| s.bg(hover)))
                             .when(opens_editor || !editable, |row| row.cursor_pointer())
                             .when(!editing, |row| {
-                                row.tooltip(Tooltip::text(if opens_editor {
+                                row.tooltip(Tooltip::text(if draft.is_some() {
+                                    format!(
+                                        "Not saved; it holds “{}”. Click to edit; ⌘S saves this node's changes together",
+                                        display_value(property.as_ref(), &value)
+                                    )
+                                } else if opens_editor {
                                     format!("{ty} · click to edit")
                                 } else if editable {
                                     ty.clone()
@@ -2609,8 +2888,11 @@ impl Render for NodePeek {
         .then(|| self.render_relationships(cx));
         let endpoints = self.render_endpoints(cx);
         let is_node = matches!(self.subject, PeekSubject::Node { .. });
+        let drafts_bar = self.render_drafts_bar(cx);
         v_flex()
             .id("node-peek")
+            .key_context("NodeView")
+            .on_action(cx.listener(Self::save_drafts))
             .on_action(cx.listener(Self::on_save_field))
             .on_action(cx.listener(Self::on_cancel_field))
             .on_action(cx.listener(Self::on_expand_field))
@@ -2703,6 +2985,7 @@ impl Render for NodePeek {
                         )
                     }),
             )
+            .children(drafts_bar)
             .children(
                 endpoints.map(|endpoints| v_flex().child(section("Endpoints")).child(endpoints)),
             )
@@ -2776,6 +3059,71 @@ mod tests {
             assert_eq!(view.snapshot.as_deref(), Some("c2"), "its own commit");
             assert!(!view.newer, "its own write does not make it behind");
             assert!(view.saving.is_empty() && view.edits.is_empty());
+        });
+    }
+
+    /// A changed field left on the page is a draft of the session's, which a table of the type
+    /// shows too; ⌘S on the page saves it as one commit and lets it go everywhere (spec 014).
+    #[gpui::test]
+    async fn a_field_left_changed_is_a_draft_the_table_shows_and_save_lands(
+        cx: &mut TestAppContext,
+    ) {
+        let session = session(PEOPLE, cx);
+        let (view, cx) = page(session.clone(), cx);
+        view.update_in(cx, |view, window, cx| {
+            let person = view.schema.as_ref().unwrap().node("Person").unwrap();
+            let property = person.property("name").unwrap().clone();
+            view.start_edit(property, window, cx);
+            let editor = view.edits["name"].editor.clone();
+            editor.update(cx, |editor, cx| editor.set_text("Ada Lovelace", window, cx));
+            view.left_field("name", cx);
+            assert!(view.edits.is_empty(), "leaving closes the field");
+        });
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        session.read_with(cx, |session, _| {
+            assert_eq!(
+                session.draft(&key).map(|d| d.text.as_str()),
+                Some("Ada Lovelace")
+            );
+        });
+        let table = cx.update(|window, cx| {
+            cx.new(|cx| {
+                crate::TypeTable::new(
+                    gpui::WeakEntity::new_invalid(),
+                    session.clone(),
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            })
+        });
+        table.read_with(cx, |table, _| {
+            assert_eq!(
+                table.draft_text("p1", "name").as_deref(),
+                Some("Ada Lovelace"),
+                "the table of the type shows the page's draft"
+            );
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.save_drafts(&SaveNodeDrafts, window, cx)
+        });
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| assert_eq!(session.draft(&key), None));
+        table.read_with(cx, |table, _| {
+            assert_eq!(
+                table.draft_text("p1", "name"),
+                None,
+                "saved, it goes everywhere"
+            )
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.value_of("name"), json!("Ada Lovelace"));
+            assert_eq!(view.snapshot.as_deref(), Some("c2"));
         });
     }
 

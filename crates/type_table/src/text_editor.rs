@@ -11,7 +11,7 @@ use gpui::{
 };
 use gq_language::input::{edit_text, parse_input};
 use gq_language::{SchemaModel, builder};
-use graph_store::{GraphSession, Loadable};
+use graph_store::{DraftKey, GraphSession, Loadable};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Value, json};
 use studio_actions::node::SaveText;
@@ -250,6 +250,14 @@ impl TextEditor {
                 this.state = match result {
                     SaveResult::Saved { .. } => {
                         this.old = Loadable::Loaded(new);
+                        // A draft kept for the property elsewhere is now saved too.
+                        let key = DraftKey {
+                            type_name: this.type_name.clone(),
+                            id: this.id.clone(),
+                            property: this.property.clone(),
+                        };
+                        this.session
+                            .update(cx, |session, cx| session.remove_draft(&key, cx));
                         State::Saved
                     }
                     SaveResult::NoMatch => State::Conflict,

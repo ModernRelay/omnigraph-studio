@@ -71,6 +71,12 @@
     }
   },
   {
+    "context": "NodeView",
+    "bindings": {
+      "ctrl-s": "studio_node::SaveNodeDrafts"
+    }
+  },
+  {
     "context": "TextEditor",
     "bindings": {
       "ctrl-s": "studio_node::SaveText"

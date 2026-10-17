@@ -1,6 +1,6 @@
 # 014: Node pages, editing in place, and long text
 
-Status: in progress; parts 1 and 3, editing a field in place, and adding and removing relationships built · 2026-10-16
+Status: in progress; parts 1 and 3, editing in place with one draft per branch, and adding and removing relationships built · 2026-10-16
 
 ## Problem
 
@@ -118,7 +118,17 @@ Four parts, built in this order; each lands on its own.
   chosen; a nullable value has × to set none. A changed field stays open until it is saved or
   cancelled, so leaving it writes nothing and loses nothing; a refused, conflicting or unknown
   save opens the field again with what was typed and why. A saved field moves the view to its
-  own commit. The shared draft below replaces the open-field state.
+  own commit.
+- **Built: the shared draft.** `GraphSession` keeps drafts by branch (`DraftKey` type, id and
+  property; `DraftEntry` the value read and the text), announced by `DraftsChanged`. Leaving a
+  changed field on a page or in the peek keeps it there and closes the field; the value shows
+  what was typed with a dot, and the page shows "N changes not saved · Discard · Save" (⌘S, one
+  commit, bound to the values it shows; Discard asks once). A table's cells read the same
+  drafts, through a view it rebuilds from the session when they change, so a draft typed on a
+  page shows in the type's table and the reverse, and saving it anywhere lets it go everywhere;
+  the text editor's save lets the property's draft go too. Opening a cell or a field no longer
+  takes its draft, so Esc ends the edit and keeps it; switching branch keeps each branch's
+  drafts for when it is shown again (they were dropped before).
 - **One draft per branch**, the `graph_store::Draft` that `docs/architecture.md` describes:
   entries keyed by type, id and property (or by edge), each holding the value it was read at
   (so saves stay value-bound) and the new value. Table cells, peek fields and page fields read
@@ -226,6 +236,7 @@ Four parts, built in this order; each lands on its own.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-16 | One draft per branch, shared by tables and pages | `graph_store` `drafts_wait_with_their_branch`; `type_table` `a_field_left_changed_is_a_draft_the_table_shows_and_save_lands` (a page's draft in the type's table, ⌘S on the page: one commit, gone from both), and the table's own tests unchanged; an offscreen snapshot of Project Fable 36 with name left changed | "Project Fable 36 (draft)" with a dot and "1 change not saved · Discard · Save" under the title |
 | 2026-10-16 | A text cell with lines or markup opens in the editor | `type_table` `a_text_cell_with_lines_opens_in_the_editor_not_the_cell`; an offscreen click on keyset-paging's body cell in the `notes` graph | The click opened "Keyset paging · body" in the editor; a plain name still edits in its cell |
 | 2026-10-16 | Relationships are added and removed from the node | `gq_language` `relationship_queries_compile_in_both_directions` (the neighbours read returns `$e.@id as edge_id` and compiles); `type_table` `a_relationship_is_removed_on_the_second_press`, `a_refused_relationship_says_why_on_its_group`; `$e.@id` read through the 0.13 server with `omnigraph query`; offscreen snapshots of Radia Knuth's page: "+" on worksAt, "Liskov", ↵, then × twice on Liskov Systems; the CLI read three, then two workplaces | The search listed four Liskov companies with the first highlighted and "↑↓ choose · ↵ add · esc cancel · write · main"; ↵ made worksAt 3 with Liskov Systems listed; the first × press read "Remove", the second made it 2 again |
 | 2026-10-16 | A text property opens in its own editor with a live preview | `type_table` `a_saved_text_is_bound_to_the_value_read_and_leaves_the_tab_clean` (typed text over the value read at `c1`), `a_text_changed_elsewhere_is_kept_and_offered_both_ways` (a write matching nothing), `a_refused_text_is_kept_with_the_reason`; offscreen snapshots of Keyset paging's body: the split editor, a line typed, ⌘S; the CLI read the new body, and it was set back | The preview followed the typed line; ⌘S toasted "Set body of keyset-paging · committed to main" and cleared the tab's dot, while the Note table's tab took its newer-data dot |

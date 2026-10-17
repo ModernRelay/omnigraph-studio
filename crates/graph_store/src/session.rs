@@ -1,7 +1,7 @@
 //! One open graph on one server and branch: schema, branches, type counts, and every read and
 //! write Studio sends for it (spec 003, 004, 008).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -53,6 +53,22 @@ pub enum OutcomeKind {
     Unknown { reason: String },
 }
 
+/// Which property a draft is for: the node's type, its id and the property's name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DraftKey {
+    pub type_name: String,
+    pub id: String,
+    pub property: String,
+}
+
+/// A property's unsaved value (spec 014): the value it was read at, which its save is bound to,
+/// and the text typed for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DraftEntry {
+    pub old: Value,
+    pub text: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct OutcomeEntry {
     pub at: SystemTime,
@@ -83,6 +99,8 @@ pub enum SessionEvent {
     AvailabilityChanged,
     /// The graph's stored queries were read ([`GraphSession::stored_queries`]).
     StoredQueriesChanged,
+    /// A draft was kept, changed or let go ([`GraphSession::set_draft`]).
+    DraftsChanged,
 }
 
 /// How many answers to reads pinned to a commit, and Blob cells at a commit, a session keeps.
@@ -148,6 +166,9 @@ pub struct GraphSession {
     /// The commit each watched branch's head was last seen at, by the head watch or as one of
     /// Studio's own commits.
     heads: HashMap<String, String>,
+    /// Unsaved property values by branch (spec 014): every table, page and peek of the graph
+    /// reads and writes these, and a branch's drafts wait for it while another is shown.
+    drafts: HashMap<String, BTreeMap<DraftKey, DraftEntry>>,
     /// Branches views asked after besides the session's own, while their watch is held.
     head_watches: Vec<(String, Weak<()>)>,
     /// Head reads under way, by branch.
@@ -192,6 +213,7 @@ impl GraphSession {
             branches_read: false,
             degrees: DegreeBatches::default(),
             heads: HashMap::new(),
+            drafts: HashMap::new(),
             head_watches: Vec::new(),
             head_reads: HashMap::new(),
             branch_recheck: None,
@@ -485,6 +507,36 @@ impl GraphSession {
         cx.emit(SessionEvent::BranchChanged);
         cx.notify();
         self.check_heads(cx);
+    }
+
+    /// The unsaved value of one property on the session's branch.
+    pub fn draft(&self, key: &DraftKey) -> Option<&DraftEntry> {
+        self.drafts.get(&self.branch)?.get(key)
+    }
+
+    /// Every unsaved value on the session's branch, by type, id and property.
+    pub fn drafts(&self) -> impl Iterator<Item = (&DraftKey, &DraftEntry)> {
+        self.drafts.get(&self.branch).into_iter().flatten()
+    }
+
+    /// Keeps a property's unsaved value on the session's branch, replacing the one there.
+    pub fn set_draft(&mut self, key: DraftKey, entry: DraftEntry, cx: &mut Context<Self>) {
+        let drafts = self.drafts.entry(self.branch.clone()).or_default();
+        if drafts.get(&key) != Some(&entry) {
+            drafts.insert(key, entry);
+            cx.emit(SessionEvent::DraftsChanged);
+            cx.notify();
+        }
+    }
+
+    /// Lets a property's unsaved value go: saved, discarded or put back.
+    pub fn remove_draft(&mut self, key: &DraftKey, cx: &mut Context<Self>) -> Option<DraftEntry> {
+        let removed = self.drafts.get_mut(&self.branch)?.remove(key);
+        if removed.is_some() {
+            cx.emit(SessionEvent::DraftsChanged);
+            cx.notify();
+        }
+        removed
     }
 
     /// The commit `branch`'s head was last seen at, once a watched branch has been asked after
@@ -1259,6 +1311,48 @@ mod tests {
                 session.branches.loaded().cloned(),
                 Some(vec!["main".to_owned()])
             );
+        });
+    }
+
+    /// Drafts belong to the branch they were typed on: another branch shows its own, and the
+    /// first one's wait until it is shown again (spec 014).
+    #[gpui::test]
+    async fn drafts_wait_with_their_branch(cx: &mut TestAppContext) {
+        let http = FakeHttpClient::create(|_request| async {
+            Ok(Response::builder()
+                .status(200)
+                .header(graph_client::CONTRACT_HEADER, "0.13")
+                .body(AsyncBody::from(r#"{"branches":["main","fix"]}"#))
+                .unwrap())
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        let entry = DraftEntry {
+            old: Value::from("Ada"),
+            text: "Ada Lovelace".into(),
+        };
+        session.update(cx, |session, cx| {
+            session.set_draft(key.clone(), entry.clone(), cx);
+            assert_eq!(session.draft(&key), Some(&entry));
+            session.set_branch("fix".into(), cx);
+            assert_eq!(session.draft(&key), None, "another branch shows its own");
+            assert_eq!(session.drafts().count(), 0);
+            session.set_branch("main".into(), cx);
+            assert_eq!(session.draft(&key), Some(&entry), "it waited");
+            assert_eq!(session.remove_draft(&key, cx), Some(entry));
+            assert_eq!(session.drafts().count(), 0);
         });
     }
 

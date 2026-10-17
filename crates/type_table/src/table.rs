@@ -26,7 +26,7 @@ use gq_language::{
 };
 use graph_client::api::ReadOutput;
 use graph_client::{BlobCell, BlobMeta, ReadError};
-use graph_store::{GraphSession, Loadable, SessionEvent};
+use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent};
 use serde_json::Value;
 use studio_actions::table::{
     AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyCell, DeleteRow, EditCell, ExploreRow,
@@ -71,8 +71,9 @@ pub struct Cursor {
 enum CellState {
     /// The save is out; the cell shows an amber dot.
     Saving,
-    /// An edit that did not land, or that was left by clicking away. Reopening the cell restores
-    /// the text and the notice.
+    /// An unsaved value: the session's draft for this property (spec 014), which every table,
+    /// page and peek of the branch shares, with why its last save did not land. Reopening the
+    /// cell restores the text and the notice.
     Draft {
         text: String,
         notice: Option<Notice>,
@@ -287,7 +288,11 @@ pub struct TypeTable {
     cursor: Option<Cursor>,
     editing: Option<Editing>,
     cell_editor: Entity<Editor>,
+    /// Cells with a save out, and the session's drafts for this type as of its last change:
+    /// a view rebuilt from the session ([`TypeTable::sync_drafts`]), never written on its own.
     cells: HashMap<(String, String), CellState>,
+    /// Why a draft's last save did not land, by cell.
+    draft_notices: HashMap<(String, String), Notice>,
     /// What each Blob cell drawn so far holds, by row id and property, read at the page's
     /// commit; and the reads under way.
     blobs: HashMap<(String, String), Loadable<BlobMeta>>,
@@ -507,6 +512,7 @@ impl TypeTable {
             editing: None,
             cell_editor,
             cells: HashMap::new(),
+            draft_notices: HashMap::new(),
             blobs: HashMap::new(),
             blob_tasks: HashMap::new(),
             relations: HashMap::new(),
@@ -523,6 +529,8 @@ impl TypeTable {
             total_task: None,
             _subscriptions: subscriptions,
         };
+        // Drafts already kept for this type (on a node's page, in another table) show at once.
+        this.sync_drafts(cx);
         this.load_schema(cx);
         this
     }
@@ -547,9 +555,17 @@ impl TypeTable {
                 if self.at_commit.is_some() => {}
             SessionEvent::BranchChanged => {
                 self.branch = self.session.read(cx).branch.clone();
+                // The branch's own drafts show; the other's wait in the session.
                 self.cells.clear();
+                self.draft_notices.clear();
                 self.editing = None;
+                self.sync_drafts(cx);
                 self.reload(false, cx);
+            }
+            SessionEvent::DraftsChanged => {
+                self.sync_drafts(cx);
+                cx.emit(ItemEvent::UpdateTab);
+                cx.notify();
             }
             SessionEvent::HeadMoved { branch, .. } if *branch == self.branch => {
                 self.compare_head(cx)
@@ -569,7 +585,9 @@ impl TypeTable {
         self.session = session;
         self.schema = None;
         self.cells.clear();
+        self.draft_notices.clear();
         self.editing = None;
+        self.sync_drafts(cx);
         self.load_schema(cx);
     }
 
@@ -2611,6 +2629,7 @@ impl TypeTable {
                 *n -= 1;
             }
             self.cells.retain(|(row_id, _), _| row_id != id);
+            self.drop_row_drafts(id, cx);
             if let Some(cursor) = &mut self.cursor {
                 if self.rows.is_empty() {
                     self.cursor = None;
@@ -2935,7 +2954,9 @@ impl TypeTable {
             );
             return;
         }
-        let (text, notice) = match self.cells.remove(&key) {
+        // A draft stays the session's until it is saved, discarded or put back: opening it does
+        // not take it, so Esc keeps it.
+        let (text, notice) = match self.cells.get(&key).cloned() {
             Some(CellState::Draft { text, notice }) => (text, notice),
             _ => (edit_text(&old), None),
         };
@@ -2962,13 +2983,17 @@ impl TypeTable {
         };
         let text = self.cell_editor.read(cx).text(cx);
         if text != edit_text(&editing.old) || editing.notice.is_some() {
-            self.cells.insert(
-                (editing.row_id, editing.column),
-                CellState::Draft {
-                    text,
-                    notice: editing.notice,
-                },
+            self.put_draft(
+                &editing.row_id,
+                &editing.column,
+                editing.old,
+                text,
+                editing.notice,
+                cx,
             );
+        } else {
+            // Typed back to what the cell holds: no draft.
+            self.drop_draft(&editing.row_id, &editing.column, cx);
         }
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
@@ -3095,6 +3120,7 @@ impl TypeTable {
         match result {
             SaveResult::Saved { commit, parent } => {
                 self.cells.remove(&key);
+                self.drop_draft(&row_id, &column, cx);
                 if self
                     .paging
                     .advance_for_own_commit(parent.as_deref(), &commit)
@@ -3144,16 +3170,110 @@ impl TypeTable {
                 return false;
             }
             Ok(new) if same_value(&new, &old) => {
-                self.cells.remove(&key);
+                self.drop_draft(&key.0, &key.1, cx);
             }
             Ok(_) => {
-                self.cells
-                    .insert(key, CellState::Draft { text, notice: None });
+                self.put_draft(&key.0, &key.1, old, text, None, cx);
                 self.drafts.confirm_discard = false;
             }
         }
         self.finish_editing(window, cx);
         true
+    }
+
+    fn draft_key(&self, row_id: &str, column: &str) -> DraftKey {
+        DraftKey {
+            type_name: self.type_name.clone(),
+            id: row_id.to_owned(),
+            property: column.to_owned(),
+        }
+    }
+
+    /// Rebuilds the cells' view of the session's drafts for this type, keeping the saves out
+    /// (a cell with a save out shows that).
+    fn sync_drafts(&mut self, cx: &App) {
+        self.cells
+            .retain(|_, state| matches!(state, CellState::Saving));
+        if self.at_commit.is_some() {
+            return;
+        }
+        let session = self.session.read(cx);
+        for (key, entry) in session
+            .drafts()
+            .filter(|(key, _)| key.type_name == self.type_name)
+        {
+            let cell = (key.id.clone(), key.property.clone());
+            if self.cells.contains_key(&cell) {
+                continue;
+            }
+            let notice = self.draft_notices.get(&cell).cloned();
+            self.cells.insert(
+                cell,
+                CellState::Draft {
+                    text: entry.text.clone(),
+                    notice,
+                },
+            );
+        }
+    }
+
+    /// Keeps a cell's unsaved text in the session's drafts, with why its last save did not land.
+    fn put_draft(
+        &mut self,
+        row_id: &str,
+        column: &str,
+        old: Value,
+        text: String,
+        notice: Option<Notice>,
+        cx: &mut Context<Self>,
+    ) {
+        let cell = (row_id.to_owned(), column.to_owned());
+        match notice {
+            Some(notice) => self.draft_notices.insert(cell, notice),
+            None => self.draft_notices.remove(&cell),
+        };
+        let key = self.draft_key(row_id, column);
+        self.session.update(cx, |session, cx| {
+            session.set_draft(key, DraftEntry { old, text }, cx)
+        });
+        self.sync_drafts(cx);
+    }
+
+    /// Lets a cell's draft go: saved, or typed back to what the cell holds.
+    fn drop_draft(&mut self, row_id: &str, column: &str, cx: &mut Context<Self>) {
+        self.draft_notices
+            .remove(&(row_id.to_owned(), column.to_owned()));
+        let key = self.draft_key(row_id, column);
+        self.session
+            .update(cx, |session, cx| session.remove_draft(&key, cx));
+        self.sync_drafts(cx);
+    }
+
+    /// A deleted row's drafts go with it.
+    fn drop_row_drafts(&mut self, id: &str, cx: &mut Context<Self>) {
+        let keys: Vec<DraftKey> = self
+            .session
+            .read(cx)
+            .drafts()
+            .filter(|(key, _)| key.type_name == self.type_name && key.id == id)
+            .map(|(key, _)| key.clone())
+            .collect();
+        self.session.update(cx, |session, cx| {
+            for key in &keys {
+                session.remove_draft(key, cx);
+            }
+        });
+        self.draft_notices.retain(|(row, _), _| row != id);
+        self.sync_drafts(cx);
+    }
+
+    /// The draft text a cell shows, if any.
+    #[cfg(test)]
+    pub(crate) fn draft_text(&self, row_id: &str, column: &str) -> Option<String> {
+        match self.cells.get(&(row_id.to_owned(), column.to_owned())) {
+            Some(CellState::Draft { text, .. }) => Some(text.clone()),
+            _ => None,
+        }
     }
 
     /// The cells holding a draft, in table order: row, then column.
@@ -3203,20 +3323,15 @@ impl TypeTable {
             let old = self.rows[row].value(&key.1).clone();
             match parse_input(&property, &text) {
                 Err(message) => {
-                    self.cells.insert(
-                        key,
-                        CellState::Draft {
-                            text,
-                            notice: Some(Notice::new(Tone::Invalid, message)),
-                        },
-                    );
+                    let notice = Notice::new(Tone::Invalid, message);
+                    self.put_draft(&key.0, &key.1, old, text, Some(notice), cx);
                     let cursor = Cursor { row, col };
                     self.set_cursor(cursor, window, cx);
                     self.start_edit(cursor, window, cx);
                     return;
                 }
                 Ok(new) if same_value(&new, &old) => {
-                    self.cells.remove(&key);
+                    self.drop_draft(&key.0, &key.1, cx);
                 }
                 Ok(new) => edits.push(DraftEdit {
                     row_id: key.0,
@@ -3320,6 +3435,7 @@ impl TypeTable {
                     for edit in &edits {
                         self.cells
                             .remove(&(edit.row_id.clone(), edit.column.clone()));
+                        self.drop_draft(&edit.row_id, &edit.column, cx);
                     }
                     self.refresh_dimmed(&edits);
                 } else {
@@ -3347,14 +3463,17 @@ impl TypeTable {
                 {
                     for edit in edits {
                         if let Some(ix) = self.row_index(&edit.row_id) {
-                            self.set_cell(ix, &edit.column, edit.old);
+                            self.set_cell(ix, &edit.column, edit.old.clone());
                         }
-                        self.cells.insert(
-                            (edit.row_id, edit.column),
-                            CellState::Draft {
-                                text: edit.text,
-                                notice: Some(notice.clone()),
-                            },
+                        self.cells
+                            .remove(&(edit.row_id.clone(), edit.column.clone()));
+                        self.put_draft(
+                            &edit.row_id,
+                            &edit.column,
+                            edit.old,
+                            edit.text,
+                            Some(notice.clone()),
+                            cx,
                         );
                     }
                     self.drafts.notice = Some(notice);
@@ -3416,6 +3535,7 @@ impl TypeTable {
                                 let value = row.value(&edit.column).clone();
                                 if same_value(&value, &edit.new) {
                                     this.cells.remove(&key);
+                                    this.drop_draft(&edit.row_id, &edit.column, cx);
                                     continue;
                                 }
                                 if let Some(ix) = ix {
@@ -3425,14 +3545,14 @@ impl TypeTable {
                             }
                             Some(None) => {
                                 if let Some(ix) = ix {
-                                    this.set_cell(ix, &edit.column, edit.old);
+                                    this.set_cell(ix, &edit.column, edit.old.clone());
                                     this.set_dimmed(ix, true);
                                 }
                                 changed_elsewhere(property.as_ref(), None)
                             }
                             None => {
                                 if let Some(ix) = ix {
-                                    this.set_cell(ix, &edit.column, edit.old);
+                                    this.set_cell(ix, &edit.column, edit.old.clone());
                                 }
                                 Notice::new(
                                     Tone::Unknown,
@@ -3441,12 +3561,17 @@ impl TypeTable {
                                 )
                             }
                         };
-                        this.cells.insert(
-                            key,
-                            CellState::Draft {
-                                text: edit.text,
-                                notice: Some(notice),
-                            },
+                        this.cells.remove(&key);
+                        let old = ix
+                            .map(|ix| this.rows[ix].value(&edit.column).clone())
+                            .unwrap_or(edit.old);
+                        this.put_draft(
+                            &edit.row_id,
+                            &edit.column,
+                            old,
+                            edit.text,
+                            Some(notice),
+                            cx,
                         );
                     }
                     // The table now shows values newer than its pin.
@@ -3468,8 +3593,20 @@ impl TypeTable {
             cx.notify();
             return;
         }
-        self.cells
-            .retain(|_, state| !matches!(state, CellState::Draft { .. }));
+        let keys: Vec<DraftKey> = self
+            .session
+            .read(cx)
+            .drafts()
+            .filter(|(key, _)| key.type_name == self.type_name)
+            .map(|(key, _)| key.clone())
+            .collect();
+        self.session.update(cx, |session, cx| {
+            for key in &keys {
+                session.remove_draft(key, cx);
+            }
+        });
+        self.draft_notices.clear();
+        self.sync_drafts(cx);
         self.drafts = DraftsBar::default();
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
@@ -3669,13 +3806,12 @@ impl TypeTable {
         let free = self.editing.is_none()
             && self.filter_draft.is_none()
             && self.focus_handle.contains_focused(window, cx);
-        self.cells.insert(
-            key,
-            CellState::Draft {
-                text,
-                notice: Some(notice),
-            },
-        );
+        let old = self
+            .row_index(&row_id)
+            .map(|ix| self.rows[ix].value(&column).clone())
+            .unwrap_or(Value::Null);
+        self.cells.remove(&key);
+        self.put_draft(&row_id, &column, old, text, Some(notice), cx);
         if let (true, Some((row, col))) = (free, position) {
             let cursor = Cursor { row, col };
             self.set_cursor(cursor, window, cx);
@@ -3698,8 +3834,8 @@ impl TypeTable {
             cx.notify();
             return;
         }
-        if let Some(editing) = self.editing.take() {
-            self.cells.remove(&(editing.row_id, editing.column));
+        // Esc ends the edit; a draft the cell held stays, as it was before the edit.
+        if self.editing.take().is_some() {
             self.finish_editing(window, cx);
             return;
         }
