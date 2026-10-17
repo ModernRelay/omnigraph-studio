@@ -127,6 +127,20 @@ pub fn is_glass(cx: &App) -> bool {
 pub mod surface {
     use super::*;
 
+    /// A glass surface's fill at `alpha`: the light style's warm white, or in a dark theme the
+    /// theme's own `base` surface, so the theme's text keeps its contrast on it.
+    pub fn glass(base: Hsla, alpha: f32, cx: &App) -> Hsla {
+        glass_fill(cx.theme().appearance.is_light(), base, alpha)
+    }
+
+    pub(crate) fn glass_fill(light: bool, base: Hsla, alpha: f32) -> Hsla {
+        if light {
+            Hsla::from(gpui::rgb(0xfcfbfc)).opacity(alpha)
+        } else {
+            base.opacity(alpha)
+        }
+    }
+
     /// The rule between regions and rows: a hairline when flat; on glass a dotted rule,
     /// 14% ink, which lands at about half a solid line's weight.
     pub fn rule(cx: &App) -> Hsla {
@@ -1202,11 +1216,15 @@ pub fn empty_state(icon: IconName, title: impl Into<SharedString>) -> Div {
 /// shadows instead of a border. GPUI clips its children to the sheet's rectangle, not its
 /// rounded corners, so a child with a background flush in a corner takes the sheet's radius
 /// there (`radius::LG`).
-pub fn sheet(_cx: &App) -> Div {
+pub fn sheet(cx: &App) -> Div {
     div()
         .rounded(px(radius::LG))
         .overflow_hidden()
-        .bg(gpui::rgba(0xfcfbfccc))
+        .bg(surface::glass(
+            cx.theme().colors().panel_background,
+            0.8,
+            cx,
+        ))
         .shadow(elevation::sheet())
 }
 
@@ -1625,6 +1643,19 @@ impl RenderOnce for TimelineEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A glass sheet or toast keeps the light style's warm white in a light theme, and takes the
+    /// dark theme's own surface in a dark one: near-white there would put light text on light.
+    #[test]
+    fn glass_takes_the_dark_themes_surface() {
+        let dark_panel = gpui::hsla(0.6, 0.1, 0.16, 1.);
+        let light = surface::glass_fill(true, dark_panel, 0.8);
+        assert!(light.l > 0.95, "the light style's white");
+        assert!((light.a - 0.8).abs() < 1e-6);
+        let dark = surface::glass_fill(false, dark_panel, 0.8);
+        assert_eq!(dark.l, dark_panel.l, "the theme's surface");
+        assert!((dark.a - 0.8).abs() < 1e-6);
+    }
 
     /// The nested pairs the design system draws stay concentric (`radius::around`/`within`).
     #[test]

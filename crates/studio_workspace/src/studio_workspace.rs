@@ -3268,7 +3268,11 @@ impl Workspace {
                         if studio_ui::ds::is_glass(cx) {
                             // A small floating glass surface, like the canvas's pills.
                             toast
-                                .bg(gpui::rgba(0xfcfbfce6))
+                                .bg(studio_ui::ds::surface::glass(
+                                    colors.elevated_surface_background,
+                                    0.9,
+                                    cx,
+                                ))
                                 .shadow(studio_ui::ds::elevation::float())
                         } else {
                             toast
