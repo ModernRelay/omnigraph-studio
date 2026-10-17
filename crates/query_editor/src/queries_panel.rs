@@ -5,7 +5,9 @@
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use gpui::{Context, Entity, Render, Subscription, WeakEntity, Window};
+use gpui::{
+    Context, Entity, ListAlignment, ListState, Render, Subscription, WeakEntity, Window, list,
+};
 use graph_store::cli_config::CliAlias;
 use graph_store::{ConnectionRegistry, GraphSession, Loadable, SessionEvent};
 use studio_actions::graph::{NewQuery, OpenQueryFile, OpenStoredQuery};
@@ -22,8 +24,37 @@ pub struct QueriesPanel {
     files: Vec<(PathBuf, SystemTime)>,
     /// The aliases whose stored query the graph does not serve are shown.
     unserved_open: bool,
+    /// The list drawn, as descriptors: only the visible rows are built (constitution IX).
+    list_state: ListState,
+    rows: Vec<PanelRow>,
     _session_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// One row of the panel, as what it shows rather than its element, so the list is told only of
+/// the rows that changed and keeps its scroll position.
+#[derive(Clone, PartialEq)]
+enum PanelRow {
+    SavedEmpty,
+    Saved {
+        path: PathBuf,
+        modified: SystemTime,
+    },
+    StoredHeader,
+    StoredReading,
+    StoredFailed(String),
+    StoredEmpty,
+    Stored {
+        name: String,
+        description: Option<String>,
+        mutation: bool,
+    },
+    Alias(CliAlias),
+    UnservedHeader {
+        count: usize,
+        open: bool,
+    },
+    Unserved(CliAlias),
 }
 
 impl QueriesPanel {
@@ -56,6 +87,12 @@ impl QueriesPanel {
             session: None,
             files: Vec::new(),
             unserved_open: false,
+            list_state: ListState::new(
+                0,
+                ListAlignment::Top,
+                px(studio_ui::ds::size::SIDEBAR_ROW * 8.),
+            ),
+            rows: Vec::new(),
             _session_subscription: None,
             _subscriptions: subscriptions,
         };
@@ -76,90 +113,159 @@ impl QueriesPanel {
         cx.notify();
     }
 
-    /// The stored queries the graph serves, each with its aliases under it, then the aliases
-    /// whose query it does not serve, folded.
-    fn render_stored(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        use studio_ui::ds;
-        let session = self.session.clone()?;
-        let (catalog, server, graph) = {
-            let session = session.read(cx);
-            (
-                session.stored_queries.clone(),
-                session.server_name(cx),
-                session.graph_id.clone(),
-            )
+    /// The rows to draw: the saved files, newest first; then the stored queries the graph
+    /// serves, each with its aliases under it, then the aliases whose query it does not serve,
+    /// folded.
+    fn panel_rows(&self, cx: &App) -> Vec<PanelRow> {
+        let mut rows = Vec::new();
+        if self.files.is_empty() {
+            rows.push(PanelRow::SavedEmpty);
+        }
+        rows.extend(self.files.iter().map(|(path, modified)| PanelRow::Saved {
+            path: path.clone(),
+            modified: *modified,
+        }));
+        let Some(session) = &self.session else {
+            return rows;
         };
+        let session = session.read(cx);
+        let (server, graph) = (session.server_name(cx), session.graph_id.clone());
         let aliases: Vec<CliAlias> = ConnectionRegistry::try_global(cx)
             .map(|registry| registry.read(cx).aliases_for(&server, &graph))
             .unwrap_or_default();
-        let refresh = IconButton::new("stored-refresh", IconName::RotateCw)
-            .icon_size(IconSize::XSmall)
-            .icon_color(Color::Muted)
-            .tooltip(Tooltip::text("Read the stored queries again"))
-            .on_click(move |_, _, cx| {
-                session.update(cx, |session, cx| session.reload_stored_queries(cx))
-            });
-        let header = ds::section_header("Stored", Some(refresh.into_any_element()));
-        let mut body = v_flex().gap(px(ds::space::WITHIN));
-        let mut unserved = Vec::new();
-        match catalog {
-            Loadable::NotLoaded | Loadable::Loading => {
-                body = body.child(ds::sidebar_note("Reading stored queries…"));
-            }
-            Loadable::Failed(error) => {
-                body = body.child(ds::sidebar_placeholder(
-                    "stored-failed",
-                    IconName::Warning,
-                    "Could not be read",
-                    error,
-                ));
-            }
+        rows.push(PanelRow::StoredHeader);
+        match &session.stored_queries {
+            Loadable::NotLoaded | Loadable::Loading => rows.push(PanelRow::StoredReading),
+            Loadable::Failed(error) => rows.push(PanelRow::StoredFailed(error.clone())),
             Loadable::Loaded(queries) => {
                 if queries.is_empty() {
-                    body = body.child(ds::sidebar_placeholder(
-                        "stored-empty",
-                        IconName::Server,
-                        "No stored queries",
-                        "A graph's stored queries are declared in its cluster.yaml and applied \
-                         with `omnigraph cluster apply`; the server then runs each by name",
-                    ));
+                    rows.push(PanelRow::StoredEmpty);
                 }
-                let mut index = 0;
                 for query in queries.iter() {
-                    let open = OpenStoredQuery {
+                    rows.push(PanelRow::Stored {
                         name: query.name.clone(),
-                        alias: None,
-                    };
-                    let tooltip = query
-                        .description
-                        .clone()
-                        .unwrap_or_else(|| format!("Run {} on the server", query.name));
-                    body = body.child(
-                        ds::SidebarRow::new(("stored-query", index), query.name.clone())
-                            .icon(IconName::Server)
-                            .when(query.mutation, |row| row.end(ds::sidebar_count("writes")))
-                            .tooltip(tooltip)
-                            .on_click(move |_, window, cx| {
-                                window.dispatch_action(Box::new(open.clone()), cx)
-                            }),
+                        description: query.description.clone(),
+                        mutation: query.mutation,
+                    });
+                    rows.extend(
+                        aliases
+                            .iter()
+                            .filter(|alias| alias.query == query.name)
+                            .cloned()
+                            .map(PanelRow::Alias),
                     );
-                    index += 1;
-                    for alias in aliases.iter().filter(|alias| alias.query == query.name) {
-                        body = body.child(alias_row(index, alias));
-                        index += 1;
-                    }
                 }
-                unserved = aliases
+                let unserved: Vec<CliAlias> = aliases
                     .into_iter()
                     .filter(|alias| !queries.iter().any(|query| query.name == alias.query))
                     .collect();
+                if !unserved.is_empty() {
+                    rows.push(PanelRow::UnservedHeader {
+                        count: unserved.len(),
+                        open: self.unserved_open,
+                    });
+                    if self.unserved_open {
+                        rows.extend(unserved.into_iter().map(PanelRow::Unserved));
+                    }
+                }
             }
         }
-        let open = self.unserved_open;
-        let unserved_section = (!unserved.is_empty()).then(|| {
-            v_flex()
+        rows
+    }
+
+    fn render_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        use studio_ui::ds;
+        let Some(row) = self.rows.get(ix).cloned() else {
+            return div().into_any_element();
+        };
+        match row {
+            PanelRow::SavedEmpty => ds::sidebar_placeholder(
+                "queries-empty",
+                IconName::FileCode,
+                "No saved queries",
+                match studio_ui::shortcut_text(&studio_actions::query::Save, cx) {
+                    Some(keys) => format!("{keys} in a query saves it here, for this graph"),
+                    None => "Saving a query keeps it here, for this graph".to_owned(),
+                },
+            )
+            .into_any_element(),
+            PanelRow::Saved { path, modified } => {
+                let name = path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let age = SystemTime::now()
+                    .duration_since(modified)
+                    .map(|age| age.as_micros() as i64)
+                    .unwrap_or(0);
+                let when =
+                    studio_ui::relative_time(studio_ui::now_micros() - age, studio_ui::now_micros());
+                let open = OpenQueryFile {
+                    path: Some(path.to_string_lossy().into_owned()),
+                };
+                ds::SidebarRow::new(("saved-query", ix), name)
+                    .icon(IconName::FileCode)
+                    .end(ds::sidebar_count(when))
+                    .tooltip(path.display().to_string())
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(Box::new(open.clone()), cx)
+                    })
+                    .into_any_element()
+            }
+            PanelRow::StoredHeader => {
+                let session = self.session.clone();
+                let refresh = IconButton::new("stored-refresh", IconName::RotateCw)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Read the stored queries again"))
+                    .on_click(move |_, _, cx| {
+                        if let Some(session) = &session {
+                            session.update(cx, |session, cx| session.reload_stored_queries(cx));
+                        }
+                    });
+                ds::section_header("Stored", Some(refresh.into_any_element())).into_any_element()
+            }
+            PanelRow::StoredReading => {
+                ds::sidebar_note("Reading stored queries…").into_any_element()
+            }
+            PanelRow::StoredFailed(error) => ds::sidebar_placeholder(
+                "stored-failed",
+                IconName::Warning,
+                "Could not be read",
+                error,
+            )
+            .into_any_element(),
+            PanelRow::StoredEmpty => ds::sidebar_placeholder(
+                "stored-empty",
+                IconName::Server,
+                "No stored queries",
+                "A graph's stored queries are declared in its cluster.yaml and applied \
+                 with `omnigraph cluster apply`; the server then runs each by name",
+            )
+            .into_any_element(),
+            PanelRow::Stored {
+                name,
+                description,
+                mutation,
+            } => {
+                let tooltip = description.unwrap_or_else(|| format!("Run {name} on the server"));
+                let open = OpenStoredQuery {
+                    name: name.clone(),
+                    alias: None,
+                };
+                ds::SidebarRow::new(("stored-query", ix), name)
+                    .icon(IconName::Server)
+                    .when(mutation, |row| row.end(ds::sidebar_count("writes")))
+                    .tooltip(tooltip)
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(Box::new(open.clone()), cx)
+                    })
+                    .into_any_element()
+            }
+            PanelRow::Alias(alias) => alias_row(ix, &alias),
+            PanelRow::UnservedHeader { count, open } => v_flex()
                 .child(
-                    ds::section_disclosure("unserved", "Not served", unserved.len(), open)
+                    ds::section_disclosure("unserved", "Not served", count, open)
                         .tooltip(Tooltip::text(
                             "Aliases in the CLI config whose stored query this graph does not serve",
                         ))
@@ -168,22 +274,9 @@ impl QueriesPanel {
                             cx.notify();
                         })),
                 )
-                .when(open, |section| {
-                    section.children(
-                        unserved
-                            .iter()
-                            .enumerate()
-                            .map(|(index, alias)| unserved_row(index, alias)),
-                    )
-                })
-        });
-        Some(
-            v_flex()
-                .child(header)
-                .child(body)
-                .children(unserved_section)
                 .into_any_element(),
-        )
+            PanelRow::Unserved(alias) => unserved_row(ix, &alias),
+        }
     }
 
     fn graph_key(&self, cx: &App) -> Option<String> {
@@ -212,59 +305,20 @@ impl QueriesPanel {
 
 impl Render for QueriesPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let now = SystemTime::now();
-        let saved = if self.files.is_empty() {
-            studio_ui::ds::sidebar_placeholder(
-                "queries-empty",
-                IconName::FileCode,
-                "No saved queries",
-                match studio_ui::shortcut_text(&studio_actions::query::Save, cx) {
-                    Some(keys) => format!("{keys} in a query saves it here, for this graph"),
-                    None => "Saving a query keeps it here, for this graph".to_owned(),
-                },
-            )
-            .into_any_element()
-        } else {
-            v_flex()
-                .gap(px(studio_ui::ds::space::WITHIN))
-                .children(
-                    self.files
-                        .iter()
-                        .enumerate()
-                        .map(|(index, (path, modified))| {
-                            let name = path
-                                .file_stem()
-                                .map(|stem| stem.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            let age = now
-                                .duration_since(*modified)
-                                .map(|age| age.as_micros() as i64)
-                                .unwrap_or(0);
-                            let when = studio_ui::relative_time(
-                                studio_ui::now_micros() - age,
-                                studio_ui::now_micros(),
-                            );
-                            let open = OpenQueryFile {
-                                path: Some(path.to_string_lossy().into_owned()),
-                            };
-                            studio_ui::ds::SidebarRow::new(("saved-query", index), name)
-                                .icon(IconName::FileCode)
-                                .end(studio_ui::ds::sidebar_count(when))
-                                .tooltip(path.display().to_string())
-                                .on_click(move |_, window, cx| {
-                                    window.dispatch_action(Box::new(open.clone()), cx)
-                                })
-                        }),
-                )
-                .into_any_element()
-        };
-        let stored = self.render_stored(cx);
-        v_flex()
-            .id("queries-panel")
-            .size_full()
-            .overflow_y_scroll()
-            .child(saved)
-            .children(stored)
+        let rows = self.panel_rows(cx);
+        studio_ui::rows::sync(&self.list_state, &mut self.rows, rows);
+        list(
+            self.list_state.clone(),
+            // A row's root takes the list's width; rows of one group sit `WITHIN` apart.
+            cx.processor(|this, ix, _window, cx| {
+                div()
+                    .w_full()
+                    .pb(px(studio_ui::ds::space::WITHIN))
+                    .child(this.render_row(ix, cx))
+                    .into_any_element()
+            }),
+        )
+        .size_full()
     }
 }
 

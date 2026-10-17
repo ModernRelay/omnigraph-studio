@@ -15,6 +15,7 @@ pub mod ds;
 pub mod motion;
 mod overlay_slot;
 mod resize;
+pub mod rows;
 pub mod text;
 mod values;
 

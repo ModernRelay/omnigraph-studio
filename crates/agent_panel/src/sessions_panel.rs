@@ -15,8 +15,8 @@ use chrono::{DateTime, Datelike as _, Utc};
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Task, WeakEntity,
-    Window, div,
+    IntoElement, ListAlignment, ListState, ParentElement, Render, SharedString, Styled,
+    Subscription, Task, WeakEntity, Window, div, list,
 };
 use studio_actions::agent::{NewConversation, OpenConversation};
 use studio_settings::StudioSettings;
@@ -46,7 +46,29 @@ pub struct SessionsPanel {
     search_open: bool,
     /// An import or delete at the agent in flight; it holds the agent's process while it runs.
     _agent_task: Option<Task<()>>,
+    /// The list drawn, as descriptors: only the visible rows are built (constitution IX).
+    list_state: ListState,
+    rows: Vec<ListRow>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// One row of the list, as what it shows rather than its element, so the list is told only of
+/// the rows that changed and keeps its scroll position.
+#[derive(Clone, PartialEq)]
+enum ListRow {
+    Search,
+    Note(SharedString),
+    /// A section's label; the first sits under the panel's own title, not a section's gap.
+    Label {
+        title: &'static str,
+        first: bool,
+    },
+    Archived {
+        count: usize,
+        open: bool,
+    },
+    Conversation(String),
+    End,
 }
 
 /// What a row shows at its end.
@@ -69,7 +91,7 @@ impl SessionsPanel {
         let sessions = AgentSessions::global(cx);
         let search = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("Search titles and agents", window, cx);
+            editor.set_placeholder_text("Filter by title or agent", window, cx);
             editor.set_text_style_refinement(ds::field_text(cx));
             editor
         });
@@ -93,6 +115,8 @@ impl SessionsPanel {
             renaming: None,
             search_open: false,
             _agent_task: None,
+            list_state: ListState::new(0, ListAlignment::Top, px(ds::size::SIDEBAR_ROW * 8.)),
+            rows: Vec::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -525,48 +549,36 @@ fn imported(info: SessionInfo, graph: &str, agent: &str, cwd: &Path) -> SessionR
     }
 }
 
-impl Render for SessionsPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let Some(graph) = self.graph(cx) else {
-            return v_flex().into_any_element();
-        };
-        let shown = self.shown(cx);
-        let now = Utc::now();
-        let (listed, archived): (Vec<SessionRecord>, Vec<SessionRecord>) = {
-            let sessions = self.sessions.read(cx);
-            (
-                sessions.for_graph(&graph).into_iter().cloned().collect(),
-                sessions.archived(&graph).into_iter().cloned().collect(),
-            )
-        };
+impl SessionsPanel {
+    /// The rows to draw for `graph`: the search field when open, pinned conversations, then
+    /// recent ones, then the archive folded at the end. A search looks through the archive
+    /// too.
+    fn list_rows(&self, graph: &str, cx: &App) -> Vec<ListRow> {
+        let sessions = self.sessions.read(cx);
         let query = self.search.read(cx).text(cx).trim().to_lowercase();
         let searching = !query.is_empty();
-        let matches = |record: &SessionRecord| {
+        let matches = |record: &&SessionRecord| {
             query.is_empty()
                 || record.shown_title().to_lowercase().contains(&query)
                 || agent_name(&record.agent).to_lowercase().contains(&query)
         };
-        let (pinned, recent): (Vec<_>, Vec<_>) = listed
+        let (pinned, recent): (Vec<&SessionRecord>, Vec<&SessionRecord>) = sessions
+            .for_graph(graph)
             .into_iter()
-            .filter(|record| matches(record))
+            .filter(matches)
             .partition(|record| record.pinned);
-        let archived: Vec<_> = archived.into_iter().filter(|r| matches(r)).collect();
-        let is_shown = |record: &SessionRecord| shown.as_deref() == Some(record.session.as_str());
-
-        let mut list = v_flex().w_full();
+        let archived: Vec<&SessionRecord> = sessions
+            .archived(graph)
+            .into_iter()
+            .filter(matches)
+            .collect();
+        let id = |record: &&SessionRecord| ListRow::Conversation(record.session.clone());
+        let mut rows = Vec::new();
         if self.search_open || searching {
-            // The field's text sits on the rows' edge, as their titles do; ⎋ closes it.
-            list = list.child(
-                ds::sidebar_search(self.search.clone(), cx)
-                    .key_context("ConversationSearch")
-                    .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
-                        this.search_open = true;
-                        this.toggle_search(window, cx);
-                    })),
-            );
+            rows.push(ListRow::Search);
         }
         if pinned.is_empty() && recent.is_empty() && archived.is_empty() {
-            let note: SharedString = if searching {
+            rows.push(ListRow::Note(if searching {
                 "No conversation matches.".into()
             } else {
                 match studio_ui::shortcut_text(&studio_actions::agent::OpenAgent, cx) {
@@ -576,43 +588,92 @@ impl Render for SessionsPanel {
                     }
                     None => "No conversations yet. Ask the agent from the Agent tab.".into(),
                 }
-            };
-            list = list.child(ds::sidebar_note(note));
+            }));
         }
         if !pinned.is_empty() {
-            // The first label sits under the panel's own title, not a section's gap below it.
-            list = list.child(ds::section_label("Pinned").pt(px(ds::space::XS)));
-            for record in &pinned {
-                let row = self.row(record, is_shown(record), now, cx);
-                list = list.child(row);
-            }
+            rows.push(ListRow::Label {
+                title: "Pinned",
+                first: true,
+            });
+            rows.extend(pinned.iter().map(id));
             if !recent.is_empty() {
-                list = list.child(ds::section_label("Recent"));
+                rows.push(ListRow::Label {
+                    title: "Recent",
+                    first: false,
+                });
             }
         }
-        for record in &recent {
-            let row = self.row(record, is_shown(record), now, cx);
-            list = list.child(row);
-        }
+        rows.extend(recent.iter().map(id));
         if !archived.is_empty() {
-            // A search looks through the archive too.
             let open = self.show_archived || searching;
-            list = list.child(
-                ds::section_disclosure("archived", "Archived", archived.len(), open).on_click(
-                    cx.listener(|this, _, _, cx| {
+            rows.push(ListRow::Archived {
+                count: archived.len(),
+                open,
+            });
+            if open {
+                rows.extend(archived.iter().map(id));
+            }
+        }
+        rows.push(ListRow::End);
+        rows
+    }
+
+    fn render_list_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(row) = self.rows.get(ix).cloned() else {
+            return div().into_any_element();
+        };
+        match row {
+            // The field's text sits on the rows' edge, as their titles do; ⎋ closes it.
+            ListRow::Search => ds::sidebar_search(self.search.clone(), cx)
+                .key_context("ConversationSearch")
+                .on_action(cx.listener(|this, _: &menu::Cancel, window, cx| {
+                    this.search_open = true;
+                    this.toggle_search(window, cx);
+                }))
+                .into_any_element(),
+            ListRow::Note(note) => ds::sidebar_note(note).into_any_element(),
+            ListRow::Label { title, first } => ds::section_label(title)
+                .when(first, |label| label.pt(px(ds::space::XS)))
+                .into_any_element(),
+            ListRow::Archived { count, open } => {
+                ds::section_disclosure("archived", "Archived", count, open)
+                    .on_click(cx.listener(|this, _, _, cx| {
                         this.show_archived = !this.show_archived;
                         cx.notify();
-                    }),
-                ),
-            );
-            if open {
-                for record in &archived {
-                    let row = self.row(record, is_shown(record), now, cx);
-                    list = list.child(row);
-                }
+                    }))
+                    .into_any_element()
             }
+            ListRow::Conversation(id) => {
+                let Some(record) = self.sessions.read(cx).get(&id).cloned() else {
+                    return div().into_any_element();
+                };
+                let shown = self.shown(cx).as_deref() == Some(id.as_str());
+                self.row(&record, shown, Utc::now(), cx)
+            }
+            ListRow::End => div().h(px(ds::space::SM)).into_any_element(),
         }
-        list.child(div().h(px(ds::space::SM))).into_any_element()
+    }
+}
+
+impl Render for SessionsPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(graph) = self.graph(cx) else {
+            return v_flex().into_any_element();
+        };
+        let rows = self.list_rows(&graph, cx);
+        studio_ui::rows::sync(&self.list_state, &mut self.rows, rows);
+        list(
+            self.list_state.clone(),
+            // A row's root takes the list's width, so a note wraps at it.
+            cx.processor(|this, ix, _window, cx| {
+                div()
+                    .w_full()
+                    .child(this.render_list_row(ix, cx))
+                    .into_any_element()
+            }),
+        )
+        .size_full()
+        .into_any_element()
     }
 }
 
@@ -643,11 +704,12 @@ impl Render for SessionsActions {
             .gap(px(ds::space::XXS))
             .child({
                 let panel = panel.clone();
-                IconButton::new("search-conversations", IconName::MagnifyingGlass)
+                // A filter, not a search: the sidebar's title line ends with the global one.
+                IconButton::new("search-conversations", IconName::Filter)
                     .icon_size(IconSize::XSmall)
                     .icon_color(Color::Muted)
                     .toggle_state(searching)
-                    .tooltip(Tooltip::text("Search conversations"))
+                    .tooltip(Tooltip::text("Filter conversations"))
                     .on_click(move |_, window, cx| {
                         panel
                             .update(cx, |panel, cx| panel.toggle_search(window, cx))

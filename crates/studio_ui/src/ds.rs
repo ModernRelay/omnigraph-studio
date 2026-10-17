@@ -625,7 +625,7 @@ pub fn sidebar_note(label: impl Into<SharedString>) -> Div {
         .min_h(px(size::SIDEBAR_ROW))
         .flex()
         .items_center()
-        .child(text::muted(label))
+        .child(div().flex_1().min_w_0().child(text::muted(label)))
 }
 
 /// A surface's toolbar: fixed height, the column's edge inset, a rule below.

@@ -223,8 +223,10 @@ and Delta's sidebar.
   with it); earlier ones ran in the shared `agent/workspace`.
 - **The Conversations panel** is a tab of the left sidebar (the agent mark;
   `studio_agent::ShowConversations`), after Delta's threads list, every title on one edge. Its
-  title line holds Search, More (Import from the agent) and New conversation. Then Pinned and
-  Recent (labels only when something is pinned), each row the title alone and, at the end,
+  title line holds Filter, More (Import from the agent) and New conversation, before the
+  sidebar's own search, which searches everything; a filter's funnel keeps the two apart. Then
+  Pinned and Recent (labels only when something is pinned), each row the title alone and, at
+  the end,
   only what the conversation is doing: a turning circle while it runs, a warning mark while a
   change or tool waits for the person, a red cross when the agent stopped with an error, an
   accent dot when it finished while its tab was not shown (cleared when the tab gains focus).
@@ -241,7 +243,7 @@ and Delta's sidebar.
   wins over the agent's, and an empty one gives the agent's back. Delete… asks first, in a
   dialog: Studio forgets the conversation and its open tab closes, and the agent deletes it with
   `session/delete` when it can (otherwise the note says why); the graph and the agent's branch
-  are not touched. Search in the title line opens a field on the rows' edge (⎋ closes it); it
+  are not touched. Filter in the title line opens a field on the rows' edge (⎋ closes it); it
   matches titles and agent names and looks through the archive too. "Import from the agent"
   (More) asks the agent for its sessions in the graph's directory (`session/list`, every page up
   to 20) and adds the ones the list lacks, titled and dated as the agent reports; a toast says
