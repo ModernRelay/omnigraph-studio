@@ -1587,13 +1587,18 @@ impl Workspace {
         cx: &mut Context<Self>,
         build: impl FnOnce(&mut Window, &mut Context<V>) -> V,
     ) {
-        if let Some(active) = &self.modal
-            && active.view.clone().downcast::<V>().is_ok()
-        {
-            self.hide_modal(window, cx);
-            return;
+        // As Zed's modal layer: the open modal is asked first, whether this command closes it
+        // or another replaces it; a modal that says no stays, and the replacement is not shown.
+        // The focus to return to is the one before the first modal, not the modal's own.
+        let mut previous_focus = window.focused(cx);
+        if let Some(active) = &self.modal {
+            let same = active.view.clone().downcast::<V>().is_ok();
+            previous_focus = active.previous_focus.clone();
+            let closed = self.hide_modal(window, cx);
+            if same || !closed {
+                return;
+            }
         }
-        let previous_focus = window.focused(cx);
         let view = cx.new(|cx| build(window, cx));
         let subscription =
             cx.subscribe_in(&view, window, |this, _, _: &DismissEvent, window, cx| {
@@ -4030,6 +4035,27 @@ mod tests {
         }
     }
 
+    /// Another modal, which may close whenever.
+    struct Other {
+        focus_handle: FocusHandle,
+    }
+
+    impl EventEmitter<DismissEvent> for Other {}
+
+    impl Focusable for Other {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for Other {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().track_focus(&self.focus_handle)
+        }
+    }
+
+    impl ModalView for Other {}
+
     #[gpui::test]
     fn a_busy_modal_stays_open_until_it_agrees(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -4064,6 +4090,20 @@ mod tests {
         // The same command again asks too.
         open(true, cx);
         assert!(open_now(cx));
+        // So does another modal, which would replace it: it is not shown, as in Zed.
+        window
+            .update(cx, |workspace, window, cx| {
+                workspace.toggle_modal(window, cx, |_, cx| Other {
+                    focus_handle: cx.focus_handle(),
+                });
+            })
+            .unwrap();
+        window
+            .read_with(cx, |workspace, _| {
+                let modal = workspace.modal.as_ref().unwrap().view.clone();
+                assert!(modal.downcast::<Busy>().is_ok(), "the busy modal stays");
+            })
+            .unwrap();
         // Once the write is over it closes.
         window
             .update(cx, |workspace, _, cx| {
