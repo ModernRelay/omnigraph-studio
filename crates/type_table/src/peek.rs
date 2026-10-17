@@ -185,6 +185,9 @@ pub struct NodePeek {
     edge_writes: HashSet<usize>,
     /// Why a group's last write did not land.
     group_notices: HashMap<usize, Notice>,
+    /// The relationship groups with no neighbours are listed too; by default they fold into
+    /// one row at the end.
+    show_empty: bool,
     /// The node's drafts being saved together.
     saving_drafts: bool,
     /// Why the drafts' last save did not land; the second press of Discard drops them.
@@ -307,6 +310,7 @@ impl NodePeek {
             saving_drafts: false,
             drafts_notice: None,
             confirm_discard: false,
+            show_empty: false,
             _tasks: Vec::new(),
             _subscription: subscription,
         };
@@ -2328,6 +2332,27 @@ impl NodePeek {
             .into_any_element()
     }
 
+    /// Whether a group sits among those listed above the empty row: it has neighbours, or its
+    /// count failed and says why, or a write or its outcome is out on it. One with none, or
+    /// still being counted, waits under the empty row, so opening that row moves nothing.
+    fn listed_by_default(&self, index: usize) -> bool {
+        let Some(group) = self.groups.get(index) else {
+            return false;
+        };
+        let working = self.edge_writes.contains(&index) || self.group_notices.contains_key(&index);
+        lists_group(&group.count, working)
+    }
+
+    /// Whether a group under the empty row shows: the row is open, or the person is adding to
+    /// that group.
+    fn folded_shown(&self, index: usize) -> bool {
+        self.show_empty
+            || self
+                .adding
+                .as_ref()
+                .is_some_and(|adding| adding.index == index)
+    }
+
     fn render_relationships(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.groups.is_empty() {
             return Label::new("This type takes part in no relationships.")
@@ -2336,93 +2361,165 @@ impl NodePeek {
                 .into_any_element();
         }
         let hover = cx.theme().colors().element_hover;
-        v_flex()
-            .gap_0p5()
-            .children(self.groups.iter().enumerate().map(|(index, group)| {
-                let icon = match group.group.direction {
-                    Direction::Outgoing => IconName::ArrowRight,
-                    Direction::Incoming => IconName::ArrowLeft,
-                };
-                let count = match &group.count {
-                    Loadable::Loaded(n) => format_count(*n),
-                    Loadable::Failed(_) => "?".into(),
-                    _ => "…".into(),
-                };
-                let failed = match &group.count {
-                    Loadable::Failed(error) => Some(error.clone()),
-                    _ => None,
-                };
-                let header_group = SharedString::from(format!("peek-group-{index}"));
-                let add = self
-                    .edits_relationships()
-                    .then(|| self.render_add_button(index, header_group.clone(), cx));
-                let header = h_flex()
-                    .id(("peek-group", index))
-                    .group(header_group)
-                    .px_1()
-                    .py_0p5()
-                    .gap_1p5()
-                    .rounded_sm()
-                    .hover(move |s| s.bg(hover))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(index, cx)))
-                    .when_some(failed, |d, error| d.tooltip(Tooltip::text(error)))
-                    .child(
-                        Icon::new(if group.expanded {
-                            IconName::ChevronDown
-                        } else {
-                            IconName::ChevronRight
-                        })
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                    )
-                    .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
-                    .child(
-                        Label::new(gq_language::traversal_name(&group.group.edge))
-                            .size(LabelSize::Small),
-                    )
-                    .child(
-                        Label::new(group.group.other_type.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(div().flex_1())
-                    .when(self.edge_writes.contains(&index), |header| {
-                        header.child(Indicator::dot().color(Color::Warning))
+        let (listed, folded): (Vec<usize>, Vec<usize>) =
+            (0..self.groups.len()).partition(|&index| self.listed_by_default(index));
+        let counting = folded.iter().any(|&index| {
+            matches!(
+                self.groups[index].count,
+                Loadable::NotLoaded | Loadable::Loading
+            )
+        });
+        // Until a count arrives nothing says a group holds anything; once every group is
+        // counted, the ones with none fold into one row after the rest and open beneath it.
+        let reading = (listed.is_empty() && counting).then(|| {
+            Label::new("Reading…")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element()
+        });
+        let empty_row = (!folded.is_empty() && !counting).then(|| {
+            let open = self.show_empty;
+            h_flex()
+                .id("peek-empty-groups")
+                .px_1()
+                .py_0p5()
+                .gap_1p5()
+                .rounded_sm()
+                .hover(move |s| s.bg(hover))
+                .cursor_pointer()
+                .tooltip(Tooltip::text(if open {
+                    "Hide the relationships with none"
+                } else {
+                    "Show the relationships with none, to add one"
+                }))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.show_empty = !this.show_empty;
+                    cx.notify();
+                }))
+                .child(
+                    Icon::new(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
                     })
-                    .children(add)
-                    .child(
-                        Label::new(count)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .buffer_font(cx),
-                    );
-                let adding = self
-                    .adding
-                    .as_ref()
-                    .filter(|adding| adding.index == index)
-                    .map(|adding| self.render_add_row(adding, cx));
-                let notice = self.group_notices.get(&index).map(|notice| {
-                    h_flex()
-                        .pl(px(22.))
-                        .gap_1p5()
-                        .child(Indicator::dot().color(notice_color(notice.tone)))
-                        .child(
-                            Label::new(notice.message.clone())
-                                .size(LabelSize::XSmall)
-                                .color(notice_color(notice.tone)),
-                        )
-                });
-                let body = group
-                    .expanded
-                    .then(|| self.render_neighbours(index, group, cx));
-                v_flex()
-                    .child(header)
-                    .children(adding)
-                    .children(notice)
-                    .children(body)
-            }))
-            .into_any_element()
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+                )
+                .child(
+                    Label::new("Empty")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(div().flex_1())
+                .child(
+                    Label::new(format_count(folded.len() as i64))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .buffer_font(cx),
+                )
+                .into_any_element()
+        });
+        let mut column = v_flex().gap_0p5().children(reading);
+        for index in listed {
+            column = column.child(self.render_group(index, cx));
+        }
+        column = column.children(empty_row);
+        if !counting {
+            for index in folded {
+                if self.folded_shown(index) {
+                    column = column.child(self.render_group(index, cx));
+                }
+            }
+        }
+        column.into_any_element()
+    }
+
+    /// One relationship group: its header (direction, name, the other type, "+", the count),
+    /// then an open search, its notice and, when open, its neighbours.
+    fn render_group(&self, index: usize, cx: &mut Context<Self>) -> Div {
+        let hover = cx.theme().colors().element_hover;
+        let group = &self.groups[index];
+        let icon = match group.group.direction {
+            Direction::Outgoing => IconName::ArrowRight,
+            Direction::Incoming => IconName::ArrowLeft,
+        };
+        let count = match &group.count {
+            Loadable::Loaded(n) => format_count(*n),
+            Loadable::Failed(_) => "?".into(),
+            _ => "…".into(),
+        };
+        let failed = match &group.count {
+            Loadable::Failed(error) => Some(error.clone()),
+            _ => None,
+        };
+        let header_group = SharedString::from(format!("peek-group-{index}"));
+        let add = self
+            .edits_relationships()
+            .then(|| self.render_add_button(index, header_group.clone(), cx));
+        let header = h_flex()
+            .id(("peek-group", index))
+            .group(header_group)
+            .px_1()
+            .py_0p5()
+            .gap_1p5()
+            .rounded_sm()
+            .hover(move |s| s.bg(hover))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(index, cx)))
+            .when_some(failed, |d, error| d.tooltip(Tooltip::text(error)))
+            .child(
+                Icon::new(if group.expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+            .child(
+                Label::new(gq_language::traversal_name(&group.group.edge)).size(LabelSize::Small),
+            )
+            .child(
+                Label::new(group.group.other_type.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(div().flex_1())
+            .when(self.edge_writes.contains(&index), |header| {
+                header.child(Indicator::dot().color(Color::Warning))
+            })
+            .children(add)
+            .child(
+                Label::new(count)
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .buffer_font(cx),
+            );
+        let adding = self
+            .adding
+            .as_ref()
+            .filter(|adding| adding.index == index)
+            .map(|adding| self.render_add_row(adding, cx));
+        let notice = self.group_notices.get(&index).map(|notice| {
+            h_flex()
+                .pl(px(22.))
+                .gap_1p5()
+                .child(Indicator::dot().color(notice_color(notice.tone)))
+                .child(
+                    Label::new(notice.message.clone())
+                        .size(LabelSize::XSmall)
+                        .color(notice_color(notice.tone)),
+                )
+        });
+        let body = group
+            .expanded
+            .then(|| self.render_neighbours(index, group, cx));
+        v_flex()
+            .child(header)
+            .children(adding)
+            .children(notice)
+            .children(body)
     }
 
     /// A group's "+": a search for the node to relate; a relationship that needs properties
@@ -2813,6 +2910,12 @@ fn node_actions(type_name: &str, id: &str, at_commit: Option<String>) -> (PeekNo
     )
 }
 
+/// Whether a relationship group is listed by default: it has neighbours, the person is working
+/// in it, or its count failed. One with none, or not counted yet, is not.
+fn lists_group(count: &Loadable<i64>, active: bool) -> bool {
+    active || matches!(count, Loadable::Loaded(n) if *n > 0) || matches!(count, Loadable::Failed(_))
+}
+
 /// A notice's colour: red for what was refused or cannot be sent, amber for a conflict or an
 /// unknown outcome.
 fn notice_color(tone: Tone) -> Color {
@@ -3148,6 +3251,39 @@ mod tests {
             assert!(view.removing.is_none() && view.edge_writes.is_empty());
             assert_eq!(view.snapshot.as_deref(), Some("c2"), "its own commit");
             assert!(!view.newer && view.group_notices.is_empty());
+        });
+    }
+
+    /// A node lists the relationships it has; the ones with none fold into one row, which
+    /// lists them when opened. One the person is adding to stays listed while empty.
+    #[gpui::test]
+    async fn relationships_with_none_fold_away_until_asked_for(cx: &mut TestAppContext) {
+        let (view, cx) = page(session(KNOWS, cx), cx);
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.groups.len() >= 2, "knows, out and in");
+            for group in &mut view.groups {
+                group.count = Loadable::Loading;
+            }
+            assert!(!view.listed_by_default(0), "not counted yet");
+            view.groups[0].count = Loadable::Loaded(2);
+            for group in view.groups.iter_mut().skip(1) {
+                group.count = Loadable::Loaded(0);
+            }
+            assert!(view.listed_by_default(0), "it has neighbours");
+            assert!(!view.listed_by_default(1), "it has none");
+            assert!(!view.folded_shown(1), "folded under the empty row");
+            view.groups[1].count = Loadable::Failed("unreachable".into());
+            assert!(view.listed_by_default(1), "a failed count says why");
+            view.groups[1].count = Loadable::Loaded(0);
+            view.edge_writes.insert(1);
+            assert!(view.listed_by_default(1), "a write is out on it");
+            view.edge_writes.clear();
+            view.show_empty = true;
+            assert!(!view.listed_by_default(1), "opening the row moves nothing");
+            assert!(view.folded_shown(1), "it shows under the open row");
+            view.show_empty = false;
+            view.start_add(1, window, cx);
+            assert!(view.folded_shown(1), "being added to, with the row closed");
         });
     }
 

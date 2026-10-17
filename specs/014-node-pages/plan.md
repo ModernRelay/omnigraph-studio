@@ -174,6 +174,13 @@ Four parts, built in this order; each lands on its own.
 
 ### 4. Relationships from the node
 
+- **Only the relationships a node has are listed**, on the page and in the peek: a group with
+  neighbours, one whose count failed (its reason in the tooltip), and one with a write or its
+  outcome out. The groups with none fold into one "Empty" row after them, with their number;
+  opening it lists them beneath it, each with its "+", so the rows above do not move. While the
+  counts are read and none has arrived, the section reads "Reading…"; the empty row waits until
+  every group is counted. A group whose last neighbour is removed moves under the empty row; one
+  added to from there moves up once it has a neighbour.
 - **Built so far**: a group's "+" (always on the page, under the pointer in the peek) opens a
   search over the other type, eight matches by name or id; ↑↓ choose and ↵ adds, written at
   once as one commit with this node at the end its group points from. On an outgoing
@@ -236,6 +243,7 @@ Four parts, built in this order; each lands on its own.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-17 | A node lists only the relationships it has | `type_table` `relationships_with_none_fold_away_until_asked_for` (not counted, with neighbours, with none, a failed count, a write out, the row open, adding with it closed); offscreen snapshots of Leslie Wirth's page, then with Empty opened | Three groups with neighbours, then "Empty 1"; opened, `contributes Project` with "+" and 0 appeared under it and the rows above stayed where they were |
 | 2026-10-16 | One draft per branch, shared by tables and pages | `graph_store` `drafts_wait_with_their_branch`; `type_table` `a_field_left_changed_is_a_draft_the_table_shows_and_save_lands` (a page's draft in the type's table, ⌘S on the page: one commit, gone from both), and the table's own tests unchanged; an offscreen snapshot of Project Fable 36 with name left changed | "Project Fable 36 (draft)" with a dot and "1 change not saved · Discard · Save" under the title |
 | 2026-10-16 | A text cell with lines or markup opens in the editor | `type_table` `a_text_cell_with_lines_opens_in_the_editor_not_the_cell`; an offscreen click on keyset-paging's body cell in the `notes` graph | The click opened "Keyset paging · body" in the editor; a plain name still edits in its cell |
 | 2026-10-16 | Relationships are added and removed from the node | `gq_language` `relationship_queries_compile_in_both_directions` (the neighbours read returns `$e.@id as edge_id` and compiles); `type_table` `a_relationship_is_removed_on_the_second_press`, `a_refused_relationship_says_why_on_its_group`; `$e.@id` read through the 0.13 server with `omnigraph query`; offscreen snapshots of Radia Knuth's page: "+" on worksAt, "Liskov", ↵, then × twice on Liskov Systems; the CLI read three, then two workplaces | The search listed four Liskov companies with the first highlighted and "↑↓ choose · ↵ add · esc cancel · write · main"; ↵ made worksAt 3 with Liskov Systems listed; the first × press read "Remove", the second made it 2 again |
