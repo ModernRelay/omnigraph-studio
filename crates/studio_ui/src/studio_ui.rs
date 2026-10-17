@@ -153,22 +153,6 @@ pub fn is_numeric(value: &Value) -> bool {
     matches!(value, Value::Number(_))
 }
 
-/// A centered message with an optional detail line, for empty, loading and error states.
-pub fn empty_state(title: impl Into<SharedString>, detail: Option<SharedString>) -> Div {
-    v_flex()
-        .size_full()
-        .items_center()
-        .justify_center()
-        .gap_1()
-        .p_6()
-        .child(Label::new(title.into()).color(Color::Muted))
-        .children(detail.map(|detail| {
-            Label::new(detail)
-                .size(LabelSize::Small)
-                .color(Color::Disabled)
-        }))
-}
-
 /// A small colored square for a node or edge type.
 pub fn type_swatch(type_name: &str) -> Div {
     type_mark(type_name, type_name)

@@ -1,6 +1,7 @@
 //! Every binding in Studio's keymaps names an action Studio has, on every platform, and no key
-//! that types a character acts while a text field has focus. The person's `keymap.json` wins over
-//! Studio's bindings and is read again when it changes.
+//! that types a character acts while a text field has focus. Every action without arguments has
+//! a key on every platform, except the few reached from the palette and menus alone. The
+//! person's `keymap.json` wins over Studio's bindings and is read again when it changes.
 //!
 //! `harness = false`: the macOS platform must be created on the main thread.
 
@@ -27,6 +28,27 @@ const KEYMAPS: [(&str, &str); 3] = [
     ),
 ];
 
+/// The actions without a default key, as in Zed: rare, or destructive enough that a key would
+/// be reached by accident. Each is in the command palette, and most in a menu as well.
+const PALETTE_ONLY: [&str; 16] = [
+    "studio::RevealLog",
+    "studio::OpenDesignSystem",
+    "studio::SplitLeft",
+    "studio::SplitUp",
+    "studio::TogglePinTab",
+    "studio::KeepPreviewTab",
+    "studio::CloseGraph",
+    "studio_graph::ReviewBranch",
+    "studio_graph::OpenHistory",
+    "studio_graph::OpenInspector",
+    "studio_graph::CreateBranch",
+    "studio_graph::DeleteBranch",
+    "studio_graph::MergeBranch",
+    "studio_agent::ClearQueue",
+    "studio_agent::Restart",
+    "studio_agent::ShowConversations",
+];
+
 /// The platform's command modifier, as keymaps write it.
 const MODIFIER: &str = if cfg!(target_os = "macos") {
     "cmd"
@@ -47,7 +69,7 @@ fn main() {
   {{
     "bindings": {{
       "{MODIFIER}-k": null,
-      "{MODIFIER}-alt-o": "studio::OpenGraph",
+      "{MODIFIER}-alt-g": "studio::OpenGraph",
       "{MODIFIER}-alt-j": "studio::NoSuchAction",
     }},
   }},
@@ -67,6 +89,8 @@ fn main() {
     cx.update(studio::init);
     every_keymap_binding_names_a_studio_action(&mut cx);
     println!("test every_keymap_binding_names_a_studio_action ... ok");
+    every_action_has_a_key_or_is_palette_only(&mut cx);
+    println!("test every_action_has_a_key_or_is_palette_only ... ok");
     the_persons_keymap_wins_and_is_read_again(&mut cx, &keymap);
     println!("test the_persons_keymap_wins_and_is_read_again ... ok");
     std::fs::remove_dir_all(&data).ok();
@@ -121,6 +145,43 @@ fn every_keymap_binding_names_a_studio_action(cx: &mut HeadlessAppContext) {
     }
 }
 
+/// An action Studio defines that takes no arguments is bound on every platform unless it is
+/// palette-only, and a palette-only action is bound on none.
+fn every_action_has_a_key_or_is_palette_only(cx: &mut HeadlessAppContext) {
+    // An action without arguments has no schema; one with only optional fields has one.
+    let actions: Vec<&str> = cx.update(|cx| {
+        cx.action_schemas(&mut schemars::SchemaGenerator::default())
+            .into_iter()
+            .filter(|(name, schema)| name.starts_with("studio") && schema.is_none())
+            .map(|(name, _)| name)
+            .collect()
+    });
+    for name in PALETTE_ONLY {
+        assert!(actions.contains(&name), "{name} is not an action");
+    }
+    for (platform, content) in KEYMAPS {
+        let blocks: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+        let bound: Vec<&str> = blocks
+            .iter()
+            .filter_map(|block| block["bindings"].as_object())
+            .flat_map(|bindings| bindings.values())
+            .filter_map(|action| action.as_str().or_else(|| action[0].as_str()))
+            .collect();
+        for name in &actions {
+            let palette_only = PALETTE_ONLY.contains(name);
+            assert!(
+                bound.contains(name) != palette_only,
+                "{platform}: {name} {}",
+                if palette_only {
+                    "is palette-only but has a key"
+                } else {
+                    "has no key"
+                }
+            );
+        }
+    }
+}
+
 /// Whether `action` is bound to the platform's modifier and `key`, with Alt when `alt`.
 fn bound(cx: &mut HeadlessAppContext, action: &dyn Action, key: &str, alt: bool) -> bool {
     cx.update(|cx| {
@@ -159,7 +220,7 @@ fn saved(cx: &mut HeadlessAppContext, path: &Path, text: &str) {
 /// naming no action is reported while the rest apply. A file saved broken keeps the bindings in
 /// effect; a file saved again replaces them, and Studio's own come back.
 fn the_persons_keymap_wins_and_is_read_again(cx: &mut HeadlessAppContext, keymap: &Path) {
-    assert!(bound(cx, &OpenGraph, "o", true), "the person's binding");
+    assert!(bound(cx, &OpenGraph, "g", true), "the person's binding");
     assert!(
         !bound(cx, &ToggleCommandPalette, "k", false),
         "removed with null"
@@ -185,14 +246,14 @@ fn the_persons_keymap_wins_and_is_read_again(cx: &mut HeadlessAppContext, keymap
         "{problems:?}"
     );
     assert!(
-        bound(cx, &OpenGraph, "o", true),
+        bound(cx, &OpenGraph, "g", true),
         "a broken file keeps the bindings"
     );
 
     saved(cx, keymap, "[]");
     assert_eq!(keymap_problems(cx), Vec::<String>::new());
     assert!(
-        !bound(cx, &OpenGraph, "o", true),
+        !bound(cx, &OpenGraph, "g", true),
         "the person's binding is gone"
     );
     assert!(

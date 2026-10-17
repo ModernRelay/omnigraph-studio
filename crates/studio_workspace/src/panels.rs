@@ -50,8 +50,8 @@ impl PanelPosition {
 
     pub fn default_size(self) -> f32 {
         match self {
-            PanelPosition::Left => 264.,
-            PanelPosition::Right => 340.,
+            PanelPosition::Left => studio_ui::ds::size::SIDEBAR_WIDTH,
+            PanelPosition::Right => studio_ui::ds::size::INSPECTOR_WIDTH,
             PanelPosition::Bottom => 300.,
         }
     }

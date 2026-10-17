@@ -859,38 +859,43 @@ impl Item for BlobView {
 impl Render for BlobView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match &self.content {
-            Loadable::Loading | Loadable::NotLoaded => studio_ui::empty_state(
-                format!("Reading {}…", self.cell.property),
-                self.size.map(|size| studio_ui::format_bytes(size).into()),
-            )
-            .into_any_element(),
-            Loadable::Failed(error) => studio_ui::empty_state(
-                format!("Studio could not show {}", self.cell.property),
-                Some(error.clone().into()),
+            Loadable::Loading | Loadable::NotLoaded => {
+                studio_ui::ds::loading_state(match self.size {
+                    Some(size) => format!(
+                        "Reading {}, {}…",
+                        self.cell.property,
+                        studio_ui::format_bytes(size)
+                    ),
+                    None => format!("Reading {}…", self.cell.property),
+                })
+                .into_any_element()
+            }
+            Loadable::Failed(error) => studio_ui::ds::error_state(
+                format!("{} could not be shown", self.cell.property),
+                error.clone(),
             )
             .into_any_element(),
             Loadable::Loaded(Content::Null) => {
-                studio_ui::empty_state("No value", None).into_any_element()
+                studio_ui::ds::empty_state(IconName::FileGeneric, "No value").into_any_element()
             }
-            Loadable::Loaded(Content::External(uri)) => studio_ui::empty_state(
-                "A reference to a file outside the graph",
-                Some(format!("{uri} · Studio does not fetch objects outside the graph.").into()),
-            )
-            .into_any_element(),
-            Loadable::Loaded(Content::TooLarge) => studio_ui::empty_state(
+            // Studio does not fetch objects outside the graph.
+            Loadable::Loaded(Content::External(uri)) => {
+                studio_ui::ds::empty_state(IconName::Link, "Stored outside the graph")
+                    .child(studio_ui::ds::state_detail(uri.clone()))
+                    .into_any_element()
+            }
+            Loadable::Loaded(Content::TooLarge) => studio_ui::ds::empty_state(
+                IconName::FileGeneric,
                 format!(
                     "{} is {}",
                     self.cell.property,
                     studio_ui::format_bytes(self.size.unwrap_or(0))
                 ),
-                Some(
-                    format!(
-                        "Studio shows values up to {}; save it, or open it in the default app.",
-                        studio_ui::format_bytes(VIEW_MAX)
-                    )
-                    .into(),
-                ),
             )
+            .child(studio_ui::ds::state_detail(format!(
+                "Studio shows values up to {}; save it, or open it in the default app.",
+                studio_ui::format_bytes(VIEW_MAX)
+            )))
             .into_any_element(),
             Loadable::Loaded(Content::Image { image, size, .. }) => {
                 let (image, size) = (image.clone(), *size);

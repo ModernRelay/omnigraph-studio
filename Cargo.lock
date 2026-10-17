@@ -179,7 +179,6 @@ name = "agent_panel"
 version = "0.2.1"
 dependencies = [
  "agent-client-protocol",
- "anyhow",
  "chrono",
  "editor",
  "futures",
@@ -4131,7 +4130,6 @@ dependencies = [
 name = "gq_language"
 version = "0.2.1"
 dependencies = [
- "anyhow",
  "omnigraph-compiler",
  "serde_json",
 ]
@@ -4171,7 +4169,6 @@ dependencies = [
  "serde",
  "serde_json",
  "smol",
- "thiserror 2.0.17",
  "url",
 ]
 
@@ -9798,7 +9795,6 @@ dependencies = [
  "editor",
  "gpui",
  "gpui_platform",
- "gq_language",
  "graph_canvas",
  "graph_client",
  "graph_store",
@@ -9810,8 +9806,8 @@ dependencies = [
  "menu",
  "query_editor",
  "relationship_tree",
- "release_channel",
  "review",
+ "schemars 1.0.4",
  "serde_json",
  "settings",
  "smol",
@@ -9871,7 +9867,6 @@ dependencies = [
  "gpui",
  "pulldown-cmark",
  "serde_json",
- "studio_actions",
  "studio_settings",
  "studio_theme",
  "theme",

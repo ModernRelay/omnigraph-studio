@@ -7,7 +7,7 @@ palette landed 2026-10-12 (`crates/command_palette`), with scope tabs and the As
 ## Problem
 
 Every surface needs the same frame: a window with docks, panes and tabs, a status bar, a command
-palette, menus, settings, a theme, notifications, and keyboard bindings for everything. Zed has
+palette, menus, settings, a theme, notifications, and keyboard bindings. Zed has
 all of it, but its `workspace` assumes a code project, collaboration and Zed's database.
 
 ## Principles
@@ -56,7 +56,9 @@ and Forward buttons; the top-left one makes room for the traffic lights. ⌘\ an
 and down with a copy of the active tab (reopened from its saved form), ⌘⌥→/← move between
 panes, a pane that loses its last tab closes. Pinned tabs come first with a pin instead of a
 close button and survive "Close others" and "Close all"; a tab's right-click menu has the
-close variants, Pin and the splits. A preview tab (italic title) is what a single click in the
+close variants, Pin and the splits, as Zed's: each entry acts on the clicked tab and shows the
+key of the action it stands for, read in that tab's context, and a close variant with no tab to
+close is disabled. A preview tab (italic title) is what a single click in the
 Types list opens; the next preview replaces it in place, and a double click, opening it again
 without preview, or work in it keeps it. Tabs that hold unsaved work stay open on the bulk
 closes. The workspace file saves each pane's tabs, active tab and pinned count, the split tree
@@ -162,6 +164,8 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
 
 - Transparent title bar with no title area: the traffic lights sit in the first column's
   header (the sidebar's, else the top-left pane's), and every header strip moves the window.
+  As in Zed's title bar, that room is left on macOS only, and not in full screen, where the
+  lights hide with the menu bar; there the strip starts at its own edge.
 - Status bar left: the docks' panel buttons, then the connection chip (`ready`,
   `connecting…`, `contract mismatch`, `unauthorized`, `unreachable`, with the contract and the
   round trip), the graph and the branch menu, which switches branch for the window. Right: what
@@ -175,6 +179,14 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
 - Actions in `studio_actions`, one module per surface. Doc comments are the palette text.
 - Default keymaps in `assets/keymaps/default-{macos,linux,windows}.json`. Contexts:
   `Workspace`, `TypeTable`, `Tree`, `Canvas`, `QueryEditor`, `Review`, `History`, `Inspector`.
+  Every action without arguments has a key on every platform except, as in Zed, the rare and
+  the destructive (reveal the log, the design system gallery, directional splits left and up,
+  pin and keep tab, close graph, branch create, delete, merge and review, history, the storage
+  inspector, the agent's queue, restart and conversation list), which the palette and menus
+  reach. `crates/studio/tests/keymaps.rs` holds that list and fails on an action outside it with
+  no key. Workspace keys from Zed: ⌥⌘O open a graph (Zed's open recent), ⌥⌘T close others, ⌘R
+  refresh the graph (a table's own ⌘R refreshes the table); ⌥⌘W closes every tab, since ⌘K is
+  the palette and cannot start Zed's ⌘K W chord. ⌘N in the agent panel starts a conversation.
 - Global: ⌘K palette, ⌘P go to type or node, ⌘⇧B switch branch, ⌘, settings, ⌘1–⌘9 tabs,
   ⌘[ / ⌘] back and forward, `?` key sheet (outside text fields).
 - In lists and tables: J/K or ↑/↓, ↵ open, Space peek, Esc steps back one level (close editor,
@@ -443,8 +455,13 @@ than styling one-off elements.
   next message's gutter row. Explanations go in tooltips. Sentences appear only in errors
   (`Callout`) and in what an agent writes.
 - **Empty states.** An icon, a title of two or three words, and the actions that fill the
-  space as outlined buttons with their key bindings (`ds::empty_state`); an empty panel is one
-  dim row (`ds::sidebar_placeholder`).
+  space as outlined buttons with their key bindings (`ds::empty_state`, `ds::state_action`); an
+  empty panel is one dim row (`ds::sidebar_placeholder`). A line the words and actions cannot
+  carry, such as a reference's address or why a value is not shown, goes under the title
+  (`ds::state_detail`). While content is read, a muted line holds its place
+  (`ds::loading_state`); content that could not be read shows an error icon, what failed and
+  the reason as it came, then its recovery (`ds::error_state`). These are the only three: no
+  view centers a sentence of its own.
 
 ### Motion
 
@@ -485,6 +502,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-17 | A tab's menu shows its keys; every action has a key or is palette-only; the lights' room only where they show; one loading and one error state | `studio` `keymaps` `every_action_has_a_key_or_is_palette_only` (red on `studio_graph::OpenSchema` while optional-field actions counted; then on none); `studio_workspace` `strips_make_room_for_traffic_lights_only_when_they_show`; offscreen snapshots: the right-click menu on the first and on the last of two tabs, and the design gallery's state row | The menu read Close ⌘W, Close Others ⌥⌘T, Close All ⌥⌘W, Split Right `⌘\`, Split Down `⌘⇧\`; on the last tab "Close to the Right" was disabled. Five actions gained keys from Zed's (⌥⌘O, ⌘R, ⌥⌘T, ⌥⌘W, ⌘N in the agent panel), sixteen stay palette-only. The old centred-sentence helper is gone; its callers read the schema, history, changes, review, Blob and table states through `ds::loading_state`, `ds::error_state` and `ds::empty_state` |
 | 2026-10-16 | The status bar lists keys behind one button | Offscreen snapshots of Person's table: the bar, then the keyboard button pressed | The bar reads the panels, the server, knowledge / main, ⌨, the memory and the docks; the menu lists Edit ↵, Peek ␣, Open page ⌘↵, Explore G, Copy ⌘C, Filter by this value ⌥⌘F, New row ⌘N, Delete row ⌘⌫, Save drafts ⌘S, Refresh ⌘R. A Studio view built as the menu closed itself at once; Zed's context menu does not |
 | 2026-10-16 | Buttons at Zed's insets; a tab's title centred | `studio_ui` `controls_draw_at_their_sizes` (8 px each side, red at 6 before the change); offscreen snapshots: two tabs with the pointer on the inactive one, the table toolbar, the insert dialog, the bottom dock | The active tab had 21 px before its icon and 8 after its ×; with × under the pointer only, 21 and 23, as Zed's. Toolbar and dialog buttons read with Zed's 8 px; a dock header's title now starts on its toolbar's 16 px edge (it was 12) |
 | 2026-10-16 | The sidebar toggle at the status bar's start; tabs drag in the app | `studio` `windows_leave_the_titlebar_drag_to_the_app` (red before the option was set); offscreen snapshots with the sidebar shown and hidden, the ontology browsing Company into Nodes, Activity empty | In the app, dragging a tab moved the window: AppKit owned the title bar's band, where Studio's tabs sit. The toggle reads filled with the sidebar shown and empty with it hidden; the sidebar's list starts 6 px under its header; Nodes and Activity did what their specs say, their empty states now naming where a type is clicked and showing Activity's icon |

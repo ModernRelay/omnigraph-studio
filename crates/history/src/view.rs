@@ -15,7 +15,7 @@ use graph_client::api::CommitOutput;
 use graph_store::{GraphSession, SessionEvent};
 use studio_actions::graph::OpenCommit;
 use studio_actions::history::{NextMatch, PreviousMatch};
-use studio_ui::{change_counts, empty_state, now_micros, relative_time, short_commit_id};
+use studio_ui::{change_counts, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 use ui::{Banner, ContextMenu, Severity, Tooltip, right_click_menu};
@@ -382,21 +382,6 @@ impl HistoryView {
             self.detail = Some(detail);
         }
         cx.notify();
-    }
-
-    /// Selects the commit with this id, when it is in the list.
-    pub fn select_commit(&mut self, commit_id: &str, cx: &mut Context<Self>) -> bool {
-        match self
-            .commits
-            .iter()
-            .position(|c| c.graph_commit_id == commit_id)
-        {
-            Some(ix) => {
-                self.select(ix, cx);
-                true
-            }
-            None => false,
-        }
     }
 
     fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
@@ -884,19 +869,19 @@ impl Render for HistoryView {
         });
         let body = match &self.state {
             State::Failed(error) => {
-                empty_state("History could not be read.", Some(error.clone())).into_any_element()
+                studio_ui::ds::error_state("History could not be read", error.clone())
+                    .into_any_element()
             }
             State::Loading if self.commits.is_empty() => {
-                empty_state("Reading commits…", None).into_any_element()
+                studio_ui::ds::loading_state("Reading commits…").into_any_element()
             }
             _ if self.compact => self.render_list(cx),
             _ => {
                 let list = self.render_list(cx);
                 let detail = match &self.detail {
                     Some(detail) => detail.clone().into_any_element(),
-                    None => {
-                        empty_state("Select a commit to see its changes.", None).into_any_element()
-                    }
+                    None => studio_ui::ds::empty_state(IconName::HistoryRerun, "Select a commit")
+                        .into_any_element(),
                 };
                 h_flex()
                     .flex_1()

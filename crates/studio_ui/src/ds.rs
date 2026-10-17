@@ -8,8 +8,8 @@
 //! elevation.
 
 use gpui::{
-    AnyElement, App, Background, BoxShadow, ClickEvent, Div, ElementId, Hsla, MouseButton,
-    SharedString, Stateful, Window, point,
+    AnyElement, App, BoxShadow, ClickEvent, Div, ElementId, Hsla, MouseButton, SharedString,
+    Stateful, Window, point,
 };
 use studio_settings::{StudioSettings, WindowStyle};
 use ui::prelude::*;
@@ -111,6 +111,8 @@ pub mod size {
     pub const FEED_ROW: f32 = 36.;
     pub const SIDEBAR_WIDTH: f32 = 264.;
     pub const INSPECTOR_WIDTH: f32 = 340.;
+    /// The widest a state's detail line runs before it wraps (`state_detail`).
+    pub const STATE_DETAIL_WIDTH: f32 = 360.;
     /// Width of a field's label column.
     pub const FIELD_LABEL: f32 = 112.;
     /// The gap around and between glass sheets.
@@ -214,16 +216,6 @@ pub mod surface {
     /// The glass window's base, under [`super::wash`].
     pub fn page(cx: &App) -> Hsla {
         cx.theme().colors().editor_background
-    }
-
-    /// Kept for callers that paint the wash as one background: mint to sky.
-    pub fn wash(cx: &App) -> Background {
-        let base = cx.theme().colors().editor_background;
-        gpui::linear_gradient(
-            135.,
-            gpui::linear_color_stop(base.blend(gpui::hsla(0.40, 0.45, 0.65, 0.10)), 0.),
-            gpui::linear_color_stop(base.blend(gpui::hsla(0.60, 0.70, 0.70, 0.08)), 1.),
-        )
     }
 }
 
@@ -1212,6 +1204,63 @@ pub fn empty_state(icon: IconName, title: impl Into<SharedString>) -> Div {
         .child(Label::new(title.into()).color(Color::Muted))
 }
 
+/// What a view shows while its content is read, where the content will be: a muted line, as
+/// Zed's panels say "Loading…". No icon: it passes, and asks nothing.
+pub fn loading_state(title: impl Into<SharedString>) -> Div {
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .p(px(space::PAGE))
+        .child(Label::new(title.into()).color(Color::Muted))
+}
+
+/// A view whose content could not be read, laid out as an [`empty_state`]: an error icon, what
+/// failed in a few words, then the reason as it came. Recovery actions follow as children.
+pub fn error_state(title: impl Into<SharedString>, reason: impl Into<SharedString>) -> Div {
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap(px(space::LG))
+        .p(px(space::PAGE))
+        .child(
+            Icon::new(IconName::XCircle)
+                .size(IconSize::Medium)
+                .color(Color::Error),
+        )
+        .child(
+            v_flex()
+                .items_center()
+                .gap(px(space::XS))
+                .child(Label::new(title.into()))
+                .child(state_detail(reason)),
+        )
+}
+
+/// One line under a state's title for what its words and actions cannot carry: a reason, or a
+/// value such as a reference's address. Centered and wrapped at a reading width.
+pub fn state_detail(text: impl Into<SharedString>) -> Div {
+    div()
+        .max_w(px(size::STATE_DETAIL_WIDTH))
+        .text_center()
+        .child(text::meta(text))
+}
+
+/// An action an empty or error state offers: an outlined button with its key, read in the
+/// view's context. The caller says what a click does.
+pub fn state_action(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    action: &dyn gpui::Action,
+    focus: &gpui::FocusHandle,
+    cx: &App,
+) -> Button {
+    button(id, label)
+        .style(ButtonStyle::Outlined)
+        .key_binding(ui::KeyBinding::for_action_in(action, focus, cx).size(rems_from_px(11_f32)))
+}
+
 /// A raised glass sheet: a translucent fill over the wash, a light outline, and layered soft
 /// shadows instead of a border. GPUI clips its children to the sheet's rectangle, not its
 /// rounded corners, so a child with a background flush in a corner takes the sheet's radius
@@ -1464,26 +1513,6 @@ pub fn round_button(
                     .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
             }
         })
-}
-
-/// What a composer is about: a tile, a title and a muted line, in a pressed pill.
-pub fn context_chip(
-    icon: IconName,
-    title: impl Into<SharedString>,
-    detail: impl Into<SharedString>,
-) -> Div {
-    h_flex()
-        .gap(px(space::MD))
-        .p(px(space::SM))
-        .pr(px(space::LG))
-        .rounded(px(radius::MD))
-        .bg(gpui::black().opacity(0.035))
-        .child(tile(icon).rounded(px(radius::within(radius::MD, space::SM))))
-        .child(
-            v_flex()
-                .child(text::body(title).single_line())
-                .child(text::meta(detail).single_line()),
-        )
 }
 
 /// One entry of a timeline: a hollow dot on a dotted rail, an optional disclosure, a bold

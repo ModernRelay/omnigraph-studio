@@ -35,7 +35,10 @@ use studio_actions::workspace::{
 };
 use studio_settings::{BottomDockLayout, StudioSettings};
 use ui::prelude::*;
-use ui::{ButtonLike, ContextMenu, Indicator, PopoverMenu, Tooltip, right_click_menu};
+use ui::{
+    ButtonLike, ContextMenu, ContextMenuEntry, ContextMenuItem, Indicator, PopoverMenu, Tooltip,
+    right_click_menu,
+};
 
 pub use item::{Item, ItemEvent, ItemFooter, ItemHandle, KeyHint};
 pub use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};
@@ -157,6 +160,9 @@ pub struct Workspace {
     drag_pending: bool,
     /// Where the traffic lights were last placed; they move with the window style.
     traffic_lights: Option<Point<Pixels>>,
+    /// Whether the window shows traffic lights the top-left strips make room for, read each
+    /// frame: on macOS, and not in full screen, where they hide with the menu bar.
+    lights_shown: bool,
     /// The settings file problem last shown, so a toast appears once per problem.
     settings_error: Option<String>,
     /// What the CLI's files could not give, as last shown.
@@ -344,6 +350,7 @@ impl Workspace {
             focus_handle: cx.focus_handle(),
             drag_pending: false,
             traffic_lights: None,
+            lights_shown: cfg!(target_os = "macos"),
             settings_error: None,
             cli_errors: Vec::new(),
             _settings_subscription: settings_subscription,
@@ -940,22 +947,6 @@ impl Workspace {
         })
     }
 
-    /// Adds an item as a tab of the active pane, or activates the tab with the same dedupe key.
-    pub fn add_item(
-        &mut self,
-        item: Box<dyn ItemHandle>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(key) = item.dedupe_key(cx)
-            && let Some((pane, index)) = self.find_key(&key, cx)
-        {
-            self.activate_in(pane, index, true, window, cx);
-            return;
-        }
-        self.insert(item, false, window, cx);
-    }
-
     /// Opens an item of type `T`, unless a tab with `key` is open, which is activated instead.
     pub fn open_item<T: Item>(
         &mut self,
@@ -1184,11 +1175,6 @@ impl Workspace {
                 self.force_close(pane, index, window, cx);
             }
         }
-    }
-
-    /// Closes a tab of the active pane without asking.
-    pub fn force_close_item(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.force_close(self.active_pane, index, window, cx);
     }
 
     /// Closes a tab without asking. A pane left empty closes too, unless it is the only one.
@@ -1855,6 +1841,11 @@ impl Workspace {
             })
     }
 
+    /// Room for the traffic lights at the start of a top-left strip (`lights_room`).
+    fn lights_room(&self, zoomed: bool, cx: &App) -> Option<f32> {
+        lights_room(self.lights_shown, zoomed, cx)
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors();
         let panel = colors.panel_background;
@@ -1869,7 +1860,10 @@ impl Workspace {
             .when(!studio_ui::ds::is_glass(cx), |d| {
                 d.border_b_1().border_color(hairline)
             })
-            .child(div().w(px(TRAFFIC_LIGHTS_WIDTH)).flex_none())
+            .map(|strip| match self.lights_room(false, cx) {
+                Some(room) => strip.child(div().w(px(room)).flex_none()),
+                None => strip.pl(px(studio_ui::ds::space::EDGE)),
+            })
             .children(self.left.active_panel().map(dock_title))
             .child(
                 IconButton::new("search", IconName::MagnifyingGlass)
@@ -2383,12 +2377,13 @@ impl Workspace {
                         this.drop_tab(dragged, pane_id, Some(index), window, cx)
                     }));
                 let workspace = workspace.clone();
+                let focus = item.focus_handle(cx);
                 right_click_menu(SharedString::from(format!("tab-menu-{pane_id}-{index}")))
                     .trigger(move |_, _, _| tab)
                     .menu(move |window, cx| {
-                        let workspace = workspace.clone();
-                        ContextMenu::build(window, cx, move |menu, _, _| {
-                            tab_menu(menu, workspace.clone(), item_id, pinned)
+                        let (workspace, focus) = (workspace.clone(), focus.clone());
+                        ContextMenu::build(window, cx, move |menu, _, cx| {
+                            tab_menu(menu.context(focus), workspace, item_id, cx)
                         })
                     })
             }))
@@ -2468,12 +2463,14 @@ impl Workspace {
         )
         .debug_selector(move || format!("pane-header-{pane_id}"))
         .bg(header_bg)
-        .when(
-            zoomed || (top_left && (!self.left.visible() || self.session.is_none())),
-            |strip| {
+        .when_some(
+            (zoomed || (top_left && (!self.left.visible() || self.session.is_none())))
+                .then(|| self.lights_room(zoomed, cx))
+                .flatten(),
+            |strip, room| {
                 strip.child(
                     div()
-                        .w(px(lights_room(zoomed, cx)))
+                        .w(px(room))
                         .h_full()
                         .flex_none()
                         .border_b_1()
@@ -3056,9 +3053,10 @@ impl Workspace {
         .gap(px(studio_ui::ds::space::XS))
         .border_b_1()
         .border_color(hairline)
-        .when(zoomed, |strip| {
-            strip.child(div().w(px(lights_room(true, cx))).flex_none())
-        })
+        .when_some(
+            zoomed.then(|| self.lights_room(true, cx)).flatten(),
+            |strip, room| strip.child(div().w(px(room)).flex_none()),
+        )
         .children(dock.active_panel().map(dock_title))
         .child(
             IconButton::new(
@@ -3561,6 +3559,8 @@ impl Render for Workspace {
             && self.session.is_some()
             && self.zoomed != Some(Zoomed::Dock(PanelPosition::Left));
         let gap = px(studio_ui::ds::size::SHEET_GAP);
+        self.lights_shown =
+            cfg!(target_os = "macos") && !window.is_fullscreen() && !window.is_simple_fullscreen();
         let lights = traffic_light_position(glass);
         if self.traffic_lights != Some(lights) {
             self.traffic_lights = Some(lights);
@@ -3663,16 +3663,20 @@ fn dock_title(panel: &PanelEntry) -> impl IntoElement {
 
 /// Room for the traffic lights at the start of a header strip at the window's top left; a
 /// zoomed one starts inside the zoom's inset, the lights where the window style puts them.
-fn lights_room(zoomed: bool, cx: &App) -> f32 {
+/// `None` without lights, as Zed's title bar: off macOS, and in full screen.
+fn lights_room(shown: bool, zoomed: bool, cx: &App) -> Option<f32> {
+    if !shown {
+        return None;
+    }
     if !zoomed {
-        return TRAFFIC_LIGHTS_WIDTH;
+        return Some(TRAFFIC_LIGHTS_WIDTH);
     }
     let gap = if studio_ui::ds::is_glass(cx) {
         studio_ui::ds::size::SHEET_GAP
     } else {
         0.
     };
-    TRAFFIC_LIGHTS_WIDTH + gap - ZOOM_INSET
+    Some(TRAFFIC_LIGHTS_WIDTH + gap - ZOOM_INSET)
 }
 
 /// The dock a panel goes in: where the settings place it, else its own.
@@ -3863,13 +3867,29 @@ fn resized(flexes: &[f32], boundary: usize, fraction: f32) -> Option<Vec<f32>> {
     Some(next)
 }
 
-/// A tab's right-click menu, after Zed's: close variants, pin, then splits.
+/// A tab's right-click menu, after Zed's: close variants, pin, then splits. Each entry names the
+/// action its key runs, for the hint, and acts on the clicked tab; a close variant with nothing
+/// to close is disabled.
 fn tab_menu(
     menu: ContextMenu,
     workspace: WeakEntity<Workspace>,
     item: EntityId,
-    pinned: bool,
+    cx: &App,
 ) -> ContextMenu {
+    let targets = workspace
+        .upgrade()
+        .and_then(|workspace| {
+            let workspace = workspace.read(cx);
+            let (pane, index) = workspace.find_item(item)?;
+            let pane = workspace.pane(pane)?;
+            Some(TabTargets {
+                pinned: pane.is_pinned(index),
+                others: !pane.others(index).is_empty(),
+                right: !pane.to_the_right(index).is_empty(),
+                all: !pane.all_unpinned().is_empty(),
+            })
+        })
+        .unwrap_or_default();
     let on = |f: fn(&mut Workspace, PaneId, usize, &mut Window, &mut Context<Workspace>)| {
         let workspace = workspace.clone();
         move |window: &mut Window, cx: &mut App| {
@@ -3882,48 +3902,62 @@ fn tab_menu(
                 .ok();
         }
     };
-    menu.entry(
-        "Close",
-        None,
-        on(|w, pane, index, window, cx| w.close_in(pane, index, window, cx)),
-    )
-    .entry(
-        "Close Others",
-        None,
-        on(|w, pane, index, window, cx| {
+    let entry = |label: &'static str, action: Option<Box<dyn Action>>, enabled: bool| {
+        let entry = ContextMenuEntry::new(label).disabled(!enabled);
+        match action {
+            Some(action) => entry.action(action),
+            None => entry,
+        }
+    };
+    menu.item(ContextMenuItem::Entry(
+        entry("Close", Some(Box::new(CloseActiveItem)), true).handler(on(
+            |w, pane, index, window, cx| w.close_in(pane, index, window, cx),
+        )),
+    ))
+    .item(ContextMenuItem::Entry(
+        entry(
+            "Close Others",
+            Some(Box::new(CloseOtherItems)),
+            targets.others,
+        )
+        .handler(on(|w, pane, index, window, cx| {
             let ids = w.pane(pane).map(|p| p.others(index)).unwrap_or_default();
             w.close_clean(ids, window, cx);
-        }),
-    )
-    .entry(
-        "Close to the Right",
-        None,
-        on(|w, pane, index, window, cx| {
-            let ids = w
-                .pane(pane)
-                .map(|p| p.to_the_right(index))
-                .unwrap_or_default();
-            w.close_clean(ids, window, cx);
-        }),
-    )
-    .entry(
-        "Close All",
-        None,
-        on(|w, pane, _, window, cx| {
-            let ids = w.pane(pane).map(|p| p.all_unpinned()).unwrap_or_default();
-            w.close_clean(ids, window, cx);
-        }),
-    )
+        })),
+    ))
+    .item(ContextMenuItem::Entry(
+        entry("Close to the Right", None, targets.right).handler(on(
+            |w, pane, index, window, cx| {
+                let ids = w
+                    .pane(pane)
+                    .map(|p| p.to_the_right(index))
+                    .unwrap_or_default();
+                w.close_clean(ids, window, cx);
+            },
+        )),
+    ))
+    .item(ContextMenuItem::Entry(
+        entry("Close All", Some(Box::new(CloseAllItems)), targets.all).handler(on(
+            |w, pane, _, window, cx| {
+                let ids = w.pane(pane).map(|p| p.all_unpinned()).unwrap_or_default();
+                w.close_clean(ids, window, cx);
+            },
+        )),
+    ))
     .separator()
     .entry(
-        if pinned { "Unpin Tab" } else { "Pin Tab" },
-        None,
+        if targets.pinned {
+            "Unpin Tab"
+        } else {
+            "Pin Tab"
+        },
+        Some(Box::new(TogglePinTab)),
         on(|w, pane, index, _, cx| w.toggle_pin(pane, index, cx)),
     )
     .separator()
     .entry(
         "Split Right",
-        None,
+        Some(Box::new(SplitRight)),
         on(|w, pane, index, window, cx| {
             w.activate_in(pane, index, true, window, cx);
             w.split(SplitDirection::Right, window, cx)
@@ -3931,12 +3965,22 @@ fn tab_menu(
     )
     .entry(
         "Split Down",
-        None,
+        Some(Box::new(SplitDown)),
         on(|w, pane, index, window, cx| {
             w.activate_in(pane, index, true, window, cx);
             w.split(SplitDirection::Down, window, cx)
         }),
     )
+}
+
+/// What a tab's menu can act on: whether the tab is pinned, and whether each close variant has
+/// a tab to close.
+#[derive(Default)]
+struct TabTargets {
+    pinned: bool,
+    others: bool,
+    right: bool,
+    all: bool,
 }
 
 /// The strip along a dock's inner edge that resizes it.
@@ -4688,6 +4732,22 @@ mod tests {
         let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
         cx.deactivate_window();
         assert_eq!(paused(&mut cx), Some(true));
+    }
+
+    /// The top-left strips make room for traffic lights only where the window shows them: off
+    /// macOS and in full screen they start at their own edge, as Zed's title bar does.
+    #[gpui::test]
+    fn strips_make_room_for_traffic_lights_only_when_they_show(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            assert_eq!(lights_room(false, false, cx), None, "no lights");
+            assert_eq!(lights_room(false, true, cx), None, "no lights, zoomed");
+            assert_eq!(lights_room(true, false, cx), Some(TRAFFIC_LIGHTS_WIDTH));
+            assert_eq!(
+                lights_room(true, true, cx),
+                Some(TRAFFIC_LIGHTS_WIDTH - ZOOM_INSET),
+                "flat, inside the zoom's inset"
+            );
+        });
     }
 
     /// Only the top-left pane's first tab on glass, with nothing before it, meets the sheet's

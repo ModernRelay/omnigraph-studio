@@ -242,7 +242,6 @@ impl OpenGraphModal {
     }
 
     fn render_graphs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
         let Some(connection) = &self.selected else {
             return v_flex().child(Label::new("Add a server to start.").color(Color::Muted));
         };
@@ -308,14 +307,9 @@ impl OpenGraphModal {
                     h_flex()
                         .gap_2()
                         .child(
-                            div()
+                            studio_ui::ds::field_frame(false, cx)
                                 .flex_1()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(colors.border)
-                                .child(self.replacement_token.clone()),
+                                .child(studio_ui::ds::field_input(self.replacement_token.clone())),
                         )
                         .child(
                             studio_ui::ds::button("update-token", "Update token")
@@ -383,14 +377,9 @@ impl OpenGraphModal {
                 h_flex()
                     .gap_2()
                     .child(
-                        div()
+                        studio_ui::ds::field_frame(false, cx)
                             .flex_1()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(colors.border)
-                            .child(self.graph_id.clone()),
+                            .child(studio_ui::ds::field_input(self.graph_id.clone())),
                     )
                     .child(
                         studio_ui::ds::button("open", "Open")
@@ -404,7 +393,6 @@ impl OpenGraphModal {
     }
 
     fn render_add(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
         let field = |label: &'static str, editor: &Entity<Editor>| {
             v_flex()
                 .gap_1()
@@ -414,13 +402,8 @@ impl OpenGraphModal {
                         .color(Color::Muted),
                 )
                 .child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(colors.border)
-                        .child(editor.clone()),
+                    studio_ui::ds::field_frame(false, cx)
+                        .child(studio_ui::ds::field_input(editor.clone())),
                 )
         };
         v_flex()

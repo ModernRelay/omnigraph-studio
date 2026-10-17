@@ -25,8 +25,8 @@ use studio_actions::review::{
     AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext,
 };
 use studio_ui::{
-    ChangeCard, ChangeKind, PropertyRow, change_counts, change_group_header, empty_state,
-    group_digits, short_commit_id, type_swatch,
+    ChangeCard, ChangeKind, PropertyRow, change_counts, change_group_header, group_digits,
+    short_commit_id, type_swatch,
 };
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace, workspace_for};
 use ui::prelude::*;
@@ -1652,21 +1652,18 @@ impl Render for ReviewView {
                 let _ = data;
                 self.render_conflicts(cx)
             }
-            (LoadState::Ready, Some(data)) if data.folded.changes.is_empty() => empty_state(
-                format!(
-                    "{} has no changes to review against {}.",
-                    self.branch, self.target
-                ),
-                Some(
-                    if data.commits.is_empty() {
-                        "The branch has no commits of its own."
+            (LoadState::Ready, Some(data)) if data.folded.changes.is_empty() => {
+                studio_ui::ds::empty_state(IconName::Check, "Nothing to review")
+                    .child(studio_ui::ds::state_detail(if data.commits.is_empty() {
+                        format!("{} has no commits of its own.", self.branch)
                     } else {
-                        "Its commits change nothing in the end."
-                    }
-                    .into(),
-                ),
-            )
-            .into_any_element(),
+                        format!(
+                            "Its commits change nothing against {} in the end.",
+                            self.target
+                        )
+                    }))
+                    .into_any_element()
+            }
             (LoadState::Ready, Some(_)) => list(
                 self.list_state.clone(),
                 cx.processor(|this, row, window, cx| this.render_row(row, window, cx)),
@@ -1676,9 +1673,10 @@ impl Render for ReviewView {
             .py_2()
             .into_any_element(),
             (LoadState::Failed(error), _) => {
-                empty_state("The review could not be read.", Some(error.clone())).into_any_element()
+                studio_ui::ds::error_state("The review could not be read", error.clone())
+                    .into_any_element()
             }
-            _ => empty_state("Reading changes…", None).into_any_element(),
+            _ => studio_ui::ds::loading_state("Reading changes…").into_any_element(),
         };
         // Typing in the search box must not move between cards.
         let mut context = gpui::KeyContext::new_with_defaults();

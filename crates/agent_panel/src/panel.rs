@@ -2348,7 +2348,6 @@ impl AgentPanel {
     }
 
     fn render_setup(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().colors().border_variant;
         v_flex()
             .id("agent-setup")
             .overflow_y_scroll()
@@ -2423,14 +2422,9 @@ impl AgentPanel {
                         h_flex()
                             .gap_1()
                             .child(
-                                div()
+                                studio_ui::ds::field_frame(false, cx)
                                     .flex_1()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .border_1()
-                                    .border_color(border)
-                                    .child(self.custom_command.clone()),
+                                    .child(studio_ui::ds::field_input(self.custom_command.clone())),
                             )
                             .child(
                                 studio_ui::ds::icon_button("use-custom", IconName::ArrowRight)

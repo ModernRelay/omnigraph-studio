@@ -160,11 +160,10 @@ impl Render for SchemaView {
         }
         if self.shown.is_none() {
             return match &self.session.read(cx).schema {
-                Loadable::Failed(error) => studio_ui::empty_state(
-                    "The schema could not be read",
-                    Some(error.clone().into()),
-                ),
-                _ => studio_ui::empty_state("Reading the schema…", None),
+                Loadable::Failed(error) => {
+                    studio_ui::ds::error_state("The schema could not be read", error.clone())
+                }
+                _ => studio_ui::ds::loading_state("Reading the schema…"),
             }
             .into_any_element();
         }

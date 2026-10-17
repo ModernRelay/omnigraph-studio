@@ -10,7 +10,6 @@ path = "src/agent_panel.rs"
 
 [dependencies]
 agent-client-protocol = { workspace = true }
-anyhow = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 editor = { workspace = true }
 futures = { workspace = true }

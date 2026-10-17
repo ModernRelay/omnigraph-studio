@@ -2,8 +2,9 @@
 //!
 //! Layer 0 (`docs/architecture.md`). Plan: `specs/002-app-shell/plan.md`.
 //!
-//! Each action gets a default binding in `assets/keymaps/` and appears in the command palette
-//! wherever it is available.
+//! Each action appears in the command palette wherever it is available, and each one without
+//! arguments has a default binding in `assets/keymaps/`, except the few that are rare or
+//! destructive, as in Zed. The keymap test (`crates/studio/tests/keymaps.rs`) lists those.
 
 pub mod workspace {
     use gpui::actions;

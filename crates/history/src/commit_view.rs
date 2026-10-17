@@ -11,8 +11,8 @@ use graph_client::api::{ChangeCauseOutput, CommitOutput};
 use graph_store::{ChangeFold, FoldedChange, FoldedChanges, GraphSession, NetChange, TypeCounts};
 use studio_actions::graph::{OpenCommit, OpenQueryAt, OpenType};
 use studio_ui::{
-    ChangeCard, ChangeKind, PropertyRow, change_group_header, empty_state, now_micros,
-    relative_time, short_commit_id, utc_date_time,
+    ChangeCard, ChangeKind, PropertyRow, change_group_header, now_micros, relative_time,
+    short_commit_id, utc_date_time,
 };
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
@@ -521,14 +521,14 @@ impl Render for CommitView {
         let more = usize::from(self.next_page_token.is_some());
         let body = match &self.state {
             State::Failed(message) => {
-                empty_state("The changes could not be read.", Some(message.clone()))
+                studio_ui::ds::error_state("The changes could not be read", message.clone())
                     .into_any_element()
             }
             State::Ready if self.rows.is_empty() => {
-                empty_state("This commit changed no entities.", None).into_any_element()
+                studio_ui::ds::empty_state(IconName::Check, "No entity changes").into_any_element()
             }
             State::Loading if self.rows.is_empty() => {
-                empty_state("Reading changes…", None).into_any_element()
+                studio_ui::ds::loading_state("Reading changes…").into_any_element()
             }
             _ => {
                 if self.list_state.item_count() != self.rows.len() + more {

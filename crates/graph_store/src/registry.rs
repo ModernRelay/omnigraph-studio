@@ -404,18 +404,6 @@ impl ConnectionRegistry {
         Ok(())
     }
 
-    /// Removes a server Studio added, with its keychain token.
-    pub fn remove_server(&mut self, connection: &Entity<Connection>, cx: &mut Context<Self>) {
-        let url = connection.read(cx).server.url.clone();
-        if connection.read(cx).server.source == ServerSource::Studio {
-            cx.delete_credentials(&url).detach();
-        }
-        self.connections.retain(|c| c != connection);
-        self.save(cx);
-        cx.emit(RegistryEvent::ServersChanged);
-        cx.notify();
-    }
-
     /// Writes Studio-added servers and remembered graph ids to the data directory.
     pub fn save(&self, cx: &App) {
         let servers = self

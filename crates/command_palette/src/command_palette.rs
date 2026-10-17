@@ -39,8 +39,8 @@ use matching::{Candidate, Group, Ranked, rank};
 pub use matching::{humanize_action_name, normalize_query};
 use studio_workspace::ModalView;
 
-/// Registers the palette with every new workspace and binds ⌘K and ⌘⇧P (Ctrl elsewhere) unless
-/// the keymap already does.
+/// Registers the palette with every new workspace. Its keys (⌘K and ⌘⇧P, Ctrl elsewhere) come
+/// from the keymap files (`assets/keymaps/`), as every key does.
 pub fn init(cx: &mut App) {
     recent::load(cx);
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {

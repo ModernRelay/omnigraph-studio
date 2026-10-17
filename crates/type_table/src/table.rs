@@ -1094,12 +1094,7 @@ impl TypeTable {
         if self.selection.len() < 2 {
             return None;
         }
-        let colors = cx.theme().colors();
-        let (border, field_border, field_bg) = (
-            colors.border_variant,
-            colors.border,
-            colors.editor_background,
-        );
+        let border = cx.theme().colors().border_variant;
         let count = self.selection.len();
         let read_only = self.kind == TableKind::Edge || self.at_commit.is_some();
         let editable: Vec<String> = self
@@ -1167,15 +1162,9 @@ impl TypeTable {
                 )
                 .when(chosen.is_some(), |bar| {
                     bar.child(
-                        div()
+                        studio_ui::ds::field_frame(false, cx)
                             .w(px(220.))
-                            .px_2()
-                            .py_0p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(field_border)
-                            .bg(field_bg)
-                            .child(self.bulk_editor.clone()),
+                            .child(studio_ui::ds::field_input(self.bulk_editor.clone())),
                     )
                     .child(
                         studio_ui::ds::button(
@@ -2499,10 +2488,6 @@ impl TypeTable {
             cx.emit(ItemEvent::UpdateTab);
             cx.notify();
         }
-    }
-
-    pub fn pinned_commit(&self) -> Option<&str> {
-        self.paging.pinned.as_deref()
     }
 
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4421,7 +4406,8 @@ impl TypeTable {
                     .when_some(count_error, |d, error| d.tooltip(Tooltip::text(error)))
                     .child(Label::new(count).size(LabelSize::Small).color(Color::Muted)),
             )
-            // Where edits go is in the title bar; the table says only when it cannot edit.
+            // Where edits go is the branch the status bar names; the table says only when it
+            // cannot edit.
             .when(read_only, |d| {
                 d.child(
                     div()
@@ -4763,34 +4749,35 @@ impl TypeTable {
         self.frame_now = chrono::Local::now();
         self.edit_slot.clear();
         if self.missing {
-            return studio_ui::empty_state(
-                format!("The schema has no type {}", self.type_name),
-                Some("It may have been renamed or dropped. Close this tab.".into()),
+            return studio_ui::ds::empty_state(
+                IconName::Warning,
+                format!("No type {}", self.type_name),
             )
+            .child(studio_ui::ds::state_detail(
+                "It may have been renamed or dropped. Close this tab.",
+            ))
             .into_any_element();
         }
         match &self.first_page {
             Loadable::Failed(error) => {
-                let error = error.clone();
-                return v_flex()
-                    .size_full()
-                    .child(studio_ui::empty_state(
-                        format!("Studio could not read {}", self.type_name),
-                        Some(error.into()),
-                    ))
-                    .child(
-                        h_flex().justify_center().pb_6().child(
-                            studio_ui::ds::button("retry-table", "Refresh")
-                                .style(ButtonStyle::Filled)
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.refresh(window, cx)),
-                                ),
-                        ),
+                return studio_ui::ds::error_state(
+                    format!("{} could not be read", self.type_name),
+                    error.clone(),
+                )
+                .child(
+                    studio_ui::ds::state_action(
+                        "retry-table",
+                        "Refresh",
+                        &RefreshTable,
+                        &self.focus_handle,
+                        cx,
                     )
-                    .into_any_element();
+                    .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
+                )
+                .into_any_element();
             }
             Loadable::Loading | Loadable::NotLoaded => {
-                return studio_ui::empty_state(format!("Reading {}…", self.type_name), None)
+                return studio_ui::ds::loading_state(format!("Reading {}…", self.type_name))
                     .into_any_element();
             }
             Loadable::Loaded(()) => {}
@@ -4800,25 +4787,37 @@ impl TypeTable {
             None => self.rows.is_empty(),
         };
         if empty {
-            let (title, detail) = if self.filters.is_empty() {
-                (
-                    format!("No {} rows on {}", self.type_name, self.branch),
-                    // Nodes and edges both add rows at the head; a past commit adds none.
-                    self.at_commit.is_none().then(|| {
-                        match studio_ui::shortcut_text(&InsertRow, cx) {
-                            Some(keys) => format!("Add one with Row ({keys})."),
-                            None => "Add one with Row.".to_owned(),
-                        }
-                        .into()
-                    }),
-                )
+            // The branch is the status bar's to name. Nodes and edges both add rows at the
+            // head; a past commit adds none.
+            let state = if self.filters.is_empty() {
+                studio_ui::ds::empty_state(IconName::Table, format!("No {} rows", self.type_name))
+                    .when(self.at_commit.is_none(), |state| {
+                        state.child(
+                            studio_ui::ds::state_action(
+                                "insert-first-row",
+                                "Add Row",
+                                &InsertRow,
+                                &self.focus_handle,
+                                cx,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| this.on_insert(&InsertRow, window, cx),
+                            )),
+                        )
+                    })
             } else {
-                (
-                    "No rows match these filters".to_owned(),
-                    Some("Remove a filter or clear them all.".into()),
+                studio_ui::ds::empty_state(IconName::Filter, "No rows match").child(
+                    studio_ui::ds::state_action(
+                        "clear-filters-empty",
+                        "Clear Filters",
+                        &ClearFilters,
+                        &self.focus_handle,
+                        cx,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_filters(cx))),
                 )
             };
-            return studio_ui::empty_state(title, detail).into_any_element();
+            return state.into_any_element();
         }
         let grid = self.render_grid(cx);
         // A column's edge dragged anywhere over the grid resizes it until released.

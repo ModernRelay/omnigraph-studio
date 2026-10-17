@@ -33,7 +33,6 @@ ui = { workspace = true }
 theme = { workspace = true }
 editor = { workspace = true }
 settings = { workspace = true }
-release_channel = { workspace = true }
 menu = { workspace = true }
 studio_actions = { workspace = true }
 studio_settings = { workspace = true }
@@ -44,7 +43,6 @@ graph_client = { workspace = true }
 url = { workspace = true }
 smol = { workspace = true }
 graph_store = { workspace = true }
-gq_language = { workspace = true }
 command_palette = { workspace = true }
 type_table = { workspace = true }
 relationship_tree = { workspace = true }
@@ -79,6 +77,7 @@ studio_settings = { workspace = true, features = ["test-support"] }
 studio_theme = { workspace = true, features = ["test-support"] }
 gpui_platform = { workspace = true, features = ["test-support", "font-kit", "runtime_shaders"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+schemars = { workspace = true }
 serde_json = { workspace = true }
 
 [lints]

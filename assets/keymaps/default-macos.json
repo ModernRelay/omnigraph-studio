@@ -33,6 +33,10 @@
       "cmd-j": "studio::ToggleActivity",
       "cmd-\\": "studio::SplitRight",
       "cmd-shift-\\": "studio::SplitDown",
+      "cmd-alt-o": "studio::OpenGraph",
+      "cmd-r": "studio::Refresh",
+      "cmd-alt-t": "studio::CloseOtherItems",
+      "cmd-alt-w": "studio::CloseAllItems",
       "cmd-alt-right": "studio::ActivateNextPane",
       "cmd-alt-left": "studio::ActivatePreviousPane",
       "ctrl-cmd-]": "studio::ActivateNextGraph",
@@ -93,6 +97,7 @@
   {
     "context": "AgentPanel",
     "bindings": {
+      "cmd-n": "studio_agent::NewConversation",
       "cmd-enter": "studio_agent::Send",
       "cmd-shift-.": "studio_agent::Stop",
       "cmd-y": "studio_agent::Allow",

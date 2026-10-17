@@ -467,6 +467,31 @@ impl Render for DesignGallery {
                 ),
             );
 
+        // What a view shows instead of its content: reading it, and failing to.
+        let state_frame = || {
+            div()
+                .h(px(160.))
+                .rounded(px(radius::MD))
+                .border_1()
+                .border_color(surface::rule(cx))
+        };
+        let states = h_flex()
+            .gap(px(space::LG))
+            .child(
+                state_frame()
+                    .w(px(360.))
+                    .child(ds::loading_state("Reading Person…")),
+            )
+            .child(
+                state_frame().w(px(360.)).child(
+                    ds::error_state(
+                        "Person could not be read",
+                        "Could not reach the server: the connection was refused",
+                    )
+                    .child(ds::button("g-retry", "Refresh").style(ButtonStyle::Outlined)),
+                ),
+            );
+
         // Cards, after the reference: a tile, a title, a muted line, a run strip, a meta row.
         let tick_colors = [
             Some(ds::Status::Done),
@@ -705,6 +730,7 @@ impl Render for DesignGallery {
                     .child(section("Card", div().w(px(520.)).child(card)))
                     .child(section("Empty state", div().w(px(360.)).child(empty))),
             )
+            .child(section("Loading and error states", states))
             .child(section(
                 "Settings rows · segmented control",
                 div().w(px(720.)).child(settings_rows),

@@ -12,11 +12,11 @@ other: what two features share moves down a layer.
 | Layer | Crates | Role | Allowed dependencies |
 |---|---|---|---|
 | 0 | `studio_actions` | Every action type, with doc comments that become palette descriptions | `gpui` |
-| 1 | `studio_settings`, `studio_theme` | Typed layered settings; theme tokens and the `ThemeSettingsProvider` Zed's `theme` crate needs | `gpui`, `theme`, `refineable`, serde |
+| 1 | `studio_settings`, `studio_theme` | Typed layered settings; graph tokens over Zed's themes, set up through Zed's `theme_settings`, and the themes Studio bundles | `gpui`, `theme`, `theme_settings`, serde |
 | 2 | `graph_client` | Every HTTP request: contract header, DTOs for the 0.13 API, write outcomes, change-feed paging. **No `gpui`** | Zed `http_client` (Apache-2.0), serde |
 | 2 | `gq_language` | Schema and query intelligence on `omnigraph-compiler`: parse, diagnostics, completion items, hover text, result-column types. **No `gpui`** | `omnigraph-compiler` |
-| 2 | `studio_ui` | Studio components on Zed's `ui`: state chips, write-outcome banners, empty and error states, key hints | `ui`, `theme`, `studio_theme`, `studio_actions` |
-| 3 | `graph_store` | GPUI entities: connections, graph sessions, schema model, snapshot pins, exploration, drafts | `gpui`, `graph_client`, `gq_language`, `gpui_tokio` |
+| 2 | `studio_ui` | Studio components on Zed's `ui`: the design system (`ds`), state chips, write-outcome banners, empty and error states, text read as markdown | `ui`, `theme`, `studio_theme`, `pulldown-cmark` |
+| 3 | `graph_store` | GPUI entities: connections, graph sessions, schema model, snapshot pins, exploration, drafts | `gpui`, `graph_client`, `gq_language`, Zed's `reqwest_client` |
 | 4 | `studio_workspace` | The window frame: panes, tabs, docks, panels, status bar, modal and toast layers | `gpui`, `ui`, `studio_ui`, `studio_actions`, `studio_settings` |
 | 5 | `command_palette`, `type_table`, `relationship_tree`, `graph_canvas`, `query_editor`, `review`, `history`, `inspectors`, `agent_panel` | One surface each | layers 0–4 |
 | 6 | `studio` | The binary: initialises every crate in order, menus, windows, single instance, URL scheme | everything |
@@ -34,8 +34,9 @@ view (layer 5) ──reads──▶ entity in graph_store ──calls──▶ g
 ```
 
 - Views never call `graph_client` directly. They read entities and dispatch actions.
-- `graph_client` runs on Tokio through `gpui_tokio`; `graph_store` awaits it in a task it keeps
-  in a field, so dropping or replacing the task cancels the request.
+- `graph_client` sends through Zed's `HttpClient` (the `reqwest_client` that `graph_store::init`
+  installs); `graph_store` awaits it in a task it keeps in a field, so dropping or replacing the
+  task cancels the request.
 - Results are applied in one `update` on the main thread, followed by one `notify`.
 
 ## State model
@@ -96,8 +97,9 @@ a 412 reopens the draft.
   overrides. The settings window is generated from the same schema (spec 002). The user file
   is the person's text: comments allowed, a value that does not fit costs only its setting,
   and writes edit only the keys that changed (`studio_settings::document`).
-- `studio_theme` registers Studio's `ThemeSettingsProvider` and adds graph tokens: one color per
-  node type, edge colors, diff colors. It starts from Zed's base themes.
+- `studio_theme` sets up Zed's `theme_settings` with Zed's themes and the ones Studio bundles
+  (Vitesse Refined, the default light theme), and adds graph tokens: one color per node type,
+  edge colors, diff colors.
 
 ## Testing
 

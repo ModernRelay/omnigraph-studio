@@ -61,14 +61,9 @@ agent_panel = { path = "crates/agent_panel" }
 # Zed, one release tag for every crate (docs/zed-pin.md). GPL-3.0-or-later and Apache-2.0.
 gpui = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-gpui_tokio = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 ui = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 theme = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-component = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-icons = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 menu = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-refineable = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-sum_tree = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 collections = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 util = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 http_client = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
@@ -76,7 +71,6 @@ reqwest_client = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2
 editor = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 markdown = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 language = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
-multi_buffer = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 settings = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 release_channel = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 zlog = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
@@ -108,7 +102,6 @@ serde_path_to_error = "0.1"
 # The maintained continuation of serde_yaml, which is deprecated and pulls in an unmaintained
 # libyaml port.
 serde_norway = "0.9"
-thiserror = "2"
 # Unix sockets on Windows 10 and later, for the agent's tool socket.
 uds_windows = "1.1"
 url = "2"

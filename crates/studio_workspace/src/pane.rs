@@ -367,19 +367,6 @@ impl Member {
         removed
     }
 
-    /// The pane at the top right, whose tab strip carries the dock toggles.
-    pub fn top_right(&self) -> PaneId {
-        match self {
-            Member::Pane(id) => *id,
-            Member::Split {
-                axis: SplitAxis::Horizontal,
-                members,
-                ..
-            } => members.last().map_or(0, Member::top_right),
-            Member::Split { members, .. } => members.first().map_or(0, Member::top_right),
-        }
-    }
-
     /// The pane at the top left, whose tab strip makes room for the traffic lights.
     pub fn top_left(&self) -> PaneId {
         match self {
@@ -588,7 +575,6 @@ mod tests {
         );
         assert!(tree.split(2, 3, SplitDirection::Down));
         assert_eq!(tree.panes(), [0, 1, 2, 3]);
-        assert_eq!(tree.top_right(), 2, "the upper of the stacked right panes");
         assert_eq!(tree.top_left(), 0);
         assert!(tree.split(0, 4, SplitDirection::Left));
         assert_eq!(tree.panes(), [4, 0, 1, 2, 3]);

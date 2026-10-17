@@ -36,7 +36,6 @@ use studio_actions::canvas::{
 use studio_actions::graph::{
     OpenCanvas, OpenNode, OpenOntology, OpenType, PeekNode, ShowNodeOnCanvas, ShowResultsOnCanvas,
 };
-use studio_ui::empty_state;
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
 use ui::{ContextMenu, Tooltip};
@@ -2257,10 +2256,10 @@ impl Render for GraphCanvas {
         let schema = self.session.read(cx).schema.clone();
         let body = match schema {
             Loadable::NotLoaded | Loadable::Loading => {
-                Some(empty_state("Reading the schema…", None).into_any_element())
+                Some(studio_ui::ds::loading_state("Reading the schema…").into_any_element())
             }
             Loadable::Failed(message) => Some(
-                empty_state("Studio could not read the schema", Some(message.into()))
+                studio_ui::ds::error_state("The schema could not be read", message)
                     .into_any_element(),
             ),
             Loadable::Loaded(_)
@@ -2269,14 +2268,13 @@ impl Render for GraphCanvas {
                 Some(self.render_explore_start(cx))
             }
             Loadable::Loaded(_) if self.scene.nodes.is_empty() => Some(
-                empty_state(
-                    match self.mode {
-                        Mode::Schema => "The schema has no node types",
-                        Mode::Explore => "Laying out…",
-                        Mode::Results => "The result has no nodes",
-                    },
-                    None,
-                )
+                match self.mode {
+                    Mode::Schema => studio_ui::ds::empty_state(IconName::GitGraph, "No node types"),
+                    Mode::Explore => studio_ui::ds::loading_state("Laying out…"),
+                    Mode::Results => {
+                        studio_ui::ds::empty_state(IconName::Hash, "No nodes in the result")
+                    }
+                }
                 .into_any_element(),
             ),
             Loadable::Loaded(_) => None,

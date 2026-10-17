@@ -15,8 +15,6 @@ use gpui::{App, Hsla, Pixels, Point, Window, point, px};
 
 /// How long a change of place takes: long enough to follow, short enough not to wait for.
 pub const GLIDE: Duration = Duration::from_millis(220);
-/// How long something appearing takes.
-pub const APPEAR: Duration = Duration::from_millis(180);
 
 /// An easing curve over linear progress `0..=1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
