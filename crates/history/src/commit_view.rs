@@ -127,8 +127,7 @@ impl CommitView {
     /// Reads the next pages of changes, up to [`CAP`] more.
     fn load_more(&mut self, cx: &mut Context<Self>) {
         self.state = State::Loading;
-        let client = self.session.read(cx).client(cx);
-        let graph = self.session.read(cx).graph_id.clone();
+        let session = self.session.clone();
         let commit_id = self.commit_id.clone();
         let mut token = self.next_page_token.take();
         let mut fold = self.fold.clone();
@@ -136,10 +135,10 @@ impl CommitView {
         self._task = Some(cx.spawn(async move |this, cx| {
             let mut cause = None;
             let result = loop {
-                match client
-                    .commit_changes(&graph, &commit_id, token.as_deref(), PAGE)
-                    .await
-                {
+                let read = session.update(cx, |session, cx| {
+                    session.commit_changes(&commit_id, token.clone(), PAGE, cx)
+                });
+                match read.await {
                     Ok(page) => {
                         let block = graph_client::api::ChangeBlockOutput {
                             cause: page.cause.clone(),

@@ -76,25 +76,22 @@ impl StorageInspector {
 
     /// Reads everything again, at the session's current branch.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        let session = self.session.read(cx);
-        self.branch = session.branch.clone();
-        let client = session.client(cx);
-        let graph = session.graph_id.clone();
+        self.branch = self.session.read(cx).branch.clone();
         let branch = self.branch.clone();
         self.health = Loadable::Loading;
         self.readiness = Loadable::Loading;
         self.graphs = Loadable::Loading;
         self.snapshot = Loadable::Loading;
+        let read = self
+            .session
+            .update(cx, |session, cx| session.server_state(&branch, cx));
         self._task = Some(cx.spawn(async move |this, cx| {
-            let health = loadable(client.health().await);
-            let readiness = loadable(client.readiness().await);
-            let graphs = loadable(client.graphs().await);
-            let snapshot = loadable(client.snapshot(&graph, &branch).await);
+            let state = read.await;
             this.update(cx, |this, cx| {
-                this.health = health;
-                this.readiness = readiness;
-                this.graphs = graphs;
-                this.snapshot = snapshot;
+                this.health = loadable(state.health);
+                this.readiness = loadable(state.readiness);
+                this.graphs = loadable(state.graphs);
+                this.snapshot = loadable(state.snapshot);
                 cx.notify();
             })
             .ok();
@@ -103,7 +100,7 @@ impl StorageInspector {
     }
 
     fn render_server(&self, cx: &mut Context<Self>) -> AnyElement {
-        let url = self.session.read(cx).client(cx).base_url().to_owned();
+        let url = self.session.read(cx).server_url(cx);
         let health = self.health.loaded();
         let readiness = self.readiness.loaded();
         let mut rows = vec![

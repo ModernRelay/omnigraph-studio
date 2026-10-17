@@ -455,8 +455,6 @@ impl HistoryView {
     /// detail nets them. A commit with more changes than the page shows "N+". A commit's
     /// changes never change, so an answer is kept for the life of the view.
     fn load_row_counts(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
-        let session = self.session.read(cx);
-        let (client, graph) = (session.client(cx), session.graph_id.clone());
         let ids: Vec<String> = self
             .commits
             .get(range.start..range.end.min(self.commits.len()))
@@ -467,14 +465,13 @@ impl HistoryView {
             .collect();
         for id in ids {
             self.asked_counts.insert(id.clone());
-            let (client, graph) = (client.clone(), graph.clone());
             let key = id.clone();
+            let read = self.session.update(cx, |session, cx| {
+                session.commit_changes(&id, None, ROW_COUNT_PAGE, cx)
+            });
             let task = cx.spawn(async move |this, cx| {
                 // A parentless commit or one past cleanup cannot be compared: no count.
-                let Ok(page) = client
-                    .commit_changes(&graph, &id, None, ROW_COUNT_PAGE)
-                    .await
-                else {
+                let Ok(page) = read.await else {
                     return;
                 };
                 let more = page.next_page_token.is_some();

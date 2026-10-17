@@ -120,7 +120,7 @@ impl Connection {
         })
     }
 
-    pub fn client(&self) -> &GraphClient {
+    pub(crate) fn client(&self) -> &GraphClient {
         &self.client
     }
 

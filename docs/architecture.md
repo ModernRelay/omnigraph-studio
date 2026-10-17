@@ -33,7 +33,12 @@ view (layer 5) ──reads──▶ entity in graph_store ──calls──▶ g
       └──── cx.notify() ◀───────┘   (results applied on the main thread)
 ```
 
-- Views never call `graph_client` directly. They read entities and dispatch actions.
+- Views never call `graph_client` directly. They read entities and dispatch actions. The
+  session's client is private to `graph_store`, so every read goes through a session method
+  that counts it while it runs and notes what it says about the server (the history's and the
+  review's change pages, the storage inspector's server state among them). The one client
+  another crate holds is the agent gateway's (`GraphSession::gateway_client`), which forwards
+  the agent CLI's own requests inside its sandbox.
 - `graph_client` sends through Zed's `HttpClient` (the `reqwest_client` that `graph_store::init`
   installs); `graph_store` awaits it in a task it keeps in a field, so dropping or replacing the
   task cancels the request.

@@ -12,11 +12,14 @@ use futures::future::{Either, Shared, select};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task};
 use gq_language::{BuiltQuery, RelationshipGroup, SchemaModel, builder};
 use graph_client::api::{
-    BranchCreateOutput, BranchCreateRequest, BranchMergeOutput, BranchMergeRequest, ChangeOutput,
-    ChangeRequest, CommitOutput, InvokeStoredQueryRequest, QueryCatalogEntry, QueryRequest,
-    ReadOutput, SnapshotDatasetOutput,
+    BranchCreateOutput, BranchCreateRequest, BranchMergeOutput, BranchMergeRequest,
+    ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitOutput, GraphListResponse,
+    InvokeStoredQueryRequest, QueryCatalogEntry, QueryRequest, ReadOutput, ReadinessOutput,
+    SnapshotDatasetOutput, SnapshotOutput,
 };
-use graph_client::{BlobAt, BlobCell, BlobMeta, GraphClient, ReadError, WriteOutcome};
+use graph_client::{
+    BlobAt, BlobCell, BlobMeta, CommitChanges, GraphClient, ReadError, ServerHealth, WriteOutcome,
+};
 use serde_json::Value;
 
 use crate::connection::Connection;
@@ -122,6 +125,15 @@ pub struct HeadWatch {
 
 /// A branch's commits, newest first, shared by the views that show them.
 pub type CommitList = Arc<Vec<CommitOutput>>;
+
+/// The server as the storage inspector shows it ([`GraphSession::server_state`]): each read's
+/// own answer, so one failing leaves the others.
+pub struct ServerState {
+    pub health: Result<ServerHealth, ReadError>,
+    pub readiness: Result<ReadinessOutput, ReadError>,
+    pub graphs: Result<GraphListResponse, ReadError>,
+    pub snapshot: Result<SnapshotOutput, ReadError>,
+}
 
 /// A read at a commit: the commit, the query text and its parameters.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -246,8 +258,23 @@ impl GraphSession {
         session
     }
 
-    pub fn client(&self, cx: &App) -> GraphClient {
+    /// The client every read and write of this session goes through. Views never hold one
+    /// (`docs/architecture.md`): they ask the session, which counts the read and notes what
+    /// it says about the server.
+    pub(crate) fn client(&self, cx: &App) -> GraphClient {
         self.connection.read(cx).client().clone()
+    }
+
+    /// The server's address, for a view that shows it.
+    pub fn server_url(&self, cx: &App) -> String {
+        self.connection.read(cx).client().base_url().to_owned()
+    }
+
+    /// The client the agent gateway forwards the agent CLI's own requests through, inside the
+    /// sandbox the gateway enforces. The one client a crate outside `graph_store` holds: the
+    /// CLI's reads are its own, not the session's.
+    pub fn gateway_client(&self, cx: &App) -> GraphClient {
+        self.client(cx)
     }
 
     pub fn server_name(&self, cx: &App) -> String {
@@ -891,6 +918,83 @@ impl GraphSession {
             this.update(cx, |this, _| this.commit_lists.finish(&key, &result))
                 .ok();
             result
+        })
+    }
+
+    /// One page of a commit's changes against its first parent, from `page_token` (the first
+    /// page when `None`).
+    pub fn commit_changes(
+        &mut self,
+        commit_id: &str,
+        page_token: Option<String>,
+        limit: u32,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<CommitChanges, ReadError>> {
+        let (client, graph, commit) =
+            (self.client(cx), self.graph_id.clone(), commit_id.to_owned());
+        self.counted_read(
+            async move {
+                client
+                    .commit_changes(&graph, &commit, page_token.as_deref(), limit)
+                    .await
+            },
+            cx,
+        )
+    }
+
+    /// One page of `branch`'s change feed: from `start` (`now`, `beginning` or
+    /// `after:<commit_id>`), or from `page_token` to continue.
+    pub fn changes(
+        &mut self,
+        branch: &str,
+        start: Option<String>,
+        page_token: Option<String>,
+        limit: u32,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ChangeFeedOutput, ReadError>> {
+        let (client, graph, branch) = (self.client(cx), self.graph_id.clone(), branch.to_owned());
+        self.counted_read(
+            async move {
+                client
+                    .changes(
+                        &graph,
+                        &branch,
+                        start.as_deref(),
+                        page_token.as_deref(),
+                        limit,
+                    )
+                    .await
+            },
+            cx,
+        )
+    }
+
+    /// The server's health and readiness, the graphs it serves, and `branch`'s snapshot: what
+    /// the storage inspector shows, read together.
+    pub fn server_state(&mut self, branch: &str, cx: &mut Context<Self>) -> Task<ServerState> {
+        let client = self.client(cx);
+        let (graph, branch) = (self.graph_id.clone(), branch.to_owned());
+        // Each is a read of its own, counted and noted as one.
+        let health = {
+            let client = client.clone();
+            self.counted_read(async move { client.health().await }, cx)
+        };
+        let readiness = {
+            let client = client.clone();
+            self.counted_read(async move { client.readiness().await }, cx)
+        };
+        let graphs = {
+            let client = client.clone();
+            self.counted_read(async move { client.graphs().await }, cx)
+        };
+        let snapshot = self.counted_read(async move { client.snapshot(&graph, &branch).await }, cx);
+        cx.background_spawn(async move {
+            ServerState {
+                health: health.await,
+                readiness: readiness.await,
+                graphs: graphs.await,
+                snapshot: snapshot.await,
+            }
         })
     }
 
@@ -1936,6 +2040,69 @@ mod tests {
         let read = session.update(cx, |session, cx| session.commits("feature", false, cx));
         read.await.unwrap();
         assert_eq!(reads_of("feature"), 3);
+    }
+
+    /// The reads the history, the commit view, the review and the storage inspector ask for
+    /// go through the session, so they count as running while they run and stop counting
+    /// when dropped.
+    #[gpui::test]
+    async fn feature_reads_are_counted_while_they_run(cx: &mut TestAppContext) {
+        let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = held.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let held = seen.clone();
+            async move {
+                let feature = path.ends_with("/changes")
+                    || path.ends_with("/healthz")
+                    || path.ends_with("/readyz")
+                    || path.ends_with("/snapshot")
+                    || path == "/graphs";
+                if feature {
+                    // A read that never answers, held until dropped.
+                    held.fetch_add(1, Ordering::SeqCst);
+                    futures::future::pending::<()>().await;
+                }
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(r#"{"branches":["main"]}"#))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        // Opening the session reads some of these routes itself.
+        let before = session.read_with(cx, |session, _| session.reads_in_flight);
+        let held_before = held.load(Ordering::SeqCst);
+
+        let reads = session.update(cx, |session, cx| {
+            (
+                session.commit_changes("c1", None, 10, cx),
+                session.changes("main", Some("beginning".into()), None, 10, cx),
+                session.server_state("main", cx),
+            )
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            held.load(Ordering::SeqCst) - held_before,
+            6,
+            "two change reads and four server reads"
+        );
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.reads_in_flight, before + 6)
+        });
+        drop(reads);
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| assert_eq!(session.reads_in_flight, before));
     }
 
     /// The command palette's search drops its reads when the text changes; the count must come

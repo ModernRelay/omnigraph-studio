@@ -9,11 +9,11 @@ use gpui::{
     ListAlignment, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
 };
 use gq_language::SchemaModel;
+use graph_client::WriteOutcome;
 use graph_client::api::{
     BranchMergeOutcome, BranchMergeOutput, ChangeOutput, ChangeRequest, CommitOutput,
     MergeConflictOutput,
 };
-use graph_client::{GraphClient, WriteOutcome};
 use graph_store::fixes::compose;
 use graph_store::{
     ChangeFold, FoldedChange, FoldedChanges, GraphSession, HeadWatch, NetChange, REVIEW_CHANGE_CAP,
@@ -268,13 +268,12 @@ impl ReviewView {
         if !matches!(self.merge, MergeState::Merging | MergeState::Checking) {
             self.merge = MergeState::Idle;
         }
-        let client = self.session.read(cx).client(cx);
-        let graph = self.session.read(cx).graph_id.clone();
+        let session = self.session.clone();
         let branch = self.branch.clone();
         let target = self.target.clone();
         let scope = self.scope.clone();
         self._load_task = Some(cx.spawn(async move |this, cx| {
-            let result = read_review(client, graph, branch, target, scope, this.clone(), cx).await;
+            let result = read_review(session, branch, target, scope, this.clone(), cx).await;
             this.update(cx, |this, cx| this.finish_load(result, cx))
                 .ok();
         }));
@@ -659,14 +658,13 @@ impl ReviewView {
         self.show_conflicts = false;
         cx.notify();
         let session = self.session.clone();
-        let client = session.read(cx).client(cx);
-        let graph = session.read(cx).graph_id.clone();
         let branch = self.branch.clone();
         let target = self.target.clone();
         let bound = self.bound_head.clone();
         self._merge_task = Some(cx.spawn(async move |this, cx| {
-            let head = match client.commits(&graph, &branch).await {
-                Ok(list) => list.commits.first().map(|c| c.graph_commit_id.clone()),
+            let read = session.update(cx, |session, cx| session.commits(&branch, true, cx));
+            let head = match read.await {
+                Ok(list) => list.first().map(|c| c.graph_commit_id.clone()),
                 Err(error) => {
                     this.update(cx, |this, cx| {
                         this.merge = MergeState::Refused(format!(
@@ -711,14 +709,9 @@ impl ReviewView {
                         cx.notify();
                     })
                     .ok();
-                    let verified = verify_merge(
-                        &client,
-                        &graph,
-                        &target,
-                        commit.as_deref(),
-                        bound.as_deref(),
-                    )
-                    .await;
+                    let verified =
+                        verify_merge(&session, &target, commit.as_deref(), bound.as_deref(), cx)
+                            .await;
                     MergeState::Merged {
                         outcome,
                         commit,
@@ -739,7 +732,7 @@ impl ReviewView {
                     })
                     .ok();
                     // Settle by reading history, never by merging again (constitution III).
-                    let landed = merge_landed(&client, &graph, &target, bound.as_deref()).await;
+                    let landed = merge_landed(&session, &target, bound.as_deref(), cx).await;
                     MergeState::Unknown { reason, landed }
                 }
             };
@@ -1467,24 +1460,22 @@ fn build_rows(data: &ReviewData, query: &str) -> Vec<Row> {
 /// Reads both histories, finds the fork, and folds the branch's change feed from there, up to
 /// the reviewed head and the change cap.
 async fn read_review(
-    client: GraphClient,
-    graph: String,
+    session: Entity<GraphSession>,
     branch: String,
     target: String,
     scope: Option<String>,
     this: WeakEntity<ReviewView>,
     cx: &mut AsyncApp,
 ) -> Result<ReviewData, String> {
-    let branch_commits = client
-        .commits(&graph, &branch)
+    // Read now, not from the session's shared lists: a review shows what the branches hold.
+    let branch_commits = session
+        .update(cx, |session, cx| session.commits(&branch, true, cx))
         .await
-        .map_err(|e| e.to_string())?
-        .commits;
-    let target_commits = client
-        .commits(&graph, &target)
+        .map_err(|e| e.to_string())?;
+    let target_commits = session
+        .update(cx, |session, cx| session.commits(&target, true, cx))
         .await
-        .map_err(|e| e.to_string())?
-        .commits;
+        .map_err(|e| e.to_string())?;
     let fork = fork_point(&branch_commits, &target_commits).cloned();
     let head = branch_commits.first().cloned();
     let since: Vec<CommitOutput> = commits_since(
@@ -1503,8 +1494,10 @@ async fn read_review(
         let mut token: Option<String> = None;
         loop {
             let limit = FEED_PAGE.min(REVIEW_CHANGE_CAP - fold.raw_changes()).max(1) as u32;
-            let page = client
-                .commit_changes(&graph, commit, token.as_deref(), limit)
+            let page = session
+                .update(cx, |session, cx| {
+                    session.commit_changes(commit, token.clone(), limit, cx)
+                })
                 .await
                 .map_err(|e| e.to_string())?;
             let block = graph_client::api::ChangeBlockOutput {
@@ -1542,8 +1535,10 @@ async fn read_review(
         let mut token: Option<String> = None;
         loop {
             let limit = FEED_PAGE.min(REVIEW_CHANGE_CAP - fold.raw_changes()).max(1) as u32;
-            let page = client
-                .changes(&graph, &branch, start.as_deref(), token.as_deref(), limit)
+            let page = session
+                .update(cx, |session, cx| {
+                    session.changes(&branch, start.clone(), token.clone(), limit, cx)
+                })
                 .await
                 .map_err(|e| e.to_string())?;
             let mut blocks = Vec::new();
@@ -1620,28 +1615,30 @@ async fn read_review(
 /// Whether the target's history holds the merge just reported: the merge commit, or for a
 /// fast-forward or an up-to-date target, a commit carrying the source head.
 async fn verify_merge(
-    client: &GraphClient,
-    graph: &str,
+    session: &Entity<GraphSession>,
     target: &str,
     commit: Option<&str>,
     source_head: Option<&str>,
+    cx: &mut AsyncApp,
 ) -> bool {
-    let Ok(list) = client.commits(graph, target).await else {
+    let read = session.update(cx, |session, cx| session.commits(target, true, cx));
+    let Ok(list) = read.await else {
         return false;
     };
-    commit.is_some_and(|c| list.commits.iter().any(|t| t.graph_commit_id == c))
-        || source_head.is_some_and(|head| contains_merge_of(&list.commits, head))
+    commit.is_some_and(|c| list.iter().any(|t| t.graph_commit_id == c))
+        || source_head.is_some_and(|head| contains_merge_of(&list, head))
 }
 
 /// After a lost merge response: whether the target's history shows the source head merged.
 async fn merge_landed(
-    client: &GraphClient,
-    graph: &str,
+    session: &Entity<GraphSession>,
     target: &str,
     source_head: Option<&str>,
+    cx: &mut AsyncApp,
 ) -> Option<bool> {
-    let list = client.commits(graph, target).await.ok()?;
-    Some(contains_merge_of(&list.commits, source_head?))
+    let read = session.update(cx, |session, cx| session.commits(target, true, cx));
+    let list = read.await.ok()?;
+    Some(contains_merge_of(&list, source_head?))
 }
 
 impl Render for ReviewView {
