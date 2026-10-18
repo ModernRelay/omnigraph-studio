@@ -126,6 +126,7 @@ impl ConnectionRegistry {
         );
         this.watch_operator_files(cx);
 
+        let mut any_moved = false;
         for saved in saved.servers.into_iter().filter(|s| s.source == "studio") {
             // An address saved without a scheme (`localhost:8080`) is read with the one it
             // needs; its token, kept under the old address, moves with it.
@@ -143,9 +144,7 @@ impl ConnectionRegistry {
                 continue;
             };
             connection.update(cx, |connection, _| connection.await_token());
-            if moved {
-                this.save(cx);
-            }
+            any_moved |= moved;
             let read = cx.read_credentials(&saved.url);
             cx.spawn(async move |_, cx| {
                 let token = read
@@ -162,6 +161,10 @@ impl ConnectionRegistry {
                     .ok();
             })
             .detach();
+        }
+        // Once, with every address read again: the file then names each with its scheme.
+        if any_moved {
+            this.save(cx);
         }
         this
     }
