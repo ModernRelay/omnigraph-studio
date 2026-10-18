@@ -5222,7 +5222,6 @@ impl TypeTable {
                                 .max_w(px(360.))
                                 .max_h(px(260.))
                                 .overflow_y_scroll()
-                                .border_1()
                                 .border_color(border)
                                 .bg(bg)
                                 .shadow(studio_ui::ds::elevation::overlay())
@@ -6320,8 +6319,6 @@ impl TypeTable {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let colors = cx.theme().colors();
-        let (bg, border) = (colors.elevated_surface_background, colors.border);
         div()
             .absolute()
             .top_0()
@@ -6339,11 +6336,7 @@ impl TypeTable {
                                 .px(px(space::MD))
                                 .py(px(space::SM))
                                 .gap(px(space::XS))
-                                .rounded_md()
-                                .border_1()
-                                .border_color(border)
-                                .bg(bg)
-                                .shadow_md()
+                                .map(|callout| studio_ui::ds::menu_surface(callout, cx))
                                 .children(notice.map(|notice| {
                                     let unknown = notice.tone == Tone::Unknown;
                                     h_flex()
@@ -6631,7 +6624,7 @@ impl Render for DraggedColumn {
         div()
             .px(px(space::MD))
             .py(px(space::XS))
-            .rounded_md()
+            .rounded_full()
             .bg(cx.theme().colors().elevated_surface_background)
             .border_1()
             .border_color(cx.theme().colors().border)

@@ -779,7 +779,6 @@ impl InsertEdgeModal {
                 .id(("endpoint-suggestions", end as usize))
                 .max_h(px(208.))
                 .overflow_y_scroll()
-                .border_1()
                 .border_color(colors.border_variant)
                 .children(endpoint.offers.rows(
                     "endpoint-suggestion",
@@ -1235,7 +1234,6 @@ impl DeleteRowModal {
                 let hidden = plan.dependents.len().saturating_sub(DEPENDENTS_NAMED);
                 let list = studio_ui::ds::row_list()
                     .bg(cx.theme().colors().editor_background)
-                    .border_1()
                     .border_color(studio_ui::ds::surface::floating_border(cx))
                     .children(plan.dependents.iter().take(DEPENDENTS_NAMED).map(|d| {
                         h_flex()

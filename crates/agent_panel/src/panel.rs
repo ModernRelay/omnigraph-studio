@@ -3514,7 +3514,7 @@ impl AgentPanel {
                         .px(px(ds::space::SM))
                         .gap(px(ds::space::XS))
                         .items_center()
-                        .rounded_md()
+                        .rounded_full()
                         .cursor_pointer()
                         .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
                         .tooltip(Tooltip::text(about))

@@ -1263,7 +1263,7 @@ impl RelationshipTree {
                             .h(px(ROW_HEIGHT))
                             .px(px(space::MD))
                             .gap(px(space::SM))
-                            .rounded_md()
+                            .rounded_full()
                             .bg(field)
                             .child(
                                 Icon::new(IconName::MagnifyingGlass)

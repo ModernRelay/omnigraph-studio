@@ -416,9 +416,16 @@ than styling one-off elements.
   the first tab of the top-left pane, when the sidebar is shown.
 - **Concentric radii, in code.** A surface around rounded children has their radius plus the
   gap between the edges (`ds::radius::around`); a child takes its container's less the gap
-  (`ds::radius::within`, square when the gap is wider). Buttons are pills and circles (below),
-  so a surface around them needs no radius of theirs; a menu row is `radius::MENU_ITEM`, the
-  menu's 10 px less its 4 px inset.
+  (`ds::radius::within`, square when the gap is wider). The gap counts a hairline border
+  (`size::HAIRLINE`), which GPUI draws inside the box: a menu row is `radius::MENU_ITEM`, the
+  menu's 10 px less its hairline and 4 px padding (5); the palette's results card is 11 in its
+  16 px frame, its rows 6. A fill flush with a bordered edge (a card's header, a modal's
+  footer) rounds its own corners at the container's radius less the hairline
+  (`radius::flush`): GPUI clips children to a rectangle, not to rounded corners, so the fill
+  otherwise shows a square corner outside the curve. Buttons are pills and circles (below), so
+  a surface around them needs no radius of theirs. Radii come from `ds::radius` by role (key
+  caps and chips XS 4, rows and fields SM 6, cards and menus 10, sheets LG 14, modals 16, and
+  round ends for anything clicked), never GPUI's `rounded_sm()`-style utilities.
   The nested pieces are components: `ds::segmented`, `ds::row_list` (a field's offers),
   `ds::float_bar` (the canvas's floating controls, 7 px around 22 px buttons 3 px in),
   `ds::pill_button` (round, 4 px inside a pill's round end) and the context chip's tile. The
@@ -541,6 +548,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-18 | Nested radii count the hairline; flush fills follow their container's corners; no raw radius utilities | `ds` test `nested_radii_are_concentric` (menu row, palette list and row, a row list, `radius::flush` for a card header and a modal footer); offscreen snapshots cropped at 2×: the gallery's card header, the delete dialog's footer, ⌘K's highlighted row, a tab's menu | Before, the card header's fill showed a square corner outside the card's curve; the menu row, palette card and palette row were 1 px rounder than their insets allowed, since the hairline was not counted. Fourteen `rounded_sm`/`rounded_md` calls became tokens by role: the inspector's rows SM, its image frame MD, a table cell's edit notice a menu surface, a dragged column, the agent picker and the tree's filter row pills |
 | 2026-10-18 | Tower's buttons, menus, modals and icons; spacing on the ds scale | `studio_ui` `button` tests (`controls_draw_at_their_sizes`: 28 px pills 10 px in, circles, pill fields; `zed_styles_pick_the_variants`), `menu` tests (Zed's six, on the fork), `studio_theme` `icons` tests (≤ 100 Nucleo drawings, each file named once, each replacing a Zed icon); the workspace suite; `cargo clippy --workspace --all-targets -D warnings`; offscreen snapshots in glass on a scratch cluster: the delete dialog with two dependents, ⌘K, a tab's context menu, the design gallery, a table with the new icons | The dialog read one muted paragraph under "Delete Acme", the dependents list, then Cancel and a red Delete with a light ↵; the palette a frame with the results card inside; the menu 26 px rows and edge-to-edge rules. A 97 % modal fill let the rows behind show through above the title; the fill is opaque now. The settings reset, a 28 px circle, made its row taller than the others; it is compact. A spacing conversion made both arms of one `if` equal (clippy); collapsed |
 | 2026-10-17 | Views read through the session; growing lists draw only their visible rows | `graph_store` `feature_reads_are_counted_while_they_run` (six held reads counted, then none once dropped); `studio_ui` `rows` `only_the_rows_between_a_shared_start_and_end_change`; the compiler, with the session's client private to `graph_store`; offscreen snapshots of History, Storage, Conversations, Queries and Activity against the dev server | History listed its 10 commits with their counts and the head's change; Storage showed the server, both graphs and main's snapshot; Queries and Activity kept their layout as lists. Conversations' empty note now wraps at the sidebar's width, where it was clipped, and its filter shows a funnel beside the sidebar's search |
 | 2026-10-17 | A tab's menu shows its keys; every action has a key or is palette-only; the lights' room only where they show; one loading and one error state | `studio` `keymaps` `every_action_has_a_key_or_is_palette_only` (red on `studio_graph::OpenSchema` while optional-field actions counted; then on none); `studio_workspace` `strips_make_room_for_traffic_lights_only_when_they_show`; offscreen snapshots: the right-click menu on the first and on the last of two tabs, and the design gallery's state row | The menu read Close ⌘W, Close Others ⌥⌘T, Close All ⌥⌘W, Split Right `⌘\`, Split Down `⌘⇧\`; on the last tab "Close to the Right" was disabled. Five actions gained keys from Zed's (⌥⌘O, ⌘R, ⌥⌘T, ⌥⌘W, ⌘N in the agent panel), sixteen stay palette-only. The old centred-sentence helper is gone; its callers read the schema, history, changes, review, Blob and table states through `ds::loading_state`, `ds::error_state` and `ds::empty_state` |

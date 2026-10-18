@@ -779,7 +779,6 @@ impl Render for DesignGallery {
                 ds::modal_body().child(
                     ds::row_list()
                         .bg(colors.editor_background)
-                        .border_1()
                         .border_color(surface::floating_border(cx))
                         .child(
                             h_flex()

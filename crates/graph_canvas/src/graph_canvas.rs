@@ -2380,7 +2380,7 @@ impl Render for GraphCanvas {
                     .top(from.y.min(to.y) - bounds.origin.y)
                     .w((to.x - from.x).abs())
                     .h((to.y - from.y).abs())
-                    .rounded_sm()
+                    .rounded(px(studio_ui::ds::radius::XS))
                     .border_1()
                     .border_color(accent.opacity(0.6))
                     .bg(accent.opacity(0.08))

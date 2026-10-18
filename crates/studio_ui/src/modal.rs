@@ -139,6 +139,8 @@ pub fn modal_footer(cx: &App) -> Div {
         .border_t_1()
         .border_color(surface::floating_border(cx))
         .bg(cx.theme().colors().text.opacity(0.025))
+        // Its fill meets the card's bottom corners.
+        .rounded_b(px(radius::flush(radius::MODAL)))
 }
 
 /// A modal's Cancel: an outline pill at a control's height.

@@ -219,7 +219,7 @@ pub fn type_mark(type_name: &str, label: &str) -> Div {
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(4.))
+        .rounded(px(ds::radius::XS))
         .bg(color)
         .text_color(gpui::white())
         .text_size(px(9.))

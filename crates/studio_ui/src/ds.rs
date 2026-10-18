@@ -72,12 +72,19 @@ pub mod radius {
     pub const MODAL: f32 = 16.;
     /// A context menu or popover.
     pub const MENU: f32 = 10.;
-    /// A menu's rows, [`super::space::XS`] inside it.
-    pub const MENU_ITEM: f32 = within(MENU, super::space::XS);
-    /// The command palette's results: a solid card inset in its glass frame.
-    pub const PALETTE_LIST: f32 = within(MODAL, super::space::XS);
-    /// A palette row, inset in the results card.
-    pub const PALETTE_ROW: f32 = within(PALETTE_LIST, super::space::XS);
+    /// A menu's rows, inside its hairline and [`super::space::XS`] of padding.
+    pub const MENU_ITEM: f32 = within(MENU, super::space::XS + super::size::HAIRLINE);
+    /// The command palette's results: a solid card inside its glass frame's hairline and
+    /// padding.
+    pub const PALETTE_LIST: f32 = within(MODAL, super::space::XS + super::size::HAIRLINE);
+    /// A palette row, inside the results card's hairline and padding.
+    pub const PALETTE_ROW: f32 = within(PALETTE_LIST, super::space::XS + super::size::HAIRLINE);
+    /// A fill flush with a bordered surface's edge (a card's header, a modal's footer): the
+    /// surface's radius less its hairline. GPUI clips children to a rectangle, not to their
+    /// container's corners, so such a fill rounds its own.
+    pub const fn flush(outer: f32) -> f32 {
+        within(outer, super::size::HAIRLINE)
+    }
     // Buttons, fields, tabs, pills and floating bars have no radius here: they are round at
     // the ends (`rounded_full`), so whatever holds them is a pill too.
 
@@ -135,6 +142,9 @@ pub mod size {
     pub const FIELD_LABEL: f32 = 112.;
     /// The gap around and between glass sheets.
     pub const SHEET_GAP: f32 = 8.;
+    /// A hairline border's width. A border sits inside its box, so it is part of the gap
+    /// between a surface's edge and its children's (`radius::within`, `radius::around`).
+    pub const HAIRLINE: f32 = 1.;
     /// A modal's width: enough for a sentence and a form, never the window.
     pub const MODAL_WIDTH: f32 = 480.;
     /// A wide modal: two panes side by side (opening a graph).
@@ -989,12 +999,14 @@ pub fn pill_button(
         .child(Icon::new(icon).size(IconSize::XSmall).color(color))
 }
 
-/// A padded list of rounded rows, as a field's offers: rows of radius `radius::XS`, the list
-/// concentric around them. The caller adds the fill, border and shadow.
+/// A padded list of rounded rows, as a field's offers: rows of radius `radius::XS` inside a
+/// hairline, the list concentric around them. The caller colours the hairline and adds the
+/// fill and shadow.
 pub fn row_list() -> Div {
     v_flex()
         .p(px(space::XS))
-        .rounded(px(radius::around(radius::XS, space::XS)))
+        .border_1()
+        .rounded(px(radius::around(radius::XS, space::XS + size::HAIRLINE)))
 }
 
 /// A floating group of controls over a canvas: a glass pill 28 px tall holding
@@ -1220,6 +1232,8 @@ pub fn card(cx: &App) -> Div {
 pub fn card_header(cx: &App) -> Div {
     h_flex()
         .w_full()
+        // Its fill meets the card's top corners.
+        .rounded_t(px(radius::flush(radius::MD)))
         .min_h(px(size::SIDEBAR_ROW + space::MD))
         .px(px(space::LG))
         .gap(px(space::MD))
@@ -1746,10 +1760,23 @@ mod tests {
     fn nested_radii_are_concentric() {
         // A card `space::XS` inside a glass sheet.
         assert_eq!(radius::within(radius::LG, space::XS), radius::MD);
-        // A segment in its track; a context chip's tile; a row in a row list.
-        assert_eq!(radius::around(radius::SM, space::XXS), 8.);
+        // A context chip's tile; a row in a row list, inside its hairline and padding.
         assert_eq!(radius::within(radius::MD, space::SM), radius::XS);
-        assert_eq!(radius::around(radius::XS, space::XS), 8.);
+        assert_eq!(radius::around(radius::XS, space::XS + size::HAIRLINE), 9.);
+        // A menu's rows, the palette's results and their rows: each inside a hairline and
+        // `space::XS` of padding.
+        assert_eq!(radius::MENU_ITEM, radius::MENU - space::XS - size::HAIRLINE);
+        assert_eq!(
+            radius::PALETTE_LIST,
+            radius::MODAL - space::XS - size::HAIRLINE
+        );
+        assert_eq!(
+            radius::PALETTE_ROW,
+            radius::PALETTE_LIST - space::XS - size::HAIRLINE
+        );
+        // A fill flush with a bordered edge: a card's header, a modal's footer.
+        assert_eq!(radius::flush(radius::MD), radius::MD - size::HAIRLINE);
+        assert_eq!(radius::flush(radius::MODAL), radius::MODAL - size::HAIRLINE);
         // A pill button's half height is the pill's less the gap: round in its round end.
         let button = size::PILL - 2. * PILL_BUTTON_GAP;
         assert_eq!(
