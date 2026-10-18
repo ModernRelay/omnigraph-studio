@@ -1807,8 +1807,10 @@ impl ReviewView {
                             ),
                         })
                         .on_click(cx.listener(move |this, _, _, cx| this.revert(change, cx)));
+                // The selected change is what ⌥⌘Z reverts: a card without its own change selects
+                // its first relationship, which shows it.
                 line = line
-                    .selected(self.selected == Some(change) && group.change.is_some())
+                    .selected(self.selected == Some(change))
                     .hollow(state.reviewed)
                     .hover_group(hover)
                     .action(revert);
