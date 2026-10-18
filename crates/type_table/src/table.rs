@@ -1155,13 +1155,13 @@ impl TypeTable {
         self.bulk.notice = None;
         self.saves_in_flight += 1;
         cx.notify();
-        let branch = self.branch.clone();
+        let (session, branch) = (self.session.clone(), self.branch.clone());
         let column = property.name;
         // Detached: a write is never cancelled by closing the tab.
         cx.spawn_in(window, async move |this, cx| {
             let outcome = write.await;
             this.update_in(cx, |this, _window, cx| {
-                this.finish_bulk(outcome, rows, column, new, &branch, cx)
+                this.finish_bulk(outcome, rows, column, new, &session, &branch, cx)
             })
             .ok();
         })
@@ -1174,13 +1174,14 @@ impl TypeTable {
         rows: Vec<(String, Value)>,
         column: String,
         new: Value,
+        session: &Entity<GraphSession>,
         branch: &str,
         cx: &mut Context<Self>,
     ) {
         self.saves_in_flight = self.saves_in_flight.saturating_sub(1);
         self.bulk.saving = false;
         // The rows set were the branch left's; the table shows what it read on this one.
-        if branch != self.branch {
+        if !self.shows(session, branch) {
             self.saves_settled(cx);
             cx.notify();
             return;
@@ -3074,12 +3075,16 @@ impl TypeTable {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The columns can change between the frame clicked and the click: a column gone is no
+        // cell.
+        let Some(column) = self.columns.get(col) else {
+            return;
+        };
+        let (role, editable) = (column.role.clone(), column.editable(self.kind));
+        let relationship = column.relationship().cloned();
         let cursor = Cursor { row, col };
         // A double click on a node's key opens its page (spec 014); the first click peeked it.
-        if clicks >= 2
-            && self.kind == TableKind::Node
-            && matches!(self.columns[col].role, ColumnRole::Key)
-        {
+        if clicks >= 2 && self.kind == TableKind::Node && matches!(role, ColumnRole::Key) {
             self.set_cursor(cursor, cx);
             self.open_row_page(row, window, cx);
             return;
@@ -3096,11 +3101,8 @@ impl TypeTable {
         self.set_cursor(cursor, cx);
         // A relationship cell opens the related rows: the other type, filtered to those related
         // to this row through the same relationship seen from the other end.
-        if let (Some(group), Some(id)) = (
-            self.columns[col].relationship(),
-            self.rows.get(row).map(|r| r.id.clone()),
-        ) {
-            let back = builder::reversed(group, &self.type_name);
+        if let (Some(group), Some(id)) = (relationship, self.rows.get(row).map(|r| r.id.clone())) {
+            let back = builder::reversed(&group, &self.type_name);
             window.dispatch_action(
                 Box::new(studio_actions::graph::OpenType {
                     type_name: group.other_type.clone(),
@@ -3113,7 +3115,7 @@ impl TypeTable {
             );
             return;
         }
-        if self.columns[col].editable(self.kind) {
+        if editable {
             self.start_edit(cursor, window, cx);
         } else {
             self.show_peek(row, false, cx);
@@ -3424,13 +3426,15 @@ impl TypeTable {
         let write = self.session.update(cx, |session, cx| {
             session.write(&query, None, description, cx)
         });
-        let branch = self.branch.clone();
+        let (session, branch) = (self.session.clone(), self.branch.clone());
         // Detached: a write is never cancelled by closing the tab.
         cx.spawn_in(window, async move |this, cx| {
             let outcome = write.await;
             let result = save_result(&outcome, &branch);
             this.update_in(cx, |this, window, cx| {
-                this.finish_save(row_id, column, old, text, &branch, result, window, cx)
+                this.finish_save(
+                    row_id, column, old, text, &session, &branch, result, window, cx,
+                )
             })
             .ok();
         })
@@ -3444,20 +3448,24 @@ impl TypeTable {
         column: String,
         old: Value,
         text: String,
+        session: &Entity<GraphSession>,
         branch: &str,
         result: SaveResult,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.saves_in_flight = self.saves_in_flight.saturating_sub(1);
-        // The table moved to another branch meanwhile and shows what it read there; the write's
-        // outcome is told by its toast. A saved cell's draft was the branch left's.
-        if branch != self.branch {
-            if let SaveResult::Saved { .. } = result {
-                let key = self.draft_key(&row_id, &column);
-                self.session
-                    .update(cx, |session, cx| session.remove_draft_on(branch, &key, cx));
-            }
+        // The table moved to another branch or graph meanwhile and shows what it read there;
+        // the write's outcome is told by its toast. A saved cell's draft was the branch left's,
+        // and the text of one that did not land stays a draft there.
+        if !self.shows(session, branch) {
+            let key = self.draft_key(&row_id, &column);
+            session.update(cx, |session, cx| match result {
+                SaveResult::Saved { .. } => {
+                    session.remove_draft_on(branch, &key, cx);
+                }
+                _ => session.set_draft_on(branch, key, DraftEntry { old, text }, cx),
+            });
             self.saves_settled(cx);
             cx.emit(ItemEvent::UpdateTab);
             cx.notify();
@@ -3526,6 +3534,12 @@ impl TypeTable {
         }
         self.finish_editing(window, cx);
         true
+    }
+
+    /// Whether the table still shows `session`'s `branch`: an answer read for another is not
+    /// this table's.
+    fn shows(&self, session: &Entity<GraphSession>, branch: &str) -> bool {
+        &self.session == session && self.branch == branch
     }
 
     fn draft_key(&self, row_id: &str, column: &str) -> DraftKey {
@@ -3743,13 +3757,13 @@ impl TypeTable {
         self.drafts.saving = true;
         self.saves_in_flight += 1;
         cx.notify();
-        let branch = self.branch.clone();
+        let (session, branch) = (self.session.clone(), self.branch.clone());
         let row_count = rows.len();
         // Detached: a write is never cancelled by closing the tab.
         cx.spawn_in(window, async move |this, cx| {
             let outcome = write.await;
             this.update_in(cx, |this, window, cx| {
-                this.finish_drafts(outcome, row_count, edits, &branch, window, cx)
+                this.finish_drafts(outcome, row_count, edits, &session, &branch, window, cx)
             })
             .ok();
         })
@@ -3761,13 +3775,14 @@ impl TypeTable {
         outcome: graph_client::WriteOutcome<graph_client::api::ChangeOutput>,
         row_count: usize,
         edits: Vec<DraftEdit>,
+        session: &Entity<GraphSession>,
         branch: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.saves_in_flight = self.saves_in_flight.saturating_sub(1);
         self.drafts.saving = false;
-        if branch != self.branch {
+        if !self.shows(session, branch) {
             // As for one cell: the drafts saved were the branch left's, and the rest wait there.
             if let graph_client::WriteOutcome::Committed(output) = &outcome
                 && output.commit.is_some()
@@ -3775,8 +3790,7 @@ impl TypeTable {
             {
                 for edit in &edits {
                     let key = self.draft_key(&edit.row_id, &edit.column);
-                    self.session
-                        .update(cx, |session, cx| session.remove_draft_on(branch, &key, cx));
+                    session.update(cx, |session, cx| session.remove_draft_on(branch, &key, cx));
                 }
             }
             self.saves_settled(cx);
@@ -3883,6 +3897,7 @@ impl TypeTable {
                 .session
                 .update(cx, |session, cx| session.read(&query, None, cx));
             self.saves_in_flight += 1;
+            let (session, branch) = (self.session.clone(), self.branch.clone());
             cx.spawn_in(window, async move |this, cx| {
                 let result = read.await;
                 this.update_in(cx, |this, _window, cx| {
@@ -3890,6 +3905,32 @@ impl TypeTable {
                     let now = result
                         .ok()
                         .map(|output| node_rows(&output.rows).into_iter().next());
+                    if !this.shows(&session, &branch) {
+                        // The table moved on: each draft is settled where it was typed, and
+                        // nothing here changes.
+                        for edit in row_edits {
+                            let key = this.draft_key(&edit.row_id, &edit.column);
+                            let value = match &now {
+                                Some(Some(row)) => Some(row.value(&edit.column).clone()),
+                                _ => None,
+                            };
+                            session.update(cx, |session, cx| match value {
+                                Some(value) if same_value(&value, &edit.new) => {
+                                    session.remove_draft_on(&branch, &key, cx);
+                                }
+                                value => {
+                                    let old = value.unwrap_or(edit.old);
+                                    let entry = DraftEntry {
+                                        old,
+                                        text: edit.text,
+                                    };
+                                    session.set_draft_on(&branch, key, entry, cx);
+                                }
+                            });
+                        }
+                        this.saves_settled(cx);
+                        return;
+                    }
                     for edit in row_edits {
                         let key = (edit.row_id.clone(), edit.column.clone());
                         let property = this.property_of(&edit.column);
@@ -4105,10 +4146,26 @@ impl TypeTable {
         let read = self
             .session
             .update(cx, |session, cx| session.read(&query, None, cx));
+        let (session, branch) = (self.session.clone(), self.branch.clone());
         cx.spawn_in(window, async move |this, cx| {
             let result = read.await;
             this.update_in(cx, |this, window, cx| {
                 this.saves_in_flight = this.saves_in_flight.saturating_sub(1);
+                if !this.shows(&session, &branch) {
+                    // The table moved on: the text stays a draft where it was typed, bound to
+                    // the value just read there, and nothing here changes.
+                    let read = result
+                        .ok()
+                        .and_then(|output| node_rows(&output.rows).into_iter().next())
+                        .map(|row| row.value(&column).clone());
+                    let key = this.draft_key(&row_id, &column);
+                    session.update(cx, |session, cx| {
+                        let old = read.unwrap_or(old);
+                        session.set_draft_on(&branch, key, DraftEntry { old, text }, cx)
+                    });
+                    this.saves_settled(cx);
+                    return;
+                }
                 let notice = match result {
                     Ok(output) => {
                         let now = node_rows(&output.rows).into_iter().next();
@@ -6951,6 +7008,67 @@ mod tests {
                 session.draft(&key).map(|draft| draft.text.as_str()),
                 Some("Ada King")
             );
+        });
+        table.read_with(cx, |table, _| assert_eq!(table.saves_in_flight, 0));
+    }
+
+    /// A conflict's re-read that comes back after the table moved to another branch keeps the
+    /// typed text as a draft on the branch it was typed on, bound to the value read there, and
+    /// leaves the new branch alone.
+    #[gpui::test]
+    async fn a_conflict_read_again_after_a_branch_switch_stays_on_its_branch(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session(PEOPLE, cx);
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        let (table, cx) = cx.add_window_view({
+            let session = session.clone();
+            |window, cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            }
+        });
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            table.reread_conflict(
+                "p1".into(),
+                "name".into(),
+                "Ada B".into(),
+                "Ada Lovelace".into(),
+                window,
+                cx,
+            );
+        });
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            let on_main: Vec<_> = session.drafts_on("main").collect();
+            assert_eq!(
+                on_main,
+                vec![(
+                    &key,
+                    &graph_store::DraftEntry {
+                        old: "Ada".into(),
+                        text: "Ada Lovelace".into(),
+                    }
+                )],
+                "bound to the value read on main"
+            );
+            assert!(session.draft(&key).is_none(), "nothing on fix");
         });
         table.read_with(cx, |table, _| assert_eq!(table.saves_in_flight, 0));
     }

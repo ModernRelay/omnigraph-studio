@@ -11,7 +11,7 @@ use gpui::{
 };
 use gq_language::input::{edit_text, parse_input};
 use gq_language::{SchemaModel, builder};
-use graph_store::{DraftKey, GraphSession, Loadable};
+use graph_store::{DraftKey, GraphSession, Loadable, SessionEvent};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Value, json};
 use studio_actions::node::SaveText;
@@ -41,6 +41,9 @@ enum State {
 
 pub struct TextEditor {
     session: Entity<GraphSession>,
+    /// The branch the value was read on, which saves go to: the window can move to another
+    /// branch while text is being written.
+    branch: String,
     schema: Option<Arc<SchemaModel>>,
     type_name: String,
     id: String,
@@ -89,7 +92,7 @@ impl TextEditor {
             editor
         });
         let preview = cx.new(|cx| Markdown::new(SharedString::default(), None, None, cx));
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             // The preview follows the text as it is typed; the tab's dot follows whether it
             // differs from the saved value.
             cx.subscribe_in(&editor, window, |this, _, event: &EditorEvent, _, cx| {
@@ -108,8 +111,26 @@ impl TextEditor {
             }),
         ];
         let schema = session.read(cx).schema_model();
+        let branch = session.read(cx).branch.clone();
+        // On another branch, an editor with nothing unsaved reads the property there; one
+        // with unsaved text keeps writing to the branch it was read on, and says so.
+        let follow = cx.subscribe_in(&session, window, |this, _, event, window, cx| {
+            if let SessionEvent::BranchChanged = event
+                && !this.unsaved
+                && this.typed.is_none()
+                && this.read_at.is_none()
+                && !matches!(this.state, State::Saving)
+            {
+                this.state = State::Idle;
+                this.read(window, cx);
+            } else if let SessionEvent::BranchChanged = event {
+                cx.notify();
+            }
+        });
+        subscriptions.push(follow);
         let mut this = Self {
             session,
+            branch,
             schema,
             type_name,
             id,
@@ -157,6 +178,7 @@ impl TextEditor {
             }
         };
         self.old = Loadable::Loading;
+        self.branch = self.session.read(cx).branch.clone();
         let at = self.read_at.clone();
         let read = self
             .session
@@ -233,6 +255,7 @@ impl TextEditor {
         }
         let write = match crate::write::write_property(
             &self.session,
+            &self.branch,
             &schema,
             &self.type_name,
             &self.id,
@@ -249,7 +272,7 @@ impl TextEditor {
             }
         };
         self.state = State::Saving;
-        let branch = self.session.read(cx).branch.clone();
+        let branch = self.branch.clone();
         // Detached: closing the tab never cancels a write.
         cx.spawn_in(window, async move |this, cx| {
             let result = write.await;
@@ -301,7 +324,13 @@ impl TextEditor {
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let branch = self.session.read(cx).branch.clone();
+        let branch = self.branch.clone();
+        // Unsaved text read on a branch the window has left still saves there.
+        let elsewhere = (self.session.read(cx).branch != branch).then(|| {
+            Label::new(format!("Saves to {branch}"))
+                .size(LabelSize::Small)
+                .color(Color::Warning)
+        });
         let dirty = self.is_dirty(cx);
         let mode = self.mode;
         let segment = |id: &'static str, label: &'static str, to: Mode, cx: &mut Context<Self>| {
@@ -373,6 +402,7 @@ impl TextEditor {
                     .single_line(),
             )
             .child(div().flex_1())
+            .children(elsewhere)
             .children(status)
             .child(
                 studio_ui::ds::segmented(cx)
@@ -560,6 +590,50 @@ mod tests {
         view.read_with(cx, |view, cx| {
             assert!(matches!(view.state, State::Saved));
             assert!(!view.is_dirty(cx), "saved");
+        });
+    }
+
+    /// With nothing unsaved the editor follows the window to another branch and reads the
+    /// value there; with unsaved text it keeps saving to the branch it read it on.
+    #[gpui::test]
+    async fn unsaved_text_saves_to_the_branch_it_was_read_on(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session_answering(PEOPLE, 200, committed("c2", "c1"), cx);
+        cx.run_until_parked();
+        let (view, cx) = cx.add_window_view({
+            let session = session.clone();
+            move |window, cx| {
+                TextEditor::new(
+                    session,
+                    "Person".into(),
+                    "p1".into(),
+                    "name".into(),
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            }
+        });
+        cx.run_until_parked();
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.branch, "fix", "followed"));
+        view.update_in(cx, |view, window, cx| {
+            view.set_text("Ada Lovelace".into(), window, cx);
+        });
+        cx.run_until_parked();
+        session.update(cx, |session, cx| session.set_branch("main".into(), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.branch, "fix", "kept with the text")
+        });
+        save(&view, cx);
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.outcomes.last().unwrap().branch, "fix");
         });
     }
 

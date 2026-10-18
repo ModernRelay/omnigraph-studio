@@ -1564,6 +1564,7 @@ impl NodePeek {
         let name = property.name.clone();
         let write = match crate::write::write_property(
             &self.session,
+            &self.branch,
             &schema,
             &type_name,
             &id,

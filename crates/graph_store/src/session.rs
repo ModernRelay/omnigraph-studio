@@ -858,7 +858,20 @@ impl GraphSession {
 
     /// Keeps a property's unsaved value on the session's branch, replacing the one there.
     pub fn set_draft(&mut self, key: DraftKey, entry: DraftEntry, cx: &mut Context<Self>) {
-        let drafts = self.drafts.entry(self.branch.clone()).or_default();
+        let branch = self.branch.clone();
+        self.set_draft_on(&branch, key, entry, cx);
+    }
+
+    /// As [`GraphSession::set_draft`], on `branch`: an edit whose check comes back after the
+    /// session moved stays on the branch it was typed on.
+    pub fn set_draft_on(
+        &mut self,
+        branch: &str,
+        key: DraftKey,
+        entry: DraftEntry,
+        cx: &mut Context<Self>,
+    ) {
+        let drafts = self.drafts.entry(branch.to_owned()).or_default();
         if drafts.get(&key) != Some(&entry) {
             drafts.insert(key, entry);
             cx.emit(SessionEvent::DraftsChanged);
