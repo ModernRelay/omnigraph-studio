@@ -14,7 +14,8 @@ use gpui::{
 };
 use gq_language::input::{edit_text, parse_input};
 use gq_language::{Direction, RelationshipGroup, SchemaModel, builder};
-use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent};
+use graph_store::carry::{ChangesSince, Since, TypeRef, edge_reads, node_reads};
+use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, ReadWatch, SessionEvent};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Map, Value};
 use studio_actions::graph::{OpenBlob, OpenNodePage, PeekNode};
@@ -193,6 +194,10 @@ pub struct NodePeek {
     /// Why the drafts' last save did not land; the second press of Discard drops them.
     drafts_notice: Option<Notice>,
     confirm_discard: bool,
+    /// What the view reads, told to the session for the branch named.
+    reads: Option<(String, ReadWatch)>,
+    /// The head moved and the session is reading what changed: the view decides when it is in.
+    awaiting_changes: bool,
     _tasks: Vec<Task<()>>,
     _subscription: Subscription,
 }
@@ -266,6 +271,7 @@ impl NodePeek {
                 && this.schema.is_none()
             {
                 this.schema = session.read(cx).schema_model();
+                this.watch_reads(cx);
                 if this.schema.is_some() && this.values.loaded().is_none() {
                     this.load_node(cx);
                 }
@@ -274,15 +280,16 @@ impl NodePeek {
             }
             // While its own writes are out the view compares when they end: the head may be its
             // own commit.
-            if let SessionEvent::HeadMoved { branch, head } = event
-                && *branch == session.read(cx).branch
-                && !this.holds_commit
+            let moved = match event {
+                SessionEvent::HeadMoved { branch, .. } => Some(branch),
+                SessionEvent::ChangesRead { branch } if this.awaiting_changes => Some(branch),
+                _ => None,
+            };
+            if moved.is_some_and(|branch| *branch == session.read(cx).branch)
                 && this.saving.is_empty()
                 && this.edge_writes.is_empty()
-                && this.snapshot.as_ref().is_some_and(|pin| pin != head)
             {
-                this.newer = true;
-                cx.notify();
+                this.compare_head(cx);
             }
         });
         cx.on_release(|this: &mut Self, cx| this.release_images(cx))
@@ -311,9 +318,12 @@ impl NodePeek {
             drafts_notice: None,
             confirm_discard: false,
             show_empty: false,
+            reads: None,
+            awaiting_changes: false,
             _tasks: Vec::new(),
             _subscription: subscription,
         };
+        this.watch_reads(cx);
         match values {
             Some(values) => {
                 this.values = Loadable::Loaded(values);
@@ -1379,14 +1389,77 @@ impl NodePeek {
         }
     }
 
-    /// Whether the branch moved past the commit shown, once this view's writes are in.
+    /// Tells the session what the view reads on its branch, so a head move that changed none
+    /// of it moves the view along without reading again (spec 015).
+    fn watch_reads(&mut self, cx: &mut Context<Self>) {
+        let Some(schema) = &self.schema else {
+            return;
+        };
+        let branch = self.session.read(cx).branch.clone();
+        if self.holds_commit || self.reads.as_ref().is_some_and(|(at, _)| *at == branch) {
+            return;
+        }
+        let types = match &self.subject {
+            PeekSubject::Node { type_name, .. } => node_reads(schema, type_name),
+            PeekSubject::Edge { edge_type, .. } => edge_reads(schema, edge_type),
+        };
+        let watch = self
+            .session
+            .update(cx, |session, _| session.watch_reads(&branch, types));
+        self.reads = Some((branch, watch));
+    }
+
+    /// Whether the branch moved past the commit shown, once this view's writes are in. A move
+    /// that changed nothing the view shows moves it to the head without reading again; one
+    /// whose changes are not known yet waits for the session to read them.
     fn compare_head(&mut self, cx: &mut Context<Self>) {
+        self.awaiting_changes = false;
         if self.holds_commit {
             return;
         }
+        self.watch_reads(cx);
         let session = self.session.read(cx);
-        if let (Some(head), Some(pin)) = (session.head(&session.branch), self.snapshot.as_deref()) {
-            self.newer = head != pin;
+        let (Some(head), Some(pin)) = (session.head(&session.branch), self.snapshot.clone()) else {
+            return;
+        };
+        if head == pin {
+            self.newer = false;
+        } else if !self.newer {
+            match session.changes_since(&session.branch, &pin, head) {
+                Since::Pending => self.awaiting_changes = true,
+                Since::Known(since) if self.unchanged_in(&since) => {
+                    self.snapshot = Some(head.to_owned())
+                }
+                Since::Known(_) | Since::Unknown => self.newer = true,
+            }
+        }
+        cx.notify();
+    }
+
+    /// Whether `since` left what the view shows as it is: the node or edge itself, and through
+    /// each relationship group the edges at the node and the neighbours listed. A list being
+    /// read is checked by the other type as a whole, since what it will show is not known.
+    fn unchanged_in(&self, since: &ChangesSince) -> bool {
+        match &self.subject {
+            PeekSubject::Edge { edge_type, id, .. } => {
+                !since.entity_changed(&TypeRef::Edge(edge_type.clone()), id)
+            }
+            PeekSubject::Node { type_name, id } => {
+                !since.entity_changed(&TypeRef::Node(type_name.clone()), id)
+                    && self.groups.iter().all(|group| {
+                        let other = TypeRef::Node(group.group.other_type.clone());
+                        let listed = match &group.neighbours {
+                            Loadable::Loading => !since.type_changed(&other),
+                            Loadable::Loaded(listed) => listed
+                                .iter()
+                                .all(|neighbour| !since.entity_changed(&other, &neighbour.id)),
+                            Loadable::NotLoaded | Loadable::Failed(_) => true,
+                        };
+                        !since.edges_at(&group.group.edge, id)
+                            && listed
+                            && (group.more.is_none() || !since.type_changed(&other))
+                    })
+            }
         }
     }
 
@@ -3150,7 +3223,9 @@ mod tests {
     use gpui::{TestAppContext, VisualTestContext};
     use serde_json::json;
 
-    use crate::test_support::{PEOPLE, session, session_answering, session_routing};
+    use crate::test_support::{
+        PEOPLE, changed, session, session_answering, session_followed, session_routing,
+    };
 
     fn page(
         session: Entity<GraphSession>,
@@ -3323,6 +3398,64 @@ mod tests {
             1,
             "a count only past the page: {asked:?}"
         );
+    }
+
+    /// Another writer's commit that changed nothing the page shows moves the page to it without
+    /// reading again: not the node, no edge at it, no neighbour it lists. One that changed a
+    /// listed neighbour offers Refresh (spec 015).
+    #[gpui::test]
+    async fn a_page_moves_to_a_commit_that_changed_nothing_it_shows(cx: &mut TestAppContext) {
+        let reads = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = reads.clone();
+        let (session, writer) = session_followed(
+            KNOWS,
+            move |request| {
+                let name = request["name"].as_str().unwrap_or_default();
+                seen.lock().unwrap().push(name.to_owned());
+                match name {
+                    "studio_node" => json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }]),
+                    "studio_neighbours" => json!([
+                        { "id": "p010", "edge_id": "e1" },
+                        { "id": "p011", "edge_id": "e2" },
+                    ]),
+                    _ => json!([]),
+                }
+            },
+            cx,
+        );
+        let (view, cx) = page(session.clone(), cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.as_deref(), Some("c1"));
+        });
+        let read_before = reads.lock().unwrap().len();
+
+        writer.commit(
+            "c2",
+            vec![
+                changed("node", "Person", "p999", None),
+                changed("edge", "Knows", "e9", Some(("p998", "p999"))),
+            ],
+        );
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.as_deref(), Some("c2"), "moved to the head");
+            assert!(!view.newer);
+        });
+        let read_after: Vec<String> = reads.lock().unwrap()[read_before..].to_vec();
+        assert_eq!(read_after, ["studio_head"], "nothing read again");
+
+        writer.commit("c3", vec![changed("node", "Person", "p010", None)]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        assert!(session.read_with(cx, |session, _| matches!(
+            session.changes_since("main", "c2", "c3"),
+            graph_store::carry::Since::Known(_)
+        )));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.as_deref(), Some("c2"));
+            assert!(view.newer, "a neighbour it lists changed");
+        });
     }
 
     /// A relationship is removed on the second press of its ×, as its own commit, which the

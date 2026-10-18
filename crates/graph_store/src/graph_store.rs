@@ -3,6 +3,7 @@
 //!
 //! Layer 3 (`docs/architecture.md`). Plan: `specs/003-connections/plan.md`.
 
+pub mod carry;
 pub mod changes;
 pub mod cli_config;
 mod connection;
@@ -30,7 +31,7 @@ pub use fixes::{RevertUnavailable, revert_query};
 pub use registry::{ConnectionRegistry, RegistryEvent, data_dir};
 pub use session::{
     CommitList, DraftEntry, DraftKey, FollowUp, GraphSession, HEAD_POLL, HeadWatch, Loadable,
-    OutcomeEntry, OutcomeKind, ServerState, SessionEvent, open_session,
+    OutcomeEntry, OutcomeKind, ReadWatch, ServerState, SessionEvent, open_session,
 };
 
 /// Sets up the HTTP client and loads every known server. Call once at startup.

@@ -1,7 +1,7 @@
 //! One open graph on one server and branch: schema, branches, type counts, and every read and
 //! write Studio sends for it (spec 003, 004, 008).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -18,11 +18,12 @@ use graph_client::api::{
     SnapshotDatasetOutput, SnapshotOutput,
 };
 use graph_client::{
-    ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CommitChanges, GraphClient, ReadError,
+    ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CommitChanges, FeedAt, GraphClient, ReadError,
     ServerHealth, WriteOutcome,
 };
 use serde_json::Value;
 
+use crate::carry::{ChangeLog, FeedFold, Since, TypeRef};
 use crate::connection::Connection;
 use crate::degrees::{DEGREE_BATCH, DegreeBatchKey, DegreeBatches, page_counts};
 use crate::memo::{Held, Memo};
@@ -114,6 +115,11 @@ pub enum SessionEvent {
     StoredQueriesChanged,
     /// A draft was kept, changed or let go ([`GraphSession::set_draft`]).
     DraftsChanged,
+    /// `branch`'s change feed was read up to its head, or the read stopped: a view waiting on
+    /// [`GraphSession::changes_since`] asks again.
+    ChangesRead {
+        branch: String,
+    },
 }
 
 /// How many answers to reads pinned to a commit, and Blob cells at a commit, a session keeps.
@@ -126,6 +132,18 @@ const COMMIT_LISTS: usize = 64;
 /// How often a session asks after the heads of the branches its views show, while a window of
 /// Studio's is active.
 pub const HEAD_POLL: Duration = Duration::from_secs(30);
+
+/// Changes asked for per page of a change-feed read, and the most pages one read takes. A read
+/// that stops sooner leaves its remaining commits unknown: the views over them read again.
+const FEED_PAGE: u32 = 1_000;
+const FEED_PAGES: usize = 8;
+
+/// What a view reads, by type, while the watch is held: when its branch's head moves, the
+/// change feed is asked about these types, so a view none of them changed for moves to the new
+/// head without reading again (spec 015, carry-forward).
+pub struct ReadWatch {
+    _alive: Rc<()>,
+}
 
 /// A view's interest in a branch's head: the session asks after the branch while one is held.
 /// The session's own branch is always asked after.
@@ -156,6 +174,23 @@ struct PinnedRead {
 /// The first wait before a graph that answered 503 is asked again; it doubles up to the cap.
 const RECHECK_FIRST: Duration = Duration::from_secs(5);
 const RECHECK_CAP: Duration = Duration::from_secs(60);
+
+/// Where the next page of a change-feed read starts.
+enum FeedNext {
+    Start(String),
+    Cursor(String),
+    Page(String),
+}
+
+impl FeedNext {
+    fn at(&self) -> FeedAt<'_> {
+        match self {
+            Self::Start(start) => FeedAt::Start(start),
+            Self::Cursor(cursor) => FeedAt::Cursor(cursor),
+            Self::Page(token) => FeedAt::Page(token),
+        }
+    }
+}
 
 /// Answers kept by key, with the read under way shared by everyone who asks meanwhile.
 type ReadMemo<K, V> = Memo<K, V, Shared<Task<Result<V, ReadError>>>>;
@@ -195,6 +230,13 @@ pub struct GraphSession {
     head_watches: Vec<(String, Weak<()>)>,
     /// Head reads under way, by branch.
     head_reads: HashMap<String, Task<()>>,
+    /// The types views read, by branch, while their watch is held.
+    read_watches: Vec<(String, BTreeSet<TypeRef>, Weak<()>)>,
+    /// Each followed branch's commits as the change feed described them.
+    change_logs: HashMap<String, ChangeLog>,
+    /// Change-feed reads under way, by branch, and the branches whose head moved meanwhile.
+    change_reads: HashMap<String, Task<()>>,
+    change_reads_again: HashSet<String>,
     /// The branch list read again by the head watch, while under way.
     branch_recheck: Option<Task<()>>,
     /// A poll came while no window was active; the next activation asks at once.
@@ -238,6 +280,10 @@ impl GraphSession {
             drafts: HashMap::new(),
             head_watches: Vec::new(),
             head_reads: HashMap::new(),
+            read_watches: Vec::new(),
+            change_logs: HashMap::new(),
+            change_reads: HashMap::new(),
+            change_reads_again: HashSet::new(),
             branch_recheck: None,
             head_check_missed: false,
             _head_poll: None,
@@ -597,6 +643,147 @@ impl GraphSession {
         HeadWatch { _alive: alive }
     }
 
+    /// Asks the change feed about `types` on `branch` while the returned watch is held.
+    pub fn watch_reads(&mut self, branch: &str, types: BTreeSet<TypeRef>) -> ReadWatch {
+        let alive = Rc::new(());
+        self.read_watches
+            .push((branch.to_owned(), types, Rc::downgrade(&alive)));
+        ReadWatch { _alive: alive }
+    }
+
+    /// What `branch`'s commits after `from`, up to and including `to`, changed among the types
+    /// the change feed was asked about: [`Since::Pending`] while the feed is being read.
+    pub fn changes_since(&self, branch: &str, from: &str, to: &str) -> Since {
+        if let Some(since) = self
+            .change_logs
+            .get(branch)
+            .and_then(|log| log.since(from, to))
+        {
+            return Since::Known(since);
+        }
+        if self.change_reads.contains_key(branch) {
+            Since::Pending
+        } else {
+            Since::Unknown
+        }
+    }
+
+    /// The type names the views on `branch` read.
+    fn read_names(&mut self, branch: &str) -> BTreeSet<String> {
+        self.read_watches
+            .retain(|(_, _, alive)| alive.strong_count() > 0);
+        self.read_watches
+            .iter()
+            .filter(|(watched, ..)| watched == branch)
+            .flat_map(|(_, types, _)| types.iter().map(|ty| ty.name().to_owned()))
+            .collect()
+    }
+
+    /// Reads `branch`'s change feed after the newest commit its log holds, up to the feed's
+    /// head, asked only about the types views read: every change carries its images, so an
+    /// unfiltered read costs what every type wrote.
+    fn read_changes(&mut self, branch: &str, cx: &mut Context<Self>) {
+        if self.change_reads.contains_key(branch) {
+            self.change_reads_again.insert(branch.to_owned());
+            return;
+        }
+        let Some(head) = self.heads.get(branch).cloned() else {
+            return;
+        };
+        let names = self.read_names(branch);
+        let schema = self.schema_model().map(|schema| schema.source.clone());
+        let log = self.change_logs.entry(branch.to_owned()).or_default();
+        if log.holds(&head) {
+            return;
+        }
+        let (Some(from), Some(schema)) = (log.last.clone(), schema) else {
+            log.last = Some(head);
+            return;
+        };
+        if names.is_empty() {
+            // Nobody reads the branch: the log starts again at its head.
+            log.last = Some(head);
+            return;
+        }
+        let (client, graph) = (self.client(cx), self.graph_id.clone());
+        let types: Vec<String> = names.iter().cloned().collect();
+        let mut fold = FeedFold::new(Arc::new(names));
+        let key = branch.to_owned();
+        let branch = branch.to_owned();
+        let read = cx.spawn(async move |this, cx| {
+            let mut next = Some(FeedNext::Start(format!("after:{from}")));
+            let mut failed = None;
+            for _ in 0..FEED_PAGES {
+                let Some(at) = next.take() else {
+                    break;
+                };
+                match client
+                    .changes(&graph, &branch, at.at(), &types, FEED_PAGE)
+                    .await
+                {
+                    Ok(page) => {
+                        fold.page(&page);
+                        next = match (page.next_page_token, page.cursor, page.caught_up) {
+                            (Some(token), ..) => Some(FeedNext::Page(token)),
+                            (None, _, Some(true)) | (None, None, _) => None,
+                            // More complete commits wait past the page's limit.
+                            (None, Some(cursor), _) => Some(FeedNext::Cursor(cursor)),
+                        };
+                    }
+                    // A schema boundary (409), reclaimed history (410) or a failed read: the
+                    // commits read before it stand.
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
+                }
+            }
+            let commits = fold.complete();
+            // The feed filters by type name, so a schema change in between (a rename) could
+            // hide a view's changes: what it says counts only under the schema views read with.
+            let schema_read = if commits.is_empty() {
+                None
+            } else {
+                Some(client.schema(&graph).await)
+            };
+            this.update(cx, |this, cx| {
+                this.change_reads.remove(&branch);
+                if let Some(error) = failed.clone() {
+                    this.note_read::<()>(&Err(error), cx);
+                }
+                let same_schema = match &schema_read {
+                    None => true,
+                    Some(Ok(output)) => *output.schema_source == *schema,
+                    Some(Err(_)) => false,
+                };
+                let stopped = failed.is_some() || next.is_some() || !same_schema;
+                let head = this.heads.get(&branch).cloned();
+                let log = this.change_logs.entry(branch.clone()).or_default();
+                if same_schema {
+                    for (commit, logged) in commits {
+                        log.record(commit, logged);
+                    }
+                }
+                // The commits a read stopped short of stay unknown; the next read starts at the
+                // head.
+                if let Some(head) = head
+                    && stopped
+                    && !log.holds(&head)
+                {
+                    log.last = Some(head);
+                }
+                cx.emit(SessionEvent::ChangesRead {
+                    branch: branch.clone(),
+                });
+                if this.change_reads_again.remove(&branch) {
+                    this.read_changes(&branch, cx);
+                }
+            })
+            .ok();
+        });
+        self.change_reads.insert(key, read);
+    }
+
     /// A window became active: asks after the heads at once when a poll came while none was.
     pub fn window_activated(&mut self, cx: &mut Context<Self>) {
         if std::mem::take(&mut self.head_check_missed) {
@@ -622,6 +809,8 @@ impl GraphSession {
             .retain(|(_, alive)| alive.strong_count() > 0);
         let watched = self.watched_branches();
         self.heads.retain(|branch, _| watched.contains(branch));
+        self.change_logs
+            .retain(|branch, _| watched.contains(branch));
         if self.unavailable.is_some() {
             return;
         }
@@ -708,6 +897,8 @@ impl GraphSession {
         if previous.as_deref() == Some(head.as_str()) {
             return;
         }
+        // Before views hear of the move, so they find the read under way.
+        self.read_changes(&branch, cx);
         if previous.is_some() && !own {
             self.commit_lists.forget(&branch);
             if branch == self.branch {
@@ -1013,15 +1204,12 @@ impl GraphSession {
         let (client, graph, branch) = (self.client(cx), self.graph_id.clone(), branch.to_owned());
         self.counted_read(
             async move {
-                client
-                    .changes(
-                        &graph,
-                        &branch,
-                        start.as_deref(),
-                        page_token.as_deref(),
-                        limit,
-                    )
-                    .await
+                let at = match (&page_token, &start) {
+                    (Some(token), _) => FeedAt::Page(token),
+                    (None, Some(start)) => FeedAt::Start(start),
+                    (None, None) => FeedAt::Start("now"),
+                };
+                client.changes(&graph, &branch, at, &[], limit).await
             },
             cx,
         )
@@ -2388,5 +2576,187 @@ mod tests {
                 OutcomeKind::Refused { .. }
             ));
         });
+    }
+
+    /// A head move reads the change feed after the commit the log last holds, asked only about
+    /// the types views read; a range answers once that read is in, and is unknown when nobody
+    /// read the branch or the schema changed meanwhile.
+    #[gpui::test]
+    async fn a_head_move_reads_the_change_feed_for_the_types_views_read(cx: &mut TestAppContext) {
+        use crate::carry::{Since, TypeRef};
+        use serde_json::{Value, json};
+
+        const SCHEMA: &str = "node Person {\n  slug: String @key\n}\nnode Company {\n  slug: String @key\n}\nedge WorksAt: Person -> Company\n";
+        struct Served {
+            head: String,
+            schema: String,
+            /// Each commit with its parent and changes, oldest first.
+            commits: Vec<(String, String, Vec<Value>)>,
+            /// The query string of every feed read.
+            feeds: Vec<String>,
+        }
+        let served = Arc::new(std::sync::Mutex::new(Served {
+            head: "c1".into(),
+            schema: SCHEMA.into(),
+            commits: Vec::new(),
+            feeds: Vec::new(),
+        }));
+        let state = served.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let query = request.uri().query().unwrap_or_default().to_owned();
+            let state = state.clone();
+            async move {
+                let mut served = state.lock().unwrap();
+                let body = if path.ends_with("/schema") {
+                    json!({ "schema_source": served.schema })
+                } else if path.ends_with("/changes") {
+                    served.feeds.push(query.clone());
+                    let pairs: Vec<(String, String)> =
+                        url::form_urlencoded::parse(query.as_bytes())
+                            .into_owned()
+                            .collect();
+                    let types: Vec<&str> = pairs
+                        .iter()
+                        .filter(|(key, _)| key == "type")
+                        .map(|(_, value)| value.as_str())
+                        .collect();
+                    let after = pairs
+                        .iter()
+                        .find(|(key, _)| key == "start")
+                        .and_then(|(_, value)| value.strip_prefix("after:"))
+                        .unwrap_or_default()
+                        .to_owned();
+                    let start = served
+                        .commits
+                        .iter()
+                        .position(|(commit, ..)| *commit == after)
+                        .map_or(0, |at| at + 1);
+                    let blocks: Vec<Value> = served.commits[start..]
+                        .iter()
+                        .map(|(commit, parent, changes)| {
+                            let changes: Vec<&Value> = changes
+                                .iter()
+                                .filter(|change| {
+                                    types.is_empty()
+                                        || types.contains(&change["type"]["name"].as_str().unwrap())
+                                })
+                                .collect();
+                            json!({
+                                "cause": {
+                                    "graph_commit_id": commit,
+                                    "parent_commit_id": parent,
+                                    "authored_branch": "main",
+                                    "authored_at": 0,
+                                },
+                                "changes": changes,
+                            })
+                        })
+                        .collect();
+                    json!({ "blocks": blocks, "cursor": "cursor", "caught_up": true })
+                } else if path.ends_with("/query") {
+                    json!({
+                        "query_name": "studio_head",
+                        "target": { "branch": "main" },
+                        "row_count": 0,
+                        "columns": [],
+                        "rows": [],
+                        "graph_commit_id": served.head,
+                    })
+                } else {
+                    json!({ "branches": ["main"] })
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        assert_eq!(
+            session.read_with(cx, |session, _| session.head("main").map(str::to_owned)),
+            Some("c1".into())
+        );
+        let node = |ty: &str, id: &str| json!({ "kind": "node", "type": { "id": ty, "name": ty }, "id": id, "op": "update", "before": { "properties": {} }, "after": { "properties": {} } });
+        let commit = |cx: &mut TestAppContext, id: &str, changes: Vec<Value>| {
+            {
+                let mut served = served.lock().unwrap();
+                let parent = std::mem::replace(&mut served.head, id.to_owned());
+                served.commits.push((id.to_owned(), parent, changes));
+            }
+            session.update(cx, |session, cx| {
+                session.saw_head("main".into(), id.into(), false, cx)
+            });
+        };
+        let since = |cx: &mut TestAppContext, from: &str, to: &str| {
+            session.read_with(cx, |session, _| session.changes_since("main", from, to))
+        };
+        let person = TypeRef::Node("Person".into());
+        let company = TypeRef::Node("Company".into());
+
+        let watch = session.update(cx, |session, _| {
+            session.watch_reads("main", BTreeSet::from([person.clone()]))
+        });
+        commit(cx, "c2", vec![node("Company", "co1")]);
+        assert!(
+            matches!(since(cx, "c1", "c2"), Since::Pending),
+            "the read is under way"
+        );
+        cx.run_until_parked();
+        let feeds = served.lock().unwrap().feeds.clone();
+        assert_eq!(feeds.len(), 1);
+        assert!(
+            feeds[0].contains("start=after%3Ac1") && feeds[0].contains("type=Person"),
+            "{}",
+            feeds[0]
+        );
+        let Since::Known(range) = since(cx, "c1", "c2") else {
+            panic!("known")
+        };
+        assert!(
+            !range.type_changed(&person),
+            "Company's change is no Person's"
+        );
+        assert!(
+            range.type_changed(&company),
+            "the feed was not asked about Company"
+        );
+
+        commit(cx, "c3", vec![node("Person", "p1")]);
+        cx.run_until_parked();
+        assert!(served.lock().unwrap().feeds[1].contains("start=after%3Ac2"));
+        let Since::Known(range) = since(cx, "c1", "c3") else {
+            panic!("known")
+        };
+        assert!(range.entity_changed(&person, "p1"));
+        assert!(!range.entity_changed(&person, "p2"));
+
+        // Nobody reads the branch: no feed read, and the range is not known.
+        drop(watch);
+        commit(cx, "c4", vec![node("Person", "p2")]);
+        cx.run_until_parked();
+        assert_eq!(served.lock().unwrap().feeds.len(), 2);
+        assert!(matches!(since(cx, "c3", "c4"), Since::Unknown));
+
+        // A schema changed in between: what the feed said does not count.
+        let _watch = session.update(cx, |session, _| {
+            session.watch_reads("main", BTreeSet::from([person.clone()]))
+        });
+        served.lock().unwrap().schema =
+            format!("{SCHEMA}node Project {{\n  slug: String @key\n}}\n");
+        commit(cx, "c5", vec![node("Company", "co2")]);
+        cx.run_until_parked();
+        assert_eq!(served.lock().unwrap().feeds.len(), 3);
+        assert!(matches!(since(cx, "c4", "c5"), Since::Unknown));
     }
 }

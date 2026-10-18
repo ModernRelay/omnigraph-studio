@@ -1,7 +1,8 @@
 # 015: One read model: versions, cache, scheduler
 
 Status: in progress; head reads go as branch reads (02ba803), a relationship group is one read
-when it fits (2dfe205), Studio needs 0.14 (911a885) · 2026-10-18
+when it fits (2dfe205), Studio needs 0.14 (911a885), node pages, peeks and tables move past
+commits that changed nothing they show (carry-forward, below) · 2026-10-18
 
 ## Problem
 
@@ -237,6 +238,33 @@ Three parts in `graph_store`, owned by `GraphSession`, and one change in how vie
   answered by reading again without that property, once per property, and the property shows as
   "added later".
 
+### Carry-forward as built (2026-10-18)
+
+A first cut of parts 1 and 4, ahead of the shared cache:
+
+- The head probe stays. When it, or one of Studio's writes, moves a branch's head, the session
+  reads the change feed after the last commit it logged (`start=after:<id>`), with one `type`
+  filter per type name an open view reads. Views say what they read with a held watch
+  (`GraphSession::watch_reads`). With no watch on the branch nothing is read.
+- The log (`graph_store::carry`) keeps, per commit, its first parent, the names asked about, and
+  per type the ids written and, for edges, the nodes at either end; past 1,000 ids a type counts
+  as changed throughout. 500 commits per branch. A read takes at most 8 pages of 1,000 changes;
+  a commit it stops inside, a `409`, a `410` or a failed read leaves the rest unknown, and the
+  next read starts at the head.
+- After a read that returned commits, `/schema` is read once; a different text means none of it
+  counts. The feed filters by type name, so a rename could hide a view's changes, and a name
+  the server does not know is accepted without error (validation log).
+- `changes_since(branch, from, to)` walks first parents from `to` back to `from`: pending while
+  the read is out (views decide on `ChangesRead`), unknown when a commit is missing.
+- A node page or peek moves to the head when the node is unchanged, no edge of any group is at
+  the node, and no listed neighbour changed (a list still loading, or a next page being read,
+  needs its other type unchanged). An edge peek checks the edge. A table checks types: its own,
+  each relationship's edge and other type, and those types' relationships, which grouping a
+  relationship column by its neighbours' relationships reads. Otherwise "Newer data · Refresh"
+  shows as before.
+- Not yet: the tree and canvas (`Exploration`) and review still offer Refresh on every move;
+  answers are not shared across commits (part 2), so a moved view's later reads are new reads.
+
 ### Expected effect, to be measured
 
 A Person page on the personal graph: from about 185 requests in three waves, all at once and all
@@ -251,6 +279,7 @@ become one request.
 | Cache answers per commit, never invalidate | Time-based staleness (TanStack `staleTime`, SWR `dedupingInterval`, Zero TTLs) | A commit never changes and the feed says exactly when a branch moves; a timer only guesses |
 | One answer per key and commit | A normalized entity store shared by all views (Relay, Apollo, urql Graphcache) | Merging records read at different times shows states that never existed, against II; counts and neighbour lists do not normalize |
 | Carry answers across commits by read set | Re-read everything on each head move | 20 commits an hour; most touch types a view does not read. Read-set tracking is what Replicache subscriptions, Convex and Salsa do |
+| Ask the feed only about the types views read, and read `/schema` after it | The unfiltered feed; trusting type names | Unfiltered, 20 commits were 540 KB and 8.5 s on the personal graph; a filter by name misses a renamed type's changes and accepts a name it does not know |
 | Read sets from the feed's change set | From `/snapshot` table versions | `published_dataset_version` is not content identity across branches (fact 5); the feed is exact and cursor-bound to one branch lifetime |
 | Branch reads verified by commit for the head | Pin every read to its commit (constitution II as written) | 0.5–0.9 s cheaper per read on 0.13 (fact 3); the commit check keeps one commit per view |
 | No optimistic updates | Optimistic layers with rollback (Linear, Replicache, Zero) | Constitution III: an outcome is known only from the server |
@@ -318,7 +347,10 @@ commit can be cleaned up; measure first).
 | 2026-10-17 | Commit cadence | `commit list` on the personal graph | 4,875 commits; 20 in the last hour, 374 in a day; median gap 6 s in the last 200 |
 | 2026-10-17 | Pinned reads skip the server's read caches | `crates/omnigraph/src/db/omnigraph.rs` at `d883c49e` | "Snapshot-id reads are deliberately NOT cached"; only `ReadTarget::Branch` gets the shared session and held handles |
 | 2026-10-17 | The feed is costly when commits carry changes | `omnigraph changes poll --start after:<id>` on the personal graph | 5 commits: 4.7 s, 469 KB, 306 changes in 16 types (Workflow and Run types); 20 commits: 8.5 s, 540 KB |
-| — | Unverified: a feed poll's behavior across a schema apply (empty block or `409 schema_boundary`), with and without `type` filters | To test against the dev server before Heads is built | — |
+| 2026-10-18 | A `type`-filtered feed still returns every commit | `GET /changes?start=after:<id>&type=…` on a 0.14 dev server, three commits on a scratch branch (a Company insert, a WorksAt insert, a Person update) | Commits touching other types come as empty blocks; `type=Nope` answers `200` with three empty blocks; `limit=1` with two types ends after the first change's commit with a cursor and `caught_up: false` |
+| 2026-10-18 | A feed poll across a schema apply | `plan_intervals` (`crates/omnigraph/src/changes/enumerate.rs`) and `first_or_boundary` (`changes/feed.rs`) at `d883c49e`; not run live | The gate ignores the request's filters: a type added or removed with rows, or a changed column fingerprint, is `409 schema_boundary` for the whole commit; as a poll's first commit it is the answer, later it ends the page with `caught_up: false`. A rename's block is not known, hence the `/schema` check |
+| 2026-10-18 | Schema apply needs a graph with only `main` | `schema_apply.rs` at `d883c49e` ("schema apply requires a graph with only main") | Confirmed |
+| 2026-10-18 | Carry-forward | `graph_store` `carry::tests` (5) and `a_head_move_reads_the_change_feed_for_the_types_views_read`; `type_table` `a_page_moves_to_a_commit_that_changed_nothing_it_shows`, `a_table_moves_its_pin_past_commits_to_other_types` | Pass |
 | 2026-10-17 | Historical reads use the live schema contract | `docs/user/branching/index.md`; `omnigraph.rs` ("a point-in-time read keeps the LIVE contract") | Confirmed: the schema epoch belongs in every key |
 
 ## Corrections

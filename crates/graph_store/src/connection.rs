@@ -361,7 +361,9 @@ mod tests {
             let path = request.uri().path().to_owned();
             async move {
                 let body = if path.ends_with("/healthz") {
-                    format!(r#"{{"status":"ok","version":"{version}","internal_schema_version":16}}"#)
+                    format!(
+                        r#"{{"status":"ok","version":"{version}","internal_schema_version":16}}"#
+                    )
                 } else {
                     r#"{"graphs":[]}"#.to_owned()
                 };
@@ -395,7 +397,13 @@ mod tests {
                 version: "0.13.0".into()
             }
         );
-        assert_eq!(refused.label(), "OmniGraph 0.13.0; Studio needs 0.14 or later");
-        assert_eq!(connect_to("0.14.0-edge+d883c49", cx), ConnectionState::Ready);
+        assert_eq!(
+            refused.label(),
+            "OmniGraph 0.13.0; Studio needs 0.14 or later"
+        );
+        assert_eq!(
+            connect_to("0.14.0-edge+d883c49", cx),
+            ConnectionState::Ready
+        );
     }
 }

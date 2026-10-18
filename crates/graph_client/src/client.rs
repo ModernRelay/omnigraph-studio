@@ -203,6 +203,15 @@ fn check_root(url: &Url) -> Result<(), String> {
     Ok(())
 }
 
+/// Where a change-feed read starts: `now`, `beginning` or `after:<commit_id>`; a cursor a
+/// terminal page returned; or a page token, to continue one read.
+#[derive(Debug, Clone, Copy)]
+pub enum FeedAt<'a> {
+    Start(&'a str),
+    Cursor(&'a str),
+    Page(&'a str),
+}
+
 /// A client for one server. Cheap to clone.
 #[derive(Clone)]
 pub struct GraphClient {
@@ -753,17 +762,18 @@ impl GraphClient {
         &self,
         graph: &str,
         branch: &str,
-        start: Option<&str>,
-        page_token: Option<&str>,
+        at: FeedAt<'_>,
+        types: &[String],
         limit: u32,
     ) -> Result<ChangeFeedOutput, ReadError> {
         let limit = limit.to_string();
         let mut query = vec![("branch", branch), ("limit", limit.as_str())];
-        if let Some(token) = page_token {
-            query.push(("page_token", token));
-        } else if let Some(start) = start {
-            query.push(("start", start));
-        }
+        query.push(match at {
+            FeedAt::Start(start) => ("start", start),
+            FeedAt::Cursor(cursor) => ("cursor", cursor),
+            FeedAt::Page(token) => ("page_token", token),
+        });
+        query.extend(types.iter().map(|name| ("type", name.as_str())));
         self.read(Method::GET, &["graphs", graph, "changes"], &query, None)
             .await
     }

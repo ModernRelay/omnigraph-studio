@@ -6,7 +6,7 @@
 //! rows virtualized by `uniform_list`.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -26,7 +26,8 @@ use gq_language::{
 };
 use graph_client::api::ReadOutput;
 use graph_client::{BlobCell, BlobMeta, ReadError};
-use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent};
+use graph_store::carry::{Since, TypeRef, edge_reads, node_reads};
+use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, ReadWatch, SessionEvent};
 use serde_json::Value;
 use studio_actions::table::{
     AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyCell, DeleteRow, EditCell, ExploreRow,
@@ -310,6 +311,12 @@ pub struct TypeTable {
     saves_in_flight: usize,
     /// The session saw the head move while a save was out; compared once they are all back.
     head_moved_while_saving: bool,
+    /// What the table reads, told to the session for its branch: a head move that changed none
+    /// of it moves the pin without reading again (spec 015).
+    reads: BTreeSet<TypeRef>,
+    _reads: Option<ReadWatch>,
+    /// The head moved and the session is reading what changed.
+    awaiting_changes: bool,
     focus_handle: FocusHandle,
     table_state: Entity<TableInteractionState>,
     widths: Entity<ResizableColumnsState>,
@@ -523,6 +530,9 @@ impl TypeTable {
             newer: false,
             saves_in_flight: 0,
             head_moved_while_saving: false,
+            reads: BTreeSet::new(),
+            _reads: None,
+            awaiting_changes: false,
             focus_handle: cx.focus_handle(),
             table_state,
             widths,
@@ -557,6 +567,7 @@ impl TypeTable {
                 if self.at_commit.is_some() => {}
             SessionEvent::BranchChanged => {
                 self.branch = self.session.read(cx).branch.clone();
+                self.watch_reads(cx);
                 // The branch's own drafts show; the other's wait in the session.
                 self.cells.clear();
                 self.draft_notices.clear();
@@ -570,6 +581,11 @@ impl TypeTable {
                 cx.notify();
             }
             SessionEvent::HeadMoved { branch, .. } if *branch == self.branch => {
+                self.compare_head(cx)
+            }
+            SessionEvent::ChangesRead { branch }
+                if *branch == self.branch && self.awaiting_changes =>
+            {
                 self.compare_head(cx)
             }
             _ => {}
@@ -643,7 +659,38 @@ impl TypeTable {
         self.all_columns = columns;
         self.show_columns(cx);
         self.schema = Some(schema);
+        self.watch_reads(cx);
         self.reload(false, cx);
+    }
+
+    /// Tells the session what the table reads on its branch: its type, and for a node type each
+    /// relationship's edge and other type, and theirs one hop further, which grouping a
+    /// relationship column by its neighbours' relationships reads.
+    fn watch_reads(&mut self, cx: &mut Context<Self>) {
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        if self.missing || self.at_commit.is_some() {
+            self._reads = None;
+            return;
+        }
+        let reads = match self.kind {
+            TableKind::Node => {
+                let mut reads = node_reads(&schema, &self.type_name);
+                for group in schema.relationships_of(&self.type_name) {
+                    reads.extend(node_reads(&schema, &group.other_type));
+                }
+                reads
+            }
+            TableKind::Edge => edge_reads(&schema, &self.type_name),
+        };
+        let branch = self.branch.clone();
+        let types = reads.clone();
+        self._reads = Some(
+            self.session
+                .update(cx, |session, _| session.watch_reads(&branch, types)),
+        );
+        self.reads = reads;
     }
 
     /// Shows the columns the layout picks, keeping the cursor on its column when it still shows.
@@ -2441,8 +2488,11 @@ impl TypeTable {
     }
 
     /// Offers Refresh when the branch head the session last saw is not the commit the table
-    /// shows. While the table's own writes are out it waits for them: each moves the pin itself.
+    /// shows, unless nothing the table reads changed in between: then the pin moves to the head
+    /// and nothing is read again. While the table's own writes are out it waits for them: each
+    /// moves the pin itself.
     fn compare_head(&mut self, cx: &mut Context<Self>) {
+        self.awaiting_changes = false;
         if self.saves_in_flight > 0 {
             self.head_moved_while_saving = true;
             return;
@@ -2450,18 +2500,24 @@ impl TypeTable {
         if self.newer || self.at_commit.is_some() {
             return;
         }
-        let Some(pin) = self.paging.pinned.as_deref() else {
+        let Some(pin) = self.paging.pinned.clone() else {
             return;
         };
-        if self
-            .session
-            .read(cx)
-            .head(&self.branch)
-            .is_some_and(|head| head != pin)
-        {
-            self.newer = true;
-            cx.emit(ItemEvent::UpdateTab);
-            cx.notify();
+        let session = self.session.read(cx);
+        let Some(head) = session.head(&self.branch).filter(|head| *head != pin) else {
+            return;
+        };
+        match session.changes_since(&self.branch, &pin, head) {
+            Since::Pending => self.awaiting_changes = true,
+            Since::Known(since) if !since.any_changed(&self.reads) => {
+                self.paging.pinned = Some(head.to_owned());
+                cx.notify();
+            }
+            Since::Known(_) | Since::Unknown => {
+                self.newer = true;
+                cx.emit(ItemEvent::UpdateTab);
+                cx.notify();
+            }
         }
     }
 
@@ -6162,10 +6218,77 @@ mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
 
-    use crate::test_support::{PEOPLE, session};
+    use crate::test_support::{PEOPLE, changed, session, session_followed};
 
     fn grid_renders(table: &Entity<TypeTable>, cx: &mut VisualTestContext) -> usize {
         table.read_with(cx, |table, cx| table.grid.read(cx).renders)
+    }
+
+    /// Another writer's commit that changed none of the types the table reads moves its pin to
+    /// the head without reading again; one that wrote its type offers Refresh (spec 015).
+    #[gpui::test]
+    async fn a_table_moves_its_pin_past_commits_to_other_types(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let reads = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = reads.clone();
+        let (session, writer) = session_followed(
+            &format!("{PEOPLE}node Note {{\n  slug: String @key\n}}\n"),
+            move |request| {
+                let name = request["name"].as_str().unwrap_or_default();
+                seen.lock().unwrap().push(name.to_owned());
+                if name == "studio_head" {
+                    return serde_json::json!([]);
+                }
+                serde_json::json!([
+                    {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
+                    {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
+                ])
+            },
+            cx,
+        );
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session.clone(),
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.paging.pinned.as_deref(), Some("c1"))
+        });
+        let read_before = reads.lock().unwrap().len();
+
+        writer.commit("c2", vec![changed("node", "Note", "n1", None)]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(
+                table.paging.pinned.as_deref(),
+                Some("c2"),
+                "moved to the head"
+            );
+            assert!(!table.newer);
+        });
+        assert_eq!(
+            reads.lock().unwrap()[read_before..].to_vec(),
+            ["studio_head"],
+            "nothing read again"
+        );
+
+        writer.commit("c3", vec![changed("node", "Person", "p3", None)]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.paging.pinned.as_deref(), Some("c2"));
+            assert!(table.newer, "a person changed");
+        });
     }
 
     /// Typing in the filter field or in a cell draws the grid no more: the field draws over

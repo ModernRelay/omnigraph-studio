@@ -72,8 +72,103 @@ pub(crate) fn session_routing(
         seen.lock().unwrap().push(name);
         answer(request)
     });
-    let session = serve_with(schema, rows, 200, committed("c2", "c1"), cx);
+    let session = serve_with(schema, rows, 200, committed("c2", "c1"), None, cx);
     (session, asked)
+}
+
+/// Another writer's commits, which the fake server's head and change feed follow: the head
+/// probe answers the newest, and the feed the commits after its `start`, with only the changes
+/// to the types it names.
+#[derive(Default)]
+pub(crate) struct Writer {
+    commits: Mutex<Vec<(String, String, Vec<Value>)>>,
+}
+
+impl Writer {
+    /// Commits `commit` on the newest one (or `c1`) with `changes`.
+    pub(crate) fn commit(&self, commit: &str, changes: Vec<Value>) {
+        let mut commits = self.commits.lock().unwrap();
+        let parent = commits
+            .last()
+            .map_or("c1".to_owned(), |(id, ..)| id.clone());
+        commits.push((commit.to_owned(), parent, changes));
+    }
+
+    fn head(&self) -> Option<String> {
+        self.commits
+            .lock()
+            .unwrap()
+            .last()
+            .map(|(id, ..)| id.clone())
+    }
+
+    fn feed(&self, query: &str) -> Value {
+        // Type names and commit ids need no decoding past the `:` of `after:`.
+        let pairs: Vec<(String, String)> = query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.replace("%3A", ":")))
+            .collect();
+        let types: Vec<&str> = pairs
+            .iter()
+            .filter(|(key, _)| key == "type")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        let after = pairs
+            .iter()
+            .find(|(key, _)| key == "start")
+            .and_then(|(_, value)| value.strip_prefix("after:"))
+            .unwrap_or_default();
+        let commits = self.commits.lock().unwrap();
+        let start = commits
+            .iter()
+            .position(|(id, ..)| id == after)
+            .map_or(0, |at| at + 1);
+        let blocks: Vec<Value> = commits[start..]
+            .iter()
+            .map(|(id, parent, changes)| {
+                let changes: Vec<&Value> = changes
+                    .iter()
+                    .filter(|change| {
+                        types.is_empty() || types.contains(&change["type"]["name"].as_str().unwrap())
+                    })
+                    .collect();
+                json!({
+                    "cause": { "graph_commit_id": id, "parent_commit_id": parent, "authored_branch": "main", "authored_at": 0 },
+                    "changes": changes,
+                })
+            })
+            .collect();
+        json!({ "blocks": blocks, "cursor": "cursor", "caught_up": true })
+    }
+}
+
+/// One change to a node or an edge (with its ends), as the change feed reports it.
+pub(crate) fn changed(kind: &str, ty: &str, id: &str, ends: Option<(&str, &str)>) -> Value {
+    let mut image = json!({ "properties": {} });
+    if let Some((from, to)) = ends {
+        image["endpoints"] = json!({ "from": from, "to": to });
+    }
+    json!({ "kind": kind, "type": { "id": ty, "name": ty }, "id": id, "op": "update", "before": image, "after": image })
+}
+
+/// As [`session_routing`], with another writer committing on the branch.
+pub(crate) fn session_followed(
+    schema: &str,
+    answer: impl Fn(&Value) -> Value + Send + Sync + 'static,
+    cx: &mut TestAppContext,
+) -> (Entity<GraphSession>, Arc<Writer>) {
+    let writer = Arc::new(Writer::default());
+    let rows: Rows = Arc::new(answer);
+    let session = serve_with(
+        schema,
+        rows,
+        200,
+        committed("c2", "c1"),
+        Some(writer.clone()),
+        cx,
+    );
+    (session, writer)
 }
 
 /// The rows a read answers with, from its request body.
@@ -92,6 +187,7 @@ fn serve(
         Arc::new(move |_: &Value| (*rows).clone()),
         write_status,
         write_body,
+        None,
         cx,
     )
 }
@@ -101,6 +197,7 @@ fn serve_with(
     rows: Rows,
     write_status: u16,
     write_body: Value,
+    writer: Option<Arc<Writer>>,
     cx: &mut TestAppContext,
 ) -> Entity<GraphSession> {
     use futures::AsyncReadExt as _;
@@ -108,8 +205,10 @@ fn serve_with(
     let write_body: Arc<Value> = Arc::new(write_body);
     let http = FakeHttpClient::create(move |request| {
         let (schema, rows, write_body) = (schema.clone(), rows.clone(), write_body.clone());
+        let writer = writer.clone();
         async move {
             let path = request.uri().path().to_owned();
+            let query = request.uri().query().unwrap_or_default().to_owned();
             let (status, body) = if path.ends_with("/schema") {
                 (200, json!({ "schema_source": &*schema }))
             } else if path.ends_with("/query") {
@@ -117,6 +216,13 @@ fn serve_with(
                 request.into_body().read_to_end(&mut bytes).await.ok();
                 let asked: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
                 let rows = rows(&asked);
+                // The head probe sees the other writer's newest commit; every other read is
+                // answered at c1, which no commit after it changes for what the tests read.
+                let at = writer
+                    .as_ref()
+                    .filter(|_| asked["name"] == "studio_head")
+                    .and_then(|writer| writer.head())
+                    .unwrap_or_else(|| "c1".to_owned());
                 (
                     200,
                     json!({
@@ -125,9 +231,11 @@ fn serve_with(
                         "row_count": rows.as_array().map_or(0, Vec::len),
                         "columns": ["n"],
                         "rows": rows,
-                        "graph_commit_id": "c1",
+                        "graph_commit_id": at,
                     }),
                 )
+            } else if let Some(writer) = writer.as_ref().filter(|_| path.ends_with("/changes")) {
+                (200, writer.feed(&query))
             } else if path.contains("/mutate") {
                 (write_status, (*write_body).clone())
             } else {
