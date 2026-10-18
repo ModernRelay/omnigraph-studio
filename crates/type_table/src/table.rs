@@ -1168,6 +1168,7 @@ impl TypeTable {
         .detach();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_bulk(
         &mut self,
         outcome: graph_client::WriteOutcome<graph_client::api::ChangeOutput>,
@@ -3770,6 +3771,7 @@ impl TypeTable {
         .detach();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_drafts(
         &mut self,
         outcome: graph_client::WriteOutcome<graph_client::api::ChangeOutput>,
