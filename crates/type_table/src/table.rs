@@ -323,6 +323,10 @@ pub struct TypeTable {
     absent: HashMap<String, PropertyThen>,
     /// What the Group menu offers for these columns: its submenus and every choice.
     grouping_choices: GroupingChoices,
+    /// What each cell shows, by row id and column, made the first time it is drawn: a text
+    /// value is read as markdown to show its first line, too slow to do for every cell every
+    /// frame. A cell set, or rows read again, are made again.
+    cell_text: RefCell<HashMap<String, HashMap<String, SharedString>>>,
     peek: Option<(String, Entity<NodePeek>)>,
     newer: bool,
     /// Writes out for this table: its own saves and the dialogs' inserts and deletes. Each moves
@@ -549,6 +553,7 @@ impl TypeTable {
             relations_asked: HashSet::new(),
             absent: HashMap::new(),
             grouping_choices: Default::default(),
+            cell_text: RefCell::new(HashMap::new()),
             peek: None,
             newer: false,
             saves_in_flight: 0,
@@ -678,6 +683,7 @@ impl TypeTable {
             self.grouping_choices = Default::default();
             self.columns.clear();
             self.rows.clear();
+            self.cell_text.borrow_mut().clear();
             cx.notify();
             return;
         };
@@ -1813,6 +1819,7 @@ impl TypeTable {
             cx.emit(ItemEvent::UpdateTab);
         }
         self.rows.clear();
+        self.cell_text.borrow_mut().clear();
         // At the same commit a row's relationships and Blob cells cannot have changed: a new
         // order or filter keeps what was read and reads only rows not seen yet.
         if !keep_pin {
@@ -2306,6 +2313,9 @@ impl TypeTable {
         for row in self.rows.iter_mut().filter(|row| row.id == id) {
             set_value(row, column, value.clone());
         }
+        if let Some(row) = self.cell_text.borrow_mut().get_mut(&id) {
+            row.remove(column);
+        }
     }
 
     /// Dims the row at `ix` and its copies, or shows them plainly again.
@@ -2790,6 +2800,8 @@ impl TypeTable {
     }
 
     fn remove_row(&mut self, id: &str, cx: &mut Context<Self>) {
+        // A row put back (an undone delete) shows its values afresh.
+        self.cell_text.borrow_mut().remove(id);
         if let Some(index) = self.rows.iter().position(|row| row.id == id) {
             let row = self.rows.remove(index);
             if let Some(grouping) = &mut self.grouping {
@@ -5820,6 +5832,25 @@ impl TypeTable {
         drawn
     }
 
+    /// What a cell shows, made once (see `cell_text`): looked up without allocating.
+    fn cell_text_of(&self, row: &Row, column: &ColumnSpec, value: &Value) -> SharedString {
+        if let Some(shown) = self
+            .cell_text
+            .borrow()
+            .get(&row.id)
+            .and_then(|cells| cells.get(&column.key))
+        {
+            return shown.clone();
+        }
+        let shown: SharedString = display_value(column.property(), value).into();
+        self.cell_text
+            .borrow_mut()
+            .entry(row.id.clone())
+            .or_default()
+            .insert(column.key.clone(), shown.clone());
+        shown
+    }
+
     fn render_cell(
         &self,
         ix: usize,
@@ -5893,9 +5924,9 @@ impl TypeTable {
         }
         // Dates read relative; the exact value is the cell's tooltip.
         let relative = crate::model::relative_value(column.property(), value, self.frame_now);
-        let shown = match &relative {
-            Some((shown, _)) => shown.clone(),
-            None => display_value(column.property(), value),
+        let shown: SharedString = match &relative {
+            Some((shown, _)) => shown.clone().into(),
+            None => self.cell_text_of(row, column, value),
         };
         let text_color = if value.is_null() {
             Color::Disabled

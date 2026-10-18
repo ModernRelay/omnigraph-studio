@@ -233,7 +233,11 @@ mod tests {
             write_atomic_in_turn(path.clone(), format!("{n}").into_bytes(), Access::Private);
         }
         writes_done();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "49", "the last asked, last");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "49",
+            "the last asked, last"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
