@@ -193,6 +193,7 @@ dependencies = [
  "menu",
  "percent-encoding",
  "reqwest_client",
+ "rustix",
  "serde",
  "serde_json",
  "smol",
@@ -4347,9 +4348,11 @@ dependencies = [
  "gq_language",
  "graph_client",
  "graph_store",
+ "http_client",
  "menu",
  "serde_json",
  "studio_actions",
+ "studio_theme",
  "studio_ui",
  "studio_workspace",
  "ui",
@@ -8540,6 +8543,7 @@ dependencies = [
  "menu",
  "serde_json",
  "studio_actions",
+ "studio_theme",
  "studio_ui",
  "studio_workspace",
  "ui",
@@ -9838,6 +9842,7 @@ name = "studio_settings"
 version = "0.2.1"
 dependencies = [
  "gpui",
+ "log",
  "schemars 1.0.4",
  "serde",
  "serde_ignored",
@@ -9852,6 +9857,7 @@ version = "0.2.1"
 dependencies = [
  "assets",
  "gpui",
+ "log",
  "release_channel",
  "semver",
  "serde_json",
@@ -9880,6 +9886,7 @@ version = "0.2.1"
 dependencies = [
  "gpui",
  "graph_store",
+ "http_client",
  "libc",
  "menu",
  "serde",
