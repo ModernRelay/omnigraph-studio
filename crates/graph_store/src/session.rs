@@ -274,6 +274,9 @@ pub struct GraphSession {
     pub schema: Loadable<Arc<SchemaModel>>,
     pub branches: Loadable<Vec<String>>,
     pub datasets: Loadable<Vec<SnapshotDatasetOutput>>,
+    /// Each type's row count from `datasets`, by name: the sidebar asks for every type each
+    /// frame.
+    dataset_counts: HashMap<String, i64>,
     /// The queries the server serves by name for this graph (spec 007), read with the schema.
     pub stored_queries: Loadable<Arc<Vec<QueryCatalogEntry>>>,
     pub outcomes: Vec<OutcomeEntry>,
@@ -353,6 +356,7 @@ impl GraphSession {
             schema: Loadable::NotLoaded,
             branches: Loadable::NotLoaded,
             datasets: Loadable::NotLoaded,
+            dataset_counts: HashMap::new(),
             stored_queries: Loadable::NotLoaded,
             outcomes: Vec::new(),
             reads_in_flight: 0,
@@ -701,6 +705,7 @@ impl GraphSession {
 
     pub fn reload_counts(&mut self, cx: &mut Context<Self>) {
         self.datasets = Loadable::Loading;
+        self.dataset_counts.clear();
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let branch = self.branch.clone();
@@ -713,6 +718,13 @@ impl GraphSession {
                 Err(error) => Loadable::Failed(error.to_string()),
             };
             this.update(cx, |this, cx| {
+                this.dataset_counts = match &result {
+                    Loadable::Loaded(datasets) => datasets
+                        .iter()
+                        .map(|dataset| (dataset.type_name.clone(), dataset.entity_count))
+                        .collect(),
+                    _ => HashMap::new(),
+                };
                 this.datasets = result;
                 cx.emit(SessionEvent::CountsChanged);
                 cx.notify();
@@ -738,11 +750,7 @@ impl GraphSession {
 
     /// The row count of a type at the branch head, from the snapshot.
     pub fn count_of(&self, type_name: &str) -> Option<i64> {
-        self.datasets
-            .loaded()?
-            .iter()
-            .find(|d| d.type_name == type_name)
-            .map(|d| d.entity_count)
+        self.dataset_counts.get(type_name).copied()
     }
 
     pub fn set_branch(&mut self, branch: String, cx: &mut Context<Self>) {

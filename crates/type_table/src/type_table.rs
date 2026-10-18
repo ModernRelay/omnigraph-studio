@@ -141,14 +141,17 @@ pub fn init(cx: &mut App) {
         let handle = cx.entity().downgrade();
         let session = workspace.session().cloned();
         let types = cx.new(|cx| TypesList::new(handle, session, window, cx));
+        let types: gpui::AnyView = types.into();
         workspace.add_panel(
             PanelPosition::Left,
             "types",
             "Graph",
             IconName::Blocks,
-            types.into(),
+            types.clone(),
             cx,
         );
+        // A schema can hold hundreds of types: the list draws those in view.
+        workspace.set_panel_scrolls_itself(&types, cx);
         workspace.register_action(|workspace, action: &UndoDelete, _window, cx| {
             undo_delete(workspace, action, cx);
         });

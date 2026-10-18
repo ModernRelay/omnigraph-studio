@@ -222,10 +222,16 @@ pub fn traffic_light_position(glass: bool) -> Point<Pixels> {
 /// replays it.
 struct DockHost {
     view: AnyView,
+    /// The panel scrolls itself (a list that draws only its rows in view), so the host gives
+    /// it its size rather than scrolling it.
+    scrolls_itself: bool,
 }
 
 impl Render for DockHost {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        if self.scrolls_itself {
+            return div().id("dock-host").size_full().child(self.view.clone());
+        }
         div()
             .id("dock-host")
             .size_full()
@@ -1473,9 +1479,23 @@ impl Workspace {
             .collect();
         self.dock_hosts.retain(|id, _| live.contains(id));
         let view = view.clone();
-        self.dock_hosts
-            .entry(view.entity_id())
-            .or_insert_with(|| cx.new(|_| DockHost { view }));
+        self.dock_hosts.entry(view.entity_id()).or_insert_with(|| {
+            cx.new(|_| DockHost {
+                view,
+                scrolls_itself: false,
+            })
+        });
+    }
+
+    /// Lets a side panel scroll itself, as a list that draws only the rows in view does: its
+    /// host gives it the dock's size instead of scrolling it.
+    pub fn set_panel_scrolls_itself(&mut self, view: &AnyView, cx: &mut Context<Self>) {
+        if let Some(host) = self.dock_hosts.get(&view.entity_id()) {
+            host.update(cx, |host, cx| {
+                host.scrolls_itself = true;
+                cx.notify();
+            });
+        }
     }
 
     /// A dock panel's view, cached inside its scrolling host.
