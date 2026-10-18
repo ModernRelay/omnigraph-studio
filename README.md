@@ -186,3 +186,8 @@ test in CI. Not implemented:
 GPL-3.0-or-later, because Studio links Zed's GPL-3.0 UI crates (`LICENSE`). OmniGraph is MIT
 and is not affected: Studio talks to it over HTTP and links only the MIT-licensed
 `omnigraph-compiler`.
+
+The icons in `assets/icons/nucleo/` are not under the GPL: they are [Nucleo](https://nucleoapp.com)
+icons, used under Nucleo's licence (`assets/icons/nucleo/NOTICE`), which allows an open-source
+project up to 100 of them and only within the product they ship with. `script/vendor-icons.py`
+copies them from a licensed bundle; a test keeps the count under the limit.

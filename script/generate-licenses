@@ -64,6 +64,14 @@ mkdir -p "$(dirname "$out")"
   cat assets/themes/LICENSES
   echo '```'
   echo
+  echo "## Icons Studio bundles"
+  echo
+  echo "Studio's icons (assets/icons/nucleo) are Nucleo's, under Nucleo's licence, not the GPL."
+  echo
+  echo '```'
+  cat assets/icons/nucleo/NOTICE
+  echo '```'
+  echo
   cargo about generate --locked --fail -c "$config" \
     --manifest-path crates/studio/Cargo.toml script/licenses/template.md.hbs
 } > "$out"

@@ -11,6 +11,8 @@ use std::borrow::Cow;
 
 use gpui::{App, AssetSource, Hsla, SharedString};
 
+mod icons;
+
 /// Themes Studio bundles beside Zed's, by asset path (`assets/themes/` in this repository, with
 /// their notices in `assets/themes/LICENSES`). Zed's theme loader lists `themes/` and loads each
 /// family, so these are registered with Zed's own.
@@ -19,11 +21,15 @@ const STUDIO_THEMES: &[(&str, &[u8])] = &[(
     include_bytes!("../../../assets/themes/vitesse-refined/vitesse-theme-refined.json"),
 )];
 
-/// Zed's assets (fonts, icons, themes, keymaps), and Studio's own themes.
+/// Zed's assets (fonts, icons, themes, keymaps), Studio's own themes, and Studio's icons in
+/// place of Zed's (`icons`).
 pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        if let Some(svg) = icons::nucleo(path) {
+            return Ok(Some(Cow::Borrowed(svg)));
+        }
         match STUDIO_THEMES.iter().find(|(own, _)| *own == path) {
             Some((_, bytes)) => Ok(Some(Cow::Borrowed(bytes))),
             None => assets::Assets.load(path),
