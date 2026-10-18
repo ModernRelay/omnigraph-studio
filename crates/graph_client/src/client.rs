@@ -1022,7 +1022,10 @@ fn summary(status: StatusCode, body: &[u8]) -> ApiErrorSummary {
 /// Classifies a write's response (constitution III, spec 003).
 ///
 /// - 2xx with the contract header and a readable body: committed.
-/// - 4xx, 503 and 429: refused; the server did not admit or did not apply the write.
+/// - 4xx, 503 and 429 with the contract header and the server's error body: refused; the server
+///   did not admit or did not apply the write. OmniGraph stamps the header on every response
+///   it sends, errors included, so an error without it came from something in between (a
+///   proxy, a gateway), which cannot say whether the server applied the write.
 /// - Anything else (a lost contract header, an unreadable success body, other 5xx): unknown.
 fn classify_write<T: DeserializeOwned>(raw: RawResponse) -> WriteOutcome<T> {
     let contract_ok = raw
@@ -1045,7 +1048,10 @@ fn classify_write<T: DeserializeOwned>(raw: RawResponse) -> WriteOutcome<T> {
     let refused = raw.status.is_client_error()
         || raw.status == StatusCode::SERVICE_UNAVAILABLE
         || raw.status == StatusCode::TOO_MANY_REQUESTS;
-    if refused && let Ok(body) = serde_json::from_slice::<ErrorOutput>(&raw.body) {
+    if refused
+        && contract_ok
+        && let Ok(body) = serde_json::from_slice::<ErrorOutput>(&raw.body)
+    {
         return WriteOutcome::Refused(ApiError {
             status: raw.status.as_u16(),
             body,
@@ -1369,6 +1375,19 @@ mod tests {
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
+        // The same answer without the contract header came from something between Studio and
+        // the server, which cannot say whether the server applied the write.
+        let outcome = block_on(
+            client(respond(503, None, r#"{"error":"upstream busy"}"#)).mutate(
+                "g",
+                &ChangeRequest::default(),
+                None,
+            ),
+        );
+        assert!(
+            matches!(outcome, WriteOutcome::Unknown { .. }),
+            "{outcome:?}"
+        );
     }
 
     #[test]
