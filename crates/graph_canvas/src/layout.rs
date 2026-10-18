@@ -4,9 +4,9 @@
 //! is placed as far apart as the relationships between them say, so related types sit together
 //! and the most connected ones in the middle. It is a function of the schema alone (names,
 //! relationships, label lengths) and the types the person placed: counts never move a type
-//! (constitution V). The exploration places each new node radially around the node it hangs
-//! off, fanning away from where the walk came from, then relaxes overlaps for a fixed number of
-//! iterations. Nodes laid out before keep their positions exactly, so expanding never moves
+//! (constitution V). The exploration places each new node in a column beside the node it hangs
+//! off, on the side away from where the walk came from, then relaxes overlaps for a fixed number
+//! of iterations. Nodes laid out before keep their positions exactly, so expanding never moves
 //! what the person already sees. No randomness: the same input gives the same output.
 
 use std::collections::HashMap;
@@ -108,8 +108,8 @@ const STRESS_SETTLED: f32 = 0.05;
 /// relationships between two types pull them together harder. Each connected group of types is
 /// laid out alone, from a classical multidimensional scaling start (deterministic: no
 /// randomness), turned so its long axis runs across the screen. The largest group is the map;
-/// smaller groups follow below it, and types with no relationship sit in a grid under all of
-/// them, in the order given. Chips are then pushed apart until none overlap. A placed type never
+/// smaller groups follow below it, and types with no relationship stand in columns beside all
+/// of them, in the order given. Chips are then pushed apart until none overlap. A placed type never
 /// moves: it anchors its group, which keeps the place the person gave it.
 pub fn ontology_positions(nodes: &[OntologyNode], edges: &[OntologyEdge]) -> Vec<Vec2> {
     let n = nodes.len();
@@ -189,8 +189,9 @@ pub fn ontology_positions(nodes: &[OntologyNode], edges: &[OntologyEdge]) -> Vec
         laid.push((members.clone(), local, anchored));
     }
 
-    // The first free group is centred; anchored groups stay where their placed types put them;
-    // the rest stack below, left-aligned, in rows as wide as the map.
+    // The first group is centred unless a placed type anchors it; anchored groups stay where
+    // their placed types put them; the rest stack below, left-aligned, in rows as wide as the
+    // map.
     let bounds_of = |members: &[usize], at: &[Vec2]| -> (Vec2, Vec2) {
         let mut min = Vec2::new(f32::MAX, f32::MAX);
         let mut max = Vec2::new(f32::MIN, f32::MIN);
@@ -233,6 +234,8 @@ pub fn ontology_positions(nodes: &[OntologyNode], edges: &[OntologyEdge]) -> Vec
     let row_width = (placed_max.x - placed_min.x).max(900.);
     let mut cursor = Vec2::new(placed_min.x, placed_max.y + COMPONENT_GAP);
     let mut row_height: f32 = 0.;
+    // A row's first group can be wider than the row: the unrelated types stand beyond it.
+    let mut right = placed_max.x;
     for index in stacked {
         let (members, local, _) = &laid[index];
         let (min, max) = bounds_of(members, local);
@@ -244,6 +247,7 @@ pub fn ontology_positions(nodes: &[OntologyNode], edges: &[OntologyEdge]) -> Vec
         for (k, &i) in members.iter().enumerate() {
             position[i] = local[k] - min + cursor;
         }
+        right = right.max(cursor.x + size.x);
         cursor.x += size.x + COMPONENT_GAP;
         row_height = row_height.max(size.y);
     }
@@ -276,7 +280,7 @@ pub fn ontology_positions(nodes: &[OntologyNode], edges: &[OntologyEdge]) -> Vec
             }
         } else {
             let rows = (((bottom - placed_min.y) / pitch).floor() as usize).max(1);
-            let left = placed_max.x + COMPONENT_GAP;
+            let left = right + COMPONENT_GAP;
             for (k, &i) in free.iter().enumerate() {
                 let (column, row) = (k / rows, k % rows);
                 position[i] = Vec2::new(
@@ -762,10 +766,13 @@ fn free_top(ideal: f32, total: f32, span: (f32, f32), taken: &[[f32; 4]], downwa
     let mut best: Option<f32> = None;
     let mut consider = |low: f32, high: f32| {
         let low = if downward { low.max(ideal) } else { low };
-        if high - low < total {
+        // Compared as the clamp's own bounds: `high - low >= total` can hold in f32 while
+        // `high - total` rounds below `low`, and `clamp` panics on reversed bounds.
+        let last = high - total;
+        if last < low {
             return;
         }
-        let start = ideal.clamp(low, high - total);
+        let start = ideal.clamp(low, last);
         if best.is_none_or(|best| (start - ideal).abs() < (best - ideal).abs()) {
             best = Some(start);
         }
@@ -824,6 +831,13 @@ fn relax(nodes: &[LayoutNode], position: &mut [Vec2], fixed: &[bool]) {
         * 2.
         + GAP;
     for _ in 0..RELAX_ITERATIONS {
+        // Back towards where each was put, before the pushes: a round that ended on the pull
+        // would leave every pushed pair overlapping again by a part of its push.
+        for i in 0..count {
+            if !fixed[i] {
+                position[i] = position[i] + (seeds[i] - position[i]) * 0.05;
+            }
+        }
         let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
         for (index, point) in position.iter().enumerate() {
             grid.entry(cell_of(*point, cell)).or_default().push(index);
@@ -874,11 +888,6 @@ fn relax(nodes: &[LayoutNode], position: &mut [Vec2], fixed: &[bool]) {
                         moved = true;
                     }
                 }
-            }
-        }
-        for i in 0..count {
-            if !fixed[i] {
-                position[i] = position[i] + (seeds[i] - position[i]) * 0.05;
             }
         }
         if !moved {
@@ -965,9 +974,6 @@ mod tests {
             .collect()
     }
 
-    /// Instrument for spec 006's scale check: how long a result's layout takes as it grows.
-    /// Run with `cargo test -p graph_canvas --release explore_layout_time -- --ignored
-    /// --nocapture`.
     /// `free_top` as it was first written, testing every block for every candidate: the
     /// oracle for the merged-gap search.
     fn free_top_by_testing(
@@ -1050,6 +1056,20 @@ mod tests {
         }
     }
 
+    /// A gap whose height equals the column's in f32 (`high - low == total`) while
+    /// `high - total` rounds below `low`: the clamp's bounds would be reversed.
+    #[test]
+    fn a_gap_one_rounding_short_of_a_column_is_passed_over() {
+        let (low, high, total) = (202.546_78_f32, 922.546_75_f32, 720.);
+        assert!(high - low >= total && high - total < low, "the rounding this guards");
+        let taken = [[0., 100., 0., low], [0., 100., high, 1_000.]];
+        let start = free_top(300., total, (0., 100.), &taken, false);
+        assert_eq!(start, 1_000., "below every chip");
+    }
+
+    /// Instrument for spec 006's scale check: how long a result's layout takes as it grows.
+    /// Run with `cargo test -p graph_canvas --release explore_layout_time -- --ignored
+    /// --nocapture`.
     #[test]
     #[ignore = "instrument: layout time by node count"]
     fn explore_layout_time() {
@@ -1397,6 +1417,48 @@ mod tests {
         // Its neighbours gather around the place it was given.
         let neighbour = pinned[1];
         assert!((neighbour - target).length() < (at[1] - target).length());
+    }
+
+    /// A narrow map with rows of smaller groups stacked under it, as wide as the row they make:
+    /// the unrelated types stand beyond them all, overlapping no chip.
+    #[test]
+    fn unrelated_types_stand_clear_of_the_groups_stacked_under_the_map() {
+        let chip = |half_width| OntologyNode {
+            half_width,
+            pinned: None,
+        };
+        // The map: five compact types around a hub. Under it: six related pairs.
+        let mut nodes: Vec<OntologyNode> = (0..5).map(|_| chip(30.)).collect();
+        nodes.extend((0..12).map(|_| chip(50.)));
+        let unrelated = nodes.len()..nodes.len() + 8;
+        nodes.extend(unrelated.clone().map(|_| chip(40.)));
+        let mut edges: Vec<OntologyEdge> = (1..5)
+            .map(|to| OntologyEdge {
+                from: 0,
+                to,
+                label_half_width: 10.,
+            })
+            .collect();
+        edges.extend((0..6).map(|pair| OntologyEdge {
+            from: 5 + 2 * pair,
+            to: 6 + 2 * pair,
+            label_half_width: 40.,
+        }));
+        let at = ontology_positions(&nodes, &edges);
+        let overlaps = |i: usize, j: usize| {
+            (at[i].x - at[j].x).abs() < nodes[i].half_width + nodes[j].half_width
+                && (at[i].y - at[j].y).abs() < 2. * CHIP_HALF_HEIGHT
+        };
+        for alone in unrelated {
+            for other in (0..nodes.len()).filter(|&other| other != alone) {
+                assert!(
+                    !overlaps(alone, other),
+                    "type {alone} at {:?} overlaps type {other} at {:?}",
+                    at[alone],
+                    at[other]
+                );
+            }
+        }
     }
 
     #[test]
