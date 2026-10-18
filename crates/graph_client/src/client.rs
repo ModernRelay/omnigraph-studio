@@ -379,11 +379,18 @@ impl GraphClient {
         headers: &[(&str, &str)],
         timeout: Duration,
     ) -> Result<RawResponse, String> {
-        self.send_reading(method, url, body, headers, timeout, usize::MAX)
-            .await
+        self.send_reading(
+            method,
+            url,
+            body,
+            headers,
+            timeout,
+            BodyLimit::First(usize::MAX),
+        )
+        .await
     }
 
-    /// [`Self::send`], reading at most `limit` bytes of the body: the rest is never read.
+    /// [`Self::send`], keeping only what `limit` says of the body: the rest is never read.
     async fn send_reading(
         &self,
         method: Method,
@@ -391,7 +398,7 @@ impl GraphClient {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
         timeout: Duration,
-        limit: usize,
+        limit: BodyLimit,
     ) -> Result<RawResponse, String> {
         // No route answers with a redirect to follow; a Blob's external reference answers 302
         // with a URI Studio shows and never fetches.
@@ -431,7 +438,12 @@ impl GraphClient {
             .and_then(|value| value.trim().parse::<u64>().ok())
             .map(Duration::from_secs);
         let headers = response.headers().clone();
-        let bytes = read_body(response.into_body(), limit)
+        let (skip, keep) = match limit {
+            BodyLimit::First(keep) => (0, keep),
+            BodyLimit::Range { start, len } if status == StatusCode::OK => (start, len),
+            BodyLimit::Range { len, .. } => (0, len),
+        };
+        let bytes = read_body(response.into_body(), skip, keep)
             .await
             .map_err(|error| describe_transport(&error.into()))?;
         Ok(RawResponse {
@@ -452,18 +464,18 @@ impl GraphClient {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> Result<RawResponse, ReadError> {
-        self.fetch_reading(method, url, body, headers, usize::MAX)
+        self.fetch_reading(method, url, body, headers, BodyLimit::First(usize::MAX))
             .await
     }
 
-    /// [`Self::fetch`], reading at most `limit` bytes of the body.
+    /// [`Self::fetch`], keeping only what `limit` says of the body.
     async fn fetch_reading(
         &self,
         method: Method,
         url: Url,
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
-        limit: usize,
+        limit: BodyLimit,
     ) -> Result<RawResponse, ReadError> {
         let mut retries = 0;
         loop {
@@ -580,23 +592,41 @@ impl GraphClient {
         }
         let url = self.blob_url(graph, cell, at);
         let bytes = format!("bytes={}-{}", range.start, end - 1);
-        // The range's bytes are the first `end` of the whole value too, which a server that
-        // ignores Range sends: what follows them is never read.
+        // A 206 is the range alone. A server that ignores Range sends the whole value, read
+        // through the range's start without keeping it; what follows the range is never read.
+        let len = (end - range.start) as usize;
         let raw = self
-            .fetch_reading(Method::GET, url, None, &[("range", &bytes)], end as usize)
+            .fetch_reading(
+                Method::GET,
+                url,
+                None,
+                &[("range", &bytes)],
+                BodyLimit::Range {
+                    start: range.start,
+                    len,
+                },
+            )
             .await?;
         match raw.status.as_u16() {
-            200 | 206 => {
+            200 => {
                 check_contract(&raw)?;
-                let mut body = raw.body;
-                // A server that ignores Range sends the whole value from the start.
-                if raw.status == StatusCode::OK {
-                    body = body
-                        .get(range.start as usize..)
-                        .unwrap_or_default()
-                        .to_vec();
+                Ok(raw.body)
+            }
+            206 => {
+                check_contract(&raw)?;
+                // Bytes from elsewhere in the value would show as the ones asked for.
+                let served = raw
+                    .headers
+                    .get("content-range")
+                    .and_then(|value| value.to_str().ok());
+                if !served.is_some_and(|served| content_range_starts_at(served, range.start)) {
+                    return Err(ReadError::Decode(format!(
+                        "the server sent a range other than the one asked for ({})",
+                        served.unwrap_or("no Content-Range")
+                    )));
                 }
-                body.truncate((end - range.start) as usize);
+                let mut body = raw.body;
+                body.truncate(len);
                 Ok(body)
             }
             301 | 302 | 303 | 307 | 308 => Err(ReadError::Refused(ApiErrorSummary {
@@ -1062,14 +1092,46 @@ fn classify_write<T: DeserializeOwned>(raw: RawResponse) -> WriteOutcome<T> {
     }
 }
 
-/// A response body: at most `limit` bytes, the rest left unread.
-async fn read_body(mut body: AsyncBody, limit: usize) -> std::io::Result<Vec<u8>> {
+/// How much of a response body is kept.
+#[derive(Debug, Clone, Copy)]
+enum BodyLimit {
+    /// Its first bytes, this many at most.
+    First(usize),
+    /// `len` bytes from `start` of a value asked for by range: a 206 is the range itself, a
+    /// 200 the whole value, read through `start` without keeping it.
+    Range { start: u64, len: usize },
+}
+
+/// Whether a 206's `Content-Range` (`bytes 2-4/10`) starts where the request asked.
+fn content_range_starts_at(served: &str, start: u64) -> bool {
+    served
+        .trim()
+        .strip_prefix("bytes ")
+        .and_then(|range| range.split_once('-'))
+        .and_then(|(first, _)| first.trim().parse::<u64>().ok())
+        == Some(start)
+}
+
+/// A response body: `skip` bytes read and dropped, then at most `limit` kept, the rest left
+/// unread.
+async fn read_body(mut body: AsyncBody, skip: u64, limit: usize) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
+    let mut buffer = vec![0; limit.min(256 * 1024).max(usize::from(skip > 0) * 64 * 1024)];
+    let mut skipped = 0;
+    while skipped < skip {
+        let want = buffer
+            .len()
+            .min(usize::try_from(skip - skipped).unwrap_or(usize::MAX));
+        let read = body.read(&mut buffer[..want]).await?;
+        if read == 0 {
+            return Ok(bytes);
+        }
+        skipped += read as u64;
+    }
     if limit == usize::MAX {
         body.read_to_end(&mut bytes).await?;
         return Ok(bytes);
     }
-    let mut buffer = vec![0; limit.min(256 * 1024)];
     while bytes.len() < limit {
         let want = buffer.len().min(limit - bytes.len());
         let read = body.read(&mut buffer[..want]).await?;
@@ -1719,6 +1781,14 @@ mod tests {
             [2, 3, 4]
         );
         assert!(seen.lock().unwrap()[0].starts_with("GET bytes=2-4"));
+        // The server answers bytes 2-4 whatever is asked: from 3 on, those are not the bytes
+        // asked for.
+        assert!(matches!(
+            block_on(client.blob_bytes("g", &cell("bytes"), at, 3..6)),
+            Err(ReadError::Decode(message)) if message.contains("bytes 2-4/10")
+        ));
+        assert!(content_range_starts_at(" bytes 3-5/10", 3));
+        assert!(!content_range_starts_at("bytes */10", 3));
         assert!(matches!(
             block_on(client.blob_bytes("g", &cell("external"), at, 0..5)),
             Err(ReadError::Refused(e)) if e.status == 302
@@ -1728,7 +1798,7 @@ mod tests {
             Vec::<u8>::new(),
             "an empty range sends nothing"
         );
-        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert_eq!(seen.lock().unwrap().len(), 3);
     }
 
     #[test]
