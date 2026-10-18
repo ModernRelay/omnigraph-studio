@@ -17,7 +17,8 @@ use graph_client::{ReadError, WriteOutcome};
 use graph_store::fixes::compose;
 use graph_store::{
     ChangeFold, FoldedChange, FoldedChanges, GraphSession, HeadWatch, NetChange, REVIEW_CHANGE_CAP,
-    SessionEvent, TypeCounts, commits_since, fork_point, revert_query, summary_sentence,
+    SessionEvent, TypeCounts, commits_since, contains_merge_of, fork_point, revert_query,
+    summary_sentence,
 };
 use serde_json::Value;
 use studio_actions::review::{
@@ -1764,8 +1765,7 @@ async fn read_review_by_histories(
     Ok(fed.into_review(fork, head, cx).await)
 }
 
-/// Whether the target holds the merge just reported: the source head is the merge base of the
-/// two (merged, fast-forwarded, or already there), or the target's head is the merge commit.
+/// Whether the target holds the merge just reported.
 async fn verify_merge(
     session: &Entity<GraphSession>,
     source: &str,
@@ -1774,16 +1774,12 @@ async fn verify_merge(
     source_head: Option<&str>,
     cx: &mut AsyncApp,
 ) -> bool {
-    let read = session.update(cx, |session, cx| session.merge_base(source, target, cx));
-    let Ok(base) = read.await else {
-        return false;
-    };
-    source_head == Some(base.merge_base.graph_commit_id.as_str())
-        || commit == Some(base.target_commit_id.as_str())
+    merge_shown(session, source, target, commit, source_head, cx)
+        .await
+        .unwrap_or(false)
 }
 
-/// After a lost merge response: whether the target holds the source head, which is then the
-/// merge base of the two.
+/// After a lost merge response: whether the target holds the source head.
 async fn merge_landed(
     session: &Entity<GraphSession>,
     source: &str,
@@ -1791,9 +1787,35 @@ async fn merge_landed(
     source_head: Option<&str>,
     cx: &mut AsyncApp,
 ) -> Option<bool> {
+    source_head?;
+    merge_shown(session, source, target, None, source_head, cx).await
+}
+
+/// Whether the target shows the merge of `source_head` (or the merge commit `commit`). The source
+/// head being the merge base of the two proves it with one read: merged, fast-forwarded, or
+/// already there. When the merge base has moved past it (more of the source was merged since),
+/// the target's history is read: the merge commit, or a commit carrying the source head.
+async fn merge_shown(
+    session: &Entity<GraphSession>,
+    source: &str,
+    target: &str,
+    commit: Option<&str>,
+    source_head: Option<&str>,
+    cx: &mut AsyncApp,
+) -> Option<bool> {
     let read = session.update(cx, |session, cx| session.merge_base(source, target, cx));
-    let base = read.await.ok()?;
-    Some(base.merge_base.graph_commit_id == source_head?)
+    if let Ok(base) = read.await
+        && (source_head == Some(base.merge_base.graph_commit_id.as_str())
+            || commit == Some(base.target_commit_id.as_str()))
+    {
+        return Some(true);
+    }
+    let read = session.update(cx, |session, cx| session.commits(target, true, cx));
+    let list = read.await.ok()?;
+    Some(
+        commit.is_some_and(|c| list.iter().any(|t| t.graph_commit_id == c))
+            || source_head.is_some_and(|head| contains_merge_of(&list, head)),
+    )
 }
 
 impl Render for ReviewView {
@@ -1932,11 +1954,6 @@ mod tests {
         Entity<GraphSession>,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
-        use gpui::AppContext as _;
-        use graph_store::{Connection, ServerEntry, ServerSource};
-        use http_client::http::Response;
-        use http_client::{AsyncBody, FakeHttpClient};
-
         let commit = |id: &str, parent: Option<&str>| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "created_at": 0, "parent_commit_id": parent, "actor_id": "act-dev" });
         let person = |id: &str, op: &str| json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": id, "op": op, "before": { "properties": { "slug": id } }, "after": { "properties": { "slug": id, "name": "x" } } });
         let block = |id: &str, parent: &str, change: Value| json!({ "cause": { "graph_commit_id": id, "parent_commit_id": parent, "authored_branch": "feature", "authored_at": 0, "actor_id": "act-dev" }, "changes": [change] });
@@ -1945,33 +1962,55 @@ mod tests {
         let feed = json!({ "blocks": [block("f1", "m1", person("p1", "insert")), block("f2", "f1", person("p2", "update"))], "cursor": "c", "caught_up": true });
         let feature = json!({ "commits": [commit("f2", Some("f1")), commit("f1", Some("m1")), commit("m1", None)] });
         let main = json!({ "commits": [commit("m2", Some("m1")), commit("m1", None)] });
+        fake_server(
+            move |path, query| {
+                if path.ends_with("/schema") {
+                    (
+                        200,
+                        json!({ "schema_source": "node Person {\n  slug: String @key\n  name: String?\n}\n" }),
+                    )
+                } else if path.ends_with("/branches/merge-base") {
+                    (200, base.clone())
+                } else if path.ends_with("/changes") && query.contains("start=after%3Am2") {
+                    (
+                        400,
+                        json!({ "error": "start commit is not on this branch's first-parent chain", "code": "bad_request" }),
+                    )
+                } else if path.ends_with("/changes") {
+                    (200, feed.clone())
+                } else if path.ends_with("/commits") && query.contains("branch=feature") {
+                    (200, feature.clone())
+                } else if path.ends_with("/commits") {
+                    (200, main.clone())
+                } else {
+                    (200, json!({ "branches": ["main", "feature"] }))
+                }
+            },
+            cx,
+        )
+    }
+
+    /// A session on a server answering each request's path and query with `answer`; every
+    /// request is recorded.
+    fn fake_server(
+        answer: impl Fn(&str, &str) -> (u16, Value) + Send + Sync + 'static,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use gpui::AppContext as _;
+        use graph_store::{Connection, ServerEntry, ServerSource};
+        use http_client::http::Response;
+        use http_client::{AsyncBody, FakeHttpClient};
+
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
         let http = FakeHttpClient::create(move |request| {
             let path = request.uri().path().to_owned();
             let query = request.uri().query().unwrap_or_default().to_owned();
             seen.lock().unwrap().push(format!("{path}?{query}"));
-            let (status, body) = if path.ends_with("/schema") {
-                (
-                    200,
-                    json!({ "schema_source": "node Person {\n  slug: String @key\n  name: String?\n}\n" }),
-                )
-            } else if path.ends_with("/branches/merge-base") {
-                (200, base.clone())
-            } else if path.ends_with("/changes") && query.contains("start=after%3Am2") {
-                (
-                    400,
-                    json!({ "error": "start commit is not on this branch's first-parent chain", "code": "bad_request" }),
-                )
-            } else if path.ends_with("/changes") {
-                (200, feed.clone())
-            } else if path.ends_with("/commits") && query.contains("branch=feature") {
-                (200, feature.clone())
-            } else if path.ends_with("/commits") {
-                (200, main.clone())
-            } else {
-                (200, json!({ "branches": ["main", "feature"] }))
-            };
+            let (status, body) = answer(&path, &query);
             async move {
                 Ok(Response::builder()
                     .status(status)
@@ -2051,6 +2090,51 @@ mod tests {
                 .count(),
             2,
             "both lists: {asked:?}"
+        );
+    }
+
+    /// A merge is confirmed by its source head being the merge base; when more of the source
+    /// was merged since, the merge base has moved past it, and the target's history shows it.
+    #[gpui::test]
+    async fn a_merge_is_confirmed_after_more_of_the_source_was_merged(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let commit = |id: &str, merged: Option<&str>| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "created_at": 0, "merged_parent_commit_id": merged });
+        // main merged f2 (as m3), then f3 (as m4).
+        let base = json!({ "merge_base": commit("f3", None), "source": "feature", "source_commit_id": "f3", "target": "main", "target_commit_id": "m4" });
+        let main = json!({ "commits": [commit("m4", Some("f3")), commit("m3", Some("f2")), commit("m1", None)] });
+        let (session, _) = fake_server(
+            move |path, _| {
+                if path.ends_with("/branches/merge-base") {
+                    (200, base.clone())
+                } else if path.ends_with("/commits") {
+                    (200, main.clone())
+                } else {
+                    (200, json!({ "branches": ["main", "feature"] }))
+                }
+            },
+            cx,
+        );
+        let mut async_cx = cx.to_async();
+        assert!(
+            verify_merge(
+                &session,
+                "feature",
+                "main",
+                Some("m3"),
+                Some("f2"),
+                &mut async_cx
+            )
+            .await
+        );
+        assert_eq!(
+            merge_landed(&session, "feature", "main", Some("f2"), &mut async_cx).await,
+            Some(true),
+            "f2 was merged, though the merge base is f3 now"
+        );
+        assert_eq!(
+            merge_landed(&session, "feature", "main", Some("f9"), &mut async_cx).await,
+            Some(false)
         );
     }
 }

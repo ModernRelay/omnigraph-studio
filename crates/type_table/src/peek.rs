@@ -404,6 +404,9 @@ impl NodePeek {
     pub fn hold_commit(&mut self) {
         self.holds_commit = true;
         self.newer = false;
+        // A held commit never moves, so nothing the branch does concerns it.
+        self.reads = None;
+        self.awaiting_changes = false;
     }
 
     /// Reads a node again at the branch head, with its relationships and Blobs.
@@ -3514,6 +3517,10 @@ mod tests {
                 view.absent.get("born"),
                 Some(&None),
                 "added after this commit"
+            );
+            assert!(
+                view.reads.is_none(),
+                "a page held at a commit watches no reads"
             );
         });
         let names = asked.lock().unwrap().clone();

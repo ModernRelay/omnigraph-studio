@@ -40,6 +40,14 @@ pub fn fork_point<'a>(
         .find(|commit| reachable.contains(commit.graph_commit_id.as_str()))
 }
 
+/// Whether `target`'s history shows `head` merged: listed itself, or the merged parent of one
+/// of its commits.
+pub fn contains_merge_of(target: &[CommitOutput], head: &str) -> bool {
+    target
+        .iter()
+        .any(|c| c.graph_commit_id == head || c.merged_parent_commit_id.as_deref() == Some(head))
+}
+
 /// The commits of `branch` newer than `fork`, newest first. Every commit when `fork` is `None`.
 pub fn commits_since<'a>(branch: &'a [CommitOutput], fork: Option<&str>) -> &'a [CommitOutput] {
     match fork {
@@ -523,6 +531,9 @@ mod tests {
         ];
         assert_eq!(fork_point(&branch, &main).unwrap().graph_commit_id, "b2");
         assert_eq!(commits_since(&branch, Some("b2")).len(), 1);
+        assert!(contains_merge_of(&main, "b2"));
+        assert!(contains_merge_of(&main, "m2"));
+        assert!(!contains_merge_of(&main, "b3"));
     }
 
     #[test]
