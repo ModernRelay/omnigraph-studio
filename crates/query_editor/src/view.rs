@@ -1614,6 +1614,8 @@ impl QueryEditor {
         }));
     }
 
+    /// A read's answer built and shown in one step, as a run does across threads.
+    #[cfg(test)]
     fn finish_read(
         &mut self,
         prepared: Prepared,
