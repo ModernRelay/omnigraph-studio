@@ -67,8 +67,10 @@ times over.
 
 `script/measure-frames` runs the common cases against the development graph (`script/dev-server`)
 on `release-fast`: a key in the table's filter field, in a cell, in the query editor with six
-result columns, and in the Go To palette, and a table scroll. On 2026-10-14 (Apple M5 Pro, load
-average 5) each key cost 1.3 to 1.9 ms of main-thread CPU and a scroll 6 ms.
+result columns, and in the Go To palette, and a table scroll. On 2026-10-18 (Apple M5 Pro, load
+average 8) each key cost 1.2 to 2.0 ms of main-thread CPU and a table scroll 4.3 ms. On the
+personal graph's 92-column Person type a table scroll costs 4.0 ms, and a 63-column query
+result 2.2 ms.
 
 In the running app, `studio.show_performance` puts Studio's memory and CPU at the end of the
 footer, and a build with `--features perf` (GPUI's `profiler`) has GPUI's frame-time overlay on
