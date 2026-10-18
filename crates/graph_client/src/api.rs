@@ -62,6 +62,10 @@ pub enum GraphAvailability {
     Transitioning,
     Blocked,
     Stopping,
+    /// A value a newer server sends that this build does not know: Studio accepts any server
+    /// from 0.14 on, so an answer still decodes.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -72,6 +76,10 @@ pub enum GraphAvailabilityAction {
     WaitForTransition,
     ApplyCorrectionOrRestart,
     WaitForRestart,
+    /// A value a newer server sends that this build does not know: Studio accepts any server
+    /// from 0.14 on, so an answer still decodes.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -82,6 +90,10 @@ pub enum GraphStartupFailure {
     InvalidExternalBlobPolicy,
     OpenFailed,
     InvalidStoredQueries,
+    /// A value a newer server sends that this build does not know: Studio accepts any server
+    /// from 0.14 on, so an answer still decodes.
+    #[serde(other)]
+    Other,
 }
 
 // ---- schema and snapshot ----
@@ -121,7 +133,7 @@ pub struct SnapshotDatasetOutput {
     pub native_dataset_branch: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {
     Node,
@@ -335,6 +347,10 @@ pub enum BranchMergeOutcome {
     AlreadyUpToDate,
     FastForward,
     Merged,
+    /// A value a newer server sends that this build does not know: Studio accepts any server
+    /// from 0.14 on, so an answer still decodes.
+    #[serde(other)]
+    Other,
 }
 
 /// `GET /graphs/{id}/commits?branch=`.
@@ -373,6 +389,10 @@ pub enum CommitKind {
     Unpublished,
     /// An unattached snapshot, written `as unattached branch`, which never publishes.
     Unattached,
+    /// A value a newer server sends that this build does not know: Studio accepts any server
+    /// from 0.14 on, so an answer still decodes.
+    #[serde(other)]
+    Other,
 }
 
 // ---- changes ----
@@ -481,6 +501,10 @@ pub enum ErrorCode {
     Internal,
     /// `commit publish` of an unattached snapshot, which never publishes.
     UnattachedCannotPublish,
+    /// A value a newer server sends that this build does not know: Studio accepts any server
+    /// from 0.14 on, so an answer still decodes.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -503,6 +527,10 @@ pub enum MergeConflictKind {
     UniqueViolation,
     CardinalityViolation,
     ValueConstraintViolation,
+    /// A value a newer server sends that this build does not know: Studio accepts any server
+    /// from 0.14 on, so an answer still decodes.
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -812,5 +840,18 @@ mod contract_tests {
             let ours: BTreeSet<&str> = ours.iter().copied().collect();
             assert_eq!(ours, theirs, "{name}: variants differ from the contract");
         }
+    }
+
+    /// A value a newer server sends decodes as `Other`, so its answer is still read: an error
+    /// with a new code is still a refusal, with its message.
+    #[test]
+    fn a_value_this_build_does_not_know_still_decodes() {
+        use super::{ErrorCode, ErrorOutput, GraphAvailability};
+        let error: ErrorOutput =
+            serde_json::from_str(r#"{"error":"slow down","code":"brand_new_code"}"#).unwrap();
+        assert_eq!(error.code, Some(ErrorCode::Other));
+        assert_eq!(error.error, "slow down");
+        let state: GraphAvailability = serde_json::from_str(r#""draining""#).unwrap();
+        assert_eq!(state, GraphAvailability::Other);
     }
 }

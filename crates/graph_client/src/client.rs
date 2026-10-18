@@ -3,7 +3,6 @@
 //! Reads return `Result<T, ReadError>`. Writes return a [`WriteOutcome`] and are never retried
 //! here (constitution III).
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -250,14 +249,16 @@ pub fn server_root(input: &str) -> Result<String, String> {
     let text = if text.contains("://") {
         text.to_owned()
     } else {
-        let host = text
-            .split(['/', ':'])
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let loopback = matches!(host.as_str(), "localhost" | "0.0.0.0" | "[")
-            || host.starts_with("127.")
-            || text.starts_with("[::1]");
+        // The host as a URL reads it: a name that only begins like a loopback address
+        // (`127.example.com`, `[::ffff:203.0.113.7]`) is another host, reached over https.
+        let loopback = Url::parse(&format!("http://{text}"))
+            .ok()
+            .is_some_and(|url| match url.host() {
+                Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+                Some(url::Host::Ipv4(address)) => address.is_loopback() || address.is_unspecified(),
+                Some(url::Host::Ipv6(address)) => address.is_loopback(),
+                None => false,
+            });
         format!("{}://{text}", if loopback { "http" } else { "https" })
     };
     let url = Url::parse(&text).map_err(|error| format!("“{input}” is not an address: {error}"))?;
@@ -377,6 +378,20 @@ impl GraphClient {
         headers: &[(&str, &str)],
         timeout: Duration,
     ) -> Result<RawResponse, String> {
+        self.send_reading(method, url, body, headers, timeout, usize::MAX)
+            .await
+    }
+
+    /// [`Self::send`], reading at most `limit` bytes of the body: the rest is never read.
+    async fn send_reading(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<Vec<u8>>,
+        headers: &[(&str, &str)],
+        timeout: Duration,
+        limit: usize,
+    ) -> Result<RawResponse, String> {
         // No route answers with a redirect to follow; a Blob's external reference answers 302
         // with a URI Studio shows and never fetches.
         let mut builder = Request::builder()
@@ -415,10 +430,7 @@ impl GraphClient {
             .and_then(|value| value.trim().parse::<u64>().ok())
             .map(Duration::from_secs);
         let headers = response.headers().clone();
-        let mut bytes = Vec::new();
-        response
-            .into_body()
-            .read_to_end(&mut bytes)
+        let bytes = read_body(response.into_body(), limit)
             .await
             .map_err(|error| describe_transport(&error.into()))?;
         Ok(RawResponse {
@@ -439,16 +451,30 @@ impl GraphClient {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> Result<RawResponse, ReadError> {
+        self.fetch_reading(method, url, body, headers, usize::MAX)
+            .await
+    }
+
+    /// [`Self::fetch`], reading at most `limit` bytes of the body.
+    async fn fetch_reading(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<Vec<u8>>,
+        headers: &[(&str, &str)],
+        limit: usize,
+    ) -> Result<RawResponse, ReadError> {
         let mut retries = 0;
         loop {
             let raw = {
                 let _slot = self.read_slots.acquire().await;
-                self.send(
+                self.send_reading(
                     method.clone(),
                     url.clone(),
                     body.clone(),
                     headers,
                     READ_TIMEOUT,
+                    limit,
                 )
                 .await
                 .map_err(ReadError::Transport)?
@@ -553,8 +579,10 @@ impl GraphClient {
         }
         let url = self.blob_url(graph, cell, at);
         let bytes = format!("bytes={}-{}", range.start, end - 1);
+        // The range's bytes are the first `end` of the whole value too, which a server that
+        // ignores Range sends: what follows them is never read.
         let raw = self
-            .fetch(Method::GET, url, None, &[("range", &bytes)])
+            .fetch_reading(Method::GET, url, None, &[("range", &bytes)], end as usize)
             .await?;
         match raw.status.as_u16() {
             200 | 206 => {
@@ -683,21 +711,6 @@ impl GraphClient {
         serde_json::from_slice(&raw.body).map_err(|e| ReadError::Decode(e.to_string()))
     }
 
-    /// The operation ids the server's own OpenAPI document advertises (constitution X).
-    pub async fn operations(&self) -> Result<BTreeSet<String>, ReadError> {
-        let url = self.url(&["openapi.json"], &[]);
-        let raw = self
-            .send(Method::GET, url, None, &[], READ_TIMEOUT)
-            .await
-            .map_err(ReadError::Transport)?;
-        if !raw.status.is_success() {
-            return Err(ReadError::Refused(summary(raw.status, &raw.body)));
-        }
-        let document: Value =
-            serde_json::from_slice(&raw.body).map_err(|e| ReadError::Decode(e.to_string()))?;
-        Ok(operation_ids(&document))
-    }
-
     // ---- protected reads ----
 
     pub async fn graphs(&self) -> Result<GraphListResponse, ReadError> {
@@ -774,28 +787,12 @@ impl GraphClient {
             snapshot: None,
             ..request.clone()
         };
-        match if_commit {
-            Some(commit) => {
-                self.write(
-                    Method::POST,
-                    &["graphs", graph, "queries", name, "if-graph-commit"],
-                    &[],
-                    Some(json(&request)),
-                    &[(IF_GRAPH_COMMIT_HEADER, commit)],
-                )
-                .await
-            }
-            None => {
-                self.write(
-                    Method::POST,
-                    &["graphs", graph, "queries", name],
-                    &[],
-                    Some(json(&request)),
-                    &[],
-                )
-                .await
-            }
-        }
+        self.write_bound(
+            &["graphs", graph, "queries", name],
+            json(&request),
+            if_commit,
+        )
+        .await
     }
 
     pub async fn branches(&self, graph: &str) -> Result<BranchListOutput, ReadError> {
@@ -883,26 +880,37 @@ impl GraphClient {
         request: &ChangeRequest,
         if_commit: Option<&str>,
     ) -> WriteOutcome<ChangeOutput> {
+        self.write_bound(&["graphs", graph, "mutate"], json(request), if_commit)
+            .await
+    }
+
+    /// A `POST` to `segments`, or, bound to `if_commit`, to its `if-graph-commit` route with
+    /// the commit in the header: it changes nothing unless the branch is still at that commit.
+    async fn write_bound<T: DeserializeOwned>(
+        &self,
+        segments: &[&str],
+        body: Vec<u8>,
+        if_commit: Option<&str>,
+    ) -> WriteOutcome<T> {
         match if_commit {
             Some(commit) => {
+                let bound: Vec<&str> = segments
+                    .iter()
+                    .copied()
+                    .chain(["if-graph-commit"])
+                    .collect();
                 self.write(
                     Method::POST,
-                    &["graphs", graph, "mutate", "if-graph-commit"],
+                    &bound,
                     &[],
-                    Some(json(request)),
+                    Some(body),
                     &[(IF_GRAPH_COMMIT_HEADER, commit)],
                 )
                 .await
             }
             None => {
-                self.write(
-                    Method::POST,
-                    &["graphs", graph, "mutate"],
-                    &[],
-                    Some(json(request)),
-                    &[],
-                )
-                .await
+                self.write(Method::POST, segments, &[], Some(body), &[])
+                    .await
             }
         }
     }
@@ -1029,20 +1037,23 @@ fn classify_write<T: DeserializeOwned>(raw: RawResponse) -> WriteOutcome<T> {
     }
 }
 
-fn operation_ids(document: &Value) -> BTreeSet<String> {
-    let mut ids = BTreeSet::new();
-    if let Some(paths) = document.get("paths").and_then(Value::as_object) {
-        for operations in paths.values() {
-            if let Some(operations) = operations.as_object() {
-                for operation in operations.values() {
-                    if let Some(id) = operation.get("operationId").and_then(Value::as_str) {
-                        ids.insert(id.to_owned());
-                    }
-                }
-            }
-        }
+/// A response body: at most `limit` bytes, the rest left unread.
+async fn read_body(mut body: AsyncBody, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    if limit == usize::MAX {
+        body.read_to_end(&mut bytes).await?;
+        return Ok(bytes);
     }
-    ids
+    let mut buffer = vec![0; limit.min(256 * 1024)];
+    while bytes.len() < limit {
+        let want = buffer.len().min(limit - bytes.len());
+        let read = body.read(&mut buffer[..want]).await?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    Ok(bytes)
 }
 
 /// What went wrong reaching the server, in words: a class (refused, timed out, name not found,
@@ -1535,19 +1546,6 @@ mod tests {
         assert_eq!(gap("parse error: expected not_expr"), None);
     }
 
-    #[test]
-    fn operation_ids_come_from_the_served_document() {
-        let document: Value =
-            serde_json::from_str(include_str!("../openapi/omnigraph-0.14.0-edge.json")).unwrap();
-        let ids = operation_ids(&document);
-        assert!(ids.contains("cluster_query"));
-        assert!(ids.contains("cluster_getDiff"), "0.14 has the graph diff");
-        assert!(
-            !ids.contains("cluster_getNodeNeighborhood"),
-            "a route the document does not list is not there"
-        );
-    }
-
     /// A server for Blob reads: answers by `id`, and records each request's `Range` and
     /// redirect policy.
     fn blob_server() -> (Arc<dyn HttpClient>, Arc<std::sync::Mutex<Vec<String>>>) {
@@ -1634,6 +1632,45 @@ mod tests {
         );
     }
 
+    /// Bytes without end, counting how many were read.
+    struct Endless(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl futures::AsyncRead for Endless {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buffer: &mut [u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            buffer.fill(7);
+            self.0
+                .fetch_add(buffer.len(), std::sync::atomic::Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(buffer.len()))
+        }
+    }
+
+    /// A server that ignores Range sends the whole value: the range is cut from it, and what
+    /// follows the range is never read.
+    #[test]
+    fn a_range_answered_with_the_whole_value_reads_no_further_than_the_range() {
+        let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = read.clone();
+        let http = FakeHttpClient::create(move |_| {
+            let counted = counted.clone();
+            async move {
+                Ok(Response::builder()
+                    .status(200)
+                    .header(CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from_reader(Endless(counted)))
+                    .unwrap())
+            }
+        });
+        let client = client(http);
+        let bytes =
+            block_on(client.blob_bytes("g", &cell("whole"), BlobAt::Branch("main"), 10..14));
+        assert_eq!(bytes.unwrap(), [7, 7, 7, 7]);
+        assert_eq!(read.load(std::sync::atomic::Ordering::SeqCst), 14);
+    }
+
     #[test]
     fn blob_bytes_are_read_by_range_and_external_values_are_not_fetched() {
         let (http, seen) = blob_server();
@@ -1678,6 +1715,18 @@ mod tests {
             server_root("https://graph.example.com/base/").as_deref(),
             Ok("https://graph.example.com/base")
         );
+        // Only a loopback host goes without TLS, not a name that begins like one.
+        for remote in [
+            "127.example.com:8787",
+            "[::ffff:203.0.113.7]:8787",
+            "localhost.example",
+        ] {
+            assert!(
+                server_root(remote).unwrap().starts_with("https://"),
+                "{remote}"
+            );
+        }
+        assert!(server_root("0.0.0.0:8080").unwrap().starts_with("http://"));
         assert!(server_root("").is_err());
         assert!(server_root("ftp://graph.example.com").is_err());
         assert!(server_root("mailto:someone@example.com").is_err());
