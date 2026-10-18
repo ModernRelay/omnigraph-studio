@@ -18,13 +18,14 @@ pub const DEGREE_BATCH: usize = 100;
 /// Where one count goes: the asker, until it stops waiting.
 pub(crate) type Waiter = oneshot::Sender<Result<u64, String>>;
 
-/// The counts read together: one node type, one relationship, one commit (`None`, the branch
-/// head).
+/// The counts read together: one node type, one relationship, one commit (`None`, the head of
+/// `branch`, the session's branch when they were asked for).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct DegreeBatchKey {
     pub type_name: String,
     pub group: RelationshipGroup,
     pub snapshot: Option<String>,
+    pub branch: String,
 }
 
 /// One read to send: its key, and its nodes in id order with everyone waiting on each.
@@ -66,11 +67,11 @@ impl DegreeBatches {
 }
 
 /// `id → n` from a `builder::page_degrees` answer; a node with no neighbours has no row.
-pub(crate) fn page_counts(rows: &Value) -> HashMap<String, u64> {
-    rows.as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|row| Some((row.get("id")?.as_str()?.to_owned(), row.get("n")?.as_u64()?)))
+/// `None` when a row does not say both, so an answer that cannot be read is no count of 0.
+pub(crate) fn page_counts(rows: &Value) -> Option<HashMap<String, u64>> {
+    rows.as_array()?
+        .iter()
+        .map(|row| Some((row.get("id")?.as_str()?.to_owned(), row.get("n")?.as_u64()?)))
         .collect()
 }
 
@@ -89,6 +90,7 @@ mod tests {
                 other_type: "Person".into(),
             },
             snapshot: Some("c1".into()),
+            branch: "main".into(),
         }
     }
 
@@ -147,9 +149,12 @@ mod tests {
 
     #[test]
     fn counts_read_by_id_and_absent_nodes_have_none() {
-        let counts = page_counts(&json!([{"id": "p-1", "n": 3}, {"id": "p-2", "n": 0}, {"n": 4}]));
+        let counts = page_counts(&json!([{"id": "p-1", "n": 3}, {"id": "p-2", "n": 0}])).unwrap();
         assert_eq!(counts.get("p-1"), Some(&3));
         assert_eq!(counts.get("p-2"), Some(&0));
         assert_eq!(counts.len(), 2);
+        // A row that does not say its node or its count makes the answer unreadable.
+        assert_eq!(page_counts(&json!([{"id": "p-1", "n": 3}, {"n": 4}])), None);
+        assert_eq!(page_counts(&json!([{"id": "p-1", "n": -1}])), None);
     }
 }

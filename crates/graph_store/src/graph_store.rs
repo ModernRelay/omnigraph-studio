@@ -24,7 +24,7 @@ use gpui::App;
 
 pub use changes::{
     ChangeFold, FoldedChange, FoldedChanges, NetChange, PropertyDiff, REVIEW_CHANGE_CAP,
-    TypeCounts, commits_since, contains_merge_of, fork_point, grouped, summary_sentence,
+    TypeCounts, commits_since, contains_merge_of, fork_point, summary_sentence,
 };
 pub use connection::{
     Connection, ConnectionEvent, ConnectionState, GraphListing, ServerEntry, ServerSource,

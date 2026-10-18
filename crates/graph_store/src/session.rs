@@ -1385,7 +1385,9 @@ impl GraphSession {
                 group,
                 ids,
             } => {
-                let counts = page_counts(&output.rows);
+                let Some(counts) = page_counts(&output.rows) else {
+                    return;
+                };
                 for id in ids {
                     let key = DegreeAt {
                         type_name: type_name.clone(),
@@ -1414,22 +1416,34 @@ impl GraphSession {
             key.id.clone(),
             key.schema,
         );
-        let commits = self.degree_commits.get(&family)?.clone();
-        let carried = commits
+        let commits = self.degree_commits.get(&family)?;
+        let mut remaining: HashSet<&str> = commits
             .iter()
-            .rev()
-            .filter(|commit| **commit != key.commit)
-            .find_map(|commit| {
+            .map(String::as_str)
+            .filter(|commit| *commit != key.commit)
+            .collect();
+        let counts = &self.degree_counts;
+        let mut carried = None;
+        // One walk back from `key`'s commit gives the range since each kept commit it passes.
+        self.change_logs
+            .get(&self.branch)?
+            .since_each(&key.commit, |start, since| {
+                if !remaining.remove(start) {
+                    return false;
+                }
                 let at = DegreeAt {
-                    commit: commit.clone(),
+                    commit: start.to_owned(),
                     ..key.clone()
                 };
-                let n = *self.degree_counts.peek(&at)?;
-                match self.changes_since(&self.branch, commit, &key.commit) {
-                    Since::Known(since) if !since.edges_at(&key.group.edge, &key.id) => Some(n),
-                    _ => None,
+                if let Some(n) = counts.peek(&at)
+                    && !since.edges_at(&key.group.edge, &key.id)
+                {
+                    carried = Some(*n);
+                    return true;
                 }
-            })?;
+                remaining.is_empty()
+            });
+        let carried = carried?;
         self.count_kept_at(key);
         self.degree_counts.insert(key.clone(), carried);
         Some(carried)
@@ -1454,29 +1468,39 @@ impl GraphSession {
             return None;
         }
         let family = (key.query.clone(), key.params.clone(), key.schema);
-        let commits = self.pinned_commits.get(&family)?.clone();
-        let mut gone = Vec::new();
+        let commits = self.pinned_commits.get(&family)?;
+        let reads = &self.pinned_reads;
+        let at = |commit: &str| PinnedRead {
+            commit: commit.to_owned(),
+            ..key.clone()
+        };
+        let (kept, gone): (Vec<&str>, Vec<&str>) = commits
+            .iter()
+            .map(String::as_str)
+            .filter(|commit| *commit != key.commit)
+            .partition(|commit| reads.peek(&at(commit)).is_some());
+        let mut remaining: HashSet<&str> = kept.into_iter().collect();
+        let gone: Vec<String> = gone.into_iter().map(str::to_owned).collect();
         let mut found = None;
-        // The newest first: the fewest commits to walk.
-        for commit in commits.iter().rev().filter(|commit| **commit != key.commit) {
-            let at = PinnedRead {
-                commit: commit.clone(),
-                ..key.clone()
-            };
-            let Some(output) = self.pinned_reads.peek(&at) else {
-                gone.push(commit.clone());
-                continue;
-            };
-            if let Since::Known(since) = self.changes_since(&self.branch, commit, &key.commit)
-                && answer_unchanged(&since, depends, &output.rows)
-            {
-                let mut output = output.clone();
-                output.graph_commit_id = Some(key.commit.clone());
-                output.target.branch = None;
-                output.target.snapshot = Some(key.commit.clone());
-                found = Some(output);
-                break;
-            }
+        // One walk back from `key`'s commit gives the range since each kept answer it passes,
+        // the newest first.
+        if let Some(log) = self.change_logs.get(&self.branch) {
+            log.since_each(&key.commit, |start, since| {
+                if !remaining.remove(start) {
+                    return false;
+                }
+                if let Some(output) = reads.peek(&at(start))
+                    && answer_unchanged(since, depends, &output.rows)
+                {
+                    let mut output = output.clone();
+                    output.graph_commit_id = Some(key.commit.clone());
+                    output.target.branch = None;
+                    output.target.snapshot = Some(key.commit.clone());
+                    found = Some(output);
+                    return true;
+                }
+                remaining.is_empty()
+            });
         }
         if !gone.is_empty()
             && let Some(commits) = self.pinned_commits.get_mut(&family)
@@ -1959,6 +1983,7 @@ impl GraphSession {
             type_name: type_name.to_owned(),
             group: group.clone(),
             snapshot,
+            branch: self.branch.clone(),
         };
         if self.degrees.add(key, id.to_owned(), tx) {
             let session = cx.entity().downgrade();
@@ -1982,6 +2007,20 @@ impl GraphSession {
                 !waiters.is_empty()
             });
             if nodes.is_empty() {
+                continue;
+            }
+            // Asked for at the head of a branch the session has since left: its head is not
+            // this branch's, and the asker reads again on the move.
+            if key.snapshot.is_none() && key.branch != self.branch {
+                for (_, waiters) in nodes {
+                    for waiter in waiters {
+                        waiter
+                            .send(Err(
+                                "The branch changed while the count was asked for.".into()
+                            ))
+                            .ok();
+                    }
+                }
                 continue;
             }
             let ids: Vec<String> = nodes.iter().map(|(id, _)| id.clone()).collect();
@@ -2017,8 +2056,11 @@ impl GraphSession {
                     }
                 };
                 let answer = result
-                    .map(|output| page_counts(&output.rows))
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| error.to_string())
+                    .and_then(|output| {
+                        page_counts(&output.rows)
+                            .ok_or_else(|| "The server's counts could not be read.".to_owned())
+                    });
                 for (id, waiters) in nodes {
                     let count = answer
                         .as_ref()
@@ -2970,6 +3012,17 @@ mod tests {
             count.await.unwrap();
         }
         assert_eq!(reads.lock().unwrap().len(), 2);
+
+        // A count asked for at the head of a branch the session leaves in the same turn is not
+        // read at the new branch's head.
+        let at_head = session.update(cx, |session, cx| {
+            let count = session.degree("Person", &group("Knows", "Person"), "p-1", None, cx);
+            session.set_branch("fix".into(), cx);
+            count
+        });
+        let error = at_head.await.unwrap_err();
+        assert!(error.contains("branch changed"), "{error}");
+        assert_eq!(reads.lock().unwrap().len(), 2, "nothing was read for it");
     }
 
     /// The session asks after its branch's head, and each watched branch's, once the schema

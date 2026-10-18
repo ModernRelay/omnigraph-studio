@@ -117,11 +117,15 @@ impl Logged {
                         .filter_map(|end| endpoints.get(end).and_then(Value::as_str))
                         .map(str::to_owned)
                         .collect::<Vec<_>>()
-                });
-            self.touched
-                .entry(ty)
-                .or_insert_with(Touched::none)
-                .add(&change.id, ends);
+                })
+                .collect::<Vec<_>>();
+            let touched = self.touched.entry(ty).or_insert_with(Touched::none);
+            // An edge whose ends the images do not say could be at any node.
+            if matches!(change.kind, EntityKind::Edge) && ends.is_empty() {
+                *touched = Touched::All;
+            } else {
+                touched.add(&change.id, ends);
+            }
         }
     }
 }
@@ -181,7 +185,8 @@ pub fn answer_unchanged(since: &ChangesSince, depends: &Depends, rows: &Value) -
     depends_unchanged(since, depends, listed_ids(depends, rows).as_deref())
 }
 
-/// The nodes an answer lists, for a dependence that names a column of them.
+/// The nodes an answer lists, for a dependence that names a column of them; `None`, which
+/// counts any change to the listed type, when a row does not name its node.
 pub(crate) fn listed_ids(depends: &Depends, rows: &Value) -> Option<Vec<String>> {
     let Depends::EdgesAt {
         listed: Some((_, column)),
@@ -190,14 +195,10 @@ pub(crate) fn listed_ids(depends: &Depends, rows: &Value) -> Option<Vec<String>>
     else {
         return None;
     };
-    Some(
-        rows.as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|row| row.get(column).and_then(Value::as_str))
-            .map(str::to_owned)
-            .collect(),
-    )
+    rows.as_array()?
+        .iter()
+        .map(|row| row.get(column).and_then(Value::as_str).map(str::to_owned))
+        .collect()
 }
 
 /// Whether `since` left alone an answer that depends on `depends`. `listed` holds the nodes a
@@ -287,17 +288,33 @@ impl ChangeLog {
     /// What the commits after `from` up to and including `to` changed, walking back from `to`
     /// by first parent; `None` when one of them is not in the log.
     pub(crate) fn since(&self, from: &str, to: &str) -> Option<ChangesSince> {
+        let mut found = None;
+        self.since_each(to, |start, range| {
+            if start == from {
+                found = Some(range.clone());
+                return true;
+            }
+            false
+        });
+        found
+    }
+
+    /// One walk back from `to` by first parent, merging each commit once: `visit` hears each
+    /// commit the walk reaches, newest first, with what the commits after it up to `to`
+    /// changed, and ends the walk by answering `true`. Reading the ranges from several earlier
+    /// commits costs one walk, not one each.
+    pub(crate) fn since_each(&self, to: &str, mut visit: impl FnMut(&str, &ChangesSince) -> bool) {
         let mut at = to;
         let mut range: Option<ChangesSince> = None;
         for _ in 0..LOG_COMMITS {
-            let logged = self.commits.get(at)?;
-            match &mut range {
-                None => {
-                    range = Some(ChangesSince {
-                        asked: (*logged.asked).clone(),
-                        touched: logged.touched.clone(),
-                    })
-                }
+            let Some(logged) = self.commits.get(at) else {
+                return;
+            };
+            let range = match &mut range {
+                None => range.insert(ChangesSince {
+                    asked: (*logged.asked).clone(),
+                    touched: logged.touched.clone(),
+                }),
                 Some(range) => {
                     range.asked.retain(|name| logged.asked.contains(name));
                     for (ty, touched) in &logged.touched {
@@ -307,15 +324,17 @@ impl ChangeLog {
                             .or_insert_with(Touched::none)
                             .merge(touched);
                     }
+                    range
                 }
+            };
+            let Some(parent) = logged.parent.as_deref() else {
+                return;
+            };
+            if visit(parent, range) {
+                return;
             }
-            match logged.parent.as_deref() {
-                Some(parent) if parent == from => return range,
-                Some(parent) => at = parent,
-                None => return None,
-            }
+            at = parent;
         }
-        None
     }
 }
 
@@ -451,6 +470,76 @@ pub(crate) mod tests {
         assert!(!later.type_changed(&person));
         // A start the log cannot reach is not an answer.
         assert!(log.since("c0", "c4").is_none());
+    }
+
+    /// What cannot be told is taken as changed: an edge whose images name no ends could be at
+    /// any node, and an answer with a row that does not name its node lists unknown nodes.
+    #[test]
+    fn what_a_change_or_an_answer_does_not_say_counts_as_changed() {
+        let ends_unknown = json!({
+            "kind": "edge",
+            "type": { "id": "WorksAt", "name": "WorksAt" },
+            "id": "e1",
+            "op": "delete",
+            "before": { "properties": {} },
+        });
+        let log = log(
+            &[page(
+                json!([block("c2", "c1", json!([ends_unknown]))]),
+                true,
+            )],
+            &["WorksAt"],
+        );
+        assert!(log.since("c1", "c2").unwrap().edges_at("WorksAt", "anyone"));
+
+        let depends = Depends::EdgesAt {
+            edge: "WorksAt".into(),
+            nodes: vec!["p1".into()],
+            listed: Some(("Company".into(), "id".into())),
+        };
+        assert_eq!(
+            listed_ids(&depends, &json!([{ "id": "co1" }, { "id": "co2" }])),
+            Some(vec!["co1".to_owned(), "co2".to_owned()])
+        );
+        assert_eq!(
+            listed_ids(&depends, &json!([{ "id": "co1" }, { "name": "x" }])),
+            None
+        );
+        assert_eq!(listed_ids(&depends, &json!({ "id": "co1" })), None);
+    }
+
+    /// One walk back gives, for each commit it passes, the same range `since` gives from it.
+    #[test]
+    fn one_walk_reads_the_range_since_each_earlier_commit() {
+        let log = log(
+            &[page(
+                json!([
+                    block("c2", "c1", json!([node("Person", "p1")])),
+                    block("c3", "c2", json!([])),
+                    block("c4", "c3", json!([node("Person", "p2")])),
+                ]),
+                true,
+            )],
+            &["Person"],
+        );
+        let person = TypeRef::Node("Person".into());
+        let mut seen = Vec::new();
+        log.since_each("c4", |start, range| {
+            let alone = log.since(start, "c4").unwrap();
+            for id in ["p1", "p2"] {
+                assert_eq!(
+                    range.entity_changed(&person, id),
+                    alone.entity_changed(&person, id)
+                );
+            }
+            seen.push(start.to_owned());
+            start == "c2"
+        });
+        assert_eq!(
+            seen,
+            ["c3", "c2"],
+            "newest first, until the visit ends the walk"
+        );
     }
 
     #[test]

@@ -206,8 +206,6 @@ pub(crate) fn endpoints_of(value: &Value) -> Option<(String, String)> {
 pub struct ChangeFold {
     entries: Vec<FoldedChange>,
     index: HashMap<(bool, String, String), usize>,
-    commits: Vec<String>,
-    actors: BTreeSet<String>,
     raw_changes: usize,
 }
 
@@ -226,7 +224,6 @@ impl ChangeFold {
         for change in changes {
             self.add(&cause, change);
         }
-        self.note_commit(&cause);
     }
 
     /// Adds every change in `block` until `cap` feed entries have been folded. Returns `false`
@@ -241,17 +238,7 @@ impl ChangeFold {
             }
             self.add(&cause, change);
         }
-        self.note_commit(&cause);
         complete
-    }
-
-    fn note_commit(&mut self, cause: &ChangeCauseOutput) {
-        if self.commits.last() != Some(&cause.graph_commit_id) {
-            self.commits.push(cause.graph_commit_id.clone());
-        }
-        if let Some(actor) = &cause.actor_id {
-            self.actors.insert(actor.clone());
-        }
     }
 
     pub fn add(&mut self, cause: &ChangeCauseOutput, change: EntityChangeOutput) {
@@ -316,8 +303,6 @@ impl ChangeFold {
         });
         FoldedChanges {
             changes: changes.into_iter().map(|(_, c)| c).collect(),
-            commits: self.commits,
-            actors: self.actors.into_iter().collect(),
             raw_changes: self.raw_changes,
         }
     }
@@ -327,9 +312,6 @@ impl ChangeFold {
 #[derive(Debug, Clone, Default)]
 pub struct FoldedChanges {
     pub changes: Vec<FoldedChange>,
-    /// Commits whose changes were folded, in feed order.
-    pub commits: Vec<String>,
-    pub actors: Vec<String>,
     pub raw_changes: usize,
 }
 
@@ -390,7 +372,7 @@ fn plural(count: usize, one: &str, many: &str) -> String {
 }
 
 /// `20000` → `20,000`.
-pub fn grouped(n: usize) -> String {
+fn grouped(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
@@ -812,9 +794,7 @@ mod tests {
         };
         assert!(!fold.add_block_capped(block, 3));
         assert_eq!(fold.raw_changes(), 3);
-        let folded = fold.finish();
-        assert_eq!(folded.commits, vec!["c1"]);
-        assert_eq!(folded.actors, vec!["act-a"]);
+        assert_eq!(fold.finish().changes.len(), 3);
     }
 
     /// Spec 008's budget: folding a capped review stays under a second off the main thread.
