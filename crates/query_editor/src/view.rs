@@ -11,7 +11,8 @@ use editor::display_map::{
 };
 use editor::scroll::Autoscroll;
 use editor::{
-    Editor, EditorEvent, HighlightKey, MultiBufferOffset, SelectionEffects, ToOffset as _,
+    Anchor, Bias, Editor, EditorEvent, HighlightKey, MultiBufferOffset, SelectionEffects,
+    ToOffset as _,
 };
 use gpui::{
     AnyView, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, Entity, EventEmitter,
@@ -19,7 +20,7 @@ use gpui::{
     ScrollHandle, ScrollStrategy, SharedString, StyleRefinement, Subscription, Task,
     UnderlineStyle, UniformListScrollHandle, WeakEntity, Window, uniform_list,
 };
-use gq_language::{QueryInfo, ResultColumn, SchemaModel, Statement, TokenKind};
+use gq_language::{QueryInfo, ResultColumn, SchemaModel, TokenKind};
 use graph_client::api::ErrorCode;
 use graph_client::api::{
     ChangeRequest, ParamDescriptor, ParamKind, QueryCatalogEntry, QueryRequest, ReadOutput,
@@ -31,6 +32,7 @@ use studio_actions::query::{CopyCell, CopyRow, Explain, Run, Save, SaveAs};
 use studio_ui::{
     ColumnDrag, ColumnResize, GridColumn, GridPlace, ROW_HEIGHT, columns_in_view, format_value,
     grid_cell, grid_header, grid_places, is_numeric, resizable_grid_header, short_commit_id,
+    value_text,
 };
 use studio_workspace::{Item, ItemEvent, ItemFooter, KeyHint, SavedItem};
 use ui::prelude::*;
@@ -39,8 +41,8 @@ use ui::{ContextMenu, KeyBinding, PopoverMenu, Tooltip};
 use crate::analysis::Analysis;
 use crate::completion::GqCompletionProvider;
 use crate::results::{
-    PlanItem, ResultGraph, ResultTable, ServerDiagnostic, SourceMap, copy_text, format_elapsed,
-    is_plan, plan_items, rows_label, server_diagnostic, short_commit, type_label,
+    PlanItem, ResultGraph, ResultTable, ServerDiagnostic, SourceMap, format_elapsed, is_plan,
+    plan_items, rows_label, server_diagnostic, type_label,
 };
 
 /// How long typing pauses before the source is checked again.
@@ -241,11 +243,18 @@ pub struct QueryEditor {
     /// The `.gq` file this tab edits, and its text as last read or written (spec 007).
     path: Option<std::path::PathBuf>,
     saved_text: Option<String>,
+    /// The text differs from `saved_text`: found once per edit, not on every draw of the tab.
+    unsaved: bool,
     file_error: Option<String>,
     /// The run line above each declaration (spec 007): the blocks, the declarations they were
     /// made for, and each declaration's last outcome by name.
     run_lines: Vec<CustomBlockId>,
     run_line_names: Vec<String>,
+    /// Where each run line's declaration starts, kept by the text as it is edited.
+    run_line_starts: Vec<Anchor>,
+    /// Where each problem of the last check starts, kept by the text as it is edited: a jump
+    /// made before the next check lands where the problem is now.
+    problem_starts: Vec<Option<Anchor>>,
     last_runs: HashMap<String, RunNote>,
     /// The branch's latest commits, for the snapshot picker: id, Unix micros, actor.
     commits: Vec<(String, i64, Option<String>)>,
@@ -355,13 +364,8 @@ impl Item for QueryEditor {
     }
 
     /// A file-backed query with changes since it was saved.
-    fn is_dirty(&self, cx: &App) -> bool {
-        self.writing
-            || self.stored.is_none()
-                && self
-                    .saved_text
-                    .as_ref()
-                    .is_some_and(|saved| *saved != self.editor.read(cx).text(cx))
+    fn is_dirty(&self, _cx: &App) -> bool {
+        self.writing || self.stored.is_none() && self.unsaved
     }
 
     fn tab_icon(&self, _cx: &App) -> Option<IconName> {
@@ -488,11 +492,18 @@ impl QueryEditor {
                 &session,
                 window,
                 |this, _, event: &SessionEvent, window, cx| match event {
-                    SessionEvent::SchemaChanged => {
+                    // Another writer's schema too: the text is checked against the schema the
+                    // session reads under now.
+                    SessionEvent::SchemaChanged | SessionEvent::SchemaMoved => {
                         this.set_example(window, cx);
                         this.schedule_check(window, cx);
                     }
                     SessionEvent::BranchChanged | SessionEvent::BranchesChanged => {
+                        // A write waiting to be confirmed was for the branch shown when it
+                        // was asked for.
+                        if matches!(event, SessionEvent::BranchChanged) {
+                            this.pending_write = None;
+                        }
                         this.load_commits(cx);
                         cx.notify()
                     }
@@ -511,11 +522,14 @@ impl QueryEditor {
             session,
             path: None,
             saved_text: None,
+            unsaved: false,
             file_error: None,
             commits: Vec::new(),
             commits_task: None,
             run_lines: Vec::new(),
             run_line_names: Vec::new(),
+            run_line_starts: Vec::new(),
+            problem_starts: Vec::new(),
             last_runs: HashMap::new(),
             at_commit: None,
             editor,
@@ -686,6 +700,8 @@ impl QueryEditor {
     /// Pins reads to a commit and refuses writes, for a query opened from History.
     pub fn pin_to(&mut self, commit: String, cx: &mut Context<Self>) {
         self.at_commit = Some(commit);
+        // A pinned tab only reads.
+        self.pending_write = None;
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
@@ -700,9 +716,17 @@ impl QueryEditor {
     ) {
         self.path = Some(path);
         self.saved_text = Some(saved.unwrap_or_default());
+        self.sync_unsaved(cx);
         self.file_error = None;
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
+    }
+
+    fn sync_unsaved(&mut self, cx: &App) {
+        self.unsaved = self
+            .saved_text
+            .as_ref()
+            .is_some_and(|saved| *saved != self.editor.read(cx).text(cx));
     }
 
     /// ⌘S: writes the file this tab edits; a new query is saved in this graph's queries folder,
@@ -785,6 +809,8 @@ impl QueryEditor {
                     Ok(()) => {
                         this.path = Some(path);
                         this.saved_text = Some(text);
+                        // Typing while it was written stays unsaved.
+                        this.sync_unsaved(cx);
                         this.file_error = None;
                         crate::saved_queries_changed(cx);
                     }
@@ -839,8 +865,13 @@ impl QueryEditor {
     // ---- editing ----
 
     fn edited(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The write waiting to be confirmed is the text as it was; an edit asks again.
+        if self.pending_write.take().is_some() {
+            cx.notify();
+        }
         if self.saved_text.is_some() {
             // The tab's changed-since-saved dot follows the text.
+            self.sync_unsaved(cx);
             cx.emit(ItemEvent::UpdateTab);
         }
         self.highlight_syntax(cx);
@@ -849,7 +880,7 @@ impl QueryEditor {
     }
 
     fn cursor_moved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let before = self.current_query().map(|(name, _)| name);
+        let before = self.current_query().map(|(name, _)| name.to_owned());
         let editor = self.editor.read(cx);
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         self.cursor = editor
@@ -863,7 +894,7 @@ impl QueryEditor {
         // a run the result area shows its columns. Only a new declaration notifies: the tab
         // draws again anyway because its editor changed, and a notify on every key would draw
         // the rows again too.
-        if self.current_query().map(|(name, _)| name) != before {
+        if self.current_query().map(|(name, _)| name) != before.as_deref() {
             cx.emit(ItemEvent::UpdateTab);
             cx.notify();
         }
@@ -905,7 +936,9 @@ impl QueryEditor {
 
     /// Checks the text after typing pauses, off the main thread.
     fn schedule_check(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A check under a schema being read again would be replaced when it is in.
         let Some(schema) = self.schema(cx).filter(|_| self.stored.is_none()) else {
+            self.check_task = None;
             return;
         };
         self.check_task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -913,11 +946,18 @@ impl QueryEditor {
             let Ok(text) = this.update(cx, |this, cx| this.editor.read(cx).text(cx)) else {
                 return;
             };
+            let checked = schema.clone();
             let analysis = cx
-                .background_spawn(async move { Analysis::new(&schema, text) })
+                .background_spawn(async move { Analysis::new(&checked, text) })
                 .await;
             this.update_in(cx, |this, window, cx| {
-                this.apply_analysis(Arc::new(analysis), window, cx)
+                // Under another schema now: the check that schema scheduled is coming.
+                if this
+                    .schema(cx)
+                    .is_some_and(|now| Arc::ptr_eq(&now, &schema) || now.source == schema.source)
+                {
+                    this.apply_analysis(Arc::new(analysis), window, cx);
+                }
             })
             .ok();
         }));
@@ -929,14 +969,23 @@ impl QueryEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A check of older text would underline the wrong places and offer the wrong
+        // parameters; a newer one is coming.
+        if self.editor.read(cx).text(cx) != analysis.text {
+            return;
+        }
         let error = cx.theme().status().error;
         let key = HighlightKey::ConsoleAnsiHighlight(DIAGNOSTIC_KEY);
-        self.editor.update(cx, |editor, cx| {
-            // A check of older text would underline the wrong places; a newer one is coming.
-            if editor.text(cx) != analysis.text {
-                return;
-            }
+        self.problem_starts = self.editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let starts = analysis
+                .problems
+                .iter()
+                .map(|(_, range)| {
+                    let range = range.as_ref()?;
+                    Some(snapshot.anchor_after(MultiBufferOffset(range.start)))
+                })
+                .collect();
             let ranges: Vec<_> = analysis
                 .problems
                 .iter()
@@ -963,6 +1012,7 @@ impl QueryEditor {
                     cx,
                 );
             }
+            starts
         });
         self.analysis = Some(analysis);
         self.sync_params(window, cx);
@@ -989,18 +1039,28 @@ impl QueryEditor {
         }
         let this = cx.entity().downgrade();
         let old: collections::HashSet<CustomBlockId> = self.run_lines.drain(..).collect();
-        let lines = self.editor.update(cx, |editor, cx| {
+        let (lines, starts) = self.editor.update(cx, |editor, cx| {
             editor.remove_blocks(old, None, cx);
             let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let starts: Vec<Anchor> = analysis
+                .outline
+                .declarations
+                .iter()
+                // After: text typed just before a declaration stays above its run line.
+                .map(|declaration| {
+                    snapshot.anchor_after(MultiBufferOffset(declaration.range.start))
+                })
+                .collect();
             let blocks: Vec<BlockProperties<editor::Anchor>> = analysis
                 .outline
                 .declarations
                 .iter()
+                .zip(&starts)
                 .enumerate()
-                .map(|(index, declaration)| {
+                .map(|(index, (declaration, at))| {
                     let this = this.clone();
                     let name = declaration.name.clone();
-                    let at = snapshot.anchor_before(MultiBufferOffset(declaration.range.start));
+                    let at = *at;
                     BlockProperties {
                         placement: BlockPlacement::Above(at),
                         height: Some(1),
@@ -1012,19 +1072,19 @@ impl QueryEditor {
                     }
                 })
                 .collect();
-            editor.insert_blocks(blocks, None, cx)
+            (editor.insert_blocks(blocks, None, cx), starts)
         });
         self.run_lines = lines;
+        self.run_line_starts = starts;
         self.run_line_names = names;
     }
 
-    /// The run line's click: run the declaration it sits above.
+    /// The run line's click: run the declaration it sits above, where it is now.
     fn run_declaration(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(start) = self
-            .analysis
-            .as_ref()
-            .and_then(|a| a.outline.declarations.get(index))
-            .map(|d| d.range.start)
+            .run_line_starts
+            .get(index)
+            .map(|at| self.offset_of(at, cx))
         else {
             return;
         };
@@ -1197,7 +1257,7 @@ impl QueryEditor {
                 let (_, Some(info)) = self.current_query()? else {
                     return None;
                 };
-                Some(info.params)
+                Some(info.params.clone())
             }
         }
     }
@@ -1248,10 +1308,10 @@ impl QueryEditor {
     }
 
     /// The declaration under the cursor and what the last check said about it.
-    fn current_query(&self) -> Option<(String, Option<QueryInfo>)> {
+    fn current_query(&self) -> Option<(&str, Option<&QueryInfo>)> {
         let analysis = self.analysis.as_ref()?;
         let (declaration, info) = analysis.query_at(self.cursor)?;
-        Some((declaration.name.clone(), info.cloned()))
+        Some((declaration.name.as_str(), info))
     }
 
     /// Makes an input for each parameter of the query under the cursor. Inputs are kept by
@@ -1260,19 +1320,30 @@ impl QueryEditor {
         let Some((_, Some(info))) = self.current_query() else {
             return;
         };
-        for (name, _, nullable) in &info.params {
-            if self.params.contains_key(name) {
-                continue;
-            }
-            let placeholder = if *nullable { "empty is null" } else { "value" };
+        let missing: Vec<(String, bool)> = info
+            .params
+            .iter()
+            .filter(|(name, ..)| !self.params.contains_key(name))
+            .map(|(name, _, nullable)| (name.clone(), *nullable))
+            .collect();
+        for (name, nullable) in missing {
+            let placeholder = if nullable { "empty is null" } else { "value" };
             let input = param_input(placeholder, None, window, cx);
-            self.params.insert(name.clone(), input);
+            self.params.insert(name, input);
         }
     }
 
+    fn offset_of(&self, anchor: &Anchor, cx: &App) -> usize {
+        let snapshot = self.editor.read(cx).buffer().read(cx).snapshot(cx);
+        anchor.to_offset(&snapshot).0
+    }
+
+    /// Puts the cursor at `offset`, kept within the text and on a character's boundary.
     fn jump_to(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, cx| {
-            let offset = offset.min(editor.text(cx).len());
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let offset = MultiBufferOffset(offset.min(snapshot.len().0));
+            let offset = snapshot.clip_offset(offset, Bias::Left).0;
             editor.change_selections(
                 SelectionEffects::scroll(Autoscroll::center()),
                 window,
@@ -1296,6 +1367,15 @@ impl QueryEditor {
             if explain {
                 return Err("Explain shows the plan of a query, not of a statement.".into());
             }
+            if statement.targets_branch()
+                && let Some(commit) = &self.at_commit
+            {
+                return Err(format!(
+                    "A load goes to a branch head, and this tab reads commit {}. Open a new \
+                     query to load into a branch.",
+                    short_commit_id(commit)
+                ));
+            }
             let label = source[outline.prefix.end..]
                 .lines()
                 .next()
@@ -1306,10 +1386,10 @@ impl QueryEditor {
                 text: source.clone(),
                 name: None,
                 label,
-                write: statement != Statement::Read,
-                // A load writes to the request's branch, as a mutation does; the others name
-                // their own targets.
-                statement: statement != Statement::Load,
+                write: statement.writes(),
+                // A load, and the plan of one, go to the request's branch, as a mutation does;
+                // the others name their own targets.
+                statement: !statement.targets_branch(),
                 params: None,
                 columns: None,
                 map: SourceMap {
@@ -1419,6 +1499,10 @@ impl QueryEditor {
     }
 
     fn explain(&mut self, _: &Explain, _window: &mut Window, cx: &mut Context<Self>) {
+        // A write's outcome stays on screen until it is in, as Run waits for it.
+        if self.writing {
+            return;
+        }
         match self.prepare(true, cx) {
             Err(message) => self.output = Output::Failed(Failure::new(message)),
             Ok(prepared) => self.send_read(prepared, cx),
@@ -1557,6 +1641,26 @@ impl QueryEditor {
         let Some(PendingWrite { prepared, branch }) = self.pending_write.take() else {
             return;
         };
+        // What would be sent now must be what the bar asked about: a parameter typed, a branch
+        // switched or a pin since then sends nothing, and Run asks again.
+        let now = self.prepare(false, cx).ok();
+        let same = now.as_ref().is_some_and(|now| {
+            now.text == prepared.text
+                && now.params == prepared.params
+                && now.stored == prepared.stored
+        }) && self.at_commit.is_none()
+            && self.branch(cx) == branch;
+        if !same {
+            self.output = Output::Failed(Failure::new(
+                "The query, its parameters or its branch changed after Run; nothing was written. \
+                 Run it again to confirm the write as it is now."
+                    .to_owned(),
+            ));
+            let focus = self.main_focus(cx);
+            window.focus(&focus, cx);
+            cx.notify();
+            return;
+        }
         let request = ChangeRequest {
             query: prepared.text.clone(),
             name: prepared.name.clone(),
@@ -1582,6 +1686,8 @@ impl QueryEditor {
             }),
         };
         self.writing = true;
+        // A read still out would land over the write's outcome.
+        self.run_task = None;
         self.output = Output::Running {
             label: format!("Writing {} to {branch}…", prepared.label).into(),
         };
@@ -1688,7 +1794,7 @@ impl QueryEditor {
         if let (Output::Rows(rows), Some((row, column))) = (&self.output, self.selected)
             && let Some(value) = rows.table.rows.get(row).and_then(|r| r.get(column))
         {
-            cx.write_to_clipboard(ClipboardItem::new_string(copy_text(value)));
+            cx.write_to_clipboard(ClipboardItem::new_string(value_text(value)));
         }
     }
 
@@ -1839,10 +1945,12 @@ impl QueryEditor {
             None => match self.current_query() {
                 Some((name, Some(info))) if !name.is_empty() => (
                     IconName::FileCode,
-                    Some(name),
+                    Some(name.to_owned()),
                     Some(if info.is_mutation { "writes" } else { "reads" }),
                 ),
-                Some((name, None)) if !name.is_empty() => (IconName::FileCode, Some(name), None),
+                Some((name, None)) if !name.is_empty() => {
+                    (IconName::FileCode, Some(name.to_owned()), None)
+                }
                 _ => (IconName::FileCode, None, None),
             },
         };
@@ -1942,8 +2050,8 @@ impl QueryEditor {
                         .problems
                         .iter()
                         .enumerate()
-                        .map(|(index, (problem, range))| {
-                            let at = range.as_ref().map(|r| r.start);
+                        .map(|(index, (problem, _))| {
+                            let at = self.problem_starts.get(index).copied().flatten();
                             let position = match (problem.line, problem.column) {
                                 (Some(line), Some(column)) => format!("{line}:{column}"),
                                 _ => String::new(),
@@ -1993,8 +2101,9 @@ impl QueryEditor {
                                         .color(Color::Muted),
                                 )
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    if let Some(at) = at {
-                                        this.jump_to(at, window, cx);
+                                    if let Some(at) = &at {
+                                        let offset = this.offset_of(at, cx);
+                                        this.jump_to(offset, window, cx);
                                     }
                                 }))
                         }),
@@ -2200,7 +2309,7 @@ impl QueryEditor {
             Some((name, Some(info))) if info.is_mutation => v_flex()
                 .flex_1()
                 .min_h_0()
-                .child(writes(&name, self.branch(cx)))
+                .child(writes(name, self.branch(cx)))
                 .into_any_element(),
             _ => v_flex()
                 .flex_1()
@@ -2355,8 +2464,11 @@ impl QueryEditor {
         let widths: Vec<Pixels> = rows.widths.iter().map(|&width| px(width)).collect();
         // The row numbers scroll with the columns. The view is never wider than the window,
         // whose width is this frame's.
-        let start = -self.results_hscroll.offset().x - px(ROW_NUMBER_WIDTH);
-        let mut drawn = columns_in_view(&widths, start..start + window.viewport_size().width);
+        let width = window.viewport_size().width;
+        let content = widths.iter().fold(px(ROW_NUMBER_WIDTH), |sum, w| sum + *w);
+        let scrolled = studio_ui::scrolled_within(-self.results_hscroll.offset().x, content, width);
+        let start = scrolled - px(ROW_NUMBER_WIDTH);
+        let mut drawn = columns_in_view(&widths, start..start + width);
         if let Some(drawn) = self.selected.and_then(|(_, column)| drawn.get_mut(column)) {
             *drawn = true;
         }
@@ -2614,7 +2726,11 @@ impl QueryEditor {
                     facts.push(
                         div()
                             .id("write-commit")
-                            .child(ds::meta_code(IconName::GitCommit, short_commit(commit), cx))
+                            .child(ds::meta_code(
+                                IconName::GitCommit,
+                                short_commit_id(commit),
+                                cx,
+                            ))
                             .tooltip(Tooltip::text(format!("Graph commit {commit}")))
                             .into_any_element(),
                     );
@@ -2708,7 +2824,8 @@ impl QueryEditor {
                                 column.child(ds::meta_row(facts))
                             })
                             .children(diagnostic.map(|diagnostic| {
-                                let at = diagnostic.byte;
+                                // A stored query's text is the server's: no place in this tab.
+                                let at = diagnostic.byte.filter(|_| self.stored.is_none());
                                 ds::button(
                                     "server-diagnostic",
                                     format!(
@@ -2799,16 +2916,6 @@ fn param_input(
         }
         editor
     })
-}
-
-/// A value as a parameter input shows it: a string as it is, anything else as JSON, which the
-/// input reads back.
-fn value_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    }
 }
 
 /// The dedupe key of the tab running the stored query `name`, so it opens once.
@@ -3127,6 +3234,174 @@ mod tests {
                 editor.resize_column(1, None, cx);
                 assert_eq!(widths(editor), vec![fitted[1], fitted[0]]);
                 assert!(editor.column_widths.is_empty());
+            });
+        }
+
+        /// The confirm bar asks about one write: an edit or a pin since ⌘↵ dismisses it, and a
+        /// confirmation of text that no longer matches sends nothing.
+        #[gpui::test]
+        async fn a_confirmed_write_is_the_one_the_bar_asked_about(cx: &mut TestAppContext) {
+            cx.update(|cx| {
+                studio_theme::init_test(cx);
+                editor::init(cx);
+            });
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            let pending = |text: &str| PendingWrite {
+                prepared: Prepared {
+                    text: text.into(),
+                    name: Some("w".into()),
+                    label: "w".into(),
+                    write: true,
+                    statement: false,
+                    params: None,
+                    columns: None,
+                    map: SourceMap::default(),
+                    stored: None,
+                },
+                branch: "main".into(),
+            };
+            let (a, b) = (
+                "query w() { insert Person { slug: \"a\" } }",
+                "query w() { insert Person { slug: \"b\" } }",
+            );
+            editor.update_in(cx, |editor, window, cx| {
+                editor.pending_write = Some(pending(a));
+                editor.edited(window, cx);
+                assert!(editor.pending_write.is_none(), "an edit asks again");
+
+                // The text changed without the bar learning of it: confirming sends nothing.
+                editor.set_text(b, window, cx);
+                editor.pending_write = Some(pending(a));
+                editor.confirm_write(&menu::Confirm, window, cx);
+                assert!(!editor.writing, "nothing was sent");
+                assert!(matches!(editor.output, Output::Failed(_)));
+
+                editor.pending_write = Some(pending(b));
+                editor.pin_to("c1".into(), cx);
+                assert!(editor.pending_write.is_none(), "a pinned tab only reads");
+            });
+        }
+
+        /// The tab's unsaved dot follows the text against the file as last read or written.
+        #[gpui::test]
+        async fn a_file_tab_is_unsaved_while_its_text_differs(cx: &mut TestAppContext) {
+            cx.update(|cx| {
+                studio_theme::init_test(cx);
+                editor::init(cx);
+            });
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            // Each edit is heard once the update that made it ends, before the tab draws.
+            let type_text = |text: &str, cx: &mut gpui::VisualTestContext| {
+                editor.update_in(cx, |editor, window, cx| editor.set_text(text, window, cx));
+                editor.read_with(cx, |editor, cx| editor.is_dirty(cx))
+            };
+            assert!(!type_text("query a() {}", cx), "no file yet");
+            editor.update(cx, |editor, cx| {
+                editor.set_file("a.gq".into(), Some("query a() {}".into()), cx);
+                assert!(!editor.is_dirty(cx));
+            });
+            assert!(type_text("query b() {}", cx));
+            assert!(!type_text("query a() {}", cx), "back to the saved text");
+        }
+
+        /// A problem and a run line keep their place in the text edited before the next check.
+        #[gpui::test]
+        async fn problems_and_run_lines_follow_edits_before_the_next_check(
+            cx: &mut TestAppContext,
+        ) {
+            cx.update(|cx| {
+                studio_theme::init_test(cx);
+                editor::init(cx);
+            });
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            let schema = SchemaModel::parse("node Person {\n  slug: String @key\n}\n").unwrap();
+            editor.update_in(cx, |editor, window, cx| {
+                let text = "query a() { match { $p: Nope } return { $p.slug } }";
+                editor.set_text(text, window, cx);
+                let analysis = Arc::new(Analysis::new(&schema, text.to_owned()));
+                let problem = analysis.problems[0].1.clone().expect("a position").start;
+                editor.apply_analysis(analysis, window, cx);
+                let note = "// note\n";
+                editor.editor.update(cx, |editor, cx| {
+                    editor.edit([(MultiBufferOffset(0)..MultiBufferOffset(0), note)], cx)
+                });
+                let at = editor.problem_starts[0].expect("anchored");
+                assert_eq!(editor.offset_of(&at, cx), problem + note.len());
+                assert_eq!(editor.offset_of(&editor.run_line_starts[0], cx), note.len());
+            });
+        }
+
+        /// A check of text edited since is dropped whole: its underlines, parameters and run
+        /// lines would be the old text's.
+        #[gpui::test]
+        async fn a_check_of_older_text_is_not_kept(cx: &mut TestAppContext) {
+            cx.update(|cx| {
+                studio_theme::init_test(cx);
+                editor::init(cx);
+            });
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            let schema = SchemaModel::parse("node Person {\n  slug: String @key\n}\n").unwrap();
+            editor.update_in(cx, |editor, window, cx| {
+                let old = "query a($x: String) { match { $p: Person } return { $p.slug } }";
+                editor.set_text(old, window, cx);
+                let analysis = Arc::new(Analysis::new(&schema, old.to_owned()));
+                editor.set_text(
+                    "query b() { match { $p: Person } return { $p.slug } }",
+                    window,
+                    cx,
+                );
+                editor.apply_analysis(analysis, window, cx);
+                assert!(
+                    editor.analysis.as_ref().is_none_or(|kept| kept.text != old),
+                    "the older text's check was kept"
+                );
+            });
+        }
+
+        /// A branch read runs at once and names its own branches; the plan of a load is a read
+        /// of the tab's branch head, refused on a tab pinned to a commit.
+        #[gpui::test]
+        async fn statements_are_sent_as_the_server_reads_them(cx: &mut TestAppContext) {
+            cx.update(|cx| {
+                studio_theme::init_test(cx);
+                editor::init(cx);
+            });
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            fn kind(
+                text: &str,
+                editor: &mut QueryEditor,
+                window: &mut Window,
+                cx: &mut Context<QueryEditor>,
+            ) -> Result<(bool, bool), String> {
+                editor.set_text(text, window, cx);
+                editor
+                    .prepare(false, cx)
+                    .map(|prepared| (prepared.write, prepared.statement))
+            }
+            editor.update_in(cx, |editor, window, cx| {
+                let load = "explain load csv \"s3://b/p.csv\" into node:Person mode append";
+                assert_eq!(
+                    kind("branch diff x into main", editor, window, cx),
+                    Ok((false, true))
+                );
+                assert_eq!(
+                    kind("branch merge x dry run", editor, window, cx),
+                    Ok((false, true))
+                );
+                assert_eq!(kind("branch merge x", editor, window, cx), Ok((true, true)));
+                assert_eq!(kind(load, editor, window, cx), Ok((false, false)));
+                editor.pin_to("c1".into(), cx);
+                assert!(kind(load, editor, window, cx).is_err(), "a pinned tab");
             });
         }
 

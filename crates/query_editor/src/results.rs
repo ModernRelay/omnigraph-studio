@@ -148,15 +148,6 @@ pub fn type_label(column: &ResultColumn) -> String {
     }
 }
 
-/// The text a copied cell gets: strings as they are, everything else as JSON.
-pub fn copy_text(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    }
-}
-
 /// The columns `explain` answers with.
 pub fn is_plan(columns: &[String]) -> bool {
     columns == ["tree", "depth", "node", "detail"]
@@ -349,18 +340,6 @@ pub fn rows_label(count: i64) -> String {
     }
 }
 
-/// A commit id short enough for a status line; the full id goes in the tooltip. Graph commit
-/// ids (`hb1.<lineage>.<sequence>.<ULID>`) share their head, so the tail is what tells two
-/// apart.
-pub fn short_commit(id: &str) -> String {
-    let count = id.chars().count();
-    if count > 12 {
-        format!("…{}", id.chars().skip(count - 10).collect::<String>())
-    } else {
-        id.to_owned()
-    }
-}
-
 /// Where the text sent to the server came from, so a position the server reports can be
 /// mapped back into the editor: the settings prefix is copied as is, then `inserted` bytes the
 /// editor added (`explain `), then the declaration that starts at `start` in the editor.
@@ -411,6 +390,7 @@ pub fn server_diagnostic(value: &Value, fallback: &str, map: SourceMap) -> Serve
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use studio_ui::value_text;
 
     use super::*;
 
@@ -485,10 +465,10 @@ mod tests {
 
     #[test]
     fn copied_cells_are_plain_text() {
-        assert_eq!(copy_text(&json!("Ada")), "Ada");
-        assert_eq!(copy_text(&json!(["a", "b"])), "[\"a\",\"b\"]");
-        assert_eq!(copy_text(&Value::Null), "");
-        assert_eq!(copy_text(&json!(4)), "4");
+        assert_eq!(value_text(&json!("Ada")), "Ada");
+        assert_eq!(value_text(&json!(["a", "b"])), "[\"a\",\"b\"]");
+        assert_eq!(value_text(&Value::Null), "");
+        assert_eq!(value_text(&json!(4)), "4");
     }
 
     #[test]
@@ -573,11 +553,6 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_millis(1250)), "1.2 s");
         assert_eq!(rows_label(1), "1 row");
         assert_eq!(rows_label(0), "0 rows");
-        assert_eq!(short_commit("abc"), "abc");
-        assert_eq!(
-            short_commit("hb1.01M4RAJY7S28C66BR5E19AJPH0.2.01M4RCHTJZ78MSXG2BJ64ENC3T"),
-            "…2BJ64ENC3T"
-        );
     }
 
     #[test]

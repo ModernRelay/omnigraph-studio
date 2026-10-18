@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use gpui::{
-    Context, Entity, ListAlignment, ListState, Render, Subscription, WeakEntity, Window, list,
+    Context, Entity, ListAlignment, ListState, Render, Subscription, Task, WeakEntity, Window, list,
 };
 use graph_store::cli_config::CliAlias;
 use graph_store::{ConnectionRegistry, GraphSession, Loadable, SessionEvent};
@@ -28,6 +28,9 @@ pub struct QueriesPanel {
     list_state: ListState,
     rows: Vec<PanelRow>,
     _session_subscription: Option<Subscription>,
+    /// The folder's latest listing: an earlier one, of another graph's folder perhaps, is
+    /// dropped rather than landing after it.
+    _listing: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -94,6 +97,7 @@ impl QueriesPanel {
             ),
             rows: Vec::new(),
             _session_subscription: None,
+            _listing: None,
             _subscriptions: subscriptions,
         };
         this.watch_session(session, cx);
@@ -286,20 +290,20 @@ impl QueriesPanel {
     /// Lists the graph's queries folder again, off the main thread.
     fn read_folder(&mut self, cx: &mut Context<Self>) {
         let Some(graph) = self.graph_key(cx) else {
+            self._listing = None;
             self.files.clear();
             cx.notify();
             return;
         };
         let listing = cx.background_spawn(async move { studio_settings::saved_queries(&graph) });
-        cx.spawn(async move |this, cx| {
+        self._listing = Some(cx.spawn(async move |this, cx| {
             let files = listing.await;
             this.update(cx, |this, cx| {
                 this.files = files;
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        }));
     }
 }
 

@@ -25,8 +25,8 @@ use studio_actions::graph::{
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
 
-pub use schema_view::SchemaView;
-pub use view::QueryEditor;
+use schema_view::SchemaView;
+use view::QueryEditor;
 
 /// Bumped whenever a query file is written, so lists of saved queries read the folder again.
 #[derive(Default)]

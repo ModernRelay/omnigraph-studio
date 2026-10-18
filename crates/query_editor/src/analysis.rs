@@ -142,7 +142,7 @@ mod tests {
     /// Instrument for spike S4's budget (diagnostics < 100 ms after typing stops on a 500-line
     /// file): `cargo test -p query_editor --release -- --ignored --nocapture analysis_time`.
     #[test]
-    #[ignore = "instrument: prints the time to analyse a 500-line source"]
+    #[ignore = "instrument: prints the time to analyse, and to complete in, a 500-line source"]
     fn analysis_time_on_a_500_line_source() {
         let schema = SchemaModel::parse(DEV_SCHEMA).unwrap();
         let one = "query q{n}($slug: String) {\n  match {\n    $p: Person { slug: $slug }\n    $p worksAt $c\n  }\n  return { $p.name, $c.name }\n  limit 10\n}\n";
@@ -159,6 +159,18 @@ mod tests {
         }
         println!(
             "analysis of {} lines: {:?} per run",
+            text.lines().count(),
+            started.elapsed() / runs
+        );
+        // A completion at the end of the source, as each key in an open menu asks.
+        let started = std::time::Instant::now();
+        for _ in 0..runs {
+            let at = text.rfind("$c.name").unwrap() + 3;
+            let (_, items) = gq_language::completions(&schema, &text, at);
+            assert!(!items.is_empty());
+        }
+        println!(
+            "completion in {} lines: {:?} per key",
             text.lines().count(),
             started.elapsed() / runs
         );
