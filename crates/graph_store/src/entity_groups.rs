@@ -49,6 +49,10 @@ pub struct EntityGroup {
     pub relationships: Vec<GroupRelationship>,
     /// Relationship changes reviewed in another group that this entity is an end of.
     pub mirrors: Vec<GroupRelationship>,
+    /// Relationships moved to another end, `(removed, added)` changes: for an edge type that
+    /// allows one target per source (`@card(..1)`), the one removal and one addition of it from
+    /// this entity, which read as one change.
+    pub repoints: Vec<(usize, usize)>,
 }
 
 impl EntityGroup {
@@ -100,6 +104,9 @@ pub struct RelationshipEntry {
     pub other_type: String,
     /// The branch added the other end.
     pub other_is_new: bool,
+    /// For a relationship moved to another end ([`EntityGroup::repoints`]): the removed
+    /// change this entry stands for too, and its other end, named.
+    pub replaces: Option<(usize, String)>,
 }
 
 /// A review's changes by entity, in display order: [`GroupSection::Existing`] first, each
@@ -141,6 +148,7 @@ impl EntityGroups {
                 change: Some(ix),
                 relationships: Vec::new(),
                 mirrors: Vec::new(),
+                repoints: Vec::new(),
             });
         }
         let net_of = |group: usize, groups: &[EntityGroup]| {
@@ -164,6 +172,7 @@ impl EntityGroups {
                     change: Some(ix),
                     relationships: Vec::new(),
                     mirrors: Vec::new(),
+                    repoints: Vec::new(),
                 });
                 continue;
             };
@@ -195,6 +204,7 @@ impl EntityGroups {
                         change: None,
                         relationships: Vec::new(),
                         mirrors: Vec::new(),
+                        repoints: Vec::new(),
                     });
                     groups.len() - 1
                 }),
@@ -207,6 +217,40 @@ impl EntityGroups {
                 other_id: there.1.clone(),
                 other_group: None,
             });
+        }
+
+        // A one-target relationship removed and added again from the same source moved: it
+        // reads as one change, the old end to the new.
+        if let Some(schema) = schema {
+            for group in &mut groups {
+                let mut by_type: HashMap<&str, (Vec<usize>, Vec<usize>)> = HashMap::new();
+                for relationship in &group.relationships {
+                    let edge = &changes[relationship.change];
+                    let one_target = schema
+                        .edge(&edge.type_name)
+                        .is_some_and(|edge| edge.at_most_one);
+                    if relationship.direction != Direction::Outgoing || !one_target {
+                        continue;
+                    }
+                    let (removed, added) = by_type.entry(edge.type_name.as_str()).or_default();
+                    match edge.net() {
+                        Some(NetChange::Removed) => removed.push(relationship.change),
+                        Some(NetChange::Added) => added.push(relationship.change),
+                        _ => {}
+                    }
+                }
+                let mut repoints: Vec<(usize, usize)> = by_type
+                    .into_values()
+                    .filter_map(
+                        |(removed, added)| match (removed.as_slice(), added.as_slice()) {
+                            (&[removed], &[added]) => Some((removed, added)),
+                            _ => None,
+                        },
+                    )
+                    .collect();
+                repoints.sort_unstable();
+                group.repoints = repoints;
+            }
         }
 
         // Display order. A type ranks where its first group was made: node changes come in the
@@ -385,15 +429,46 @@ impl EntityGroups {
         names: &NodeNames,
     ) -> Vec<RelationshipEntry> {
         let group = &self.groups[ix];
+        let other_name = |relationship: &GroupRelationship| {
+            relationship
+                .other_group
+                .and_then(|g| self.groups[g].change)
+                .and_then(|c| entity_name(&folded.changes[c], schema))
+                .or_else(|| {
+                    names
+                        .get(&(
+                            relationship.other_type.clone(),
+                            relationship.other_id.clone(),
+                        ))
+                        .cloned()
+                })
+                .unwrap_or_else(|| relationship.other_id.clone())
+        };
         let entry = |relationship: &GroupRelationship, mirror: bool| {
             let edge = &folded.changes[relationship.change];
             let other = relationship
                 .other_group
                 .and_then(|g| self.groups[g].change)
                 .map(|c| &folded.changes[c]);
+            let replaces = (!mirror)
+                .then(|| {
+                    group
+                        .repoints
+                        .iter()
+                        .find(|(_, added)| *added == relationship.change)
+                })
+                .flatten()
+                .and_then(|&(removed, _)| {
+                    let was = group.relationships.iter().find(|r| r.change == removed)?;
+                    Some((removed, other_name(was)))
+                });
             RelationshipEntry {
                 change: relationship.change,
-                net: if mirror { None } else { edge.net() },
+                net: match (mirror, &replaces) {
+                    (true, _) => None,
+                    (false, Some(_)) => Some(NetChange::Changed),
+                    (false, None) => edge.net(),
+                },
                 words: match schema.and_then(|s| s.edge(&edge.type_name)) {
                     Some(edge_type) => {
                         relationship_words(&edge_type.name, &edge_type.from, &edge_type.to)
@@ -401,24 +476,19 @@ impl EntityGroups {
                     None => edge.type_name.clone(),
                 },
                 outgoing: relationship.direction == Direction::Outgoing,
-                other: other
-                    .and_then(|change| entity_name(change, schema))
-                    .or_else(|| {
-                        names
-                            .get(&(
-                                relationship.other_type.clone(),
-                                relationship.other_id.clone(),
-                            ))
-                            .cloned()
-                    })
-                    .unwrap_or_else(|| relationship.other_id.clone()),
+                other: other_name(relationship),
                 other_type: relationship.other_type.clone(),
                 other_is_new: other.and_then(FoldedChange::net) == Some(NetChange::Added),
+                replaces,
             }
         };
+        // A moved relationship's removal is in its addition's entry.
+        let moved_from =
+            |change: usize| group.repoints.iter().any(|(removed, _)| *removed == change);
         group
             .relationships
             .iter()
+            .filter(|r| !moved_from(r.change))
             .map(|r| entry(r, false))
             .chain(group.mirrors.iter().map(|m| entry(m, true)))
             .collect()
@@ -672,6 +742,37 @@ mod tests {
         );
         assert!(groups.groups[1].is_edge);
         assert_eq!(groups.home, [0, 1]);
+    }
+
+    /// A one-target relationship removed and added again from the same source reads as one
+    /// change, from the old end to the new; one that allows many targets does not.
+    #[test]
+    fn a_moved_one_target_relationship_is_one_line() {
+        let schema = SchemaModel::parse(SCHEMA).unwrap();
+        let folded = folded(vec![
+            node("Person", "maya", NetChange::Changed),
+            edge("WorksAt", "e1", "maya", "acme", NetChange::Removed),
+            edge("WorksAt", "e2", "maya", "globex", NetChange::Added),
+            edge("Knows", "e3", "maya", "ana", NetChange::Removed),
+            edge("Knows", "e4", "maya", "bob", NetChange::Added),
+        ]);
+        let groups = EntityGroups::new(&folded, Some(&schema));
+        assert_eq!(groups.groups[0].repoints, [(1, 2)]);
+        let lines = groups.entries(&folded, 0, Some(&schema), &NodeNames::default());
+        let moved: Vec<_> = lines
+            .iter()
+            .map(|line| (line.change, line.net, line.replaces.clone()))
+            .collect();
+        assert_eq!(
+            moved,
+            [
+                (3, Some(NetChange::Removed), None),
+                (4, Some(NetChange::Added), None),
+                (2, Some(NetChange::Changed), Some((1, "acme".to_owned()))),
+            ]
+        );
+        // Both changes are still reviewed on the card.
+        assert_eq!(groups.groups[0].changes().count(), 5);
     }
 
     /// A relationship from an entity to itself is reviewed there once, with no mirror.

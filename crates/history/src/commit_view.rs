@@ -552,7 +552,11 @@ impl CommitView {
                     .into_iter()
                     .map(|entry| {
                         let edge = &self.folded.changes[entry.change];
-                        relationship_line(entry, edge, schema)
+                        let was = entry
+                            .replaces
+                            .as_ref()
+                            .map(|(removed, _)| &self.folded.changes[*removed]);
+                        relationship_line(entry, edge, was, schema)
                     })
                     .collect();
                 div()
@@ -645,6 +649,7 @@ fn relationship_counts(entries: &[RelationshipEntry]) -> (usize, usize, usize) {
 fn relationship_line(
     entry: RelationshipEntry,
     edge: &FoldedChange,
+    was: Option<&FoldedChange>,
     schema: Option<&SchemaModel>,
 ) -> RelationshipLine {
     let kind = entry.net.map(|net| match net {
@@ -652,10 +657,18 @@ fn relationship_line(
         NetChange::Changed => ChangeKind::Changed,
         NetChange::Removed => ChangeKind::Removed,
     });
+    // A moved relationship's rows compare the old edge's values with the new one's.
+    let compared = was.map(|was| FoldedChange {
+        before: was.before.clone(),
+        ..edge.clone()
+    });
     let (id, rows) = match kind {
         Some(_) => (
             ("relationship", entry.change),
-            edge.card_diffs(schema)
+            compared
+                .as_ref()
+                .unwrap_or(edge)
+                .card_diffs(schema)
                 .into_iter()
                 .map(|diff| PropertyRow {
                     name: diff.name.into(),
@@ -666,14 +679,20 @@ fn relationship_line(
         ),
         None => (("mirror", entry.change), Vec::new()),
     };
-    let line = RelationshipLine::new(id, kind, entry.words, entry.outgoing, entry.other)
+    let other = match &entry.replaces {
+        Some((_, was)) => format!("{was} → {}", entry.other),
+        None => entry.other,
+    };
+    let line = RelationshipLine::new(id, kind, entry.words, entry.outgoing, other)
         .other_detail(entry.other_type)
         .rows(rows);
-    match kind {
+    match (kind, entry.replaces.is_some()) {
         // The other end is the card it is shown on.
-        None => line.note("shown there"),
-        Some(_) if entry.other_is_new => line.note("new"),
-        Some(_) => line,
+        (None, _) => line.note("shown there"),
+        (Some(_), true) if entry.other_is_new => line.note("moved, new"),
+        (Some(_), true) => line.note("moved"),
+        (Some(_), false) if entry.other_is_new => line.note("new"),
+        (Some(_), false) => line,
     }
 }
 

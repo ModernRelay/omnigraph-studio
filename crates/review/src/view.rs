@@ -568,8 +568,30 @@ impl ReviewView {
 
     fn revert_and_next(&mut self, _: &RevertAndNext, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.selected {
-            self.revert(ix, cx);
+            self.revert_line(ix, cx);
             self.select_next(&NextChange, window, cx);
+        }
+    }
+
+    /// Reverts a change as its card shows it: a relationship moved to another end
+    /// ([`EntityGroup::repoints`]) moves back, the new edge removed before the old one returns,
+    /// since an edge type with one target per source holds one at a time. Fixes go one at a
+    /// time, so the second waits for the first.
+    fn revert_line(&mut self, change: usize, cx: &mut Context<Self>) {
+        let pair = self.group_of(change).and_then(|group| {
+            let data = self.data.as_ref()?;
+            data.groups.groups[group]
+                .repoints
+                .iter()
+                .copied()
+                .find(|&(removed, added)| removed == change || added == change)
+        });
+        match pair {
+            Some((removed, added)) => {
+                self.revert(added, cx);
+                self.revert(removed, cx);
+            }
+            None => self.revert(change, cx),
         }
     }
 
@@ -1782,39 +1804,58 @@ impl ReviewView {
             .map(|entry| {
                 let change = entry.change;
                 let mirror = entry.net.is_none();
-                let mut line = relationship_line(entry, &changes[change], schema)
+                let moved_from = entry.replaces.as_ref().map(|(removed, _)| *removed);
+                let was_edge = moved_from.map(|removed| &changes[removed]);
+                let mut line = relationship_line(entry, &changes[change], was_edge, schema)
                     .on_click(cx.listener(move |this, _, _, cx| this.select(change, cx)));
                 if mirror {
                     return line;
                 }
                 let state = &self.cards[change];
+                let was = moved_from.map(|removed| &self.cards[removed]);
                 let hover = SharedString::from(format!("relationship-{change}"));
-                let blocked = state.revert_blocked.clone();
+                let blocked = state
+                    .revert_blocked
+                    .clone()
+                    .or_else(|| was.and_then(|was| was.revert_blocked.clone()));
+                let done = state.fix.done() || was.is_some_and(|was| was.fix.done());
+                let reviewed = state.reviewed && was.is_none_or(|was| was.reviewed);
+                let fix = match was {
+                    Some(was) if state.fix == FixState::Idle => was.fix.clone(),
+                    _ => state.fix.clone(),
+                };
                 let branch = self.branch.clone();
                 let revert =
                     studio_ui::ds::icon_button(("revert-relationship", change), IconName::Undo)
                         .icon_size(IconSize::XSmall)
                         .style(ButtonStyle::Subtle)
                         .visible_on_hover(hover.clone())
-                        .disabled(blocked.is_some() || state.fix.done())
+                        .disabled(blocked.is_some() || done)
                         .tooltip(move |_, cx| match &blocked {
                             Some(reason) => Tooltip::simple(reason.clone(), cx),
                             None => Tooltip::with_meta(
-                                "Revert this relationship change",
+                                if moved_from.is_some() {
+                                    "Move this relationship back"
+                                } else {
+                                    "Revert this relationship change"
+                                },
                                 Some(&RevertAndNext),
                                 format!("Writes to {branch}, bound to the reviewed head"),
                                 cx,
                             ),
                         })
-                        .on_click(cx.listener(move |this, _, _, cx| this.revert(change, cx)));
+                        .on_click(cx.listener(move |this, _, _, cx| this.revert_line(change, cx)));
                 // The selected change is what ⌥⌘Z reverts: a card without its own change selects
                 // its first relationship, which shows it.
                 line = line
-                    .selected(self.selected == Some(change))
-                    .hollow(state.reviewed)
+                    .selected(
+                        self.selected
+                            .is_some_and(|s| s == change || Some(s) == moved_from),
+                    )
+                    .hollow(reviewed)
                     .hover_group(hover)
                     .action(revert);
-                if let Some((text, color)) = fix_status(&state.fix) {
+                if let Some((text, color)) = fix_status(&fix) {
                     line = line.status(text, color);
                 }
                 line
@@ -1853,6 +1894,7 @@ pub(crate) fn relationship_counts(entries: &[RelationshipEntry]) -> (usize, usiz
 pub(crate) fn relationship_line(
     entry: RelationshipEntry,
     edge: &FoldedChange,
+    was: Option<&FoldedChange>,
     schema: Option<&SchemaModel>,
 ) -> RelationshipLine {
     let kind = entry.net.map(|net| match net {
@@ -1865,8 +1907,16 @@ pub(crate) fn relationship_line(
     } else {
         ("mirror", entry.change)
     };
+    // A moved relationship's rows compare the old edge's values with the new one's.
+    let compared = was.map(|was| FoldedChange {
+        before: was.before.clone(),
+        ..edge.clone()
+    });
     let rows = if kind.is_some() {
-        edge.card_diffs(schema)
+        compared
+            .as_ref()
+            .unwrap_or(edge)
+            .card_diffs(schema)
             .into_iter()
             .map(|diff| PropertyRow {
                 name: diff.name.into(),
@@ -1877,13 +1927,19 @@ pub(crate) fn relationship_line(
     } else {
         Vec::new()
     };
-    let note = match kind {
+    let note = match (kind, &entry.replaces) {
         // The other end is the card it is reviewed on.
-        None => Some("reviewed there".to_owned()),
-        Some(_) if entry.other_is_new => Some("new".to_owned()),
-        Some(_) => None,
+        (None, _) => Some("reviewed there"),
+        (Some(_), Some(_)) if entry.other_is_new => Some("moved, new"),
+        (Some(_), Some(_)) => Some("moved"),
+        (Some(_), None) if entry.other_is_new => Some("new"),
+        (Some(_), None) => None,
     };
-    let line = RelationshipLine::new(id, kind, entry.words, entry.outgoing, entry.other)
+    let other = match &entry.replaces {
+        Some((_, was)) => format!("{was} → {}", entry.other),
+        None => entry.other,
+    };
+    let line = RelationshipLine::new(id, kind, entry.words, entry.outgoing, other)
         .other_detail(entry.other_type)
         .rows(rows);
     match note {

@@ -66,10 +66,16 @@ place), X (designed on 0.13; the better routes are deferred).
   story. A line reads as the relationship in words (`WorksAt` is "works at", `NoteAboutPerson`
   from Note to Person is "about"), an arrow for its direction and the other end by its label
   property, else its id; "new" marks an end the branch added, and a changed relationship's
-  properties follow it. A relationship whose type the schema lacks stands alone as its own
-  card. A card's header is the kind's symbol (+ ~ −, · for unchanged), the entity's name and
-  its id; its type is the run's header's. Cards are hairline frames on the document, values in
-  the UI font.
+  properties follow it. An end the review knows only by id, and a node standing unchanged for
+  its relationships, is named by its label read at the reviewed head (`builder::node_labels`,
+  500 ids a read, 5,000 nodes at most); until then, or without a label, its id shows. A
+  relationship moved to another end, the one removal and one addition of an edge type that
+  allows one target per source (`@card(..1)`) from the card's entity, is one line, "works at
+  Lumen Labs → Northwind, moved", its rows comparing the old edge's values with the new one's;
+  its Revert removes the new edge, then restores the old one, as two writes in that order. A
+  relationship whose type the schema lacks stands alone as its own card. A card's header is
+  the kind's symbol (+ ~ −, · for unchanged), the entity's name and its id; its type is the
+  run's header's. Cards are hairline frames on the document, values in the UI font.
 - Act in place: Revert (restore the before image), Edit, Mark reviewed (every change on the
   card; the card turns hollow but stays, and says how many are not reviewed when some are).
   Each relationship line has its own Revert, shown on hover. Keys: J/K between cards, ↵ edit,
