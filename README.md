@@ -25,6 +25,7 @@ instead, see below.
 Requirements:
 
 - Rust 1.98.1, installed by `rust-toolchain.toml`.
+- CMake, which builds wasmtime's C API for Zed's tree-sitter (`brew install cmake` on macOS).
 - macOS: the Command Line Tools (GPUI compiles its Metal shaders when Studio starts); full
   Xcode to compile them into a release build (`script/bundle-mac`). Linux: the Wayland, X11 and
   Vulkan development packages listed in `.github/workflows/ci.yml`.
@@ -145,9 +146,10 @@ cargo test --workspace
 python3 script/check-layers.py
 ```
 
-These are the checks CI runs on macOS and Linux. `crates/studio/examples/snapshot.rs` renders
-Studio offscreen to a PNG while dispatching actions, clicks and keystrokes. It is how UI changes
-are checked against the sample graph:
+CI runs these checks on macOS, Linux and Windows for each pull request that changes more than
+documentation, and not again on merge. `crates/studio/examples/snapshot.rs` renders Studio
+offscreen to a PNG while dispatching actions, clicks and keystrokes. It is how UI changes are
+checked against the sample graph:
 
 ```bash
 OMNIGRAPH_STUDIO_SERVER=http://127.0.0.1:8787 OMNIGRAPH_STUDIO_TOKEN=dev-token \

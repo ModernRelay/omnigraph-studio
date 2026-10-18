@@ -1,8 +1,7 @@
 name: CI
 
+# Pull requests only: a merge to main is not built again.
 on:
-  push:
-    branches: [main]
   pull_request:
 
 concurrency:
@@ -10,8 +9,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Whether a pull request changes more than documentation: Markdown at the root and anything in
+  # .specify/, docs/ and specs/. Markdown elsewhere counts as code: the agent panel compiles its
+  # skill's files in.
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      # The checkout is the pull request's merge commit; its first parent is the base.
+      - id: diff
+        run: |
+          changed=$(git diff --name-only HEAD^1 HEAD)
+          echo "$changed"
+          if grep -qvE '^[^/]+\.md$|^(\.specify|docs|specs)/' <<< "$changed"; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   check:
     name: Check (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
