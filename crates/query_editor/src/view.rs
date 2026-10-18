@@ -133,6 +133,56 @@ struct RowsOutput {
     commit: Option<String>,
 }
 
+/// A read's rows made ready to show: the table, each column's width from its content, which
+/// columns align right, and the graph the node columns make.
+struct BuiltRows {
+    table: ResultTable,
+    widths: Vec<f32>,
+    right_aligned: Vec<bool>,
+    graph: Option<Arc<ResultGraph>>,
+}
+
+impl BuiltRows {
+    /// The rows of an answer that holds them, not a plan's or a failure's.
+    fn of(
+        result: &Result<ReadOutput, ReadError>,
+        columns: Option<&[ResultColumn]>,
+        schema: Option<Arc<SchemaModel>>,
+    ) -> Option<Self> {
+        match result {
+            Ok(output) if !is_plan(&output.columns) => Some(Self::new(output, columns, schema)),
+            _ => None,
+        }
+    }
+
+    fn new(
+        output: &ReadOutput,
+        columns: Option<&[ResultColumn]>,
+        schema: Option<Arc<SchemaModel>>,
+    ) -> Self {
+        let table = ResultTable::new(output.columns.clone(), &output.rows, columns);
+        let widths = (0..table.columns.len())
+            .map(|i| table.column_width(i))
+            .collect();
+        let right_aligned = (0..table.columns.len())
+            .map(|i| {
+                table
+                    .rows
+                    .iter()
+                    .find(|row| !row[i].is_null())
+                    .is_some_and(|row| is_numeric(&row[i]))
+            })
+            .collect();
+        let graph = schema.and_then(|schema| table.graph(&schema)).map(Arc::new);
+        Self {
+            table,
+            widths,
+            right_aligned,
+            graph,
+        }
+    }
+}
+
 struct PlanOutput {
     label: String,
     /// The planned declaration's name, to find it again in the text as it is now.
@@ -1539,15 +1589,23 @@ impl QueryEditor {
             label: format!("Running {} on {branch}…", prepared.label).into(),
         };
         self.selected = None;
+        let schema = self.session.read(cx).schema_model();
         // Replacing the task cancels an earlier read still in flight.
         self.run_task = Some(cx.spawn(async move |this, cx| {
             let result = task.await;
             let elapsed = started.elapsed();
+            // The rows are built off the main thread: a large answer would hold up frames.
+            let columns = prepared.columns.clone();
+            let (result, built) = cx
+                .background_spawn(async move {
+                    let built = BuiltRows::of(&result, columns.as_deref(), schema);
+                    (result, built)
+                })
+                .await;
             this.update(cx, |this, cx| {
                 // A new output replaces the plan whose operator lit the text.
                 this.light_plan_parts(None, cx);
-                let schema = this.session.read(cx).schema_model();
-                this.finish_read(prepared, branch, result, elapsed, schema);
+                this.show_read(prepared, branch, result, built, elapsed);
                 cx.emit(ItemEvent::UpdateTab);
                 this.run_task = None;
                 cx.notify();
@@ -1563,6 +1621,19 @@ impl QueryEditor {
         result: Result<ReadOutput, ReadError>,
         elapsed: Duration,
         schema: Option<Arc<SchemaModel>>,
+    ) {
+        let built = BuiltRows::of(&result, prepared.columns.as_deref(), schema);
+        self.show_read(prepared, branch, result, built, elapsed);
+    }
+
+    /// Shows a read's answer, its rows already built ([`BuiltRows`]).
+    fn show_read(
+        &mut self,
+        prepared: Prepared,
+        branch: String,
+        result: Result<ReadOutput, ReadError>,
+        built: Option<BuiltRows>,
+        elapsed: Duration,
     ) {
         let note = match &result {
             Ok(output) => RunNote {
@@ -1588,26 +1659,19 @@ impl QueryEditor {
                 commit: output.graph_commit_id,
             }),
             Ok(output) => {
-                let table =
-                    ResultTable::new(output.columns, &output.rows, prepared.columns.as_deref());
-                let widths = (0..table.columns.len())
-                    .map(|i| {
-                        self.column_widths
-                            .get(&table.columns[i])
-                            .copied()
-                            .unwrap_or_else(|| table.column_width(i))
-                    })
+                let BuiltRows {
+                    table,
+                    widths,
+                    right_aligned,
+                    graph,
+                } = built
+                    .unwrap_or_else(|| BuiltRows::new(&output, prepared.columns.as_deref(), None));
+                // A width the person dragged a column to wins over the one from its content.
+                let widths = widths
+                    .into_iter()
+                    .zip(&table.columns)
+                    .map(|(width, column)| self.column_widths.get(column).copied().unwrap_or(width))
                     .collect();
-                let right_aligned = (0..table.columns.len())
-                    .map(|i| {
-                        table
-                            .rows
-                            .iter()
-                            .find(|row| !row[i].is_null())
-                            .is_some_and(|row| is_numeric(&row[i]))
-                    })
-                    .collect();
-                let graph = schema.and_then(|schema| table.graph(&schema)).map(Arc::new);
                 let shown = table.rows.iter().map(|_| Default::default()).collect();
                 Output::Rows(RowsOutput {
                     label: prepared.label,
@@ -2077,8 +2141,10 @@ impl QueryEditor {
                                         .color(Color::Muted)
                                 }))
                                 .when(!problem.edits.is_empty(), |row| {
-                                    let edits = problem.edits.clone();
-                                    let checked = analysis.text.clone();
+                                    // The analysis is shared, not copied: the problems are
+                                    // drawn every frame, the text and edits only applied on
+                                    // a click.
+                                    let checked = analysis.clone();
                                     row.child(
                                         Button::new(("apply-fix", index), "Fix")
                                             .style(ButtonStyle::Tinted(ui::TintColor::Accent))
@@ -2087,7 +2153,14 @@ impl QueryEditor {
                                                 "Apply the compiler's suggested edit",
                                             ))
                                             .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.apply_fix(&checked, &edits, window, cx)
+                                                if let Some(problem) = checked.problems.get(index) {
+                                                    this.apply_fix(
+                                                        &checked.text,
+                                                        &problem.0.edits,
+                                                        window,
+                                                        cx,
+                                                    )
+                                                }
                                             })),
                                     )
                                 })
