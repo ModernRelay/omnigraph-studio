@@ -3,8 +3,9 @@
 //! summary sentence. Pure functions; no GPUI.
 //!
 //! Review folds the branch's change feed after the merge base (E7). When the feed refuses the
-//! base as a start, because the target was merged into the branch, review finds the fork by
-//! walking both branches' `GET /commits` instead.
+//! base as a start, because the target was merged into the branch, review folds the net diff
+//! from the merge base instead, and finds the branch's commits since its fork by walking both
+//! branches' `GET /commits`.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 

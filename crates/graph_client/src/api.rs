@@ -409,6 +409,17 @@ pub struct ChangeFeedOutput {
     pub caught_up: Option<bool>,
 }
 
+/// `GET /graphs/{id}/diff` (one page): the net entity changes between two commits, with no
+/// cause, since a range has no single author.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiffOutput {
+    pub from_commit_id: String,
+    pub to_commit_id: String,
+    pub changes: Vec<EntityChangeOutput>,
+    #[serde(default)]
+    pub next_page_token: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChangeBlockOutput {
     pub cause: ChangeCauseOutput,

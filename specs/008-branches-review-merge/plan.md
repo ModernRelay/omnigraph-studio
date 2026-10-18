@@ -98,11 +98,13 @@ place), X (designed on 0.13; the better routes are deferred).
 ## Deferred
 
 - Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
-  - E6 paged branch-to-branch diff: the change feed is folded from the fork, capped at 20,000
-    changes, until then.
+  - E6 paged branch-to-branch diff: `GET /diff` since 0.14. A review folds the change feed
+    after the merge base, for each commit's author and the reviewed marks; a branch its target
+    was merged into, whose base the feed refuses as a start, folds the net diff from the merge
+    base to the reviewed head instead (both pinned), capped at 20,000 changes either way.
   - E7 merge base: `GET /branches/merge-base` since 0.14 (fork, head, and a merge's
-    confirmation); walking `GET /commits` parents remains for a review of one commit and for a
-    base off the branch's first-parent history, which the feed refuses as a start.
+    confirmation); walking `GET /commits` parents remains for a review of one commit and for
+    the commit list of a branch its target was merged into.
   - E8 merge preview with no effects: merge on request and show the 409 conflicts until then.
   - E9 branch details: derived from `GET /commits?branch=` until then.
   - E21 a branch from a commit: 0.13 forks only a branch's head (`from` names a branch).
@@ -149,4 +151,6 @@ place), X (designed on 0.13; the better routes are deferred).
   workspace's handlers. `review::init` focuses the workspace when nothing is focused; the fix
   belongs in `studio_workspace`.
 - 2026-10-12: the change feed folds first-parent history, so a branch that merged its target in
-  shows the merged-in changes too. E6 removes this.
+  showed the merged-in changes too, each with Revert, which would undo the target's own change
+  on merge. Since 2026-10-18 such a review folds the net diff from the merge base (E6) and says
+  "Since main was last merged in at …".

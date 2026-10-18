@@ -14,9 +14,9 @@ use gq_language::builder::{Depends, Seeds};
 use gq_language::{BuiltQuery, RelationshipGroup, SchemaModel, builder};
 use graph_client::api::{
     BranchCreateOutput, BranchCreateRequest, BranchMergeOutput, BranchMergeRequest,
-    ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitOutput, EntityKind, GraphListResponse,
-    InvokeStoredQueryRequest, MergeBaseOutput, QueryCatalogEntry, QueryRequest, ReadOutput,
-    ReadTargetOutput, ReadinessOutput, SnapshotDatasetOutput, SnapshotOutput,
+    ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitOutput, DiffOutput, EntityKind,
+    GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput, QueryCatalogEntry, QueryRequest,
+    ReadOutput, ReadTargetOutput, ReadinessOutput, SnapshotDatasetOutput, SnapshotOutput,
 };
 use graph_client::{
     ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CommitChanges, FeedAt, GraphClient, ReadError,
@@ -1852,6 +1852,27 @@ impl GraphSession {
                     (None, None) => FeedAt::Start("now"),
                 };
                 client.changes(&graph, &branch, at, &[], limit).await
+            },
+            cx,
+        )
+    }
+
+    /// One page of the net changes from commit `from` to commit `to`.
+    pub fn diff(
+        &mut self,
+        from: &str,
+        to: &str,
+        page_token: Option<String>,
+        limit: u32,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<DiffOutput, ReadError>> {
+        let (client, graph) = (self.client(cx), self.graph_id.clone());
+        let (from, to) = (from.to_owned(), to.to_owned());
+        self.counted_read(
+            async move {
+                client
+                    .diff(&graph, &from, &to, page_token.as_deref(), limit)
+                    .await
             },
             cx,
         )

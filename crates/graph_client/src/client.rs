@@ -17,8 +17,9 @@ use url::Url;
 use crate::api::{
     BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
     BranchMergeRequest, ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitListOutput,
-    ErrorOutput, GraphListResponse, HealthOutput, InvokeStoredQueryRequest, MergeBaseOutput,
-    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotOutput,
+    DiffOutput, ErrorOutput, GraphListResponse, HealthOutput, InvokeStoredQueryRequest,
+    MergeBaseOutput, QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput,
+    SnapshotOutput,
 };
 use crate::{ApiError, CONTRACT_HEADER, IF_GRAPH_COMMIT_HEADER, SUPPORTED_CONTRACTS, WriteOutcome};
 
@@ -832,8 +833,25 @@ impl GraphClient {
         .await
     }
 
-    /// One page of a branch's change feed. `start` is `now`, `beginning` or
-    /// `after:<commit_id>`; pass `page_token` from the previous page to continue.
+    /// `GET /graphs/{id}/diff`: one page of the net changes from commit `from` to commit
+    /// `to`; pass `page_token` from the previous page to continue.
+    pub async fn diff(
+        &self,
+        graph: &str,
+        from: &str,
+        to: &str,
+        page_token: Option<&str>,
+        limit: u32,
+    ) -> Result<DiffOutput, ReadError> {
+        let limit = limit.to_string();
+        let mut query = vec![("from", from), ("to", to), ("limit", limit.as_str())];
+        if let Some(token) = page_token {
+            query.push(("page_token", token));
+        }
+        self.read(Method::GET, &["graphs", graph, "diff"], &query, None)
+            .await
+    }
+
     /// `GET /graphs/{id}/branches/merge-base`: what a merge of `source` into `target` would
     /// classify against, with both heads.
     pub async fn merge_base(
@@ -851,6 +869,7 @@ impl GraphClient {
         .await
     }
 
+    /// One page of a branch's change feed, from `at`.
     pub async fn changes(
         &self,
         graph: &str,
