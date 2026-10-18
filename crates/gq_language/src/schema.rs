@@ -2,6 +2,7 @@
 //! relationship groups a node type takes part in. Built from `.pg` source with
 //! `omnigraph-compiler`, so Studio reads the schema exactly as the engine does.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use omnigraph_compiler::catalog::Catalog;
@@ -142,6 +143,11 @@ pub struct SchemaModel {
     pub nodes: Vec<NodeType>,
     pub edges: Vec<EdgeType>,
     pub(crate) catalog: Arc<Catalog>,
+    /// Where each node and edge type is, by name, and each node type's relationship groups:
+    /// views look these up every frame, and a schema can hold hundreds of edge types.
+    node_index: HashMap<String, usize>,
+    edge_index: HashMap<String, usize>,
+    relationships: HashMap<String, Arc<[RelationshipGroup]>>,
 }
 
 impl std::fmt::Debug for SchemaModel {
@@ -200,45 +206,70 @@ impl SchemaModel {
                 }
             })
             .collect();
+        let nodes: Vec<NodeType> = nodes;
+        let edges: Vec<EdgeType> = edges;
+        let node_index = nodes
+            .iter()
+            .enumerate()
+            .map(|(at, node)| (node.name.clone(), at))
+            .collect();
+        let edge_index = edges
+            .iter()
+            .enumerate()
+            .map(|(at, edge)| (edge.name.clone(), at))
+            .collect();
+        let relationships = nodes
+            .iter()
+            .map(|node| (node.name.clone(), groups_of(&edges, &node.name).into()))
+            .collect();
         Ok(Self {
             source: source.into(),
             nodes,
             edges,
             catalog: Arc::new(catalog),
+            node_index,
+            edge_index,
+            relationships,
         })
     }
 
     pub fn node(&self, name: &str) -> Option<&NodeType> {
-        self.nodes.iter().find(|n| n.name == name)
+        self.nodes.get(*self.node_index.get(name)?)
     }
 
     pub fn edge(&self, name: &str) -> Option<&EdgeType> {
-        self.edges.iter().find(|e| e.name == name)
+        self.edges.get(*self.edge_index.get(name)?)
     }
 
-    /// The relationship groups of a node type, outgoing first, each in schema order.
-    pub fn relationships_of(&self, node_type: &str) -> Vec<RelationshipGroup> {
-        let mut groups = Vec::new();
-        for edge in &self.edges {
-            if edge.from == node_type {
-                groups.push(RelationshipGroup {
-                    edge: edge.name.clone(),
-                    direction: Direction::Outgoing,
-                    other_type: edge.to.clone(),
-                });
-            }
-        }
-        for edge in &self.edges {
-            if edge.to == node_type {
-                groups.push(RelationshipGroup {
-                    edge: edge.name.clone(),
-                    direction: Direction::Incoming,
-                    other_type: edge.from.clone(),
-                });
-            }
-        }
-        groups
+    /// The relationship groups of a node type, outgoing first, each in schema order; none for
+    /// a type the schema does not hold.
+    pub fn relationships_of(&self, node_type: &str) -> &[RelationshipGroup] {
+        self.relationships
+            .get(node_type)
+            .map(|groups| &**groups)
+            .unwrap_or_default()
     }
+}
+
+/// A node type's relationship groups, outgoing first, each in schema order.
+fn groups_of(edges: &[EdgeType], node_type: &str) -> Vec<RelationshipGroup> {
+    let outgoing = edges
+        .iter()
+        .filter(|edge| edge.from == node_type)
+        .map(|edge| RelationshipGroup {
+            edge: edge.name.clone(),
+            direction: Direction::Outgoing,
+            other_type: edge.to.clone(),
+        });
+    let incoming = edges
+        .iter()
+        .filter(|edge| edge.to == node_type)
+        .map(|edge| RelationshipGroup {
+            edge: edge.name.clone(),
+            direction: Direction::Incoming,
+            other_type: edge.from.clone(),
+        });
+    outgoing.chain(incoming).collect()
 }
 
 /// The compiled shape lists properties by name; tables and forms show them as the `.pg` file

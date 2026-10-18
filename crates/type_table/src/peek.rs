@@ -906,9 +906,9 @@ impl NodePeek {
         };
         self.groups = schema
             .relationships_of(&type_name)
-            .into_iter()
+            .iter()
             .map(|group| Group {
-                group,
+                group: group.clone(),
                 count: Loadable::Loading,
                 expanded: false,
                 neighbours: Loadable::NotLoaded,

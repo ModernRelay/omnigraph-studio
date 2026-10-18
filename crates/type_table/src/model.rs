@@ -1108,7 +1108,7 @@ mod tests {
     fn node_columns_pin_the_key_and_follow_schema_order() {
         let schema = schema();
         let groups = schema.relationships_of("Person");
-        let columns = node_columns(schema.node("Person").unwrap(), &groups);
+        let columns = node_columns(schema.node("Person").unwrap(), groups);
         let keys: Vec<_> = columns.iter().map(|c| c.key.as_str()).collect();
         assert_eq!(
             keys[..6],

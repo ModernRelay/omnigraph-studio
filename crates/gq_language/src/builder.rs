@@ -2659,7 +2659,7 @@ mod tests {
                 filters.push(knows.clone());
             }
             for group in schema.relationships_of(node) {
-                let key = relationship_key(&group);
+                let key = relationship_key(group);
                 let query = neighbour_counts(&schema, node, &filters, &key, 200).unwrap();
                 assert_compiles(&query);
                 assert!(query.text.contains("$g.@id as value"), "{}", query.text);
@@ -2688,7 +2688,7 @@ mod tests {
             for group in schema.relationships_of(node_type) {
                 let other = schema.node(&group.other_type).unwrap();
                 for property in other.properties.iter().filter(|p| GroupBy::allowed(p)) {
-                    let key = neighbour_property_key(&group, &property.name);
+                    let key = neighbour_property_key(group, &property.name);
                     let counts = neighbour_value_counts(
                         &schema,
                         node_type,
@@ -2811,10 +2811,10 @@ mod tests {
         let ids = vec!["person-000000".to_owned(), "person-000001".to_owned()];
         for node in &schema.nodes {
             for group in schema.relationships_of(&node.name) {
-                let degrees = page_degrees(&schema, &node.name, &group, &ids).unwrap();
+                let degrees = page_degrees(&schema, &node.name, group, &ids).unwrap();
                 assert!(degrees.text.contains("$n.@id in $ids"), "{}", degrees.text);
                 assert_compiles(&degrees);
-                let sample = page_neighbours(&schema, &node.name, &group, &ids, 300).unwrap();
+                let sample = page_neighbours(&schema, &node.name, group, &ids, 300).unwrap();
                 assert!(sample.text.contains("limit 300"));
                 assert_compiles(&sample);
             }
@@ -3146,11 +3146,11 @@ mod tests {
     fn relationship_queries_compile_in_both_directions() {
         let schema = dev();
         for group in schema.relationships_of("Person") {
-            assert_compiles(&degree(&schema, "Person", &group, "person-000000").unwrap());
+            assert_compiles(&degree(&schema, "Person", group, "person-000000").unwrap());
             let page = neighbours(
                 &schema,
                 "Person",
-                &group,
+                group,
                 "person-000000",
                 None,
                 Narrow::default(),
@@ -3167,16 +3167,7 @@ mod tests {
                 value: None,
             };
             assert_compiles(
-                &neighbours(
-                    &schema,
-                    "Company",
-                    &group,
-                    "company-00000",
-                    None,
-                    search,
-                    50,
-                )
-                .unwrap(),
+                &neighbours(&schema, "Company", group, "company-00000", None, search, 50).unwrap(),
             );
         }
     }
@@ -3186,24 +3177,24 @@ mod tests {
         let schema = dev();
         for node_type in ["Person", "Company", "Project"] {
             for group in schema.relationships_of(node_type) {
-                for by in GroupBy::choices(&schema, &group) {
+                for by in GroupBy::choices(&schema, group) {
                     let values =
-                        neighbour_values(&schema, node_type, &group, "x", &by, 100).unwrap();
+                        neighbour_values(&schema, node_type, group, "x", &by, 100).unwrap();
                     assert_compiles(&values);
                     assert!(values.text.contains("order { n desc, value asc }"));
                     let related = by.on == GroupOn::Relationship;
                     if related {
                         let without =
-                            neighbours_without(&schema, node_type, &group, "x", &by).unwrap();
+                            neighbours_without(&schema, node_type, group, "x", &by).unwrap();
                         assert_compiles(&without);
                     }
-                    for value in [json!(null), sample_value(&schema, &group, &by)] {
+                    for value in [json!(null), sample_value(&schema, group, &by)] {
                         let narrow = Narrow {
                             search: Some("a"),
                             value: Some((&by, &value)),
                         };
                         let page =
-                            neighbours(&schema, node_type, &group, "x", None, narrow, 50).unwrap();
+                            neighbours(&schema, node_type, group, "x", None, narrow, 50).unwrap();
                         assert_compiles(&page);
                         let none = if related { "not {" } else { "is null" };
                         assert_eq!(page.text.contains(none), value.is_null(), "{}", page.text);
@@ -3213,10 +3204,10 @@ mod tests {
         }
         let works_at = schema
             .relationships_of("Company")
-            .into_iter()
+            .iter()
             .find(|group| group.edge == "WorksAt")
             .unwrap();
-        let choices: Vec<String> = GroupBy::choices(&schema, &works_at)
+        let choices: Vec<String> = GroupBy::choices(&schema, works_at)
             .iter()
             .map(|by| format!("{:?} {}", by.on, by.property))
             .collect();
@@ -3242,10 +3233,10 @@ mod tests {
         };
         let knows = schema
             .relationships_of("Person")
-            .into_iter()
+            .iter()
             .find(|group| group.edge == "Knows")
             .unwrap();
-        let values = neighbour_values(&schema, "Person", &knows, "x", &by_company, 10).unwrap();
+        let values = neighbour_values(&schema, "Person", knows, "x", &by_company, 10).unwrap();
         assert!(values.text.contains("$m worksAt $v"), "{}", values.text);
         assert!(values.text.contains("$v.name as label"), "{}", values.text);
         assert_eq!(by_company.label(), "worksAt →");
@@ -3254,14 +3245,14 @@ mod tests {
             property: "out:Owns".into(),
         };
         assert!(
-            neighbour_values(&schema, "Person", &knows, "x", &elsewhere, 10).is_err(),
+            neighbour_values(&schema, "Person", knows, "x", &elsewhere, 10).is_err(),
             "a relationship of another type"
         );
         let key = GroupBy {
             on: GroupOn::Node,
             property: "slug".into(),
         };
-        assert!(neighbour_values(&schema, "Company", &works_at, "x", &key, 10).is_err());
+        assert!(neighbour_values(&schema, "Company", works_at, "x", &key, 10).is_err());
     }
 
     /// A value of the grouping property's type, as a bucket would hold it.

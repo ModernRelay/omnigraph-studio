@@ -485,8 +485,8 @@ impl ExploreState {
         let node = path.node(&root).clone();
         self.expanded.insert(path.clone());
         for group in schema.relationships_of(&node.type_name) {
-            if !is_field(schema, &group) {
-                self.expand(&path.child_group(&group));
+            if !is_field(schema, group) {
+                self.expand(&path.child_group(group));
             }
         }
     }
@@ -610,9 +610,9 @@ impl ExploreState {
         ancestors.push((node.clone(), index));
         for group in groups {
             let key = GroupKey::new(node.clone(), group.clone());
-            let group_path = path.child_group(&group);
+            let group_path = path.child_group(group);
             let list = self.neighbours.get(&key);
-            if is_field(schema, &group) {
+            if is_field(schema, group) {
                 let index_of_field = out.len();
                 out.push(Entry {
                     path: group_path.clone(),
@@ -669,7 +669,7 @@ impl ExploreState {
             if !group_expanded {
                 continue;
             }
-            match self.grouping.get(&group) {
+            match self.grouping.get(group) {
                 Some(by) => self.push_values(
                     schema,
                     &key,
@@ -890,10 +890,10 @@ impl ExploreState {
             let node = path.node(root);
             return schema
                 .relationships_of(&node.type_name)
-                .into_iter()
+                .iter()
                 .filter_map(|group| {
                     let key = GroupKey::new(node.clone(), group.clone());
-                    if is_field(schema, &group) {
+                    if is_field(schema, group) {
                         (!self.neighbours.contains_key(&key)).then_some(LoadTarget::Page(key))
                     } else {
                         (!self.counts.contains_key(&key)).then_some(LoadTarget::Count(key))
@@ -1794,8 +1794,9 @@ mod tests {
     ) -> RelationshipGroup {
         schema
             .relationships_of(of)
-            .into_iter()
+            .iter()
             .find(|g| g.edge == edge && g.direction == direction)
+            .cloned()
             .unwrap()
     }
 

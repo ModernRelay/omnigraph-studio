@@ -656,7 +656,7 @@ impl TypeTable {
         }
         let columns = if let Some(node) = schema.node(&self.type_name) {
             self.kind = TableKind::Node;
-            node_columns(node, &schema.relationships_of(&self.type_name))
+            node_columns(node, schema.relationships_of(&self.type_name))
         } else if let Some(edge) = schema.edge(&self.type_name) {
             self.kind = TableKind::Edge;
             edge_columns(edge)
@@ -1990,9 +1990,9 @@ impl TypeTable {
             } => {
                 let group = schema
                     .relationships_of(&self.type_name)
-                    .into_iter()
+                    .iter()
                     .find(|group| group.direction == direction && group.edge == edge)?;
-                (group.other_type, property)
+                (group.other_type.clone(), property)
             }
             builder::GroupKey::EndpointProperty { end, property } => {
                 let edge = schema.edge(&self.type_name)?;
@@ -4231,7 +4231,7 @@ impl TypeTable {
             && let Some(schema) = &self.schema
         {
             for group in schema.relationships_of(&self.type_name) {
-                let key = builder::relationship_key(&group);
+                let key = builder::relationship_key(group);
                 // The entry's icon shows the direction, so the label names the traversal only.
                 let label = format!(
                     "{} {}",
@@ -4304,9 +4304,9 @@ impl TypeTable {
                 .schema
                 .as_ref()?
                 .relationships_of(&self.type_name)
-                .into_iter()
+                .iter()
                 .find(|group| builder::relationship_key(group) == key)?;
-            return Some(SuggestSource::Nodes(group.other_type));
+            return Some(SuggestSource::Nodes(group.other_type.clone()));
         }
         let property = self.filterable().into_iter().find(|p| p.name == key)?;
         if let Some(values) = &property.enum_values {

@@ -532,8 +532,9 @@ mod tests {
         state.root_status = Loadable::Loaded(());
         let knows = schema
             .relationships_of("Person")
-            .into_iter()
+            .iter()
             .find(|g| g.edge == "Knows" && g.direction == Direction::Outgoing)
+            .cloned()
             .unwrap();
         let ada_knows = GroupKey::new(person("ada"), knows.clone());
         state.counts.insert(ada_knows.clone(), Loadable::Loaded(20));
@@ -590,8 +591,9 @@ mod tests {
         state.root_status = Loadable::Loaded(());
         let employer = schema
             .relationships_of("Person")
-            .into_iter()
+            .iter()
             .find(|g| g.edge == "Employer")
+            .cloned()
             .unwrap();
         let key = GroupKey::new(person("ada"), employer.clone());
         let acme = NodeRef::new("Company", "acme");
