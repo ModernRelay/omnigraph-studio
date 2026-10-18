@@ -749,7 +749,8 @@ fn paint_pill(
         point(at.x - px(width / 2.), at.y - px(height / 2.)),
         size(px(width), px(height)),
     );
-    let radius = Corners::all(px(height / 2.));
+    // A chip is not a button: the scale's `sm` corner, zoomed with it, never past round.
+    let radius = Corners::all(px((studio_ui::ds::radii(cx).sm * s).min(height / 2.)));
     if let Some(ring) = style.ring {
         window.paint_drop_shadows(
             rect,
@@ -858,9 +859,11 @@ fn paint_letter_mark(
         point(center.x - px(size_px / 2.), center.y - px(size_px / 2.)),
         size(px(size_px), px(size_px)),
     );
+    // The design system's `xs` corner, at the mark's 16 px size scaled to this one.
+    let corner = studio_ui::ds::radii(cx).xs * size_px / studio_ui::ds::size::ROW_ICON;
     window.paint_quad(quad(
         rect,
-        px(size_px / 4.),
+        px(corner),
         tint.opacity(alpha),
         px(0.),
         tint,
