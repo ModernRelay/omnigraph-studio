@@ -143,6 +143,12 @@ const PINNED_BLOBS: usize = 2_048;
 /// How many branches' commit lists a session keeps.
 const COMMIT_LISTS: usize = 64;
 
+/// Ids per read of [`GraphSession::node_names`], and the most nodes one call names: a review
+/// of 20,000 changes asks a bounded number of small reads, and an end past the limit keeps its
+/// id.
+const NAME_BATCH: usize = 500;
+const NAME_LIMIT: usize = 5_000;
+
 /// How often a session asks after the heads of the branches its views show, while a window of
 /// Studio's is active.
 const HEAD_POLL: Duration = Duration::from_secs(30);
@@ -1567,6 +1573,50 @@ impl GraphSession {
                     .ok();
             }
             result
+        })
+    }
+
+    /// Names of the nodes `ends` lists, `(type, id)`, by their type's label property, read at
+    /// `snapshot` (the session's branch when `None`): one read per type of at most
+    /// [`NAME_BATCH`] ids, the first [`NAME_LIMIT`] ends only. A node whose label is its key, or
+    /// that a read did not find, is left out, and so is every node of a read that failed: a
+    /// name only replaces an id its caller already shows.
+    pub fn node_names(
+        &mut self,
+        ends: Vec<(String, String)>,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<crate::NodeNames> {
+        let Some(schema) = self.schema_model() else {
+            return Task::ready(crate::NodeNames::default());
+        };
+        let mut by_type: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (type_name, id) in ends.into_iter().take(NAME_LIMIT) {
+            by_type.entry(type_name).or_default().push(id);
+        }
+        let mut reads = Vec::new();
+        for (type_name, ids) in by_type {
+            for chunk in ids.chunks(NAME_BATCH) {
+                if let Ok(Some(query)) = builder::node_labels(&schema, &type_name, chunk) {
+                    reads.push((type_name.clone(), self.read(&query, snapshot.clone(), cx)));
+                }
+            }
+        }
+        cx.spawn(async move |_, _| {
+            let mut names = crate::NodeNames::default();
+            for (type_name, read) in reads {
+                let Ok(output) = read.await else { continue };
+                for row in output.rows.as_array().into_iter().flatten() {
+                    if let (Some(id), Some(label)) = (
+                        row.get("id").and_then(Value::as_str),
+                        row.get("label").and_then(Value::as_str),
+                    ) && !label.is_empty()
+                    {
+                        names.insert((type_name.clone(), id.to_owned()), label.to_owned());
+                    }
+                }
+            }
+            names
         })
     }
 

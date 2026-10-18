@@ -31,8 +31,8 @@ pub use connection::{
     Connection, ConnectionEvent, ConnectionState, GraphListing, ServerEntry, ServerSource,
 };
 pub use entity_groups::{
-    EntityGroup, EntityGroups, GroupRelationship, GroupRun, GroupSection, RelationshipEntry,
-    entity_name, relationship_words,
+    EntityGroup, EntityGroups, GroupRelationship, GroupRun, GroupSection, NodeNames,
+    RelationshipEntry, entity_name, relationship_words,
 };
 pub use exploration::*;
 pub use fixes::{RevertUnavailable, revert_query};

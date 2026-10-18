@@ -17,9 +17,9 @@ use graph_client::{ReadError, WriteOutcome};
 use graph_store::fixes::compose;
 use graph_store::{
     ChangeFold, EntityGroup, EntityGroups, FoldedChange, FoldedChanges, GraphSession, GroupRun,
-    GroupSection, HeadWatch, NetChange, REVIEW_CHANGE_CAP, RelationshipEntry, SessionEvent,
-    TypeCounts, commits_since, contains_merge_of, entity_name, fork_point, revert_query,
-    summary_sentence,
+    GroupSection, HeadWatch, NetChange, NodeNames, REVIEW_CHANGE_CAP, RelationshipEntry,
+    SessionEvent, TypeCounts, commits_since, contains_merge_of, entity_name, fork_point,
+    revert_query, summary_sentence,
 };
 use serde_json::Value;
 use studio_actions::review::{
@@ -221,6 +221,9 @@ pub struct ReviewView {
     headers: Vec<GroupRun>,
     /// The selected change: an entity's own, or one relationship on its card.
     selected: Option<usize>,
+    /// Names of the nodes the review knows only by id, read at the reviewed head after it
+    /// loads; until then, and for a node without a name, its id shows.
+    names: NodeNames,
     list_state: ListState,
     /// The head fixes and the merge bind to: the reviewed head, then each fix's own commit.
     bound_head: Option<String>,
@@ -244,6 +247,7 @@ pub struct ReviewView {
     /// The session asks after the reviewed branch's head while the review is open.
     _head_watch: HeadWatch,
     _load_task: Option<Task<()>>,
+    _names_task: Option<Task<()>>,
     _merge_task: Option<Task<()>>,
     _search_task: Option<Task<()>>,
     _fix_tasks: Vec<Task<()>>,
@@ -332,6 +336,7 @@ impl ReviewView {
             rows: Vec::new(),
             headers: Vec::new(),
             selected: None,
+            names: NodeNames::default(),
             list_state: ListState::new(0, ListAlignment::Top, px(800.)),
             bound_head: None,
             reviewed_keys: HashSet::new(),
@@ -345,6 +350,7 @@ impl ReviewView {
             head_moved_while_writing: false,
             _head_watch: head_watch,
             _load_task: None,
+            _names_task: None,
             _merge_task: None,
             _search_task: None,
             _fix_tasks: Vec::new(),
@@ -412,13 +418,46 @@ impl ReviewView {
                     .and_then(|&group| data.groups.groups[group].primary());
                 self.bound_head = data.head.clone();
                 self.newer = data.moved_while_reading;
+                let ends = data.groups.unnamed_ends();
+                let head = data.head.clone();
                 self.data = Some(data);
                 self.load = LoadState::Ready;
+                self.read_names(ends, head, cx);
             }
             Err(error) => self.load = LoadState::Failed(error.into()),
         }
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
+    }
+
+    /// Reads the names of the nodes the review knows only by id, at the head it read. A name
+    /// already known is not read again: a node is known only by id while the branch has not
+    /// changed it, so its name has not moved, and a Refresh keeps showing it.
+    fn read_names(
+        &mut self,
+        ends: Vec<(String, String)>,
+        head: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let missing: Vec<_> = ends
+            .into_iter()
+            .filter(|end| !self.names.contains_key(end))
+            .collect();
+        if missing.is_empty() {
+            self._names_task = None;
+            return;
+        }
+        let names = self
+            .session
+            .update(cx, |session, cx| session.node_names(missing, head, cx));
+        self._names_task = Some(cx.spawn(async move |this, cx| {
+            let names = names.await;
+            this.update(cx, |this, cx| {
+                this.names.extend(names);
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn change_count(&self) -> usize {
@@ -1642,7 +1681,11 @@ impl ReviewView {
         let mut card = match group.change {
             Some(own) => change_card(&changes[own], schema, ("change", ix))
                 .name(entity_name(&changes[own], schema)),
-            None => ChangeCard::new(("change", ix), ChangeKind::Unchanged, group.id.clone()),
+            None => ChangeCard::new(("change", ix), ChangeKind::Unchanged, group.id.clone()).name(
+                self.names
+                    .get(&(group.type_name.clone(), group.id.clone()))
+                    .cloned(),
+            ),
         }
         .selected(selected_group == Some(ix))
         .hollow(reviewed);
@@ -1732,7 +1775,7 @@ impl ReviewView {
             );
         }
 
-        let entries = data.groups.entries(&data.folded, ix, schema);
+        let entries = data.groups.entries(&data.folded, ix, schema, &self.names);
         let counts = relationship_counts(&entries);
         let lines = entries
             .into_iter()

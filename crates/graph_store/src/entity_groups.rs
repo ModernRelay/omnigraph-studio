@@ -66,6 +66,9 @@ impl EntityGroup {
     }
 }
 
+/// Names of nodes the review knows only by id, by `(type, id)`, as read from the graph.
+pub type NodeNames = HashMap<(String, String), String>;
+
 /// A run of consecutive groups of one type, as a list shows them under one header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupRun {
@@ -343,13 +346,43 @@ impl EntityGroups {
         runs
     }
 
+    /// The nodes the review knows only by id, `(type, id)`, each once: those standing unchanged
+    /// for their relationships, and relationship ends without a change of their own. Their
+    /// names are read from the graph ([`NodeNames`]).
+    pub fn unnamed_ends(&self) -> Vec<(String, String)> {
+        let unchanged =
+            |group: Option<usize>| group.is_none_or(|g| self.groups[g].change.is_none());
+        let mut seen = std::collections::HashSet::new();
+        let mut ends = Vec::new();
+        for group in &self.groups {
+            if group.is_edge {
+                continue;
+            }
+            if group.change.is_none() && seen.insert((&group.type_name, &group.id)) {
+                ends.push((group.type_name.clone(), group.id.clone()));
+            }
+            for relationship in &group.relationships {
+                if unchanged(relationship.other_group)
+                    && seen.insert((&relationship.other_type, &relationship.other_id))
+                {
+                    ends.push((
+                        relationship.other_type.clone(),
+                        relationship.other_id.clone(),
+                    ));
+                }
+            }
+        }
+        ends
+    }
+
     /// The lines of group `ix`'s card: the relationship changes reviewed there, then the
-    /// mirrors, each with its other end named.
+    /// mirrors, each with its other end named, from the review or else from `names`.
     pub fn entries(
         &self,
         folded: &FoldedChanges,
         ix: usize,
         schema: Option<&SchemaModel>,
+        names: &NodeNames,
     ) -> Vec<RelationshipEntry> {
         let group = &self.groups[ix];
         let entry = |relationship: &GroupRelationship, mirror: bool| {
@@ -370,6 +403,14 @@ impl EntityGroups {
                 outgoing: relationship.direction == Direction::Outgoing,
                 other: other
                     .and_then(|change| entity_name(change, schema))
+                    .or_else(|| {
+                        names
+                            .get(&(
+                                relationship.other_type.clone(),
+                                relationship.other_id.clone(),
+                            ))
+                            .cloned()
+                    })
                     .unwrap_or_else(|| relationship.other_id.clone()),
                 other_type: relationship.other_type.clone(),
                 other_is_new: other.and_then(FoldedChange::net) == Some(NetChange::Added),
@@ -597,6 +638,19 @@ mod tests {
         let maya = &groups.groups[0];
         let mirror = &maya.mirrors[0];
         assert_eq!(groups.groups[mirror.other_group.unwrap()].id, "theo");
+        // Known only by id: the unchanged source standing for its relationship, and the ends
+        // with no change of their own, each once.
+        let ends: Vec<String> = groups
+            .unnamed_ends()
+            .into_iter()
+            .map(|(type_name, id)| format!("{type_name}:{id}"))
+            .collect();
+        assert_eq!(ends, ["Person:ana", "Person:bob", "Company:acme"]);
+        let names = NodeNames::from([(("Person".into(), "ana".into()), "Ana Lima".into())]);
+        let lines = groups.entries(&folded, 0, Some(&schema), &names);
+        assert_eq!(lines[0].other, "Ana Lima", "a name read from the graph");
+        // Theo's label is his key: the id is his name.
+        assert_eq!(lines[1].other, "theo");
         assert_eq!(
             maya.relationships[0].other_group, None,
             "ana is not in the review"

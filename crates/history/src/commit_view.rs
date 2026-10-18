@@ -10,7 +10,7 @@ use graph_client::ReadError;
 use graph_client::api::{ChangeCauseOutput, CommitOutput};
 use graph_store::{
     ChangeFold, EntityGroups, FoldedChange, FoldedChanges, GraphSession, GroupRun, GroupSection,
-    NetChange, RelationshipEntry, TypeCounts, entity_name,
+    NetChange, NodeNames, RelationshipEntry, TypeCounts, entity_name,
 };
 use studio_actions::graph::{OpenCommit, OpenQueryAt, OpenType};
 use studio_ui::menu::ContextMenu;
@@ -64,6 +64,9 @@ pub struct CommitView {
     /// them.
     groups: EntityGroups,
     runs: Vec<GroupRun>,
+    /// Names of the nodes known here only by id, read at the commit.
+    names: NodeNames,
+    _names_task: Option<Task<()>>,
     counts: Vec<TypeCounts>,
     rows: Vec<Row>,
     next_page_token: Option<String>,
@@ -126,6 +129,8 @@ impl CommitView {
             folded: FoldedChanges::default(),
             groups: EntityGroups::default(),
             runs: Vec::new(),
+            names: NodeNames::default(),
+            _names_task: None,
             counts: Vec::new(),
             rows: Vec::new(),
             next_page_token: None,
@@ -214,8 +219,27 @@ impl CommitView {
                         this.counts = counts;
                         this.rows = rows;
                         this.runs = runs;
+                        let ends: Vec<_> = groups
+                            .unnamed_ends()
+                            .into_iter()
+                            .filter(|end| !this.names.contains_key(end))
+                            .collect();
                         this.groups = groups;
                         this.folded = folded;
+                        if !ends.is_empty() {
+                            let commit = Some(this.commit_id.clone());
+                            let names = this
+                                .session
+                                .update(cx, |session, cx| session.node_names(ends, commit, cx));
+                            this._names_task = Some(cx.spawn(async move |this, cx| {
+                                let names = names.await;
+                                this.update(cx, |this, cx| {
+                                    this.names.extend(names);
+                                    cx.notify();
+                                })
+                                .ok();
+                            }));
+                        }
                         this.next_page_token = token;
                         // Rows read further down keep the place the person scrolled to.
                         let top = this.list_state.logical_scroll_top();
@@ -515,9 +539,14 @@ impl CommitView {
                         ("commit-change", ix),
                         ChangeKind::Unchanged,
                         group.id.clone(),
+                    )
+                    .name(
+                        self.names
+                            .get(&(group.type_name.clone(), group.id.clone()))
+                            .cloned(),
                     ),
                 };
-                let entries = self.groups.entries(&self.folded, ix, schema);
+                let entries = self.groups.entries(&self.folded, ix, schema, &self.names);
                 let counts = relationship_counts(&entries);
                 let lines = entries
                     .into_iter()

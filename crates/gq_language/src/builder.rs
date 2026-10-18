@@ -1918,6 +1918,40 @@ pub fn node_label(
     })
 }
 
+/// The labels of nodes of one type, by id, to name nodes known only by their ids (the review's
+/// unchanged ends, spec 008). Columns: `id`, `label`; an id with no row does not exist at the
+/// commit read. `None` when the type's label is its key, which names it already.
+pub fn node_labels(
+    schema: &SchemaModel,
+    type_name: &str,
+    ids: &[String],
+) -> Result<Option<BuiltQuery>, BuildError> {
+    let node = node(schema, type_name)?;
+    let Some(label) = node
+        .label_property()
+        .filter(|label| Some(*label) != node.key.as_deref())
+    else {
+        return Ok(None);
+    };
+    let mut params = Params::new();
+    let ids = params.add("ids", "[String]", Value::from(ids.to_vec()));
+    let text = format!(
+        "query studio_node_labels({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id in {ids}\n  }}\n  return {{ $n.@id as id, $n.{label} as label }}\n}}\n",
+        sig = params.signature(),
+        ty = node.name,
+    );
+    Ok(Some(BuiltQuery {
+        name: "studio_node_labels".into(),
+        text,
+        params: params.values,
+        depends: Depends::Types {
+            nodes: vec![node.name.clone()],
+            edges: Vec::new(),
+        },
+        seeds: None,
+    }))
+}
+
 /// Nodes of one type whose id starts with `text`, or whose label contains it (spec 002, ⌘P go
 /// to a node). Columns: `id`, then `label` when the type has a label other than its key.
 pub fn node_search(
@@ -3456,6 +3490,29 @@ mod tests {
         assert!(!query.text.contains("as label"), "{}", query.text);
         let result = check(&schema, &query.text);
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        // Nothing to read in a batch either: the key names it.
+        assert!(
+            node_labels(&schema, "Tag", &["t".into()])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Labels by id, for many nodes of one type in one read.
+    #[test]
+    fn node_labels_compile_for_every_type() {
+        let schema = dev();
+        let ids = vec!["a".to_owned(), "b".to_owned()];
+        for node in &schema.nodes {
+            let query = node_labels(&schema, &node.name, &ids).unwrap().unwrap();
+            assert_compiles(&query);
+            assert!(query.text.contains("$n.@id in $ids"), "{}", query.text);
+            assert!(query.text.contains("$n.name as label"), "{}", query.text);
+        }
+        assert!(matches!(
+            node_labels(&schema, "Nope", &ids),
+            Err(BuildError::UnknownType(_))
+        ));
     }
 
     #[test]
