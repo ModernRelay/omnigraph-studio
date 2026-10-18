@@ -278,6 +278,12 @@ A first cut of parts 1 and 4, ahead of the shared cache:
   groups the commit touched, and a moved view's later reads mostly cost nothing. The memo
   keeps its answers within 64 MB (each weighed by its rows), least recently used first out, up
   to 4,096; the release buffer is not built.
+- Seeding: a generated query may say what its rows also answer at the same commit and schema
+  (`builder::Seeds`). A whole-node page's rows answer each row's `node_by_id`, so a node page
+  or peek opened from a table at the session's known head reads nothing for the node; a page's
+  relationship counts answer each node's count. Counts are kept per node, commit and schema
+  epoch (16,384 of them), so a peek, the tree and the canvas share the table's, and a count
+  carries to a later commit that changed no edge of its group at the node.
 - Review reads its fork and head from `branches/merge-base` and folds the feed after the base,
   instead of reading both branches' whole commit lists (each about 1.6 s on the personal graph,
   and 3m47s once right after a restart); its commits come from the feed blocks' causes. A

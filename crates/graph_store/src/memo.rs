@@ -70,6 +70,11 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone> Memo<K, V, P> {
         }
     }
 
+    /// Whether anything is held for `key`, without marking it used.
+    pub(crate) fn holds(&self, key: &K) -> bool {
+        self.entries.contains_key(key)
+    }
+
     /// Keeps `value` as the answer for `key`.
     pub(crate) fn insert(&mut self, key: K, value: V) {
         self.put(key, Held::Done(value));

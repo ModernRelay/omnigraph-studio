@@ -492,7 +492,12 @@ impl NodePeek {
         };
         let type_name = type_name.clone();
         self.values = Loadable::Loading;
-        let snapshot = self.snapshot.clone();
+        // At the head the session knows, a node kept there answers at once: a table's page
+        // read it already.
+        let snapshot = self.snapshot.clone().or_else(|| {
+            let session = self.session.read(cx);
+            session.head(&session.branch).map(str::to_owned)
+        });
         let read = self.read_shown(&query, snapshot, cx);
         self._tasks.push(cx.spawn(async move |this, cx| {
             let result = read.await;

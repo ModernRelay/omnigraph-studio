@@ -200,6 +200,7 @@ pub fn compose(name: &str, parts: Vec<BuiltQuery>) -> BuiltQuery {
         ),
         params,
         depends: Default::default(),
+        seeds: None,
     }
 }
 

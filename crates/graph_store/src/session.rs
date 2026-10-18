@@ -10,13 +10,13 @@ use futures::FutureExt as _;
 use futures::channel::oneshot;
 use futures::future::{Either, Shared, select};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task};
-use gq_language::builder::Depends;
+use gq_language::builder::{Depends, Seeds};
 use gq_language::{BuiltQuery, RelationshipGroup, SchemaModel, builder};
 use graph_client::api::{
     BranchCreateOutput, BranchCreateRequest, BranchMergeOutput, BranchMergeRequest,
     ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitOutput, GraphListResponse,
     InvokeStoredQueryRequest, MergeBaseOutput, QueryCatalogEntry, QueryRequest, ReadOutput,
-    ReadinessOutput, SnapshotDatasetOutput, SnapshotOutput,
+    ReadTargetOutput, ReadinessOutput, SnapshotDatasetOutput, SnapshotOutput,
 };
 use graph_client::{
     ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CommitChanges, FeedAt, GraphClient, ReadError,
@@ -175,6 +175,28 @@ struct PinnedRead {
     schema: u64,
 }
 
+/// One node's count through a relationship group, at a commit and schema epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DegreeAt {
+    type_name: String,
+    group: RelationshipGroup,
+    id: String,
+    commit: String,
+    schema: u64,
+}
+
+/// How many nodes' counts a session keeps.
+const DEGREE_COUNTS: usize = 16_384;
+
+/// A query's parameters as a memo key holds them: as sent.
+fn params_key(params: &serde_json::Map<String, Value>) -> String {
+    if params.is_empty() {
+        String::new()
+    } else {
+        Value::Object(params.clone()).to_string()
+    }
+}
+
 /// The first wait before a graph that answered 503 is asked again; it doubles up to the cap.
 const RECHECK_FIRST: Duration = Duration::from_secs(5);
 const RECHECK_CAP: Duration = Duration::from_secs(60);
@@ -243,6 +265,9 @@ pub struct GraphSession {
     /// Answers to reads pinned to a commit, and those under way (they never change).
     pinned_reads: ReadMemo<PinnedRead, ReadOutput>,
     pinned_blobs: ReadMemo<(BlobCell, String, u64), BlobMeta>,
+    /// Each node's count through a group, by commit: read in a batch, or what a page's counts
+    /// gave (`builder::Seeds`). Shared by the table, the peek, the tree and the canvas.
+    degree_counts: Memo<DegreeAt, u64, ()>,
     /// Which schema the session reads under: a new number each time the schema's text changes,
     /// the first one included. A read at an old commit uses the current schema, so the same
     /// query at the same commit can mean something else after a rename, a drop or an addition;
@@ -309,6 +334,7 @@ impl GraphSession {
             recheck_after: RECHECK_FIRST,
             pinned_reads: Memo::weighed(PINNED_READS, PINNED_READ_BYTES, read_bytes),
             pinned_blobs: Memo::new(PINNED_BLOBS),
+            degree_counts: Memo::new(DEGREE_COUNTS),
             schema_epoch: 0,
             schema_text: None,
             commit_lists: Memo::new(COMMIT_LISTS),
@@ -560,6 +586,7 @@ impl GraphSession {
         self.schema_text = Some(model.source.clone());
         self.pinned_reads.clear();
         self.pinned_blobs.clear();
+        self.degree_counts.clear();
         // Each log starts again at its branch's head, so the next move is read.
         self.change_logs = self
             .heads
@@ -1108,6 +1135,104 @@ impl GraphSession {
         cx.emit(SessionEvent::HeadMoved { branch, head });
     }
 
+    /// Keeps what an answer's rows also answer (`builder::Seeds`): whole nodes as their node
+    /// reads, counts as each node's count. Nothing already held is replaced, and nothing is kept
+    /// when the schema changed while it was read.
+    fn seed(&mut self, seeds: &Seeds, output: &ReadOutput, epoch: u64) {
+        let (Some(commit), Some(schema)) = (output.graph_commit_id.clone(), self.schema_model())
+        else {
+            return;
+        };
+        if epoch != self.schema_epoch {
+            return;
+        }
+        let rows = output
+            .rows
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        match seeds {
+            Seeds::Nodes { type_name } => {
+                for row in rows {
+                    let Some(id) = row
+                        .get("n")
+                        .and_then(|node| node.get("@id"))
+                        .and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    let Ok(query) = builder::node_by_id(&schema, type_name, id) else {
+                        continue;
+                    };
+                    let key = PinnedRead {
+                        commit: commit.clone(),
+                        query: query.text,
+                        params: params_key(&query.params),
+                        schema: epoch,
+                    };
+                    if !self.pinned_reads.holds(&key) {
+                        let answer = ReadOutput {
+                            query_name: query.name,
+                            target: ReadTargetOutput {
+                                branch: None,
+                                snapshot: Some(commit.clone()),
+                            },
+                            row_count: 1,
+                            columns: output.columns.clone(),
+                            rows: Value::Array(vec![row.clone()]),
+                            graph_commit_id: Some(commit.clone()),
+                        };
+                        self.pinned_reads.insert(key, answer);
+                    }
+                }
+            }
+            Seeds::Degrees {
+                type_name,
+                group,
+                ids,
+            } => {
+                let counts = page_counts(&output.rows);
+                for id in ids {
+                    let key = DegreeAt {
+                        type_name: type_name.clone(),
+                        group: group.clone(),
+                        id: id.clone(),
+                        commit: commit.clone(),
+                        schema: epoch,
+                    };
+                    let n = counts.get(id).copied().unwrap_or(0);
+                    self.degree_counts.insert(key, n);
+                }
+            }
+        }
+    }
+
+    /// A node's count through a group kept at `key`'s commit, or at an earlier commit of the
+    /// session's branch when no edge of the group's type at the node changed in between.
+    fn degree_kept(&mut self, key: &DegreeAt) -> Option<u64> {
+        if let Some(Held::Done(n)) = self.degree_counts.get(key) {
+            return Some(n);
+        }
+        let carried = self
+            .degree_counts
+            .answers()
+            .filter(|(at, _)| {
+                at.type_name == key.type_name
+                    && at.group == key.group
+                    && at.id == key.id
+                    && at.schema == key.schema
+                    && at.commit != key.commit
+            })
+            .find_map(|(at, n)| {
+                match self.changes_since(&self.branch, &at.commit, &key.commit) {
+                    Since::Known(since) if !since.edges_at(&key.group.edge, &key.id) => Some(*n),
+                    _ => None,
+                }
+            })?;
+        self.degree_counts.insert(key.clone(), carried);
+        Some(carried)
+    }
+
     /// An answer to the same query and parameters read at an earlier commit of the session's
     /// branch, standing for `key`'s commit because no commit in between changed what it
     /// depends on (spec 015, carry-forward). Answered as read at `key`'s commit.
@@ -1146,6 +1271,29 @@ impl GraphSession {
         snapshot: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<ReadOutput, ReadError>> {
+        let read = self.read_kept(query, snapshot, cx);
+        let Some(seeds) = query.seeds.clone() else {
+            return read;
+        };
+        // What its rows also answer is kept too, at the commit and schema it was read under.
+        let epoch = self.schema_epoch;
+        cx.spawn(async move |this, cx| {
+            let result = read.await;
+            if let Ok(output) = &result {
+                this.update(cx, |this, _| this.seed(&seeds, output, epoch))
+                    .ok();
+            }
+            result
+        })
+    }
+
+    /// [`GraphSession::read`] without its seeds.
+    fn read_kept(
+        &mut self,
+        query: &BuiltQuery,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
         let request = QueryRequest {
             query: query.text.clone(),
             name: Some(query.name.clone()),
@@ -1159,11 +1307,7 @@ impl GraphSession {
         let key = PinnedRead {
             commit,
             query: request.query.clone(),
-            params: request
-                .params
-                .as_ref()
-                .map(|params| params.to_string())
-                .unwrap_or_default(),
+            params: params_key(&query.params),
             schema: self.schema_epoch,
         };
         let shared = match self.pinned_reads.get(&key) {
@@ -1503,6 +1647,18 @@ impl GraphSession {
         snapshot: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<u64, String>> {
+        if let Some(commit) = &snapshot {
+            let at = DegreeAt {
+                type_name: type_name.to_owned(),
+                group: group.clone(),
+                id: id.to_owned(),
+                commit: commit.clone(),
+                schema: self.schema_epoch,
+            };
+            if let Some(n) = self.degree_kept(&at) {
+                return Task::ready(Ok(n));
+            }
+        }
         let (tx, rx) = oneshot::channel();
         let key = DegreeBatchKey {
             type_name: type_name.to_owned(),
@@ -3075,5 +3231,85 @@ mod tests {
         );
         read_at_c1(cx).await.unwrap();
         assert_eq!(reads(), 3, "read again under the renamed schema");
+    }
+
+    /// What a read's rows also answer is kept: a page's whole nodes answer their node reads,
+    /// and a page's counts each node's count, at the commit read. A count carries to a later
+    /// commit that changed no edge of its group at the node (spec 015).
+    #[gpui::test]
+    async fn a_pages_rows_answer_node_reads_and_its_counts_each_nodes_count(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::test_server::{followed_session, node_change};
+        use serde_json::json;
+
+        const SCHEMA: &str =
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n";
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = sent.clone();
+        let (session, served) = followed_session(
+            SCHEMA,
+            move |request| {
+                let name = request["name"].as_str().unwrap_or_default().to_owned();
+                seen.lock().unwrap().push(name.clone());
+                match name.as_str() {
+                    "studio_page" => json!([
+                        { "n": { "@id": "p1", "slug": "p1", "name": "Ada" } },
+                        { "n": { "@id": "p2", "slug": "p2", "name": "Grace" } },
+                    ]),
+                    "studio_page_degrees" => json!([{ "id": "p1", "n": 3 }]),
+                    _ => json!([]),
+                }
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+        let sent_now = |name: &str| sent.lock().unwrap().iter().filter(|n| *n == name).count();
+        let page = builder::node_page(&schema, "Person", &[], None, &builder::PageStart::First, 50)
+            .unwrap();
+        let read = session.update(cx, |session, cx| session.read(&page, None, cx));
+        cx.run_until_parked();
+        read.await.unwrap();
+
+        let node = builder::node_by_id(&schema, "Person", "p2").unwrap();
+        let read = session.update(cx, |session, cx| session.read(&node, Some("c1".into()), cx));
+        let output = read.await.unwrap();
+        assert_eq!(sent_now("studio_node"), 0, "the page answered it");
+        assert_eq!(output.rows[0]["n"]["name"], json!("Grace"));
+
+        let group = schema.relationships_of("Person")[0].clone();
+        let ids = vec!["p1".to_owned(), "p2".to_owned()];
+        let degrees = builder::page_degrees(&schema, "Person", &group, &ids).unwrap();
+        let read = session.update(cx, |session, cx| {
+            session.read(&degrees, Some("c1".into()), cx)
+        });
+        cx.run_until_parked();
+        read.await.unwrap();
+        let count = |cx: &mut TestAppContext, id: &str, commit: &str| {
+            let read = session.update(cx, |session, cx| {
+                session.degree("Person", &group, id, Some(commit.into()), cx)
+            });
+            cx.run_until_parked();
+            read
+        };
+        assert_eq!(count(cx, "p1", "c1").await, Ok(3));
+        assert_eq!(count(cx, "p2", "c1").await, Ok(0), "no row is none");
+        assert_eq!(
+            sent_now("studio_page_degrees"),
+            1,
+            "the counts were the page's"
+        );
+
+        // Another person changed, no edge at p1: its count carries.
+        let _scope = session.update(cx, |session, _| watching(session, &["Person"], &["Knows"]));
+        served
+            .lock()
+            .unwrap()
+            .commit("c2", vec![node_change("Person", "p9")]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        assert_eq!(count(cx, "p1", "c2").await, Ok(3));
+        assert_eq!(sent_now("studio_page_degrees"), 1, "carried, not read");
     }
 }
