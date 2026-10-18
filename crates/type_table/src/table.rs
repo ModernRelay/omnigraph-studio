@@ -3261,7 +3261,14 @@ impl TypeTable {
         if matches!(self.cells.get(&key), Some(CellState::Saving)) {
             return;
         }
-        let old = row.value(&column.key).clone();
+        // A draft's save is bound to the value it was typed over, which a Refresh since may
+        // have replaced in the cell: a change made elsewhere meanwhile then shows as a conflict
+        // rather than being overwritten.
+        let old = match self.cells.get(&key) {
+            Some(CellState::Draft { .. }) => self.draft_old(&key.0, &key.1, cx),
+            _ => None,
+        }
+        .unwrap_or_else(|| row.value(&column.key).clone());
         // Text with markup or more than one line opens in the editor with its preview (spec
         // 014): a one-line cell editor would flatten it. It reads the value at the table's
         // commit, so its save stays bound to what the cell shows.
@@ -3537,6 +3544,15 @@ impl TypeTable {
         true
     }
 
+    /// The value a cell's draft was typed over, which its save is bound to.
+    fn draft_old(&self, row_id: &str, column: &str, cx: &App) -> Option<Value> {
+        let key = self.draft_key(row_id, column);
+        self.session
+            .read(cx)
+            .draft(&key)
+            .map(|draft| draft.old.clone())
+    }
+
     /// Whether the table still shows `session`'s `branch`: an answer read for another is not
     /// this table's.
     fn shows(&self, session: &Entity<GraphSession>, branch: &str) -> bool {
@@ -3682,7 +3698,9 @@ impl TypeTable {
                 unseen += 1;
                 continue;
             };
-            let old = self.rows[row].value(&key.1).clone();
+            let old = self
+                .draft_old(&key.0, &key.1, cx)
+                .unwrap_or_else(|| self.rows[row].value(&key.1).clone());
             match parse_input(&property, &text) {
                 Err(message) => {
                     let notice = Notice::new(Tone::Invalid, message);
@@ -6956,6 +6974,59 @@ mod tests {
     }
 
     /// A cell saved on one branch lands after the window moved to another: it lets go of the
+    /// A draft is saved bound to the value it was typed over, not the one a Refresh put in the
+    /// cell since: a change made elsewhere meanwhile is a conflict, not overwritten.
+    #[gpui::test]
+    async fn a_draft_is_saved_bound_to_the_value_it_was_typed_over(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, sent) = crate::test_support::session_recording_writes(PEOPLE, cx);
+        let (table, cx) = cx.add_window_view({
+            let session = session.clone();
+            |window, cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            }
+        });
+        cx.run_until_parked();
+        // Typed over "Ada B"; the server now holds "Ada".
+        session.update(cx, |session, cx| {
+            let key = DraftKey {
+                type_name: "Person".into(),
+                id: "p1".into(),
+                property: "name".into(),
+            };
+            let draft = graph_store::DraftEntry {
+                old: "Ada B".into(),
+                text: "Ada King".into(),
+            };
+            session.set_draft(key, draft, cx);
+        });
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| table.save_drafts(window, cx));
+        cx.run_until_parked();
+        let sent = sent.lock().unwrap();
+        let params: Vec<&str> = sent[0]["params"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            params.contains(&"Ada B"),
+            "bound to the draft's value: {params:?}"
+        );
+        assert!(!params.contains(&"Ada"), "not to the one shown: {params:?}");
+    }
+
     /// draft of the branch it was saved on, never that of the branch shown, which stays.
     #[gpui::test]
     async fn a_save_that_lands_after_a_branch_switch_keeps_the_new_branchs_draft(

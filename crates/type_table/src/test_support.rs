@@ -183,11 +183,33 @@ pub(crate) fn session_followed(
 /// The rows a read answers with, from its request body.
 type Rows = Arc<dyn Fn(&Value) -> Value + Send + Sync>;
 
-/// How the next write is answered: its status and body.
-type Writes = Arc<dyn Fn() -> (u16, Value) + Send + Sync>;
+/// How the next write, its request body given, is answered: its status and body.
+type Writes = Arc<dyn Fn(&Value) -> (u16, Value) + Send + Sync>;
 
 fn always(status: u16, body: Value) -> Writes {
-    Arc::new(move || (status, body.clone()))
+    Arc::new(move |_| (status, body.clone()))
+}
+
+/// As [`session`], every write's request body recorded, in order.
+pub(crate) fn session_recording_writes(
+    schema: &str,
+    cx: &mut TestAppContext,
+) -> (Entity<GraphSession>, Arc<Mutex<Vec<Value>>>) {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let log = sent.clone();
+    let writes: Writes = Arc::new(move |request: &Value| {
+        log.lock().unwrap().push(request.clone());
+        (200, committed("c2", "c1"))
+    });
+    let rows = Arc::new(people());
+    let session = serve_with(
+        schema,
+        Arc::new(move |_: &Value| (*rows).clone()),
+        writes,
+        None,
+        cx,
+    );
+    (session, sent)
 }
 
 /// As [`session`], the writes answered in turn by `answers`; any after the last get the last.
@@ -201,7 +223,7 @@ pub(crate) fn session_writing(
             .into_iter()
             .collect::<std::collections::VecDeque<_>>(),
     );
-    let writes: Writes = Arc::new(move || {
+    let writes: Writes = Arc::new(move |_| {
         let mut answers = answers.lock().unwrap();
         match answers.len() {
             0 => (500, json!({})),
@@ -295,7 +317,9 @@ fn serve_with(
             } else if let Some(writer) = writer.as_ref().filter(|_| path.ends_with("/changes")) {
                 (200, writer.feed(&query))
             } else if path.contains("/mutate") {
-                writes()
+                let mut bytes = Vec::new();
+                request.into_body().read_to_end(&mut bytes).await.ok();
+                writes(&serde_json::from_slice(&bytes).unwrap_or(Value::Null))
             } else {
                 // A second branch, for views that follow the window to another one.
                 (200, json!({ "branches": ["main", "fix"] }))

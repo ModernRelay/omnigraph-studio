@@ -1406,12 +1406,16 @@ impl NodePeek {
         if !self.edits_property(&property) || self.saving.contains(&name) {
             return;
         }
-        let old = self.value_of(&name);
-        // A draft opens with its text; the save binds to the value the view shows.
-        let text = self
-            .draft_of(&name, cx)
-            .map(|draft| draft.text)
-            .unwrap_or_else(|| edit_text(&old));
+        // A draft opens with its text, its save bound to the value it was typed over: a
+        // change made elsewhere since then shows as a conflict rather than being overwritten.
+        let (old, text) = match self.draft_of(&name, cx) {
+            Some(draft) => (draft.old, draft.text),
+            None => {
+                let old = self.value_of(&name);
+                let text = edit_text(&old);
+                (old, text)
+            }
+        };
         // Text, which reads as markdown, takes line breaks (⇧↵); other values are one line.
         let lines = reads_as_markdown(&property);
         let editor = cx.new(|cx| {
@@ -2096,7 +2100,8 @@ impl NodePeek {
             else {
                 continue;
             };
-            let old = self.value_of(&name);
+            // Bound to the value the draft was typed over (spec 014).
+            let old = draft.old.clone();
             match parse_input(&property, &draft.text) {
                 Ok(new) if same_value(&new, &old) => self.drop_draft(&name, cx),
                 Ok(new) => cells.push((name, old, new)),
