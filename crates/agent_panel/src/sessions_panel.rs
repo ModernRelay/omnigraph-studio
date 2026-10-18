@@ -21,12 +21,11 @@ use gpui::{
 use studio_actions::agent::{NewConversation, OpenConversation};
 use studio_settings::StudioSettings;
 use studio_ui::ds;
+use studio_ui::ds::IconButton;
+use studio_ui::menu::ContextMenu;
 use studio_workspace::{ToastKind, Workspace};
 use ui::prelude::*;
-use ui::{
-    CommonAnimationExt as _, ContextMenu, IconButton, Indicator, PopoverMenu, Tooltip,
-    right_click_menu,
-};
+use ui::{CommonAnimationExt as _, Indicator, PopoverMenu, Tooltip, right_click_menu};
 
 use crate::connection::{self, AgentConnection};
 use crate::host::AgentLaunch;
@@ -795,32 +794,29 @@ impl Focusable for DeleteConversation {
 
 impl Render for DeleteConversation {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        ds::dialog(format!("Delete “{}”", self.record.shown_title()), cx)
+        ds::modal(cx)
             .key_context("DeleteConversation")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.delete(cx)))
             .child(
-                Label::new(
-                    "Studio forgets this conversation and its open tab closes; the agent \
-                     deletes it too when it can. This cannot be undone. The graph and the \
-                     agent's branch are not touched.",
-                )
-                .size(LabelSize::Small)
-                .color(Color::Muted),
+                ds::ModalHeader::new(format!("Delete “{}”", self.record.shown_title()))
+                    .description(SharedString::from(
+                        "Studio forgets this conversation and its open tab closes; the agent \
+                         deletes it too when it can. This cannot be undone. The graph and the \
+                         agent's branch are not touched.",
+                    ))
+                    .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
             )
             .child(
-                h_flex()
-                    .gap_2()
-                    .justify_end()
+                ds::modal_footer(cx)
                     .child(
-                        ds::button("cancel", "Cancel")
+                        ds::cancel_button("cancel")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
-                        ds::button("delete", "Delete")
-                            .style(ButtonStyle::Filled)
-                            .color(Color::Error)
+                        ds::action_button("delete", "Delete")
+                            .variant(ds::Variant::Destructive)
                             .on_click(cx.listener(|this, _, _, cx| this.delete(cx))),
                     ),
             )

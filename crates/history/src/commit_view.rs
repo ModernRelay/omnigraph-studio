@@ -10,13 +10,14 @@ use graph_client::ReadError;
 use graph_client::api::{ChangeCauseOutput, CommitOutput};
 use graph_store::{ChangeFold, FoldedChange, FoldedChanges, GraphSession, NetChange, TypeCounts};
 use studio_actions::graph::{OpenCommit, OpenQueryAt, OpenType};
+use studio_ui::menu::ContextMenu;
 use studio_ui::{
     ChangeCard, ChangeKind, PropertyRow, change_group_header, now_micros, relative_time,
     short_commit_id, utc_date_time,
 };
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
-use ui::{ContextMenu, PopoverMenu, Tooltip};
+use ui::{PopoverMenu, Tooltip};
 
 /// Changes asked for per page.
 const PAGE: u32 = 500;
@@ -395,7 +396,7 @@ impl CommitView {
         }
         let table_commit = commit.clone();
         h_flex()
-            .gap_1()
+            .gap(px(studio_ui::ds::space::XS))
             .child(
                 PopoverMenu::new("open-table-at")
                     .trigger(
@@ -479,9 +480,9 @@ impl CommitView {
                     .into_any_element()
             }
             None if more => h_flex()
-                .px_4()
-                .py_2()
-                .gap_2()
+                .px(px(studio_ui::ds::space::XL))
+                .py(px(studio_ui::ds::space::MD))
+                .gap(px(studio_ui::ds::space::MD))
                 .child(
                     studio_ui::ds::button(
                         "load-more",
@@ -586,7 +587,7 @@ impl Render for CommitView {
                 )
                 .flex_1()
                 .min_h_0()
-                .py_2()
+                .py(px(studio_ui::ds::space::MD))
                 .into_any_element()
             }
         };

@@ -15,7 +15,11 @@ use studio_settings::{StudioSettings, WindowStyle};
 use ui::prelude::*;
 use ui::{CommonAnimationExt as _, Tooltip, rems_from_px};
 
-pub use crate::button::Button;
+pub use crate::button::{Button, IconButton, Variant};
+pub use crate::menu::{MenuRow, menu_header, menu_separator, menu_surface};
+pub use crate::modal::{
+    ModalHeader, action_button, cancel_button, modal, modal_body, modal_footer, write_target,
+};
 
 // ---- tokens ----
 
@@ -41,6 +45,12 @@ pub mod space {
     pub const BETWEEN: f32 = XXL;
     /// Horizontal inset of rows, toolbars and strips from their column's edge.
     pub const EDGE: f32 = XL;
+    /// Inside a control's pill, either side of its content: a medium button, a field.
+    pub const CONTROL_INSET: f32 = 10.;
+    /// A modal's inset: its header, body and footer from its edge.
+    pub const MODAL: f32 = XXL;
+    /// Between a modal's sections (its header and body, its body's groups).
+    pub const MODAL_STACK: f32 = LG;
     /// Padding of a document page (settings, storage, empty states).
     pub const PAGE: f32 = XXL;
 }
@@ -58,10 +68,18 @@ pub mod radius {
     pub const MD: f32 = 10.;
     /// Glass sheets.
     pub const LG: f32 = 14.;
-    /// Zed's buttons, `ds::button` and `ds::icon_button` among them (`ButtonLike`'s
-    /// `rounded_sm`). A button takes no other radius, so a surface around buttons is sized
-    /// from this.
-    pub const BUTTON: f32 = 4.;
+    /// A modal: the largest radius, as it is the largest surface that floats.
+    pub const MODAL: f32 = 16.;
+    /// A context menu or popover.
+    pub const MENU: f32 = 10.;
+    /// A menu's rows, [`super::space::XS`] inside it.
+    pub const MENU_ITEM: f32 = within(MENU, super::space::XS);
+    /// The command palette's results: a solid card inset in its glass frame.
+    pub const PALETTE_LIST: f32 = within(MODAL, super::space::XS);
+    /// A palette row, inset in the results card.
+    pub const PALETTE_ROW: f32 = within(PALETTE_LIST, super::space::XS);
+    // Buttons, fields, tabs, pills and floating bars have no radius here: they are round at
+    // the ends (`rounded_full`), so whatever holds them is a pill too.
 
     /// The radius of a surface whose children have radius `inner` and sit `gap` inside its
     /// edge (its border and padding).
@@ -117,6 +135,16 @@ pub mod size {
     pub const FIELD_LABEL: f32 = 112.;
     /// The gap around and between glass sheets.
     pub const SHEET_GAP: f32 = 8.;
+    /// A modal's width: enough for a sentence and a form, never the window.
+    pub const MODAL_WIDTH: f32 = 480.;
+    /// A wide modal: two panes side by side (opening a graph).
+    pub const MODAL_WIDE: f32 = 720.;
+    /// The command palette's width.
+    pub const PALETTE_WIDTH: f32 = 580.;
+    /// A context menu's row.
+    pub const MENU_ROW: f32 = 26.;
+    /// The narrowest a context menu draws.
+    pub const MENU_MIN_WIDTH: f32 = 200.;
 }
 
 /// Whether the window is drawn in the glass style (setting `studio.window_style`).
@@ -213,6 +241,47 @@ pub mod surface {
         gpui::rgb(rgb).into()
     }
 
+    /// A modal's or a menu's fill: the elevated surface, opaque in both styles. Tower's glass
+    /// blurs what is behind it and GPUI cannot, so even a 97 % fill lets the text behind show
+    /// through as ghosts.
+    pub fn floating(cx: &App) -> Hsla {
+        cx.theme().colors().elevated_surface_background
+    }
+
+    /// The hairline of a floating surface (a modal, a menu): 8 % ink, the same in both
+    /// styles, so it reads on the dim behind a modal as on the page.
+    pub fn floating_border(cx: &App) -> Hsla {
+        cx.theme().colors().text.opacity(0.08)
+    }
+
+    /// The light veil behind the command palette: the page keeps its colour behind it.
+    pub fn veil(cx: &App) -> Hsla {
+        if cx.theme().appearance.is_light() {
+            gpui::black().opacity(0.08)
+        } else {
+            gpui::black().opacity(0.36)
+        }
+    }
+
+    /// The dim behind a dialog. Tower's also blurs; GPUI cannot, so it is a little lighter.
+    pub fn backdrop(cx: &App) -> Hsla {
+        if cx.theme().appearance.is_light() {
+            gpui::black().opacity(0.24)
+        } else {
+            gpui::black().opacity(0.48)
+        }
+    }
+
+    /// A hovered control's fill and the highlighted menu row's: a faint ink.
+    pub fn highlight(cx: &App) -> Hsla {
+        cx.theme().colors().text.opacity(0.045)
+    }
+
+    /// The pressed fill: a selected tab, a toggled button, a control while it is pressed.
+    pub fn pressed(cx: &App) -> Hsla {
+        cx.theme().colors().text.opacity(0.06)
+    }
+
     /// The glass window's base, under [`super::wash`].
     pub fn page(cx: &App) -> Hsla {
         cx.theme().colors().editor_background
@@ -265,6 +334,17 @@ pub mod elevation {
             shadow(0.05, 1., 2., 0.),
             shadow(0.12, 6., 14., -6.),
         ]
+    }
+
+    /// A modal or a context menu: the glass sheet's rim and shadow. A dark theme drops the
+    /// white rim, which would read as a light outline, and deepens the shadow to show on a
+    /// dark page.
+    pub fn floating(cx: &App) -> Vec<BoxShadow> {
+        if cx.theme().appearance.is_light() {
+            sheet()
+        } else {
+            vec![shadow(0.24, 1., 2., 0.), shadow(0.4, 12., 28., -9.)]
+        }
     }
 
     /// Popovers and toasts.
@@ -756,17 +836,19 @@ pub fn field_frame(invalid: bool, cx: &App) -> Div {
     let colors = cx.theme().colors();
     h_flex()
         .h(px(size::CONTROL))
-        .px(px(space::MD))
+        // The border is part of the inset.
+        .px(px(space::CONTROL_INSET - 1.))
         .gap(px(space::SM))
         .items_center()
-        .rounded(px(radius::SM))
+        .rounded_full()
         .border_1()
         .border_color(if invalid {
             cx.theme().status().error_border
         } else {
-            colors.border
+            colors.text.opacity(0.1)
         })
         .bg(colors.editor_background)
+        .shadow(elevation::raised())
 }
 
 /// A field's editor, filling what its [`field_frame`] leaves.
@@ -889,8 +971,8 @@ pub fn pill_button(
     cx: &App,
 ) -> Stateful<Div> {
     let diameter = size::PILL - 2. * PILL_BUTTON_GAP;
-    let hover = cx.theme().colors().ghost_element_hover;
-    let active = cx.theme().colors().ghost_element_active;
+    let hover = surface::highlight(cx);
+    let active = surface::pressed(cx);
     div()
         .id(id.into())
         .size(px(diameter))
@@ -915,17 +997,12 @@ pub fn row_list() -> Div {
         .rounded(px(radius::around(radius::XS, space::XS)))
 }
 
-/// A floating group of controls over a canvas: 28 px tall, a hairline, a float shadow, holding
-/// [`bar_button`]s and [`bar_icon_button`]s (22 px), so they sit 3 px inside its edge and its
-/// radius is theirs plus that. A medium button would not fit inside its border.
+/// A floating group of controls over a canvas: a glass pill 28 px tall holding
+/// [`bar_button`]s, [`bar_icon_button`]s (22 px) and [`segment`]s, 3 px inside its edge, so a
+/// pill holds pills. A medium button would not fit inside its border.
 pub fn float_bar(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
     let gap = (size::CONTROL - size::BAR_BUTTON) / 2.;
     let colors = cx.theme().colors();
-    let fill = if cx.theme().appearance.is_light() {
-        gpui::white()
-    } else {
-        colors.elevated_surface_background
-    };
     h_flex()
         .id(id.into())
         .h(px(size::CONTROL))
@@ -933,10 +1010,10 @@ pub fn float_bar(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
         // The border is part of the gap.
         .px(px(gap - 1.))
         .items_center()
-        .rounded(px(radius::around(radius::BUTTON, gap)))
-        .bg(fill)
+        .rounded_full()
+        .bg(surface::glass(colors.elevated_surface_background, 0.92, cx))
         .border_1()
-        .border_color(colors.border_variant)
+        .border_color(surface::floating_border(cx))
         .shadow(elevation::float())
         .occlude()
 }
@@ -963,41 +1040,35 @@ pub fn tag(label: impl Into<SharedString>, cx: &App) -> Div {
         )
 }
 
-/// A segmented control: a sunken track holding [`segment`]s, for a choice of two to four.
-pub fn segmented(cx: &App) -> Div {
-    h_flex()
-        .flex_none()
-        .p(px(space::XXS))
-        .gap(px(space::XXS))
-        .rounded(px(radius::around(radius::SM, space::XXS)))
-        .bg(surface::sunken(cx).blend(gpui::black().opacity(0.03)))
+/// A choice of two to four, as Tower's tabs: no track, quiet labels, the selected one on the
+/// pressed pill. Over content, put it in a [`float_bar`].
+pub fn segmented(_cx: &App) -> Div {
+    h_flex().flex_none().gap(px(space::XXS))
 }
 
-/// One option of a [`segmented`] control; the selected one is raised.
+/// One option of a [`segmented`] control: a bar button's height, so a floating bar holds it.
 pub fn segment(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     selected: bool,
     cx: &App,
 ) -> Stateful<Div> {
-    let hover = surface::hover(cx);
-    let raised = cx.theme().colors().editor_background;
+    let hover = cx.theme().colors().text.opacity(0.03);
     h_flex()
         .id(id.into())
-        .h(px(size::CONTROL - 2. * space::XXS))
+        .h(px(size::BAR_BUTTON))
         .px(px(space::MD + space::XXS))
         .items_center()
-        .rounded(px(radius::SM))
+        .rounded_full()
         .cursor_pointer()
-        .when(selected, |segment| {
-            segment.bg(raised).shadow(elevation::raised())
-        })
+        .when(selected, |segment| segment.bg(surface::pressed(cx)))
         .when(!selected, |segment| {
             segment.hover(move |style| style.bg(hover))
         })
         .child(
             Label::new(label.into())
                 .size(LabelSize::Small)
+                .when(selected, |label| label.weight(gpui::FontWeight::MEDIUM))
                 .color(if selected {
                     Color::Default
                 } else {
@@ -1036,6 +1107,7 @@ pub fn setting_row(
                         .when_some(reset, |title, reset| {
                             title.child(
                                 IconButton::new("reset", IconName::Undo)
+                                    .size(ButtonSize::Compact)
                                     .icon_size(IconSize::XSmall)
                                     .icon_color(Color::Muted)
                                     .tooltip(Tooltip::text("Reset to default"))
@@ -1061,22 +1133,6 @@ pub fn key_hint(
         .flex_none()
         .child(ui::KeyBinding::for_action_in(action, focus, cx).size(rems_from_px(11_f32)))
         .child(text::meta(label))
-}
-
-/// A modal dialog's frame: a raised sheet with its title; the body and the buttons (Cancel, then
-/// the action) follow as children.
-pub fn dialog(title: impl Into<SharedString>, cx: &App) -> Div {
-    let colors = cx.theme().colors();
-    v_flex()
-        .w(px(440.))
-        .p_4()
-        .gap_3()
-        .rounded_lg()
-        .bg(colors.elevated_surface_background)
-        .border_1()
-        .border_color(colors.border)
-        .shadow_lg()
-        .child(Headline::new(title.into()).size(HeadlineSize::Small))
 }
 
 /// A bordered block of code or a command, as Delta draws edits and commands in a thread.

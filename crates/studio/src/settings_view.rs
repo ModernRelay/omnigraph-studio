@@ -15,10 +15,11 @@ use gpui::{
 use serde_json::Value;
 use studio_settings::{FieldKind, Scope, SettingField, SettingsValues, StudioSettings};
 use studio_ui::ds::{self, space};
+use studio_ui::menu::ContextMenu;
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use theme::ThemeRegistry;
 use ui::prelude::*;
-use ui::{Callout, ContextMenu, PopoverMenu, Severity, Switch, Tooltip};
+use ui::{Callout, PopoverMenu, Severity, Switch, Tooltip};
 
 pub struct SettingsView {
     search: Entity<Editor>,

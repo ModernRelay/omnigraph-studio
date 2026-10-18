@@ -183,20 +183,23 @@ impl Render for SchemaView {
         }
         v_flex()
             .size_full()
-            .pt_1()
+            .pt(px(studio_ui::ds::space::XS))
             .when(self.newer, |d| {
                 d.child(
-                    h_flex().px_2().pb_1().child(
-                        studio_ui::ds::button("newer-schema", "Newer schema · Refresh")
-                            .style(ButtonStyle::Tinted(TintColor::Accent))
-                            .label_size(LabelSize::Small)
-                            .tooltip(Tooltip::text(
-                                "The schema changed elsewhere; show the one the graph has now",
-                            ))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.show_source(window, cx)),
-                            ),
-                    ),
+                    h_flex()
+                        .px(px(studio_ui::ds::space::MD))
+                        .pb(px(studio_ui::ds::space::XS))
+                        .child(
+                            studio_ui::ds::button("newer-schema", "Newer schema · Refresh")
+                                .style(ButtonStyle::Tinted(TintColor::Accent))
+                                .label_size(LabelSize::Small)
+                                .tooltip(Tooltip::text(
+                                    "The schema changed elsewhere; show the one the graph has now",
+                                ))
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.show_source(window, cx)),
+                                ),
+                        ),
                 )
             })
             .child(self.editor.clone())

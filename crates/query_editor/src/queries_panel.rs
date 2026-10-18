@@ -11,6 +11,7 @@ use gpui::{
 use graph_store::cli_config::CliAlias;
 use graph_store::{ConnectionRegistry, GraphSession, Loadable, SessionEvent};
 use studio_actions::graph::{NewQuery, OpenQueryFile, OpenStoredQuery};
+use studio_ui::ds::IconButton;
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::Tooltip;
 use ui::prelude::*;

@@ -22,8 +22,11 @@ use serde_json::{Map, Value};
 use studio_actions::graph::{OpenBlob, OpenNodePage, PeekNode};
 use studio_actions::node::{CancelField, ExpandField, SaveField, SaveNodeDrafts};
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
+use studio_ui::ds::IconButton;
+use studio_ui::ds::space;
+use studio_ui::menu::ContextMenu;
 use ui::prelude::*;
-use ui::{ContextMenu, Indicator, PopoverMenu, Switch, ToggleState, Tooltip, rems_from_px};
+use ui::{Indicator, PopoverMenu, Switch, ToggleState, Tooltip, rems_from_px};
 
 use crate::blob::{
     IMAGE_MAX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, save_value, suggested_file_name,
@@ -804,7 +807,7 @@ impl NodePeek {
     fn render_blobs(&self, cx: &mut Context<Self>) -> AnyElement {
         let border = studio_ui::ds::surface::rule(cx);
         v_flex()
-            .gap_2()
+            .gap(px(space::MD))
             .children(self.blobs.iter().enumerate().map(|(index, slot)| {
                 let facts = match &slot.meta {
                     Loadable::Loaded(BlobMeta::Managed { size, .. }) => {
@@ -824,7 +827,7 @@ impl NodePeek {
                     ),
                     (Loadable::Loaded(BlobMeta::External { uri }), _) => Some(
                         v_flex()
-                            .gap_1()
+                            .gap(px(space::XS))
                             .child(studio_ui::CopyableValue::new(
                                 ("blob-uri", index),
                                 Some(uri.clone()),
@@ -842,7 +845,7 @@ impl NodePeek {
                             .w_full()
                             .flex()
                             .justify_center()
-                            .p_2()
+                            .p(px(space::MD))
                             .rounded_md()
                             .border_1()
                             .border_color(border)
@@ -856,7 +859,7 @@ impl NodePeek {
                     ),
                     (_, Loadable::Loaded(Preview::Text { text, more })) => Some(
                         v_flex()
-                            .gap_1()
+                            .gap(px(space::XS))
                             .child(studio_ui::ds::code_block(text.clone(), cx))
                             .when(*more > 0, |d| {
                                 d.child(studio_ui::ds::text::meta(format!(
@@ -868,7 +871,7 @@ impl NodePeek {
                     ),
                     (_, Loadable::Loaded(Preview::Bytes { hex, more })) => Some(
                         v_flex()
-                            .gap_1()
+                            .gap(px(space::XS))
                             .child(studio_ui::ds::code_block(hex.clone(), cx))
                             .when(*more > 0, |d| {
                                 d.child(studio_ui::ds::text::meta(format!(
@@ -909,7 +912,7 @@ impl NodePeek {
                         ),
                         None if managed => Some(
                             h_flex()
-                                .gap(px(studio_ui::ds::space::XXS))
+                                .gap(px(space::XXS))
                                 .child({
                                     let open = OpenBlob {
                                         type_name: self.subject.type_name().to_owned(),
@@ -940,10 +943,10 @@ impl NodePeek {
                         None => None,
                     };
                 v_flex()
-                    .gap_1()
+                    .gap(px(space::XS))
                     .child(
                         h_flex()
-                            .gap_2()
+                            .gap(px(space::MD))
                             .items_center()
                             .child(
                                 Icon::new(IconName::File)
@@ -2219,7 +2222,7 @@ impl NodePeek {
         };
         Some(
             h_flex()
-                .gap(px(studio_ui::ds::space::SM))
+                .gap(px(space::SM))
                 .items_center()
                 .child(Indicator::dot().color(Color::Accent))
                 .child(Label::new(label).size(LabelSize::Small))
@@ -2367,7 +2370,7 @@ impl NodePeek {
         let rows = self.property_rows();
         let label_width = if self.page { 160. } else { 96. };
         v_flex()
-            .gap_0p5()
+            .gap(px(space::XXS))
             .children(
                 rows.into_iter()
                     .enumerate()
@@ -2404,7 +2407,7 @@ impl NodePeek {
                             (None, _) if draft.is_some() => {
                                 let text = draft.as_ref().map(|d| d.text.clone()).unwrap_or_default();
                                 h_flex()
-                                    .gap(px(studio_ui::ds::space::SM))
+                                    .gap(px(space::SM))
                                     .child(
                                         Label::new(if text.trim().is_empty() { "—".to_owned() } else { studio_ui::text::first_line(&text) })
                                             .size(LabelSize::Small),
@@ -2428,9 +2431,9 @@ impl NodePeek {
                         h_flex()
                             .id(("peek-property", index))
                             .group(group.clone())
-                            .px_1()
-                            .py_0p5()
-                            .gap_2()
+                            .px(px(space::XS))
+                            .py(px(space::XXS))
+                            .gap(px(space::MD))
                             .items_start()
                             .rounded_sm()
                             .when(!editing, |row| row.hover(move |s| s.bg(hover)))
@@ -2463,7 +2466,7 @@ impl NodePeek {
                                     .w(px(label_width))
                                     .flex_none()
                                     .pt(px(if editing {
-                                        studio_ui::ds::space::SM
+                                        space::SM
                                     } else {
                                         0.
                                     }))
@@ -2562,7 +2565,7 @@ impl NodePeek {
             // The menu's label on the values' edge: the button's own padding sits outside it.
             return Some(
                 div()
-                    .ml(px(-studio_ui::ds::space::XS))
+                    .ml(px(-space::XS))
                     .child(
                         PopoverMenu::new(SharedString::from(format!("peek-enum-{index}")))
                             .trigger(
@@ -2700,11 +2703,11 @@ impl NodePeek {
             .map(|values| format!("One of: {}", values.join(", ")));
         // The frame reaches past the values' edge by its padding, its border and the editor's
         // own inset, so the text stays where it read before the edit.
-        let reach = px(studio_ui::ds::space::MD + 1.) + editor_inset(window, cx);
+        let reach = px(space::MD + 1.) + editor_inset(window, cx);
         v_flex()
             .key_context("NodeField")
             .w_full()
-            .gap(px(studio_ui::ds::space::XXS))
+            .gap(px(space::XXS))
             .child(
                 studio_ui::ds::field_frame(invalid, cx)
                     .ml(-reach)
@@ -2712,7 +2715,7 @@ impl NodePeek {
                         frame
                             .h_auto()
                             .min_h(px(studio_ui::ds::size::CONTROL))
-                            .py(px(studio_ui::ds::space::XS))
+                            .py(px(space::XS))
                             .items_start()
                     })
                     .child(studio_ui::ds::field_input(edit.editor.clone()))
@@ -2736,7 +2739,7 @@ impl NodePeek {
             .children(edit.notice.clone().map(|notice| {
                 let unknown = notice.tone == Tone::Unknown;
                 h_flex()
-                    .gap_1p5()
+                    .gap(px(space::SM))
                     .child(Indicator::dot().color(notice.tone.color()))
                     .child(
                         Label::new(notice.message)
@@ -2794,9 +2797,9 @@ impl NodePeek {
         let open = self.show_empty;
         h_flex()
             .id("peek-empty-groups")
-            .px_1()
-            .py_0p5()
-            .gap_1p5()
+            .px(px(space::XS))
+            .py(px(space::XXS))
+            .gap(px(space::SM))
             .rounded_sm()
             .hover(move |s| s.bg(hover))
             .cursor_pointer()
@@ -2859,9 +2862,9 @@ impl NodePeek {
         let header = h_flex()
             .id(("peek-group", index))
             .group(header_group)
-            .px_1()
-            .py_0p5()
-            .gap_1p5()
+            .px(px(space::XS))
+            .py(px(space::XXS))
+            .gap(px(space::SM))
             .rounded_sm()
             .hover(move |s| s.bg(hover))
             .cursor_pointer()
@@ -2904,7 +2907,7 @@ impl NodePeek {
         let notice = self.group_notices.get(&index).map(|notice| {
             h_flex()
                 .pl(px(22.))
-                .gap_1p5()
+                .gap(px(space::SM))
                 .child(Indicator::dot().color(notice.tone.color()))
                 .child(
                     Label::new(notice.message.clone())
@@ -2991,9 +2994,9 @@ impl NodePeek {
                     let highlighted = n == adding.highlighted;
                     h_flex()
                         .id(SharedString::from(format!("peek-found-{index}-{n}")))
-                        .px_1()
-                        .py_0p5()
-                        .gap_2()
+                        .px(px(space::XS))
+                        .py(px(space::XXS))
+                        .gap(px(space::MD))
                         .rounded_sm()
                         .cursor_pointer()
                         .when(highlighted, |row| row.bg(selected))
@@ -3045,8 +3048,8 @@ impl NodePeek {
             )
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel_add(cx)))
             .pl(px(22.))
-            .py(px(studio_ui::ds::space::XS))
-            .gap(px(studio_ui::ds::space::XS))
+            .py(px(space::XS))
+            .gap(px(space::XS))
             .child(
                 studio_ui::ds::field_frame(false, cx)
                     .child(
@@ -3147,7 +3150,7 @@ impl NodePeek {
                         let open = self.open_page_action();
                         div()
                             .id(SharedString::from(format!("peek-more-{index}")))
-                            .px_1()
+                            .px(px(space::XS))
                             .cursor_pointer()
                             .tooltip(Tooltip::text("Open the node's page to see them all"))
                             .on_click(move |_, window, cx| {
@@ -3179,9 +3182,9 @@ impl NodePeek {
                         h_flex()
                             .id(SharedString::from(format!("peek-neighbour-{index}-{n}")))
                             .group(row_group)
-                            .px_1()
-                            .py_0p5()
-                            .gap_2()
+                            .px(px(space::XS))
+                            .py(px(space::XXS))
+                            .gap(px(space::MD))
                             .rounded_sm()
                             .hover(move |s| s.bg(hover))
                             .cursor_pointer()
@@ -3256,9 +3259,9 @@ impl NodePeek {
             Some(
                 h_flex()
                     .id(label)
-                    .px_1()
-                    .py_0p5()
-                    .gap_2()
+                    .px(px(space::XS))
+                    .py(px(space::XXS))
+                    .gap(px(space::MD))
                     .rounded_sm()
                     .hover(move |s| s.bg(hover))
                     .cursor_pointer()
@@ -3286,7 +3289,7 @@ impl NodePeek {
         };
         Some(
             v_flex()
-                .gap_0p5()
+                .gap(px(space::XXS))
                 .children(endpoint("from", from_type, FROM_COLUMN))
                 .children(endpoint("to", to_type, TO_COLUMN))
                 .into_any_element(),
@@ -3363,7 +3366,7 @@ fn neighbours_from(rows: &Value) -> Vec<Neighbour> {
 }
 
 fn section(title: &'static str) -> impl IntoElement {
-    div().pt_2().pb_1().child(
+    div().pt(px(space::MD)).pb(px(space::XS)).child(
         Label::new(title)
             .size(LabelSize::XSmall)
             .color(Color::Muted),
@@ -3474,9 +3477,9 @@ impl NodePeek {
             Some(Item::Head) => {
                 let head = self.render_head(window, cx);
                 let head = if page {
-                    head.pt(px(studio_ui::ds::space::XL)).gap_2()
+                    head.pt(px(space::XL)).gap(px(space::MD))
                 } else {
-                    head.pt_4().gap_1p5()
+                    head.pt(px(space::XL)).gap(px(space::SM))
                 };
                 head.when(self.shows_relationships(), |head| {
                     head.child(section("Relationships"))
@@ -3499,20 +3502,13 @@ impl NodePeek {
             .w_full()
             .map(|item| {
                 if page {
-                    item.max_w(px(PAGE_WIDTH))
-                        .px(px(studio_ui::ds::space::PAGE))
+                    item.max_w(px(PAGE_WIDTH)).px(px(space::PAGE))
                 } else {
-                    item.px_4()
+                    item.px(px(space::XL))
                 }
             })
-            .pt_0p5()
-            .when(last, |item| {
-                if page {
-                    item.pb(px(studio_ui::ds::space::XL))
-                } else {
-                    item.pb_4()
-                }
-            })
+            .pt(px(space::XXS))
+            .when(last, |item| item.pb(px(space::XL)))
             .child(item)
             .into_any_element()
     }
@@ -3539,7 +3535,7 @@ impl NodePeek {
             .w_full()
             .child(
                 h_flex()
-                    .gap_1p5()
+                    .gap(px(space::SM))
                     .child(studio_ui::type_swatch(&type_name))
                     .child(
                         Label::new(type_name.clone())

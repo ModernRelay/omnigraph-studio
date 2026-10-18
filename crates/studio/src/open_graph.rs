@@ -10,10 +10,11 @@ use graph_store::{
     Connection, ConnectionEvent, ConnectionRegistry, ConnectionState, GraphListing, ServerSource,
     open_session,
 };
+use studio_ui::ds::{self, MenuRow, size, space};
 use studio_workspace::ModalView;
 use studio_workspace::Workspace;
+use ui::Indicator;
 use ui::prelude::*;
-use ui::{Indicator, ListItem, ListItemSpacing};
 
 pub struct OpenGraphModal {
     workspace: WeakEntity<Workspace>,
@@ -267,12 +268,8 @@ impl OpenGraphModal {
         v_flex()
             .w(px(240.))
             .flex_none()
-            .gap_0p5()
-            .child(
-                Label::new("Servers")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
+            .gap(px(space::XXS))
+            .child(pane_label("Servers"))
             .children(
                 connections
                     .into_iter()
@@ -286,12 +283,13 @@ impl OpenGraphModal {
                             ServerSource::Studio => "added in Studio",
                             ServerSource::Environment => "environment",
                         };
-                        ListItem::new(("server", index))
-                            .spacing(ListItemSpacing::Sparse)
+                        MenuRow::new(("server", index))
+                            .height(size::FEED_ROW)
                             .toggle_state(selected)
                             .start_slot(Indicator::dot().color(color))
                             .child(
                                 v_flex()
+                                    .min_w_0()
                                     .child(Label::new(c.server.name.clone()).size(LabelSize::Small))
                                     .child(
                                         Label::new(format!("{} · {source}", c.server.url))
@@ -343,10 +341,12 @@ impl OpenGraphModal {
         v_flex()
             .flex_1()
             .min_w_0()
-            .gap_2()
+            .gap(px(space::XXS))
             .child(
                 h_flex()
-                    .gap_2()
+                    .min_h(px(size::CONTROL))
+                    .px(px(space::MD))
+                    .gap(px(space::MD))
                     .child(Indicator::dot().color(state_color(&state)))
                     .child(
                         Label::new(status)
@@ -378,7 +378,8 @@ impl OpenGraphModal {
             .when(state == ConnectionState::Unauthorized, |pane| {
                 pane.child(
                     h_flex()
-                        .gap_2()
+                        .py(px(space::XS))
+                        .gap(px(space::MD))
                         .child(
                             studio_ui::ds::field_frame(false, cx)
                                 .flex_1()
@@ -401,14 +402,12 @@ impl OpenGraphModal {
                         ),
                 )
             })
-            .child(
-                Label::new("Graphs")
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .children(
-                listing_note.map(|n| Label::new(n).size(LabelSize::Small).color(Color::Muted)),
-            )
+            .child(pane_label("Graphs"))
+            .children(listing_note.map(|n| {
+                div()
+                    .px(px(space::MD))
+                    .child(Label::new(n).size(LabelSize::Small).color(Color::Muted))
+            }))
             .children(
                 graphs
                     .into_iter()
@@ -424,8 +423,8 @@ impl OpenGraphModal {
                             None => "remembered".into(),
                         };
                         let id = graph.clone();
-                        ListItem::new(("graph", index))
-                            .spacing(ListItemSpacing::Sparse)
+                        MenuRow::new(("graph", index))
+                            .height(size::ROW)
                             .start_slot(
                                 Icon::new(IconName::Folder)
                                     .size(IconSize::Small)
@@ -433,7 +432,7 @@ impl OpenGraphModal {
                             )
                             .child(
                                 h_flex()
-                                    .gap_2()
+                                    .gap(px(space::MD))
                                     .child(Label::new(graph).size(LabelSize::Small))
                                     .child(
                                         Label::new(detail)
@@ -448,7 +447,8 @@ impl OpenGraphModal {
             )
             .child(
                 h_flex()
-                    .gap_2()
+                    .pt(px(space::SM))
+                    .gap(px(space::MD))
                     .child(
                         studio_ui::ds::field_frame(false, cx)
                             .flex_1()
@@ -468,7 +468,7 @@ impl OpenGraphModal {
     fn render_add(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let field = |label: &'static str, editor: &Entity<Editor>| {
             v_flex()
-                .gap_1()
+                .gap(px(space::XS))
                 .child(
                     Label::new(label)
                         .size(LabelSize::XSmall)
@@ -481,26 +481,34 @@ impl OpenGraphModal {
         };
         v_flex()
             .flex_1()
-            .gap_3()
+            .min_w_0()
+            .gap(px(space::LG))
             .child(Label::new("Add a server").size(LabelSize::Small))
             .child(field("Address", &self.new_url))
             .child(field("Name", &self.new_name))
             .child(field("Bearer token", &self.new_token))
             .child(
                 h_flex()
-                    .gap_2()
-                    .child(
-                        studio_ui::ds::button("add", "Add and connect")
-                            .style(ButtonStyle::Filled)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.add_server(window, cx)),
-                            ),
-                    )
-                    .child(studio_ui::ds::button("cancel-add", "Cancel").on_click(
+                    .gap(px(space::MD))
+                    .justify_end()
+                    .child(ds::cancel_button("cancel-add").on_click(
                         cx.listener(|this, _, window, cx| this.show_add(false, window, cx)),
-                    )),
+                    ))
+                    .child(
+                        ds::action_button("add", "Add and connect").on_click(
+                            cx.listener(|this, _, window, cx| this.add_server(window, cx)),
+                        ),
+                    ),
             )
     }
+}
+
+/// A pane's name, over its rows and on their text's edge.
+fn pane_label(title: &'static str) -> Div {
+    div()
+        .px(px(space::MD))
+        .pb(px(space::XS))
+        .child(ds::text::meta(title))
 }
 
 /// The server a dialog starts on: the first ready one, else the first.
@@ -523,42 +531,46 @@ fn state_color(state: &ConnectionState) -> Color {
 
 impl Render for OpenGraphModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let surface = cx.theme().colors().elevated_surface_background;
-        let border = cx.theme().colors().border;
-        let border_variant = cx.theme().colors().border_variant;
         let servers = self.render_servers(cx).into_any_element();
         let body = if self.adding {
             self.render_add(cx).into_any_element()
         } else {
             self.render_graphs(cx).into_any_element()
         };
-        v_flex()
+        ds::modal(cx)
             .key_context("OpenGraphModal")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.confirm(window, cx)))
-            .w(px(760.))
+            .w(px(size::MODAL_WIDE))
             .max_h(px(560.))
-            .p_4()
-            .gap_3()
-            .rounded_lg()
-            .bg(surface)
-            .border_1()
-            .border_color(border)
-            .shadow_lg()
-            .child(Headline::new("Open a graph").size(HeadlineSize::Small))
             .child(
-                h_flex()
-                    .items_start()
-                    .gap_4()
-                    .child(servers)
-                    .child(div().w_px().h(px(320.)).bg(border_variant))
-                    .child(body),
+                ds::ModalHeader::new("Open a graph")
+                    .description(SharedString::from(
+                        "Pick a server, then one of its graphs, or enter a graph's id.",
+                    ))
+                    .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
             )
-            .children(
-                self.error
-                    .clone()
-                    .map(|e| Label::new(e).size(LabelSize::Small).color(Color::Error)),
+            .child(
+                ds::modal_body()
+                    .child(
+                        h_flex()
+                            .items_start()
+                            .gap(px(space::XL))
+                            .child(servers)
+                            .child(
+                                div()
+                                    .w_px()
+                                    .self_stretch()
+                                    .bg(ds::surface::floating_border(cx)),
+                            )
+                            .child(body),
+                    )
+                    .children(
+                        self.error
+                            .clone()
+                            .map(|e| Label::new(e).size(LabelSize::Small).color(Color::Error)),
+                    ),
             )
     }
 }

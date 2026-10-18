@@ -12,6 +12,7 @@ use graph_client::api::{
 };
 use graph_store::{GraphSession, Loadable, SessionEvent};
 use studio_ui::CopyableValue;
+use studio_ui::ds::space;
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 
@@ -216,7 +217,7 @@ impl StorageInspector {
             None => Vec::new(),
         };
         let header = h_flex()
-            .gap_2()
+            .gap(px(space::MD))
             .child(column("Graph", 140.))
             .child(column("State", 110.))
             .child(column("Reads", 60.))
@@ -255,8 +256,8 @@ impl StorageInspector {
         if let Some(snapshot) = snapshot {
             rows.push(
                 h_flex()
-                    .gap_2()
-                    .pt_2()
+                    .gap(px(space::MD))
+                    .pt(px(space::MD))
                     .child(column("Kind", 56.))
                     .child(column("Type", 150.))
                     .child(column("Rows", 90.))
@@ -268,7 +269,7 @@ impl StorageInspector {
             for (ix, dataset) in snapshot.datasets.iter().enumerate() {
                 rows.push(
                     h_flex()
-                        .gap_2()
+                        .gap(px(space::MD))
                         .min_h(px(24.))
                         .child(
                             div().w(px(56.)).flex_none().child(
@@ -284,7 +285,7 @@ impl StorageInspector {
                             h_flex()
                                 .w(px(150.))
                                 .flex_none()
-                                .gap_1p5()
+                                .gap(px(space::SM))
                                 .child(studio_ui::kind_swatch(
                                     &dataset.type_name,
                                     dataset.entity_kind == graph_client::api::EntityKind::Edge,
@@ -368,7 +369,7 @@ fn column(text: &'static str, width: f32) -> Div {
 
 fn kv(label: &'static str, value: CopyableValue) -> AnyElement {
     h_flex()
-        .gap_3()
+        .gap(px(space::LG))
         .min_h(px(24.))
         .child(
             div()
@@ -386,13 +387,13 @@ fn graph_row(ix: usize, graph: &GraphInfo, current: bool) -> AnyElement {
     let failure = graph.failure.map(|f| words(&format!("{f:?}")));
     let yes_no = |b: bool| if b { "yes" } else { "no" };
     h_flex()
-        .gap_2()
+        .gap(px(space::MD))
         .min_h(px(24.))
         .child(
             h_flex()
                 .w(px(140.))
                 .flex_none()
-                .gap_1()
+                .gap(px(space::XS))
                 .child(CopyableValue::new(
                     ("graph-id", ix),
                     Some(graph.graph_id.clone()),
@@ -458,8 +459,8 @@ fn words(variant: &str) -> String {
 fn section(title: &str, error: Option<String>, rows: Vec<AnyElement>, cx: &App) -> AnyElement {
     v_flex()
         .w_full()
-        .gap_1()
-        .py_3()
+        .gap(px(space::XS))
+        .py(px(space::LG))
         .border_b_1()
         .border_color(studio_ui::ds::surface::rule(cx))
         .child(
@@ -491,9 +492,9 @@ impl Render for StorageInspector {
             .child(
                 h_flex()
                     .flex_none()
-                    .px_4()
-                    .py_2()
-                    .gap_2()
+                    .px(px(space::XL))
+                    .py(px(space::MD))
+                    .gap(px(space::MD))
                     .border_b_1()
                     .border_color(border)
                     .child(Icon::new(IconName::Server).color(Color::Muted))
@@ -519,9 +520,9 @@ impl Render for StorageInspector {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .px_6()
-                    .py_4()
-                    .gap_4()
+                    .px(px(space::XXL))
+                    .py(px(space::XL))
+                    .gap(px(space::XL))
                     .child(server)
                     .child(graphs)
                     .child(snapshot)

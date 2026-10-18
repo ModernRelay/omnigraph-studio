@@ -33,10 +33,13 @@ use studio_actions::tree::{
     ClearFilter, Collapse, CollapseAll, Expand, ExpandAll, OpenPage, OpenSelected, OpenTable,
     PeekSelected, RerootHere, SelectNext, SelectPrevious, ShowOnCanvas, ToggleEmptyGroups,
 };
+use studio_ui::ds::space;
+use studio_ui::ds::{Button, IconButton};
+use studio_ui::menu::ContextMenu;
 use studio_ui::type_swatch;
 use studio_workspace::{PanelPosition, Workspace, WorkspaceEvent};
 use ui::prelude::*;
-use ui::{ContextMenu, IndentGuideColors, PopoverMenu, StickyCandidate, Tooltip};
+use ui::{IndentGuideColors, PopoverMenu, StickyCandidate, Tooltip};
 
 use rows::{RowId, RowTag};
 
@@ -726,7 +729,7 @@ impl RelationshipTree {
                 h_flex()
                     .min_w_0()
                     .flex_1()
-                    .gap_1p5()
+                    .gap(px(space::SM))
                     // The root carries the type's mark; below it a dot, since each
                     // relationship already names the type it leads to.
                     .child(if root {
@@ -762,7 +765,7 @@ impl RelationshipTree {
             EntryKind::Cycle { node, .. } => h_flex()
                 .min_w_0()
                 .flex_1()
-                .gap_1p5()
+                .gap(px(space::SM))
                 .child(Label::new("↺").size(LabelSize::Small).color(Color::Muted))
                 .child(type_swatch(&node.type_name))
                 .child(
@@ -793,7 +796,7 @@ impl RelationshipTree {
                 h_flex()
                     .min_w_0()
                     .flex_1()
-                    .gap_1p5()
+                    .gap(px(space::SM))
                     .child(
                         Label::new(format!(
                             "{} →",
@@ -844,7 +847,7 @@ impl RelationshipTree {
                 h_flex()
                     .min_w_0()
                     .flex_1()
-                    .gap_1p5()
+                    .gap(px(space::SM))
                     .child(Label::new(arrow).size(LabelSize::Small).color(muted))
                     .child(
                         div().min_w_0().flex_shrink(1.).child(
@@ -914,7 +917,7 @@ impl RelationshipTree {
                 h_flex()
                     .min_w_0()
                     .flex_1()
-                    .gap_1p5()
+                    .gap(px(space::SM))
                     .child(
                         div().min_w_0().flex_shrink(1.).child(
                             Label::new(text)
@@ -974,7 +977,7 @@ impl RelationshipTree {
                 h_flex()
                     .min_w_0()
                     .flex_1()
-                    .gap_1()
+                    .gap(px(space::XS))
                     .child(
                         Icon::new(IconName::Warning)
                             .size(IconSize::XSmall)
@@ -1053,8 +1056,8 @@ impl RelationshipTree {
             .w_full()
             .h(px(ROW_HEIGHT))
             .pl(px(LEFT_PAD + entry.depth as f32 * INDENT))
-            .pr_2()
-            .gap_1()
+            .pr(px(space::MD))
+            .gap(px(space::XS))
             .items_center()
             .bg(panel_bg)
             .border_l_2()
@@ -1223,11 +1226,11 @@ impl RelationshipTree {
         let field = studio_ui::ds::surface::sunken(cx);
         Some(
             v_flex()
-                .px_2()
-                .pb_1()
-                .gap_1()
+                .px(px(space::MD))
+                .pb(px(space::XS))
+                .gap(px(space::XS))
                 .when(!breadcrumb.is_empty(), |d| {
-                    d.child(h_flex().min_w_0().flex_wrap().gap_0p5().children(
+                    d.child(h_flex().min_w_0().flex_wrap().gap(px(space::XXS)).children(
                         breadcrumb.into_iter().map(|(index, text)| {
                             studio_ui::ds::button(("crumb", index), format!("{text} ›"))
                                 .label_size(LabelSize::XSmall)
@@ -1258,8 +1261,8 @@ impl RelationshipTree {
                     d.child(
                         h_flex()
                             .h(px(ROW_HEIGHT))
-                            .px_2()
-                            .gap_1p5()
+                            .px(px(space::MD))
+                            .gap(px(space::SM))
                             .rounded_md()
                             .bg(field)
                             .child(
@@ -1478,7 +1481,7 @@ impl Render for ExploreActions {
         };
         let weak = self.tree.clone();
         h_flex()
-            .gap_0p5()
+            .gap(px(space::XXS))
             // The toggle shows only when it changes something: an empty group, or hiding on.
             .when(hide_empty || any_empty, |row| {
                 let tree = weak.clone();
@@ -1552,11 +1555,11 @@ impl HoverCard {
             * 6.5
             + 8.;
         v_flex()
-            .gap_1()
+            .gap(px(space::XS))
             .max_w(px(320.))
             .child(
                 h_flex()
-                    .gap_1p5()
+                    .gap(px(space::SM))
                     .child(studio_ui::ds::type_dot(&self.type_name))
                     .child(
                         div().min_w_0().flex_shrink(1.).child(
@@ -1585,9 +1588,9 @@ impl HoverCard {
             .when(!self.edge.is_empty(), |card| {
                 card.child(
                     v_flex()
-                        .mt_1()
-                        .pt_1()
-                        .gap_0p5()
+                        .mt(px(space::XS))
+                        .pt(px(space::XS))
+                        .gap(px(space::XXS))
                         .border_t_1()
                         .border_color(cx.theme().colors().border_variant)
                         .children(self.relationship.clone().map(|relationship| {
@@ -1598,7 +1601,7 @@ impl HoverCard {
                         .children(self.edge.iter().map(|(name, value)| {
                             let value = rows::edge_value(value);
                             h_flex()
-                                .gap_2()
+                                .gap(px(space::MD))
                                 .child(
                                     div().w(px(name_width)).flex_none().child(
                                         Label::new(name.clone())

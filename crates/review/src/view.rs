@@ -24,13 +24,16 @@ use serde_json::Value;
 use studio_actions::review::{
     AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext,
 };
+use studio_ui::ds::Button;
+use studio_ui::ds::space;
+use studio_ui::menu::ContextMenu;
 use studio_ui::{
     ChangeCard, ChangeKind, PropertyRow, change_counts, change_group_header, group_digits,
     short_commit_id, type_swatch,
 };
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace, workspace_for};
 use ui::prelude::*;
-use ui::{Banner, Checkbox, ContextMenu, KeyBinding, PopoverMenu, Severity, ToggleState, Tooltip};
+use ui::{Banner, Checkbox, KeyBinding, PopoverMenu, Severity, ToggleState, Tooltip};
 
 use crate::conflicts::{conflict_wording, resolution_hint};
 
@@ -1097,7 +1100,7 @@ impl ReviewView {
                 .gap_y_1()
                 .children(data.counts.iter().map(|count| {
                     h_flex()
-                        .gap_1p5()
+                        .gap(px(space::SM))
                         .child(studio_ui::kind_swatch(&count.type_name, count.is_edge))
                         .child(Label::new(count.type_name.clone()).size(LabelSize::Small))
                         .child(change_counts(count.added, count.changed, count.removed))
@@ -1228,15 +1231,15 @@ impl ReviewView {
 
         v_flex()
             .flex_none()
-            .px_4()
-            .pt_3()
-            .pb_2()
-            .gap_2()
+            .px(px(space::XL))
+            .pt(px(space::LG))
+            .pb(px(space::MD))
+            .gap(px(space::MD))
             .border_b_1()
             .border_color(border)
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap(px(space::MD))
                     .child(Icon::new(IconName::GitBranch).color(Color::Muted))
                     .child(
                         Headline::new(format!("{} → {}", self.branch, self.target))
@@ -1263,7 +1266,7 @@ impl ReviewView {
                     })
                     .child(merge_button),
             )
-            .child(h_flex().gap_2().child(scope_menu).child(search))
+            .child(h_flex().gap(px(space::MD)).child(scope_menu).child(search))
             .child(Label::new(sentence))
             .when(!detail.is_empty(), |d| {
                 d.child(
@@ -1448,8 +1451,8 @@ impl ReviewView {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .p_4()
-            .gap_2()
+            .p(px(space::XL))
+            .gap(px(space::MD))
             .child(
                 Label::new(format!(
                     "Conflicts merging {} into {}",
@@ -1467,9 +1470,9 @@ impl ReviewView {
                 h_flex()
                     .id(("conflict", ix))
                     .w_full()
-                    .gap_3()
-                    .px_3()
-                    .py_2()
+                    .gap(px(space::LG))
+                    .px(px(space::LG))
+                    .py(px(space::MD))
                     .rounded_md()
                     .border_1()
                     .border_color(border)
@@ -1482,7 +1485,7 @@ impl ReviewView {
                             .child(Label::new(words).color(Color::Conflict))
                             .child(
                                 h_flex()
-                                    .gap_2()
+                                    .gap(px(space::MD))
                                     .child(type_swatch(&conflict.type_name))
                                     .child(
                                         Label::new(conflict.type_name.clone())
@@ -1527,7 +1530,7 @@ impl ReviewView {
             Some(Row::Group(ix)) => {
                 let count = &data.counts[ix];
                 div()
-                    .px_4()
+                    .px(px(space::XL))
                     .child(change_group_header(
                         &count.type_name,
                         count.is_edge,
@@ -1639,8 +1642,8 @@ impl ReviewView {
                     })
                     .on_click(cx.listener(move |this, _, _, cx| this.revert(ix, cx)));
                 div()
-                    .px_4()
-                    .py_1()
+                    .px(px(space::XL))
+                    .py(px(space::XS))
                     .child(
                         card.action(review_button)
                             .when_some(edit_button, |card, button| card.action(button))
@@ -2158,7 +2161,7 @@ impl Render for ReviewView {
             )
             .flex_1()
             .min_h_0()
-            .py_2()
+            .py(px(space::MD))
             .into_any_element(),
             (LoadState::Failed(error), _) => {
                 studio_ui::ds::error_state("The review could not be read", error.clone())

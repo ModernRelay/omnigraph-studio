@@ -15,10 +15,11 @@ use graph_client::api::CommitOutput;
 use graph_store::{GraphSession, SessionEvent};
 use studio_actions::graph::OpenCommit;
 use studio_actions::history::{NextMatch, PreviousMatch};
+use studio_ui::menu::ContextMenu;
 use studio_ui::{change_counts, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
-use ui::{Banner, ContextMenu, Severity, Tooltip, right_click_menu};
+use ui::{Banner, Severity, Tooltip, right_click_menu};
 
 use crate::commit_view::{CommitCounts, CommitView};
 use crate::lanes::{Graph, GraphCommit, assign_lanes};
@@ -635,7 +636,7 @@ impl HistoryView {
                                     studio_ui::ds::text::meta("no changes").into_any_element()
                                 } else {
                                     h_flex()
-                                        .gap_1()
+                                        .gap(px(studio_ui::ds::space::XS))
                                         .child(change_counts(added, changed, removed))
                                         .when(partial, |d| {
                                             d.child(studio_ui::ds::text::meta("+ more"))
@@ -894,7 +895,7 @@ impl Render for HistoryView {
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             );
         let warning = (count > LONG_HISTORY).then(|| {
-            div().px_4().py_1().child(
+            div().px(px(studio_ui::ds::space::XL)).py(px(studio_ui::ds::space::XS)).child(
                 Banner::new()
                     .severity(Severity::Warning)
                     .child(

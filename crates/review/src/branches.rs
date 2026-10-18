@@ -14,10 +14,11 @@ use gpui::{
 use graph_client::WriteOutcome;
 use graph_store::{GraphSession, SessionEvent};
 use studio_actions::graph::{CreateBranch, DeleteBranch, MergeBranch, ReviewBranch};
-use studio_ui::{now_micros, relative_time, short_commit_id};
+use studio_ui::menu::{ContextMenu, ContextMenuEntry};
+use studio_ui::{ds, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::prelude::*;
-use ui::{ContextMenu, ContextMenuEntry, Tooltip, right_click_menu};
+use ui::{Tooltip, right_click_menu};
 
 use crate::view::open_review;
 use studio_workspace::ModalView;
@@ -295,7 +296,7 @@ impl Render for BranchList {
             }
             Err(Some(error)) => {
                 list = list.child(
-                    div().px_2().child(
+                    div().px(px(ds::space::MD)).child(
                         Label::new(format!("Branches could not be read: {error}"))
                             .size(LabelSize::XSmall)
                             .color(Color::Error),
@@ -425,33 +426,38 @@ impl Render for CreateBranchModal {
             },
             self.from
         );
-        studio_ui::ds::dialog(format!("New branch from {}", self.from), cx)
+        ds::modal(cx)
             .key_context("CreateBranchModal")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.create(cx)))
-            .child(field(&self.name, cx))
             .child(
-                Label::new(cli)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
-                    .buffer_font(cx),
-            )
-            .children(
-                self.error
-                    .clone()
-                    .map(|e| Label::new(e).size(LabelSize::Small).color(Color::Error)),
+                ds::ModalHeader::new(format!("New branch from {}", self.from))
+                    .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
             )
             .child(
-                h_flex()
-                    .gap_2()
-                    .justify_end()
+                ds::modal_body()
+                    .child(field(&self.name, cx))
                     .child(
-                        studio_ui::ds::button("cancel", "Cancel")
+                        Label::new(cli)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .buffer_font(cx),
+                    )
+                    .children(
+                        self.error
+                            .clone()
+                            .map(|e| Label::new(e).size(LabelSize::Small).color(Color::Error)),
+                    ),
+            )
+            .child(
+                ds::modal_footer(cx)
+                    .child(
+                        ds::cancel_button("cancel")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
-                        studio_ui::ds::button(
+                        ds::action_button(
                             "create",
                             if self.running {
                                 "Creating…"
@@ -459,7 +465,6 @@ impl Render for CreateBranchModal {
                                 "Create"
                             },
                         )
-                        .style(ButtonStyle::Filled)
                         .disabled(self.running)
                         .on_click(cx.listener(|this, _, _, cx| this.create(cx))),
                     ),
@@ -632,32 +637,40 @@ impl Render for DeleteBranchModal {
             ),
         };
         let cli = format!("omnigraph branch delete {branch}");
-        studio_ui::ds::dialog(format!("Delete {branch}?"), cx)
+        let running = self.running;
+        ds::modal(cx)
             .key_context("DeleteBranchModal")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.delete(cx)))
-            .child(Label::new(what).size(LabelSize::Small).color(if typing {
-                Color::Warning
-            } else {
-                Color::Muted
-            }))
-            .when(typing, |dialog| dialog.child(field(&self.confirm, cx)))
-            .children(
-                self.error
-                    .clone()
-                    .map(|e| Label::new(e).size(LabelSize::Small).color(Color::Error)),
-            )
+            // What it loses is the description; the body holds only the field that asks for
+            // the branch's name when it may lose commits.
             .child(
-                h_flex()
-                    .gap_2()
-                    .justify_end()
+                ds::ModalHeader::new(format!("Delete {branch}?"))
+                    .description(SharedString::from(what))
+                    .close_disabled(running)
+                    .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
+            )
+            .when(typing || self.error.is_some(), |dialog| {
+                dialog.child(
+                    ds::modal_body()
+                        .when(typing, |body| body.child(field(&self.confirm, cx)))
+                        .children(
+                            self.error
+                                .clone()
+                                .map(|e| Label::new(e).size(LabelSize::Small).color(Color::Error)),
+                        ),
+                )
+            })
+            .child(
+                ds::modal_footer(cx)
                     .child(
-                        studio_ui::ds::button("cancel", "Cancel")
+                        ds::cancel_button("cancel")
+                            .disabled(running)
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
-                        studio_ui::ds::button(
+                        ds::action_button(
                             "delete",
                             if self.running {
                                 "Deleting…"
@@ -665,8 +678,7 @@ impl Render for DeleteBranchModal {
                                 "Delete"
                             },
                         )
-                        .style(ButtonStyle::Filled)
-                        .color(Color::Error)
+                        .variant(ds::Variant::Destructive)
                         .disabled(!confirmed || self.running)
                         .tooltip(move |_, cx| {
                             Tooltip::with_meta("Delete the branch", None, cli.clone(), cx)

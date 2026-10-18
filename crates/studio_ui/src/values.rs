@@ -6,6 +6,8 @@ use gpui::{App, ClipboardItem, ElementId, SharedString, Window};
 use ui::Tooltip;
 use ui::prelude::*;
 
+use crate::button::IconButton;
+
 /// A value as plain text: a string as it is, nothing for null, anything else as JSON. What a
 /// copied cell holds, and what a text field shows and reads back.
 pub fn value_text(value: &serde_json::Value) -> String {
@@ -157,11 +159,12 @@ impl RenderOnce for CopyableValue {
         h_flex()
             .id(self.id.clone())
             .group(group.clone())
-            .gap_1()
+            .gap(px(crate::ds::space::XS))
             .min_w_0()
             .child(div().min_w_0().child(label))
             .child(
                 IconButton::new(self.id, IconName::Copy)
+                    .size(ButtonSize::Compact)
                     .icon_size(IconSize::XSmall)
                     .icon_color(Color::Muted)
                     .visible_on_hover(group)

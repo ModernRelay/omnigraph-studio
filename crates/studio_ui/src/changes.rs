@@ -3,6 +3,7 @@
 
 use std::rc::Rc;
 
+use crate::ds::space;
 use gpui::{AnyElement, App, ClickEvent, Div, ElementId, SharedString, Window};
 use serde_json::Value;
 use ui::prelude::*;
@@ -161,7 +162,7 @@ impl RenderOnce for ChangeCard {
         let kind = self.kind;
         let header = h_flex()
             .id("change-kind")
-            .gap(px(crate::ds::space::INLINE))
+            .gap(px(space::INLINE))
             .min_w_0()
             .tooltip(ui::Tooltip::text(kind.label()))
             .child(
@@ -202,7 +203,7 @@ impl RenderOnce for ChangeCard {
                 ChangeKind::Changed => h_flex()
                     .flex_1()
                     .min_w_0()
-                    .gap_2()
+                    .gap(px(space::MD))
                     .child(div().min_w_0().max_w(relative(0.48)).child(value_label(
                         &row.before,
                         Color::Deleted,
@@ -227,7 +228,7 @@ impl RenderOnce for ChangeCard {
                 }
             };
             h_flex()
-                .gap_3()
+                .gap(px(space::LG))
                 .min_w_0()
                 .child(
                     div()
@@ -255,9 +256,9 @@ impl RenderOnce for ChangeCard {
                 v_flex()
                     .flex_1()
                     .min_w_0()
-                    .px_3()
-                    .py_2()
-                    .gap_1()
+                    .px(px(space::LG))
+                    .py(px(space::MD))
+                    .gap(px(space::XS))
                     .when(self.hollow, |d| d.opacity(0.6))
                     .child(header)
                     .children(rows),
@@ -282,7 +283,7 @@ pub fn change_counts(added: usize, changed: usize, removed: usize) -> Div {
         })
     };
     h_flex()
-        .gap_1p5()
+        .gap(px(space::SM))
         .children(part(added, ChangeKind::Added))
         .children(part(changed, ChangeKind::Changed))
         .children(part(removed, ChangeKind::Removed))
@@ -297,9 +298,9 @@ pub fn change_group_header(
     removed: usize,
 ) -> Div {
     h_flex()
-        .gap_2()
-        .pt_3()
-        .pb_1()
+        .gap(px(space::MD))
+        .pt(px(space::LG))
+        .pb(px(space::XS))
         .child(crate::kind_swatch(type_name, is_edge))
         .child(Label::new(type_name.to_owned()).size(LabelSize::Small))
         .child(

@@ -23,40 +23,16 @@ use crate::offers::Offers;
 use crate::suggest::{self, NODE_SUGGESTIONS};
 use crate::table::TypeTable;
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
+use studio_ui::ds::{
+    ModalHeader, Variant, action_button, cancel_button, modal, modal_body, modal_footer,
+    write_target,
+};
 use studio_workspace::ModalView;
 
 struct Field {
     property: Property,
     editor: Entity<Editor>,
     error: Option<String>,
-}
-
-fn write_target(branch: &str, cx: &App) -> impl IntoElement {
-    let border = cx.theme().colors().border_variant;
-    div()
-        .px_2()
-        .py_0p5()
-        .rounded_md()
-        .border_1()
-        .border_color(border)
-        .child(
-            Label::new(format!("write · {branch}"))
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
-        )
-}
-
-fn frame(cx: &App) -> Div {
-    let colors = cx.theme().colors();
-    v_flex()
-        .w(px(520.))
-        .p_4()
-        .gap_3()
-        .rounded_lg()
-        .bg(colors.elevated_surface_background)
-        .border_1()
-        .border_color(colors.border)
-        .shadow_lg()
 }
 
 fn field_box(editor: &Entity<Editor>, invalid: bool, cx: &App) -> impl IntoElement {
@@ -299,10 +275,10 @@ fn render_field(field: &Field, cx: &App) -> AnyElement {
     let p = &field.property;
     let required = !p.nullable;
     v_flex()
-        .gap_1()
+        .gap(px(studio_ui::ds::space::XS))
         .child(
             h_flex()
-                .gap_2()
+                .gap(px(studio_ui::ds::space::MD))
                 .child(Label::new(p.name.clone()).size(LabelSize::Small))
                 .child(
                     Label::new(p.display_type())
@@ -342,7 +318,7 @@ impl Render for InsertRowModal {
             .collect();
         let saving = self.saving;
         let blocked = self.blocked.clone();
-        frame(cx)
+        modal(cx)
             .key_context("InsertRowModal")
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.submit(window, cx)))
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel(cx)))
@@ -355,39 +331,35 @@ impl Render for InsertRowModal {
                 this.focus_step(-1, window, cx)
             }))
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Headline::new(format!("New {}", self.type_name)).size(HeadlineSize::Small),
-                    )
-                    .child(div().flex_1())
-                    .child(write_target(&self.branch, cx)),
+                ModalHeader::new(format!("New {}", self.type_name))
+                    .meta(write_target(self.branch.clone(), cx))
+                    .close_disabled(saving)
+                    .on_close(cx.listener(|this, _, _, cx| this.cancel(cx))),
             )
-            .children(fields)
-            .children(blocked.map(|b| Label::new(b).size(LabelSize::Small).color(Color::Error)))
-            .children(self.notice.clone().map(|notice| {
-                Label::new(notice.message)
-                    .size(LabelSize::Small)
-                    .color(notice.tone.color())
-            }))
             .child(
-                h_flex()
-                    .gap_2()
-                    .justify_end()
+                modal_body()
+                    .children(fields)
+                    .children(
+                        blocked.map(|b| Label::new(b).size(LabelSize::Small).color(Color::Error)),
+                    )
+                    .children(self.notice.clone().map(|notice| {
+                        Label::new(notice.message)
+                            .size(LabelSize::Small)
+                            .color(notice.tone.color())
+                    })),
+            )
+            .child(
+                modal_footer(cx)
                     .child(
-                        studio_ui::ds::button("cancel-insert", "Cancel")
+                        cancel_button("cancel-insert")
                             .disabled(saving)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
-                        studio_ui::ds::button(
-                            "insert",
-                            if saving { "Inserting…" } else { "Insert" },
-                        )
-                        .style(ButtonStyle::Filled)
-                        .disabled(saving || self.blocked.is_some())
-                        .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
-                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                        action_button("insert", if saving { "Inserting…" } else { "Insert" })
+                            .disabled(saving || self.blocked.is_some())
+                            .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
+                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             )
     }
@@ -816,10 +788,10 @@ impl InsertEdgeModal {
                 ))
         });
         v_flex()
-            .gap_1()
+            .gap(px(studio_ui::ds::space::XS))
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap(px(studio_ui::ds::space::MD))
                     .child(Label::new(label.to_owned()).size(LabelSize::Small))
                     .child(
                         Label::new(endpoint.type_name.clone())
@@ -866,7 +838,7 @@ impl Render for InsertEdgeModal {
             .collect();
         let saving = self.saving;
         let blocked = self.blocked.clone();
-        frame(cx)
+        modal(cx)
             .key_context("InsertEdgeModal")
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.confirm(window, cx)))
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel(cx)))
@@ -879,41 +851,37 @@ impl Render for InsertEdgeModal {
                 this.focus_step(-1, window, cx)
             }))
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Headline::new(format!("New {}", self.edge_name)).size(HeadlineSize::Small),
-                    )
-                    .child(div().flex_1())
-                    .child(write_target(&self.branch, cx)),
+                ModalHeader::new(format!("New {}", self.edge_name))
+                    .meta(write_target(self.branch.clone(), cx))
+                    .close_disabled(saving)
+                    .on_close(cx.listener(|this, _, _, cx| this.cancel(cx))),
             )
-            .child(from)
-            .child(to)
-            .children(fields)
-            .children(blocked.map(|b| Label::new(b).size(LabelSize::Small).color(Color::Error)))
-            .children(self.notice.clone().map(|notice| {
-                Label::new(notice.message)
-                    .size(LabelSize::Small)
-                    .color(notice.tone.color())
-            }))
             .child(
-                h_flex()
-                    .gap_2()
-                    .justify_end()
+                modal_body()
+                    .child(from)
+                    .child(to)
+                    .children(fields)
+                    .children(
+                        blocked.map(|b| Label::new(b).size(LabelSize::Small).color(Color::Error)),
+                    )
+                    .children(self.notice.clone().map(|notice| {
+                        Label::new(notice.message)
+                            .size(LabelSize::Small)
+                            .color(notice.tone.color())
+                    })),
+            )
+            .child(
+                modal_footer(cx)
                     .child(
-                        studio_ui::ds::button("cancel-insert-edge", "Cancel")
+                        cancel_button("cancel-insert-edge")
                             .disabled(saving)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
-                        studio_ui::ds::button(
-                            "insert-edge",
-                            if saving { "Inserting…" } else { "Insert" },
-                        )
-                        .style(ButtonStyle::Filled)
-                        .disabled(saving || self.blocked.is_some())
-                        .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
-                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                        action_button("insert-edge", if saving { "Inserting…" } else { "Insert" })
+                            .disabled(saving || self.blocked.is_some())
+                            .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
+                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             )
     }
@@ -1247,7 +1215,7 @@ impl DeleteRowModal {
             Loadable::NotLoaded => None,
             Loadable::Loading => Some(
                 h_flex()
-                    .gap_2()
+                    .gap(px(studio_ui::ds::space::MD))
                     .child(studio_ui::ds::spinner())
                     .child(
                         Label::new("Finding what depends on it…")
@@ -1264,22 +1232,11 @@ impl DeleteRowModal {
             ),
             Loadable::Loaded(plan) if plan.dependents.is_empty() => None,
             Loadable::Loaded(plan) => {
-                let counts = plan
-                    .dependent_counts()
-                    .into_iter()
-                    .map(|(t, n)| format!("{n} {t}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let it = if self.targets.len() == 1 {
-                    "it"
-                } else {
-                    "them"
-                };
                 let hidden = plan.dependents.len().saturating_sub(DEPENDENTS_NAMED);
                 let list = studio_ui::ds::row_list()
                     .bg(cx.theme().colors().editor_background)
                     .border_1()
-                    .border_color(cx.theme().colors().border_variant)
+                    .border_color(studio_ui::ds::surface::floating_border(cx))
                     .children(plan.dependents.iter().take(DEPENDENTS_NAMED).map(|d| {
                         h_flex()
                             .h(px(studio_ui::ds::size::SIDEBAR_ROW))
@@ -1310,20 +1267,48 @@ impl DeleteRowModal {
                             ),
                         )
                     });
-                Some(
-                    v_flex()
-                        .gap_2()
-                        .child(
-                            Label::new(format!(
-                                "Also deletes {counts} that cannot exist without {it}:"
-                            ))
-                            .size(LabelSize::Small),
-                        )
-                        .child(list)
-                        .into_any_element(),
-                )
+                Some(list.into_any_element())
             }
         }
+    }
+
+    /// The dialog's one paragraph: what goes, what else goes with it, and whether Undo can
+    /// bring it back. The body holds only what it names (the dependents, the confirm field).
+    fn description(&self) -> String {
+        let them = self.targets.len() > 1;
+        let mut text = match (self.edges, them) {
+            (true, false) => format!("Removes it from {}. Its nodes stay.", self.branch),
+            (true, true) => format!("Removes them from {}. Their nodes stay.", self.branch),
+            (false, false) => format!("Removes it and its relationships from {}.", self.branch),
+            (false, true) => format!("Removes them and their relationships from {}.", self.branch),
+        };
+        if let Loadable::Loaded(plan) = &self.plan
+            && !plan.dependents.is_empty()
+        {
+            let counts: Vec<String> = plan
+                .dependent_counts()
+                .into_iter()
+                .map(|(t, n)| format!("{n} {t}"))
+                .collect();
+            let counts = match counts.split_last() {
+                Some((last, [])) => last.clone(),
+                Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+                None => String::new(),
+            };
+            let it = if them { "them" } else { "it" };
+            text.push_str(&format!(
+                " Also deletes {counts} that cannot exist without {it}."
+            ));
+        }
+        match &self.undo_unavailable {
+            Some(reason) => text.push_str(&format!(
+                " Undo cannot restore this: {reason} Type {} to confirm.",
+                Self::phrase_for(&self.targets)
+            )),
+            None if self.ready() => text.push_str(" You can undo this right after."),
+            None => {}
+        }
+        text
     }
 }
 
@@ -1333,84 +1318,51 @@ impl Render for DeleteRowModal {
         let confirmed = self.confirmed(cx);
         let saving = self.saving;
         let headline = format!("Delete {}", self.what());
-        let explanation = if self.edges {
-            format!("Removes it from {}. Its nodes stay.", self.branch)
-        } else {
-            format!("Removes it and its relationships from {}.", self.branch)
-        };
-        let explanation = if self.targets.len() > 1 {
-            explanation
-                .replace("Removes it", "Removes them")
-                .replace("Its nodes", "Their nodes")
-        } else {
-            explanation
-        };
-        let undo_note = match (&self.undo_unavailable, ready) {
-            (Some(reason), _) => Some(
-                Label::new(format!(
-                    "Undo cannot restore this: {reason} Type {} to confirm.",
-                    Self::phrase_for(&self.targets)
-                ))
-                .size(LabelSize::Small)
-                .color(Color::Warning),
-            ),
-            (None, true) => Some(
-                Label::new("You can undo this right after.")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            ),
-            (None, false) => None,
-        };
-        frame(cx)
+        let description = self.description();
+        let plan = self.render_plan(cx);
+        let typing = self.undo_unavailable.is_some();
+        let notice = self.notice.clone();
+        modal(cx)
             .key_context("DeleteRowModal")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.submit(window, cx)))
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel(cx)))
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .overflow_hidden()
-                            .child(Headline::new(headline).size(HeadlineSize::Small)),
-                    )
-                    .child(write_target(&self.branch, cx)),
+                ModalHeader::new(headline)
+                    .description(SharedString::from(description))
+                    .meta(write_target(self.branch.clone(), cx))
+                    .close_disabled(saving)
+                    .on_close(cx.listener(|this, _, _, cx| this.cancel(cx))),
             )
-            .child(
-                Label::new(explanation)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .children(self.render_plan(cx))
-            .children(undo_note)
-            .when(self.undo_unavailable.is_some(), |d| {
-                d.child(field_box(&self.confirm, false, cx))
+            // The body only when it has something: the dependents, the confirm field, or the
+            // write's outcome.
+            .when(plan.is_some() || typing || notice.is_some(), |dialog| {
+                dialog.child(
+                    modal_body()
+                        .children(plan)
+                        .when(typing, |body| {
+                            body.child(field_box(&self.confirm, false, cx))
+                        })
+                        .children(notice.map(|notice| {
+                            Label::new(notice.message)
+                                .size(LabelSize::Small)
+                                .color(notice.tone.color())
+                        })),
+                )
             })
-            .children(self.notice.clone().map(|notice| {
-                Label::new(notice.message)
-                    .size(LabelSize::Small)
-                    .color(notice.tone.color())
-            }))
             .child(
-                h_flex()
-                    .gap_2()
-                    .justify_end()
+                modal_footer(cx)
                     .child(
-                        studio_ui::ds::button("cancel-delete", "Cancel")
+                        cancel_button("cancel-delete")
                             .disabled(saving)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
-                        studio_ui::ds::button(
-                            "delete",
-                            if saving { "Deleting…" } else { "Delete" },
-                        )
-                        .style(ButtonStyle::Tinted(ui::TintColor::Error))
-                        .disabled(saving || !ready || !confirmed)
-                        .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
-                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                        action_button("delete", if saving { "Deleting…" } else { "Delete" })
+                            .variant(Variant::Destructive)
+                            .disabled(saving || !ready || !confirmed)
+                            .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
+                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             )
     }
@@ -1519,45 +1471,38 @@ impl Render for SaveViewModal {
             }
             parts.join(", ")
         };
-        frame(cx)
+        modal(cx)
             .key_context("SaveViewModal")
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.submit(window, cx)))
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .child(
-                Headline::new(format!("Save a view of {}", self.view.type_name))
-                    .size(HeadlineSize::Small),
+                ModalHeader::new(format!("Save a view of {}", self.view.type_name))
+                    .description(SharedString::from(format!(
+                        "The table's {summary}, kept for this graph in your settings."
+                    )))
+                    .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
             )
             .child(
-                Label::new(format!(
-                    "The table's {summary}, kept for this graph in your settings."
-                ))
-                .size(LabelSize::Small)
-                .color(Color::Muted),
+                modal_body()
+                    .child(field_box(&self.name, false, cx))
+                    .when(replaces, |d| {
+                        d.child(
+                            Label::new(format!("Replaces the view “{name}”."))
+                                .size(LabelSize::Small)
+                                .color(Color::Warning),
+                        )
+                    }),
             )
-            .child(field_box(&self.name, false, cx))
-            .when(replaces, |d| {
-                d.child(
-                    Label::new(format!("Replaces the view “{name}”."))
-                        .size(LabelSize::Small)
-                        .color(Color::Warning),
-                )
-            })
             .child(
-                h_flex()
-                    .gap_2()
-                    .justify_end()
+                modal_footer(cx)
                     .child(
-                        studio_ui::ds::button("cancel-view", "Cancel")
+                        cancel_button("cancel-view")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
-                        studio_ui::ds::button(
-                            "save-view",
-                            if replaces { "Replace" } else { "Save" },
-                        )
-                        .style(ButtonStyle::Filled)
-                        .disabled(name.is_empty())
-                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                        action_button("save-view", if replaces { "Replace" } else { "Save" })
+                            .disabled(name.is_empty())
+                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             )
     }

@@ -109,9 +109,9 @@ impl Render for TypesList {
             Loadable::Failed(error) => {
                 let error = error.clone();
                 return v_flex()
-                    .px_3()
-                    .py_1()
-                    .gap_1()
+                    .px(px(studio_ui::ds::space::LG))
+                    .py(px(studio_ui::ds::space::XS))
+                    .gap(px(studio_ui::ds::space::XS))
                     .child(
                         Label::new("Studio could not read the schema.")
                             .size(LabelSize::Small)
@@ -170,7 +170,7 @@ impl Render for TypesList {
             }),
         )
         .size_full()
-        .pb_2()
+        .pb(px(studio_ui::ds::space::MD))
         .into_any_element()
     }
 }
@@ -220,7 +220,7 @@ impl TypesList {
                 })
                 .into_any_element(),
             Row::Section(title) => studio_ui::ds::section_label(*title)
-                .pt_3()
+                .pt(px(studio_ui::ds::space::LG))
                 .into_any_element(),
             Row::Type { name, is_edge } => {
                 let s = session.read(cx);

@@ -29,6 +29,9 @@ use graph_client::{ReadError, WriteOutcome};
 use graph_store::{GraphSession, SessionEvent};
 use serde_json::{Map, Value};
 use studio_actions::query::{CopyCell, CopyRow, Explain, Run, Save, SaveAs};
+use studio_ui::ds::Button;
+use studio_ui::ds::space;
+use studio_ui::menu::ContextMenu;
 use studio_ui::{
     ColumnDrag, ColumnResize, GridColumn, GridPlace, ROW_HEIGHT, columns_in_view, format_value,
     grid_cell, grid_header, grid_places, is_numeric, resizable_grid_header, short_commit_id,
@@ -36,7 +39,7 @@ use studio_ui::{
 };
 use studio_workspace::{Item, ItemEvent, ItemFooter, KeyHint, SavedItem};
 use ui::prelude::*;
-use ui::{ContextMenu, KeyBinding, PopoverMenu, Tooltip};
+use ui::{KeyBinding, PopoverMenu, Tooltip};
 
 use crate::analysis::Analysis;
 use crate::completion::GqCompletionProvider;
@@ -2031,7 +2034,7 @@ impl QueryEditor {
                 h_flex()
                     .id("query-title")
                     .min_w_0()
-                    .gap(px(studio_ui::ds::space::INLINE))
+                    .gap(px(space::INLINE))
                     .items_center()
                     .tooltip(Tooltip::text(tip))
                     .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
@@ -2105,7 +2108,7 @@ impl QueryEditor {
                 .flex_none()
                 .max_h(px(112.))
                 .overflow_y_scroll()
-                .py_1()
+                .py(px(space::XS))
                 .border_t_1()
                 .border_color(border)
                 .children(
@@ -2121,9 +2124,9 @@ impl QueryEditor {
                             };
                             h_flex()
                                 .id(("problem", index))
-                                .px_2()
-                                .py_0p5()
-                                .gap_2()
+                                .px(px(space::MD))
+                                .py(px(space::XXS))
+                                .gap(px(space::MD))
                                 .cursor_pointer()
                                 .hover(move |s| s.bg(hover))
                                 .child(
@@ -2583,11 +2586,15 @@ impl QueryEditor {
                         .border_color(border)
                         .when(row_selected, |d| d.bg(row_selected_bg))
                         .child(
-                            h_flex().w(px(ROW_NUMBER_WIDTH)).flex_none().px_2().child(
-                                studio_ui::cell_text((ix + 1).to_string(), cx)
-                                    .size(TextSize::XSmall, cx)
-                                    .color(muted),
-                            ),
+                            h_flex()
+                                .w(px(ROW_NUMBER_WIDTH))
+                                .flex_none()
+                                .px(px(space::MD))
+                                .child(
+                                    studio_ui::cell_text((ix + 1).to_string(), cx)
+                                        .size(TextSize::XSmall, cx)
+                                        .color(muted),
+                                ),
                         )
                         .children(places.iter().map(|place| {
                             let column = match *place {
@@ -2633,7 +2640,7 @@ impl QueryEditor {
                     cx.processor(|this, range, _window, cx| this.render_plan_rows(range, cx)),
                 )
                 .flex_1()
-                .py(px(studio_ui::ds::space::XS)),
+                .py(px(space::XS)),
             )
             .into_any_element()
     }
@@ -2702,7 +2709,7 @@ impl QueryEditor {
                 let element = match plan.items.get(ix)? {
                     PlanItem::Header(title) => h_flex()
                         .h(px(PLAN_ROW_HEIGHT))
-                        .px_2()
+                        .px(px(space::MD))
                         .child(
                             Label::new(title.clone())
                                 .size(LabelSize::XSmall)
@@ -2719,8 +2726,8 @@ impl QueryEditor {
                         .w_full()
                         .h(px(PLAN_ROW_HEIGHT))
                         .pl(px(12. + *depth as f32 * 16.))
-                        .pr_2()
-                        .gap_2()
+                        .pr(px(space::MD))
+                        .gap(px(space::MD))
                         .hover(|row| row.bg(hover_bg))
                         .when(hovered == Some(ix), |row| row.bg(lit_bg))
                         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
@@ -2749,8 +2756,8 @@ impl QueryEditor {
                         .id(("plan-note", ix))
                         .h(px(PLAN_ROW_HEIGHT))
                         .pl(px(12.))
-                        .pr_2()
-                        .gap_2()
+                        .pr(px(space::MD))
+                        .gap(px(space::MD))
                         .child(
                             Label::new(name.clone())
                                 .size(LabelSize::XSmall)
@@ -2944,7 +2951,7 @@ impl Render for QueryEditor {
                     .h(relative(0.42))
                     .min_h(px(120.))
                     .flex_none()
-                    .pt(px(studio_ui::ds::space::XS))
+                    .pt(px(space::XS))
                     .border_b_1()
                     .border_color(studio_ui::ds::surface::rule(cx))
                     .child(self.editor.clone())
@@ -3063,7 +3070,7 @@ fn run_line(
         .id(("run-line", index))
         .w_full()
         .pl(block.margins.gutter.full_width())
-        .gap_2()
+        .gap(px(space::MD))
         .items_center()
         .child(
             Button::new(("run-line-run", index), "Run")
@@ -3100,7 +3107,7 @@ fn render_facts(facts: &[(String, String)]) -> impl IntoElement {
     h_flex()
         .min_w_0()
         .flex_1()
-        .gap_3()
+        .gap(px(space::LG))
         .overflow_hidden()
         .children(facts.iter().map(|(name, value)| {
             let value = if value.chars().count() > SHOWN {
@@ -3110,7 +3117,7 @@ fn render_facts(facts: &[(String, String)]) -> impl IntoElement {
             };
             h_flex()
                 .flex_none()
-                .gap_1()
+                .gap(px(space::XS))
                 .when(!name.is_empty(), |fact| {
                     fact.child(
                         Label::new(name.clone())

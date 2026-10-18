@@ -34,14 +34,17 @@ use studio_actions::table::{
     FilterBySelection, InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp, OpenRowPage, PeekRow,
     RefreshTable, SaveDrafts, SelectNextSuggestion, SelectPreviousSuggestion, StageEdit,
 };
+use studio_ui::ds::Button;
+use studio_ui::ds::space;
+use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::{ColumnDrag, ColumnResize, GridPlace, ROW_HEIGHT, columns_in_view, grid_places};
 use studio_workspace::{
     Item, ItemEvent, ItemFooter, KeyHint, SavedItem, ToastKind, Workspace, WorkspaceEvent,
 };
 use ui::prelude::*;
 use ui::{
-    ColumnWidthConfig, ContextMenu, ContextMenuEntry, Indicator, PopoverMenu, PopoverMenuHandle,
-    Table, TableInteractionState, TintColor, Tooltip,
+    ColumnWidthConfig, Indicator, PopoverMenu, PopoverMenuHandle, Table, TableInteractionState,
+    TintColor, Tooltip,
 };
 
 use crate::dialogs::{
@@ -1255,9 +1258,9 @@ impl TypeTable {
         let saving = self.bulk.saving;
         let mut bar = h_flex()
             .flex_none()
-            .px_3()
-            .py_1p5()
-            .gap_2()
+            .px(px(space::LG))
+            .py(px(space::SM))
+            .gap(px(space::MD))
             .items_center()
             .border_b_1()
             .border_color(border)
@@ -4070,10 +4073,10 @@ impl TypeTable {
             .id("drafts-bar")
             .occlude()
             .max_w(px(720.))
-            .pl_3()
-            .pr_1p5()
-            .py_1()
-            .gap_2()
+            .pl(px(space::LG))
+            .pr(px(space::SM))
+            .py(px(space::XS))
+            .gap(px(space::MD))
             .items_center()
             .rounded(px(studio_ui::ds::radius::LG))
             .bg(fill)
@@ -4132,7 +4135,7 @@ impl TypeTable {
                 .bottom_3()
                 .left_0()
                 .right_0()
-                .px_3()
+                .px(px(space::LG))
                 .justify_center()
                 .child(pill)
                 .into_any_element(),
@@ -4972,9 +4975,9 @@ impl TypeTable {
         let mut bar = h_flex()
             .flex_none()
             .flex_wrap()
-            .px(px(studio_ui::ds::space::EDGE))
-            .py(px(studio_ui::ds::space::SM))
-            .gap(px(studio_ui::ds::space::SM))
+            .px(px(space::EDGE))
+            .py(px(space::SM))
+            .gap(px(space::SM))
             .items_center()
             .border_b_1()
             .border_color(studio_ui::ds::surface::rule(cx));
@@ -5128,7 +5131,7 @@ impl TypeTable {
                             }))
                             .relative()
                             .w(px(180.))
-                            .px(px(studio_ui::ds::space::MD))
+                            .px(px(space::MD))
                             .child(self.filter_editor.clone())
                             .children(offers),
                     )
@@ -5137,10 +5140,10 @@ impl TypeTable {
                 .child(
                     h_flex()
                         .h_full()
-                        .pl(px(studio_ui::ds::space::XS))
+                        .pl(px(space::XS))
                         // The pill's border is the rest of the gap.
                         .pr(px(studio_ui::ds::PILL_BUTTON_GAP - 1.))
-                        .gap(px(studio_ui::ds::space::XXS))
+                        .gap(px(space::XXS))
                         .items_center()
                         .child(
                             studio_ui::ds::pill_button(
@@ -5362,8 +5365,8 @@ impl TypeTable {
                         }),
                     )
                     .h(px(studio_ui::HEADER_HEIGHT))
-                    .px_4()
-                    .gap_1p5()
+                    .px(px(space::XL))
+                    .gap(px(space::SM))
                     .w_full()
                     .overflow_hidden()
                     .when(column.align_right, |d| d.justify_end())
@@ -5623,8 +5626,8 @@ impl TypeTable {
             .id(("section-header", index))
             .h(px(ROW_HEIGHT))
             .w_full()
-            .px_3()
-            .gap_1p5()
+            .px(px(space::LG))
+            .gap(px(space::SM))
             .items_center()
             .overflow_hidden()
             .cursor_pointer()
@@ -5688,7 +5691,7 @@ impl TypeTable {
                 .into_any_element()
         } else if let Some(error) = &section.error {
             h_flex()
-                .gap_1()
+                .gap(px(space::XS))
                 .child(
                     Icon::new(IconName::Warning)
                         .size(IconSize::XSmall)
@@ -5742,7 +5745,7 @@ impl TypeTable {
             h_flex()
                 .h(px(ROW_HEIGHT))
                 .w_full()
-                .px_4()
+                .px(px(space::XL))
                 .items_center()
                 .child(content)
                 .into_any_element(),
@@ -5754,7 +5757,7 @@ impl TypeTable {
             h_flex()
                 .h(px(ROW_HEIGHT))
                 .w_full()
-                .px_3()
+                .px(px(space::LG))
                 .items_center()
                 .child(
                     Label::new(format!(
@@ -5960,18 +5963,22 @@ impl TypeTable {
             .id(SharedString::from(format!("relation-{}-{key}", row.id)))
             .w_full()
             .min_w_0()
-            .gap_1()
+            .gap(px(space::XS))
             .tooltip(Tooltip::text(format!(
                 "{} {} · click to open them",
                 format_count(count),
                 group.other_type
             )))
             .child(
-                h_flex().min_w_0().gap_1().overflow_hidden().children(
-                    labels[..fit]
-                        .iter()
-                        .map(|label| studio_ui::ds::tag(label.to_string(), cx)),
-                ),
+                h_flex()
+                    .min_w_0()
+                    .gap(px(space::XS))
+                    .overflow_hidden()
+                    .children(
+                        labels[..fit]
+                            .iter()
+                            .map(|label| studio_ui::ds::tag(label.to_string(), cx)),
+                    ),
             )
             .when(more > 0, |cell| {
                 cell.child(
@@ -6026,7 +6033,7 @@ impl TypeTable {
                 row.id, property.name
             )))
             .min_w_0()
-            .gap_1()
+            .gap(px(space::XS))
             .when_some(tooltip, |cell, tooltip| {
                 cell.tooltip(Tooltip::text(tooltip))
             })
@@ -6158,10 +6165,10 @@ impl TypeTable {
             .relative()
             .h(px(ROW_HEIGHT))
             .w_full()
-            .px_4()
+            .px(px(space::XL))
             .flex()
             .items_center()
-            .gap_1()
+            .gap(px(space::XS))
             .overflow_hidden()
             .when(col == 0, |d| {
                 d.border_r_1().border_color(divider.opacity(0.6))
@@ -6329,9 +6336,9 @@ impl TypeTable {
                             v_flex()
                                 .min_w(px(280.))
                                 .max_w(px(460.))
-                                .px_2()
-                                .py_1p5()
-                                .gap_1()
+                                .px(px(space::MD))
+                                .py(px(space::SM))
+                                .gap(px(space::XS))
                                 .rounded_md()
                                 .border_1()
                                 .border_color(border)
@@ -6340,7 +6347,7 @@ impl TypeTable {
                                 .children(notice.map(|notice| {
                                     let unknown = notice.tone == Tone::Unknown;
                                     h_flex()
-                                        .gap_1p5()
+                                        .gap(px(space::SM))
                                         .child(Indicator::dot().color(notice.tone.color()))
                                         .child(
                                             Label::new(notice.message)
@@ -6622,8 +6629,8 @@ struct DraggedColumn {
 impl Render for DraggedColumn {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .px_2()
-            .py_1()
+            .px(px(space::MD))
+            .py(px(space::XS))
             .rounded_md()
             .bg(cx.theme().colors().elevated_surface_background)
             .border_1()

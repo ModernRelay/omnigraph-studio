@@ -30,14 +30,15 @@ use studio_actions::agent::Ask;
 use studio_actions::graph::{OpenNode, OpenQueryFile, OpenType};
 use studio_actions::palette::{AskAgent, ShowScope};
 use studio_actions::workspace::{GoTo, ShowKeyBindings, SwitchBranch, ToggleCommandPalette};
+use studio_ui::ds::{MenuRow, elevation, radius, size, space, surface};
 use studio_workspace::{ToastKind, Workspace};
+use ui::HighlightedLabel;
 use ui::prelude::*;
-use ui::{HighlightedLabel, ListItem, ListItemSpacing};
 
 use found::{Answers, Found};
 use matching::humanize_action_name;
 use matching::{Candidate, Group, Ranked, rank};
-use studio_workspace::ModalView;
+use studio_workspace::{ModalPlacement, ModalView};
 
 /// Registers the palette with every new workspace. Its keys (⌘K and ⌘⇧P, Ctrl elsewhere) come
 /// from the keymap files (`assets/keymaps/`), as every key does.
@@ -290,7 +291,11 @@ pub struct CommandPalette {
 
 impl EventEmitter<DismissEvent> for CommandPalette {}
 
-impl ModalView for CommandPalette {}
+impl ModalView for CommandPalette {
+    fn placement(&self) -> ModalPlacement {
+        ModalPlacement::Palette
+    }
+}
 
 impl Focusable for CommandPalette {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -745,15 +750,15 @@ impl CommandPalette {
                     div()
                         .h(px(ROW_HEIGHT))
                         .child(
-                            ListItem::new(ix)
-                                .inset(true)
-                                .spacing(ListItemSpacing::Sparse)
+                            MenuRow::new(ix)
+                                .height(ROW_HEIGHT)
+                                .radius(radius::PALETTE_ROW)
                                 .toggle_state(ix == self.selected)
-                                .start_slot::<gpui::Div>(start)
+                                .when_some(start, |row, start| row.start_slot(start))
                                 .child(
                                     h_flex()
                                         .w_full()
-                                        .gap_2()
+                                        .gap(px(space::MD))
                                         .justify_between()
                                         .child(label)
                                         .child(div().flex_none().child(end)),
@@ -917,12 +922,6 @@ fn add_type_rows(
 
 impl Render for CommandPalette {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        let (surface, border, border_variant) = (
-            colors.elevated_surface_background,
-            colors.border,
-            colors.border_variant,
-        );
         let count = self.matches.len();
         // Only a scope that shows nodes waits on them.
         let searching = self.searching && self.mode.scope().is_some_and(Scope::searches_nodes);
@@ -951,7 +950,7 @@ impl Render for CommandPalette {
             .h(px(
                 ROW_HEIGHT * count.min(VISIBLE_ROWS) as f32 + 2. * LIST_PAD
             ))
-            .py(px(LIST_PAD))
+            .p(px(LIST_PAD))
             .into_any_element()
         };
         let description = self.selected_description();
@@ -977,7 +976,7 @@ impl Render for CommandPalette {
                     ),
                 );
             }
-            h_flex().px_3().pb_2().child(tabs)
+            h_flex().px(px(space::SM)).pb(px(space::XS)).child(tabs)
         });
         v_flex()
             .key_context("CommandPalette Picker")
@@ -989,18 +988,23 @@ impl Render for CommandPalette {
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::show_scope))
             .on_action(cx.listener(Self::ask_agent))
-            .w(px(580.))
-            .rounded_lg()
-            .bg(surface)
+            // Tower's palette: a glass frame holding one solid card, the results, inset by a
+            // small gap and rounded concentrically; the search above it on the glass, the
+            // description and the keys below.
+            .w(px(size::PALETTE_WIDTH))
+            .max_w_full()
+            .p(px(space::XS))
+            .gap(px(space::XS))
+            .rounded(px(radius::MODAL))
+            .bg(surface::floating(cx))
             .border_1()
-            .border_color(border)
-            .shadow_lg()
-            .overflow_hidden()
+            .border_color(surface::floating_border(cx))
+            .shadow(elevation::floating(cx))
             .child(
                 h_flex()
-                    .px_3()
-                    .py_2()
-                    .gap_2()
+                    .px(px(space::CONTROL_INSET))
+                    .py(px(space::SM))
+                    .gap(px(space::MD))
                     .child(
                         Icon::new(IconName::MagnifyingGlass)
                             .size(IconSize::Small)
@@ -1018,15 +1022,21 @@ impl Render for CommandPalette {
                     }),
             )
             .children(tabs)
-            .child(div().h_px().w_full().bg(border_variant))
-            .child(list)
+            .child(
+                div()
+                    .rounded(px(radius::PALETTE_LIST))
+                    .bg(cx.theme().colors().editor_background)
+                    .border_1()
+                    .border_color(surface::floating_border(cx))
+                    .shadow(elevation::raised())
+                    .overflow_hidden()
+                    .child(list),
+            )
             .child(
                 h_flex()
-                    .px_3()
-                    .py_1p5()
-                    .gap_3()
-                    .border_t_1()
-                    .border_color(border_variant)
+                    .px(px(space::CONTROL_INSET))
+                    .py(px(space::SM))
+                    .gap(px(space::LG))
                     .child(div().flex_1().min_w_0().children(description.map(|d| {
                         Label::new(d)
                             .size(LabelSize::XSmall)

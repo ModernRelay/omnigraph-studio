@@ -119,53 +119,39 @@ impl EditModal {
 
 impl Render for EditModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        ds::card(cx)
+        ds::modal(cx)
             .key_context("ReviewEdit")
             .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.save(cx)))
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
-            .w(px(520.))
             .child(
-                ds::card_header(cx)
-                    .child(
-                        Icon::new(IconName::Pencil)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .child(ds::text::body(format!("Edit {}", self.title)))
-                    .child(div().flex_1())
-                    .child(ds::meta(IconName::GitBranch, self.branch.clone())),
+                ds::ModalHeader::new(format!("Edit {}", self.title))
+                    .meta(ds::write_target(self.branch.clone(), cx))
+                    .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
             )
-            .child(
-                ds::card_body()
-                    .gap(px(ds::space::SM))
-                    .children(self.fields.iter().map(|field| {
-                        ds::field(
-                            field.property.name.clone(),
-                            v_flex()
-                                .gap(px(ds::space::XXS))
-                                .child(
-                                    ds::field_frame(field.error.is_some(), cx)
-                                        .child(ds::field_input(field.editor.clone())),
-                                )
-                                .children(field.error.clone().map(|error| {
-                                    Label::new(error)
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Error)
-                                })),
+            .child(ds::modal_body().children(self.fields.iter().map(|field| {
+                ds::field(
+                    field.property.name.clone(),
+                    v_flex()
+                        .gap(px(ds::space::XXS))
+                        .child(
+                            ds::field_frame(field.error.is_some(), cx)
+                                .child(ds::field_input(field.editor.clone())),
                         )
-                    })),
-            )
+                        .children(field.error.clone().map(|error| {
+                            Label::new(error)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Error)
+                        })),
+                )
+            })))
             .child(
-                ds::card_footer(cx)
-                    .child(div().flex_1())
+                ds::modal_footer(cx)
                     .child(
-                        studio_ui::ds::button("cancel-edit", "Cancel")
-                            .style(ButtonStyle::Outlined)
+                        ds::cancel_button("cancel-edit")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
-                        studio_ui::ds::button("save-edit", "Save")
-                            .style(ButtonStyle::Filled)
+                        ds::action_button("save-edit", "Save")
                             .tooltip(ui::Tooltip::text(format!(
                                 "Writes the changed fields to {}, bound to the reviewed head",
                                 self.branch

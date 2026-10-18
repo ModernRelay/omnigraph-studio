@@ -98,6 +98,7 @@ impl Render for DesignGallery {
                 ("SM", radius::SM),
                 ("MD", radius::MD),
                 ("LG", radius::LG),
+                ("MODAL", radius::MODAL),
             ]
             .into_iter()
             .map(|(name, value)| {
@@ -690,6 +691,149 @@ impl Render for DesignGallery {
                 )),
             ));
 
+        // Buttons, after Tower's (spec 002, "Buttons"): every variant at a control's height,
+        // the sizes, icon buttons, and the toggled and disabled states.
+        let variants = [
+            ("Primary", ds::Variant::Primary),
+            ("Secondary", ds::Variant::Secondary),
+            ("Outline", ds::Variant::Outline),
+            ("Ghost", ds::Variant::Ghost),
+            ("Destructive", ds::Variant::Destructive),
+            ("Glass", ds::Variant::Glass),
+        ];
+        let sizes = [
+            ("Large", ButtonSize::Large),
+            ("Medium", ButtonSize::Medium),
+            ("Default", ButtonSize::Default),
+            ("Compact", ButtonSize::Compact),
+        ];
+        let buttons = v_flex()
+            .gap(px(space::LG))
+            .child(
+                h_flex()
+                    .gap(px(space::MD))
+                    .children(
+                        variants
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, (label, variant))| {
+                                ds::Button::new(("g-variant", index), label)
+                                    .variant(variant)
+                                    .label_size(LabelSize::Small)
+                            }),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap(px(space::MD))
+                    .items_center()
+                    .children(sizes.into_iter().enumerate().map(|(index, (label, size))| {
+                        ds::Button::new(("g-size", index), label)
+                            .variant(ds::Variant::Outline)
+                            .size(size)
+                            .label_size(LabelSize::Small)
+                    }))
+                    .children(sizes.into_iter().enumerate().map(|(index, (_, size))| {
+                        ds::IconButton::new(("g-icon-size", index), IconName::Plus)
+                            .variant(ds::Variant::Outline)
+                            .size(size)
+                            .icon_size(IconSize::Small)
+                    })),
+            )
+            .child(
+                h_flex()
+                    .gap(px(space::MD))
+                    .items_center()
+                    .child(
+                        ds::Button::new("g-toggled", "Toggled")
+                            .label_size(LabelSize::Small)
+                            .toggle_state(true),
+                    )
+                    .child(
+                        ds::Button::new("g-disabled", "Disabled")
+                            .variant(ds::Variant::Primary)
+                            .label_size(LabelSize::Small)
+                            .disabled(true),
+                    )
+                    .child(
+                        ds::Button::new("g-icon-label", "Row")
+                            .label_size(LabelSize::Small)
+                            .start_icon(Icon::new(IconName::Plus).size(IconSize::Small)),
+                    )
+                    .child(ds::icon_button("g-icon-ghost", IconName::Ellipsis))
+                    .child(ds::icon_button("g-icon-toggled", IconName::Filter).toggle_state(true)),
+            );
+
+        // A modal's card (spec 002, "Modals"): header, body and footer.
+        let modal = ds::modal(cx)
+            .child(
+                ds::ModalHeader::new("Delete Acme")
+                    .description(SharedString::from(
+                        "Removes it and its relationships from main. Also deletes 1 Person that \
+                         cannot exist without it. You can undo this right after.",
+                    ))
+                    .meta(ds::write_target("main", cx))
+                    .on_close(|_, _, _| {}),
+            )
+            .child(
+                ds::modal_body().child(
+                    ds::row_list()
+                        .bg(colors.editor_background)
+                        .border_1()
+                        .border_color(surface::floating_border(cx))
+                        .child(
+                            h_flex()
+                                .h(px(size::SIDEBAR_ROW))
+                                .px(px(space::MD))
+                                .gap(px(space::MD))
+                                .child(studio_ui::type_swatch("Person"))
+                                .child(Label::new("Ada Lovelace").size(LabelSize::Small))
+                                .child(div().flex_1())
+                                .child(
+                                    Label::new("needs WorksAt")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        ),
+                ),
+            )
+            .child(
+                ds::modal_footer(cx)
+                    .child(ds::cancel_button("g-modal-cancel"))
+                    .child(
+                        ds::action_button("g-modal-delete", "Delete")
+                            .variant(ds::Variant::Destructive)
+                            .key_binding(ui::KeyBinding::for_action_in(&menu::Confirm, &focus, cx)),
+                    ),
+            );
+
+        // A context menu (spec 002, "Menus"): a group header, rows, the highlighted row, a
+        // checked one, a disabled one, and a separator.
+        let menu = ds::menu_surface(v_flex().w(px(240.)).p(px(space::XS)), cx)
+            .child(ds::menu_header("Row".into()))
+            .child(
+                ds::MenuRow::new("g-menu-peek")
+                    .toggle_state(true)
+                    .child(Label::new("Peek")),
+            )
+            .child(ds::MenuRow::new("g-menu-edit").child(Label::new("Edit cell")))
+            .child(
+                ds::MenuRow::new("g-menu-wrap")
+                    .start_slot(
+                        Icon::new(IconName::Check)
+                            .size(IconSize::Small)
+                            .color(Color::Accent),
+                    )
+                    .child(Label::new("Wrap long text")),
+            )
+            .child(
+                ds::MenuRow::new("g-menu-disabled")
+                    .disabled(true)
+                    .child(Label::new("Paste").color(Color::Disabled)),
+            )
+            .child(ds::menu_separator(cx))
+            .child(ds::MenuRow::new("g-menu-delete").child(Label::new("Delete row")));
+
         v_flex()
             .id("design-gallery")
             .track_focus(&self.focus_handle)
@@ -729,6 +873,14 @@ impl Render for DesignGallery {
                     .items_start()
                     .child(section("Card", div().w(px(520.)).child(card)))
                     .child(section("Empty state", div().w(px(360.)).child(empty))),
+            )
+            .child(section("Buttons", buttons))
+            .child(
+                h_flex()
+                    .gap(px(space::XXXL))
+                    .items_start()
+                    .child(section("Modal", modal))
+                    .child(section("Menu", menu)),
             )
             .child(section("Loading and error states", states))
             .child(section(

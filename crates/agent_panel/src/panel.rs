@@ -25,11 +25,13 @@ use studio_actions::agent::{Allow, AllowAlways, ClearQueue, Reject, Restart, Sen
 use studio_actions::graph::ReviewBranch;
 use studio_settings::StudioSettings;
 use studio_ui::ds;
+use studio_ui::ds::IconButton;
+use studio_ui::menu::ContextMenu;
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
 use ui::{
-    Callout, CircularProgress, CommonAnimationExt as _, ContextMenu, Indicator, KeyBinding,
-    PopoverMenu, Severity, Tooltip,
+    Callout, CircularProgress, CommonAnimationExt as _, Indicator, KeyBinding, PopoverMenu,
+    Severity, Tooltip,
 };
 
 use crate::cli_home::{self, CliHome};
@@ -2277,7 +2279,7 @@ fn gutter_row(icon: Option<Icon>, content: impl IntoElement) -> Div {
     h_flex()
         .w_full()
         .items_start()
-        .gap_1()
+        .gap(px(ds::space::XS))
         .child(
             div()
                 .w(px(GUTTER))
@@ -2424,8 +2426,8 @@ impl Render for AgentPanel {
             .id("composer")
             .key_context("AgentComposer")
             .flex_none()
-            .pl_2()
-            .pr_4()
+            .pl(px(ds::space::MD))
+            .pr(px(ds::space::XL))
             .pt(px(ds::space::MD))
             .pb(px(ds::space::LG))
             .border_t_1()
@@ -2545,15 +2547,15 @@ impl AgentPanel {
             .min_h_0()
             .items_center()
             .justify_center()
-            .p_6()
+            .p(px(ds::space::XXL))
             .child(
                 v_flex()
                     .w(px(320.))
-                    .gap_1()
+                    .gap(px(ds::space::XS))
                     .child(
                         h_flex()
-                            .gap_1p5()
-                            .mb_2()
+                            .gap(px(ds::space::SM))
+                            .mb(px(ds::space::MD))
                             .justify_center()
                             .child(Label::new("Choose an agent").color(Color::Muted))
                             .child(
@@ -2579,7 +2581,7 @@ impl AgentPanel {
                             .first()
                             .map(|queued| queued.text.clone())
                             .map(|question| {
-                                div().mb_2().child(
+                                div().mb(px(ds::space::MD)).child(
                                     Label::new(format!(
                                         "“{question}” is sent once you choose an agent."
                                     ))
@@ -2610,15 +2612,15 @@ impl AgentPanel {
                     }))
                     .child(
                         h_flex()
-                            .my_2()
-                            .gap_2()
+                            .my(px(ds::space::MD))
+                            .gap(px(ds::space::MD))
                             .child(ui::Divider::horizontal())
                             .child(Label::new("or").size(LabelSize::XSmall).color(Color::Muted))
                             .child(ui::Divider::horizontal()),
                     )
                     .child(
                         h_flex()
-                            .gap_1()
+                            .gap(px(ds::space::XS))
                             .child(
                                 studio_ui::ds::field_frame(false, cx)
                                     .flex_1()
@@ -2788,9 +2790,9 @@ impl AgentPanel {
             return v_flex()
                 .flex_1()
                 .min_h_0()
-                .py_4()
-                .pr_4()
-                .pl_2()
+                .py(px(ds::space::XL))
+                .pr(px(ds::space::XL))
+                .pl(px(ds::space::MD))
                 .child(studio_ui::ds::empty_state(
                     IconName::ZedAssistant,
                     "Ask about the graph",
@@ -2850,10 +2852,10 @@ impl AgentPanel {
             },
         };
         div()
-            .pl_2()
-            .pr_4()
+            .pl(px(ds::space::MD))
+            .pr(px(ds::space::XL))
             .pb(px(ds::space::LG))
-            .when(ix == 0, |block| block.pt_4())
+            .when(ix == 0, |block| block.pt(px(ds::space::XL)))
             .child(body)
             .into_any_element()
     }
@@ -2911,7 +2913,7 @@ impl AgentPanel {
                         .color(Color::Muted),
                 ),
                 v_flex()
-                    .gap_0p5()
+                    .gap(px(ds::space::XXS))
                     .children(items.iter().map(|(content, status)| {
                         let icon = match status {
                             PlanEntryStatus::Completed => {
@@ -2923,7 +2925,7 @@ impl AgentPanel {
                             _ => Icon::new(IconName::Circle).color(Color::Disabled),
                         };
                         h_flex()
-                            .gap_2()
+                            .gap(px(ds::space::MD))
                             .child(icon.size(IconSize::XSmall))
                             .child(Label::new(content.clone()).size(LabelSize::Small))
                     })),
@@ -3174,7 +3176,7 @@ impl AgentPanel {
                     matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
                 h_flex()
                     .id(("tool", index))
-                    .gap_1()
+                    .gap(px(ds::space::XS))
                     .tooltip(Tooltip::text(title.clone()))
                     .child(
                         Label::new(if failed {
@@ -3407,12 +3409,12 @@ impl AgentPanel {
                     _ => None,
                 };
                 studio_ui::ds::card_footer(cx)
-                    .px_2()
-                    .gap_3()
+                    .px(px(ds::space::MD))
+                    .gap(px(ds::space::LG))
                     .child(
                         h_flex()
                             .id(("outcome", index))
-                            .gap_1()
+                            .gap(px(ds::space::XS))
                             .when_some(tooltip, |d, tooltip| d.tooltip(Tooltip::text(tooltip)))
                             .child(Icon::new(icon).size(IconSize::XSmall).color(color))
                             .child(Label::new(label).size(LabelSize::Small).color(color)),
@@ -3715,8 +3717,8 @@ impl AgentPanel {
             h_flex()
                 .flex_none()
                 .h(px(studio_ui::ds::size::STRIP))
-                .px_3()
-                .gap_3()
+                .px(px(ds::space::LG))
+                .gap(px(ds::space::LG))
                 .border_t_1()
                 .border_color(studio_ui::ds::surface::rule(cx))
                 .child(studio_ui::ds::meta(

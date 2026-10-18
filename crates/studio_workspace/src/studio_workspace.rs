@@ -34,11 +34,10 @@ use studio_actions::workspace::{
     ToggleSidebar, ToggleZoom,
 };
 use studio_settings::{BottomDockLayout, StudioSettings};
+use studio_ui::ds::IconButton;
+use studio_ui::menu::{ContextMenu, ContextMenuEntry, ContextMenuItem};
 use ui::prelude::*;
-use ui::{
-    ButtonLike, ContextMenu, ContextMenuEntry, ContextMenuItem, Indicator, PopoverMenu, Tooltip,
-    right_click_menu,
-};
+use ui::{ButtonLike, Indicator, PopoverMenu, Tooltip, right_click_menu};
 
 pub use item::{Item, ItemEvent, ItemFooter, ItemHandle, KeyHint};
 pub use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};
@@ -57,6 +56,21 @@ pub trait ModalView: Render + Focusable + EventEmitter<DismissEvent> {
     fn on_before_dismiss(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
         true
     }
+
+    /// Where the modal sits; a dialog unless it says otherwise.
+    fn placement(&self) -> ModalPlacement {
+        ModalPlacement::Dialog
+    }
+}
+
+/// Where a modal sits (spec 002, "Modals"), after Tower's: a dialog over a dim, a quarter of
+/// the way down the space it leaves free; the command palette near the top over a light veil,
+/// a quick look over the page that keeps its colour.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ModalPlacement {
+    #[default]
+    Dialog,
+    Palette,
 }
 
 /// Asks the open modal [`ModalView::on_before_dismiss`].
@@ -64,6 +78,7 @@ type BeforeDismiss = Box<dyn Fn(&mut Window, &mut App) -> bool>;
 
 struct ActiveModal {
     view: AnyView,
+    placement: ModalPlacement,
     previous_focus: Option<FocusHandle>,
     before_dismiss: BeforeDismiss,
     _subscription: Subscription,
@@ -240,7 +255,7 @@ impl Render for DockHost {
         div()
             .id("dock-host")
             .size_full()
-            .pb_2()
+            .pb(px(studio_ui::ds::space::MD))
             .overflow_y_scroll()
             .child(self.view.clone())
     }
@@ -1757,12 +1772,14 @@ impl Workspace {
                 this.hide_modal(window, cx);
             });
         let focus = view.focus_handle(cx);
+        let placement = view.read(cx).placement();
         let asked = view.clone();
         let before_dismiss = Box::new(move |window: &mut Window, cx: &mut App| {
             asked.update(cx, |modal, cx| modal.on_before_dismiss(window, cx))
         });
         self.modal = Some(ActiveModal {
             view: view.into(),
+            placement,
             previous_focus,
             before_dismiss,
             _subscription: subscription,
@@ -3022,7 +3039,7 @@ impl Workspace {
                         .px(px(studio_ui::ds::space::SM))
                         .gap(px(studio_ui::ds::space::SM))
                         .items_center()
-                        .rounded(px(studio_ui::ds::radius::BUTTON))
+                        .rounded_full()
                         .cursor_pointer()
                         .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
                         .map(|button| match unavailable.clone() {
@@ -3320,7 +3337,7 @@ impl Workspace {
             .child(
                 v_flex()
                     .w(px(240.))
-                    .gap_1()
+                    .gap(px(studio_ui::ds::space::XS))
                     .child(action_button(
                         "search",
                         "Search",
@@ -3417,7 +3434,7 @@ impl Workspace {
             .absolute()
             .top(px(HEADER_HEIGHT + 8.))
             .right_3()
-            .gap_2()
+            .gap(px(studio_ui::ds::space::MD))
             .children(self.toasts.iter().map(|toast| {
                 let color = match toast.kind {
                     ToastKind::Info => Color::Muted,
@@ -3433,9 +3450,9 @@ impl Workspace {
                         }
                         cx.notify();
                     }))
-                    .gap_2()
-                    .px_3()
-                    .py_2()
+                    .gap(px(studio_ui::ds::space::MD))
+                    .px(px(studio_ui::ds::space::LG))
+                    .py(px(studio_ui::ds::space::MD))
                     .max_w(px(420.))
                     .rounded(px(studio_ui::ds::radius::MD))
                     .map(|toast| {
@@ -3691,16 +3708,32 @@ impl Render for Workspace {
         for registration in self.actions.clone() {
             root = registration(root, window, cx);
         }
+        // The modal over a dim (a dialog) or a light veil (the palette); a click on either
+        // closes it. A dialog sits a quarter of the way down the space it leaves free, as
+        // Tower's `1fr auto 3fr` rows place it; the palette a tenth of the window down.
+        let viewport = window.viewport_size();
         let modal = self.modal.as_ref().map(|modal| {
+            let palette = modal.placement == ModalPlacement::Palette;
+            let card = div()
+                .flex_none()
+                .min_h_0()
+                .max_w_full()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(modal.view.clone());
             deferred(
-                div()
+                v_flex()
                     .absolute()
                     .size_full()
                     .top_0()
                     .left_0()
-                    .flex()
-                    .justify_center()
-                    .pt(px(80.))
+                    .items_center()
+                    .px(px(studio_ui::ds::space::EDGE))
+                    .py(px(studio_ui::ds::space::EDGE))
+                    .bg(if palette {
+                        studio_ui::ds::surface::veil(cx)
+                    } else {
+                        studio_ui::ds::surface::backdrop(cx)
+                    })
                     .occlude()
                     .on_mouse_down(
                         MouseButton::Left,
@@ -3708,11 +3741,15 @@ impl Render for Workspace {
                             this.hide_modal(window, cx);
                         }),
                     )
-                    .child(
-                        div()
-                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .child(modal.view.clone()),
-                    ),
+                    .map(|layer| {
+                        if palette {
+                            layer.pt(viewport.height * 0.1).child(card)
+                        } else {
+                            let mut below = div().flex_1();
+                            below.style().flex_grow = Some(3.);
+                            layer.child(div().flex_1()).child(card).child(below)
+                        }
+                    }),
             )
             .with_priority(1)
         });
@@ -3923,7 +3960,7 @@ impl Render for DraggedTab {
             .bg(colors.elevated_surface_background)
             .border_1()
             .border_color(colors.border)
-            .rounded(px(studio_ui::ds::radius::BUTTON))
+            .rounded_full()
             .shadow(studio_ui::ds::elevation::float())
             .children(
                 self.icon
@@ -4219,34 +4256,30 @@ impl ConfirmClose {
 impl Render for ConfirmClose {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focus = self.focus_handle.clone();
-        studio_ui::ds::card(cx)
+        studio_ui::ds::modal(cx)
             .key_context("ConfirmClose")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.close(window, cx)))
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
-            .w(px(380.))
             .child(
-                studio_ui::ds::card_body()
-                    .gap(px(studio_ui::ds::space::SM))
-                    .child(studio_ui::ds::text::title(format!("Close {}?", self.title)))
-                    .child(studio_ui::ds::text::muted(
+                studio_ui::ds::ModalHeader::new(format!("Close {}?", self.title))
+                    .description(SharedString::from(
                         "It has unsaved changes or a write still running. A write in flight \
                          still finishes; the activity log keeps its outcome.",
-                    )),
+                    ))
+                    .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
             )
             .child(
-                studio_ui::ds::card_footer(cx)
-                    .justify_end()
-                    .gap(px(studio_ui::ds::space::SM))
+                studio_ui::ds::modal_footer(cx)
                     .child(
-                        studio_ui::ds::button("keep-open", "Keep open")
-                            .style(ButtonStyle::Outlined)
+                        studio_ui::ds::Button::new("keep-open", "Keep open")
+                            .variant(studio_ui::ds::Variant::Outline)
+                            .label_size(LabelSize::Small)
                             .key_binding(ui::KeyBinding::for_action_in(&menu::Cancel, &focus, cx))
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
-                        studio_ui::ds::button("close-anyway", "Close")
-                            .style(ButtonStyle::Filled)
+                        studio_ui::ds::action_button("close-anyway", "Close")
                             .key_binding(ui::KeyBinding::for_action_in(&menu::Confirm, &focus, cx))
                             .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
                     ),

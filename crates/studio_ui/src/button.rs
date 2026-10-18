@@ -1,42 +1,300 @@
-//! Studio's text button, what `ds::button` makes: Zed's `Button`, with a medium button's 8 px
-//! either side of its content. Zed keeps a button's colours to itself, so this draws Zed's
-//! `ButtonLike` (colours, hover, press, focus, toggled and disabled states) at a medium
-//! button's height around its own row: the start icon, the label, a key binding and the end
-//! icon, coloured as Zed's `Button` colours them.
+//! Studio's buttons, after Tower's (spec 002, "Buttons"): every text button is a pill and every
+//! icon button a circle, in one of six variants — primary (solid ink), secondary (a faint ink
+//! fill), outline (a solid item with a hairline and a contact shadow), ghost (nothing until
+//! hovered), destructive (solid red) and glass (a floating pill). Zed's `ButtonLike` keeps its
+//! corners at 4 px and its colours to itself, so Studio draws its own; it keeps Zed's builder
+//! traits, so `.style(ButtonStyle::…)` picks the variant (`Variant::from`) and a button is a
+//! `PopoverMenu` trigger as Zed's is.
+//!
+//! A disabled button fades to 64 %; a toggled one sits on the pressed fill. Clicks stop at the
+//! button and a press leaves the focus where it was, as Zed's buttons do.
 
-use gpui::{AnyView, App, ClickEvent, CursorStyle, DefiniteLength, ElementId, FocusHandle, Window};
+use gpui::{
+    AnyView, App, BoxShadow, ClickEvent, CursorStyle, DefiniteLength, ElementId, FocusHandle,
+    FontWeight, Hsla, MouseButton, Role, Stateful, Window, point,
+};
 use ui::prelude::*;
-use ui::{ButtonLike, ElevationIndex, KeyBinding, rems_from_px};
+use ui::{ElevationIndex, KeyBinding, TintColor};
 
+use crate::ds;
+
+/// What a button looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variant {
+    /// The one action a surface is for: solid ink, white type.
+    Primary,
+    /// A quiet filled control: a faint ink fill.
+    Secondary,
+    /// A solid item: the surface's own fill, a hairline and a contact shadow. Cancel, and most
+    /// controls on glass.
+    Outline,
+    /// Nothing until hovered: toolbars, rows, inline actions.
+    Ghost,
+    /// An action that destroys: solid red, white type.
+    Destructive,
+    /// A control floating over content (a canvas's bar): a small glass pill.
+    Glass,
+}
+
+impl From<ButtonStyle> for Variant {
+    fn from(style: ButtonStyle) -> Self {
+        match style {
+            // Studio marks a surface's main action Filled (Insert, Run, Merge, Save).
+            ButtonStyle::Filled => Variant::Primary,
+            ButtonStyle::Outlined | ButtonStyle::OutlinedGhost | ButtonStyle::OutlinedCustom(_) => {
+                Variant::Outline
+            }
+            ButtonStyle::Tinted(TintColor::Error) => Variant::Destructive,
+            ButtonStyle::Tinted(_) => Variant::Primary,
+            ButtonStyle::Subtle | ButtonStyle::Transparent => Variant::Ghost,
+        }
+    }
+}
+
+/// A button's height for each of Zed's sizes: the medium one is a control's.
+pub fn height(size: ButtonSize) -> Option<f32> {
+    match size {
+        ButtonSize::Large => Some(32.),
+        ButtonSize::Medium => Some(ds::size::CONTROL),
+        ButtonSize::Default => Some(ds::size::BAR_BUTTON),
+        ButtonSize::Compact => Some(18.),
+        ButtonSize::None => None,
+    }
+}
+
+/// A text button's padding either side of its content.
+fn inset(size: ButtonSize) -> f32 {
+    match size {
+        ButtonSize::Large => ds::space::LG,
+        ButtonSize::Medium => 10.,
+        ButtonSize::Default => ds::space::MD,
+        ButtonSize::Compact => ds::space::SM,
+        ButtonSize::None => 0.,
+    }
+}
+
+/// The paint of one variant, in one state.
+struct Paint {
+    fill: Hsla,
+    hover: Hsla,
+    active: Hsla,
+    border: Hsla,
+    shadows: Vec<BoxShadow>,
+    /// The type and icons' colour.
+    ink: Color,
+}
+
+fn paint(variant: Variant, selected: bool, cx: &App) -> Paint {
+    let colors = cx.theme().colors();
+    let ink = colors.text;
+    let clear = gpui::transparent_black();
+    let pressed = ink.opacity(0.07);
+    match variant {
+        Variant::Primary => Paint {
+            fill: ink,
+            hover: ink.opacity(0.9),
+            active: ink.opacity(0.84),
+            border: ink,
+            shadows: vec![
+                // A light catching the top edge, and a contact shadow in the ink's own colour.
+                BoxShadow {
+                    color: gpui::white().opacity(0.16),
+                    offset: point(px(0.), px(1.)),
+                    blur_radius: px(0.),
+                    spread_radius: px(0.),
+                    inset: true,
+                },
+                BoxShadow {
+                    color: ink.opacity(0.24),
+                    offset: point(px(0.), px(1.)),
+                    blur_radius: px(2.),
+                    spread_radius: px(0.),
+                    inset: false,
+                },
+            ],
+            ink: Color::Custom(colors.editor_background),
+        },
+        Variant::Destructive => {
+            let red = cx.theme().status().error;
+            Paint {
+                fill: red,
+                hover: red.opacity(0.9),
+                active: red.opacity(0.84),
+                border: red,
+                shadows: vec![BoxShadow {
+                    color: red.opacity(0.24),
+                    offset: point(px(0.), px(1.)),
+                    blur_radius: px(2.),
+                    spread_radius: px(0.),
+                    inset: false,
+                }],
+                ink: Color::Custom(gpui::white()),
+            }
+        }
+        Variant::Outline => Paint {
+            fill: if selected {
+                colors.editor_background.blend(pressed)
+            } else {
+                colors.editor_background
+            },
+            hover: colors.editor_background.blend(ink.opacity(0.03)),
+            active: colors.editor_background.blend(pressed),
+            border: ink.opacity(0.1),
+            shadows: ds::elevation::raised(),
+            ink: Color::Default,
+        },
+        Variant::Secondary => Paint {
+            fill: if selected {
+                pressed
+            } else {
+                ds::surface::highlight(cx)
+            },
+            hover: ink.opacity(0.065),
+            active: ink.opacity(0.08),
+            border: clear,
+            shadows: Vec::new(),
+            ink: Color::Default,
+        },
+        Variant::Ghost => Paint {
+            fill: if selected { pressed } else { clear },
+            hover: ds::surface::highlight(cx),
+            active: pressed,
+            border: clear,
+            shadows: Vec::new(),
+            ink: Color::Default,
+        },
+        Variant::Glass => Paint {
+            fill: ds::surface::glass(colors.elevated_surface_background, 0.92, cx),
+            hover: ds::surface::glass(colors.elevated_surface_background, 0.98, cx),
+            active: ds::surface::glass(colors.elevated_surface_background, 0.98, cx).blend(pressed),
+            border: ink.opacity(0.08),
+            shadows: ds::elevation::float(),
+            ink: Color::Default,
+        },
+    }
+}
+
+type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
+type TooltipBuilder = Box<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>;
+
+/// What every button has: its id, look, size, state and handlers.
+struct Base {
+    id: ElementId,
+    variant: Variant,
+    size: ButtonSize,
+    disabled: bool,
+    selected: bool,
+    width: Option<DefiniteLength>,
+    on_click: Option<ClickHandler>,
+    tooltip: Option<TooltipBuilder>,
+    tab_index: Option<isize>,
+    focus_handle: Option<FocusHandle>,
+    cursor_style: CursorStyle,
+    visible_on_hover: Option<SharedString>,
+    aria_label: Option<SharedString>,
+}
+
+impl Base {
+    fn new(id: ElementId, variant: Variant, size: ButtonSize) -> Self {
+        Self {
+            id,
+            variant,
+            size,
+            disabled: false,
+            selected: false,
+            width: None,
+            on_click: None,
+            tooltip: None,
+            tab_index: None,
+            focus_handle: None,
+            cursor_style: CursorStyle::PointingHand,
+            visible_on_hover: None,
+            aria_label: None,
+        }
+    }
+
+    /// The pill (or circle) with its paint, states and handlers; the caller adds the content.
+    fn frame(self, cx: &App) -> Stateful<Div> {
+        let paint = paint(self.variant, self.selected, cx);
+        let focused_border = cx.theme().colors().border_focused;
+        let disabled = self.disabled;
+        div()
+            .id(self.id)
+            .role(Role::Button)
+            .when_some(self.aria_label, |this, label| this.aria_label(label))
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .when_some(height(self.size), |this, h| this.h(px(h)))
+            .when_some(self.width, |this, width| this.w(width))
+            .rounded_full()
+            .border_1()
+            .border_color(paint.border)
+            .bg(paint.fill)
+            .shadow(paint.shadows)
+            .text_color(paint.ink.color(cx))
+            .when_some(self.tab_index, |this, index| {
+                this.tab_index(index).tab_stop(!disabled)
+            })
+            .when_some(self.focus_handle, |this, handle| this.track_focus(&handle))
+            .when(disabled, |this| this.opacity(0.64).cursor_not_allowed())
+            .when(!disabled, |this| {
+                let (hover, active) = (paint.hover, paint.active);
+                this.cursor(self.cursor_style)
+                    .hover(move |style| style.bg(hover))
+                    .active(move |style| style.bg(active))
+                    .focus_visible(move |style| style.border_color(focused_border))
+            })
+            .when_some(self.visible_on_hover, |this, group| {
+                this.visible_on_hover(group)
+            })
+            .when_some(self.on_click.filter(|_| !disabled), |this, on_click| {
+                this.on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                    .on_click(move |event, window, cx| {
+                        cx.stop_propagation();
+                        on_click(event, window, cx)
+                    })
+            })
+            .when_some(self.tooltip, |this, tooltip| {
+                this.tooltip(move |window, cx| tooltip(window, cx))
+            })
+    }
+}
+
+/// A text button: a pill holding an optional start icon, the label, a key binding and an
+/// optional end icon. What `ds::button` makes.
 #[derive(IntoElement)]
 pub struct Button {
-    base: ButtonLike,
-    size: ButtonSize,
+    base: Base,
     label: SharedString,
     label_color: Option<Color>,
     label_size: Option<LabelSize>,
     start_icon: Option<Icon>,
     end_icon: Option<Icon>,
     key_binding: Option<KeyBinding>,
-    disabled: bool,
-    selected: bool,
 }
 
 impl Button {
     pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
         let label = label.into();
+        let mut base = Base::new(id.into(), Variant::Ghost, ButtonSize::Medium);
+        base.aria_label = Some(label.clone());
         Self {
-            base: ButtonLike::new(id).aria_label(label.clone()),
-            size: ButtonSize::Medium,
+            base,
             label,
             label_color: None,
             label_size: None,
             start_icon: None,
             end_icon: None,
             key_binding: None,
-            disabled: false,
-            selected: false,
         }
+    }
+
+    /// The look, directly; `.style(ButtonStyle::…)` picks it from Zed's styles.
+    pub fn variant(mut self, variant: Variant) -> Self {
+        self.base.variant = variant;
+        self
     }
 
     pub fn color(mut self, color: impl Into<Option<Color>>) -> Self {
@@ -68,132 +326,277 @@ impl Button {
 
 impl Toggleable for Button {
     fn toggle_state(mut self, selected: bool) -> Self {
-        self.selected = selected;
-        self.base = self.base.toggle_state(selected);
+        self.base.selected = selected;
         self
     }
 }
 
 impl Disableable for Button {
     fn disabled(mut self, disabled: bool) -> Self {
-        self.disabled = disabled;
-        self.base = self.base.disabled(disabled);
+        self.base.disabled = disabled;
         self
     }
 }
 
 impl Clickable for Button {
     fn on_click(mut self, handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
-        self.base = self.base.on_click(handler);
+        self.base.on_click = Some(Box::new(handler));
         self
     }
 
     fn cursor_style(mut self, cursor_style: CursorStyle) -> Self {
-        self.base = self.base.cursor_style(cursor_style);
+        self.base.cursor_style = cursor_style;
         self
     }
 }
 
 impl FixedWidth for Button {
     fn width(mut self, width: impl Into<DefiniteLength>) -> Self {
-        self.base = self.base.width(width);
+        self.base.width = Some(width.into());
         self
     }
 
     fn full_width(mut self) -> Self {
-        self.base = self.base.full_width();
+        self.base.width = Some(relative(1.));
         self
     }
 }
 
 impl ButtonCommon for Button {
     fn id(&self) -> &ElementId {
-        self.base.id()
+        &self.base.id
     }
 
     fn style(mut self, style: ButtonStyle) -> Self {
-        self.base = self.base.style(style);
+        self.base.variant = style.into();
         self
     }
 
     fn size(mut self, size: ButtonSize) -> Self {
-        self.size = size;
+        self.base.size = size;
         self
     }
 
     fn tooltip(mut self, tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static) -> Self {
-        self.base = self.base.tooltip(tooltip);
+        self.base.tooltip = Some(Box::new(tooltip));
         self
     }
 
     fn tab_index(mut self, tab_index: impl Into<isize>) -> Self {
-        self.base = self.base.tab_index(tab_index);
+        self.base.tab_index = Some(tab_index.into());
         self
     }
 
-    fn layer(mut self, elevation: ElevationIndex) -> Self {
-        self.base = self.base.layer(elevation);
+    fn layer(self, _elevation: ElevationIndex) -> Self {
         self
     }
 
     fn track_focus(mut self, focus_handle: &FocusHandle) -> Self {
-        self.base = self.base.track_focus(focus_handle);
+        self.base.focus_handle = Some(focus_handle.clone());
+        self
+    }
+}
+
+impl VisibleOnHover for Button {
+    fn visible_on_hover(mut self, group_name: impl Into<SharedString>) -> Self {
+        self.base.visible_on_hover = Some(group_name.into());
         self
     }
 }
 
 impl RenderOnce for Button {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        // A medium or large button: Zed's small padding (4 px) at its own height, and 4 px
-        // more inside, so Zed's medium 8. Smaller sizes are Zed's as they are.
-        let (base, inset) = match self.size {
-            ButtonSize::Large => (
-                self.base
-                    .size(ButtonSize::Default)
-                    .height(rems_from_px(32_f32).into()),
-                true,
-            ),
-            ButtonSize::Medium => (
-                self.base
-                    .size(ButtonSize::Default)
-                    .height(rems_from_px(28_f32).into()),
-                true,
-            ),
-            size => (self.base.size(size), false),
+        let size = self.base.size;
+        let painted = paint(self.base.variant, self.base.selected, cx).ink;
+        let ink = self.label_color.unwrap_or(painted);
+        // Ink on solid fills always; a caller's colour only on the quiet variants.
+        let ink = match self.base.variant {
+            Variant::Primary | Variant::Destructive => painted,
+            _ => ink,
         };
-        let label_color = if self.disabled {
-            Color::Disabled
-        } else if self.selected {
-            Color::Selected
-        } else {
-            self.label_color.unwrap_or_default()
-        };
-        let icon = |icon: Icon| {
-            if self.disabled {
-                icon.color(Color::Disabled)
-            } else {
-                icon
+        let icon = |icon: Icon| icon.color(ink);
+        // A key on a solid fill takes the fill's ink, a little quieter; elsewhere its own.
+        let key_ink = match self.base.variant {
+            Variant::Primary | Variant::Destructive => {
+                Some(Color::Custom(painted.color(cx).opacity(0.72)))
             }
+            _ => None,
         };
-        base.child(
+        let pad = inset(size);
+        self.base.frame(cx).child(
             h_flex()
-                .when(inset, |row| row.px(DynamicSpacing::Base04.rems(cx)))
-                .gap(DynamicSpacing::Base04.rems(cx))
+                .px(px(pad - 1.))
+                .gap(px(match size {
+                    ButtonSize::Large | ButtonSize::Medium => ds::space::SM,
+                    _ => ds::space::XS,
+                }))
                 .children(self.start_icon.map(icon))
                 .child(
                     h_flex()
                         .debug_selector(|| "button-label".into())
-                        .gap(DynamicSpacing::Base06.rems(cx))
+                        .gap(px(ds::space::SM))
                         .justify_between()
                         .child(
                             Label::new(self.label)
-                                .color(label_color)
-                                .size(self.label_size.unwrap_or_default()),
+                                .color(ink)
+                                .weight(FontWeight::MEDIUM)
+                                .size(self.label_size.unwrap_or(LabelSize::Small)),
                         )
-                        .children(self.key_binding),
+                        .children(self.key_binding.map(|key| match key_ink {
+                            Some(ink) => key.color(ink),
+                            None => key,
+                        })),
                 )
                 .children(self.end_icon.map(icon)),
         )
+    }
+}
+
+/// An icon button: a circle around one icon. What `ds::icon_button` makes.
+#[derive(IntoElement)]
+pub struct IconButton {
+    base: Base,
+    icon: IconName,
+    icon_size: IconSize,
+    icon_color: Option<Color>,
+    selected_icon: Option<IconName>,
+    selected_icon_color: Option<Color>,
+}
+
+impl IconButton {
+    pub fn new(id: impl Into<ElementId>, icon: IconName) -> Self {
+        Self {
+            base: Base::new(id.into(), Variant::Ghost, ButtonSize::Medium),
+            icon,
+            icon_size: IconSize::Small,
+            icon_color: None,
+            selected_icon: None,
+            selected_icon_color: None,
+        }
+    }
+
+    pub fn variant(mut self, variant: Variant) -> Self {
+        self.base.variant = variant;
+        self
+    }
+
+    pub fn icon_size(mut self, size: IconSize) -> Self {
+        self.icon_size = size;
+        self
+    }
+
+    pub fn icon_color(mut self, color: Color) -> Self {
+        self.icon_color = Some(color);
+        self
+    }
+
+    /// The icon shown while toggled on.
+    pub fn selected_icon(mut self, icon: impl Into<Option<IconName>>) -> Self {
+        self.selected_icon = icon.into();
+        self
+    }
+
+    pub fn selected_icon_color(mut self, color: impl Into<Option<Color>>) -> Self {
+        self.selected_icon_color = color.into();
+        self
+    }
+
+    /// The name a screen reader says; the tooltip's text is not read.
+    pub fn aria_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.base.aria_label = Some(label.into());
+        self
+    }
+}
+
+impl Toggleable for IconButton {
+    fn toggle_state(mut self, selected: bool) -> Self {
+        self.base.selected = selected;
+        self
+    }
+}
+
+impl Disableable for IconButton {
+    fn disabled(mut self, disabled: bool) -> Self {
+        self.base.disabled = disabled;
+        self
+    }
+}
+
+impl Clickable for IconButton {
+    fn on_click(mut self, handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
+        self.base.on_click = Some(Box::new(handler));
+        self
+    }
+
+    fn cursor_style(mut self, cursor_style: CursorStyle) -> Self {
+        self.base.cursor_style = cursor_style;
+        self
+    }
+}
+
+impl ButtonCommon for IconButton {
+    fn id(&self) -> &ElementId {
+        &self.base.id
+    }
+
+    fn style(mut self, style: ButtonStyle) -> Self {
+        self.base.variant = style.into();
+        self
+    }
+
+    fn size(mut self, size: ButtonSize) -> Self {
+        self.base.size = size;
+        self
+    }
+
+    fn tooltip(mut self, tooltip: impl Fn(&mut Window, &mut App) -> AnyView + 'static) -> Self {
+        self.base.tooltip = Some(Box::new(tooltip));
+        self
+    }
+
+    fn tab_index(mut self, tab_index: impl Into<isize>) -> Self {
+        self.base.tab_index = Some(tab_index.into());
+        self
+    }
+
+    fn layer(self, _elevation: ElevationIndex) -> Self {
+        self
+    }
+
+    fn track_focus(mut self, focus_handle: &FocusHandle) -> Self {
+        self.base.focus_handle = Some(focus_handle.clone());
+        self
+    }
+}
+
+impl VisibleOnHover for IconButton {
+    fn visible_on_hover(mut self, group_name: impl Into<SharedString>) -> Self {
+        self.base.visible_on_hover = Some(group_name.into());
+        self
+    }
+}
+
+impl RenderOnce for IconButton {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let selected = self.base.selected;
+        let painted = paint(self.base.variant, selected, cx).ink;
+        let color = match self.base.variant {
+            Variant::Primary | Variant::Destructive => painted,
+            _ if selected => self
+                .selected_icon_color
+                .or(self.icon_color)
+                .unwrap_or(painted),
+            _ => self.icon_color.unwrap_or(Color::Muted),
+        };
+        let icon = match (selected, self.selected_icon) {
+            (true, Some(icon)) => icon,
+            _ => self.icon,
+        };
+        let side = height(self.base.size);
+        self.base
+            .frame(cx)
+            .when_some(side, |this, side| this.w(px(side)))
+            .child(Icon::new(icon).size(self.icon_size).color(color))
     }
 }
 
@@ -229,6 +632,11 @@ mod tests {
                                 .debug_selector(|| "bar-icon-button".into())
                                 .child(ds::bar_icon_button("zoom", ui::IconName::Plus)),
                         ),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "icon-button".into())
+                        .child(ds::icon_button("x", ui::IconName::Close)),
                 )
                 .child(
                     div()
@@ -275,13 +683,19 @@ mod tests {
                         .debug_selector(|| "pill".into())
                         .on_click(cx.listener(|this, _, _, _| this.pressed += 1)),
                 )
+                .child(
+                    div().debug_selector(|| "text-button".into()).child(
+                        ds::button("t", "Apply")
+                            .on_click(cx.listener(|this, _, _, _| this.pressed += 10)),
+                    ),
+                )
         }
     }
 
-    /// Pressing a pill's button leaves the focus in the pill's field and the click with the
-    /// button, as Zed's buttons do.
+    /// Pressing a pill's button, or a text button, leaves the focus in the field and the click
+    /// with the button, as Zed's buttons do.
     #[gpui::test]
-    fn a_pill_button_keeps_the_focus_and_the_click(cx: &mut TestAppContext) {
+    fn a_pressed_button_keeps_the_focus_and_the_click(cx: &mut TestAppContext) {
         cx.update(studio_theme::init_test);
         let (probe, cx): (_, &mut VisualTestContext) = cx.add_window_view(|_, cx| PillProbe {
             field: cx.focus_handle(),
@@ -292,18 +706,22 @@ mod tests {
         let field = probe.read_with(cx, |probe, _| probe.field.clone());
         cx.update(|window, cx| window.focus(&field, cx));
         cx.run_until_parked();
-        let pill = cx.debug_bounds("pill").expect("the pill button was drawn");
-        cx.simulate_click(pill.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
+        for selector in ["pill", "text-button"] {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} was drawn"));
+            cx.simulate_click(bounds.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+        }
         probe.read_with(cx, |probe, _| {
-            assert_eq!((probe.pressed, probe.outer_clicks), (1, 0));
+            assert_eq!((probe.pressed, probe.outer_clicks), (11, 0));
         });
         cx.update(|window, _| assert!(field.is_focused(window), "the field kept the focus"));
     }
 
-    /// The design system's controls draw at their tokens: a button 28 px tall with its content
-    /// 6 px in, a field as tall as a button, a pill button round in a pill, and a floating
-    /// bar's buttons inside its border.
+    /// The design system's controls draw at their tokens: a button as tall as a control with its
+    /// content 10 px in, an icon button a circle, a field as tall as a button, a pill button
+    /// round in a pill, and a floating bar's buttons inside its border.
     #[gpui::test]
     fn controls_draw_at_their_sizes(cx: &mut TestAppContext) {
         cx.update(studio_theme::init_test);
@@ -314,15 +732,18 @@ mod tests {
                 .unwrap_or_else(|| panic!("{selector} was not drawn"))
         };
         let button = bounds(cx, "button");
-        // A label alone: what the inset is measured to, Zed's medium button's 8 px.
+        // A label alone: what the inset is measured to.
         let content = bounds(cx, "button-label");
         assert_eq!(f32::from(button.size.height), ds::size::CONTROL);
-        assert_eq!(f32::from(content.origin.x - button.origin.x), 8.);
+        assert_eq!(f32::from(content.origin.x - button.origin.x), 10.);
         assert_eq!(
             f32::from(button.right() - content.right()),
-            8.,
+            10.,
             "the inset is even"
         );
+        let icon = bounds(cx, "icon-button");
+        assert_eq!(f32::from(icon.size.height), ds::size::CONTROL);
+        assert_eq!(icon.size.width, icon.size.height, "a circle");
         assert_eq!(
             f32::from(bounds(cx, "field").size.height),
             ds::size::CONTROL
@@ -349,5 +770,23 @@ mod tests {
             );
             assert!(button.top() >= bar.top() + gpui::px(1.), "{selector}");
         }
+    }
+
+    /// Zed's styles pick Tower's variants: the quiet ones stay quiet, a tint is the action.
+    #[test]
+    fn zed_styles_pick_the_variants() {
+        use super::Variant;
+        use ui::{ButtonStyle, TintColor};
+        assert_eq!(Variant::from(ButtonStyle::Subtle), Variant::Ghost);
+        assert_eq!(Variant::from(ButtonStyle::Filled), Variant::Primary);
+        assert_eq!(Variant::from(ButtonStyle::Outlined), Variant::Outline);
+        assert_eq!(
+            Variant::from(ButtonStyle::Tinted(TintColor::Accent)),
+            Variant::Primary
+        );
+        assert_eq!(
+            Variant::from(ButtonStyle::Tinted(TintColor::Error)),
+            Variant::Destructive
+        );
     }
 }

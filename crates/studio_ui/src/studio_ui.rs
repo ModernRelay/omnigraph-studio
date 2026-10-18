@@ -14,6 +14,8 @@ mod cell_text;
 mod changes;
 pub mod ds;
 mod grid_places;
+pub mod menu;
+mod modal;
 pub mod motion;
 mod overlay_slot;
 mod resize;
@@ -113,8 +115,8 @@ pub fn resizable_grid_header(
                 .relative()
                 .w(column.width)
                 .flex_none()
-                .px_3()
-                .gap_1p5()
+                .px(px(crate::ds::space::LG))
+                .gap(px(crate::ds::space::SM))
                 .overflow_hidden()
                 .when(column.align_right, |d| d.justify_end())
                 .child(
@@ -140,7 +142,7 @@ pub fn grid_cell(width: Pixels, align_right: bool) -> Div {
         .w(width)
         .h(px(ROW_HEIGHT))
         .flex_none()
-        .px_3()
+        .px(px(crate::ds::space::LG))
         .overflow_hidden()
         .when(align_right, |d| d.justify_end())
 }

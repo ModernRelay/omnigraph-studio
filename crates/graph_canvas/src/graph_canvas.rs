@@ -36,12 +36,14 @@ use studio_actions::canvas::{
 use studio_actions::graph::{
     OpenCanvas, OpenNode, OpenOntology, OpenType, PeekNode, ShowNodeOnCanvas, ShowResultsOnCanvas,
 };
+use studio_ui::ds::space;
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
+use ui::Tooltip;
 use ui::prelude::*;
-use ui::{ContextMenu, Tooltip};
 
 use layout::{LayoutKind, LayoutNode, OntologyEdge, OntologyNode, Vec2};
 use model::{HUB_STEP, Scene, SceneId, SceneKind};
+use studio_ui::menu::ContextMenu;
 use studio_ui::motion::{self, Ease, Lerp, Tween};
 
 /// Labels of graph nodes show from this zoom up; hubs from a little further out.
@@ -1933,8 +1935,8 @@ impl GraphCanvas {
             .absolute()
             .bottom_3()
             .left_3()
-            .px_2p5()
-            .py_1()
+            .px(px(space::CONTROL_INSET))
+            .py(px(space::XS))
             .rounded_full()
             .bg(if cx.theme().appearance.is_light() {
                 gpui::white()
@@ -2011,17 +2013,17 @@ impl GraphCanvas {
             .top_2()
             .left_2()
             .right_2()
-            .gap_2()
+            .gap(px(space::MD))
             .child(
                 h_flex()
                     .w_full()
-                    .gap_2()
+                    .gap(px(space::MD))
                     .child(
                         // The face switch is the design system's segmented control, floating.
                         if mode == Mode::Results {
                             panel("canvas-mode")
                                 .child(
-                                    div().px_2().child(
+                                    div().px(px(space::MD)).child(
                                         Label::new(summary)
                                             .size(LabelSize::Small)
                                             .color(Color::Muted)
@@ -2081,8 +2083,8 @@ impl GraphCanvas {
                     .child(div().flex_1())
                     .child(
                         panel("canvas-search")
-                            .px_3()
-                            .gap_2()
+                            .px(px(space::LG))
+                            .gap(px(space::MD))
                             .cursor_pointer()
                             .child(
                                 Icon::new(IconName::MagnifyingGlass)
