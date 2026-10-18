@@ -294,10 +294,17 @@ async fn connect(
     // The agent never inherits the person's graph credentials (spec 013): OmniGraph's own
     // variables in Studio's environment are removed for its process, unless the agent's
     // settings set them. The process API can add variables but not remove them, so the agent
-    // starts through `env -u`. Model providers' variables (AWS, Azure, Google) stay: the agent
-    // may need them for its model.
-    let removed = credential_variables(std::env::vars_os().map(|(name, _)| name), &launch.env);
-    let (program, args) = without_variables(&removed, program, args);
+    // starts through `env -u`, or on Windows through Studio's own launcher. Model providers'
+    // variables (AWS, Azure, Google) stay: the agent may need them for its model.
+    let removed = credential_variables(
+        std::env::vars_os().map(|(name, _)| name),
+        &launch.env,
+        cfg!(windows),
+    );
+    let (program, args) = without_variables(&removed, program, args).map_err(|error| {
+        agent_client_protocol::Error::internal_error()
+            .data(format!("Studio could not find its own executable: {error}"))
+    })?;
     let config = AcpAgentConfig::new(&program)
         .args(args.iter().cloned())
         .envs(launch.env.clone());
@@ -826,10 +833,21 @@ mod tests {
 
 /// The command that runs `program` with `args` and none of `removed` in its environment: as it
 /// is when nothing is removed, else through `env -u`. `env` reads a word holding `=` as an
-/// assignment, so such a program runs through `sh`, which takes it as its own argument.
-fn without_variables(removed: &[String], program: &str, args: &[String]) -> (String, Vec<String>) {
+/// assignment, so such a program runs through `sh`, which takes it as its own argument. Windows
+/// has no `env`, so there it runs through Studio's own executable as its launcher (`launch.rs`).
+fn without_variables(
+    removed: &[String],
+    program: &str,
+    args: &[String],
+) -> std::io::Result<(PathBuf, Vec<String>)> {
     if removed.is_empty() {
-        return (program.to_owned(), args.to_vec());
+        return Ok((program.into(), args.to_vec()));
+    }
+    if cfg!(windows) {
+        return Ok((
+            std::env::current_exe()?,
+            crate::launch::arguments(removed, program, args),
+        ));
     }
     let mut wrapped: Vec<String> = removed
         .iter()
@@ -840,18 +858,32 @@ fn without_variables(removed: &[String], program: &str, args: &[String]) -> (Str
     }
     wrapped.push(program.to_owned());
     wrapped.extend(args.iter().cloned());
-    ("/usr/bin/env".to_owned(), wrapped)
+    Ok(("/usr/bin/env".into(), wrapped))
 }
 
 /// OmniGraph's credential and addressing variables among `names`, except those the agent's own
-/// settings set.
+/// settings set. Windows reads a variable by its name in any case, so there `fold_case` matches
+/// names in any ASCII case: `omnigraph_profile` is the profile the CLI reads.
 fn credential_variables(
     names: impl Iterator<Item = std::ffi::OsString>,
     configured: &std::collections::BTreeMap<String, String>,
+    fold_case: bool,
 ) -> Vec<String> {
+    let same = |a: &str, b: &str| {
+        if fold_case {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
     let mut found: Vec<String> = names
         .filter_map(|name| name.into_string().ok())
         .filter(|name| {
+            let name = if fold_case {
+                name.to_ascii_uppercase()
+            } else {
+                name.clone()
+            };
             name.starts_with("OMNIGRAPH_TOKEN_")
                 || matches!(
                     name.as_str(),
@@ -863,7 +895,7 @@ fn credential_variables(
                         | "OMNIGRAPH_STUDIO_TOKEN"
                 )
         })
-        .filter(|name| !configured.contains_key(name))
+        .filter(|name| !configured.keys().any(|key| same(key, name)))
         .collect();
     found.sort();
     found
@@ -892,7 +924,8 @@ mod credential_tests {
             &["STUDIO_TEST_GONE".to_owned()],
             &program.to_string_lossy(),
             &["one".to_owned()],
-        );
+        )
+        .unwrap();
         let output = std::process::Command::new(command)
             .args(args)
             .env("STUDIO_TEST_GONE", "secret")
@@ -900,10 +933,103 @@ mod credential_tests {
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&output.stdout), "ran one unset\n");
         assert_eq!(
-            without_variables(&[], "npx", &["x".into()]),
-            ("npx".to_owned(), vec!["x".to_owned()])
+            without_variables(&[], "npx", &["x".into()]).unwrap(),
+            ("npx".into(), vec!["x".to_owned()])
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Set for this test binary when it runs as the launcher or the agent.
+    const STAND_IN: &str = "STUDIO_TEST_STAND_IN";
+    /// The test that is the launcher or the agent when this test binary runs as one.
+    const STAND_IN_TEST: &str = "host::credential_tests::stands_in_for_studio_or_the_agent";
+    /// Where the stand-in agent's own arguments start.
+    const AGENT: &str = "studio-test-agent";
+
+    /// What `the_launcher_starts_the_agent_without_the_variables` starts this test binary as:
+    /// Studio's launcher, as `main` dispatches it, or the agent, which prints its arguments and
+    /// what it inherited and exits with 7. Run as a test, it does nothing.
+    #[test]
+    fn stands_in_for_studio_or_the_agent() {
+        if std::env::var_os(STAND_IN).is_none() {
+            return;
+        }
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        if let Some(at) = args.iter().position(|arg| arg == crate::LAUNCH_COMMAND) {
+            std::process::exit(crate::launch_agent(args[at + 1..].iter().cloned()));
+        }
+        if let Some(at) = args.iter().position(|arg| arg == AGENT) {
+            let given: Vec<String> = args[at + 1..]
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            println!(
+                "agent {given:?} gone={:?} kept={:?}",
+                std::env::var_os("STUDIO_TEST_GONE"),
+                std::env::var_os("STUDIO_TEST_KEPT"),
+            );
+            std::process::exit(7);
+        }
+    }
+
+    /// The launcher Windows starts the agent through runs it without the variables, with its
+    /// program and every argument as given, and exits as it does. This test binary stands in
+    /// for Studio and for the agent, so the platform's command line carries the arguments both
+    /// times, as it does for Studio's executable.
+    #[test]
+    fn the_launcher_starts_the_agent_without_the_variables() {
+        let studio = std::env::current_exe().unwrap();
+        // libtest's own arguments, which run only the stand-in test.
+        let libtest = ["--exact", STAND_IN_TEST, "--nocapture", "--"].map(str::to_owned);
+        let given = [
+            "one",
+            "two words",
+            "a \"quoted\" word",
+            "",
+            "--",
+            "trailing\\",
+            "100%",
+        ]
+        .map(str::to_owned);
+        let mut agent_args = libtest.to_vec();
+        agent_args.push(AGENT.to_owned());
+        agent_args.extend(given.iter().cloned());
+        let removed = ["STUDIO_TEST_GONE".to_owned()];
+        let program = studio.to_string_lossy();
+        let launcher = crate::launch::arguments(&removed, &program, &agent_args);
+        #[cfg(windows)]
+        assert_eq!(
+            without_variables(&removed, &program, &agent_args).unwrap(),
+            (studio.clone(), launcher.clone()),
+            "Windows has no `env`: the agent starts through Studio's launcher"
+        );
+        let output = std::process::Command::new(&studio)
+            .args(&libtest)
+            .args(&launcher)
+            .env(STAND_IN, "1")
+            .env("STUDIO_TEST_GONE", "secret")
+            .env("STUDIO_TEST_KEPT", "kept")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let agent = stdout
+            .lines()
+            .find(|line| line.starts_with("agent "))
+            .unwrap_or_else(|| panic!("the agent did not run: {stdout}"));
+        assert_eq!(
+            agent,
+            format!("agent {given:?} gone=None kept=Some(\"kept\")")
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "the launcher exits as the agent does"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -922,7 +1048,7 @@ mod credential_tests {
         let mut configured = std::collections::BTreeMap::new();
         configured.insert("OMNIGRAPH_HOME".to_owned(), "/x".to_owned());
         assert_eq!(
-            credential_variables(names.into_iter(), &configured),
+            credential_variables(names.into_iter(), &configured, false),
             [
                 "OMNIGRAPH_BEARER_TOKEN",
                 "OMNIGRAPH_PROFILE",
@@ -930,5 +1056,19 @@ mod credential_tests {
                 "OMNIGRAPH_TOKEN_PERSONAL",
             ]
         );
+
+        // Windows reads a variable by its name in any case, and settings set it in any case.
+        let names = [
+            "omnigraph_profile",
+            "Omnigraph_Token_Work",
+            "omnigraph_home",
+            "PATH",
+        ]
+        .map(std::ffi::OsString::from);
+        assert_eq!(
+            credential_variables(names.clone().into_iter(), &configured, true),
+            ["Omnigraph_Token_Work", "omnigraph_profile"]
+        );
+        assert!(credential_variables(names.into_iter(), &configured, false).is_empty());
     }
 }

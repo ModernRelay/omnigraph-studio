@@ -107,6 +107,8 @@ serde_norway = "0.9"
 # Unix sockets on Windows 10 and later, for the agent's tool socket.
 uds_windows = "1.1"
 url = "2"
+# The agent's launcher on Windows; the version the ACP crate already uses.
+windows-sys = "0.61"
 
 # Zed patches crates.io crates in its own workspace. Patches do not carry over to a crate that
 # depends on Zed, so Studio repeats the ones its graph reaches. Copied from Zed v1.23.2

@@ -111,7 +111,7 @@ Agents (claude-agent-acp 0.89.1 with Claude Agent SDK 0.3.293; codex-acp 2.2.2 w
 | Gateway | `crates/agent_panel/src/gateway.rs` | A loopback HTTP/1.1 server per conversation (`127.0.0.1:0`, one request per connection). Checks the session token and contract header, applies the rules, forwards, and reports writes to the panel |
 | CLI home | `crates/agent_panel/src/cli_home.rs` | The conversation's directory, config, credentials and wrapper; the shared `AGENTS.md`; finding a CLI that answers |
 | Panel | `crates/agent_panel/src/panel.rs` | Starts the gateway and home with the conversation, shows each write as a card, and records outcomes in the session's write log (`GraphSession::note_write`) |
-| Agent launch | `crates/agent_panel/src/host.rs` | Starts the agent without OmniGraph credentials in its environment |
+| Agent launch | `crates/agent_panel/src/host.rs`, `launch.rs`; `omnigraph-studio launch-agent` in `crates/studio/src/main.rs` | Starts the agent without OmniGraph credentials in its environment: through `env -u` on Unix, through Studio's own launcher on Windows |
 
 ### One directory per conversation
 
@@ -148,12 +148,26 @@ the command. Codex reads `AGENTS.md`; Claude reads it when there is no `CLAUDE.m
 
 ### The agent's environment
 
-The agent process is started through `/usr/bin/env -u …` because the ACP crate can add variables
-but not remove them. It removes `OMNIGRAPH_TOKEN_*`, `OMNIGRAPH_BEARER_TOKEN`,
-`OMNIGRAPH_PROFILE`, `OMNIGRAPH_HOME`, `OMNIGRAPH_CONTROL_TOKEN`, `OMNIGRAPH_CONTROL_API` and
-`OMNIGRAPH_STUDIO_TOKEN` when Studio holds them, unless `agent.env` sets them. Cloud variables
-(`AWS_*`, `AZURE_*`, Google's) stay: the agent may need them for its model, as Claude Code on
-Bedrock does. This closes the gap where the agent inherited the person's graph tokens.
+The ACP crate can add variables to the agent's process but not remove them, and its
+`spawn_process` cannot be replaced, so the agent starts through a command that removes them. It
+removes `OMNIGRAPH_TOKEN_*`, `OMNIGRAPH_BEARER_TOKEN`, `OMNIGRAPH_PROFILE`, `OMNIGRAPH_HOME`,
+`OMNIGRAPH_CONTROL_TOKEN`, `OMNIGRAPH_CONTROL_API` and `OMNIGRAPH_STUDIO_TOKEN` when Studio holds
+them, unless `agent.env` sets them. Cloud variables (`AWS_*`, `AZURE_*`, Google's) stay: the
+agent may need them for its model, as Claude Code on Bedrock does. This closes the gap where the
+agent inherited the person's graph tokens. With none of these variables set, the agent starts as
+it is.
+
+- On Unix the command is `/usr/bin/env -u NAME … PROGRAM ARGS…`. `env` reads a word holding `=`
+  as an assignment, so a program path holding one runs through `/bin/sh -c 'exec "$0" "$@"'`.
+- Windows has no `env`. There Studio starts its own executable as
+  `omnigraph-studio launch-agent NAME… -- PROGRAM ARGS…` (`launch.rs`), as it does for
+  `mcp-proxy`. The launcher removes the names, starts the program as the ACP crate would (with
+  no window), and exits with its code. Its arguments travel on the command line the standard
+  library writes and reads back, so a path or argument arrives as given. Studio stops an agent by
+  ending the process it started, which is the launcher, so the launcher puts itself in a job that
+  ends every process in it when the launcher ends; the agent and what it starts join that job.
+  Windows reads a variable by its name in any case, so there names are matched in any ASCII
+  case.
 
 ### Choosing the CLI
 
@@ -313,6 +327,7 @@ same write would split the cards and the rules.
 | Session token in a 0600 file | An environment variable | The agent process is shared by the graph's conversations, so one variable cannot hold each conversation's token, and both agents pass their whole environment to every shell command |
 | A wrapper per conversation, run by absolute path | Environment variables and a PATH entry on the agent process; one `AGENTS.md` naming the command | The agent process and working directory are shared by the graph's conversations, so per-conversation values cannot live there. Codex's shell snapshot may reorder PATH |
 | Remove only OmniGraph's variables from the agent's environment | Also remove `AWS_*`, `AZURE_*`, Google credentials | The agent may need them for its model provider |
+| On Windows the agent starts through Studio's own executable as `launch-agent` | `cmd /c set NAME= & PROGRAM ARGS…`; starting the agent's process without the ACP crate | `cmd` expands `%` even inside quotes and does not read the quotes the standard library writes, and the ACP crate passes arguments only through the standard library, so a path or argument could change. Starting the process without the crate would repeat its stderr capture, exit and shutdown handling. Studio already re-runs its executable as `mcp-proxy` |
 | Request bodies read whole, at most 64 MiB; answers to reads stream | Stream request bodies too | The rules need small JSON bodies whole; a load larger than 64 MiB is refused before sending, which bounds memory (IX) |
 | The gateway passes the upstream contract through and refuses a CLI that speaks another | Translate between contracts | The contract is an exact-match safety property. A translation layer would be a second API that drifts |
 | Studio tests each CLI once against the gateway | Map package versions to contracts | The package version does not determine the contract; a real request does, until E23 |
@@ -378,9 +393,16 @@ CLI is the one they trust).
 | 2026-10-13 | The panel shows `omnigraph_run` calls | Offscreen snapshot, the test agent using only `omnigraph_run` on "change please" | Schema and query rows, "Create agent/… from main · new", a "Mutate" card on the agent branch with its query, the "Agent CLI: Mutation · committed" notice and the branch banner with Review |
 | 2026-10-13 | The panel shows the agent's CLI writes | Offscreen snapshots with the test agent, which now uses `omnigraph_cli` and the real CLI on "cli" | "Create agent/… from main · Branch created", "Mutation · Committed" with the commit and 1 change, the refusal on main ending "Nothing was sent", the workspace's "Agent CLI: Mutation · committed" notice and the branch banner with Review. With `ask_before_writes`, each card waited with Allow, Always and Reject, and committed after Allow |
 | 2026-10-14 | The CLI is chosen by its contract, not a server's answer | `agent_panel` test `the_cli_that_speaks_the_contract_is_chosen_without_a_server` (fake CLIs: 0.11 and 0.13.0 without `version --json`, a 0.14 reporting `http_contract` 0.13, a 0.15 reporting 0.15); `--version` of ~/.local/bin/omnigraph and /opt/homebrew/bin/omnigraph | 0.13 chosen over the 0.11 before it with no server behind the gateway; the 0.14 chosen over the 0.15 before it; with 0.11 and 0.15 the wrapper ran nothing and printed each CLI and what it speaks. Both installed CLIs now report `omnigraph 0.13.0` |
-
+| 2026-10-18 | The launcher starts the agent without the variables and with its arguments as given | `agent_panel` `the_launcher_starts_the_agent_without_the_variables`: the test binary stands in for Studio and for the agent, so both hops cross a real command line. Run on macOS; not yet run on Windows, where it also checks that the agent starts through the launcher (CI runs the suite on `windows-2025`) | `STUDIO_TEST_GONE` absent and `STUDIO_TEST_KEPT` kept in the agent's environment; a space, quotes, an empty argument, `--`, a trailing backslash and `%` arrive as given; the launcher exits with the agent's 7 and writes nothing to stderr |
+| 2026-10-18 | Windows matches the variables' names in any case | `agent_panel` `the_agent_starts_without_omnigraph_credentials` | With case folded, `omnigraph_profile` and `Omnigraph_Token_Work` are removed and `omnigraph_home` stays when `agent.env` sets `OMNIGRAPH_HOME`; without it, none of them is removed |
+| 2026-10-18 | The launcher's Windows code builds | `cargo clippy --target x86_64-pc-windows-msvc -- -D warnings` on `launch.rs` in a scratch crate with `windows-sys` 0.61.2 (Rust 1.98.1) | Clean. That the agent ends with the launcher rests on `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; no test checks it |
 
 ## Corrections
+
+- 2026-10-18 · The agent started through `/usr/bin/env -u …`, which Windows does not have, so on
+  Windows any OmniGraph variable in Studio's environment kept the agent from starting. Windows
+  now starts it through Studio's own executable as `launch-agent`, and matches the variables'
+  names in any case, as Windows reads them.
 
 - 2026-10-18 · The rules read a target's query up to the end, while forwarding dropped a
   `#` and all that followed it. `load/ndjson?mode=overwrite#&branch=<agent branch>` was judged

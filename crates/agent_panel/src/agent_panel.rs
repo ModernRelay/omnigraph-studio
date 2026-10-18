@@ -10,6 +10,7 @@ mod connection;
 mod gateway;
 mod gateway_rules;
 mod host;
+mod launch;
 mod mcp;
 mod panel;
 mod sessions;
@@ -18,6 +19,7 @@ mod skill;
 mod socket;
 mod tools;
 
+pub use launch::launch_agent;
 pub use panel::PRESETS;
 pub use socket::proxy;
 
@@ -28,6 +30,9 @@ use ui::IconName;
 
 /// The argument that starts Studio's executable as the agent's stdio MCP server.
 pub const PROXY_COMMAND: &str = "mcp-proxy";
+/// The argument that starts Studio's executable as the agent's launcher, which runs the agent
+/// without OmniGraph's credentials in its environment where there is no `env -u` (spec 013).
+pub const LAUNCH_COMMAND: &str = "launch-agent";
 
 pub fn init(cx: &mut App) {
     // A restored tab comes back with its conversation.
