@@ -178,13 +178,29 @@ impl OpenGraphModal {
                     session.graph_id == graph_id && session.connection == connection
                 })
                 .map(|(session, _)| session.entity_id());
-            workspace.update(cx, |workspace, cx| match open {
-                Some(open) => workspace.show_graph(open, window, cx),
-                None => {
+            // One another window has open is shown there: a graph is open in one window at a
+            // time, since its tabs and drafts are saved by graph.
+            let elsewhere = open
+                .is_none()
+                .then(|| crate::window_holding(&connection, &graph_id, cx))
+                .flatten();
+            match (open, elsewhere) {
+                (Some(open), _) => {
+                    workspace.update(cx, |workspace, cx| workspace.show_graph(open, window, cx))
+                }
+                (None, Some((handle, session))) => cx.defer(move |cx| {
+                    handle
+                        .update(cx, |workspace, window, cx| {
+                            workspace.show_graph(session.entity_id(), window, cx);
+                            window.activate_window();
+                        })
+                        .ok();
+                }),
+                (None, None) => workspace.update(cx, |workspace, cx| {
                     let session = open_session(connection, graph_id, "main".into(), cx);
                     workspace.set_session(session, window, cx)
-                }
-            });
+                }),
+            }
         }
         cx.emit(DismissEvent);
     }

@@ -243,14 +243,23 @@ fn reopenable_windows(cx: &App) -> Vec<SavedWindow> {
             .iter()
             .any(|connection| connection.read(cx).server.url == url)
     };
-    studio_workspace::load_windows()
+    reopenable(studio_workspace::load_windows(), known)
+}
+
+/// `windows` with only their graphs on servers `known` holds, the windows left with none dropped.
+/// A graph is open in one window at a time: its tabs and drafts are saved by graph, so two
+/// windows holding it would each write over the other's. One listed by two windows from an
+/// earlier session reopens in the first.
+fn reopenable(windows: Vec<SavedWindow>, known: impl Fn(&str) -> bool) -> Vec<SavedWindow> {
+    let mut taken = std::collections::HashSet::new();
+    windows
         .into_iter()
         .filter_map(|mut window| {
             let shown = window.session.graphs.get(window.session.shown).cloned();
-            window
-                .session
-                .graphs
-                .retain(|graph| known(&graph.server_url));
+            window.session.graphs.retain(|graph| {
+                known(&graph.server_url)
+                    && taken.insert((graph.server_url.clone(), graph.graph.clone()))
+            });
             window.session.shown = shown
                 .and_then(|shown| window.session.graphs.iter().position(|g| *g == shown))
                 .unwrap_or(0);
@@ -383,6 +392,10 @@ pub fn open_link(link: &str, cx: &mut App) {
         );
     };
     let branch = target.branch.clone().unwrap_or_else(|| "main".into());
+    // The window that has the graph open, else the active one.
+    let window = window_holding(&connection, &target.graph, cx)
+        .map(|(handle, _)| handle.into())
+        .or_else(|| link_window(cx));
     let open_in = move |workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App| {
         // The graph, if the window has it open, moved to the link's branch; else opened here.
         let open = workspace
@@ -429,7 +442,7 @@ pub fn open_link(link: &str, cx: &mut App) {
         }
         window.activate_window();
     };
-    match link_window(cx) {
+    match window {
         // Through the untyped handle, so the workspace is not held while it is opened into.
         Some(handle) => {
             cx.update_window(handle, |root, window, cx| {
@@ -452,6 +465,34 @@ pub fn open_link(link: &str, cx: &mut App) {
 }
 
 use deep_link::DeepLink;
+
+/// The workspace window that has `graph` on `connection` open, with its session there. A graph
+/// is open in one window at a time: its tabs and drafts are saved by graph.
+pub(crate) fn window_holding(
+    connection: &Entity<graph_store::Connection>,
+    graph: &str,
+    cx: &App,
+) -> Option<(
+    gpui::WindowHandle<Workspace>,
+    Entity<graph_store::GraphSession>,
+)> {
+    cx.windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<Workspace>())
+        .find_map(|handle| {
+            let session = handle
+                .read(cx)
+                .ok()?
+                .open_graphs()
+                .into_iter()
+                .map(|(session, _)| session)
+                .find(|session| {
+                    let session = session.read(cx);
+                    session.graph_id == graph && session.connection == *connection
+                })?;
+            Some((handle, session))
+        })
+}
 
 /// The workspace window a link opens in: the active one, else any.
 fn link_window(cx: &App) -> Option<gpui::AnyWindowHandle> {
@@ -480,6 +521,52 @@ fn tell(cx: &mut App, kind: ToastKind, message: String) {
             })
             .ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod reopen_tests {
+    use super::*;
+
+    /// A graph two saved windows listed reopens in the first alone; the second shows what is
+    /// left, and a window left with nothing is not reopened.
+    #[test]
+    fn a_graph_two_windows_listed_reopens_in_the_first() {
+        let window = |graphs: &[&str], shown: usize| -> SavedWindow {
+            serde_json::from_value(serde_json::json!({
+                "graphs": graphs
+                    .iter()
+                    .map(|graph| serde_json::json!({
+                        "server_url": "http://studio.test",
+                        "graph": graph,
+                        "branch": "main",
+                    }))
+                    .collect::<Vec<_>>(),
+                "shown": shown,
+            }))
+            .unwrap()
+        };
+        let windows = reopenable(
+            vec![
+                window(&["crm", "notes"], 0),
+                window(&["notes", "ops"], 1),
+                window(&["crm"], 0),
+            ],
+            |url| url == "http://studio.test",
+        );
+        let graphs: Vec<Vec<&str>> = windows
+            .iter()
+            .map(|window| {
+                window
+                    .session
+                    .graphs
+                    .iter()
+                    .map(|g| g.graph.as_str())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(graphs, vec![vec!["crm", "notes"], vec!["ops"]]);
+        assert_eq!(windows[1].session.shown, 0, "ops, the graph it showed");
     }
 }
 
