@@ -424,7 +424,16 @@ impl NodePeek {
     /// Reads a node again at the branch head, with its relationships and Blobs, under the
     /// session's schema.
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.schema = self.session.read(cx).schema_model().or(self.schema.take());
+        let schema = self
+            .session
+            .read(cx)
+            .schema_model()
+            .or_else(|| self.schema.clone());
+        if schema.as_ref().map(|s| &s.source) != self.schema.as_ref().map(|s| &s.source) {
+            // Another schema reads other types: the watch is told again.
+            self.reads = None;
+        }
+        self.schema = schema;
         self.newer = false;
         self.snapshot = None;
         // What the table read belongs to the old commit.
@@ -433,6 +442,7 @@ impl NodePeek {
         self.absent.clear();
         self.groups_absent.clear();
         self._tasks.clear();
+        self.watch_reads(cx);
         self.load_node(cx);
         cx.notify();
     }
@@ -3709,6 +3719,46 @@ mod tests {
             assert_eq!(view.snapshot.as_deref(), Some("c2"));
             assert!(view.newer, "a neighbour it lists changed");
         });
+    }
+
+    /// A schema changed elsewhere leaves the page as read and offers Refresh; Refresh takes it,
+    /// and the page's next head move asks the feed about the relationships it added.
+    #[gpui::test]
+    async fn refresh_takes_a_schema_changed_elsewhere_and_watches_its_types(
+        cx: &mut TestAppContext,
+    ) {
+        let (session, writer) = session_followed(
+            PEOPLE,
+            |request| match request["name"].as_str() {
+                Some("studio_node") => {
+                    json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }])
+                }
+                _ => json!([]),
+            },
+            cx,
+        );
+        let (view, cx) = page(session.clone(), cx);
+        let grown = format!("{PEOPLE}edge Knows: Person -> Person\n");
+        writer.set_schema(&grown);
+        writer.commit("c2", vec![changed("node", "Person", "p9", None)]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.newer, "Refresh is offered");
+            assert!(view.groups.is_empty(), "still as read: no relationships");
+        });
+
+        view.update(cx, |view, cx| view.refresh(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.newer);
+            assert_eq!(view.groups.len(), 2, "Knows out and in");
+        });
+        writer.commit("c3", vec![changed("node", "Person", "p8", None)]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        let last = writer.feeds.lock().unwrap().last().cloned().unwrap();
+        assert!(last.contains("type=Knows"), "{last}");
     }
 
     /// Refresh after another writer's commit reads again only the relationship groups it

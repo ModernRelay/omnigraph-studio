@@ -1,7 +1,8 @@
 //! The schema's source, read-only (spec 007): the `.pg` text the server holds for the graph,
 //! coloured and folded by the schema grammar. Text can be selected and copied; a schema changes
 //! by deployment (`omnigraph cluster apply`), never from Studio. It follows the session: a branch
-//! switch or a refresh that brings another schema shows the new text.
+//! switch or a refresh that brings another schema shows the new text. A schema another writer
+//! changed, seen at a head move, waits for the person: the tab offers the newer schema.
 
 use editor::scroll::Autoscroll;
 use editor::{Editor, MultiBufferOffset, SelectionEffects};
@@ -9,6 +10,7 @@ use gpui::{App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, S
 use graph_store::{GraphSession, Loadable, SessionEvent};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
+use ui::{TintColor, Tooltip};
 
 use crate::syntax::{Syntax, language};
 
@@ -22,6 +24,8 @@ pub struct SchemaView {
     shown: Option<std::sync::Arc<str>>,
     /// A type to show once the schema has been read.
     reveal: Option<String>,
+    /// The session reads under a newer schema than the one shown.
+    newer: bool,
     _subscription: gpui::Subscription,
 }
 
@@ -46,6 +50,10 @@ impl Item for SchemaView {
         Some(SCHEMA_KEY.into())
     }
 
+    fn is_stale(&self, _cx: &App) -> bool {
+        self.newer
+    }
+
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
         Some(SavedItem {
             kind: SCHEMA_KEY.into(),
@@ -64,10 +72,14 @@ impl SchemaView {
         let subscription = cx.subscribe_in(
             &session,
             window,
-            |this, _, event: &SessionEvent, window, cx| {
-                if *event == SessionEvent::SchemaChanged {
-                    this.show_source(window, cx);
+            |this, _, event: &SessionEvent, window, cx| match event {
+                SessionEvent::SchemaChanged => this.show_source(window, cx),
+                SessionEvent::SchemaMoved if this.shown.is_some() => {
+                    this.newer = true;
+                    cx.emit(ItemEvent::UpdateTab);
+                    cx.notify();
                 }
+                _ => {}
             },
         );
         let mut this = Self {
@@ -76,6 +88,7 @@ impl SchemaView {
             parsed: false,
             shown: None,
             reveal: None,
+            newer: false,
             _subscription: subscription,
         };
         if let Some(language) = language(Syntax::Pg, cx)
@@ -99,6 +112,7 @@ impl SchemaView {
             cx.notify();
             return;
         };
+        self.newer = false;
         if self.shown.as_ref() != Some(&schema.source) {
             let source = schema.source.clone();
             self.editor
@@ -170,6 +184,21 @@ impl Render for SchemaView {
         v_flex()
             .size_full()
             .pt_1()
+            .when(self.newer, |d| {
+                d.child(
+                    h_flex().px_2().pb_1().child(
+                        studio_ui::ds::button("newer-schema", "Newer schema · Refresh")
+                            .style(ButtonStyle::Tinted(TintColor::Accent))
+                            .label_size(LabelSize::Small)
+                            .tooltip(Tooltip::text(
+                                "The schema changed elsewhere; show the one the graph has now",
+                            ))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.show_source(window, cx)),
+                            ),
+                    ),
+                )
+            })
             .child(self.editor.clone())
             .into_any_element()
     }

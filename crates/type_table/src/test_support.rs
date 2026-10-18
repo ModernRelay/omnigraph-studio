@@ -84,6 +84,8 @@ pub(crate) struct Writer {
     commits: Mutex<Vec<(String, String, Vec<Value>)>>,
     /// The schema the server answers with once the writer changed it.
     schema: Mutex<Option<String>>,
+    /// The query string of every change-feed read.
+    pub(crate) feeds: Mutex<Vec<String>>,
 }
 
 impl Writer {
@@ -110,6 +112,7 @@ impl Writer {
     }
 
     fn feed(&self, query: &str) -> Value {
+        self.feeds.lock().unwrap().push(query.to_owned());
         // Type names and commit ids need no decoding past the `:` of `after:`.
         let pairs: Vec<(String, String)> = query
             .split('&')
