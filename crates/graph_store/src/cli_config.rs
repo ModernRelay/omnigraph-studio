@@ -1,10 +1,11 @@
 //! Servers, profiles and tokens from the OmniGraph CLI's operator config (spec 003).
 //!
-//! Studio reads `$OMNIGRAPH_HOME` (else `~/.omnigraph`) the way the CLI does at OmniGraph
-//! v0.13.0 (`crates/omnigraph-cli/src/operator.rs`): servers from `config.yaml`, a server's token
-//! from `OMNIGRAPH_TOKEN_<NAME>`, then `[<name>] token = …` in `credentials`, then
-//! `OMNIGRAPH_BEARER_TOKEN`. Studio never writes these files; it reads them again when they
-//! change ([`stamp`]).
+//! Studio reads `$OMNIGRAPH_HOME` (else `~/.omnigraph`) the way the CLI does
+//! (`crates/omnigraph-cli/src/operator.rs`): servers from `config.yaml`, and a server's token
+//! from `OMNIGRAPH_TOKEN_<NAME>`, then `[<name>] token = …` in `credentials`. A token is sent
+//! only to the server it is keyed to: the untargeted `OMNIGRAPH_BEARER_TOKEN` goes to none, as
+//! the CLI dropped it (OmniGraph #1030). Studio never writes these files; it reads them again
+//! when they change ([`stamp`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -238,12 +239,6 @@ fn token_in(dir: Option<&Path>, server: &str) -> Result<Option<String>, String> 
     {
         return Ok(Some(token));
     }
-    if let Ok(token) = std::env::var("OMNIGRAPH_BEARER_TOKEN") {
-        let token = token.trim();
-        if !token.is_empty() {
-            return Ok(Some(token.to_owned()));
-        }
-    }
     Ok(None)
 }
 
@@ -356,11 +351,8 @@ mod tests {
         std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
         let before = stamp(Some(&dir));
         assert!(before.iter().all(Option::is_some));
-        // A server the credentials do not name takes the shared token, as in the CLI.
-        let shared = std::env::var("OMNIGRAPH_BEARER_TOKEN")
-            .ok()
-            .map(|token| token.trim().to_owned())
-            .filter(|token| !token.is_empty());
+        // A server the credentials do not name has no token: an untargeted one in the
+        // environment is sent to no server.
         let files = read_operator(Some(&dir));
         let servers = files.servers.unwrap();
         assert_eq!(
@@ -370,7 +362,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ("studio-test-a", Some("one".to_owned())),
-                ("studio-test-b", shared.clone())
+                ("studio-test-b", None)
             ]
         );
         assert!(files.errors.is_empty());

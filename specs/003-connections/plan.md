@@ -45,8 +45,9 @@ from the served document).
    connection's, which a connection in use checks at once. A token typed into Studio for a
    CLI server lasts until the files change that server's token. Files that cannot be read
    keep every server as it was and are named in a toast that stays until dismissed, as a
-   settings file's are. A token from `OMNIGRAPH_TOKEN_<NAME>` or `OMNIGRAPH_BEARER_TOKEN` is
-   the one Studio started with, as for the CLI.
+   settings file's are. A token from `OMNIGRAPH_TOKEN_<NAME>` is the one Studio started with,
+   as for the CLI. The untargeted `OMNIGRAPH_BEARER_TOKEN` is sent to no server: a token goes
+   only to the server it is keyed to (OmniGraph #1030).
 2. Servers added in Studio (URL, optional token). Tokens go to the OS keychain through GPUI's
    credentials API; the server list goes to Studio's settings.
    An address is made a server root before it is used (`graph_client::server_root`): trimmed,
