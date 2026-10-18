@@ -12,10 +12,11 @@ use gpui::{
     App, ClipboardItem, Context, Entity, Focusable as _, Render, SharedString, Subscription, Task,
     Window,
 };
+use gq_language::builder::Depends;
 use gq_language::input::{edit_text, parse_input};
-use gq_language::{Direction, RelationshipGroup, SchemaModel, builder};
-use graph_store::carry::{ChangesSince, Since, TypeRef, edge_reads, node_reads};
-use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, ReadWatch, SessionEvent};
+use gq_language::{BuiltQuery, Direction, RelationshipGroup, SchemaModel, builder};
+use graph_store::scope::{ReadScope, ScopeSince};
+use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Map, Value};
 use studio_actions::graph::{OpenBlob, OpenNodePage, PeekNode};
@@ -31,6 +32,7 @@ use crate::model::{
     FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, display_value, field_rows, format_count,
     node_rows, reads_as_markdown, same_value, save_result, short_commit,
 };
+use graph_client::api::ReadOutput;
 use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError};
 
 /// First neighbours shown under an expanded relationship group.
@@ -194,8 +196,9 @@ pub struct NodePeek {
     /// Why the drafts' last save did not land; the second press of Discard drops them.
     drafts_notice: Option<Notice>,
     confirm_discard: bool,
-    /// What the view reads, told to the session for the branch named.
-    reads: Option<(String, ReadWatch)>,
+    /// What the view shows, as read (spec 015): the session decides from it whether a head move
+    /// changed anything shown. `None` while the view holds a commit.
+    scope: Option<ReadScope>,
     /// Properties the commit shown does not hold under their current name, and what they were
     /// then. The node is read without them.
     absent: HashMap<String, PropertyThen>,
@@ -277,7 +280,6 @@ impl NodePeek {
                 && this.schema.is_none()
             {
                 this.schema = session.read(cx).schema_model();
-                this.watch_reads(cx);
                 if this.schema.is_some() && this.values.loaded().is_none() {
                     this.load_node(cx);
                 }
@@ -308,6 +310,10 @@ impl NodePeek {
         });
         cx.on_release(|this: &mut Self, cx| this.release_images(cx))
             .detach();
+        let scope = session.update(cx, |session, _| {
+            let branch = session.branch.clone();
+            session.read_scope(&branch)
+        });
         let mut this = Self {
             session,
             blobs: Vec::new(),
@@ -332,16 +338,27 @@ impl NodePeek {
             drafts_notice: None,
             confirm_discard: false,
             show_empty: false,
-            reads: None,
+            scope: Some(scope),
             absent: HashMap::new(),
             groups_absent: Vec::new(),
             awaiting_changes: false,
             _tasks: Vec::new(),
             _subscription: subscription,
         };
-        this.watch_reads(cx);
         match values {
             Some(values) => {
+                // The row the caller read at the commit is what the view shows of the node.
+                let depends = match &this.subject {
+                    PeekSubject::Node { type_name, id } => Depends::Node {
+                        type_name: type_name.clone(),
+                        id: id.clone(),
+                    },
+                    PeekSubject::Edge { edge_type, .. } => Depends::Types {
+                        nodes: Vec::new(),
+                        edges: vec![edge_type.clone()],
+                    },
+                };
+                this.note_shown(depends, None, cx);
                 this.values = Loadable::Loaded(values);
                 this.load_groups(debounce, cx);
                 this.load_blobs(debounce, cx);
@@ -417,7 +434,7 @@ impl NodePeek {
         self.holds_commit = true;
         self.newer = false;
         // A held commit never moves, so nothing the branch does concerns it.
-        self.reads = None;
+        self.scope = None;
         self.awaiting_changes = false;
     }
 
@@ -429,10 +446,6 @@ impl NodePeek {
             .read(cx)
             .schema_model()
             .or_else(|| self.schema.clone());
-        if schema.as_ref().map(|s| &s.source) != self.schema.as_ref().map(|s| &s.source) {
-            // Another schema reads other types: the watch is told again.
-            self.reads = None;
-        }
         self.schema = schema;
         self.newer = false;
         self.snapshot = None;
@@ -442,7 +455,13 @@ impl NodePeek {
         self.absent.clear();
         self.groups_absent.clear();
         self._tasks.clear();
-        self.watch_reads(cx);
+        // What it showed is let go; what it reads now is told again, under the new schema too.
+        if let Some(scope) = &self.scope {
+            self.session.update(cx, |session, _| {
+                let branch = session.branch.clone();
+                session.reset_scope(scope, &branch);
+            });
+        }
         self.load_node(cx);
         cx.notify();
     }
@@ -474,9 +493,7 @@ impl NodePeek {
         let type_name = type_name.clone();
         self.values = Loadable::Loading;
         let snapshot = self.snapshot.clone();
-        let read = self
-            .session
-            .update(cx, |session, cx| session.read(&query, snapshot, cx));
+        let read = self.read_shown(&query, snapshot, cx);
         self._tasks.push(cx.spawn(async move |this, cx| {
             let result = read.await;
             this.update(cx, |this, cx| {
@@ -593,12 +610,14 @@ impl NodePeek {
             };
             let session = self.session.downgrade();
             let snapshot = self.snapshot.clone();
+            let scope = self.scope.clone();
             self.blobs[index]._task = Some(cx.spawn(async move |this, cx| {
                 if debounce {
                     cx.background_executor().timer(COUNT_DELAY).await;
                 }
-                let Ok(read) = session.update(cx, |session, cx| {
-                    session.blob_meta(cell.clone(), snapshot.clone(), cx)
+                let Ok(read) = session.update(cx, |session, cx| match &scope {
+                    Some(scope) => session.blob_meta_in(scope, cell.clone(), snapshot.clone(), cx),
+                    None => session.blob_meta(cell.clone(), snapshot.clone(), cx),
                 }) else {
                     return;
                 };
@@ -895,6 +914,20 @@ impl NodePeek {
         for index in 0..self.groups.len() {
             let key = builder::relationship_key(&self.groups[index].group);
             if let Some(known) = self.known.get(&key).cloned() {
+                // What the table read for the row's relationship is what the view shows of it.
+                let relationship = self.groups[index].group.clone();
+                if let PeekSubject::Node { id, .. } = &self.subject {
+                    let listed = known
+                        .first
+                        .as_ref()
+                        .map(|first| first.iter().map(|n| n.id.clone()).collect());
+                    let depends = Depends::EdgesAt {
+                        edge: relationship.edge.clone(),
+                        nodes: vec![id.clone()],
+                        listed: Some((relationship.other_type.clone(), "id".to_owned())),
+                    };
+                    self.note_shown(depends, listed, cx);
+                }
                 let group = &mut self.groups[index];
                 group.count = Loadable::Loaded(known.count);
                 if let Some(first) = known.first {
@@ -954,13 +987,15 @@ impl NodePeek {
         let snapshot = self.snapshot.clone();
         let relationship = group.group.clone();
         let read_without = without;
+        let scope = self.scope.clone();
         group._task = Some(cx.spawn(async move |this, cx| {
             if debounce {
                 cx.background_executor().timer(COUNT_DELAY).await;
             }
-            let Ok(read) =
-                session.update(cx, |session, cx| session.read(&query, snapshot.clone(), cx))
-            else {
+            let Ok(read) = session.update(cx, |session, cx| match &scope {
+                Some(scope) => session.read_in(scope, &query, snapshot.clone(), cx),
+                None => session.read(&query, snapshot.clone(), cx),
+            }) else {
                 return;
             };
             let first = match read.await {
@@ -981,8 +1016,11 @@ impl NodePeek {
                 Ok(shown.len() as u64)
             } else {
                 // More than a page: the exact count, batched with every other one asked now.
-                let Ok(count) = session.update(cx, |session, cx| {
-                    session.degree(&type_name, &relationship, &id, snapshot, cx)
+                let Ok(count) = session.update(cx, |session, cx| match &scope {
+                    Some(scope) => {
+                        session.degree_in(scope, &type_name, &relationship, &id, snapshot, cx)
+                    }
+                    None => session.degree(&type_name, &relationship, &id, snapshot, cx),
                 }) else {
                     return;
                 };
@@ -1097,9 +1135,7 @@ impl NodePeek {
         };
         group.neighbours = Loadable::Loading;
         let snapshot = self.snapshot.clone();
-        let read = self
-            .session
-            .update(cx, |session, cx| session.read(&query, snapshot, cx));
+        let read = self.read_shown(&query, snapshot, cx);
         let task = cx.spawn(async move |this, cx| {
             let result = read.await;
             this.update(cx, |this, cx| {
@@ -1156,9 +1192,7 @@ impl NodePeek {
             Err(_) => return,
         };
         let snapshot = self.snapshot.clone();
-        let read = self
-            .session
-            .update(cx, |session, cx| session.read(&query, snapshot, cx));
+        let read = self.read_shown(&query, snapshot, cx);
         let task = cx.spawn(async move |this, cx| {
             let result = read.await;
             this.update(cx, |this, cx| {
@@ -1520,24 +1554,27 @@ impl NodePeek {
         }
     }
 
-    /// Tells the session what the view reads on its branch, so a head move that changed none
-    /// of it moves the view along without reading again (spec 015).
-    fn watch_reads(&mut self, cx: &mut Context<Self>) {
-        let Some(schema) = &self.schema else {
-            return;
-        };
-        let branch = self.session.read(cx).branch.clone();
-        if self.holds_commit || self.reads.as_ref().is_some_and(|(at, _)| *at == branch) {
-            return;
+    /// Reads what the view shows, through its scope while it follows the branch.
+    fn read_shown(
+        &self,
+        query: &BuiltQuery,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
+        let scope = self.scope.clone();
+        self.session.update(cx, |session, cx| match &scope {
+            Some(scope) => session.read_in(scope, query, snapshot, cx),
+            None => session.read(query, snapshot, cx),
+        })
+    }
+
+    /// Something the view shows that the caller read for it (the table's row, its
+    /// relationships), with the nodes it lists when known.
+    fn note_shown(&self, depends: Depends, listed: Option<Vec<String>>, cx: &mut Context<Self>) {
+        if let Some(scope) = &self.scope {
+            self.session
+                .update(cx, |session, _| session.note_in(scope, depends, listed));
         }
-        let types = match &self.subject {
-            PeekSubject::Node { type_name, .. } => node_reads(schema, type_name),
-            PeekSubject::Edge { edge_type, .. } => edge_reads(schema, edge_type),
-        };
-        let watch = self
-            .session
-            .update(cx, |session, _| session.watch_reads(&branch, types));
-        self.reads = Some((branch, watch));
     }
 
     /// Whether the branch moved past the commit shown, once this view's writes are in. A move
@@ -1545,10 +1582,9 @@ impl NodePeek {
     /// whose changes are not known yet waits for the session to read them.
     fn compare_head(&mut self, cx: &mut Context<Self>) {
         self.awaiting_changes = false;
-        if self.holds_commit {
+        let Some(scope) = &self.scope else {
             return;
-        }
-        self.watch_reads(cx);
+        };
         let session = self.session.read(cx);
         let (Some(head), Some(pin)) = (session.head(&session.branch), self.snapshot.clone()) else {
             return;
@@ -1556,42 +1592,13 @@ impl NodePeek {
         if head == pin {
             self.newer = false;
         } else if !self.newer {
-            match session.changes_since(&session.branch, &pin, head) {
-                Since::Pending => self.awaiting_changes = true,
-                Since::Known(since) if self.unchanged_in(&since) => {
-                    self.snapshot = Some(head.to_owned())
-                }
-                Since::Known(_) | Since::Unknown => self.newer = true,
+            match session.scope_since(scope, &pin, head) {
+                ScopeSince::Pending => self.awaiting_changes = true,
+                ScopeSince::Unchanged => self.snapshot = Some(head.to_owned()),
+                ScopeSince::Changed => self.newer = true,
             }
         }
         cx.notify();
-    }
-
-    /// Whether `since` left what the view shows as it is: the node or edge itself, and through
-    /// each relationship group the edges at the node and the neighbours listed. A list being
-    /// read is checked by the other type as a whole, since what it will show is not known.
-    fn unchanged_in(&self, since: &ChangesSince) -> bool {
-        match &self.subject {
-            PeekSubject::Edge { edge_type, id, .. } => {
-                !since.entity_changed(&TypeRef::Edge(edge_type.clone()), id)
-            }
-            PeekSubject::Node { type_name, id } => {
-                !since.entity_changed(&TypeRef::Node(type_name.clone()), id)
-                    && self.groups.iter().all(|group| {
-                        let other = TypeRef::Node(group.group.other_type.clone());
-                        let listed = match &group.neighbours {
-                            Loadable::Loading => !since.type_changed(&other),
-                            Loadable::Loaded(listed) => listed
-                                .iter()
-                                .all(|neighbour| !since.entity_changed(&other, &neighbour.id)),
-                            Loadable::NotLoaded | Loadable::Failed(_) => true,
-                        };
-                        !since.edges_at(&group.group.edge, id)
-                            && listed
-                            && (group.more.is_none() || !since.type_changed(&other))
-                    })
-            }
-        }
     }
 
     // ---- relationships (spec 014) ----
@@ -3595,7 +3602,7 @@ mod tests {
                 "added after this commit"
             );
             assert!(
-                view.reads.is_none(),
+                view.scope.is_none(),
                 "a page held at a commit watches no reads"
             );
         });
@@ -3759,6 +3766,51 @@ mod tests {
         cx.run_until_parked();
         let last = writer.feeds.lock().unwrap().last().cloned().unwrap();
         assert!(last.contains("type=Knows"), "{last}");
+    }
+
+    /// A peek of a row the table read shows what the table read: a commit to another node
+    /// moves it along, one to its node offers Refresh, though the peek read no node itself.
+    #[gpui::test]
+    async fn a_peek_of_a_tables_row_follows_its_node(cx: &mut TestAppContext) {
+        let (session, writer) = session_followed(PEOPLE, |_| json!([]), cx);
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        cx.run_until_parked();
+        let values: Map<String, Value> =
+            serde_json::from_value(json!({ "@id": "p1", "slug": "p1", "name": "Ada" })).unwrap();
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            NodePeek::new(
+                session.clone(),
+                PeekSubject::Node {
+                    type_name: "Person".into(),
+                    id: "p1".into(),
+                },
+                Some(values),
+                Some("c1".into()),
+                HashMap::new(),
+                false,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let session = view.read_with(cx, |view, _| view.session.clone());
+        let move_head = |cx: &mut VisualTestContext, commit: &str, id: &str| {
+            writer.commit(commit, vec![changed("node", "Person", id, None)]);
+            session.update(cx, |session, cx| session.check_heads(cx));
+            cx.run_until_parked();
+        };
+        move_head(cx, "c2", "p9");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.as_deref(), Some("c2"));
+            assert!(!view.newer, "another person");
+        });
+        move_head(cx, "c3", "p1");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.as_deref(), Some("c2"));
+            assert!(view.newer, "its node changed");
+        });
     }
 
     /// Refresh after another writer's commit reads again only the relationship groups it

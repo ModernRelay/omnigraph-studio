@@ -244,8 +244,8 @@ A first cut of parts 1 and 4, ahead of the shared cache:
 
 - The head probe stays. When it, or one of Studio's writes, moves a branch's head, the session
   reads the change feed after the last commit it logged (`start=after:<id>`), with one `type`
-  filter per type name an open view reads. Views say what they read with a held watch
-  (`GraphSession::watch_reads`). With no watch on the branch nothing is read.
+  filter per type name what open views show depends on. With no view of the branch nothing is
+  read.
 - The log (`graph_store::carry`) keeps, per commit, its first parent, the names asked about, and
   per type the ids written and, for edges, the nodes at either end; past 1,000 ids a type counts
   as changed throughout. 500 commits per branch. A read takes at most 8 pages of 1,000 changes;
@@ -256,22 +256,23 @@ A first cut of parts 1 and 4, ahead of the shared cache:
   the server does not know is accepted without error (validation log).
 - `changes_since(branch, from, to)` walks first parents from `to` back to `from`: pending while
   the read is out (views decide on `ChangesRead`), unknown when a commit is missing.
-- A node page or peek moves to the head when the node is unchanged, no edge of any group is at
-  the node, and no listed neighbour changed (a list still loading, or a next page being read,
-  needs its other type unchanged). An edge peek checks the edge. A table checks types: its own,
-  each relationship's edge and other type, and those types' relationships, which grouping a
-  relationship column by its neighbours' relationships reads. Otherwise "Newer data · Refresh"
-  shows as before.
+- Each view holds a read scope (`graph_store::scope::ReadScope`) and reads what it shows through
+  it (`read_in`, `degree_in`, `blob_meta_in`; `note_in` for what a caller read for it, as the
+  table's row and relationships given to its peek). The scope keeps each answer's `Depends`
+  from the moment it is asked, and the nodes a list named once it is in. It is the one read
+  set: the feed's type filter is the union of live scopes, and `scope_since(scope, from, to)`
+  says whether a move changed anything the view shows (a list still being read counts its whole
+  listed type). A page, a peek, a table and the tree and canvas move to the head when it says
+  unchanged, and otherwise show "Newer data · Refresh" as before. Refresh, or a pin that moves
+  for another reason, resets the scope; a view held at a commit has none.
 - Tables read a relationship column's neighbours only once rows draw it (the columns in the
   horizontal view and one either side), and each row's once: a Person table on the personal
   graph has 92 relationship columns, each two reads per page. The default cap of 8 columns
   (part 4) is not built; with reads limited to the screen it is a layout choice, not a cost.
-- The tree and canvas (`Exploration`) check types too: each shown node's type with its
-  relationships' types, and for a relationship grouped by its neighbours' relationships, those.
 - Answers carry across commits too (part 2, first cut). A generated query says what its
   answer depends on (`builder::Depends`): a node, the edges of one type at some nodes plus the
-  nodes the answer lists, or whole types for pages and counts; anything else is `Unknown` and
-  never carried. A read at a commit that misses the memo is answered by the same query and
+  nodes the answer lists, or whole types for pages, counts, groupings and narrowed lists;
+  anything else (a search, a query typed by hand) is `Unknown` and never carried. A read at a commit that misses the memo is answered by the same query and
   parameters at an earlier commit of the branch when the log shows nothing it depends on
   changed in between, and kept at the new commit. So Refresh on a page reads again only the
   groups the commit touched, and a moved view's later reads mostly cost nothing. The memo

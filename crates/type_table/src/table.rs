@@ -6,7 +6,7 @@
 //! rows virtualized by `uniform_list`.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -26,8 +26,8 @@ use gq_language::{
 };
 use graph_client::api::ReadOutput;
 use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError};
-use graph_store::carry::{Since, TypeRef, edge_reads, node_reads};
-use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, ReadWatch, SessionEvent};
+use graph_store::scope::{ReadScope, ScopeSince};
+use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent};
 use serde_json::Value;
 use studio_actions::table::{
     AddFilter, Cancel, ClearFilters, ConfirmEdit, CopyCell, DeleteRow, EditCell, ExploreRow,
@@ -320,10 +320,9 @@ pub struct TypeTable {
     saves_in_flight: usize,
     /// The session saw the head move while a save was out; compared once they are all back.
     head_moved_while_saving: bool,
-    /// What the table reads, told to the session for its branch: a head move that changed none
-    /// of it moves the pin without reading again (spec 015).
-    reads: BTreeSet<TypeRef>,
-    _reads: Option<ReadWatch>,
+    /// What the table shows, as read (spec 015): a head move that changed none of it moves the
+    /// pin without reading again. `None` for a table held at a commit.
+    scope: Option<ReadScope>,
     /// The head moved and the session is reading what changed.
     awaiting_changes: bool,
     focus_handle: FocusHandle,
@@ -483,6 +482,7 @@ impl TypeTable {
         let widths = cx.new(|_| {
             ResizableColumnsState::new(1, vec![px(160.)], vec![TableResizeBehavior::Resizable])
         });
+        let scope = at_commit.is_none().then(|| new_scope(&session, cx));
         let mut this = Self {
             workspace,
             session,
@@ -542,8 +542,7 @@ impl TypeTable {
             newer: false,
             saves_in_flight: 0,
             head_moved_while_saving: false,
-            reads: BTreeSet::new(),
-            _reads: None,
+            scope,
             awaiting_changes: false,
             focus_handle: cx.focus_handle(),
             table_state,
@@ -586,7 +585,6 @@ impl TypeTable {
                 if self.at_commit.is_some() => {}
             SessionEvent::BranchChanged => {
                 self.branch = self.session.read(cx).branch.clone();
-                self.watch_reads(cx);
                 // The branch's own drafts show; the other's wait in the session.
                 self.cells.clear();
                 self.draft_notices.clear();
@@ -619,6 +617,10 @@ impl TypeTable {
     ) {
         self._subscriptions[0] = cx.subscribe_in(&session, window, Self::on_session_event);
         self.branch = session.read(cx).branch.clone();
+        // The new session reads for the table under a scope of its own.
+        if self.at_commit.is_none() {
+            self.scope = Some(new_scope(&session, cx));
+        }
         self.session = session;
         self.schema = None;
         self.cells.clear();
@@ -678,38 +680,21 @@ impl TypeTable {
         self.all_columns = columns;
         self.show_columns(cx);
         self.schema = Some(schema);
-        self.watch_reads(cx);
         self.reload(false, cx);
     }
 
-    /// Tells the session what the table reads on its branch: its type, and for a node type each
-    /// relationship's edge and other type, and theirs one hop further, which grouping a
-    /// relationship column by its neighbours' relationships reads.
-    fn watch_reads(&mut self, cx: &mut Context<Self>) {
-        let Some(schema) = self.schema.clone() else {
-            return;
-        };
-        if self.missing || self.at_commit.is_some() {
-            self._reads = None;
-            return;
-        }
-        let reads = match self.kind {
-            TableKind::Node => {
-                let mut reads = node_reads(&schema, &self.type_name);
-                for group in schema.relationships_of(&self.type_name) {
-                    reads.extend(node_reads(&schema, &group.other_type));
-                }
-                reads
-            }
-            TableKind::Edge => edge_reads(&schema, &self.type_name),
-        };
-        let branch = self.branch.clone();
-        let types = reads.clone();
-        self._reads = Some(
-            self.session
-                .update(cx, |session, _| session.watch_reads(&branch, types)),
-        );
-        self.reads = reads;
+    /// Reads what the table shows, through its scope while it follows the branch.
+    fn read_shown(
+        &self,
+        query: &BuiltQuery,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
+        let scope = self.scope.clone();
+        self.session.update(cx, |session, cx| match &scope {
+            Some(scope) => session.read_in(scope, query, snapshot, cx),
+            None => session.read(query, snapshot, cx),
+        })
     }
 
     /// Shows the columns the layout picks, keeping the cursor on its column when it still shows.
@@ -1803,8 +1788,14 @@ impl TypeTable {
         if keep_pin {
             self.paging.restart();
         } else {
-            // Another commit, or another schema: what it holds is found out again.
+            // Another commit, or another schema: what it holds is found out again, and what it
+            // shows is read again.
             self.absent.clear();
+            if let Some(scope) = &self.scope {
+                let branch = self.branch.clone();
+                self.session
+                    .update(cx, |session, _| session.reset_scope(scope, &branch));
+            }
             self.paging.reset();
             // A table opened at a commit stays pinned to it (constitution II).
             self.paging.pinned = self.at_commit.clone();
@@ -1855,9 +1846,7 @@ impl TypeTable {
             }
         };
         let snapshot = self.paging.pinned.clone();
-        let read = self
-            .session
-            .update(cx, |session, cx| session.read(&query, snapshot, cx));
+        let read = self.read_shown(&query, snapshot, cx);
         self.page_task = Some(cx.spawn(async move |this, cx| {
             let result = read.await;
             this.update(cx, |this, cx| this.apply_page(result, true, size, cx))
@@ -1896,9 +1885,7 @@ impl TypeTable {
         self.loading_more = true;
         self.more_error = None;
         let snapshot = self.paging.pinned.clone();
-        let read = self
-            .session
-            .update(cx, |session, cx| session.read(&query, snapshot, cx));
+        let read = self.read_shown(&query, snapshot, cx);
         self.page_task = Some(cx.spawn(async move |this, cx| {
             let result = read.await;
             this.update(cx, |this, cx| this.apply_page(result, false, size, cx))
@@ -2096,19 +2083,15 @@ impl TypeTable {
             }
         };
         let snapshot = self.paging.pinned.clone();
-        let read = self
-            .session
-            .update(cx, |session, cx| session.read(&query, snapshot.clone(), cx));
+        let read = self.read_shown(&query, snapshot.clone(), cx);
         self.page_task = Some(cx.spawn(async move |this, cx| {
             let result = read.await;
             // The rows with none are counted at the commit the groups were read at.
             let none = match (none, &result) {
                 (Some(none), Ok(output)) => {
                     let commit = snapshot.or_else(|| output.graph_commit_id.clone());
-                    let Ok(read) = this.update(cx, |this, cx| {
-                        this.session
-                            .update(cx, |session, cx| session.read(&none, commit, cx))
-                    }) else {
+                    let Ok(read) = this.update(cx, |this, cx| this.read_shown(&none, commit, cx))
+                    else {
                         return;
                     };
                     Some(read.await)
@@ -2196,9 +2179,7 @@ impl TypeTable {
         section.loading = true;
         section.error = None;
         let snapshot = self.paging.pinned.clone();
-        let read = self
-            .session
-            .update(cx, |session, cx| session.read(&query, snapshot, cx));
+        let read = self.read_shown(&query, snapshot, cx);
         cx.spawn(async move |this, cx| {
             let result = read.await;
             this.update(cx, |this, cx| {
@@ -2478,9 +2459,7 @@ impl TypeTable {
             let Ok(degrees) = builder::page_degrees(&schema, &self.type_name, &group, &ids) else {
                 continue;
             };
-            let degrees = self.session.update(cx, |session, cx| {
-                session.read(&degrees, snapshot.clone(), cx)
-            });
+            let degrees = self.read_shown(&degrees, snapshot.clone(), cx);
             let ids = ids.clone();
             let schema = schema.clone();
             let type_name = self.type_name.clone();
@@ -2505,11 +2484,7 @@ impl TypeTable {
                     );
                     match query {
                         Ok(query) => this
-                            .update(cx, |this, cx| {
-                                this.session.update(cx, |session, cx| {
-                                    session.read(&query, snapshot.clone(), cx)
-                                })
-                            })
+                            .update(cx, |this, cx| this.read_shown(&query, snapshot.clone(), cx))
                             .ok(),
                         Err(_) => None,
                     }
@@ -2577,9 +2552,7 @@ impl TypeTable {
                 return None;
             }
         };
-        let read = self
-            .session
-            .update(cx, |session, cx| session.read(&query, snapshot, cx));
+        let read = self.read_shown(&query, snapshot, cx);
         Some(cx.spawn(async move |this, cx| {
             let result = read.await;
             this.update(cx, |this, cx| {
@@ -2617,17 +2590,20 @@ impl TypeTable {
         let Some(pin) = self.paging.pinned.clone() else {
             return;
         };
+        let Some(scope) = &self.scope else {
+            return;
+        };
         let session = self.session.read(cx);
         let Some(head) = session.head(&self.branch).filter(|head| *head != pin) else {
             return;
         };
-        match session.changes_since(&self.branch, &pin, head) {
-            Since::Pending => self.awaiting_changes = true,
-            Since::Known(since) if !since.any_changed(&self.reads) => {
+        match session.scope_since(scope, &pin, head) {
+            ScopeSince::Pending => self.awaiting_changes = true,
+            ScopeSince::Unchanged => {
                 self.paging.pinned = Some(head.to_owned());
                 cx.notify();
             }
-            Since::Known(_) | Since::Unknown => {
+            ScopeSince::Changed => {
                 self.newer = true;
                 cx.emit(ItemEvent::UpdateTab);
                 cx.notify();
@@ -5587,8 +5563,10 @@ impl TypeTable {
                     id: id.clone(),
                     property: property.clone(),
                 };
-                let read = self.session.update(cx, |session, cx| {
-                    session.blob_meta(cell, snapshot.clone(), cx)
+                let scope = self.scope.clone();
+                let read = self.session.update(cx, |session, cx| match &scope {
+                    Some(scope) => session.blob_meta_in(scope, cell, snapshot.clone(), cx),
+                    None => session.blob_meta(cell, snapshot.clone(), cx),
                 });
                 let task_key = key.clone();
                 let task = cx.spawn(async move |this, cx| {
@@ -6338,6 +6316,14 @@ impl Render for DraggedColumn {
             .shadow_md()
             .child(Label::new(self.title.clone()).size(LabelSize::Small))
     }
+}
+
+/// A scope for a table of `session`'s branch.
+fn new_scope(session: &Entity<GraphSession>, cx: &mut App) -> ReadScope {
+    session.update(cx, |session, _| {
+        let branch = session.branch.clone();
+        session.read_scope(&branch)
+    })
 }
 
 #[cfg(test)]

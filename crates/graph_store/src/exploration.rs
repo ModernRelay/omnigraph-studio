@@ -13,7 +13,7 @@
 //! relationship grouped by a property shows one row per value, from
 //! `builder::neighbour_values`, each opening to the neighbours with that value.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
@@ -26,8 +26,8 @@ use graph_client::ReadError;
 use graph_client::api::ReadOutput;
 use serde_json::Value;
 
-use crate::carry::{Since, TypeRef, node_reads};
-use crate::session::{GraphSession, Loadable, ReadWatch, SessionEvent};
+use crate::scope::{ReadScope, ScopeSince};
+use crate::session::{GraphSession, Loadable, SessionEvent};
 
 /// One node, by type and key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1112,10 +1112,9 @@ pub struct Exploration {
     newer_available: bool,
     generation: u64,
     tasks: HashMap<LoadTarget, Task<()>>,
-    /// What the exploration reads, told to the session for the branch named: a head move
-    /// that changed none of it moves the pin without reading again (spec 015).
-    reads: BTreeSet<TypeRef>,
-    watch: Option<(String, ReadWatch)>,
+    /// What the exploration has read at its pin: a head move that changed none of it moves the
+    /// pin without reading again (spec 015).
+    scope: ReadScope,
     /// The head moved and the session is reading what changed.
     awaiting_changes: bool,
     _subscription: Subscription,
@@ -1148,6 +1147,10 @@ impl Exploration {
     }
 
     fn new(session: Entity<GraphSession>, cx: &mut Context<Self>) -> Self {
+        let scope = session.update(cx, |session, _| {
+            let branch = session.branch.clone();
+            session.read_scope(&branch)
+        });
         let subscription = cx.subscribe(&session, |this, session, event, cx| match event {
             SessionEvent::SchemaChanged => this.request_missing(cx),
             // Another writer changed the schema: what is shown stays until Refresh.
@@ -1177,8 +1180,7 @@ impl Exploration {
             newer_available: false,
             generation: 0,
             tasks: HashMap::new(),
-            reads: BTreeSet::new(),
-            watch: None,
+            scope,
             awaiting_changes: false,
             _subscription: subscription,
         }
@@ -1198,51 +1200,14 @@ impl Exploration {
         if pin == head {
             return;
         }
-        match session.changes_since(&session.branch, &pin, head) {
-            Since::Pending => self.awaiting_changes = true,
-            Since::Known(since) if !since.any_changed(&self.reads) => {
-                self.pin = Some(head.to_owned())
-            }
-            Since::Known(_) | Since::Unknown => {
+        match session.scope_since(&self.scope, &pin, head) {
+            ScopeSince::Pending => self.awaiting_changes = true,
+            ScopeSince::Unchanged => self.pin = Some(head.to_owned()),
+            ScopeSince::Changed => {
                 self.newer_available = true;
                 self.changed(cx);
             }
         }
-    }
-
-    /// Tells the session what the exploration reads: each shown node's type, its
-    /// relationships' edges and other types, and for a relationship grouped by its neighbours'
-    /// relationships those too. Told again when that changes.
-    fn watch_reads(&mut self, cx: &mut Context<Self>) {
-        let Some(schema) = self.schema(cx) else {
-            return;
-        };
-        let types: BTreeSet<&str> = self
-            .state
-            .root
-            .iter()
-            .chain(self.state.labels.keys())
-            .map(|node| node.type_name.as_str())
-            .collect();
-        let mut reads: BTreeSet<TypeRef> = types
-            .into_iter()
-            .flat_map(|ty| node_reads(&schema, ty))
-            .collect();
-        for (group, by) in &self.state.grouping {
-            if by.on == GroupOn::Relationship {
-                reads.extend(node_reads(&schema, &group.other_type));
-            }
-        }
-        let branch = self.session.read(cx).branch.clone();
-        if reads == self.reads && self.watch.as_ref().is_some_and(|(at, _)| *at == branch) {
-            return;
-        }
-        let types = reads.clone();
-        let watch = self
-            .session
-            .update(cx, |session, _| session.watch_reads(&branch, types));
-        self.watch = Some((branch, watch));
-        self.reads = reads;
     }
 
     pub fn session(&self) -> &Entity<GraphSession> {
@@ -1281,7 +1246,7 @@ impl Exploration {
 
     /// Starts a new exploration at `node`, at the branch head.
     pub fn root_at(&mut self, node: NodeRef, cx: &mut Context<Self>) {
-        self.reset_reads();
+        self.reset_reads(cx);
         let grouping = std::mem::take(&mut self.state.grouping);
         self.state = ExploreState::rooted(node);
         self.state.grouping = grouping;
@@ -1497,21 +1462,25 @@ impl Exploration {
 
     /// Drops the pin and everything read, and reads what is visible again at the branch head.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.reset_reads();
+        self.reset_reads(cx);
         self.state.clear_loaded();
         self.request_missing(cx);
         self.changed(cx);
     }
 
-    fn reset_reads(&mut self) {
+    fn reset_reads(&mut self, cx: &mut Context<Self>) {
         self.generation += 1;
         self.tasks.clear();
         self.pin = None;
         self.newer_available = false;
+        let scope = &self.scope;
+        self.session.update(cx, |session, _| {
+            let branch = session.branch.clone();
+            session.reset_scope(scope, &branch);
+        });
     }
 
     fn changed(&mut self, cx: &mut Context<Self>) {
-        self.watch_reads(cx);
         cx.emit(ExplorationEvent::Changed);
         cx.notify();
     }
@@ -1545,8 +1514,16 @@ impl Exploration {
             LoadTarget::Count(key) => {
                 self.state.counts.insert(key.clone(), Loadable::Loading);
                 let snapshot = self.pin.clone();
+                let scope = &self.scope;
                 let count = self.session.update(cx, |session, cx| {
-                    session.degree(&key.node.type_name, &key.group, &key.node.id, snapshot, cx)
+                    session.degree_in(
+                        scope,
+                        &key.node.type_name,
+                        &key.group,
+                        &key.node.id,
+                        snapshot,
+                        cx,
+                    )
                 });
                 self.spawn_count(target.clone(), count, cx);
                 return;
@@ -1628,9 +1605,16 @@ impl Exploration {
     ) {
         let snapshot = self.pin.clone();
         let generation = self.generation;
-        let read = self
-            .session
-            .update(cx, |session, cx| session.read(&query, snapshot.clone(), cx));
+        let scope = &self.scope;
+        let read = self.session.update(cx, |session, cx| {
+            session.read_in(scope, &query, snapshot.clone(), cx)
+        });
+        if let Some(without) = &without {
+            // Its answer goes into what is shown too.
+            let depends = without.depends.clone();
+            self.session
+                .update(cx, |session, _| session.note_in(scope, depends, None));
+        }
         let key = target.clone();
         let session = self.session.downgrade();
         let task = cx.spawn(async move |this, cx| {
@@ -1661,7 +1645,6 @@ impl Exploration {
                     return;
                 }
                 this.apply(&key, result);
-                this.watch_reads(cx);
                 this.loaded(&key, cx);
             })
             .ok();
@@ -2302,8 +2285,8 @@ mod tests {
         let _ = schema;
     }
 
-    /// Another writer's commit to none of the types the exploration reads moves its pin to the
-    /// head without reading again; one to a shown type offers Refresh (spec 015).
+    /// Another writer's commit that changed nothing the exploration shows moves its pin to the
+    /// head without reading again; one that changed a shown node offers Refresh (spec 015).
     #[gpui::test]
     async fn an_exploration_moves_its_pin_past_commits_to_other_types(
         cx: &mut gpui::TestAppContext,
@@ -2339,12 +2322,21 @@ mod tests {
         assert_eq!(pin(cx), (Some("c2".into()), false), "moved to the head");
         assert_eq!(served.lock().unwrap().feeds.len(), reads_before + 1);
 
+        // Another person: the tree shows only p1.
         served
             .lock()
             .unwrap()
             .commit("c3", vec![node_change("Person", "p9")]);
         session.update(cx, |session, cx| session.check_heads(cx));
         cx.run_until_parked();
-        assert_eq!(pin(cx), (Some("c2".into()), true), "a person changed");
+        assert_eq!(pin(cx), (Some("c3".into()), false), "another person");
+
+        served
+            .lock()
+            .unwrap()
+            .commit("c4", vec![node_change("Person", "p1")]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        assert_eq!(pin(cx), (Some("c3".into()), true), "the root changed");
     }
 }

@@ -45,6 +45,26 @@ pub enum Depends {
 }
 
 impl Depends {
+    /// A relationship's neighbours read by what they hold (a search, a value, a grouping): any
+    /// edge of the type and any node at its other end, and for a grouping by the neighbours'
+    /// own relationship that edge type and its ends too.
+    fn neighbours_by_value(
+        schema: &SchemaModel,
+        group: &RelationshipGroup,
+        by: Option<&GroupBy>,
+    ) -> Self {
+        let mut nodes = vec![group.other_type.clone()];
+        let mut edges = vec![group.edge.clone()];
+        if let Some(by) = by.filter(|by| by.on == GroupOn::Relationship)
+            && let Some((_, edge)) = parse_relationship_key(&by.property)
+            && let Some(edge) = schema.edge(edge)
+        {
+            edges.push(edge.name.clone());
+            nodes.extend([edge.from.clone(), edge.to.clone()]);
+        }
+        Self::Types { nodes, edges }
+    }
+
     /// A page or count of `type_name` rows: the type, and the types its filters reach through
     /// relationships, with both ends of each edge they name.
     fn rows_of(schema: &SchemaModel, type_name: &str, is_edge: bool, filters: &[Filter]) -> Self {
@@ -67,6 +87,37 @@ impl Depends {
             let Some(edge) = edge.and_then(|edge| schema.edge(edge)) else {
                 continue;
             };
+            edges.push(edge.name.clone());
+            nodes.extend([edge.from.clone(), edge.to.clone()]);
+        }
+        Self::Types { nodes, edges }
+    }
+
+    /// [`Depends::rows_of`] for rows counted by `key`: a property of their own, or what a
+    /// relationship key, a neighbour's property or an edge's end reaches too.
+    fn rows_counted_by(
+        schema: &SchemaModel,
+        type_name: &str,
+        is_edge: bool,
+        filters: &[Filter],
+        key: &str,
+    ) -> Self {
+        let Self::Types {
+            mut nodes,
+            mut edges,
+        } = Self::rows_of(schema, type_name, is_edge, filters)
+        else {
+            return Self::Unknown;
+        };
+        let edge = match parse_relationship_key(key) {
+            Some((_, edge)) => Some(edge),
+            None => match parse_group_key(key) {
+                GroupKey::NeighbourProperty { edge, .. } => Some(edge),
+                GroupKey::EndpointProperty { .. } => Some(type_name),
+                _ => None,
+            },
+        };
+        if let Some(edge) = edge.and_then(|edge| schema.edge(edge)) {
             edges.push(edge.name.clone());
             nodes.extend([edge.from.clone(), edge.to.clone()]);
         }
@@ -1107,7 +1158,7 @@ pub fn value_counts(
         name: "studio_value_counts".into(),
         text,
         params: params.values,
-        depends: Depends::Unknown,
+        depends: Depends::rows_counted_by(schema, type_name, edge_table, filters, property_name),
     })
 }
 
@@ -1163,7 +1214,7 @@ pub fn neighbour_counts(
         name: "studio_value_counts".into(),
         text,
         params: params.values,
-        depends: Depends::Unknown,
+        depends: Depends::rows_counted_by(schema, type_name, false, filters, key),
     })
 }
 
@@ -1238,7 +1289,7 @@ pub fn neighbour_value_counts(
         name: "studio_value_counts".into(),
         text,
         params: params.values,
-        depends: Depends::Unknown,
+        depends: Depends::rows_counted_by(schema, type_name, false, filters, key),
     })
 }
 
@@ -1299,7 +1350,7 @@ pub fn endpoint_value_counts(
         name: "studio_value_counts".into(),
         text,
         params: params.values,
-        depends: Depends::Unknown,
+        depends: Depends::rows_counted_by(schema, edge_name, true, filters, key),
     })
 }
 
@@ -1616,7 +1667,7 @@ pub fn neighbours_without_properties(
         .edge(&group.edge)
         .ok_or_else(|| BuildError::UnknownEdge(group.edge.clone()))?;
     let other = self::node(schema, &group.other_type)?;
-    // A narrowed list depends on the neighbours' properties too; it is read again.
+    // A narrowed list depends on what the neighbours hold too.
     let depends = if narrow.search.is_none_or(str::is_empty) && narrow.value.is_none() {
         Depends::EdgesAt {
             edge: group.edge.clone(),
@@ -1624,7 +1675,7 @@ pub fn neighbours_without_properties(
             listed: Some((other.name.clone(), "id".to_owned())),
         }
     } else {
-        Depends::Unknown
+        Depends::neighbours_by_value(schema, group, narrow.value.map(|(by, _)| by))
     };
     let mut params = Params::new();
     let id = params.add("id", "String", Value::String(id.to_owned()));
@@ -1738,7 +1789,7 @@ pub fn neighbour_values(
         name: "studio_neighbour_values".into(),
         text,
         params: params.values,
-        depends: Depends::Unknown,
+        depends: Depends::neighbours_by_value(schema, group, Some(by)),
     })
 }
 
@@ -1767,7 +1818,7 @@ pub fn neighbours_without(
         name: "studio_neighbours_without".into(),
         text,
         params: params.values,
-        depends: Depends::Unknown,
+        depends: Depends::neighbours_by_value(schema, group, Some(by)),
     })
 }
 

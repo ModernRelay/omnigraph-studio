@@ -8,7 +8,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use gq_language::SchemaModel;
 use gq_language::builder::Depends;
 use graph_client::api::{ChangeBlockOutput, ChangeFeedOutput, EntityKind};
 use serde_json::Value;
@@ -26,27 +25,6 @@ impl TypeRef {
             Self::Node(name) | Self::Edge(name) => name,
         }
     }
-}
-
-/// What a node's page, or a table of a node type, reads: the type, and through each of its
-/// relationship groups the edge type and the type at the other end.
-pub fn node_reads(schema: &SchemaModel, node_type: &str) -> BTreeSet<TypeRef> {
-    let mut types = BTreeSet::from([TypeRef::Node(node_type.to_owned())]);
-    for group in schema.relationships_of(node_type) {
-        types.insert(TypeRef::Edge(group.edge));
-        types.insert(TypeRef::Node(group.other_type));
-    }
-    types
-}
-
-/// What a view of an edge type reads: the edge type and the node types at its ends.
-pub fn edge_reads(schema: &SchemaModel, edge_type: &str) -> BTreeSet<TypeRef> {
-    let mut types = BTreeSet::from([TypeRef::Edge(edge_type.to_owned())]);
-    if let Some(edge) = schema.edge(edge_type) {
-        types.insert(TypeRef::Node(edge.from.clone()));
-        types.insert(TypeRef::Node(edge.to.clone()));
-    }
-    types
 }
 
 /// The most ids kept for one type over a range; past it every entity of the type counts as
@@ -200,6 +178,36 @@ impl ChangesSince {
 
 /// Whether `since` left alone an answer that depends on `depends` and holds `rows`.
 pub fn answer_unchanged(since: &ChangesSince, depends: &Depends, rows: &Value) -> bool {
+    depends_unchanged(since, depends, listed_ids(depends, rows).as_deref())
+}
+
+/// The nodes an answer lists, for a dependence that names a column of them.
+pub(crate) fn listed_ids(depends: &Depends, rows: &Value) -> Option<Vec<String>> {
+    let Depends::EdgesAt {
+        listed: Some((_, column)),
+        ..
+    } = depends
+    else {
+        return None;
+    };
+    Some(
+        rows.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| row.get(column).and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// Whether `since` left alone an answer that depends on `depends`. `listed` holds the nodes a
+/// list's answer named; while it is not known (the list is being read), any change to the
+/// listed type counts.
+pub(crate) fn depends_unchanged(
+    since: &ChangesSince,
+    depends: &Depends,
+    listed: Option<&[String]>,
+) -> bool {
     match depends {
         Depends::Unknown => false,
         Depends::Types { nodes, edges } => {
@@ -215,16 +223,15 @@ pub fn answer_unchanged(since: &ChangesSince, depends: &Depends, rows: &Value) -
         Depends::EdgesAt {
             edge,
             nodes,
-            listed,
+            listed: listed_type,
         } => {
             !nodes.iter().any(|node| since.edges_at(edge, node))
-                && listed.as_ref().is_none_or(|(type_name, column)| {
+                && listed_type.as_ref().is_none_or(|(type_name, _)| {
                     let ty = TypeRef::Node(type_name.clone());
-                    rows.as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|row| row.get(column).and_then(Value::as_str))
-                        .all(|id| !since.entity_changed(&ty, id))
+                    match listed {
+                        Some(ids) => ids.iter().all(|id| !since.entity_changed(&ty, id)),
+                        None => !since.type_changed(&ty),
+                    }
                 })
         }
     }

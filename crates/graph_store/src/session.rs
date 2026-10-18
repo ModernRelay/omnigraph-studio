@@ -24,10 +24,11 @@ use graph_client::{
 };
 use serde_json::Value;
 
-use crate::carry::{ChangeLog, FeedFold, Since, TypeRef, answer_unchanged};
+use crate::carry::{ChangeLog, FeedFold, Since, answer_unchanged};
 use crate::connection::Connection;
 use crate::degrees::{DEGREE_BATCH, DegreeBatchKey, DegreeBatches, page_counts};
 use crate::memo::{Held, Memo};
+use crate::scope::{ReadScope, Scope, ScopeSince};
 
 /// A value that loads from the server.
 #[derive(Debug, Clone, PartialEq)]
@@ -145,13 +146,6 @@ pub const HEAD_POLL: Duration = Duration::from_secs(30);
 /// that stops sooner leaves its remaining commits unknown: the views over them read again.
 const FEED_PAGE: u32 = 1_000;
 const FEED_PAGES: usize = 8;
-
-/// What a view reads, by type, while the watch is held: when its branch's head moves, the
-/// change feed is asked about these types, so a view none of them changed for moves to the new
-/// head without reading again (spec 015, carry-forward).
-pub struct ReadWatch {
-    _alive: Rc<()>,
-}
 
 /// A view's interest in a branch's head: the session asks after the branch while one is held.
 /// The session's own branch is always asked after.
@@ -271,8 +265,9 @@ pub struct GraphSession {
     head_watches: Vec<(String, Weak<()>)>,
     /// Head reads under way, by branch.
     head_reads: HashMap<String, Task<()>>,
-    /// The types views read, by branch, while their watch is held.
-    read_watches: Vec<(String, BTreeSet<TypeRef>, Weak<()>)>,
+    /// What each view has read at the commit it shows ([`ReadScope`]), while it holds its scope.
+    scopes: HashMap<u64, Scope>,
+    next_scope: u64,
     /// Each followed branch's commits as the change feed described them.
     change_logs: HashMap<String, ChangeLog>,
     /// Change-feed reads under way, by branch, and the branches whose head moved meanwhile.
@@ -323,7 +318,8 @@ impl GraphSession {
             drafts: HashMap::new(),
             head_watches: Vec::new(),
             head_reads: HashMap::new(),
-            read_watches: Vec::new(),
+            scopes: HashMap::new(),
+            next_scope: 0,
             change_logs: HashMap::new(),
             change_reads: HashMap::new(),
             change_reads_again: HashSet::new(),
@@ -730,12 +726,119 @@ impl GraphSession {
         HeadWatch { _alive: alive }
     }
 
-    /// Asks the change feed about `types` on `branch` while the returned watch is held.
-    pub fn watch_reads(&mut self, branch: &str, types: BTreeSet<TypeRef>) -> ReadWatch {
-        let alive = Rc::new(());
-        self.read_watches
-            .push((branch.to_owned(), types, Rc::downgrade(&alive)));
-        ReadWatch { _alive: alive }
+    /// A scope for a view of `branch`: the view reads what it shows through it
+    /// ([`GraphSession::read_in`]) while it holds it.
+    pub fn read_scope(&mut self, branch: &str) -> ReadScope {
+        self.next_scope += 1;
+        let (scope, handle) = Scope::new(self.next_scope, branch.to_owned());
+        self.scopes.retain(|_, scope| scope.is_alive());
+        self.scopes.insert(self.next_scope, scope);
+        handle
+    }
+
+    /// The view shows none of what it read through `scope` any more, and now reads `branch`.
+    pub fn reset_scope(&mut self, scope: &ReadScope, branch: &str) {
+        if let Some(scope) = self.scopes.get_mut(&scope.id) {
+            scope.reset(branch.to_owned());
+        }
+    }
+
+    /// Whether `scope`'s branch, moving from the commit the view shows (`from`) to `to`, changed
+    /// anything the view read through it.
+    pub fn scope_since(&self, scope: &ReadScope, from: &str, to: &str) -> ScopeSince {
+        let Some(scope) = self.scopes.get(&scope.id) else {
+            return ScopeSince::Changed;
+        };
+        if from == to {
+            return ScopeSince::Unchanged;
+        }
+        match self.changes_since(&scope.branch, from, to) {
+            Since::Pending => ScopeSince::Pending,
+            Since::Known(since) if scope.unchanged(&since) => ScopeSince::Unchanged,
+            Since::Known(_) | Since::Unknown => ScopeSince::Changed,
+        }
+    }
+
+    /// [`GraphSession::read`] for what a view shows: `scope` keeps what the answer depends on
+    /// from the moment it is asked.
+    pub fn read_in(
+        &mut self,
+        scope: &ReadScope,
+        query: &BuiltQuery,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
+        let id = scope.id;
+        let entry = self
+            .scopes
+            .get_mut(&id)
+            .map(|scope| scope.add(query.depends.clone()));
+        let read = self.read(query, snapshot, cx);
+        cx.spawn(async move |this, cx| {
+            let result = read.await;
+            if let (Some(entry), Ok(output)) = (entry, &result) {
+                this.update(cx, |this, _| {
+                    if let Some(scope) = this.scopes.get_mut(&id) {
+                        scope.answered(entry, &output.rows);
+                    }
+                })
+                .ok();
+            }
+            result
+        })
+    }
+
+    /// Adds to what `scope`'s view shows an answer read outside it that depends on `depends`,
+    /// with the nodes it lists when known (`None` counts the whole listed type).
+    pub fn note_in(&mut self, scope: &ReadScope, depends: Depends, listed: Option<Vec<String>>) {
+        if let Some(scope) = self.scopes.get_mut(&scope.id) {
+            scope.add_known(depends, listed);
+        }
+    }
+
+    /// [`GraphSession::degree`] for what a view shows: the count depends on the edges of the
+    /// group's type at the node.
+    pub fn degree_in(
+        &mut self,
+        scope: &ReadScope,
+        type_name: &str,
+        group: &RelationshipGroup,
+        id: &str,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<u64, String>> {
+        if let Some(scope) = self.scopes.get_mut(&scope.id) {
+            scope.add(Depends::EdgesAt {
+                edge: group.edge.clone(),
+                nodes: vec![id.to_owned()],
+                listed: None,
+            });
+        }
+        self.degree(type_name, group, id, snapshot, cx)
+    }
+
+    /// [`GraphSession::blob_meta`] for what a view shows: the cell depends on its node or edge.
+    pub fn blob_meta_in(
+        &mut self,
+        scope: &ReadScope,
+        cell: BlobCell,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<BlobMeta, ReadError>> {
+        if let Some(scope) = self.scopes.get_mut(&scope.id) {
+            scope.add(if cell.edge {
+                Depends::Types {
+                    nodes: Vec::new(),
+                    edges: vec![cell.type_name.clone()],
+                }
+            } else {
+                Depends::Node {
+                    type_name: cell.type_name.clone(),
+                    id: cell.id.clone(),
+                }
+            });
+        }
+        self.blob_meta(cell, snapshot, cx)
     }
 
     /// What `branch`'s commits after `from`, up to and including `to`, changed among the types
@@ -755,14 +858,13 @@ impl GraphSession {
         }
     }
 
-    /// The type names the views on `branch` read.
+    /// The type names what views on `branch` show depends on.
     fn read_names(&mut self, branch: &str) -> BTreeSet<String> {
-        self.read_watches
-            .retain(|(_, _, alive)| alive.strong_count() > 0);
-        self.read_watches
-            .iter()
-            .filter(|(watched, ..)| watched == branch)
-            .flat_map(|(_, types, _)| types.iter().map(|ty| ty.name().to_owned()))
+        self.scopes.retain(|_, scope| scope.is_alive());
+        self.scopes
+            .values()
+            .filter(|scope| scope.branch == branch)
+            .flat_map(Scope::names)
             .collect()
     }
 
@@ -1780,6 +1882,17 @@ mod tests {
     use super::*;
     use crate::connection::{ServerEntry, ServerSource};
 
+    /// A scope on main showing answers that depend on these node and edge types.
+    fn watching(session: &mut GraphSession, nodes: &[&str], edges: &[&str]) -> ReadScope {
+        let scope = session.read_scope("main");
+        let depends = Depends::Types {
+            nodes: nodes.iter().map(|n| n.to_string()).collect(),
+            edges: edges.iter().map(|e| e.to_string()).collect(),
+        };
+        session.note_in(&scope, depends, None);
+        scope
+    }
+
     #[gpui::test]
     async fn a_graph_that_answers_503_is_unavailable_until_it_answers_again(
         cx: &mut TestAppContext,
@@ -2755,9 +2868,7 @@ mod tests {
         let person = TypeRef::Node("Person".into());
         let company = TypeRef::Node("Company".into());
 
-        let watch = session.update(cx, |session, _| {
-            session.watch_reads("main", BTreeSet::from([person.clone()]))
-        });
+        let watch = session.update(cx, |session, _| watching(session, &["Person"], &[]));
         commit(cx, "c2", vec![node_change("Company", "co1")]);
         assert!(
             matches!(since(cx, "c1", "c2"), Since::Pending),
@@ -2799,9 +2910,7 @@ mod tests {
         assert!(matches!(since(cx, "c3", "c4"), Since::Unknown));
 
         // A schema changed in between: what the feed said does not count.
-        let _watch = session.update(cx, |session, _| {
-            session.watch_reads("main", BTreeSet::from([person.clone()]))
-        });
+        let _watch = session.update(cx, |session, _| watching(session, &["Person"], &[]));
         served.lock().unwrap().schema =
             format!("{SCHEMA}node Project {{\n  slug: String @key\n}}\n");
         commit(cx, "c5", vec![node_change("Company", "co2")]);
@@ -2817,7 +2926,6 @@ mod tests {
     async fn a_read_at_a_new_head_is_answered_from_an_earlier_commit_it_still_holds_for(
         cx: &mut TestAppContext,
     ) {
-        use crate::carry::node_reads;
         use crate::test_server::{followed_session, node_change};
         use serde_json::json;
 
@@ -2837,9 +2945,7 @@ mod tests {
         );
         cx.run_until_parked();
         let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
-        let _watch = session.update(cx, |session, _| {
-            session.watch_reads("main", node_reads(&schema, "Person"))
-        });
+        let _watch = session.update(cx, |session, _| watching(session, &["Person"], &["Knows"]));
         let group = schema.relationships_of("Person")[0].clone();
         let neighbours = builder::neighbours(
             &schema,
@@ -2896,7 +3002,7 @@ mod tests {
     /// again. A head move whose feed read finds another schema takes it (spec 015).
     #[gpui::test]
     async fn answers_kept_under_one_schema_are_not_given_under_another(cx: &mut TestAppContext) {
-        use crate::carry::{Since, node_reads};
+        use crate::carry::Since;
         use crate::test_server::{followed_session, node_change};
         use serde_json::json;
 
@@ -2936,9 +3042,7 @@ mod tests {
 
         // Another writer changes the schema; the head move's feed read finds it and the session
         // takes it, telling views it moved rather than changing them.
-        let _watch = session.update(cx, |session, _| {
-            session.watch_reads("main", node_reads(&schema, "Person"))
-        });
+        let _watch = session.update(cx, |session, _| watching(session, &["Person"], &["Knows"]));
         let events = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
         let heard = events.clone();
         cx.update(|cx| {
