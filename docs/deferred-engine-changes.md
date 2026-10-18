@@ -12,8 +12,6 @@ one is picked up it goes through OmniGraph's own RFC process.
 | E3 | Loopback guard (Host allowlist, Origin check, no CORS) in the launcher | E1 | — |
 | E4 | Owner discovery for a graph root (discovery, not fencing) | E1 | — |
 | E5 | Writer-safety rules for local sessions | E1 | Enforced by the server Studio talks to |
-| E6 | Paged branch-to-branch diff with before and after images | 008 | Change feed folded from the fork, capped at 20,000, "Partial" when capped |
-| E8 | Merge preview with no effects | 008 | Merge on request; a 409 lists conflicts and nothing moved |
 | E9 | Branch details (head, fork, creator, times) | 002, 008 | Derived from `GET /commits?branch=` |
 | E10 | Paged commit list | 009 | Full list, virtualized, warning above 5,000 commits |
 | E11 | Typed result columns or Arrow IPC | 004, 007 | Column types from `omnigraph-compiler`'s `describe_query_operation` |
@@ -27,17 +25,17 @@ one is picked up it goes through OmniGraph's own RFC process.
 | E19 | Publish `omnigraph-compiler` to crates.io again (stops at 0.8.0) | 001 | Git dependency on tag `edge-20261017-d883c49` |
 | E20 | Delegated, branch-scoped credentials for agents, recorded in history beside the actor ([#978](https://github.com/ModernRelay/omnigraph/issues/978)) | 011, 013 | Agent commits are recorded under the person's actor, on a branch named `agent/<stamp>`; Studio's gateway keeps the agent's writes on that branch |
 | E22 | The CLI reports a write refused at authentication, policy or the contract as not started ([#976](https://github.com/ModernRelay/omnigraph/issues/976)) | 013 | `AGENTS.md` says a Studio refusal wrote nothing |
-| E23 | `omnigraph version --json` with the HTTP contract ([#977](https://github.com/ModernRelay/omnigraph/issues/977)) | 013 | Each installed CLI is tested once against the gateway |
-| E24 | Unix-socket transport for `--server` ([#979](https://github.com/ModernRelay/omnigraph/issues/979)) | 013 | Codex reaches the gateway only with network access the person grants |
 | E25 | One mutation that both adds and removes (lift rule D2 for one write) | 014 | A relationship replacement saves as two ordered commits, or through a branch and a merge |
 | E26 | Edge update (T16) | 014 | An unkeyed edge's properties save as delete and insert, with a new id |
 | E27 | Annotation-only schema changes (a display hint on an existing property) | 014 | Every String reads as markdown; a hint can go only on a new property or type |
 | E28 | Merge bound to the reviewed source head (a precondition on the source, as `If-Graph-Commit` binds a write to its target) | 008 | Checks the source head just before merging; a commit landing in between is merged too, and the outcome says the merge took a commit made after the review was read |
 
-In OmniGraph 0.14 (`edge-20261017-d883c49`, checked 2026-10-17; the HTTP contract header is
-still `0.13`), and so on every server Studio supports. Studio uses E7: a review reads its fork
-and head from the merge base, and a merge is confirmed by the source head becoming the merge
-base. Paged commit lists (E10, #1013) landed on main after that build.
+These landed in OmniGraph 0.14 (`edge-20261017-d883c49`, checked 2026-10-17; the HTTP contract
+header is still `0.13`), and so are on every server Studio supports. Studio uses E7, E6 and
+E23: a review reads its fork and head from the merge base, and a merge is confirmed by the
+source head becoming the merge base; a branch its target was merged into is reviewed from
+`GET /diff` from that base; the agent's CLI is chosen by its `version --json`. E8 and E24 are
+not used yet. Paged commit lists (E10, #1013) landed on main after that build.
 
 | ID | Feature | Operation | Spec |
 |---|---|---|---|
