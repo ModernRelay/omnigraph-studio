@@ -162,10 +162,6 @@ pub fn stamp(dir: Option<&Path>) -> Vec<Option<(SystemTime, u64)>> {
         .collect()
 }
 
-pub fn load_servers_from(path: &Path) -> Result<Vec<CliServer>, String> {
-    load_operator_from(path).map(|(servers, _)| servers)
-}
-
 /// The servers and the aliases in a CLI config file.
 fn load_operator_from(path: &Path) -> Result<(Vec<CliServer>, Vec<CliAlias>), String> {
     let text = match std::fs::read_to_string(path) {
@@ -315,7 +311,7 @@ mod tests {
             "servers:\n  local:\n    url: http://127.0.0.1:8787  # dev\n  prod: { url: https://example.com }\nprofiles:\n  dev: { server: local, default_graph: knowledge }\ndefaults:\n  output: table\naliases:\n  who: { server: local, graph: knowledge, query: who_is, args: [slug], params: { limit: 5, deep: true }, format: kv }\n  bare: { server: local, query: who_is }\n  broken: { graph: knowledge }\n",
         )
         .unwrap();
-        let servers = load_servers_from(&path).unwrap();
+        let (servers, _) = load_operator_from(&path).unwrap();
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].name, "local");
         assert_eq!(servers[0].graphs, vec!["knowledge"]);

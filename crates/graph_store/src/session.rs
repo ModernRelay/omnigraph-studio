@@ -8,13 +8,13 @@ use std::time::{Duration, SystemTime};
 
 use futures::FutureExt as _;
 use futures::channel::oneshot;
-use futures::future::{Either, Shared, select};
+use futures::future::{Either, WeakShared, select};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task};
 use gq_language::builder::{Depends, Seeds};
 use gq_language::{BuiltQuery, RelationshipGroup, SchemaModel, builder};
 use graph_client::api::{
     BranchCreateOutput, BranchCreateRequest, BranchMergeOutput, BranchMergeRequest,
-    ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitOutput, GraphListResponse,
+    ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitOutput, EntityKind, GraphListResponse,
     InvokeStoredQueryRequest, MergeBaseOutput, QueryCatalogEntry, QueryRequest, ReadOutput,
     ReadTargetOutput, ReadinessOutput, SnapshotDatasetOutput, SnapshotOutput,
 };
@@ -126,6 +126,11 @@ pub enum SessionEvent {
     /// one now; a view still showing what it read under the old one offers Refresh, which takes
     /// it. Unlike [`SessionEvent::SchemaChanged`], nothing on screen changes by itself.
     SchemaMoved,
+    /// The session's branch is not in a branch list read after it moved there (deleted
+    /// elsewhere, or since the last run), so the session moved to main.
+    BranchMissing {
+        branch: String,
+    },
 }
 
 /// How many answers to reads pinned to a commit, and Blob cells at a commit, a session keeps. A
@@ -140,7 +145,7 @@ const COMMIT_LISTS: usize = 64;
 
 /// How often a session asks after the heads of the branches its views show, while a window of
 /// Studio's is active.
-pub const HEAD_POLL: Duration = Duration::from_secs(30);
+const HEAD_POLL: Duration = Duration::from_secs(30);
 
 /// Changes asked for per page of a change-feed read, and the most pages one read takes. A read
 /// that stops sooner leaves its remaining commits unknown: the views over them read again.
@@ -188,16 +193,25 @@ struct DegreeAt {
 /// How many nodes' counts a session keeps.
 const DEGREE_COUNTS: usize = 16_384;
 
+/// How many writes' outcomes the activity log keeps: an agent can write thousands of times in
+/// one session.
+const OUTCOMES: usize = 1_000;
+
 /// Adds `commit` to the commits kept for `family`, the newest last and the last 16 at most. A
-/// map grown past `cap` families starts again: carrying across commits is a saving, not a need.
-fn remember<F: std::hash::Hash + Eq>(
+/// new family past `cap` takes the place of another: carrying across commits is a saving, not
+/// a need, and a table's scroll seeds a family per row, so emptying the map at the cap would
+/// forget every other read's commits at once.
+fn remember<F: std::hash::Hash + Eq + Clone>(
     map: &mut HashMap<F, Vec<String>>,
     family: F,
     commit: &str,
     cap: usize,
 ) {
-    if map.len() > cap && !map.contains_key(&family) {
-        map.clear();
+    if map.len() >= cap
+        && !map.contains_key(&family)
+        && let Some(other) = map.keys().next().cloned()
+    {
+        map.remove(&other);
     }
     let commits = map.entry(family).or_default();
     if commits.last().map(String::as_str) != Some(commit) {
@@ -265,7 +279,16 @@ impl FeedNext {
 }
 
 /// Answers kept by key, with the read under way shared by everyone who asks meanwhile.
-type ReadMemo<K, V> = Memo<K, V, Shared<Task<Result<V, ReadError>>>>;
+type ReadMemo<K, V> = Memo<K, V, Pending<V>>;
+
+/// A read under way, as a read memo keeps it: a weak handle, so the read stops once every view
+/// that asked for it has dropped it (`counted_read` then gives its slot back to the reads still
+/// wanted), and a ticket, so its answer is filed for it alone (`Memo::finish`).
+#[derive(Clone)]
+pub(crate) struct Pending<V: 'static> {
+    read: WeakShared<Task<Result<V, ReadError>>>,
+    ticket: u64,
+}
 
 pub struct GraphSession {
     pub connection: Entity<Connection>,
@@ -276,9 +299,11 @@ pub struct GraphSession {
     pub datasets: Loadable<Vec<SnapshotDatasetOutput>>,
     /// Each type's row count from `datasets`, by name: the sidebar asks for every type each
     /// frame.
-    dataset_counts: HashMap<String, i64>,
+    /// Row counts by kind and type: a node type and an edge type may share a name.
+    dataset_counts: HashMap<(EntityKind, String), i64>,
     /// The queries the server serves by name for this graph (spec 007), read with the schema.
     pub stored_queries: Loadable<Arc<Vec<QueryCatalogEntry>>>,
+    /// Every write's outcome, oldest first: the newest [`OUTCOMES`].
     pub outcomes: Vec<OutcomeEntry>,
     pub reads_in_flight: usize,
     pub writes_in_flight: usize,
@@ -288,6 +313,8 @@ pub struct GraphSession {
     recheck_after: Duration,
     /// Answers to reads pinned to a commit, and those under way (they never change).
     pinned_reads: ReadMemo<PinnedRead, ReadOutput>,
+    /// Numbers the reads the memos keep under way (`Pending`).
+    next_ticket: u64,
     pinned_blobs: ReadMemo<(BlobCell, String, u64), BlobMeta>,
     /// Each node's count through a group, by commit: read in a batch, or what a page's counts
     /// gave (`builder::Seeds`). Shared by the table, the peek, the tree and the canvas.
@@ -308,6 +335,9 @@ pub struct GraphSession {
     commit_lists: ReadMemo<String, CommitList>,
     /// The branch list has been read once; reading it again forgets the commit lists.
     branches_read: bool,
+    /// How many times the session has moved to another branch: a branch list asked for before
+    /// the last move may not hold a branch made since, so only a later one shows it is gone.
+    branch_moves: u64,
     /// Relationship counts asked for this turn, read together when it ends.
     degrees: DegreeBatches,
     /// The commit each watched branch's head was last seen at, by the head watch or as one of
@@ -364,6 +394,7 @@ impl GraphSession {
             unavailable: None,
             recheck_after: RECHECK_FIRST,
             pinned_reads: Memo::weighed(PINNED_READS, PINNED_READ_BYTES, read_bytes),
+            next_ticket: 0,
             pinned_blobs: Memo::new(PINNED_BLOBS),
             degree_counts: Memo::new(DEGREE_COUNTS),
             pinned_commits: HashMap::new(),
@@ -372,6 +403,7 @@ impl GraphSession {
             schema_text: None,
             commit_lists: Memo::new(COMMIT_LISTS),
             branches_read: false,
+            branch_moves: 0,
             degrees: DegreeBatches::default(),
             heads: HashMap::new(),
             drafts: HashMap::new(),
@@ -433,10 +465,6 @@ impl GraphSession {
 
     pub fn server_name(&self, cx: &App) -> String {
         self.connection.read(cx).server.name.clone()
-    }
-
-    pub fn supports(&self, operation_id: &str, cx: &App) -> bool {
-        self.connection.read(cx).supports(operation_id)
     }
 
     pub fn schema_model(&self) -> Option<Arc<SchemaModel>> {
@@ -643,12 +671,24 @@ impl GraphSession {
 
     /// Reads the schema again while keeping the one held, and takes it if its text changed: a
     /// head move showed another writer may have changed it.
-    fn recheck_schema(&mut self, cx: &mut Context<Self>) {
+    fn recheck_schema(
+        &mut self,
+        read: Option<graph_client::api::SchemaOutput>,
+        cx: &mut Context<Self>,
+    ) {
+        // A reload under way reads the newest schema anyway, and views take it at once; a
+        // recheck in its place would cancel it.
+        if matches!(self.schema, Loadable::Loading) {
+            return;
+        }
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let known = self.schema_text.clone();
         let read = cx.background_spawn(async move {
-            let read = client.schema(&graph).await;
+            let read = match read {
+                Some(output) => Ok(output),
+                None => client.schema(&graph).await,
+            };
             // Compiled off the main thread, and only when it is another text.
             let parsed = read
                 .as_ref()
@@ -679,6 +719,7 @@ impl GraphSession {
         self.branches = Loadable::Loading;
         let client = self.client(cx);
         let graph = self.graph_id.clone();
+        let moves = self.branch_moves;
         let read = cx.background_spawn(async move { client.branches(&graph).await });
         self._branches_task = Some(cx.spawn(async move |this, cx| {
             let read = read.await;
@@ -698,14 +739,43 @@ impl GraphSession {
                 this.branches = result;
                 cx.emit(SessionEvent::BranchesChanged);
                 cx.notify();
+                this.leave_missing_branch(moves, cx);
             })
             .ok();
         }));
     }
 
+    /// Moves the session to main when the branch list, asked for after its last move (`moves`),
+    /// does not hold its branch: every read of a branch that is gone fails.
+    fn leave_missing_branch(&mut self, moves: u64, cx: &mut Context<Self>) {
+        let Loadable::Loaded(branches) = &self.branches else {
+            return;
+        };
+        if moves != self.branch_moves || self.branch == "main" || branches.contains(&self.branch) {
+            return;
+        }
+        let branch = self.branch.clone();
+        self.set_branch("main".into(), cx);
+        cx.emit(SessionEvent::BranchMissing { branch });
+    }
+
     pub fn reload_counts(&mut self, cx: &mut Context<Self>) {
         self.datasets = Loadable::Loading;
         self.dataset_counts.clear();
+        self.read_counts(cx);
+    }
+
+    /// Reads the counts again after a commit on the session's branch: the ones shown stay until
+    /// the new ones are in, rather than blanking every count at each commit.
+    fn refresh_counts(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.datasets, Loadable::Loaded(_)) {
+            self.read_counts(cx);
+        } else {
+            self.reload_counts(cx);
+        }
+    }
+
+    fn read_counts(&mut self, cx: &mut Context<Self>) {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let branch = self.branch.clone();
@@ -721,7 +791,10 @@ impl GraphSession {
                 this.dataset_counts = match &result {
                     Loadable::Loaded(datasets) => datasets
                         .iter()
-                        .map(|dataset| (dataset.type_name.clone(), dataset.entity_count))
+                        .map(|dataset| {
+                            let key = (dataset.entity_kind, dataset.type_name.clone());
+                            (key, dataset.entity_count)
+                        })
                         .collect(),
                     _ => HashMap::new(),
                 };
@@ -748,9 +821,11 @@ impl GraphSession {
         }
     }
 
-    /// The row count of a type at the branch head, from the snapshot.
-    pub fn count_of(&self, type_name: &str) -> Option<i64> {
-        self.dataset_counts.get(type_name).copied()
+    /// The row count of a node or edge type at the branch head, from the snapshot.
+    pub fn count_of(&self, kind: EntityKind, type_name: &str) -> Option<i64> {
+        self.dataset_counts
+            .get(&(kind, type_name.to_owned()))
+            .copied()
     }
 
     pub fn set_branch(&mut self, branch: String, cx: &mut Context<Self>) {
@@ -758,6 +833,7 @@ impl GraphSession {
             return;
         }
         self.branch = branch;
+        self.branch_moves += 1;
         self.reload_counts(cx);
         cx.emit(SessionEvent::BranchChanged);
         cx.notify();
@@ -771,7 +847,12 @@ impl GraphSession {
 
     /// Every unsaved value on the session's branch, by type, id and property.
     pub fn drafts(&self) -> impl Iterator<Item = (&DraftKey, &DraftEntry)> {
-        self.drafts.get(&self.branch).into_iter().flatten()
+        self.drafts_on(&self.branch)
+    }
+
+    /// Every unsaved value on `branch`.
+    pub fn drafts_on(&self, branch: &str) -> impl Iterator<Item = (&DraftKey, &DraftEntry)> {
+        self.drafts.get(branch).into_iter().flatten()
     }
 
     /// Keeps a property's unsaved value on the session's branch, replacing the one there.
@@ -786,7 +867,19 @@ impl GraphSession {
 
     /// Lets a property's unsaved value go: saved, discarded or put back.
     pub fn remove_draft(&mut self, key: &DraftKey, cx: &mut Context<Self>) -> Option<DraftEntry> {
-        let removed = self.drafts.get_mut(&self.branch)?.remove(key);
+        let branch = self.branch.clone();
+        self.remove_draft_on(&branch, key, cx)
+    }
+
+    /// As [`GraphSession::remove_draft`], on `branch`: a save that lands after the session moved
+    /// to another branch lets go of the draft it saved, not that branch's.
+    pub fn remove_draft_on(
+        &mut self,
+        branch: &str,
+        key: &DraftKey,
+        cx: &mut Context<Self>,
+    ) -> Option<DraftEntry> {
+        let removed = self.drafts.get_mut(branch)?.remove(key);
         if removed.is_some() {
             cx.emit(SessionEvent::DraftsChanged);
             cx.notify();
@@ -863,12 +956,16 @@ impl GraphSession {
             .get_mut(&id)
             .map(|scope| scope.add(query.depends.clone()));
         let read = self.read(query, snapshot, cx);
+        // The token goes with this task: dropped by the view, the read stops counting as out.
         cx.spawn(async move |this, cx| {
             let result = read.await;
-            if let (Some(entry), Ok(output)) = (entry, &result) {
+            if let Some((entry, _token)) = entry {
                 this.update(cx, |this, _| {
                     if let Some(scope) = this.scopes.get_mut(&id) {
-                        scope.answered(entry, &output.rows);
+                        match &result {
+                            Ok(output) => scope.answered(entry, &output.rows),
+                            Err(_) => scope.failed(entry),
+                        }
                     }
                 })
                 .ok();
@@ -896,8 +993,9 @@ impl GraphSession {
         snapshot: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<u64, String>> {
+        // A count lists no nodes: nothing it says waits for its answer.
         if let Some(scope) = self.scopes.get_mut(&scope.id) {
-            scope.add(Depends::EdgesAt {
+            let _ = scope.add(Depends::EdgesAt {
                 edge: group.edge.clone(),
                 nodes: vec![id.to_owned()],
                 listed: None,
@@ -915,7 +1013,7 @@ impl GraphSession {
         cx: &mut Context<Self>,
     ) -> Task<Result<BlobMeta, ReadError>> {
         if let Some(scope) = self.scopes.get_mut(&scope.id) {
-            scope.add(if cell.edge {
+            let _ = scope.add(if cell.edge {
                 Depends::Types {
                     nodes: Vec::new(),
                     edges: vec![cell.type_name.clone()],
@@ -1067,7 +1165,12 @@ impl GraphSession {
                     branch: branch.clone(),
                 });
                 if schema_moved && this.schema_epoch == epoch {
-                    this.recheck_schema(cx);
+                    // The text just read, when there is one, is not read again.
+                    let read = match schema_read {
+                        Some(Ok(output)) => Some(output),
+                        _ => None,
+                    };
+                    this.recheck_schema(read, cx);
                 }
                 if this.change_reads_again.remove(&branch) {
                     this.read_changes(&branch, cx);
@@ -1157,6 +1260,7 @@ impl GraphSession {
         }
         let client = self.client(cx);
         let graph = self.graph_id.clone();
+        let moves = self.branch_moves;
         let read = cx.background_spawn(async move { client.branches(&graph).await });
         self.branch_recheck = Some(cx.spawn(async move |this, cx| {
             let read = read.await;
@@ -1167,15 +1271,15 @@ impl GraphSession {
                     return;
                 };
                 let branches = branch_order(output.branches);
-                if this.branches.loaded() == Some(&branches) {
-                    return;
+                if this.branches.loaded() != Some(&branches) {
+                    // As after any branch list read: a branch deleted and made again under its
+                    // name has another history.
+                    this.commit_lists.clear();
+                    this.branches = Loadable::Loaded(branches);
+                    cx.emit(SessionEvent::BranchesChanged);
+                    cx.notify();
                 }
-                // As after any branch list read: a branch deleted and made again under its
-                // name has another history.
-                this.commit_lists.clear();
-                this.branches = Loadable::Loaded(branches);
-                cx.emit(SessionEvent::BranchesChanged);
-                cx.notify();
+                this.leave_missing_branch(moves, cx);
             })
             .ok();
         }));
@@ -1198,7 +1302,7 @@ impl GraphSession {
         if previous.is_some() && !own {
             self.commit_lists.forget(&branch);
             if branch == self.branch {
-                self.reload_counts(cx);
+                self.refresh_counts(cx);
             }
             cx.emit(SessionEvent::Committed {
                 branch: branch.clone(),
@@ -1236,12 +1340,7 @@ impl GraphSession {
                     let Ok(query) = builder::node_by_id(&schema, type_name, id) else {
                         continue;
                     };
-                    let key = PinnedRead {
-                        commit: commit.clone(),
-                        query: query.text,
-                        params: params_key(&query.params),
-                        schema: epoch,
-                    };
+                    let key = self.pinned_key(&query, &commit);
                     if !self.pinned_reads.holds(&key) {
                         self.kept_at(&key);
                         let answer = ReadOutput {
@@ -1365,6 +1464,16 @@ impl GraphSession {
         found
     }
 
+    /// The memo key of `query` read at `commit`, under the session's schema.
+    fn pinned_key(&self, query: &BuiltQuery, commit: &str) -> PinnedRead {
+        PinnedRead {
+            commit: commit.to_owned(),
+            query: query.text.clone(),
+            params: params_key(&query.params),
+            schema: self.schema_epoch,
+        }
+    }
+
     /// Notes that an answer for `key` is kept, so a miss at another commit finds it.
     fn kept_at(&mut self, key: &PinnedRead) {
         let family = (key.query.clone(), key.params.clone(), key.schema);
@@ -1380,8 +1489,14 @@ impl GraphSession {
         snapshot: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<ReadOutput, ReadError>> {
+        // An answer kept at its commit filed what its rows answer when it was read.
+        let kept = snapshot.as_deref().is_some_and(|commit| {
+            self.pinned_reads
+                .peek(&self.pinned_key(query, commit))
+                .is_some()
+        });
         let read = self.read_kept(query, snapshot, cx);
-        let Some(seeds) = query.seeds.clone() else {
+        let Some(seeds) = query.seeds.clone().filter(|_| !kept) else {
             return read;
         };
         // What its rows also answer is kept too, at the commit and schema it was read under.
@@ -1410,35 +1525,71 @@ impl GraphSession {
             branch: snapshot.is_none().then(|| self.branch.clone()),
             snapshot,
         };
-        let Some(commit) = request.snapshot.clone() else {
+        let Some(commit) = request.snapshot.as_deref() else {
             return self.read_request(request, cx);
         };
-        let key = PinnedRead {
-            commit,
-            query: request.query.clone(),
-            params: params_key(&query.params),
-            schema: self.schema_epoch,
+        let key = self.pinned_key(query, commit);
+        // Neither an answer nor a read someone still waits for: carried from an earlier
+        // commit when nothing it depends on changed since.
+        let none = match self.pinned_reads.get(&key) {
+            None => true,
+            Some(Held::Pending(pending)) => pending.read.upgrade().is_none(),
+            Some(Held::Done(_)) => false,
         };
-        let shared = match self.pinned_reads.get(&key) {
-            Some(Held::Done(output)) => return Task::ready(Ok(output)),
-            Some(Held::Pending(shared)) => shared,
-            None if let Some(output) = self.carried(&key, &query.depends) => {
-                self.kept_at(&key);
-                self.pinned_reads.insert(key, output.clone());
-                return Task::ready(Ok(output));
+        if none && let Some(output) = self.carried(&key, &query.depends) {
+            self.kept_at(&key);
+            self.pinned_reads.insert(key, output.clone());
+            return Task::ready(Ok(output));
+        }
+        self.share(
+            |session| &mut session.pinned_reads,
+            key,
+            move |session, cx| session.read_at_commit(request, cx),
+            Self::kept_at,
+            cx,
+        )
+    }
+
+    /// What `memo` keeps for `key`: its answer, the read under way that someone still waits
+    /// for, or a new read `start` begins. Every asker's task files the answer under the read it
+    /// shared, and `answered` runs when one is kept. Dropping every asker's task stops the read.
+    fn share<K, V>(
+        &mut self,
+        memo: fn(&mut Self) -> &mut ReadMemo<K, V>,
+        key: K,
+        start: impl FnOnce(&mut Self, &mut Context<Self>) -> Task<Result<V, ReadError>>,
+        answered: fn(&mut Self, &K),
+        cx: &mut Context<Self>,
+    ) -> Task<Result<V, ReadError>>
+    where
+        K: std::hash::Hash + Eq + Clone + 'static,
+        V: Clone + 'static,
+    {
+        let shared = match memo(self).get(&key) {
+            Some(Held::Done(value)) => return Task::ready(Ok(value)),
+            Some(Held::Pending(pending)) => {
+                pending.read.upgrade().map(|read| (read, pending.ticket))
             }
+            None => None,
+        };
+        let (read, ticket) = match shared {
+            Some(shared) => shared,
             None => {
-                let shared = self.read_at_commit(request, cx).shared();
-                self.pinned_reads.start(key.clone(), shared.clone());
-                shared
+                let read = start(self, cx).shared();
+                self.next_ticket += 1;
+                let ticket = self.next_ticket;
+                if let Some(weak) = read.downgrade() {
+                    memo(self).start(key.clone(), Pending { read: weak, ticket });
+                }
+                (read, ticket)
             }
         };
         cx.spawn(async move |this, cx| {
-            let result = shared.await;
+            let result = read.await;
             this.update(cx, |this, _| {
-                this.pinned_reads.finish(&key, &result);
-                if result.is_ok() {
-                    this.kept_at(&key);
+                let kept = memo(this).finish(&key, &result, |pending| pending.ticket == ticket);
+                if kept && result.is_ok() {
+                    answered(this, &key);
                 }
             })
             .ok();
@@ -1580,21 +1731,13 @@ impl GraphSession {
         // At a commit a cell never changes: the table, the peek and the Blob tab share one read.
         if let Some(commit) = snapshot.clone() {
             let key = (cell.clone(), commit, self.schema_epoch);
-            let shared = match self.pinned_blobs.get(&key) {
-                Some(Held::Done(meta)) => return Task::ready(Ok(meta)),
-                Some(Held::Pending(shared)) => shared,
-                None => {
-                    let shared = self.blob_meta_unpinned(cell, snapshot, cx).shared();
-                    self.pinned_blobs.start(key.clone(), shared.clone());
-                    shared
-                }
-            };
-            return cx.spawn(async move |this, cx| {
-                let result = shared.await;
-                this.update(cx, |this, _| this.pinned_blobs.finish(&key, &result))
-                    .ok();
-                result
-            });
+            return self.share(
+                |session| &mut session.pinned_blobs,
+                key,
+                move |session, cx| session.blob_meta_unpinned(cell, snapshot, cx),
+                |_, _| {},
+                cx,
+            );
         }
         self.blob_meta_unpinned(cell, snapshot, cx)
     }
@@ -1608,15 +1751,14 @@ impl GraphSession {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let branch = self.branch.clone();
-        cx.spawn(async move |this, cx| {
+        let request = async move {
             let at = match &snapshot {
                 Some(commit) => BlobAt::Snapshot(commit),
                 None => BlobAt::Branch(&branch),
             };
-            let result = client.blob_head(&graph, &cell, at).await;
-            this.update(cx, |this, cx| this.note_read(&result, cx)).ok();
-            result
-        })
+            client.blob_head(&graph, &cell, at).await
+        };
+        self.counted_read(request, cx)
     }
 
     /// A branch's commits as the server lists them. Read once and shared by every view that
@@ -1633,34 +1775,26 @@ impl GraphSession {
         if fresh {
             self.commit_lists.forget(&key);
         }
-        let shared = match self.commit_lists.get(&key) {
-            Some(Held::Done(list)) => return Task::ready(Ok(list)),
-            Some(Held::Pending(shared)) => shared,
-            None => {
-                let client = self.client(cx);
-                let graph = self.graph_id.clone();
-                let branch = key.clone();
-                let shared = self
-                    .counted_read(
-                        async move {
-                            client
-                                .commits(&graph, &branch)
-                                .await
-                                .map(|list| Arc::new(list.commits))
-                        },
-                        cx,
-                    )
-                    .shared();
-                self.commit_lists.start(key.clone(), shared.clone());
-                shared
-            }
-        };
-        cx.spawn(async move |this, cx| {
-            let result = shared.await;
-            this.update(cx, |this, _| this.commit_lists.finish(&key, &result))
-                .ok();
-            result
-        })
+        let branch = key.clone();
+        self.share(
+            |session| &mut session.commit_lists,
+            key,
+            move |session, cx| {
+                let client = session.client(cx);
+                let graph = session.graph_id.clone();
+                session.counted_read(
+                    async move {
+                        client
+                            .commits(&graph, &branch)
+                            .await
+                            .map(|list| Arc::new(list.commits))
+                    },
+                    cx,
+                )
+            },
+            |_, _| {},
+            cx,
+        )
     }
 
     /// One page of a commit's changes against its first parent, from `page_token` (the first
@@ -1888,12 +2022,16 @@ impl GraphSession {
         description: String,
         cx: &mut Context<Self>,
     ) -> Task<WriteOutcome<ChangeOutput>> {
-        self.write_with(query, if_commit, description, None, cx)
+        let branch = self.branch.clone();
+        self.write_on(&branch, query, if_commit, description, None, cx)
     }
 
-    /// [`Self::write`], whose outcome offers `follow_up` once it commits.
-    pub fn write_with(
+    /// [`Self::write`] on `branch`, whose outcome offers `follow_up` once it commits: each write
+    /// of a chain goes where the first went, and a dialog's where its checks read, though the
+    /// session moved to another branch meanwhile.
+    pub fn write_on(
         &mut self,
+        branch: &str,
         query: &BuiltQuery,
         if_commit: Option<String>,
         description: String,
@@ -1904,7 +2042,7 @@ impl GraphSession {
             query: query.text.clone(),
             name: Some(query.name.clone()),
             params: query.params_value(),
-            branch: Some(self.branch.clone()),
+            branch: Some(branch.to_owned()),
         };
         self.send_write(request, if_commit, description, follow_up, cx)
     }
@@ -1937,17 +2075,9 @@ impl GraphSession {
         cx.emit(SessionEvent::ActivityChanged);
         let work = cx.spawn(async move |this, cx| {
             let outcome = client.mutate(&graph, &request, if_commit.as_deref()).await;
-            let kind = match &outcome {
-                WriteOutcome::Committed(output) => OutcomeKind::Committed {
-                    commit: output.commit.as_ref().map(|c| c.graph_commit_id.clone()),
-                },
-                WriteOutcome::Refused(error) => OutcomeKind::Refused {
-                    message: error.body.error.clone(),
-                },
-                WriteOutcome::Unknown { reason } => OutcomeKind::Unknown {
-                    reason: reason.clone(),
-                },
-            };
+            let kind = outcome_kind(&outcome, |output: &ChangeOutput| {
+                output.commit.as_ref().map(|c| c.graph_commit_id.clone())
+            });
             this.update(cx, |this, cx| {
                 this.finish_write(branch, description, kind, follow_up, cx);
             })
@@ -1973,13 +2103,7 @@ impl GraphSession {
             OutcomeKind::Committed { commit } => commit.clone(),
             _ => None,
         };
-        self.outcomes.push(OutcomeEntry {
-            at: SystemTime::now(),
-            branch: branch.clone(),
-            description,
-            outcome,
-            follow_up: None,
-        });
+        self.log_outcome(branch.clone(), description, outcome, None);
         if let Some(commit) = commit {
             self.committed(branch, commit, cx);
         }
@@ -1988,6 +2112,26 @@ impl GraphSession {
         }
         cx.emit(SessionEvent::ActivityChanged);
         cx.notify();
+    }
+
+    /// Adds a write's outcome to the log, which keeps the newest [`OUTCOMES`].
+    fn log_outcome(
+        &mut self,
+        branch: String,
+        description: String,
+        outcome: OutcomeKind,
+        follow_up: Option<FollowUp>,
+    ) {
+        if self.outcomes.len() >= OUTCOMES {
+            self.outcomes.drain(..=self.outcomes.len() - OUTCOMES);
+        }
+        self.outcomes.push(OutcomeEntry {
+            at: SystemTime::now(),
+            branch,
+            description,
+            outcome,
+            follow_up,
+        });
     }
 
     fn finish_write(
@@ -2003,13 +2147,7 @@ impl GraphSession {
             OutcomeKind::Committed { commit } => commit.clone(),
             _ => None,
         };
-        self.outcomes.push(OutcomeEntry {
-            at: SystemTime::now(),
-            branch: branch.clone(),
-            description,
-            outcome,
-            follow_up,
-        });
+        self.log_outcome(branch.clone(), description, outcome, follow_up);
         if let Some(commit) = commit {
             self.committed(branch, commit, cx);
         }
@@ -2019,7 +2157,11 @@ impl GraphSession {
 
     /// One of Studio's writes committed `commit` on `branch`: it is the branch's head.
     fn committed(&mut self, branch: String, commit: String, cx: &mut Context<Self>) {
-        self.reload_counts(cx);
+        // The counts are the session's branch's: a commit elsewhere (an agent's branch) leaves
+        // them as they are.
+        if branch == self.branch {
+            self.refresh_counts(cx);
+        }
         self.commit_lists.forget(&branch);
         cx.emit(SessionEvent::Committed {
             branch: branch.clone(),
@@ -2068,7 +2210,9 @@ impl GraphSession {
             let outcome = client.delete_branch(&graph, &name).await;
             let kind = outcome_kind(&outcome, |_| None);
             this.update(cx, |this, cx| {
-                if this.branch == name {
+                // Only a branch that is gone moves the session; a refused or unknown delete
+                // leaves it where the person is.
+                if this.branch == name && matches!(outcome, WriteOutcome::Committed(_)) {
                     this.set_branch("main".into(), cx);
                 }
                 this.finish_write(name, description, kind, None, cx);
@@ -2111,13 +2255,16 @@ impl GraphSession {
     }
 }
 
+/// How a write ended, with the commit it published. A write that published none (a branch
+/// created or deleted, a merge already up to date, a mutation that matched nothing) is
+/// `Committed { commit: None }`: it moves no head and shows no commit.
 fn outcome_kind<T>(
     outcome: &WriteOutcome<T>,
     commit: impl Fn(&T) -> Option<String>,
 ) -> OutcomeKind {
     match outcome {
         WriteOutcome::Committed(value) => OutcomeKind::Committed {
-            commit: commit(value).or_else(|| Some(String::new())),
+            commit: commit(value).filter(|commit| !commit.is_empty()),
         },
         WriteOutcome::Refused(error) => OutcomeKind::Refused {
             message: error.body.error.clone(),
@@ -2165,6 +2312,24 @@ mod tests {
         };
         session.note_in(&scope, depends, None);
         scope
+    }
+
+    /// A write that published no commit (a branch created or deleted, a merge already up to
+    /// date) is done without one: it moves no head and offers no commit to view.
+    #[test]
+    fn a_write_without_a_commit_names_none() {
+        assert!(matches!(
+            outcome_kind(&WriteOutcome::Committed(()), |_| None),
+            OutcomeKind::Committed { commit: None }
+        ));
+        assert!(matches!(
+            outcome_kind(&WriteOutcome::Committed(()), |_| Some(String::new())),
+            OutcomeKind::Committed { commit: None }
+        ));
+        assert!(matches!(
+            outcome_kind(&WriteOutcome::Committed(()), |_| Some("c2".into())),
+            OutcomeKind::Committed { commit: Some(commit) } if commit == "c2"
+        ));
     }
 
     #[gpui::test]
@@ -2221,16 +2386,88 @@ mod tests {
         });
     }
 
-    /// Drafts belong to the branch they were typed on: another branch shows its own, and the
-    /// first one's wait until it is shown again (spec 014).
+    /// A session on `branch` of a server answering every request with `body`, a branch list.
+    fn listing_session(
+        body: impl Into<String>,
+        branch: &str,
+        cx: &mut TestAppContext,
+    ) -> Entity<GraphSession> {
+        let body: Arc<str> = body.into().into();
+        let http = FakeHttpClient::create(move |_request| {
+            let body = body.to_string();
+            async move {
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let branch = branch.to_owned();
+        cx.new(|cx| GraphSession::new(connection, "knowledge".into(), branch, cx))
+    }
+
+    /// A node type and an edge type may share a name; each keeps its own count.
     #[gpui::test]
-    async fn drafts_wait_with_their_branch(cx: &mut TestAppContext) {
-        let http = FakeHttpClient::create(|_request| async {
-            Ok(Response::builder()
-                .status(200)
-                .header(graph_client::CONTRACT_HEADER, "0.13")
-                .body(AsyncBody::from(r#"{"branches":["main","fix"]}"#))
-                .unwrap())
+    async fn a_node_and_an_edge_of_one_name_keep_their_own_counts(cx: &mut TestAppContext) {
+        // One answer for every request: the branch list and the snapshot read their fields.
+        let dataset = |kind: &str, count: i64| {
+            serde_json::json!({
+                "entity_kind": kind,
+                "type_name": "Knows",
+                "dataset_path": "p",
+                "published_dataset_version": 1,
+                "entity_count": count,
+            })
+        };
+        let body = serde_json::json!({
+            "branches": ["main"],
+            "graph_branch": "main",
+            "graph_manifest_version": 1,
+            "internal_schema_version": 14,
+            "datasets": [dataset("node", 3), dataset("edge", 7)],
+        })
+        .to_string();
+        let session = listing_session(body, "main", cx);
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.count_of(EntityKind::Node, "Knows"), Some(3));
+            assert_eq!(session.count_of(EntityKind::Edge, "Knows"), Some(7));
+        });
+    }
+
+    /// A commit on the session's branch reads its counts again and shows the old ones until
+    /// the new are in; a commit on another branch (an agent's) reads none.
+    #[gpui::test]
+    async fn counts_stay_shown_while_a_commit_reads_them_again(cx: &mut TestAppContext) {
+        use std::sync::atomic::AtomicUsize;
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let counted = snapshots.clone();
+        let http = FakeHttpClient::create(move |request| {
+            if request.uri().path().ends_with("/snapshot") {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+            async move {
+                let body = serde_json::json!({
+                    "branches": ["main"],
+                    "graph_branch": "main",
+                    "graph_manifest_version": 1,
+                    "internal_schema_version": 14,
+                    "datasets": [],
+                });
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
         });
         let server = ServerEntry {
             name: "dev".into(),
@@ -2241,6 +2478,110 @@ mod tests {
         let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
         let session =
             cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        let read = snapshots.load(Ordering::SeqCst);
+        let committed = |commit: &str| OutcomeKind::Committed {
+            commit: Some(commit.into()),
+        };
+        session.update(cx, |session, cx| {
+            session.note_write("agent/x".into(), "w".into(), committed("c2"), false, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            snapshots.load(Ordering::SeqCst),
+            read,
+            "another branch's commit"
+        );
+        session.update(cx, |session, cx| {
+            session.note_write("main".into(), "w".into(), committed("c3"), false, cx);
+            assert!(
+                matches!(session.datasets, Loadable::Loaded(_)),
+                "still shown"
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(snapshots.load(Ordering::SeqCst), read + 1);
+    }
+
+    /// The activity log keeps the newest writes.
+    #[gpui::test]
+    async fn the_activity_log_keeps_the_newest_writes(cx: &mut TestAppContext) {
+        let session = listing_session(r#"{"branches":["main"]}"#, "main", cx);
+        session.update(cx, |session, cx| {
+            for n in 0..=OUTCOMES {
+                let refused = OutcomeKind::Refused {
+                    message: "no".into(),
+                };
+                session.note_write("main".into(), format!("write {n}"), refused, false, cx);
+            }
+            assert_eq!(session.outcomes.len(), OUTCOMES);
+            assert_eq!(session.outcomes[0].description, "write 1");
+            assert_eq!(
+                session.outcomes.last().unwrap().description,
+                format!("write {OUTCOMES}")
+            );
+        });
+    }
+
+    /// A family past the cap takes one place: the commits kept for the others stay.
+    #[test]
+    fn a_new_family_past_the_cap_takes_one_place() {
+        let mut kept = HashMap::new();
+        for family in 0..4 {
+            remember(&mut kept, family, "c1", 4);
+        }
+        remember(&mut kept, 9, "c2", 4);
+        assert_eq!(kept.len(), 4);
+        assert_eq!(kept[&9], ["c2"]);
+        assert_eq!(
+            kept.values().filter(|commits| *commits == &["c1"]).count(),
+            3
+        );
+        // A known family's newer commit takes no place.
+        remember(&mut kept, 9, "c3", 4);
+        assert_eq!(
+            (kept.len(), kept[&9].clone()),
+            (4, vec!["c2".to_owned(), "c3".to_owned()])
+        );
+    }
+
+    /// A branch the branch list no longer holds cannot be read: the session moves to main and
+    /// says so. A list asked for before the session last moved may not hold a branch made since,
+    /// and moves nothing.
+    #[gpui::test]
+    async fn a_session_on_a_branch_that_is_gone_moves_to_main(cx: &mut TestAppContext) {
+        let session = listing_session(r#"{"branches":["main","fix"]}"#, "gone", cx);
+        let missing = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let heard = missing.clone();
+        cx.update(|cx| {
+            cx.subscribe(&session, move |_, event: &SessionEvent, _| {
+                if let SessionEvent::BranchMissing { branch } = event {
+                    heard.lock().unwrap().push(branch.clone());
+                }
+            })
+            .detach()
+        });
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| assert_eq!(session.branch, "main"));
+        assert_eq!(*missing.lock().unwrap(), ["gone"]);
+
+        session.update(cx, |session, cx| {
+            let before = session.branch_moves;
+            session.set_branch("made".into(), cx);
+            session.leave_missing_branch(before, cx);
+            assert_eq!(session.branch, "made", "a list from before the move");
+            session.set_branch("fix".into(), cx);
+            session.leave_missing_branch(session.branch_moves, cx);
+            assert_eq!(session.branch, "fix", "a branch the list holds");
+        });
+        assert_eq!(missing.lock().unwrap().len(), 1);
+    }
+
+    /// Drafts belong to the branch they were typed on: another branch shows its own, and the
+    /// first one's wait until it is shown again (spec 014).
+    #[gpui::test]
+    async fn drafts_wait_with_their_branch(cx: &mut TestAppContext) {
+        let session = listing_session(r#"{"branches":["main","fix"]}"#, "main", cx);
         let key = DraftKey {
             type_name: "Person".into(),
             id: "p1".into(),
@@ -3087,6 +3428,37 @@ mod tests {
         cx.run_until_parked();
         session.read_with(cx, |session, _| assert_eq!(session.reads_in_flight, 0));
 
+        // A read at a commit is kept under way for whoever asks next, but only while someone
+        // waits: dropped by every asker, it stops too, and the next ask reads again.
+        let pinned = BuiltQuery {
+            name: "q".into(),
+            text: "query q() { match { $p: Person } return { $p } }".into(),
+            params: serde_json::Map::new(),
+            depends: Depends::Unknown,
+            seeds: None,
+        };
+        let asked = queries.load(Ordering::SeqCst);
+        let read = session.update(cx, |session, cx| {
+            session.read(&pinned, Some("c-old".into()), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(queries.load(Ordering::SeqCst), asked + 1);
+        session.read_with(cx, |session, _| assert_eq!(session.reads_in_flight, 1));
+        drop(read);
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| assert_eq!(session.reads_in_flight, 0));
+        let again = session.update(cx, |session, cx| {
+            session.read(&pinned, Some("c-old".into()), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            queries.load(Ordering::SeqCst),
+            asked + 2,
+            "read again, not left waiting on the dropped one"
+        );
+        drop(again);
+        cx.run_until_parked();
+
         let write = session.update(cx, |session, cx| {
             session.write_request(
                 ChangeRequest {
@@ -3274,6 +3646,52 @@ mod tests {
     /// An answer kept at a commit is kept under the schema it was read with: a read at an old
     /// commit uses the current schema, so after the schema changes the same query is read
     /// again. A head move whose feed read finds another schema takes it (spec 015).
+    /// A page's rows answer the read of each node at that commit, with no request of their own;
+    /// a page answered from what was kept is not filed again.
+    #[gpui::test]
+    async fn a_page_read_at_a_commit_answers_its_nodes(cx: &mut TestAppContext) {
+        use crate::test_server::followed_session;
+        use serde_json::json;
+
+        const SCHEMA: &str = "node Person {\n  slug: String @key\n  name: String\n}\n";
+        let sent = Arc::new(std::sync::Mutex::new(0usize));
+        let counted = sent.clone();
+        let (session, _) = followed_session(
+            SCHEMA,
+            move |request| {
+                if request["name"] == "studio_node" {
+                    *counted.lock().unwrap() += 1;
+                }
+                json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }])
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+        let page = builder::node_page(&schema, "Person", &[], None, &builder::PageStart::First, 10)
+            .unwrap();
+        let node = builder::node_by_id(&schema, "Person", "p1").unwrap();
+        let read = |query: &BuiltQuery, cx: &mut TestAppContext| {
+            let read = session.update(cx, |session, cx| session.read(query, Some("c1".into()), cx));
+            cx.run_until_parked();
+            read
+        };
+        let reads = || *sent.lock().unwrap();
+
+        read(&page, cx).await.unwrap();
+        read(&node, cx).await.unwrap();
+        assert_eq!(reads(), 0, "the page's row answered it");
+
+        // The node's answer goes; the page, read again from what was kept, files nothing.
+        session.update(cx, |session, _| {
+            let key = session.pinned_key(&node, "c1");
+            session.pinned_reads.forget(&key);
+        });
+        read(&page, cx).await.unwrap();
+        read(&node, cx).await.unwrap();
+        assert_eq!(reads(), 1);
+    }
+
     #[gpui::test]
     async fn answers_kept_under_one_schema_are_not_given_under_another(cx: &mut TestAppContext) {
         use crate::carry::Since;

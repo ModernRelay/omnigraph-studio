@@ -133,30 +133,33 @@ impl ConnectionRegistry {
             let moved = url != saved.url;
             let entry = ServerEntry {
                 name: saved.name,
-                url,
+                url: url.clone(),
                 source: ServerSource::Studio,
                 known_graphs: saved.graphs,
             };
+            // Listed at once, so the windows a start reopens find it and a save made while the
+            // keychain is read keeps it; it connects once its token is in.
+            let Some(connection) = this.add_connection(entry, None, cx) else {
+                continue;
+            };
+            connection.update(cx, |connection, _| connection.await_token());
+            if moved {
+                this.save(cx);
+            }
             let read = cx.read_credentials(&saved.url);
-            cx.spawn(async move |this, cx| {
+            cx.spawn(async move |_, cx| {
                 let token = read
                     .await
                     .ok()
                     .flatten()
                     .and_then(|(_, bytes)| String::from_utf8(bytes).ok());
-                this.update(cx, |this, cx| {
-                    if moved && let Some(token) = &token {
-                        cx.write_credentials(&entry.url, KEYCHAIN_USER, token.as_bytes())
-                            .detach();
-                    }
-                    let added = this.add_connection(entry, token, cx).is_some();
-                    if moved && added {
-                        this.save(cx);
-                    }
-                    cx.emit(RegistryEvent::ServersChanged);
-                    cx.notify();
-                })
-                .ok();
+                if moved && let Some(token) = &token {
+                    cx.update(|cx| cx.write_credentials(&url, KEYCHAIN_USER, token.as_bytes()))
+                        .detach();
+                }
+                connection
+                    .update(cx, |connection, cx| connection.set_token(token, cx))
+                    .ok();
             })
             .detach();
         }
@@ -426,12 +429,11 @@ impl ConnectionRegistry {
             .collect();
         let saved = SavedServers { servers };
         if let Ok(text) = serde_json::to_string_pretty(&saved) {
-            studio_settings::write_atomic(
-                &saved_path(),
-                text.as_bytes(),
+            studio_settings::write_atomic_in_turn(
+                saved_path(),
+                text.into_bytes(),
                 studio_settings::Access::Private,
-            )
-            .ok();
+            );
         }
     }
 

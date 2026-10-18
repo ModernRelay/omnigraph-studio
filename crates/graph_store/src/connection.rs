@@ -1,6 +1,5 @@
 //! One OmniGraph server: its client, contract check, capabilities and graphs (spec 003).
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -96,12 +95,13 @@ pub struct Connection {
     /// How long the last health check took to answer: the server's round trip, shown beside
     /// it. `None` until one answers, and after one fails.
     pub latency: Option<Duration>,
-    pub operations: BTreeSet<String>,
     pub graphs: GraphListing,
-    has_token: bool,
     _task: Option<Task<()>>,
     /// The next health re-check (spec 003).
     _health_check: Option<Task<()>>,
+    /// The token is still being read (from the keychain): a connect waits for it, rather than
+    /// asking without one and being refused.
+    token_pending: bool,
 }
 
 /// Health re-check interval after a failure (spec 003).
@@ -117,7 +117,6 @@ impl Connection {
         token: Option<String>,
         http: Arc<dyn HttpClient>,
     ) -> anyhow::Result<Self> {
-        let has_token = token.is_some();
         let client = GraphClient::new(&server.url, token, http.clone())?;
         Ok(Self {
             server,
@@ -126,25 +125,21 @@ impl Connection {
             state: ConnectionState::Idle,
             health: None,
             latency: None,
-            operations: BTreeSet::new(),
             graphs: GraphListing::Unknown,
-            has_token,
             _task: None,
             _health_check: None,
+            token_pending: false,
         })
+    }
+
+    /// Notes that the token is being read; [`Connection::set_token`] ends the wait, and a
+    /// connect asked for meanwhile goes then.
+    pub fn await_token(&mut self) {
+        self.token_pending = true;
     }
 
     pub(crate) fn client(&self) -> &GraphClient {
         &self.client
-    }
-
-    pub fn has_token(&self) -> bool {
-        self.has_token
-    }
-
-    /// Whether the server's OpenAPI document advertises an operation (constitution X).
-    pub fn supports(&self, operation_id: &str) -> bool {
-        self.operations.contains(operation_id)
     }
 
     /// Graph ids to offer: the listed graphs, then known ids the listing lacks.
@@ -182,8 +177,8 @@ impl Connection {
         token: Option<String>,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
-        self.client = GraphClient::new(&self.server.url, token.clone(), self.http.clone())?;
-        self.has_token = token.is_some();
+        self.token_pending = false;
+        self.client = GraphClient::new(&self.server.url, token, self.http.clone())?;
         if self.state != ConnectionState::Idle {
             self.connect(cx);
         }
@@ -194,17 +189,24 @@ impl Connection {
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
         if self.state == ConnectionState::Connecting {
             self._task = None;
+            // A check already scheduled would connect again, or mark the server down.
+            self._health_check = None;
             self.state = ConnectionState::Idle;
             cx.emit(ConnectionEvent::StateChanged);
             cx.notify();
         }
     }
 
-    /// Checks health and contract, then reads capabilities and the graph list.
+    /// Checks health and contract, then reads the graph list.
     pub fn connect(&mut self, cx: &mut Context<Self>) {
         self.state = ConnectionState::Connecting;
+        // The probe schedules the next check when it ends.
+        self._health_check = None;
         cx.emit(ConnectionEvent::StateChanged);
         cx.notify();
+        if self.token_pending {
+            return;
+        }
         let client = self.client.clone();
         self._task = Some(cx.spawn(async move |this, cx| {
             // Off the main thread, so its round trip is not lengthened by a busy frame.
@@ -217,12 +219,10 @@ impl Connection {
                     Probe::Ready {
                         health,
                         latency,
-                        operations,
                         graphs,
                     } => {
                         this.health = Some(health);
                         this.latency = Some(latency);
-                        this.operations = operations;
                         this.graphs = graphs;
                         this.state = ConnectionState::Ready;
                     }
@@ -276,21 +276,14 @@ impl Connection {
             self.latency = latency;
             cx.notify();
         }
-        let next = match health {
-            Ok(health) if !health.contract_supported() => ConnectionState::ContractMismatch {
-                served: health.contract,
-            },
-            Ok(health) if !health.version_supported() => ConnectionState::TooOld {
-                version: health.health.version,
-            },
+        let next = match served(health) {
             Ok(_) if self.state == ConnectionState::Ready => ConnectionState::Ready,
-            // Recovered: probe capabilities and graphs again, which schedules the next check.
+            // Recovered: probe the graphs again, which schedules the next check.
             Ok(_) => {
                 self.connect(cx);
                 return;
             }
-            Err(ReadError::Transport(error)) => ConnectionState::Unreachable(error),
-            Err(error) => ConnectionState::Unreachable(error.to_string()),
+            Err(state) => state,
         };
         if next != self.state {
             self.state = next;
@@ -305,35 +298,42 @@ enum Probe {
     Ready {
         health: HealthOutput,
         latency: Duration,
-        operations: BTreeSet<String>,
         graphs: GraphListing,
     },
     Failed(ConnectionState),
 }
 
+/// A health answer as the server's state: one Studio can use, or why not.
+fn served(
+    health: Result<graph_client::ServerHealth, ReadError>,
+) -> Result<graph_client::ServerHealth, ConnectionState> {
+    match health {
+        Ok(health) if !health.contract_supported() => Err(ConnectionState::ContractMismatch {
+            served: health.contract,
+        }),
+        Ok(health) if !health.version_supported() => Err(ConnectionState::TooOld {
+            version: health.health.version,
+        }),
+        Ok(health) => Ok(health),
+        Err(ReadError::Transport(error)) => Err(ConnectionState::Unreachable(error)),
+        Err(error) => Err(ConnectionState::Unreachable(error.to_string())),
+    }
+}
+
+/// Health and the graph list, asked together: the list is dropped when the server cannot be
+/// used.
 async fn probe(client: &GraphClient) -> Probe {
-    let started = Instant::now();
-    let health = client.health().await;
-    let latency = started.elapsed();
-    let health = match health {
-        Ok(health) => health,
-        Err(ReadError::Transport(error)) => {
-            return Probe::Failed(ConnectionState::Unreachable(error));
-        }
-        Err(error) => return Probe::Failed(ConnectionState::Unreachable(error.to_string())),
+    let timed_health = async {
+        let started = Instant::now();
+        let health = client.health().await;
+        (health, started.elapsed())
     };
-    if !health.contract_supported() {
-        return Probe::Failed(ConnectionState::ContractMismatch {
-            served: health.contract.clone(),
-        });
-    }
-    if !health.version_supported() {
-        return Probe::Failed(ConnectionState::TooOld {
-            version: health.health.version.clone(),
-        });
-    }
-    let operations = client.operations().await.unwrap_or_default();
-    let graphs = match client.graphs().await {
+    let ((health, latency), graphs) = futures::join!(timed_health, client.graphs());
+    let health = match served(health) {
+        Ok(health) => health,
+        Err(state) => return Probe::Failed(state),
+    };
+    let graphs = match graphs {
         Ok(list) => GraphListing::Listed(list.graphs),
         Err(ReadError::Refused(summary)) if summary.status == 401 => {
             return Probe::Failed(ConnectionState::Unauthorized);
@@ -344,7 +344,6 @@ async fn probe(client: &GraphClient) -> Probe {
     Probe::Ready {
         health: health.health,
         latency,
-        operations,
         graphs,
     }
 }
@@ -384,6 +383,76 @@ mod tests {
         connection.update(cx, |connection, cx| connection.connect(cx));
         cx.run_until_parked();
         connection.read_with(cx, |connection, _| connection.state.clone())
+    }
+
+    /// A connection whose token is still being read waits to connect, sending nothing it
+    /// would be refused; the token's arrival connects it. A cancel stops the check scheduled
+    /// after a failure, which would otherwise connect again.
+    #[gpui::test]
+    async fn a_connect_waits_for_its_token_and_a_cancel_stays(cx: &mut TestAppContext) {
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+        let seen = sent.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let token = request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            seen.lock().unwrap().push(token);
+            async move {
+                let body = if path.ends_with("/healthz") {
+                    r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#
+                } else {
+                    r#"{"graphs":[]}"#
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Studio,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, None, http).unwrap());
+        connection.update(cx, |connection, cx| {
+            connection.await_token();
+            connection.connect(cx);
+        });
+        cx.run_until_parked();
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Connecting)
+        });
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "nothing sent without the token"
+        );
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("t".into()), cx).unwrap()
+        });
+        cx.run_until_parked();
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Ready)
+        });
+        assert!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .all(|token| token.as_deref() == Some("Bearer t"))
+        );
+
+        // A check is scheduled while ready; connecting and cancelling leave none behind.
+        connection.update(cx, |connection, cx| {
+            connection.connect(cx);
+            connection.cancel(cx);
+            assert!(connection._health_check.is_none());
+            assert_eq!(connection.state, ConnectionState::Idle);
+        });
     }
 
     /// A 0.13 server speaks the same contract header as 0.14, so its version is what refuses

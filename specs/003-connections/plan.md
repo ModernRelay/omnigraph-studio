@@ -66,9 +66,11 @@ from the served document).
 1. `HEAD /healthz` with a 5 s bound. Read the contract header.
 2. Compare with the contracts `graph_client` speaks (only `0.13` today). Mismatch: state
    `contract mismatch`, with the server's version and "Studio speaks 0.13".
-3. `GET /openapi.json` once per connection; record which operation ids exist (for example
-   `cluster_putBlob`, `cluster_publishCommit`). Surfaces ask the capability set, never the
-   version string.
+3. Capabilities: every route Studio uses is served by its minimum server (0.14, or the edge
+   build before it), so connecting reads no capability set. A surface that comes to use a newer
+   route reads `GET /openapi.json` and asks which operation ids exist, never the version string
+   (constitution X). Connecting once read the whole document (387 KB at the edge build) before
+   listing graphs, for a set nothing asked.
 4. `GET /readyz` for serving state; `GET /graphs` when allowed, for per-graph state
    (`ready`, `loading`, `transitioning`, `blocked`, `stopping`) and `read_available` /
    `write_available`.
@@ -134,7 +136,7 @@ from the served document).
 | Decision | Rejected alternatives | Why |
 |---|---|---|
 | Read the CLI's config and credentials | Ask for every token again | The CLI is how people already reach their servers |
-| Capabilities from `/openapi.json` | Compare version strings | A server on main serves routes 0.13.0 lacks |
+| Capabilities from `/openapi.json`, read when a route newer than the minimum server is used | Compare version strings; read the document on every connect | A server on main serves routes a release lacks; no route Studio uses needs the check today |
 | Never retry writes | Retry with backoff | A lost response may have committed; only history can tell |
 
 ## Deferred

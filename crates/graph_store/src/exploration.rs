@@ -4,8 +4,9 @@
 //!
 //! Every read is pinned to the commit the first read returned (constitution II). When the
 //! session sees its branch's head at another commit ([`SessionEvent::HeadMoved`]: Studio's own
-//! commit, or another writer's), [`Exploration::newer_available`] is raised and nothing changes
-//! until [`Exploration::refresh`]. Counts come from the session's batched counts
+//! commit, or another writer's), the pin moves to the head if nothing the exploration shows
+//! changed in between (spec 015); otherwise [`Exploration::newer_available`] is raised and
+//! nothing changes until [`Exploration::refresh`]. Counts come from the session's batched counts
 //! ([`GraphSession::degree`]): every count asked for in one turn (several nodes expanded,
 //! a refresh) is one `builder::page_degrees` read per node type and relationship group (engine
 //! change E16 would replace them); neighbours come in keyset
@@ -1068,8 +1069,9 @@ impl ExploreState {
         list.exhausted = (page.len() as u32) < page_size;
         // Parallel edges to one neighbour show as one row, with the first edge's properties,
         // so every path in the tree stays unique.
+        let mut shown: HashSet<NodeRef> = list.rows.iter().map(|row| row.node.clone()).collect();
         for neighbour in page {
-            if !list.rows.iter().any(|row| row.node == neighbour.node) {
+            if shown.insert(neighbour.node.clone()) {
                 list.rows.push(neighbour);
             }
         }
@@ -1077,12 +1079,9 @@ impl ExploreState {
     }
 }
 
-fn rows(output: &ReadOutput) -> Vec<serde_json::Map<String, Value>> {
+fn rows(output: &ReadOutput) -> Vec<&serde_json::Map<String, Value>> {
     match &output.rows {
-        Value::Array(rows) => rows
-            .iter()
-            .filter_map(|row| row.as_object().cloned())
-            .collect(),
+        Value::Array(rows) => rows.iter().filter_map(Value::as_object).collect(),
         _ => Vec::new(),
     }
 }
@@ -1290,6 +1289,8 @@ impl Exploration {
         let neighbours = std::mem::take(&mut self.state.neighbours);
         let values = std::mem::take(&mut self.state.values);
         let grouping = std::mem::take(&mut self.state.grouping);
+        // A searched group's neighbours are its matches: the search goes with them.
+        let searches = std::mem::take(&mut self.state.searches);
         let mut state = ExploreState::rooted(node.clone());
         state.root_status = if labels.contains_key(&node) {
             Loadable::Loaded(())
@@ -1302,6 +1303,7 @@ impl Exploration {
         state.neighbours = neighbours;
         state.values = values;
         state.grouping = grouping;
+        state.searches = searches;
         self.state = state;
         self.request_missing(cx);
         self.changed(cx);
@@ -1378,7 +1380,6 @@ impl Exploration {
         }
     }
 
-    /// Reads the next page of a group's neighbours.
     /// Reads a group's neighbours again, narrowed to ids starting with or labels containing
     /// `text` (spec 005: the filter for groups over one page); empty text reads them all.
     pub fn search_group(&mut self, key: &GroupKey, text: &str, cx: &mut Context<Self>) {
@@ -1619,15 +1620,32 @@ impl Exploration {
             self.session
                 .update(cx, |session, _| session.note_in(scope, depends, None));
         }
+        // Pinned, both are read at once at the pin; otherwise the first answer's commit is
+        // where the second is read.
+        let none_at_once = snapshot
+            .as_ref()
+            .zip(without.as_ref())
+            .map(|(commit, without)| {
+                let commit = Some(commit.clone());
+                self.session
+                    .update(cx, |session, cx| session.read(without, commit, cx))
+            });
         let key = target.clone();
         let session = self.session.downgrade();
         let task = cx.spawn(async move |this, cx| {
             let mut result = read.await;
             if let (Some(without), Ok(output)) = (without, &result) {
-                let commit = snapshot.or_else(|| output.graph_commit_id.clone());
-                let Ok(read) = session.update(cx, |session, cx| session.read(&without, commit, cx))
-                else {
-                    return;
+                let read = match none_at_once {
+                    Some(read) => read,
+                    None => {
+                        let commit = snapshot.or_else(|| output.graph_commit_id.clone());
+                        let Ok(read) =
+                            session.update(cx, |session, cx| session.read(&without, commit, cx))
+                        else {
+                            return;
+                        };
+                        read
+                    }
                 };
                 result = match (result, read.await) {
                     (Ok(mut output), Ok(none)) => {
@@ -1648,8 +1666,14 @@ impl Exploration {
                 if this.generation != generation {
                     return;
                 }
+                let unpinned = this.pin.is_none();
                 this.apply(&key, result);
                 this.loaded(&key, cx);
+                // The first answer pins the exploration: a head seen move while it was out is
+                // compared now, which it could not be before.
+                if unpinned && this.pin.is_some() {
+                    this.compare_head(cx);
+                }
             })
             .ok();
         });

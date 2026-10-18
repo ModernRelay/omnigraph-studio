@@ -3,8 +3,10 @@
 //! is shared rather than sent again. The table's peek, the tree, the canvas and the table read
 //! the same counts and neighbours; each is sent once.
 //!
-//! Only successful answers are kept; a failure is forgotten so the next read asks again. The
-//! memo holds at most `capacity` entries and forgets the least recently used first.
+//! Only successful answers are kept; a failure is forgotten so the next read asks again. An
+//! answer is kept only for the read it answers: one that comes back after its key was forgotten
+//! or read again (Refresh) changes nothing. The memo holds at most `capacity` entries and
+//! forgets the least recently used first.
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
@@ -79,13 +81,24 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone> Memo<K, V, P> {
         self.put(key, Held::Pending(pending));
     }
 
-    /// Records how a read for `key` ended: an answer is kept, a failure forgotten.
-    pub(crate) fn finish<E>(&mut self, key: &K, result: &Result<V, E>) {
+    /// Records how the read under way for `key` ended: an answer is kept, a failure forgotten.
+    /// It counts only while `key` still holds that read (`ours` tells it apart): a read whose
+    /// key was forgotten, evicted or started again since changes nothing. Whether it counted.
+    pub(crate) fn finish<E>(
+        &mut self,
+        key: &K,
+        result: &Result<V, E>,
+        ours: impl FnOnce(&P) -> bool,
+    ) -> bool {
+        match self.entries.get(key).map(|slot| &slot.held) {
+            Some(Held::Pending(pending)) if ours(pending) => {}
+            _ => return false,
+        }
         match result {
-            // Evicted while under way, the answer is kept as newly used.
             Ok(value) => self.put(key.clone(), Held::Done(value.clone())),
             Err(_) => self.forget(key),
         }
+        true
     }
 
     /// Whether anything is held for `key`, without marking it used.
@@ -177,23 +190,27 @@ mod tests {
         }
     }
 
+    fn ours<P>(_: &P) -> bool {
+        true
+    }
+
     #[test]
     fn answers_are_kept_failures_forgotten_and_the_oldest_goes_first() {
         let mut memo: Memo<&'static str, u32, ()> = Memo::new(2);
         memo.start("a", ());
         assert!(matches!(memo.get(&"a"), Some(Held::Pending(()))));
-        memo.finish::<()>(&"a", &Ok(1));
+        memo.finish::<()>(&"a", &Ok(1), ours);
         assert_eq!(done(&mut memo, "a"), Some(1));
 
         memo.start("b", ());
-        memo.finish(&"b", &Err::<u32, &str>("refused"));
+        memo.finish(&"b", &Err::<u32, &str>("refused"), ours);
         assert!(memo.get(&"b").is_none(), "a failure is asked again");
 
         memo.start("b", ());
-        memo.finish::<()>(&"b", &Ok(2));
+        memo.finish::<()>(&"b", &Ok(2), ours);
         // "a" was last used before "b" was added, so it is the least recently used.
         memo.start("c", ());
-        memo.finish::<()>(&"c", &Ok(3));
+        memo.finish::<()>(&"c", &Ok(3), ours);
         assert_eq!(memo.len(), 2);
         assert_eq!(
             done(&mut memo, "a"),
@@ -229,7 +246,27 @@ mod tests {
         // Under way, an answer weighs nothing; kept, it weighs what it is.
         memo.start("e", ());
         assert_eq!(memo.bytes(), 0);
-        memo.finish::<()>(&"e", &Ok(3));
+        memo.finish::<()>(&"e", &Ok(3), ours);
         assert_eq!(memo.bytes(), 3);
+    }
+
+    /// An answer is kept for the read it answers only: a key read again, or forgotten, since
+    /// keeps what came after.
+    #[test]
+    fn an_older_read_never_replaces_a_newer_one() {
+        let mut memo: Memo<&'static str, u32, u64> = Memo::new(4);
+        memo.start("list", 1);
+        // Read again (a Refresh) before the first came back.
+        memo.forget(&"list");
+        memo.start("list", 2);
+        assert!(!memo.finish::<()>(&"list", &Ok(10), |ticket| *ticket == 1));
+        assert!(matches!(memo.get(&"list"), Some(Held::Pending(2))));
+        assert!(memo.finish::<()>(&"list", &Ok(20), |ticket| *ticket == 2));
+        assert!(matches!(memo.get(&"list"), Some(Held::Done(20))));
+        // Forgotten while under way: the late answer is dropped.
+        memo.start("gone", 3);
+        memo.forget(&"gone");
+        assert!(!memo.finish::<()>(&"gone", &Ok(1), |_| true));
+        assert!(memo.get(&"gone").is_none());
     }
 }

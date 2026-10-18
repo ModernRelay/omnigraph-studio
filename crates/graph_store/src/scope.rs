@@ -4,7 +4,7 @@
 //! asks the change feed about the types the view reads, and decides whether a head move changed
 //! anything the view shows; views keep no read set of their own.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
 use gq_language::builder::Depends;
@@ -31,26 +31,36 @@ pub enum ScopeSince {
     Changed,
 }
 
-/// What the view shows of one dependence: the nodes its answers listed, and how many of its
-/// reads are still out. While one is, what it will list is not known, so the whole listed type
-/// counts.
+/// What the view shows of one dependence: the nodes its answers listed, and its reads still
+/// out. While one is, what it will list is not known, so the whole listed type counts.
 struct Entry {
     depends: Depends,
     listed: Vec<String>,
-    /// An answer came in, or a caller gave one with the nodes it lists.
+    /// `listed` as a set: a table scrolled through thousands of rows lists each page against
+    /// them all.
+    listed_set: HashSet<String>,
+    /// An answer came in (or failed, listing nothing), or a caller gave one with its nodes.
     known: bool,
-    pending: usize,
+    /// A caller gave an answer without its nodes: the whole listed type always counts.
+    unlisted: bool,
+    /// The reads out, each alive while its [`ReadToken`] is: a read that finishes, fails or is
+    /// dropped by its view stops counting by itself.
+    out: Vec<Weak<()>>,
 }
+
+/// Held by a read a scope counts as out, until it finishes or is dropped.
+pub(crate) struct ReadToken(#[allow(dead_code)] Rc<()>);
 
 impl Entry {
     /// The nodes listed, when they are all known.
     fn listed(&self) -> Option<&[String]> {
-        (self.known && self.pending == 0).then_some(self.listed.as_slice())
+        let settled = self.out.iter().all(|read| read.strong_count() == 0);
+        (self.known && !self.unlisted && settled).then_some(self.listed.as_slice())
     }
 
     fn list(&mut self, ids: Vec<String>) {
         for id in ids {
-            if !self.listed.contains(&id) {
+            if self.listed_set.insert(id.clone()) {
                 self.listed.push(id);
             }
         }
@@ -93,14 +103,19 @@ impl Scope {
         self.alive.strong_count() > 0
     }
 
-    /// A read the view sends: it counts from now, before its answer is in.
-    pub(crate) fn add(&mut self, depends: Depends) -> EntryAt {
+    /// A read the view sends: it counts from now, before its answer is in, while the token is
+    /// held.
+    pub(crate) fn add(&mut self, depends: Depends) -> (EntryAt, ReadToken) {
         let index = self.entry(depends);
-        self.entries[index].pending += 1;
-        EntryAt {
+        let token = Rc::new(());
+        let entry = &mut self.entries[index];
+        entry.out.retain(|read| read.strong_count() > 0);
+        entry.out.push(Rc::downgrade(&token));
+        let at = EntryAt {
             generation: self.generation,
             index,
-        }
+        };
+        (at, ReadToken(token))
     }
 
     /// An answer the view shows that was read elsewhere (a table's row and relationships, given
@@ -114,8 +129,7 @@ impl Scope {
                 entry.known = true;
                 entry.list(ids);
             }
-            // Never known: counted as a read that stays out.
-            None => entry.pending += 1,
+            None => entry.unlisted = true,
         }
     }
 
@@ -129,8 +143,10 @@ impl Scope {
         self.entries.push(Entry {
             depends,
             listed: Vec::new(),
+            listed_set: HashSet::new(),
             known: false,
-            pending: 0,
+            unlisted: false,
+            out: Vec::new(),
         });
         index
     }
@@ -145,8 +161,17 @@ impl Scope {
         };
         let listed = listed_ids(&entry.depends, rows).unwrap_or_default();
         entry.known = true;
-        entry.pending = entry.pending.saturating_sub(1);
         entry.list(listed);
+    }
+
+    /// The read at `at` failed: the view shows nothing it would have listed.
+    pub(crate) fn failed(&mut self, at: EntryAt) {
+        if at.generation != self.generation {
+            return;
+        }
+        if let Some(entry) = self.entries.get_mut(at.index) {
+            entry.known = true;
+        }
     }
 
     /// The view shows none of what it read: it reads again (Refresh, another order).
@@ -225,13 +250,14 @@ mod tests {
     #[test]
     fn a_scope_is_unchanged_while_nothing_it_shows_changed() {
         let (mut scope, _handle) = Scope::new(1, "main".into());
-        let node_read = scope.add(Depends::Node {
+        let (node_read, node_token) = scope.add(Depends::Node {
             type_name: "Person".into(),
             id: "p1".into(),
         });
-        let list = scope.add(neighbours_of("p1"));
+        let (list, list_token) = scope.add(neighbours_of("p1"));
         scope.answered(node_read, &json!([]));
         scope.answered(list, &json!([{ "id": "p2" }]));
+        drop((node_token, list_token));
         let names: BTreeSet<String> = scope.names().collect();
         assert_eq!(names, BTreeSet::from(["Person".into(), "Knows".into()]));
 
@@ -258,26 +284,54 @@ mod tests {
     #[test]
     fn a_list_still_being_read_counts_its_whole_type() {
         let (mut scope, _handle) = Scope::new(1, "main".into());
-        scope.add(neighbours_of("p1"));
+        let (_, token) = scope.add(neighbours_of("p1"));
         let asked = ["Person", "Knows"];
         assert!(
             !scope.unchanged(&since(json!([node("Person", "p9")]), &asked)),
             "any person may be listed"
         );
         assert!(scope.unchanged(&since(json!([]), &asked)));
+        drop(token);
+    }
+
+    /// A read that failed, or that its view dropped, is not out any more: one hub that timed
+    /// out does not make every change to its type count for the view.
+    #[test]
+    fn a_failed_or_dropped_read_stops_counting_as_out() {
+        let (mut scope, _handle) = Scope::new(1, "main".into());
+        let asked = ["Person", "Knows"];
+        let p9 = || since(json!([node("Person", "p9")]), &asked);
+        let (failed, token) = scope.add(neighbours_of("p1"));
+        scope.failed(failed);
+        drop(token);
+        assert!(scope.unchanged(&p9()), "it listed nothing");
+        // A second read, answered, then a third dropped before its answer.
+        let (read, token) = scope.add(neighbours_of("p1"));
+        scope.answered(read, &json!([{ "id": "p2" }]));
+        drop(token);
+        let (_, dropped) = scope.add(neighbours_of("p1"));
+        assert!(
+            !scope.unchanged(&p9()),
+            "while it is out, any person may be listed"
+        );
+        drop(dropped);
+        assert!(scope.unchanged(&p9()));
+        assert!(!scope.unchanged(&since(json!([node("Person", "p2")]), &asked)));
     }
 
     #[test]
     fn a_list_read_twice_is_one_entry_listing_both_answers() {
         let (mut scope, _handle) = Scope::new(1, "main".into());
-        let first = scope.add(neighbours_of("p1"));
+        let (first, token) = scope.add(neighbours_of("p1"));
         scope.answered(first, &json!([{ "id": "p2" }]));
+        drop(token);
         let asked = ["Person", "Knows"];
         // The next page is out: what it lists is not known yet.
-        let next = scope.add(neighbours_of("p1"));
+        let (next, token) = scope.add(neighbours_of("p1"));
         assert_eq!(scope.entries.len(), 1);
         assert!(!scope.unchanged(&since(json!([node("Person", "p9")]), &asked)));
         scope.answered(next, &json!([{ "id": "p3" }]));
+        drop(token);
         assert!(scope.unchanged(&since(json!([node("Person", "p9")]), &asked)));
         assert!(!scope.unchanged(&since(json!([node("Person", "p2")]), &asked)));
         assert!(!scope.unchanged(&since(json!([node("Person", "p3")]), &asked)));
@@ -286,7 +340,7 @@ mod tests {
     #[test]
     fn a_reset_scope_forgets_what_it_read_and_late_answers() {
         let (mut scope, _handle) = Scope::new(1, "main".into());
-        let late = scope.add(neighbours_of("p1"));
+        let (late, _token) = scope.add(neighbours_of("p1"));
         scope.reset("main".into());
         scope.answered(late, &json!([{ "id": "p2" }]));
         assert_eq!(scope.names().count(), 0);
@@ -297,7 +351,7 @@ mod tests {
     #[test]
     fn an_answer_whose_dependence_is_unknown_always_changes() {
         let (mut scope, _handle) = Scope::new(1, "main".into());
-        scope.add(Depends::Unknown);
+        let _read = scope.add(Depends::Unknown);
         assert!(!scope.unchanged(&since(json!([]), &["Person"])));
     }
 }

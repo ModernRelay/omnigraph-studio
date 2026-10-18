@@ -122,10 +122,10 @@ pub fn plan_node_delete(
         let required: Vec<_> = schema.edges.iter().filter(|edge| edge.min > 0).collect();
         for _ in 0..MAX_ROUNDS {
             let mut next = BTreeSet::new();
-            for edge in &required {
-                if !grown.contains(&edge.to) {
-                    continue;
-                }
+            // A round's reads go together, each from what the rounds before found: a node one
+            // of them finds is read past in the next round, and one found twice counts once.
+            let mut reads = Vec::new();
+            for edge in required.iter().filter(|edge| grown.contains(&edge.to)) {
                 let gone: Vec<String> = seen[&edge.to].iter().cloned().collect();
                 let done: Vec<String> = seen
                     .get(&edge.from)
@@ -139,11 +139,15 @@ pub fn plan_node_delete(
                     (MAX_DEPENDENTS + 1) as u32,
                 )
                 .map_err(|error| PlanError::Read(error.to_string()))?;
-                let output = session
-                    .update(cx, |session, cx| {
-                        session.read(&query, at_commit.clone(), cx)
-                    })
-                    .await?;
+                let read = session.update(cx, |session, cx| {
+                    session.read(&query, at_commit.clone(), cx)
+                });
+                reads.push((edge, read));
+            }
+            let (edges, reads): (Vec<&gq_language::EdgeType>, Vec<_>) = reads.into_iter().unzip();
+            let outputs = futures::future::join_all(reads).await;
+            for (edge, output) in edges.into_iter().zip(outputs) {
+                let output = output?;
                 let rows = output.rows.as_array().cloned().unwrap_or_default();
                 for row in rows {
                     let Some(id) = row.get("id").and_then(Value::as_str) else {
