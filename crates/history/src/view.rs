@@ -245,8 +245,10 @@ impl HistoryView {
             })
             .collect();
         self._task = Some(cx.spawn(async move |this, cx| {
+            // The shared lists go to the background as they are; copying thousands of commits
+            // on the main thread would hold up frames.
             let own = match own_read.await {
-                Ok(list) => list.as_ref().clone(),
+                Ok(list) => list,
                 Err(error) => {
                     this.update(cx, |this, cx| {
                         this.state = State::Failed(error.to_string().into());
@@ -256,10 +258,10 @@ impl HistoryView {
                     return;
                 }
             };
-            let mut others: Vec<(String, Vec<CommitOutput>)> = Vec::new();
+            let mut others = Vec::new();
             for (name, read) in other_reads {
                 if let Ok(list) = read.await {
-                    others.push((name, list.as_ref().clone()));
+                    others.push((name, list));
                 }
             }
             // Lay out off the main thread; long histories load in full (E10).
@@ -267,6 +269,7 @@ impl HistoryView {
             let (commits, layout, heads) = cx
                 .background_executor()
                 .spawn(async move {
+                    let own: Vec<CommitOutput> = own.as_ref().clone();
                     let heads = branch_heads(
                         std::iter::once((branch.as_str(), own.as_slice())).chain(
                             others
@@ -274,8 +277,10 @@ impl HistoryView {
                                 .map(|(name, commits)| (name.as_str(), commits.as_slice())),
                         ),
                     );
-                    let lists: Vec<Vec<CommitOutput>> =
-                        others.into_iter().map(|(_, commits)| commits).collect();
+                    let lists: Vec<Vec<CommitOutput>> = others
+                        .into_iter()
+                        .map(|(_, commits)| commits.as_ref().clone())
+                        .collect();
                     let commits = with_merged_commits(own, &lists);
                     let nodes: Vec<GraphCommit> = commits
                         .iter()
