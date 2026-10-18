@@ -132,12 +132,17 @@ impl CommitView {
 
     /// Reads the next pages of changes, up to [`CAP`] more.
     fn load_more(&mut self, cx: &mut Context<Self>) {
+        // One read at a time: the one under way holds the fold.
+        if matches!(self.state, State::Loading) && self._task.is_some() {
+            return;
+        }
         self.state = State::Loading;
         self.more_error = None;
         let session = self.session.clone();
         let commit_id = self.commit_id.clone();
         let mut token = self.next_page_token.take();
-        let mut fold = self.fold.clone();
+        // Moved, not copied, on the main thread: it comes back with the pages read.
+        let mut fold = std::mem::take(&mut self.fold);
         let start = fold.raw_changes();
         self._task = Some(cx.spawn(async move |this, cx| {
             let mut cause = None;
@@ -168,8 +173,19 @@ impl CommitView {
                 }
             };
             let read_any = fold.raw_changes() > start;
-            let folded = fold.clone().finish();
+            // Finished, counted and laid out off the main thread; the fold is kept for the
+            // next pages.
+            let (fold, folded, counts, rows) = cx
+                .background_executor()
+                .spawn(async move {
+                    let folded = fold.clone().finish();
+                    let counts = folded.counts();
+                    let rows = build_rows(&folded);
+                    (fold, folded, counts, rows)
+                })
+                .await;
             this.update(cx, |this, cx| {
+                this.fold = fold;
                 // A failure after changes were shown keeps them, and those read since.
                 let result = match result {
                     Err(message) if read_any || !this.rows.is_empty() => {
@@ -181,9 +197,8 @@ impl CommitView {
                 match result {
                     Ok(()) => {
                         this.cause = cause.or(this.cause.take());
-                        this.fold = fold;
-                        this.counts = folded.counts();
-                        this.rows = build_rows(&folded);
+                        this.counts = counts;
+                        this.rows = rows;
                         this.folded = folded;
                         this.next_page_token = token;
                         // Rows read further down keep the place the person scrolled to.

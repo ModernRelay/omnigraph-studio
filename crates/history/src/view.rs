@@ -142,6 +142,7 @@ impl HistoryView {
                 cx.subscribe(&session, |this, session, event, cx| match event {
                     SessionEvent::BranchChanged => {
                         this.branch = session.read(cx).branch.clone();
+                        this.forget_branch();
                         this.reload(cx);
                     }
                     SessionEvent::Committed { branch } if *branch == this.branch => this.reload(cx),
@@ -200,6 +201,21 @@ impl HistoryView {
         };
         view.reload(cx);
         view
+    }
+
+    /// Lets go of what was shown for the branch left, so its commits never show under the new
+    /// one's name while that is read.
+    fn forget_branch(&mut self) {
+        self.commits.clear();
+        self.graph = Graph::default();
+        self.selected = None;
+        self.detail = None;
+        self._detail_subscription = None;
+        self.heads.clear();
+        self.own_count = 0;
+        self.matches.clear();
+        self.match_at = None;
+        self.count_rows = None;
     }
 
     /// Shows the branch's history again from the session's commit lists, which are read again
