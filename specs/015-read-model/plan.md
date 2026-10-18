@@ -1,6 +1,7 @@
 # 015: One read model: versions, cache, scheduler
 
-Status: draft · 2026-10-17
+Status: in progress; head reads go as branch reads (02ba803), a relationship group is one read
+when it fits (2dfe205), Studio needs 0.14 (911a885) · 2026-10-18
 
 ## Problem
 
@@ -308,6 +309,9 @@ commit can be cleaned up; measure first).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-18 | The same reads on 0.14 | After the hosted graph moved to `0.14.0-edge+d883c49`: node by id at the branch 0.65–0.87 s, pinned to the head 1.51–1.62 s, pinned 200 back 1.34–1.56 s; a Person's 92 groups read once each (first 51 neighbours), 8 at a time | 74.5 s wall, median 1.25 s, p90 3.3 s; `spokenBy` (about 18k edges into a 208k-row table) took 61.2 s, `bookmarked` 20.8 s, `artifactFromPerson` 16.5 s; 51 groups had neighbours, 18 more than 50. The hub groups are the far-table scan of omnigraph#1051 (evidence added there); the pinned surcharge is omnigraph#1052 (0.14 numbers added there) |
+| 2026-10-18 | One read per group that fits | `type_table` `a_group_that_fits_its_page_is_read_once`: 2 neighbour reads, 1 count read only for the group past the page | Passes |
+| 2026-10-18 | A head read goes to the branch and checks its commit | `graph_store` `a_read_at_the_head_goes_to_the_branch_and_checks_its_commit` | Passes |
 | 2026-10-17 | The workload table above | CLI reads against the personal graph on 0.13.0 (`omnigraph query`, `snapshot`, `commit list`, `changes poll`), Studio's query text, 1–3 runs each, from a Mac | As in the table |
 | 2026-10-17 | A count scans the far node table | `explain` of Studio's degree query for `Mentions` | `ScanExec $m: Artifact … id_restriction=input`; `hash_join_build_bytes(node:Artifact)` ≈ 205 MB estimated; `count($e.@id)` and `count($e.@src)` the same plan and time |
 | 2026-10-17 | Snapshot versions are lineage-local | `crates/omnigraph-api-types/src/lib.rs` (`published_dataset_version` from the manifest row), `docs/dev/writes.md` (`base + 1`, readers open `staged_version`), `engine/mod.rs` `dataset_pin` | Confirmed |
