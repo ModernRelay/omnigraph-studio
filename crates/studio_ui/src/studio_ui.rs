@@ -10,6 +10,7 @@ use ui::prelude::*;
 pub use studio_theme::type_color;
 
 mod button;
+mod cell_text;
 mod changes;
 pub mod ds;
 pub mod motion;
@@ -19,6 +20,7 @@ pub mod rows;
 pub mod text;
 mod values;
 
+pub use cell_text::{CellText, cell_text};
 pub use changes::{ChangeCard, ChangeKind, PropertyRow, change_counts, change_group_header};
 pub use overlay_slot::{OverlaySlot, OverlaySlotElement};
 pub use resize::{

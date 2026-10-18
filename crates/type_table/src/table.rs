@@ -5876,7 +5876,12 @@ impl TypeTable {
         {
             return shown.clone();
         }
-        let shown: SharedString = display_value(column.property(), value).into();
+        // On one line: a control character shows as its picture, as a single-line label has it.
+        let text = display_value(column.property(), value);
+        let shown: SharedString = match ui::utils::replace_control_characters(&text) {
+            std::borrow::Cow::Owned(replaced) => replaced.into(),
+            std::borrow::Cow::Borrowed(_) => text.into(),
+        };
         self.cell_text
             .borrow_mut()
             .entry(row.id.clone())
@@ -6006,18 +6011,15 @@ impl TypeTable {
                 ui::Chip::new(shown).into_any_element()
             }
             _ => {
-                let mut label = Label::new(shown)
-                    .size(LabelSize::Small)
-                    .color(text_color)
-                    .single_line()
-                    .truncate();
+                // One line in the cell's room, never measured: most cells are this.
+                let mut text = studio_ui::cell_text(shown, cx).color(text_color.color(cx));
                 if numeric {
-                    label = label.buffer_font(cx);
+                    text = text.buffer_font(cx).align_end();
                 }
                 if matches!(column.role, ColumnRole::Key) {
-                    label = label.weight(gpui::FontWeight::MEDIUM);
+                    text = text.weight(gpui::FontWeight::MEDIUM);
                 }
-                label.into_any_element()
+                text.into_any_element()
             }
         };
         let (dot, tooltip) = match state {

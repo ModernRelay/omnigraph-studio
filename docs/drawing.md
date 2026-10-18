@@ -39,6 +39,11 @@ Measured against Zed v1.23.2 (`crates/gpui/src/window.rs`, `view.rs`):
   empty gap as wide as they are, so a line lays out a handful of cells, its header the same
   ones, and the scroll range does not change. The columns are picked as the grid draws, from
   the scroll offset and the window's width, which bounds the view's.
+- A grid cell's plain value is `studio_ui::CellText`, not a `Label`: the cell's box is fixed by
+  its column, so the text asks for no measurement and is cut only when it does not fit. A
+  truncated label is measured on every layout pass of every frame, with a line wrapper taken
+  from GPUI's pool each time (`TextLayout::layout`); in a table that was a fifth of a scroll
+  frame.
 
 ## Guards
 
