@@ -18,7 +18,8 @@ use graph_client::api::{
     SnapshotDatasetOutput, SnapshotOutput,
 };
 use graph_client::{
-    BlobAt, BlobCell, BlobMeta, CommitChanges, GraphClient, ReadError, ServerHealth, WriteOutcome,
+    ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CommitChanges, GraphClient, ReadError,
+    ServerHealth, WriteOutcome,
 };
 use serde_json::Value;
 
@@ -742,7 +743,7 @@ impl GraphSession {
             Some(Held::Done(output)) => return Task::ready(Ok(output)),
             Some(Held::Pending(shared)) => shared,
             None => {
-                let shared = self.read_request(request, cx).shared();
+                let shared = self.read_at_commit(request, cx).shared();
                 self.pinned_reads.start(key.clone(), shared.clone());
                 shared
             }
@@ -752,6 +753,54 @@ impl GraphSession {
             this.update(cx, |this, _| this.pinned_reads.finish(&key, &result))
                 .ok();
             result
+        })
+    }
+
+    /// A read at `request`'s commit. When that commit is the session branch's head, it is sent
+    /// as a read of the branch, which the server answers from its warm caches where a read
+    /// pinned to a commit resolves the commit and opens the graph at it, 0.5 s or more slower
+    /// (spec 015). Its answer counts only if it comes back at that commit, so the read still
+    /// sees exactly the commit asked for; one from a newer head is read again, pinned. Only the
+    /// head watch moves a head, since reads can finish out of order.
+    fn read_at_commit(
+        &mut self,
+        request: QueryRequest,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
+        let Some(commit) = request.snapshot.clone() else {
+            return self.read_request(request, cx);
+        };
+        if self.heads.get(&self.branch) != Some(&commit) {
+            return self.read_request(request, cx);
+        }
+        let at_branch = QueryRequest {
+            branch: Some(self.branch.clone()),
+            snapshot: None,
+            ..request.clone()
+        };
+        let branch_read = self.read_request(at_branch, cx);
+        cx.spawn(async move |this, cx| {
+            match branch_read.await {
+                Ok(mut output) if output.graph_commit_id.as_deref() == Some(commit.as_str()) => {
+                    // Answered as the pinned read would be.
+                    output.target.branch = None;
+                    output.target.snapshot = Some(commit);
+                    return Ok(output);
+                }
+                // The branch moved past the commit, or went: read at the commit itself.
+                Ok(_)
+                | Err(ReadError::Refused(ApiErrorSummary {
+                    status: 404 | 409, ..
+                })) => {}
+                Err(error) => return Err(error),
+            }
+            let pinned = this.update(cx, |this, cx| this.read_request(request, cx));
+            match pinned {
+                Ok(pinned) => pinned.await,
+                Err(_) => Err(ReadError::Transport(
+                    "Studio stopped before the server answered".into(),
+                )),
+            }
         })
     }
 
@@ -1543,6 +1592,118 @@ mod tests {
             4,
             "the branch head moves: every read is sent"
         );
+    }
+
+    /// A read at the commit the branch's head is at goes as a read of the branch, which the
+    /// server answers from its warm caches, and counts only if it comes back at that commit.
+    /// Once the branch has moved past it, the read is sent again pinned to the commit; the head
+    /// moves only by the head watch.
+    #[gpui::test]
+    async fn a_read_at_the_head_goes_to_the_branch_and_checks_its_commit(cx: &mut TestAppContext) {
+        use futures::AsyncReadExt as _;
+        let served_head = Arc::new(std::sync::Mutex::new("c1"));
+        let sent = Arc::new(std::sync::Mutex::new(
+            Vec::<(Option<String>, Option<String>)>::new(),
+        ));
+        let (head_seen, sent_seen) = (served_head.clone(), sent.clone());
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let (head, sent) = (head_seen.clone(), sent_seen.clone());
+            async move {
+                let body = if path.ends_with("/query") {
+                    let mut bytes = Vec::new();
+                    request.into_body().read_to_end(&mut bytes).await.ok();
+                    let asked: Value = serde_json::from_slice(&bytes).unwrap();
+                    let branch = asked["branch"].as_str().map(str::to_owned);
+                    let snapshot = asked["snapshot"].as_str().map(str::to_owned);
+                    sent.lock()
+                        .unwrap()
+                        .push((branch.clone(), snapshot.clone()));
+                    let at = snapshot
+                        .clone()
+                        .unwrap_or_else(|| head.lock().unwrap().to_string());
+                    serde_json::json!({
+                        "query_name": "q",
+                        "target": { "branch": branch, "snapshot": snapshot },
+                        "row_count": 1,
+                        "columns": ["at"],
+                        "rows": [{ "at": at }],
+                        "graph_commit_id": at,
+                    })
+                    .to_string()
+                } else {
+                    r#"{"branches":["main"]}"#.to_owned()
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        session.update(cx, |session, _| {
+            session.heads.insert("main".into(), "c1".into());
+        });
+        sent.lock().unwrap().clear();
+        let query = |n: i64| BuiltQuery {
+            name: "q".into(),
+            text: "query q($n: I64) { match { $p: Person } return { count($p) as n } }".into(),
+            params: [("n".to_owned(), Value::from(n))].into_iter().collect(),
+        };
+
+        let read = session.update(cx, |session, cx| {
+            session.read(&query(1), Some("c1".into()), cx)
+        });
+        let output = read.await.unwrap();
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![(Some("main".to_owned()), None)],
+            "sent as a read of the branch"
+        );
+        assert_eq!(output.graph_commit_id.as_deref(), Some("c1"));
+        assert_eq!(
+            output.target.snapshot.as_deref(),
+            Some("c1"),
+            "answered as pinned"
+        );
+        assert_eq!(output.target.branch, None);
+
+        *served_head.lock().unwrap() = "c2";
+        sent.lock().unwrap().clear();
+        let read = session.update(cx, |session, cx| {
+            session.read(&query(2), Some("c1".into()), cx)
+        });
+        let output = read.await.unwrap();
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![
+                (Some("main".to_owned()), None),
+                (None, Some("c1".to_owned()))
+            ],
+            "the branch moved: read again at the commit"
+        );
+        assert_eq!(
+            output.rows,
+            serde_json::json!([{ "at": "c1" }]),
+            "the rows are the commit's"
+        );
+        session.read_with(cx, |session, _| {
+            assert_eq!(
+                session.head("main"),
+                Some("c1"),
+                "a read does not move the head"
+            );
+        });
     }
 
     /// Counts asked for one at a time in the same turn go out as one read per node type and
