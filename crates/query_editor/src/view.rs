@@ -15,9 +15,9 @@ use editor::{
 };
 use gpui::{
     AnyView, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, HighlightStyle, MouseButton, MouseDownEvent, Render, ScrollStrategy,
-    SharedString, StyleRefinement, Subscription, Task, UnderlineStyle, UniformListScrollHandle,
-    WeakEntity, Window, uniform_list,
+    FocusHandle, Focusable, HighlightStyle, MouseButton, MouseDownEvent, Pixels, Render,
+    ScrollHandle, ScrollStrategy, SharedString, StyleRefinement, Subscription, Task,
+    UnderlineStyle, UniformListScrollHandle, WeakEntity, Window, uniform_list,
 };
 use gq_language::{QueryInfo, ResultColumn, SchemaModel, Statement, TokenKind};
 use graph_client::api::ErrorCode;
@@ -29,8 +29,8 @@ use graph_store::{GraphSession, SessionEvent};
 use serde_json::{Map, Value};
 use studio_actions::query::{CopyCell, CopyRow, Explain, Run, Save, SaveAs};
 use studio_ui::{
-    ColumnDrag, ColumnResize, GridColumn, ROW_HEIGHT, format_value, grid_cell, grid_header,
-    is_numeric, resizable_grid_header, short_commit_id,
+    ColumnDrag, ColumnResize, GridColumn, GridPlace, ROW_HEIGHT, columns_in_view, format_value,
+    grid_cell, grid_header, grid_places, is_numeric, resizable_grid_header, short_commit_id,
 };
 use studio_workspace::{Item, ItemEvent, ItemFooter, KeyHint, SavedItem};
 use ui::prelude::*;
@@ -122,6 +122,9 @@ struct RowsOutput {
     graph: Option<Arc<ResultGraph>>,
     widths: Vec<f32>,
     right_aligned: Vec<bool>,
+    /// What each row's cells show, made the first time the row is drawn rather than every
+    /// frame it is.
+    shown: Vec<std::cell::OnceCell<Box<[SharedString]>>>,
     row_count: i64,
     elapsed: Duration,
     target: String,
@@ -270,6 +273,8 @@ pub struct QueryEditor {
     resizing: Option<ColumnResize<usize>>,
     example: Option<String>,
     results_scroll: UniformListScrollHandle,
+    /// How far the results are scrolled sideways, for the columns a frame draws.
+    results_hscroll: ScrollHandle,
     results_focus: FocusHandle,
     confirm_focus: FocusHandle,
     run_task: Option<Task<()>>,
@@ -527,6 +532,7 @@ impl QueryEditor {
             resizing: None,
             example: None,
             results_scroll: UniformListScrollHandle::new(),
+            results_hscroll: ScrollHandle::new(),
             results_focus: cx.focus_handle(),
             confirm_focus: cx.focus_handle(),
             run_task: None,
@@ -1521,12 +1527,14 @@ impl QueryEditor {
                     })
                     .collect();
                 let graph = schema.and_then(|schema| table.graph(&schema)).map(Arc::new);
+                let shown = table.rows.iter().map(|_| Default::default()).collect();
                 Output::Rows(RowsOutput {
                     label: prepared.label,
                     graph,
                     table,
                     widths,
                     right_aligned,
+                    shown,
                     row_count: output.row_count,
                     elapsed,
                     target: output
@@ -2205,9 +2213,10 @@ impl QueryEditor {
     fn render_rows(
         &self,
         rows: &RowsOutput,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let places = self.result_places(rows, window);
         let table = &rows.table;
         let columns: Vec<GridColumn> = table
             .columns
@@ -2227,6 +2236,7 @@ impl QueryEditor {
         let header = || {
             resizable_grid_header(
                 &columns,
+                Some(&places),
                 px(ROW_NUMBER_WIDTH),
                 |index| Some(self.render_resize_handle(index, rows.widths[index], cx)),
                 cx,
@@ -2245,13 +2255,14 @@ impl QueryEditor {
                 .flex_1()
                 .min_h_0()
                 .overflow_x_scroll()
+                .track_scroll(&self.results_hscroll)
                 .child(
                     v_flex().h_full().w(px(total)).child(header()).child(
                         uniform_list(
                             "query-results",
                             table.rows.len(),
-                            cx.processor(|this, range, _window, cx| {
-                                this.render_grid_rows(range, cx)
+                            cx.processor(|this, range, window, cx| {
+                                this.render_grid_rows(range, window, cx)
                             }),
                         )
                         .track_scroll(&self.results_scroll)
@@ -2338,21 +2349,48 @@ impl QueryEditor {
         cx.notify();
     }
 
+    /// The result columns this frame draws: those in the sideways view, one either side, and
+    /// the selected cell's (`studio_ui::grid_places`).
+    fn result_places(&self, rows: &RowsOutput, window: &Window) -> Vec<GridPlace> {
+        let widths: Vec<Pixels> = rows.widths.iter().map(|&width| px(width)).collect();
+        // The row numbers scroll with the columns. The view is never wider than the window,
+        // whose width is this frame's.
+        let start = -self.results_hscroll.offset().x - px(ROW_NUMBER_WIDTH);
+        let mut drawn = columns_in_view(&widths, start..start + window.viewport_size().width);
+        if let Some(drawn) = self.selected.and_then(|(_, column)| drawn.get_mut(column)) {
+            *drawn = true;
+        }
+        grid_places(&drawn, &widths)
+    }
+
     fn render_grid_rows(
         &mut self,
         range: std::ops::Range<usize>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let Output::Rows(rows) = &self.output else {
             return Vec::new();
         };
+        let places = self.result_places(rows, window);
         let border = studio_ui::ds::surface::rule(cx);
         let colors = cx.theme().colors();
         let (selected_bg, row_selected_bg) = (colors.element_selected, colors.ghost_element_hover);
+        let (muted, disabled, default) = (
+            Color::Muted.color(cx),
+            Color::Disabled.color(cx),
+            Color::Default.color(cx),
+        );
         let selected = self.selected;
         range
             .filter_map(|ix| {
                 let values = rows.table.rows.get(ix)?;
+                let shown = rows.shown.get(ix)?.get_or_init(|| {
+                    values
+                        .iter()
+                        .map(|value| SharedString::from(format_value(value)))
+                        .collect()
+                });
                 let row_selected = selected.is_some_and(|(row, _)| row == ix);
                 Some(
                     h_flex()
@@ -2361,34 +2399,38 @@ impl QueryEditor {
                         .border_color(border)
                         .when(row_selected, |d| d.bg(row_selected_bg))
                         .child(
-                            div().w(px(ROW_NUMBER_WIDTH)).flex_none().px_2().child(
-                                Label::new((ix + 1).to_string())
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
+                            h_flex().w(px(ROW_NUMBER_WIDTH)).flex_none().px_2().child(
+                                studio_ui::cell_text((ix + 1).to_string(), cx)
+                                    .size(TextSize::XSmall, cx)
+                                    .color(muted),
                             ),
                         )
-                        .children(values.iter().enumerate().map(|(column, value)| {
+                        .children(places.iter().map(|place| {
+                            let column = match *place {
+                                GridPlace::Column(column) => column,
+                                GridPlace::Gap(width) => {
+                                    return div().w(width).flex_none().into_any_element();
+                                }
+                            };
                             let cell_selected = selected == Some((ix, column));
-                            let text = format_value(value);
-                            grid_cell(px(rows.widths[column]), rows.right_aligned[column])
+                            let right = rows.right_aligned[column];
+                            let text = studio_ui::cell_text(shown[column].clone(), cx).color(
+                                if values[column].is_null() {
+                                    disabled
+                                } else {
+                                    default
+                                },
+                            );
+                            grid_cell(px(rows.widths[column]), right)
                                 .when(cell_selected, |d| d.bg(selected_bg))
-                                .child(
-                                    Label::new(text)
-                                        .size(LabelSize::Small)
-                                        .color(if value.is_null() {
-                                            Color::Disabled
-                                        } else {
-                                            Color::Default
-                                        })
-                                        .single_line()
-                                        .truncate(),
-                                )
+                                .child(if right { text.align_end() } else { text })
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, window, cx| {
                                         this.select_cell(ix, column, window, cx)
                                     }),
                                 )
+                                .into_any_element()
                         }))
                         .into_any_element(),
                 )
@@ -3085,6 +3127,50 @@ mod tests {
                 editor.resize_column(1, None, cx);
                 assert_eq!(widths(editor), vec![fitted[1], fitted[0]]);
                 assert!(editor.column_widths.is_empty());
+            });
+        }
+
+        /// A result wider than its view draws the columns in view and one gap for the rest, as
+        /// wide as they are; scrolled to the end, the last (`docs/drawing.md`).
+        #[gpui::test]
+        async fn a_wide_result_draws_only_the_columns_in_view(cx: &mut TestAppContext) {
+            cx.update(|cx| {
+                studio_theme::init_test(cx);
+                editor::init(cx);
+            });
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            let names: Vec<String> = (0..60).map(|i| format!("column_{i:02}")).collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            editor.update_in(cx, |editor, window, _| {
+                finish(editor, &names);
+                let Output::Rows(rows) = &editor.output else {
+                    panic!("no rows");
+                };
+                let places = editor.result_places(rows, window);
+                assert!(places.len() < 30, "{places:?}");
+                assert_eq!(places.first(), Some(&GridPlace::Column(0)));
+                assert!(
+                    matches!(places.last(), Some(GridPlace::Gap(_))),
+                    "{places:?}"
+                );
+                let width = |place: &GridPlace| match *place {
+                    GridPlace::Column(column) => rows.widths[column],
+                    GridPlace::Gap(width) => f32::from(width),
+                };
+                let drawn: f32 = places.iter().map(width).sum();
+                let all: f32 = rows.widths.iter().sum();
+                assert!((drawn - all).abs() < 0.5, "{drawn} of {all}");
+
+                let end = px(ROW_NUMBER_WIDTH + all) - window.viewport_size().width;
+                editor.results_hscroll.set_offset(gpui::point(-end, px(0.)));
+                let places = editor.result_places(rows, window);
+                assert_eq!(places.last(), Some(&GridPlace::Column(59)), "{places:?}");
+                assert!(
+                    matches!(places.first(), Some(GridPlace::Gap(_))),
+                    "{places:?}"
+                );
             });
         }
 

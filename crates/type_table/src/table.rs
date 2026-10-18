@@ -34,7 +34,7 @@ use studio_actions::table::{
     FilterBySelection, InsertRow, MoveDown, MoveLeft, MoveRight, MoveUp, OpenRowPage, PeekRow,
     RefreshTable, SaveDrafts, SelectNextSuggestion, SelectPreviousSuggestion, StageEdit,
 };
-use studio_ui::{ColumnDrag, ColumnResize, ROW_HEIGHT};
+use studio_ui::{ColumnDrag, ColumnResize, GridPlace, ROW_HEIGHT, columns_in_view, grid_places};
 use studio_workspace::{
     Item, ItemEvent, ItemFooter, KeyHint, SavedItem, ToastKind, Workspace, WorkspaceEvent,
 };
@@ -124,29 +124,6 @@ struct RowLook {
     dimmed: bool,
     cursor: bool,
     header: bool,
-}
-
-/// One place across a line as a frame draws it: a column, or the columns between two drawn
-/// ones, which a line leaves as one empty space at their width. A wide type draws a handful of
-/// columns, so a line lays out a handful of cells, not one per column (`docs/drawing.md`).
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Place {
-    Column(usize),
-    Gap(Pixels),
-}
-
-/// The places a frame draws, from the columns it draws and every column's width. The pinned
-/// first column is always drawn, so it is always the first place.
-fn frame_places(drawn: &[bool], widths: &[Pixels]) -> Vec<Place> {
-    let mut places = Vec::new();
-    for (col, (&drawn, &width)) in drawn.iter().zip(widths).enumerate() {
-        match places.last_mut() {
-            _ if drawn => places.push(Place::Column(col)),
-            Some(Place::Gap(gap)) => *gap += width,
-            _ => places.push(Place::Gap(width)),
-        }
-    }
-    places
 }
 
 /// How long scrolling must pause before the drawn rows' Blob cells are read.
@@ -286,7 +263,7 @@ pub struct TypeTable {
     /// How the lines drawn this frame look, filled by the row callback for the row styling.
     frame_looks: Rc<RefCell<HashMap<usize, RowLook>>>,
     /// The places this frame's lines draw.
-    frame_places: Rc<[Place]>,
+    frame_places: Rc<[GridPlace]>,
     /// The columns the last drawn rows drew.
     #[cfg(test)]
     frame_drawn: Vec<bool>,
@@ -5108,14 +5085,14 @@ impl TypeTable {
             .iter()
             .map(|c| px(self.layout.width(c)))
             .collect();
-        let places: Rc<[Place]> = frame_places(&drawn, &column_widths).into();
+        let places: Rc<[GridPlace]> = grid_places(&drawn, &column_widths).into();
         self.frame_places = places.clone();
         let headers: Vec<AnyElement> = places
             .iter()
             .map(|place| {
                 let index = match *place {
-                    Place::Column(index) => index,
-                    Place::Gap(_) => return div().into_any_element(),
+                    GridPlace::Column(index) => index,
+                    GridPlace::Gap(_) => return div().into_any_element(),
                 };
                 let column = &self.columns[index];
                 let sortable = column.property().filter(|p| Sort::allowed(p));
@@ -5244,8 +5221,8 @@ impl TypeTable {
         let widths: Vec<Pixels> = places
             .iter()
             .map(|place| match *place {
-                Place::Column(col) => column_widths[col],
-                Place::Gap(width) => width,
+                GridPlace::Column(col) => column_widths[col],
+                GridPlace::Gap(width) => width,
             })
             .collect();
         Table::new(places.len())
@@ -5814,8 +5791,8 @@ impl TypeTable {
             .clone()
             .iter()
             .map(|place| match *place {
-                Place::Column(col) => self.render_cell(ix, col, row, window, cx),
-                Place::Gap(_) => div().into_any_element(),
+                GridPlace::Column(col) => self.render_cell(ix, col, row, window, cx),
+                GridPlace::Gap(_) => div().into_any_element(),
             })
             .collect()
     }
@@ -5825,34 +5802,22 @@ impl TypeTable {
     /// so a wide type would otherwise pay for every column on every scroll
     /// (`docs/drawing.md`). Worked out as the frame is drawn, so the header draws the same.
     fn drawn_columns(&self, window: &Window, cx: &App) -> Vec<bool> {
-        let count = self.columns.len();
+        if self.columns.is_empty() {
+            return Vec::new();
+        }
         let handle = &self.table_state.read(cx).horizontal_scroll_handle;
         // The scrolled part is never wider than the window, whose width is this frame's, also
         // in the frame that resizes it; the offset is this frame's too, as a scroll draws again.
         let shown_left = -handle.offset().x;
-        let shown_right = shown_left + window.viewport_size().width;
-        let mut left = px(0.);
-        let in_view: Vec<bool> = self
+        let shown = shown_left..shown_left + window.viewport_size().width;
+        let scrolled: Vec<Pixels> = self
             .columns
             .iter()
-            .enumerate()
-            .map(|(col, column)| {
-                if col == 0 {
-                    return true;
-                }
-                let right = left + px(self.layout.width(column));
-                let shown = right > shown_left && left < shown_right;
-                left = right;
-                shown
-            })
+            .skip(1)
+            .map(|column| px(self.layout.width(column)))
             .collect();
-        let mut drawn: Vec<bool> = (0..count)
-            .map(|col| {
-                in_view[col]
-                    || in_view.get(col + 1).copied().unwrap_or(false)
-                    || (col > 1 && in_view[col - 1])
-            })
-            .collect();
+        let mut drawn = vec![true];
+        drawn.extend(columns_in_view(&scrolled, shown));
         let edited = self.editing.as_ref().and_then(|editing| {
             self.columns
                 .iter()
@@ -6883,24 +6848,6 @@ mod tests {
         assert_eq!(degree_reads(), read.len(), "none read twice");
     }
 
-    #[test]
-    fn the_columns_a_frame_leaves_out_are_one_gap_per_run() {
-        let widths: Vec<Pixels> = [10., 20., 30., 40., 50., 60.].map(px).to_vec();
-        assert_eq!(
-            frame_places(&[true, false, false, true, false, false], &widths),
-            vec![
-                Place::Column(0),
-                Place::Gap(px(50.)),
-                Place::Column(3),
-                Place::Gap(px(110.)),
-            ]
-        );
-        assert_eq!(
-            frame_places(&[true, true], &widths[..2]),
-            vec![Place::Column(0), Place::Column(1)]
-        );
-    }
-
     /// A row draws the columns in view, one either side, the pinned first and the cursor's;
     /// the rest are empty at their width.
     #[gpui::test]
@@ -6974,10 +6921,13 @@ mod tests {
         table.read_with(cx, |table, _| {
             let places = &table.frame_places;
             assert!(places.len() < table.columns.len(), "{places:?}");
-            assert!(matches!(places.last(), Some(Place::Gap(_))), "{places:?}");
-            let width = |place: &Place| match *place {
-                Place::Column(col) => table.layout.width(&table.columns[col]),
-                Place::Gap(width) => f32::from(width),
+            assert!(
+                matches!(places.last(), Some(GridPlace::Gap(_))),
+                "{places:?}"
+            );
+            let width = |place: &GridPlace| match *place {
+                GridPlace::Column(col) => table.layout.width(&table.columns[col]),
+                GridPlace::Gap(width) => f32::from(width),
             };
             let drawn: f32 = places.iter().map(width).sum();
             let all: f32 = table.columns.iter().map(|c| table.layout.width(c)).sum();

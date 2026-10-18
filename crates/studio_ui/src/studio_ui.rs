@@ -13,6 +13,7 @@ mod button;
 mod cell_text;
 mod changes;
 pub mod ds;
+mod grid_places;
 pub mod motion;
 mod overlay_slot;
 mod resize;
@@ -22,6 +23,7 @@ mod values;
 
 pub use cell_text::{CellText, cell_text};
 pub use changes::{ChangeCard, ChangeKind, PropertyRow, change_counts, change_group_header};
+pub use grid_places::{GridPlace, columns_in_view, grid_places};
 pub use overlay_slot::{OverlaySlot, OverlaySlotElement};
 pub use resize::{
     COLUMN_MAX_WIDTH, COLUMN_MIN_WIDTH, ColumnDrag, ColumnResize, clamp_width, column_resize_handle,
@@ -75,24 +77,38 @@ pub const HEADER_HEIGHT: f32 = ds::size::HEADER;
 /// The header row of a grid: one line per column, the name then its type, muted, with a
 /// hairline below (spec 002, "Visual language").
 pub fn grid_header(columns: &[GridColumn], leading: Pixels, cx: &App) -> Div {
-    resizable_grid_header(columns, leading, |_| None, cx)
+    resizable_grid_header(columns, None, leading, |_| None, cx)
 }
 
-/// [`grid_header`] with what `handle` gives for a column at its right edge: a
-/// [`column_resize_handle`].
+/// [`grid_header`] at a frame's `places` (every column when `None`; see [`grid_places`]),
+/// with what `handle` gives for a column at its right edge: a [`column_resize_handle`].
 pub fn resizable_grid_header(
     columns: &[GridColumn],
+    places: Option<&[GridPlace]>,
     leading: Pixels,
     mut handle: impl FnMut(usize) -> Option<AnyElement>,
     cx: &App,
 ) -> Div {
+    let every: Vec<GridPlace>;
+    let places = match places {
+        Some(places) => places,
+        None => {
+            every = (0..columns.len()).map(GridPlace::Column).collect();
+            &every
+        }
+    };
     h_flex()
         .h(px(HEADER_HEIGHT))
         .flex_none()
         .border_b_1()
         .border_color(ds::surface::rule(cx))
         .child(div().w(leading).flex_none())
-        .children(columns.iter().enumerate().map(|(index, column)| {
+        .children(places.iter().map(|place| {
+            let index = match *place {
+                GridPlace::Column(index) => index,
+                GridPlace::Gap(width) => return div().w(width).flex_none().into_any_element(),
+            };
+            let column = &columns[index];
             h_flex()
                 .relative()
                 .w(column.width)
@@ -114,6 +130,7 @@ pub fn resizable_grid_header(
                         .single_line()
                 }))
                 .children(handle(index))
+                .into_any_element()
         }))
 }
 

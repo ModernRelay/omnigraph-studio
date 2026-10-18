@@ -39,6 +39,8 @@ Measured against Zed v1.23.2 (`crates/gpui/src/window.rs`, `view.rs`):
   empty gap as wide as they are, so a line lays out a handful of cells, its header the same
   ones, and the scroll range does not change. The columns are picked as the grid draws, from
   the scroll offset and the window's width, which bounds the view's.
+- The type table and the query results pick their columns with `studio_ui::columns_in_view` and
+  `studio_ui::grid_places`.
 - A grid cell's plain value is `studio_ui::CellText`, not a `Label`: the cell's box is fixed by
   its column, so the text asks for no measurement and is cut only when it does not fit. A
   truncated label is measured on every layout pass of every frame, with a line wrapper taken
@@ -54,6 +56,7 @@ the interaction and asserts the count:
 | --- | --- |
 | `type_table` `typing_in_a_field_leaves_the_grid_as_it_was` | The grid follows the table's `notify`; typing in the filter field or a cell does not draw it |
 | `type_table` `rows_draw_only_the_columns_in_view` | A 21-column type draws the pinned column and those in view; scrolled to the end, the last; the cursor's column always; a line lays out one gap for the rest, as wide as they are; widened, every column in the frame of the resize |
+| `query_editor` `a_wide_result_draws_only_the_columns_in_view` | A 60-column result draws the columns in view and one gap for the rest, as wide as they are; scrolled to the end, the last |
 | `query_editor` `typing_in_the_query_leaves_the_results_as_they_were` | The result area follows the tab's `notify`; typing in the query does not draw it |
 | `studio_workspace` `a_tab_that_caches_its_parts_keeps_them_while_a_field_changes` | A tab that caches its parts keeps them while a field changes; a cached tab draws them again, which is the GPUI behavior the opt-out exists for |
 
