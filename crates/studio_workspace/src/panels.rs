@@ -124,9 +124,8 @@ impl<V> Dock<V> {
         self.panels.iter().position(|panel| panel.id.as_ref() == id)
     }
 
-    /// Adds a panel, or replaces the view of the panel with the same id.
-    /// Adds a panel, or replaces the one with its id, keeping that one's header actions when
-    /// the new one brings none.
+    /// Adds a panel, or replaces the one with its id, keeping that one's header actions and
+    /// focus handle when the new one brings none.
     pub fn insert(&mut self, mut panel: PanelEntry<V>) {
         match self.position_of(&panel.id) {
             Some(index) => {

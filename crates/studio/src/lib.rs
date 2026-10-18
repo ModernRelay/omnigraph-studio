@@ -158,9 +158,14 @@ fn open_settings(workspace: &mut Workspace, window: &mut Window, cx: &mut Contex
         let session = session.read(cx);
         (session.settings_key(cx), session.graph_id.clone())
     });
-    workspace.open_item("settings", window, cx, move |window, cx| {
-        settings_view::SettingsView::new(graph, window, cx)
+    let made = graph.clone();
+    let view = workspace.open_item("settings", window, cx, move |window, cx| {
+        settings_view::SettingsView::new(made, window, cx)
     });
+    // A tab open from before offers the graph shown now.
+    if let Some(view) = view {
+        view.update(cx, |view, cx| view.set_graph(graph, window, cx));
+    }
 }
 
 /// A window's options, at `bounds` or else where the last moved window was.
@@ -263,7 +268,7 @@ fn reopen_window(
 ) {
     let registry = ConnectionRegistry::global(cx);
     let connections = registry.read(cx).connections.clone();
-    let mut shown = None;
+    let mut last = None;
     for (index, graph) in saved.session.graphs.iter().enumerate() {
         let Some(connection) = connections
             .iter()
@@ -277,14 +282,23 @@ fn reopen_window(
         }
         let session = open_session(connection, graph.graph.clone(), graph.branch.clone(), cx);
         if index == saved.session.shown {
-            shown = Some(session.entity_id());
+            workspace.update(cx, |workspace, cx| {
+                workspace.set_session(session, window, cx)
+            });
+        } else {
+            last = Some(session.entity_id());
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_session_behind(session, cx)
+            });
         }
-        workspace.update(cx, |workspace, cx| {
-            workspace.set_session(session, window, cx)
-        });
     }
-    if let Some(id) = shown {
-        workspace.update(cx, |workspace, cx| workspace.show_graph(id, window, cx));
+    // The graph it showed could not be reopened: the last one that could is shown instead.
+    if let Some(id) = last {
+        workspace.update(cx, |workspace, cx| {
+            if workspace.session().is_none() {
+                workspace.show_graph(id, window, cx)
+            }
+        });
     }
 }
 
@@ -370,21 +384,22 @@ pub fn open_link(link: &str, cx: &mut App) {
     };
     let branch = target.branch.clone().unwrap_or_else(|| "main".into());
     let open_in = move |workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App| {
-        // The graph on this branch, if the window has it open; else open it here.
+        // The graph, if the window has it open, moved to the link's branch; else opened here.
         let open = workspace
             .read(cx)
             .open_graphs()
             .into_iter()
             .find(|(session, _)| {
                 let session = session.read(cx);
-                session.graph_id == target.graph
-                    && session.branch == branch
-                    && session.connection == connection
+                session.graph_id == target.graph && session.connection == connection
             });
         match open {
-            Some((session, _)) => workspace.update(cx, |workspace, cx| {
-                workspace.show_graph(session.entity_id(), window, cx)
-            }),
+            Some((session, _)) => {
+                session.update(cx, |session, cx| session.set_branch(branch.clone(), cx));
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_graph(session.entity_id(), window, cx)
+                })
+            }
             None => {
                 if connection.read(cx).state == ConnectionState::Idle {
                     connection.update(cx, |connection, cx| connection.connect(cx));

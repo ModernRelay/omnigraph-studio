@@ -294,6 +294,22 @@ impl Member {
         }
     }
 
+    /// Whether every split has a share for each of its members (at least two), each share a
+    /// positive number: what a saved layout must be before it is drawn or split again.
+    pub fn is_well_formed(&self) -> bool {
+        match self {
+            Member::Pane(_) => true,
+            Member::Split {
+                members, flexes, ..
+            } => {
+                members.len() >= 2
+                    && flexes.len() == members.len()
+                    && flexes.iter().all(|flex| flex.is_finite() && *flex > 0.)
+                    && members.iter().all(Member::is_well_formed)
+            }
+        }
+    }
+
     pub fn contains(&self, pane: PaneId) -> bool {
         match self {
             Member::Pane(id) => *id == pane,
@@ -419,6 +435,30 @@ impl Member {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A saved layout read from disk is checked before it is used: a split's shares are
+    /// indexed by its members.
+    #[test]
+    fn a_layout_whose_shares_do_not_fit_its_panes_is_refused() {
+        let mut layout = Member::Pane(0);
+        layout.split(0, 1, SplitDirection::Right);
+        assert!(layout.is_well_formed());
+        let split = |flexes: Vec<f32>| Member::Split {
+            axis: SplitAxis::Horizontal,
+            members: vec![Member::Pane(0), Member::Pane(1)],
+            flexes,
+        };
+        assert!(split(vec![1., 2.]).is_well_formed());
+        assert!(!split(vec![1.]).is_well_formed(), "a share missing");
+        assert!(!split(vec![1., f32::NAN]).is_well_formed());
+        assert!(!split(vec![1., 0.]).is_well_formed());
+        let lone = Member::Split {
+            axis: SplitAxis::Vertical,
+            members: vec![Member::Pane(0)],
+            flexes: vec![1.],
+        };
+        assert!(!lone.is_well_formed(), "a split of one pane");
+    }
 
     #[derive(Debug, PartialEq)]
     struct T(u64);

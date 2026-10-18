@@ -35,9 +35,6 @@ pub struct SavedPane {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SavedWorkspace {
-    /// The tabs of a file written before splits; read as one pane.
-    pub items: Vec<SavedItem>,
-    pub active: usize,
     /// The panes in reading order, and the split tree over their positions in this list.
     pub panes: Vec<SavedPane>,
     pub layout: Option<crate::Member>,
@@ -80,6 +77,12 @@ pub fn restore_enabled() -> bool {
     std::env::var("OMNIGRAPH_STUDIO_NO_RESTORE").map_or(true, |v| v.is_empty() || v == "0")
 }
 
+/// Whether state is written to the data directory. This crate's tests write none of it: their
+/// data directory is the person's own.
+fn saving() -> bool {
+    !cfg!(test) && restore_enabled()
+}
+
 fn workspaces_dir() -> PathBuf {
     studio_settings::data_dir().join("workspaces")
 }
@@ -111,7 +114,7 @@ pub(crate) fn load(server_url: &str, graph: &str) -> Option<SavedWorkspace> {
 /// Saves a graph's tabs and drafts, unless restoring is off: a run that did not read them
 /// (the snapshot tool) must not replace them.
 pub(crate) fn save(server_url: &str, graph: &str, saved: &SavedWorkspace) {
-    if !restore_enabled() {
+    if !saving() {
         return;
     }
     if let Ok(text) = serde_json::to_string_pretty(saved) {
@@ -161,16 +164,11 @@ impl SavedWindow {
     }
 }
 
-/// `session.json`: the windows open when Studio last quit, in the order they were opened. A file
-/// written before several windows were remembered holds one window's `graphs` and `shown`.
+/// `session.json`: the windows open when Studio last quit, in the order they were opened.
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct SessionFile {
     windows: Vec<SavedWindow>,
-    #[serde(skip_serializing)]
-    graphs: Vec<SavedGraph>,
-    #[serde(skip_serializing)]
-    shown: usize,
 }
 
 fn session_path() -> PathBuf {
@@ -186,28 +184,17 @@ pub fn load_windows() -> Vec<SavedWindow> {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
-    if serde_json::from_str::<SessionFile>(&text).is_err() {
+    parse_session(&text).unwrap_or_else(|| {
         studio_settings::set_aside(&path);
-        return Vec::new();
-    }
-    parse_session(&text)
+        Vec::new()
+    })
 }
 
-fn parse_session(text: &str) -> Vec<SavedWindow> {
-    let Ok(file) = serde_json::from_str::<SessionFile>(text) else {
-        return Vec::new();
-    };
-    if file.windows.is_empty() && !file.graphs.is_empty() {
-        let session = SavedSession {
-            graphs: file.graphs,
-            shown: file.shown,
-        };
-        return vec![SavedWindow {
-            session,
-            bounds: None,
-        }];
-    }
-    file.windows
+/// The windows `text` holds, or `None` when it does not parse.
+fn parse_session(text: &str) -> Option<Vec<SavedWindow>> {
+    serde_json::from_str::<SessionFile>(text)
+        .ok()
+        .map(|file| file.windows)
 }
 
 /// This run's windows, in the order they opened: what `session.json` says.
@@ -314,11 +301,17 @@ impl WindowSession {
     }
 
     fn write(cx: &mut App) {
-        if cfg!(test) || !restore_enabled() {
+        if !saving() {
             return;
         }
         let session = cx.global_mut::<WindowSession>();
         let saved = session.windows.saved();
+        // A window reports its graphs after its first draw: until one does, the windows the last
+        // run left are what to reopen, and an empty list written over them would lose them to
+        // a crash or a quit at launch.
+        if session.written.is_none() && saved.is_empty() {
+            return;
+        }
         if session.written.as_ref() != Some(&saved) {
             write_session(&saved);
             session.written = Some(saved);
@@ -349,7 +342,6 @@ pub(crate) fn window_moved(slot: u64, bounds: Bounds<Pixels>, cx: &mut App) {
 fn write_session(windows: &[SavedWindow]) {
     let file = SessionFile {
         windows: windows.to_vec(),
-        ..SessionFile::default()
     };
     if let Ok(text) = serde_json::to_string_pretty(&file) {
         write_private(&session_path(), &text);
@@ -406,7 +398,7 @@ pub fn saved_window_bounds(cx: &App) -> Option<Bounds<Pixels>> {
 }
 
 pub(crate) fn save_window_bounds(bounds: Bounds<Pixels>) {
-    if !restore_enabled() {
+    if !saving() {
         return;
     }
     let saved = SavedBounds::from(bounds);
@@ -471,7 +463,6 @@ mod tests {
         ];
         let file = SessionFile {
             windows: windows.clone(),
-            ..SessionFile::default()
         };
         let text = serde_json::to_string(&file).unwrap();
         let keys: Vec<String> = serde_json::from_str::<serde_json::Map<String, Value>>(&text)
@@ -480,24 +471,9 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(keys, ["windows"], "only the new shape is written");
-        assert_eq!(parse_session(&text), windows);
-
-        let older = parse_session(
-            r#"{"graphs": [{"server_url": "https://example.test", "graph": "crm", "branch": "main"}], "shown": 0}"#,
-        );
-        assert_eq!(
-            older,
-            vec![SavedWindow {
-                session: showing(&["crm"]),
-                bounds: None
-            }]
-        );
-        let without_shown = parse_session(
-            r#"{"graphs": [{"server_url": "https://example.test", "graph": "crm", "branch": "main"}]}"#,
-        );
-        assert_eq!(without_shown[0].session.shown, 0);
-        assert!(parse_session("{}").is_empty());
-        assert!(parse_session("not json").is_empty());
+        assert_eq!(parse_session(&text), Some(windows));
+        assert_eq!(parse_session("{}"), Some(Vec::new()));
+        assert_eq!(parse_session("not json"), None);
     }
 
     #[test]
@@ -592,8 +568,6 @@ mod tests {
         let mut layout = crate::Member::Pane(0);
         layout.split(0, 1, crate::SplitDirection::Right);
         let saved = SavedWorkspace {
-            items: Vec::new(),
-            active: 0,
             panes: vec![
                 SavedPane {
                     items: vec![SavedItem {
@@ -622,12 +596,8 @@ mod tests {
             serde_json::from_str::<SavedWorkspace>(&text).unwrap(),
             saved
         );
-        let partial: SavedWorkspace = serde_json::from_str(r#"{"active": 2}"#).unwrap();
-        assert_eq!(partial.active, 2);
-        assert!(partial.items.is_empty());
-        assert!(
-            partial.panes.is_empty() && partial.layout.is_none(),
-            "a file from before splits"
-        );
+        let partial: SavedWorkspace = serde_json::from_str(r#"{"active_pane": 2}"#).unwrap();
+        assert_eq!(partial.active_pane, 2);
+        assert!(partial.panes.is_empty() && partial.layout.is_none());
     }
 }

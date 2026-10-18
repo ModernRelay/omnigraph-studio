@@ -5,13 +5,15 @@
 //! graph open, a scope switch shows that graph's own values for the settings a graph may
 //! override (`graphs` in `settings.json`). Changes write `settings.json` and apply at once.
 
+use std::rc::Rc;
+
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle, Render,
     SharedString, StyledText, Subscription, Window,
 };
 use serde_json::Value;
-use studio_settings::{FieldKind, Scope, SettingField, StudioSettings};
+use studio_settings::{FieldKind, Scope, SettingField, SettingsValues, StudioSettings};
 use studio_ui::ds::{self, space};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use theme::ThemeRegistry;
@@ -26,8 +28,13 @@ pub struct SettingsView {
     scope: Scope,
     /// A field for each text setting, made with the tab.
     text_inputs: Vec<TextInput>,
+    /// The font choices, read from the system when a font setting is first drawn.
+    fonts: Option<Options>,
     _subscriptions: Vec<Subscription>,
 }
+
+/// A dropdown's choices: each label and the value it sets.
+type Options = Rc<[(SharedString, Value)]>;
 
 /// A text setting's field. It writes when the person presses Enter or leaves it, not on every
 /// key, and shows the setting's value again whenever it changes elsewhere, unless it holds
@@ -132,6 +139,7 @@ impl SettingsView {
             graph,
             scope: Scope::All,
             text_inputs,
+            fonts: None,
             _subscriptions: subscriptions,
         };
         this.show_text_values(window, cx);
@@ -142,12 +150,12 @@ impl SettingsView {
     /// not yet written: a control pressed while a field has focus draws the values before the
     /// field hears it lost focus and writes.
     fn show_text_values(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let settings = StudioSettings::get(cx).clone();
+        let values = StudioSettings::get(cx).values();
         for input in &mut self.text_inputs {
             if input.edited(cx) {
                 continue;
             }
-            let text = text_of(&settings.value_in(&self.scope, input.field));
+            let text = studio_ui::value_text(values.value_in(&self.scope, input.field));
             if input.editor.read(cx).text(cx) != text {
                 input
                     .editor
@@ -155,6 +163,25 @@ impl SettingsView {
             }
             input.shown = text;
         }
+    }
+
+    /// The graph whose scope the tab offers: the window's, which can change while the tab is
+    /// open. A scope of the graph no longer offered goes back to all graphs.
+    pub fn set_graph(
+        &mut self,
+        graph: Option<(String, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.graph == graph {
+            return;
+        }
+        let key = graph.as_ref().map(|(key, _)| key.clone());
+        self.graph = graph;
+        if matches!(&self.scope, Scope::Graph(shown) if Some(shown) != key.as_ref()) {
+            self.set_scope(Scope::All, window, cx);
+        }
+        cx.notify();
     }
 
     /// Shows another scope's values, after writing any typing to the scope it was typed in.
@@ -184,7 +211,11 @@ impl SettingsView {
             scope: self.scope.clone(),
             field: input.field,
         };
-        if StudioSettings::get(cx).value_in(&target.scope, target.field) != value {
+        if *StudioSettings::get(cx)
+            .values()
+            .value_in(&target.scope, target.field)
+            != value
+        {
             target.set(value, cx);
         }
         self.text_inputs[index].shown = typed;
@@ -202,15 +233,6 @@ impl SettingsView {
             }))
             .child(ds::field_input(self.text_inputs[index].editor.clone()))
             .into_any_element()
-    }
-}
-
-/// A setting's value as a text field shows it: unset is empty.
-fn text_of(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
     }
 }
 
@@ -287,7 +309,7 @@ fn stepper(
 }
 
 /// A menu of named values; the current one is checked.
-fn dropdown(target: &Target, current: Value, options: Vec<(SharedString, Value)>) -> AnyElement {
+fn dropdown(target: &Target, current: Value, options: Options) -> AnyElement {
     let shown = options
         .iter()
         .find(|(_, value)| *value == current)
@@ -306,18 +328,35 @@ fn dropdown(target: &Target, current: Value, options: Vec<(SharedString, Value)>
             let current = current.clone();
             let target = target.clone();
             Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                for (label, value) in options {
+                for (label, value) in options.iter() {
                     let target = target.clone();
-                    let checked = value == current;
-                    menu = menu.toggleable_entry(label, checked, IconPosition::Start, None, {
-                        move |_, cx| target.set(value.clone(), cx)
-                    });
+                    let checked = *value == current;
+                    let value = value.clone();
+                    menu =
+                        menu.toggleable_entry(label.clone(), checked, IconPosition::Start, None, {
+                            move |_, cx| target.set(value.clone(), cx)
+                        });
                 }
                 menu
             }))
         })
         .anchor(gpui::Anchor::TopRight)
         .into_any_element()
+}
+
+/// "Default", then every font the system has, by name.
+fn font_options(cx: &App) -> Options {
+    let mut fonts = cx.text_system().all_font_names();
+    fonts.sort();
+    fonts.dedup();
+    std::iter::once(("Default".into(), Value::Null))
+        .chain(
+            fonts
+                .into_iter()
+                .filter(|name| !name.starts_with('.'))
+                .map(|name| (name.clone().into(), Value::from(name))),
+        )
+        .collect()
 }
 
 /// The agent's presets as a segmented choice, with the command it runs underneath.
@@ -359,8 +398,13 @@ fn agent_control(target: &Target, current: Value, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn control(target: &Target, settings: &StudioSettings, cx: &App) -> AnyElement {
-    let current = settings.value_in(&target.scope, target.field);
+fn control(
+    target: &Target,
+    values: &SettingsValues,
+    fonts: Option<&Options>,
+    cx: &App,
+) -> AnyElement {
+    let current = values.value_in(&target.scope, target.field).clone();
     match &target.field.kind {
         FieldKind::Choice(choices) if choices.len() <= 4 => {
             let mut segments = ds::segmented(cx);
@@ -419,20 +463,11 @@ fn control(target: &Target, settings: &StudioSettings, cx: &App) -> AnyElement {
                     .collect(),
             )
         }
-        FieldKind::Custom(kind) if kind == "font" => {
-            let mut fonts = cx.text_system().all_font_names();
-            fonts.sort();
-            fonts.dedup();
-            let options = std::iter::once(("Default".into(), Value::Null))
-                .chain(
-                    fonts
-                        .into_iter()
-                        .filter(|name| !name.starts_with('.'))
-                        .map(|name| (name.clone().into(), Value::from(name))),
-                )
-                .collect();
-            dropdown(target, current, options)
-        }
+        FieldKind::Custom(kind) if kind == "font" => dropdown(
+            target,
+            current,
+            fonts.cloned().unwrap_or_else(|| Rc::from([])),
+        ),
         FieldKind::Custom(kind) if kind == "agent" => agent_control(target, current, cx),
         FieldKind::Custom(_) | FieldKind::Text { .. } => {
             let shown = match &current {
@@ -493,7 +528,7 @@ impl Render for SettingsView {
             .collect();
         self.section = self.section.min(sections.len().saturating_sub(1));
         let chosen = sections.get(self.section).copied().unwrap_or_default();
-        let settings = StudioSettings::get(cx).clone();
+        let values = StudioSettings::get(cx).values();
         let shown: Vec<&'static SettingField> = studio_settings::fields()
             .iter()
             .filter(in_scope)
@@ -507,6 +542,13 @@ impl Render for SettingsView {
                 }
             })
             .collect();
+        let wants_fonts = shown
+            .iter()
+            .any(|field| matches!(&field.kind, FieldKind::Custom(kind) if kind == "font"));
+        if wants_fonts && self.fonts.is_none() {
+            self.fonts = Some(font_options(cx));
+        }
+        let fonts = self.fonts.clone();
         let path = studio_settings::settings_path();
         let settings_problems = studio_settings::settings_problems(cx);
         let keymap_problems = studio_settings::keymap_problems(cx).to_vec();
@@ -529,7 +571,7 @@ impl Render for SettingsView {
                 let count = studio_settings::fields()
                     .iter()
                     .filter(in_scope)
-                    .filter(|f| f.section == *section && !settings.is_default_in(&scope, f))
+                    .filter(|f| f.section == *section && !values.is_default_in(&scope, f))
                     .count();
                 ds::SidebarRow::new(("settings-section", index), *section)
                     .selected(!searching && index == self.section)
@@ -568,7 +610,7 @@ impl Render for SettingsView {
                                 scope: scope.clone(),
                                 field,
                             };
-                            let overridden = !settings.is_default_in(&scope, field);
+                            let overridden = !values.is_default_in(&scope, field);
                             let reset = overridden.then(|| {
                                 let target = target.clone();
                                 Box::new(
@@ -585,7 +627,7 @@ impl Render for SettingsView {
                                 (Scope::Graph(_), true) => format!(
                                     "{} All graphs: {}.",
                                     field.description,
-                                    studio_ui::format_value(&settings.value_at(&field.path))
+                                    studio_ui::format_value(values.at(&field.path))
                                 ),
                                 _ => field.description.clone(),
                             };
@@ -595,7 +637,7 @@ impl Render for SettingsView {
                                 .position(|input| std::ptr::eq(input.field, field));
                             let control = match text_input {
                                 Some(index) => self.text_control(index, cx),
-                                None => control(&target, &settings, cx),
+                                None => control(&target, &values, fonts.as_ref(), cx),
                             };
                             let row = ds::setting_row(
                                 target.id("row"),

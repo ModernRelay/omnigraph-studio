@@ -107,6 +107,10 @@ struct ParkedGraph {
     active_pane: PaneId,
     next_pane: PaneId,
     saved: Option<SavedWorkspace>,
+    /// False for a graph reopened behind the shown one: `saved` is its saved state, whose tabs
+    /// open when it is first shown, so a start does not read every table of every graph a
+    /// window had open.
+    restored: bool,
 }
 
 /// What fills the document area while zoomed.
@@ -182,15 +186,16 @@ pub struct Workspace {
     _save_check: Option<Task<()>>,
     _save_bounds: Option<Task<()>>,
     _bounds_subscription: Subscription,
+    _quit_subscription: Subscription,
     _activation_subscription: Subscription,
     _registry_subscription: Option<Subscription>,
     _session_subscription: Option<Subscription>,
     _item_subscriptions: Vec<(gpui::EntityId, Subscription)>,
 }
 
-/// How long state must be still before it is written.
 /// How often, at most, the workspace's state is compared with what was last written.
 const SAVE_CHECK: Duration = Duration::from_millis(250);
+/// How long state must be still before it is written.
 const SAVE_DELAY: Duration = Duration::from_millis(500);
 /// Height of a column's header strip (spec 002, after Delta), and of the status bar under the
 /// columns (after Zed's).
@@ -282,6 +287,11 @@ impl Workspace {
         let this = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_, cx| {
             this.update(cx, |workspace, cx| match workspace.running_write(cx) {
+                // Closing drops the save waiting for its delay: written now.
+                None => {
+                    workspace.flush_saves(cx);
+                    true
+                }
                 Some(graph) => {
                     workspace.show_toast(
                         ToastKind::Error,
@@ -292,7 +302,6 @@ impl Workspace {
                     );
                     false
                 }
-                None => true,
             })
             .unwrap_or(true)
         });
@@ -369,6 +378,12 @@ impl Workspace {
             _save_check: None,
             _save_bounds: None,
             _bounds_subscription: bounds_subscription,
+            // GPUI drops every window once the quit handlers ran: a save still waiting for its
+            // delay would go with them.
+            _quit_subscription: cx.on_app_quit(|this, cx| {
+                this.flush_saves(cx);
+                async {}
+            }),
             _activation_subscription: activation_subscription,
             _registry_subscription: registry_subscription,
             _session_subscription: None,
@@ -469,9 +484,9 @@ impl Workspace {
 
     /// The server URL and graph id the open session belongs to.
     fn graph_key(&self, cx: &App) -> Option<(String, String)> {
-        let session = self.session.as_ref()?.read(cx);
-        let url = session.connection.read(cx).server.url.clone();
-        Some((url, session.graph_id.clone()))
+        self.session
+            .as_ref()
+            .map(|session| graph_key_of(session, cx))
     }
 
     fn snapshot(&self, cx: &App) -> SavedWorkspace {
@@ -501,8 +516,6 @@ impl Workspace {
             .center
             .map(&|id| order.iter().position(|p| *p == id).unwrap_or_default());
         SavedWorkspace {
-            items: Vec::new(),
-            active: 0,
             panes,
             layout: Some(layout),
             active_pane,
@@ -562,18 +575,21 @@ impl Workspace {
     }
 
     /// The docks a graph's saved state names: open or hidden, their sizes and active panels.
-    fn apply_docks(&mut self, saved: &SavedWorkspace) {
+    /// A saved graph's docks, their sizes held within `window` as a drag holds them: a size
+    /// saved on a larger display does not squeeze the document on a smaller one.
+    fn apply_docks(&mut self, saved: &SavedWorkspace, window: gpui::Size<Pixels>) {
         self.left.open = saved.sidebar_open;
         self.right.open = saved.inspector_open;
         self.bottom.open = saved.activity_open;
         self.zoomed = None;
-        for (dock, size) in [
-            (&mut self.left, saved.left_size),
-            (&mut self.right, saved.right_size),
-            (&mut self.bottom, saved.bottom_size),
+        let (width, height) = (f32::from(window.width), f32::from(window.height));
+        for (dock, size, available) in [
+            (&mut self.left, saved.left_size, width),
+            (&mut self.right, saved.right_size, width),
+            (&mut self.bottom, saved.bottom_size, height),
         ] {
-            if let Some(size) = size {
-                dock.size = size;
+            if let Some(size) = size.filter(|size| size.is_finite()) {
+                dock.resize(size, available);
             }
         }
         for (dock, id) in [
@@ -594,30 +610,36 @@ impl Workspace {
         let Some((url, graph)) = self.graph_key(cx) else {
             return;
         };
-        let Some(saved) = persistence::load(&url, &graph) else {
-            return;
-        };
-        self.apply_docks(&saved);
-        // A file from before splits has its tabs at the top level: one pane.
-        let (layout, panes) = if saved.panes.is_empty() {
-            let pane = SavedPane {
-                items: saved.items.clone(),
-                active: saved.active,
-                pinned: 0,
-            };
-            (Member::Pane(0), vec![pane])
-        } else {
-            let mut ids = saved.layout.as_ref().map(Member::panes).unwrap_or_default();
-            ids.sort_unstable();
-            match &saved.layout {
-                Some(layout) if ids == (0..saved.panes.len()).collect::<Vec<_>>() => {
-                    (layout.clone(), saved.panes.clone())
-                }
-                // A layout that does not name every pane once: the first pane alone.
-                _ => (Member::Pane(0), vec![saved.panes[0].clone()]),
+        if let Some(saved) = persistence::load(&url, &graph) {
+            self.restore_saved(saved, window, cx);
+        }
+    }
+
+    /// Reopens the tabs and panels of a graph's saved state, in the shown graph's place.
+    fn restore_saved(
+        &mut self,
+        saved: SavedWorkspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_docks(&saved, window.viewport_size());
+        let mut ids = saved.layout.as_ref().map(Member::panes).unwrap_or_default();
+        ids.sort_unstable();
+        let (layout, panes) = match &saved.layout {
+            Some(layout)
+                if ids == (0..saved.panes.len()).collect::<Vec<_>>() && layout.is_well_formed() =>
+            {
+                (layout.clone(), saved.panes.clone())
             }
+            // A layout that does not name every pane once, or whose shares do not fit its
+            // panes: the first pane alone.
+            _ => (
+                Member::Pane(0),
+                vec![saved.panes.first().cloned().unwrap_or_default()],
+            ),
         };
-        self.panes = (0..panes.len()).map(Pane::new).collect();
+        let shown = std::mem::replace(&mut self.panes, (0..panes.len()).map(Pane::new).collect());
+        self.forget_items(&shown);
         self.center = layout;
         self.next_pane = panes.len();
         self.dedupe_across_panes = false;
@@ -665,27 +687,23 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let shown = self
+        // A graph the window has open keeps its session, its tabs and its place among the
+        // graphs: it is shown, on the branch the new session is for. A second session for it
+        // would leave its tabs on the first, and a write in flight unseen.
+        let open = self
             .session
-            .as_ref()
-            .is_some_and(|current| same_graph(current, &session, cx));
-        if shown {
-            self.subscribe_session(session, window, cx);
-            cx.emit(WorkspaceEvent::SessionChanged);
-            cx.notify();
+            .iter()
+            .chain(self.parked.iter().map(|parked| &parked.session))
+            .find(|open| same_graph(open, &session, cx))
+            .cloned();
+        if let Some(open) = open {
+            let branch = session.read(cx).branch.clone();
+            open.update(cx, |open, cx| open.set_branch(branch, cx));
+            self.show_graph(open.entity_id(), window, cx);
             return;
         }
-        let parked = self
-            .parked
-            .iter()
-            .position(|parked| same_graph(&parked.session, &session, cx))
-            .map(|index| self.parked.remove(index));
         if let Some(current) = self.park(cx) {
             self.parked.push(current);
-        }
-        if let Some(parked) = parked {
-            self.show_parked(parked, window, cx);
-            return;
         }
         self.graph_order.push(session.entity_id());
         self.subscribe_session(session, window, cx);
@@ -701,6 +719,47 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Opens a graph session in this window behind the shown graph, as the graph switcher shows
+    /// it. Its saved tabs open when it is first shown. A graph the window has open already is
+    /// left as it is.
+    pub fn add_session_behind(&mut self, session: Entity<GraphSession>, cx: &mut Context<Self>) {
+        let saved = persistence::restore_enabled()
+            .then(|| {
+                let (url, graph) = graph_key_of(&session, cx);
+                persistence::load(&url, &graph)
+            })
+            .flatten();
+        self.add_behind(session, saved, cx);
+    }
+
+    fn add_behind(
+        &mut self,
+        session: Entity<GraphSession>,
+        saved: Option<SavedWorkspace>,
+        cx: &mut Context<Self>,
+    ) {
+        let open = self
+            .session
+            .iter()
+            .chain(self.parked.iter().map(|parked| &parked.session))
+            .any(|open| same_graph(open, &session, cx));
+        if open {
+            return;
+        }
+        self.graph_order.push(session.entity_id());
+        self.parked.push(ParkedGraph {
+            session,
+            panes: vec![Pane::new(0)],
+            center: Member::Pane(0),
+            active_pane: 0,
+            next_pane: 1,
+            saved,
+            restored: false,
+        });
+        cx.emit(WorkspaceEvent::SessionChanged);
+        cx.notify();
+    }
+
     fn subscribe_session(
         &mut self,
         session: Entity<GraphSession>,
@@ -711,8 +770,14 @@ impl Workspace {
             &session,
             window,
             |this, _session, event: &SessionEvent, _window, cx| {
-                if let SessionEvent::ActivityChanged = event {
-                    this.toast_for_latest_outcome(cx);
+                match event {
+                    SessionEvent::ActivityChanged => this.toast_for_latest_outcome(cx),
+                    SessionEvent::BranchMissing { branch } => this.show_toast(
+                        ToastKind::Info,
+                        format!("The branch {branch} is gone, so main is shown."),
+                        cx,
+                    ),
+                    _ => {}
                 }
                 cx.notify();
             },
@@ -720,15 +785,32 @@ impl Workspace {
         self.session = Some(session);
     }
 
-    /// Writes the shown graph's state now, rather than after the save delay.
+    /// Writes what is waiting for the save delay now, and waits for the writes: the window or
+    /// the app is going.
+    fn flush_saves(&mut self, cx: &mut Context<Self>) {
+        if persistence::restore_enabled() {
+            let open = self.session_snapshot(cx);
+            if self.saved_session.as_ref() != Some(&open) {
+                persistence::window_graphs_changed(self.window_slot, &open, cx);
+                self.saved_session = Some(open);
+            }
+        }
+        self.save_now(cx);
+        studio_settings::writes_done();
+    }
+
+    /// Writes the shown graph's state now, rather than after the save delay, when a save is
+    /// waiting or the state is not what was last written.
     fn save_now(&mut self, cx: &mut Context<Self>) {
         let Some((url, graph)) = self.graph_key(cx) else {
             return;
         };
+        let pending = self._save.take().is_some();
         let snapshot = self.snapshot(cx);
-        self._save = None;
-        persistence::save(&url, &graph, &snapshot);
-        self.saved = Some(snapshot);
+        if pending || self.saved.as_ref() != Some(&snapshot) {
+            persistence::save(&url, &graph, &snapshot);
+            self.saved = Some(snapshot);
+        }
     }
 
     /// Takes the shown graph out of the window, saved, leaving no graph shown.
@@ -751,20 +833,41 @@ impl Workspace {
             active_pane: std::mem::replace(&mut self.active_pane, 0),
             next_pane: std::mem::replace(&mut self.next_pane, 1),
             saved: self.saved.take(),
+            restored: true,
         })
     }
 
+    /// Drops the subscriptions to the tabs of `panes`, which are going.
+    fn forget_items(&mut self, panes: &[Pane<Box<dyn ItemHandle>>]) {
+        let going: HashSet<EntityId> = panes
+            .iter()
+            .flat_map(|pane| pane.items.iter().map(|item| item.item_id()))
+            .collect();
+        self._item_subscriptions
+            .retain(|(id, _)| !going.contains(id));
+    }
+
     fn show_parked(&mut self, parked: ParkedGraph, window: &mut Window, cx: &mut Context<Self>) {
+        // The tabs shown with no graph open go.
+        let shown = std::mem::take(&mut self.panes);
+        self.forget_items(&shown);
         self.panes = parked.panes;
         self.center = parked.center;
         self.active_pane = parked.active_pane;
         self.next_pane = parked.next_pane;
-        // Its docks as it left them, not the docks of the graph shown before.
-        if let Some(saved) = &parked.saved {
-            self.apply_docks(saved);
-        }
-        self.saved = parked.saved;
         self.subscribe_session(parked.session, window, cx);
+        if parked.restored {
+            // Its docks as it left them, not the docks of the graph shown before.
+            if let Some(saved) = &parked.saved {
+                self.apply_docks(saved, window.viewport_size());
+            }
+            self.saved = parked.saved;
+        } else {
+            self.saved = None;
+            if let Some(saved) = parked.saved {
+                self.restore_saved(saved, window, cx);
+            }
+        }
         let index = self.pane(self.active_pane).map_or(0, |p| p.active);
         self.activate_in(self.active_pane, index, false, window, cx);
         cx.emit(WorkspaceEvent::SessionChanged);
@@ -852,10 +955,7 @@ impl Workspace {
         }
         let id = session.entity_id();
         if let Some(closed) = self.park(cx) {
-            for item in closed.panes.iter().flat_map(|pane| pane.items.iter()) {
-                let item = item.item_id();
-                self._item_subscriptions.retain(|(id, _)| *id != item);
-            }
+            self.forget_items(&closed.panes);
         }
         self.graph_order.retain(|open| *open != id);
         let next = self.graph_order.last().copied().and_then(|next| {
@@ -1216,6 +1316,8 @@ impl Workspace {
             self.zoomed = None;
         }
         self.panes.retain(|pane| pane.id != id);
+        self.tab_scrolls.borrow_mut().remove(&id);
+        self.tabs_scrolled_to.borrow_mut().remove(&id);
         if self.active_pane == id {
             let position = order.iter().position(|p| *p == id).unwrap_or_default();
             self.active_pane = order
@@ -3371,6 +3473,13 @@ impl Workspace {
 }
 
 /// Whether two sessions are the same graph on the same server.
+/// The server and graph a session's saved state is kept under.
+fn graph_key_of(session: &Entity<GraphSession>, cx: &App) -> (String, String) {
+    let session = session.read(cx);
+    let url = session.connection.read(cx).server.url.clone();
+    (url, session.graph_id.clone())
+}
+
 fn same_graph(a: &Entity<GraphSession>, b: &Entity<GraphSession>, cx: &App) -> bool {
     let (a, b) = (a.read(cx), b.read(cx));
     a.graph_id == b.graph_id && a.connection == b.connection
@@ -3782,7 +3891,6 @@ impl Performance {
     }
 }
 
-/// A dock edge being dragged.
 /// A tab being dragged: to another place in its strip, another pane, or a pane's edge.
 #[derive(Clone)]
 struct DraggedTab {
@@ -4565,11 +4673,83 @@ mod tests {
                 ..workspace.snapshot(cx)
             };
             workspace.zoomed = Some(Zoomed::Pane(workspace.active_pane));
-            workspace.apply_docks(&saved);
+            workspace.apply_docks(&saved, gpui::size(px(1440.), px(900.)));
             assert!(!workspace.left.open && !workspace.right.open && workspace.bottom.open);
             assert_eq!(workspace.bottom.active_id().as_deref(), Some("history"));
             assert_eq!(workspace.bottom.size, 240.);
             assert_eq!(workspace.zoomed, None);
+        });
+    }
+
+    /// A graph reopened behind the shown one opens none of its tabs, so a start reads nothing
+    /// for it, until it is first shown; then its saved tabs open, once.
+    #[gpui::test]
+    fn a_graph_reopened_behind_opens_its_tabs_when_first_shown(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            persistence::register_item_kind(cx, "split", |data, workspace, window, cx| {
+                open_tab(workspace, data.as_str().unwrap_or_default(), window, cx);
+            });
+        });
+        let http = http_client::FakeHttpClient::create(|_| async {
+            Ok(http_client::http::Response::builder()
+                .status(404)
+                .body(http_client::AsyncBody::default())
+                .unwrap())
+        });
+        let server = graph_store::ServerEntry {
+            name: "test".into(),
+            url: "http://studio.test".into(),
+            source: graph_store::ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| graph_store::Connection::new(server, None, http).unwrap());
+        let session = |graph: &str, cx: &mut gpui::TestAppContext| {
+            let connection = connection.clone();
+            let graph = graph.to_owned();
+            cx.new(|cx| GraphSession::new(connection, graph, "main".into(), cx))
+        };
+        let (shown, behind) = (session("notes", cx), session("crm", cx));
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let tabs = |workspace: &Workspace| -> usize {
+                workspace.panes.iter().map(|pane| pane.items.len()).sum()
+            };
+            workspace.graph_order.push(shown.entity_id());
+            workspace.subscribe_session(shown.clone(), window, cx);
+            open_tab(workspace, "notes", window, cx);
+            let item = |key: &str| SavedItem {
+                kind: "split".into(),
+                data: serde_json::json!(key),
+            };
+            let saved = SavedWorkspace {
+                panes: vec![SavedPane {
+                    items: vec![item("a"), item("b")],
+                    active: 1,
+                    pinned: 0,
+                }],
+                ..workspace.snapshot(cx)
+            };
+            workspace.add_behind(behind.clone(), Some(saved), cx);
+            assert_eq!(tabs(workspace), 1, "the shown graph's tab alone");
+            assert!(
+                workspace
+                    .parked
+                    .iter()
+                    .all(|parked| { parked.panes.iter().all(|pane| pane.items.is_empty()) })
+            );
+            assert_eq!(workspace.open_graphs().len(), 2);
+
+            workspace.show_graph(behind.entity_id(), window, cx);
+            let pane = workspace.pane(workspace.active_pane).unwrap();
+            assert_eq!((pane.items.len(), pane.active), (2, 1));
+
+            // Shown again after the other graph: its tabs as they were, not opened twice.
+            workspace.show_graph(shown.entity_id(), window, cx);
+            assert_eq!(tabs(workspace), 1);
+            workspace.show_graph(behind.entity_id(), window, cx);
+            assert_eq!(tabs(workspace), 2);
         });
     }
 

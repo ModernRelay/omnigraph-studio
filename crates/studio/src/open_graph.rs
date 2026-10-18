@@ -122,11 +122,27 @@ impl OpenGraphModal {
             cx.notify();
             return;
         }
-        let session = open_session(connection, graph_id.trim().to_owned(), "main".into(), cx);
+        let graph_id = graph_id.trim().to_owned();
+        // A graph id typed in is kept with its server, for a token that cannot list graphs.
+        connection.update(cx, |connection, _| connection.remember_graph(&graph_id));
         ConnectionRegistry::global(cx).read(cx).save(cx);
         if let Some(workspace) = self.workspace.upgrade() {
-            workspace.update(cx, |workspace, cx| {
-                workspace.set_session(session, window, cx)
+            // A graph the window has open is shown as it is, on its own branch.
+            let open = workspace
+                .read(cx)
+                .open_graphs()
+                .into_iter()
+                .find(|(session, _)| {
+                    let session = session.read(cx);
+                    session.graph_id == graph_id && session.connection == connection
+                })
+                .map(|(session, _)| session.entity_id());
+            workspace.update(cx, |workspace, cx| match open {
+                Some(open) => workspace.show_graph(open, window, cx),
+                None => {
+                    let session = open_session(connection, graph_id, "main".into(), cx);
+                    workspace.set_session(session, window, cx)
+                }
             });
         }
         cx.emit(DismissEvent);

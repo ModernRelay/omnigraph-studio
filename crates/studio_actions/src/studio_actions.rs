@@ -164,7 +164,7 @@ pub mod graph {
             CreateBranch,
             /// Delete the current branch.
             DeleteBranch,
-            /// Merge the current branch into main.
+            /// Open the review of the current branch against main, to merge it there.
             MergeBranch,
         ]
     );
