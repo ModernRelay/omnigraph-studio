@@ -175,7 +175,10 @@ Bedrock does. This closes the gap where the agent inherited the person's graph t
 The gateway answers `GET`/`HEAD /healthz` itself with one contract header, before the token
 check, as the CLI probes with no token. Every other request needs the session token (else 401)
 and exactly one `omnigraph-http-api: 0.13` (else 400 `api_contract_mismatch`, naming the CLI to
-use). Request bodies are read whole, at most 64 MiB (413 above, before anything is sent).
+use). Request bodies are read whole, at most 64 MiB (413 above, before anything is sent). A
+target holding a `#`, or a query parameter given twice, is refused (400) before the rules
+read it: forwarding drops a `#` and all that follows it, so the rules would judge a query the
+server never sees, and a repeated key could be judged by one value and read as another.
 
 | Request | Rule |
 |---|---|
@@ -378,6 +381,12 @@ CLI is the one they trust).
 
 
 ## Corrections
+
+- 2026-10-18 · The rules read a target's query up to the end, while forwarding dropped a
+  `#` and all that followed it. `load/ndjson?mode=overwrite#&branch=<agent branch>` was judged
+  a load into the agent's branch and reached the server as a load into main, with the
+  person's token; Blob writes the same. Such targets, and repeated query keys, are now
+  refused.
 
 - 2026-10-18 · `omnigraph_run` ran the conversation's wrapper from the agent's working
   directory, with Studio's environment. The agent can rewrite that script and its home's config,

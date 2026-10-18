@@ -193,6 +193,22 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
                 .collect()
         })
         .unwrap_or_default();
+    // The rules judge the target as split here, and the server must read the same request. A
+    // `#` never travels in HTTP, and forwarding drops it with all that follows, so the rules
+    // would judge a query the server never sees; a repeated key could be judged by one value
+    // and read by the server as another.
+    let mut keys = std::collections::HashSet::new();
+    if request.target.contains('#') || !pairs.iter().all(|(key, _)| keys.insert(key.as_str())) {
+        answer(
+            &mut stream,
+            400,
+            "bad_request",
+            "Studio: a request with a `#` or a repeated query parameter is not sent. Nothing \
+             was sent.",
+        )
+        .await;
+        return;
+    }
     // The CLI probes `/healthz` with no token and no contract header before every request.
     // Every other request carries the session's token, checked before its body was read.
     if is_health(&request.method, &path) {
@@ -941,6 +957,27 @@ mod tests {
             assert_eq!(status, 403);
             assert!(body.contains("only to its own branch"), "{body}");
             assert_eq!(seen.lock().unwrap().len(), 1);
+
+            // A target the rules would read differently from the server is refused: forwarding
+            // drops a `#` and what follows it, so this load would land on main.
+            for target in [
+                "/graphs/knowledge/load/ndjson?mode=overwrite#&branch=agent%2F20261013-101500",
+                "/graphs/knowledge/load/ndjson?branch=agent%2F20261013-101500&branch=main&mode=append",
+            ] {
+                let answer = futures::FutureExt::fuse(call(
+                    port,
+                    post(target, &token, Some("0.13"), "{}\n"),
+                ));
+                let write = futures::FutureExt::fuse(events.next());
+                futures::pin_mut!(answer, write);
+                let (status, _, body) = futures::select! {
+                    answer = answer => answer,
+                    _ = write => panic!("{target} was judged a write to the agent's branch"),
+                };
+                assert_eq!(status, 400, "{target}: {body}");
+                assert!(body.contains("Nothing was sent"), "{body}");
+            }
+            assert_eq!(seen.lock().unwrap().len(), 1, "nothing reached the server");
 
             // A write to the agent's branch waits for the person; rejected, nothing is sent.
             let write =
