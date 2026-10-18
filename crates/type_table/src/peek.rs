@@ -176,6 +176,8 @@ pub struct NodePeek {
     page: bool,
     /// Text values with markup, rendered as markdown: by property, the text and its view.
     markdown: HashMap<String, (String, Entity<Markdown>)>,
+    /// Text values found to read as themselves, by property: not parsed again each frame.
+    plain_text: HashMap<String, String>,
     /// Properties being edited; a changed one stays open until it is saved or cancelled.
     edits: HashMap<String, FieldEdit>,
     /// Properties whose write is out, shown with their new value and a dot.
@@ -328,6 +330,7 @@ impl NodePeek {
             holds_commit: false,
             page,
             markdown: HashMap::new(),
+            plain_text: HashMap::new(),
             edits: HashMap::new(),
             saving: HashSet::new(),
             adding: None,
@@ -2148,30 +2151,49 @@ impl NodePeek {
     fn sync_markdown(&mut self, cx: &mut Context<Self>) {
         let Loadable::Loaded(values) = &self.values else {
             self.markdown.clear();
+            self.plain_text.clear();
             return;
         };
-        let wanted: Vec<(String, String)> = self
-            .property_rows()
-            .into_iter()
-            .filter_map(|(name, property, _)| {
-                let text = values.get(&name)?.as_str()?;
-                (reads_as_markdown(property.as_ref()?) && !studio_ui::text::is_plain(text))
-                    .then(|| (name, text.to_owned()))
-            })
-            .collect();
-        self.markdown
-            .retain(|name, (text, _)| wanted.iter().any(|(n, t)| n == name && t == text));
-        for (name, text) in wanted {
-            self.markdown.entry(name).or_insert_with(|| {
-                let source: SharedString = text.clone().into();
-                (text, cx.new(|cx| Markdown::new(source, None, None, cx)))
-            });
+        // Runs every frame: a text is parsed only when it is new, so an unchanged view costs a
+        // comparison per property.
+        let mut wanted: Vec<String> = Vec::new();
+        for (name, property, _) in self.property_rows() {
+            let Some(text) = values.get(&name).and_then(Value::as_str) else {
+                continue;
+            };
+            if !property.as_ref().is_some_and(reads_as_markdown) {
+                continue;
+            }
+            if self
+                .markdown
+                .get(&name)
+                .is_some_and(|(shown, _)| shown == text)
+                || self
+                    .plain_text
+                    .get(&name)
+                    .is_some_and(|plain| plain == text)
+            {
+                wanted.push(name);
+                continue;
+            }
+            if studio_ui::text::is_plain(text) {
+                self.plain_text.insert(name.clone(), text.to_owned());
+                self.markdown.remove(&name);
+            } else {
+                self.plain_text.remove(&name);
+                let source: SharedString = text.to_owned().into();
+                let view = cx.new(|cx| Markdown::new(source, None, None, cx));
+                self.markdown.insert(name.clone(), (text.to_owned(), view));
+            }
+            wanted.push(name);
         }
+        self.markdown.retain(|name, _| wanted.contains(name));
+        self.plain_text.retain(|name, _| wanted.contains(name));
     }
 
     fn render_properties(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let values = match &self.values {
-            Loadable::Loaded(values) => values.clone(),
+            Loadable::Loaded(values) => values,
             Loadable::Failed(error) => {
                 return Label::new(error.clone())
                     .size(LabelSize::Small)
