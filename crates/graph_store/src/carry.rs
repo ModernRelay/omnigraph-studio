@@ -253,6 +253,14 @@ pub(crate) struct ChangeLog {
 }
 
 impl ChangeLog {
+    /// A log holding nothing yet, whose next read starts after `commit`.
+    pub(crate) fn starting_at(commit: String) -> Self {
+        Self {
+            last: Some(commit),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn holds(&self, commit: &str) -> bool {
         self.commits.contains_key(commit)
     }

@@ -165,17 +165,26 @@ pub struct ServerState {
     pub snapshot: Result<SnapshotOutput, ReadError>,
 }
 
-/// A read at a commit: the commit, the query text and its parameters.
+/// A read at a commit: the commit, the query text and its parameters, and the schema epoch it
+/// was read under ([`GraphSession::schema_epoch`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PinnedRead {
     commit: String,
     query: String,
     params: String,
+    schema: u64,
 }
 
 /// The first wait before a graph that answered 503 is asked again; it doubles up to the cap.
 const RECHECK_FIRST: Duration = Duration::from_secs(5);
 const RECHECK_CAP: Duration = Duration::from_secs(60);
+
+fn parse_schema(source: &str) -> Loadable<Arc<SchemaModel>> {
+    match SchemaModel::parse(source) {
+        Ok(model) => Loadable::Loaded(Arc::new(model)),
+        Err(error) => Loadable::Failed(format!("Studio could not read the schema: {error}")),
+    }
+}
 
 /// Where the next page of a change-feed read starts.
 enum FeedNext {
@@ -215,7 +224,13 @@ pub struct GraphSession {
     recheck_after: Duration,
     /// Answers to reads pinned to a commit, and those under way (they never change).
     pinned_reads: ReadMemo<PinnedRead, ReadOutput>,
-    pinned_blobs: ReadMemo<(BlobCell, String), BlobMeta>,
+    pinned_blobs: ReadMemo<(BlobCell, String, u64), BlobMeta>,
+    /// Which schema the session reads under: a new number each time the schema's text changes,
+    /// the first one included. A read at an old commit uses the current schema, so the same
+    /// query at the same commit can mean something else after a rename, a drop or an addition;
+    /// every answer kept is kept under its epoch, and nothing crosses one.
+    schema_epoch: u64,
+    schema_text: Option<Arc<str>>,
     /// Each branch's commit list, read once and shared until a commit lands on that branch.
     commit_lists: ReadMemo<String, CommitList>,
     /// The branch list has been read once; reading it again forgets the commit lists.
@@ -275,6 +290,8 @@ impl GraphSession {
             recheck_after: RECHECK_FIRST,
             pinned_reads: Memo::new(PINNED_READS),
             pinned_blobs: Memo::new(PINNED_BLOBS),
+            schema_epoch: 0,
+            schema_text: None,
             commit_lists: Memo::new(COMMIT_LISTS),
             branches_read: false,
             degrees: DegreeBatches::default(),
@@ -493,19 +510,51 @@ impl GraphSession {
             let read = client.schema(&graph).await;
             this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
             let result = match read {
-                Ok(output) => match SchemaModel::parse(&output.schema_source) {
-                    Ok(model) => Loadable::Loaded(Arc::new(model)),
-                    Err(error) => {
-                        Loadable::Failed(format!("Studio could not read the schema: {error}"))
-                    }
-                },
+                Ok(output) => parse_schema(&output.schema_source),
                 Err(error) => Loadable::Failed(error.to_string()),
             };
+            this.update(cx, |this, cx| this.install_schema(result, cx))
+                .ok();
+        }));
+    }
+
+    /// Takes a schema read from the server. A text other than the one held starts a new schema
+    /// epoch: what was kept under the old one, answers and change logs, is let go.
+    fn install_schema(&mut self, schema: Loadable<Arc<SchemaModel>>, cx: &mut Context<Self>) {
+        if let Loadable::Loaded(model) = &schema
+            && self.schema_text.as_deref() != Some(&*model.source)
+        {
+            self.schema_epoch += 1;
+            self.schema_text = Some(model.source.clone());
+            self.pinned_reads.clear();
+            self.pinned_blobs.clear();
+            // Each log starts again at its branch's head, so the next move is read.
+            self.change_logs = self
+                .heads
+                .iter()
+                .map(|(branch, head)| (branch.clone(), ChangeLog::starting_at(head.clone())))
+                .collect();
+        }
+        self.schema = schema;
+        cx.emit(SessionEvent::SchemaChanged);
+        cx.notify();
+        self.check_heads(cx);
+    }
+
+    /// Reads the schema again while keeping the one held, and takes it if its text changed: a
+    /// head move showed another writer may have changed it.
+    fn recheck_schema(&mut self, cx: &mut Context<Self>) {
+        let client = self.client(cx);
+        let graph = self.graph_id.clone();
+        self._schema_task = Some(cx.spawn(async move |this, cx| {
+            let read = client.schema(&graph).await;
             this.update(cx, |this, cx| {
-                this.schema = result;
-                cx.emit(SessionEvent::SchemaChanged);
-                cx.notify();
-                this.check_heads(cx);
+                this.note_read(&read, cx);
+                if let Ok(output) = read
+                    && this.schema_text.as_deref() != Some(output.schema_source.as_str())
+                {
+                    this.install_schema(parse_schema(&output.schema_source), cx);
+                }
             })
             .ok();
         }));
@@ -707,7 +756,7 @@ impl GraphSession {
             log.last = Some(head);
             return;
         }
-        let (client, graph) = (self.client(cx), self.graph_id.clone());
+        let (client, graph, epoch) = (self.client(cx), self.graph_id.clone(), self.schema_epoch);
         let types: Vec<String> = names.iter().cloned().collect();
         let mut fold = FeedFold::new(Arc::new(names));
         let key = branch.to_owned();
@@ -753,11 +802,16 @@ impl GraphSession {
                 if let Some(error) = failed.clone() {
                     this.note_read::<()>(&Err(error), cx);
                 }
-                let same_schema = match &schema_read {
-                    None => true,
-                    Some(Ok(output)) => *output.schema_source == *schema,
-                    Some(Err(_)) => false,
-                };
+                let same_schema = this.schema_epoch == epoch
+                    && match &schema_read {
+                        None => true,
+                        Some(Ok(output)) => *output.schema_source == *schema,
+                        Some(Err(_)) => false,
+                    };
+                // Another writer changed the schema: a feed that crossed it refuses (409), or
+                // the schema read after it says so.
+                let schema_moved = matches!(&failed, Some(ReadError::Refused(refusal)) if refusal.status == 409)
+                    || matches!(&schema_read, Some(Ok(output)) if *output.schema_source != *schema);
                 let stopped = failed.is_some() || next.is_some() || !same_schema;
                 let head = this.heads.get(&branch).cloned();
                 let log = this.change_logs.entry(branch.clone()).or_default();
@@ -777,6 +831,9 @@ impl GraphSession {
                 cx.emit(SessionEvent::ChangesRead {
                     branch: branch.clone(),
                 });
+                if schema_moved && this.schema_epoch == epoch {
+                    this.recheck_schema(cx);
+                }
                 if this.change_reads_again.remove(&branch) {
                     this.read_changes(&branch, cx);
                 }
@@ -923,7 +980,10 @@ impl GraphSession {
         self.pinned_reads
             .answers()
             .filter(|(read, _)| {
-                read.query == key.query && read.params == key.params && read.commit != key.commit
+                read.query == key.query
+                    && read.params == key.params
+                    && read.schema == key.schema
+                    && read.commit != key.commit
             })
             .find_map(|(read, output)| {
                 match self.changes_since(&self.branch, &read.commit, &key.commit) {
@@ -966,6 +1026,7 @@ impl GraphSession {
                 .as_ref()
                 .map(|params| params.to_string())
                 .unwrap_or_default(),
+            schema: self.schema_epoch,
         };
         let shared = match self.pinned_reads.get(&key) {
             Some(Held::Done(output)) => return Task::ready(Ok(output)),
@@ -1118,7 +1179,7 @@ impl GraphSession {
     ) -> Task<Result<BlobMeta, ReadError>> {
         // At a commit a cell never changes: the table, the peek and the Blob tab share one read.
         if let Some(commit) = snapshot.clone() {
-            let key = (cell.clone(), commit);
+            let key = (cell.clone(), commit, self.schema_epoch);
             let shared = match self.pinned_blobs.get(&key) {
                 Some(Held::Done(meta)) => return Task::ready(Ok(meta)),
                 Some(Held::Pending(shared)) => shared,
@@ -2792,5 +2853,76 @@ mod tests {
         commit(cx, "c4", vec![edge("e10", "p3", "p1")]);
         read_at(cx, "c4").await.unwrap();
         assert_eq!(sent_now("studio_neighbours"), 3, "read again");
+    }
+
+    /// An answer kept at a commit is kept under the schema it was read with: a read at an old
+    /// commit uses the current schema, so after the schema changes the same query is read
+    /// again. A head move whose feed read finds another schema takes it (spec 015).
+    #[gpui::test]
+    async fn answers_kept_under_one_schema_are_not_given_under_another(cx: &mut TestAppContext) {
+        use crate::carry::{Since, node_reads};
+        use crate::test_server::{followed_session, node_change};
+        use serde_json::json;
+
+        const SCHEMA: &str = "node Person {\n  slug: String @key\n  name: String\n}\n";
+        let sent = Arc::new(std::sync::Mutex::new(0usize));
+        let counted = sent.clone();
+        let (session, served) = followed_session(
+            SCHEMA,
+            move |request| {
+                if request["name"] == "studio_node" {
+                    *counted.lock().unwrap() += 1;
+                }
+                json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }])
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+        let node = builder::node_by_id(&schema, "Person", "p1").unwrap();
+        let read_at_c1 = |cx: &mut TestAppContext| {
+            let read = session.update(cx, |session, cx| session.read(&node, Some("c1".into()), cx));
+            cx.run_until_parked();
+            read
+        };
+        let reads = || *sent.lock().unwrap();
+
+        read_at_c1(cx).await.unwrap();
+        read_at_c1(cx).await.unwrap();
+        assert_eq!(reads(), 1, "kept at the commit");
+
+        // The schema is read again with another text: the same read at the same commit is sent.
+        served.lock().unwrap().schema = format!("{SCHEMA}node Note {{\n  slug: String @key\n}}\n");
+        session.update(cx, |session, cx| session.reload_schema(cx));
+        cx.run_until_parked();
+        read_at_c1(cx).await.unwrap();
+        assert_eq!(reads(), 2, "read again under the new schema");
+
+        // Another writer changes the schema; the head move's feed read finds it and the session
+        // takes it.
+        let _watch = session.update(cx, |session, _| {
+            session.watch_reads("main", node_reads(&schema, "Person"))
+        });
+        let renamed = "node Person {\n  slug: String @key\n  full_name: String @rename_from(\"name\")\n}\nnode Note {\n  slug: String @key\n}\n";
+        served.lock().unwrap().schema = renamed.into();
+        served
+            .lock()
+            .unwrap()
+            .commit("c2", vec![node_change("Note", "n1")]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        let held = session.read_with(cx, |session, _| {
+            session.schema_model().unwrap().source.clone()
+        });
+        assert_eq!(&*held, renamed, "the new schema is taken");
+        assert!(
+            matches!(
+                session.read_with(cx, |session, _| session.changes_since("main", "c1", "c2")),
+                Since::Unknown
+            ),
+            "nothing carries across a schema change"
+        );
+        read_at_c1(cx).await.unwrap();
+        assert_eq!(reads(), 3, "read again under the renamed schema");
     }
 }
