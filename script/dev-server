@@ -55,7 +55,11 @@ fi
 OMNIGRAPH_SERVER_BEARER_TOKENS_JSON="{\"act-dev\":\"$TOKEN\"}" \
   "$SERVER" --cluster "$DATA" --bind "$BIND" &
 server=$!
-trap 'kill $server 2>/dev/null' EXIT INT TERM
+# The CLI sends a token only to a server its config names, never from OMNIGRAPH_BEARER_TOKEN, so
+# the seed loads run in a home of their own that names this one, outside the cluster root.
+home=$(mktemp -d)
+printf 'servers:\n  dev:\n    url: http://%s\n' "$BIND" > "$home/config.yaml"
+trap 'kill $server 2>/dev/null; rm -rf "$home"' EXIT INT TERM
 
 for _ in $(seq 1 60); do
   if curl -fsS "http://$BIND/readyz" > /dev/null 2>&1; then break; fi
@@ -64,9 +68,9 @@ done
 
 if [[ $fresh == 1 ]]; then
   [[ -f "$ROOT/dev/seed.jsonl" ]] || python3 "$ROOT/script/dev-seed.py" > "$ROOT/dev/seed.jsonl"
-  OMNIGRAPH_BEARER_TOKEN=$TOKEN "$CLI" load --server "http://$BIND" --graph knowledge \
+  OMNIGRAPH_HOME=$home OMNIGRAPH_TOKEN_DEV=$TOKEN "$CLI" load --server dev --graph knowledge \
     --data "$ROOT/dev/seed.jsonl" --mode overwrite --yes --quiet > /dev/null
-  OMNIGRAPH_BEARER_TOKEN=$TOKEN "$CLI" load --server "http://$BIND" --graph notes \
+  OMNIGRAPH_HOME=$home OMNIGRAPH_TOKEN_DEV=$TOKEN "$CLI" load --server dev --graph notes \
     --data "$ROOT/dev/notes-seed.jsonl" --mode overwrite --yes --quiet > /dev/null
   echo "Loaded dev/seed.jsonl into knowledge and dev/notes-seed.jsonl into notes."
 fi
