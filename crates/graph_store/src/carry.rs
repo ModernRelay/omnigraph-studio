@@ -9,6 +9,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use gq_language::SchemaModel;
+use gq_language::builder::Depends;
 use graph_client::api::{ChangeBlockOutput, ChangeFeedOutput, EntityKind};
 use serde_json::Value;
 
@@ -193,6 +194,38 @@ impl ChangesSince {
             None => false,
             Some(Touched::All) => true,
             Some(Touched::Ids { ends, .. }) => ends.contains(id),
+        }
+    }
+}
+
+/// Whether `since` left alone an answer that depends on `depends` and holds `rows`.
+pub fn answer_unchanged(since: &ChangesSince, depends: &Depends, rows: &Value) -> bool {
+    match depends {
+        Depends::Unknown => false,
+        Depends::Types { nodes, edges } => {
+            let types = nodes
+                .iter()
+                .map(|name| TypeRef::Node(name.clone()))
+                .chain(edges.iter().map(|name| TypeRef::Edge(name.clone())));
+            !since.any_changed(&types.collect::<Vec<_>>())
+        }
+        Depends::Node { type_name, id } => {
+            !since.entity_changed(&TypeRef::Node(type_name.clone()), id)
+        }
+        Depends::EdgesAt {
+            edge,
+            nodes,
+            listed,
+        } => {
+            !nodes.iter().any(|node| since.edges_at(edge, node))
+                && listed.as_ref().is_none_or(|(type_name, column)| {
+                    let ty = TypeRef::Node(type_name.clone());
+                    rows.as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|row| row.get(column).and_then(Value::as_str))
+                        .all(|id| !since.entity_changed(&ty, id))
+                })
         }
     }
 }

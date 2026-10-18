@@ -199,6 +199,7 @@ pub fn compose(name: &str, parts: Vec<BuiltQuery>) -> BuiltQuery {
             bodies.join("\n")
         ),
         params,
+        depends: Default::default(),
     }
 }
 

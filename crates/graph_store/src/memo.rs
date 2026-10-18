@@ -62,6 +62,19 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone> Memo<K, V, P> {
         }
     }
 
+    /// Keeps `value` as the answer for `key`.
+    pub(crate) fn insert(&mut self, key: K, value: V) {
+        self.put(key, Held::Done(value));
+    }
+
+    /// Every answer held, in no order.
+    pub(crate) fn answers(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.entries.iter().filter_map(|(key, held)| match held {
+            Held::Done(value) => Some((key, value)),
+            Held::Pending(_) => None,
+        })
+    }
+
     /// Forgets what is held for `key`: the next read asks again.
     pub(crate) fn forget(&mut self, key: &K) {
         self.entries.remove(key);

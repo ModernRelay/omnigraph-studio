@@ -3458,6 +3458,66 @@ mod tests {
         });
     }
 
+    /// Refresh after another writer's commit reads again only the relationship groups it
+    /// changed: the others are answered from the commit the page showed (spec 015).
+    #[gpui::test]
+    async fn refresh_reads_again_only_the_groups_a_commit_changed(cx: &mut TestAppContext) {
+        const KNOWS_AND_LIKES: &str = "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\nedge Likes: Person -> Person\n";
+        let reads = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = reads.clone();
+        let (session, writer) = session_followed(
+            KNOWS_AND_LIKES,
+            move |request| {
+                let name = request["name"].as_str().unwrap_or_default();
+                if name == "studio_neighbours" {
+                    let query = request["query"].as_str().unwrap_or_default();
+                    let edge = if query.contains(":likes") {
+                        "likes"
+                    } else {
+                        "knows"
+                    };
+                    seen.lock().unwrap().push(edge.to_owned());
+                }
+                match name {
+                    "studio_node" => json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }]),
+                    "studio_neighbours" => json!([{ "id": "p010", "edge_id": "e1" }]),
+                    _ => json!([]),
+                }
+            },
+            cx,
+        );
+        let (view, cx) = page(session.clone(), cx);
+        let read = |edge: &str| reads.lock().unwrap().iter().filter(|e| *e == edge).count();
+        assert_eq!(
+            (read("knows"), read("likes")),
+            (2, 2),
+            "each group out and in"
+        );
+
+        writer.commit(
+            "c2",
+            vec![changed("edge", "Likes", "e9", Some(("p1", "p030")))],
+        );
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        assert!(
+            view.read_with(cx, |view, _| view.newer),
+            "an edge at the node"
+        );
+
+        view.update(cx, |view, cx| view.refresh(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.as_deref(), Some("c2"));
+            assert!(!view.newer);
+        });
+        assert_eq!(
+            (read("knows"), read("likes")),
+            (2, 4),
+            "only the groups of the edge type the commit wrote"
+        );
+    }
+
     /// A relationship is removed on the second press of its ×, as its own commit, which the
     /// view moves to (spec 014).
     #[gpui::test]

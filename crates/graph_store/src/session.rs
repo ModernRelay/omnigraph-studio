@@ -10,6 +10,7 @@ use futures::FutureExt as _;
 use futures::channel::oneshot;
 use futures::future::{Either, Shared, select};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task};
+use gq_language::builder::Depends;
 use gq_language::{BuiltQuery, RelationshipGroup, SchemaModel, builder};
 use graph_client::api::{
     BranchCreateOutput, BranchCreateRequest, BranchMergeOutput, BranchMergeRequest,
@@ -23,7 +24,7 @@ use graph_client::{
 };
 use serde_json::Value;
 
-use crate::carry::{ChangeLog, FeedFold, Since, TypeRef};
+use crate::carry::{ChangeLog, FeedFold, Since, TypeRef, answer_unchanged};
 use crate::connection::Connection;
 use crate::degrees::{DEGREE_BATCH, DegreeBatchKey, DegreeBatches, page_counts};
 use crate::memo::{Held, Memo};
@@ -122,8 +123,9 @@ pub enum SessionEvent {
     },
 }
 
-/// How many answers to reads pinned to a commit, and Blob cells at a commit, a session keeps.
-const PINNED_READS: usize = 256;
+/// How many answers to reads pinned to a commit, and Blob cells at a commit, a session keeps. A
+/// node page holds one per relationship group, up to about a hundred.
+const PINNED_READS: usize = 1_024;
 const PINNED_BLOBS: usize = 2_048;
 
 /// How many branches' commit lists a session keeps.
@@ -911,6 +913,32 @@ impl GraphSession {
         cx.emit(SessionEvent::HeadMoved { branch, head });
     }
 
+    /// An answer to the same query and parameters read at an earlier commit of the session's
+    /// branch, standing for `key`'s commit because no commit in between changed what it
+    /// depends on (spec 015, carry-forward). Answered as read at `key`'s commit.
+    fn carried(&self, key: &PinnedRead, depends: &Depends) -> Option<ReadOutput> {
+        if *depends == Depends::Unknown {
+            return None;
+        }
+        self.pinned_reads
+            .answers()
+            .filter(|(read, _)| {
+                read.query == key.query && read.params == key.params && read.commit != key.commit
+            })
+            .find_map(|(read, output)| {
+                match self.changes_since(&self.branch, &read.commit, &key.commit) {
+                    Since::Known(since) if answer_unchanged(&since, depends, &output.rows) => {
+                        let mut output = output.clone();
+                        output.graph_commit_id = Some(key.commit.clone());
+                        output.target.branch = None;
+                        output.target.snapshot = Some(key.commit.clone());
+                        Some(output)
+                    }
+                    _ => None,
+                }
+            })
+    }
+
     /// Runs a read on the session's branch, or at `snapshot` when given (constitution II). A
     /// read at a commit is answered from what was read at that commit before, or shares an
     /// identical read under way: a commit never changes.
@@ -942,6 +970,10 @@ impl GraphSession {
         let shared = match self.pinned_reads.get(&key) {
             Some(Held::Done(output)) => return Task::ready(Ok(output)),
             Some(Held::Pending(shared)) => shared,
+            None if let Some(output) = self.carried(&key, &query.depends) => {
+                self.pinned_reads.insert(key, output.clone());
+                return Task::ready(Ok(output));
+            }
             None => {
                 let shared = self.read_at_commit(request, cx).shared();
                 self.pinned_reads.start(key.clone(), shared.clone());
@@ -1771,6 +1803,7 @@ mod tests {
             name: "q".into(),
             text: "query q() { match { $p: Person } return { count($p) as n } }".into(),
             params: Default::default(),
+            ..Default::default()
         };
         let (first, second) = session.update(cx, |session, cx| {
             (
@@ -1882,6 +1915,7 @@ mod tests {
             name: "q".into(),
             text: "query q($n: I64) { match { $p: Person } return { count($p) as n } }".into(),
             params: [("n".to_owned(), Value::from(n))].into_iter().collect(),
+            ..Default::default()
         };
 
         let read = session.update(cx, |session, cx| {
@@ -2176,6 +2210,7 @@ mod tests {
             name: "m".into(),
             text: "query m() { update Person set { slug: \"x\" } where @id = \"p\" }".into(),
             params: Default::default(),
+            ..Default::default()
         };
         probes.lock().unwrap().clear();
         let write = session.update(cx, |session, cx| {
@@ -2400,6 +2435,7 @@ mod tests {
             name: "m".into(),
             text: "query m() { update Person set { title: \"x\" } where @id = \"p\" }".into(),
             params: Default::default(),
+            ..Default::default()
         };
         let write = session.update(cx, |session, cx| {
             session.write(&query, None, "Set title".into(), cx)
@@ -2660,5 +2696,86 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(feeds().len(), 3);
         assert!(matches!(since(cx, "c4", "c5"), Since::Unknown));
+    }
+
+    /// A read at a commit that misses is answered by the same read at an earlier commit of the
+    /// branch when no commit in between changed what it depends on: for a node's neighbours,
+    /// the edges at the node and the neighbours listed (spec 015).
+    #[gpui::test]
+    async fn a_read_at_a_new_head_is_answered_from_an_earlier_commit_it_still_holds_for(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::carry::node_reads;
+        use crate::test_server::{followed_session, node_change};
+        use serde_json::json;
+
+        const SCHEMA: &str =
+            "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n";
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = sent.clone();
+        let (session, served) = followed_session(
+            SCHEMA,
+            move |request| {
+                seen.lock()
+                    .unwrap()
+                    .push(request["name"].as_str().unwrap_or_default().to_owned());
+                json!([{ "id": "p2", "edge_id": "e1", "label": "Grace" }])
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+        let _watch = session.update(cx, |session, _| {
+            session.watch_reads("main", node_reads(&schema, "Person"))
+        });
+        let group = schema.relationships_of("Person")[0].clone();
+        let neighbours = builder::neighbours(
+            &schema,
+            "Person",
+            &group,
+            "p1",
+            None,
+            builder::Narrow::default(),
+            51,
+        )
+        .unwrap();
+        let sent_now = |name: &str| sent.lock().unwrap().iter().filter(|n| *n == name).count();
+        let read_at = |cx: &mut TestAppContext, commit: &str| {
+            let read = session.update(cx, |session, cx| {
+                session.read(&neighbours, Some(commit.into()), cx)
+            });
+            cx.run_until_parked();
+            read
+        };
+        let commit = |cx: &mut TestAppContext, id: &str, changes| {
+            served.lock().unwrap().commit(id, changes);
+            session.update(cx, |session, cx| session.check_heads(cx));
+            cx.run_until_parked();
+        };
+        let edge = |id: &str, from: &str, to: &str| json!({ "kind": "edge", "type": { "id": "Knows", "name": "Knows" }, "id": id, "op": "insert", "after": { "properties": {}, "endpoints": { "from": from, "to": to } } });
+
+        read_at(cx, "c1").await.unwrap();
+        assert_eq!(sent_now("studio_neighbours"), 1);
+
+        // Another person, and an edge between two others.
+        commit(
+            cx,
+            "c2",
+            vec![node_change("Person", "p9"), edge("e9", "p7", "p8")],
+        );
+        let carried = read_at(cx, "c2").await.unwrap();
+        assert_eq!(sent_now("studio_neighbours"), 1, "answered from c1");
+        assert_eq!(carried.graph_commit_id.as_deref(), Some("c2"));
+        assert_eq!(carried.target.snapshot.as_deref(), Some("c2"));
+
+        // A neighbour it lists changed.
+        commit(cx, "c3", vec![node_change("Person", "p2")]);
+        read_at(cx, "c3").await.unwrap();
+        assert_eq!(sent_now("studio_neighbours"), 2, "read again");
+
+        // An edge at the node.
+        commit(cx, "c4", vec![edge("e10", "p3", "p1")]);
+        read_at(cx, "c4").await.unwrap();
+        assert_eq!(sent_now("studio_neighbours"), 3, "read again");
     }
 }

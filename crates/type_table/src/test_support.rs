@@ -216,12 +216,12 @@ fn serve_with(
                 request.into_body().read_to_end(&mut bytes).await.ok();
                 let asked: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
                 let rows = rows(&asked);
-                // The head probe sees the other writer's newest commit; every other read is
-                // answered at c1, which no commit after it changes for what the tests read.
-                let at = writer
-                    .as_ref()
-                    .filter(|_| asked["name"] == "studio_head")
-                    .and_then(|writer| writer.head())
+                // A read at a commit is answered there; a read of the branch at the other
+                // writer's newest commit, or c1.
+                let at = asked["snapshot"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| writer.as_ref().and_then(|writer| writer.head()))
                     .unwrap_or_else(|| "c1".to_owned());
                 (
                     200,

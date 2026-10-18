@@ -12,11 +12,66 @@ use crate::schema::{
 };
 
 /// A generated query: GQ source and the parameters to send with it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct BuiltQuery {
     pub name: String,
     pub text: String,
     pub params: Map<String, Value>,
+    /// What its answer depends on.
+    pub depends: Depends,
+}
+
+/// What a generated query's answer depends on, so that an answer read at one commit stands for
+/// a later commit of the branch whose changes left all of it alone (spec 015, carry-forward).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum Depends {
+    /// Not described: the answer is read again at every commit.
+    #[default]
+    Unknown,
+    /// Any entity of these node and edge types.
+    Types {
+        nodes: Vec<String>,
+        edges: Vec<String>,
+    },
+    /// One node.
+    Node { type_name: String, id: String },
+    /// The edges of `edge` at any of `nodes`, and the nodes the answer lists: a node type and
+    /// the answer column holding their ids.
+    EdgesAt {
+        edge: String,
+        nodes: Vec<String>,
+        listed: Option<(String, String)>,
+    },
+}
+
+impl Depends {
+    /// A page or count of `type_name` rows: the type, and the types its filters reach through
+    /// relationships, with both ends of each edge they name.
+    fn rows_of(schema: &SchemaModel, type_name: &str, is_edge: bool, filters: &[Filter]) -> Self {
+        let (mut nodes, mut edges) = (Vec::new(), Vec::new());
+        if is_edge {
+            edges.push(type_name.to_owned());
+        } else {
+            nodes.push(type_name.to_owned());
+        }
+        for filter in filters {
+            let edge = if filter.op.is_relationship() {
+                parse_relationship_key(&filter.property).map(|(_, edge)| edge)
+            } else {
+                match parse_group_key(&filter.property) {
+                    GroupKey::NeighbourProperty { edge, .. } => Some(edge),
+                    GroupKey::EndpointProperty { .. } => Some(type_name),
+                    _ => None,
+                }
+            };
+            let Some(edge) = edge.and_then(|edge| schema.edge(edge)) else {
+                continue;
+            };
+            edges.push(edge.name.clone());
+            nodes.extend([edge.from.clone(), edge.to.clone()]);
+        }
+        Self::Types { nodes, edges }
+    }
 }
 
 impl BuiltQuery {
@@ -714,6 +769,7 @@ pub fn node_page(
         name: "studio_page".into(),
         text,
         params: params.values,
+        depends: Depends::rows_of(schema, &node.name, false, filters),
     })
 }
 
@@ -743,6 +799,7 @@ pub fn node_count(
         name: "studio_count".into(),
         text,
         params: params.values,
+        depends: Depends::rows_of(schema, &node.name, false, filters),
     })
 }
 
@@ -754,6 +811,10 @@ pub fn node_by_id(
     id: &str,
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
+    let depends = Depends::Node {
+        type_name: node.name.clone(),
+        id: id.to_owned(),
+    };
     let mut params = Params::new();
     let id = params.add("id", "String", Value::String(id.to_owned()));
     let text = format!(
@@ -765,6 +826,7 @@ pub fn node_by_id(
         name: "studio_node".into(),
         text,
         params: params.values,
+        depends,
     })
 }
 
@@ -780,6 +842,7 @@ pub fn head_probe(schema: &SchemaModel) -> Option<BuiltQuery> {
         name: "studio_head".into(),
         text,
         params: Map::new(),
+        depends: Depends::Unknown,
     })
 }
 
@@ -843,6 +906,7 @@ pub fn edge_page(
         name: "studio_edge_page".into(),
         text,
         params: params.values,
+        depends: Depends::rows_of(schema, &edge.name, true, filters),
     })
 }
 
@@ -876,6 +940,7 @@ pub fn edge_count(
         name: "studio_edge_count".into(),
         text,
         params: params.values,
+        depends: Depends::rows_of(schema, &edge.name, true, filters),
     })
 }
 
@@ -938,6 +1003,7 @@ pub fn value_counts(
         name: "studio_value_counts".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 
@@ -993,6 +1059,7 @@ pub fn neighbour_counts(
         name: "studio_value_counts".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 
@@ -1067,6 +1134,7 @@ pub fn neighbour_value_counts(
         name: "studio_value_counts".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 
@@ -1127,6 +1195,7 @@ pub fn endpoint_value_counts(
         name: "studio_value_counts".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 
@@ -1152,6 +1221,11 @@ pub fn degree(
     schema
         .edge(&group.edge)
         .ok_or_else(|| BuildError::UnknownEdge(group.edge.clone()))?;
+    let depends = Depends::EdgesAt {
+        edge: group.edge.clone(),
+        nodes: vec![id.to_owned()],
+        listed: None,
+    };
     let mut params = Params::new();
     let id = params.add("id", "String", Value::String(id.to_owned()));
     let text = format!(
@@ -1164,6 +1238,7 @@ pub fn degree(
         name: "studio_degree".into(),
         text,
         params: params.values,
+        depends,
     })
 }
 
@@ -1179,6 +1254,11 @@ pub fn page_degrees(
     schema
         .edge(&group.edge)
         .ok_or_else(|| BuildError::UnknownEdge(group.edge.clone()))?;
+    let depends = Depends::EdgesAt {
+        edge: group.edge.clone(),
+        nodes: ids.to_vec(),
+        listed: None,
+    };
     let mut params = Params::new();
     let ids = params.add("ids", "[String]", Value::from(ids.to_vec()));
     let text = format!(
@@ -1191,6 +1271,7 @@ pub fn page_degrees(
         name: "studio_page_degrees".into(),
         text,
         params: params.values,
+        depends,
     })
 }
 
@@ -1209,6 +1290,11 @@ pub fn page_neighbours(
         .edge(&group.edge)
         .ok_or_else(|| BuildError::UnknownEdge(group.edge.clone()))?;
     let other = self::node(schema, &group.other_type)?;
+    let depends = Depends::EdgesAt {
+        edge: group.edge.clone(),
+        nodes: ids.to_vec(),
+        listed: Some((other.name.clone(), "other".to_owned())),
+    };
     let mut params = Params::new();
     let ids = params.add("ids", "[String]", Value::from(ids.to_vec()));
     let mut columns = vec!["$n.@id as id".to_owned(), "$m.@id as other".to_owned()];
@@ -1228,6 +1314,7 @@ pub fn page_neighbours(
         name: "studio_page_neighbours".into(),
         text,
         params: params.values,
+        depends,
     })
 }
 
@@ -1406,6 +1493,16 @@ pub fn neighbours(
         .edge(&group.edge)
         .ok_or_else(|| BuildError::UnknownEdge(group.edge.clone()))?;
     let other = self::node(schema, &group.other_type)?;
+    // A narrowed list depends on the neighbours' properties too; it is read again.
+    let depends = if narrow.search.is_none_or(str::is_empty) && narrow.value.is_none() {
+        Depends::EdgesAt {
+            edge: group.edge.clone(),
+            nodes: vec![id.to_owned()],
+            listed: Some((other.name.clone(), "id".to_owned())),
+        }
+    } else {
+        Depends::Unknown
+    };
     let mut params = Params::new();
     let id = params.add("id", "String", Value::String(id.to_owned()));
     let after = params.add(
@@ -1470,6 +1567,7 @@ pub fn neighbours(
         name: "studio_neighbours".into(),
         text,
         params: params.values,
+        depends,
     })
 }
 
@@ -1512,6 +1610,7 @@ pub fn neighbour_values(
         name: "studio_neighbour_values".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 
@@ -1540,6 +1639,7 @@ pub fn neighbours_without(
         name: "studio_neighbours_without".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 
@@ -1552,6 +1652,10 @@ pub fn node_label(
     id: &str,
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
+    let depends = Depends::Node {
+        type_name: node.name.clone(),
+        id: id.to_owned(),
+    };
     let mut params = Params::new();
     let id = params.add("id", "String", Value::String(id.to_owned()));
     let mut columns = vec!["$n.@id as id".to_owned()];
@@ -1570,6 +1674,7 @@ pub fn node_label(
         name: "studio_node".into(),
         text,
         params: params.values,
+        depends,
     })
 }
 
@@ -1601,6 +1706,7 @@ pub fn node_search(
         name: "studio_find".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 
@@ -1705,6 +1811,7 @@ pub fn update_cell(
         name: "studio_set".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 
@@ -1772,6 +1879,7 @@ pub fn update_rows(
         name: "studio_save_rows".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 
@@ -1826,6 +1934,7 @@ pub fn update_cells(
         name: "studio_set_rows".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 
@@ -1857,6 +1966,7 @@ pub fn insert_node(
         name: "studio_insert".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 
@@ -1878,6 +1988,7 @@ pub fn delete_node(
         name: "studio_delete".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 
@@ -1899,6 +2010,7 @@ pub fn delete_nodes(
         name: "studio_delete".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 
@@ -1920,6 +2032,7 @@ pub fn delete_edges(
         name: "studio_delete_edges".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 
@@ -1960,6 +2073,7 @@ pub fn required_dependents(
         name: "studio_required_dependents".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 
@@ -2003,6 +2117,7 @@ pub fn insert_edge(
         name: "studio_insert_edge".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 
@@ -2024,6 +2139,7 @@ pub fn delete_edge(
         name: "studio_delete_edge".into(),
         text,
         params: params.values,
+        depends: Depends::Unknown,
     })
 }
 

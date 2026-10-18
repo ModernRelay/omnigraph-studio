@@ -268,8 +268,15 @@ A first cut of parts 1 and 4, ahead of the shared cache:
   (part 4) is not built; with reads limited to the screen it is a layout choice, not a cost.
 - The tree and canvas (`Exploration`) check types too: each shown node's type with its
   relationships' types, and for a relationship grouped by its neighbours' relationships, those.
-- Not yet: review still offers Refresh on every move; answers are not shared across commits
-  (part 2), so a moved view's later reads are new reads.
+- Answers carry across commits too (part 2, first cut). A generated query says what its
+  answer depends on (`builder::Depends`): a node, the edges of one type at some nodes plus the
+  nodes the answer lists, or whole types for pages and counts; anything else is `Unknown` and
+  never carried. A read at a commit that misses the memo is answered by the same query and
+  parameters at an earlier commit of the branch when the log shows nothing it depends on
+  changed in between, and kept at the new commit. So Refresh on a page reads again only the
+  groups the commit touched, and a moved view's later reads mostly cost nothing. The memo
+  holds 1,024 answers; the byte budget and release buffer are not built.
+- Not yet: review still offers Refresh on every move.
 
 ### Expected effect, to be measured
 
@@ -357,7 +364,7 @@ commit can be cleaned up; measure first).
 | 2026-10-18 | A feed poll across a schema apply | `plan_intervals` (`crates/omnigraph/src/changes/enumerate.rs`) and `first_or_boundary` (`changes/feed.rs`) at `d883c49e`; not run live | The gate ignores the request's filters: a type added or removed with rows, or a changed column fingerprint, is `409 schema_boundary` for the whole commit; as a poll's first commit it is the answer, later it ends the page with `caught_up: false`. A rename's block is not known, hence the `/schema` check |
 | 2026-10-18 | Schema apply needs a graph with only `main` | `schema_apply.rs` at `d883c49e` ("schema apply requires a graph with only main") | Confirmed |
 | 2026-10-18 | What a carry-forward feed read costs | `GET /changes?start=after:<id>` on the personal graph (0.14 edge) with one `type` per name a view reads: a Person page 143 names, an Artifact page 165 | One commit: 0.47–0.68 s, 1–2 KB; five commits: 1.6–2.1 s, 2–5 KB. Every change in them was a `WorkflowRun`, so a Person page moves along with nothing read again. The `/schema` read after it is about 0.5 s and 199 KB |
-| 2026-10-18 | Carry-forward | `graph_store` `carry::tests` (5) and `a_head_move_reads_the_change_feed_for_the_types_views_read`; `an_exploration_moves_its_pin_past_commits_to_other_types`; `type_table` `a_page_moves_to_a_commit_that_changed_nothing_it_shows`, `a_table_moves_its_pin_past_commits_to_other_types`, `relationship_columns_read_while_drawn` | Pass |
+| 2026-10-18 | Carry-forward | `graph_store` `carry::tests` (5) and `a_head_move_reads_the_change_feed_for_the_types_views_read`; `an_exploration_moves_its_pin_past_commits_to_other_types`; `type_table` `a_page_moves_to_a_commit_that_changed_nothing_it_shows`, `a_table_moves_its_pin_past_commits_to_other_types`, `relationship_columns_read_while_drawn`, `refresh_reads_again_only_the_groups_a_commit_changed`; `graph_store` `a_read_at_a_new_head_is_answered_from_an_earlier_commit_it_still_holds_for` | Pass |
 | 2026-10-17 | Historical reads use the live schema contract | `docs/user/branching/index.md`; `omnigraph.rs` ("a point-in-time read keeps the LIVE contract") | Confirmed: the schema epoch belongs in every key |
 
 ## Corrections
