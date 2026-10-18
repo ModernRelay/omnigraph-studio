@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, ClipboardItem, Context, Entity, Focusable as _, Render, SharedString, Subscription, Task,
-    Window,
+    App, ClipboardItem, Context, Entity, Focusable as _, ListAlignment, ListState, Render,
+    SharedString, Subscription, Task, Window, list,
 };
 use gq_language::builder::Depends;
 use gq_language::input::{edit_text, parse_input};
@@ -48,6 +48,18 @@ const PAGE_WIDTH: f32 = 760.;
 /// Debounce before relationship counts are read, so moving the cursor quickly through rows
 /// does not send a burst of reads.
 const COUNT_DELAY: Duration = Duration::from_millis(120);
+
+/// One item of a page's list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageItem {
+    /// Everything above the relationship groups, ending with the Relationships heading.
+    Head,
+    /// "This type takes part in no relationships", or "Reading…" until a count arrives.
+    Note(&'static str),
+    Group(usize),
+    /// The row the groups with no neighbours fold into.
+    Empty,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PeekSubject {
@@ -201,6 +213,10 @@ pub struct NodePeek {
     /// What the view shows, as read (spec 015): the session decides from it whether a head move
     /// changed anything shown. `None` while the view holds a commit.
     scope: Option<ReadScope>,
+    /// A page draws as a list: its head, then each relationship group shown. Only what is in
+    /// view is laid out, so a node with dozens of open groups scrolls without drawing them all.
+    page_list: ListState,
+    page_items: Vec<PageItem>,
     /// Properties the commit shown does not hold under their current name, and what they were
     /// then. The node is read without them.
     absent: HashMap<String, PropertyThen>,
@@ -342,6 +358,8 @@ impl NodePeek {
             confirm_discard: false,
             show_empty: false,
             scope: Some(scope),
+            page_list: ListState::new(0, ListAlignment::Top, px(600.)),
+            page_items: Vec::new(),
             absent: HashMap::new(),
             groups_absent: Vec::new(),
             awaiting_changes: false,
@@ -2635,7 +2653,6 @@ impl NodePeek {
                 .color(Color::Muted)
                 .into_any_element();
         }
-        let hover = cx.theme().colors().element_hover;
         let (listed, folded): (Vec<usize>, Vec<usize>) =
             (0..self.groups.len()).partition(|&index| self.listed_by_default(index));
         let counting = folded.iter().any(|&index| {
@@ -2652,48 +2669,7 @@ impl NodePeek {
                 .color(Color::Muted)
                 .into_any_element()
         });
-        let empty_row = (!folded.is_empty() && !counting).then(|| {
-            let open = self.show_empty;
-            h_flex()
-                .id("peek-empty-groups")
-                .px_1()
-                .py_0p5()
-                .gap_1p5()
-                .rounded_sm()
-                .hover(move |s| s.bg(hover))
-                .cursor_pointer()
-                .tooltip(Tooltip::text(if open {
-                    "Hide the relationships with none"
-                } else {
-                    "Show the relationships with none, to add one"
-                }))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.show_empty = !this.show_empty;
-                    cx.notify();
-                }))
-                .child(
-                    Icon::new(if open {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-                )
-                .child(
-                    Label::new("Empty")
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .child(div().flex_1())
-                .child(
-                    Label::new(format_count(folded.len() as i64))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .buffer_font(cx),
-                )
-                .into_any_element()
-        });
+        let empty_row = (!folded.is_empty() && !counting).then(|| self.render_empty_row(cx));
         let mut column = v_flex().gap_0p5().children(reading);
         for index in listed {
             column = column.child(self.render_group(index, cx));
@@ -2711,6 +2687,54 @@ impl NodePeek {
 
     /// One relationship group: its header (direction, name, the other type, "+", the count),
     /// then an open search, its notice and, when open, its neighbours.
+    /// The row the groups with no neighbours fold into, with how many; a click shows them.
+    fn render_empty_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let hover = cx.theme().colors().element_hover;
+        let folded = (0..self.groups.len())
+            .filter(|&index| !self.listed_by_default(index))
+            .count();
+        let open = self.show_empty;
+        h_flex()
+            .id("peek-empty-groups")
+            .px_1()
+            .py_0p5()
+            .gap_1p5()
+            .rounded_sm()
+            .hover(move |s| s.bg(hover))
+            .cursor_pointer()
+            .tooltip(Tooltip::text(if open {
+                "Hide the relationships with none"
+            } else {
+                "Show the relationships with none, to add one"
+            }))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.show_empty = !this.show_empty;
+                cx.notify();
+            }))
+            .child(
+                Icon::new(if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+            )
+            .child(
+                Label::new("Empty")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(div().flex_1())
+            .child(
+                Label::new(format_count(folded as i64))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .buffer_font(cx),
+            )
+            .into_any_element()
+    }
+
     fn render_group(&self, index: usize, cx: &mut Context<Self>) -> Div {
         let hover = cx.theme().colors().element_hover;
         let group = &self.groups[index];
@@ -3250,6 +3274,149 @@ fn section(title: &'static str) -> impl IntoElement {
 impl Render for NodePeek {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_markdown(cx);
+        if self.page {
+            return self.render_page(cx).into_any_element();
+        }
+        // A node's relationships are listed once the node is read: while it loads, or when it
+        // does not exist at this commit, an empty list would say its type has none.
+        let relationships = self
+            .shows_relationships()
+            .then(|| self.render_relationships(cx));
+        self.render_head(window, cx)
+            .id("node-peek")
+            .key_context("NodeView")
+            .on_action(cx.listener(Self::save_drafts))
+            .on_action(cx.listener(Self::on_save_field))
+            .on_action(cx.listener(Self::on_cancel_field))
+            .on_action(cx.listener(Self::on_expand_field))
+            .p_4()
+            .gap_1p5()
+            .children(relationships.map(|relationships| {
+                v_flex()
+                    .child(section("Relationships"))
+                    .child(relationships)
+            }))
+            .into_any_element()
+    }
+}
+
+impl NodePeek {
+    /// Whether the relationships are listed: once a node is read.
+    fn shows_relationships(&self) -> bool {
+        matches!(self.subject, PeekSubject::Node { .. }) && self.values.loaded().is_some()
+    }
+
+    /// What a page's list holds now, in order, as [`Self::render_relationships`] lays the
+    /// groups out for the peek.
+    fn page_items(&self) -> Vec<PageItem> {
+        let mut items = vec![PageItem::Head];
+        if !self.shows_relationships() {
+            return items;
+        }
+        if self.groups.is_empty() {
+            items.push(PageItem::Note("This type takes part in no relationships."));
+            return items;
+        }
+        let (listed, folded): (Vec<usize>, Vec<usize>) =
+            (0..self.groups.len()).partition(|&index| self.listed_by_default(index));
+        let counting = folded.iter().any(|&index| {
+            matches!(
+                self.groups[index].count,
+                Loadable::NotLoaded | Loadable::Loading
+            )
+        });
+        if listed.is_empty() && counting {
+            items.push(PageItem::Note("Reading…"));
+        }
+        items.extend(listed.into_iter().map(PageItem::Group));
+        if !folded.is_empty() && !counting {
+            items.push(PageItem::Empty);
+            items.extend(
+                folded
+                    .into_iter()
+                    .filter(|&index| self.folded_shown(index))
+                    .map(PageItem::Group),
+            );
+        }
+        items
+    }
+
+    /// A node's page: its items as a list, told what changed since it was last drawn.
+    fn render_page(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let items = self.page_items();
+        if items != self.page_items {
+            // Items before the first change keep their place and the scroll position.
+            let same = items
+                .iter()
+                .zip(&self.page_items)
+                .take_while(|(new, old)| new == old)
+                .count();
+            self.page_list
+                .splice(same..self.page_items.len(), items.len() - same);
+            self.page_items = items;
+        }
+        // What an item holds may have changed (a group's neighbours came in, a field opened):
+        // those drawn are measured again, the others keep the height they had.
+        self.page_list.remeasure();
+        div()
+            .id("node-peek")
+            .key_context("NodeView")
+            .on_action(cx.listener(Self::save_drafts))
+            .on_action(cx.listener(Self::on_save_field))
+            .on_action(cx.listener(Self::on_cancel_field))
+            .on_action(cx.listener(Self::on_expand_field))
+            .size_full()
+            .child(
+                list(
+                    self.page_list.clone(),
+                    cx.processor(|this, ix: usize, window, cx| {
+                        this.render_page_item(ix, window, cx)
+                    }),
+                )
+                .size_full(),
+            )
+    }
+
+    fn render_page_item(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let last = ix + 1 == self.page_items.len();
+        let item = match self.page_items.get(ix).copied() {
+            Some(PageItem::Head) => self
+                .render_head(window, cx)
+                .pt(px(studio_ui::ds::space::XL))
+                .gap_2()
+                .when(self.shows_relationships(), |head| {
+                    head.child(section("Relationships"))
+                })
+                .into_any_element(),
+            Some(PageItem::Note(text)) => Label::new(text)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element(),
+            Some(PageItem::Group(index)) if index < self.groups.len() => {
+                self.render_group(index, cx).into_any_element()
+            }
+            Some(PageItem::Empty) => self.render_empty_row(cx),
+            _ => div().into_any_element(),
+        };
+        // A page reads at a document's width, with its margins.
+        div()
+            .w_full()
+            .max_w(px(PAGE_WIDTH))
+            .px(px(studio_ui::ds::space::PAGE))
+            .pt_0p5()
+            .when(last, |item| item.pb(px(studio_ui::ds::space::XL)))
+            .child(item)
+            .into_any_element()
+    }
+
+    /// Everything above the relationship groups: the node's type and name, its commit, drafts,
+    /// endpoints, properties and Blobs.
+    fn render_head(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let type_name = self.subject.type_name().to_owned();
         let id = self.subject.id().to_owned();
         let label = self.label();
@@ -3259,33 +3426,11 @@ impl Render for NodePeek {
         let open_page = (!page).then(|| self.open_page_action()).flatten();
         let has_properties = !self.property_rows().is_empty();
         let properties = self.render_properties(window, cx);
-        // A node's relationships are listed once the node is read: while it loads, or when it
-        // does not exist at this commit, an empty list would say its type has none.
-        let relationships = (matches!(self.subject, PeekSubject::Node { .. })
-            && self.values.loaded().is_some())
-        .then(|| self.render_relationships(cx));
         let endpoints = self.render_endpoints(cx);
         let is_node = matches!(self.subject, PeekSubject::Node { .. });
         let drafts_bar = self.render_drafts_bar(cx);
         v_flex()
-            .id("node-peek")
-            .key_context("NodeView")
-            .on_action(cx.listener(Self::save_drafts))
-            .on_action(cx.listener(Self::on_save_field))
-            .on_action(cx.listener(Self::on_cancel_field))
-            .on_action(cx.listener(Self::on_expand_field))
             .w_full()
-            .map(|view| {
-                if page {
-                    // A page reads at a document's width, with its margins.
-                    view.max_w(px(PAGE_WIDTH))
-                        .px(px(studio_ui::ds::space::PAGE))
-                        .py(px(studio_ui::ds::space::XL))
-                        .gap_2()
-                } else {
-                    view.p_4().gap_1p5()
-                }
-            })
             .child(
                 h_flex()
                     .gap_1p5()
@@ -3373,11 +3518,6 @@ impl Render for NodePeek {
             .when(!self.blobs.is_empty(), |d| {
                 d.child(section("Blobs")).child(self.render_blobs(cx))
             })
-            .children(relationships.map(|relationships| {
-                v_flex()
-                    .child(section("Relationships"))
-                    .child(relationships)
-            }))
     }
 }
 

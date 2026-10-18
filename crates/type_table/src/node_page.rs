@@ -101,8 +101,8 @@ impl Render for NodePage {
             .key_context("NodePage")
             .track_focus(&self.focus_handle)
             .size_full()
-            .overflow_y_scroll()
             .bg(cx.theme().colors().editor_background)
+            // The page scrolls as a list of its own, drawing only what is in view.
             .child(self.view.clone())
     }
 }
