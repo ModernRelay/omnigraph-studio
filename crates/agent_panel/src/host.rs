@@ -36,6 +36,8 @@ const STDERR_BYTES: usize = 4096;
 /// Updates kept for a session the connection has not been told about yet: an agent may report
 /// on a session before its `session/new` answer has been read.
 const EARLY_UPDATES: usize = 256;
+/// How many sessions not yet routed keep early updates.
+const EARLY_SESSIONS: usize = 16;
 /// Pages of `session/list` read at most.
 const LIST_PAGES: usize = 20;
 
@@ -80,6 +82,9 @@ pub enum Opened {
 }
 
 pub enum HostEvent {
+    /// The adapter the agent runs as, before anything of the session: a loaded session replays
+    /// its tool calls before `Ready`, and each is told apart by its adapter.
+    Adapter(tools::Adapter),
     /// The session is open.
     Ready {
         agent: String,
@@ -155,13 +160,31 @@ impl Routes {
             Some(events) => {
                 events.unbounded_send(HostEvent::Update(update)).ok();
             }
-            None => {
+            // Kept for a session about to be routed (a load's replay can come first), for a
+            // few sessions at a time: updates for one that closed are not kept for ever.
+            None if self.early.contains_key(&session) || self.early.len() < EARLY_SESSIONS => {
                 let early = self.early.entry(session).or_default();
                 if early.len() < EARLY_UPDATES {
                     early.push_back(update);
                 }
             }
+            None => {}
         }
+    }
+
+    /// Removes `session`'s route when it is still `events`': the session reopened by another
+    /// conversation since keeps its own. Whether it was removed.
+    fn remove(&mut self, session: &SessionId, events: &mpsc::UnboundedSender<HostEvent>) -> bool {
+        self.early.remove(session);
+        if self
+            .sessions
+            .get(session)
+            .is_some_and(|routed| routed.same_receiver(events))
+        {
+            self.sessions.remove(session);
+            return true;
+        }
+        false
     }
 
     fn add(&mut self, session: SessionId, events: mpsc::UnboundedSender<HostEvent>) {
@@ -174,14 +197,19 @@ impl Routes {
 
 type SharedRoutes = Arc<Mutex<Routes>>;
 /// Conversations asked to open but not yet routed: they hear an exit too.
-type Opening = Arc<Mutex<Vec<mpsc::UnboundedSender<HostEvent>>>>;
+/// The conversations asked for and not yet open; `AgentConnection::open` adds each before the
+/// agent reads its request, so one asked for before the agent fails to start hears why.
+pub type Opening = Arc<Mutex<Vec<mpsc::UnboundedSender<HostEvent>>>>;
 
 /// Runs one agent until every handle to it is dropped or it exits; then every open conversation
 /// hears why. Dropping the future kills the agent's process group.
-pub async fn run(launch: AgentLaunch, commands: mpsc::UnboundedReceiver<ConnectionCommand>) {
+pub async fn run(
+    launch: AgentLaunch,
+    commands: mpsc::UnboundedReceiver<ConnectionCommand>,
+    opening: Opening,
+) {
     let stderr = Arc::new(Mutex::new(VecDeque::<String>::new()));
     let routes = SharedRoutes::default();
-    let opening = Opening::default();
     let result = connect(
         launch,
         commands,
@@ -263,6 +291,9 @@ async fn connect(
 
     let updates = routes.clone();
     let permissions = routes.clone();
+    // Known once the agent answers `initialize`, before any session or permission request.
+    let adapter: Arc<Mutex<tools::Adapter>> = Arc::default();
+    let asked_by = adapter.clone();
     agent_client_protocol::Client
         .builder()
         .name("omnigraph-studio")
@@ -277,8 +308,14 @@ async fn connect(
         )
         .on_receive_request(
             async move |request: RequestPermissionRequest, responder, connection| {
-                let title = request.tool_call.fields.title.clone().unwrap_or_default();
-                if tools::is_studio_tool(&title) {
+                let adapter = asked_by.lock().map(|adapter| *adapter).unwrap_or_default();
+                let call = &request.tool_call;
+                let studio = tools::StudioTool::of(
+                    adapter,
+                    call.meta.as_ref(),
+                    call.fields.raw_input.as_ref(),
+                );
+                if studio.is_some() {
                     // Studio's reads are read-only and its writes wait for Studio's own
                     // approval, so the agent's prompt for them is answered at once.
                     let allow = request
@@ -336,6 +373,18 @@ async fn connect(
                 .await?;
             let capabilities = &initialized.agent_capabilities;
             let sessions = &capabilities.session_capabilities;
+            let adapter = {
+                let named = initialized
+                    .agent_info
+                    .as_ref()
+                    .map_or(tools::Adapter::Other, |info| {
+                        tools::Adapter::named(&info.name)
+                    });
+                if let Ok(mut shared) = adapter.lock() {
+                    *shared = named;
+                }
+                named
+            };
             let agent = AgentInfo {
                 name: initialized
                     .agent_info
@@ -358,9 +407,8 @@ async fn connect(
                         events,
                         commands,
                     } => {
-                        if let Ok(mut opening) = opening.lock() {
-                            opening.push(events.clone());
-                        }
+                        // Already in `opening`, from `AgentConnection::open`.
+                        events.unbounded_send(HostEvent::Adapter(adapter)).ok();
                         let session = open_session(
                             connection.clone(),
                             launch,
@@ -463,7 +511,7 @@ async fn open_session(
                 }
                 Err(_) => {
                     if let Ok(mut routes) = routes.lock() {
-                        routes.sessions.remove(&id);
+                        routes.remove(&id, &events);
                     }
                 }
             }
@@ -571,11 +619,12 @@ async fn open_session(
             }
         }
     }
-    // The panel let go: the agent may free the session.
-    if let Ok(mut routes) = routes.lock() {
-        routes.sessions.remove(&session_id);
-    }
-    if can.close {
+    // The panel let go: the agent may free the session, unless another conversation has
+    // opened it again since.
+    let ours = routes
+        .lock()
+        .is_ok_and(|mut routes| routes.remove(&session_id, &events));
+    if ours && can.close {
         connection
             .send_request(CloseSessionRequest::new(session_id))
             .block_task()
@@ -618,6 +667,40 @@ mod tests {
         ))))
     }
 
+    /// An agent that cannot start (no such program, as with no `npx` on an app's PATH) tells
+    /// the conversation asked for before it read the request, which otherwise waits for ever.
+    #[test]
+    fn a_conversation_asked_for_before_the_agent_fails_hears_why() {
+        let (events, mut heard) = mpsc::unbounded();
+        let (commands, receiver) = mpsc::unbounded();
+        let (_host, host_commands) = mpsc::unbounded();
+        let opening = Opening::default();
+        // As `AgentConnection::open` does.
+        opening.lock().unwrap().push(events.clone());
+        commands
+            .unbounded_send(ConnectionCommand::Open {
+                launch: SessionLaunch {
+                    cwd: std::env::temp_dir(),
+                    mcp_command: "studio".into(),
+                    mcp_args: Vec::new(),
+                    resume: None,
+                },
+                events,
+                commands: host_commands,
+            })
+            .unwrap();
+        let launch = AgentLaunch {
+            command: vec!["/nonexistent/studio-test-agent".into()],
+            env: BTreeMap::new(),
+        };
+        smol::block_on(run(launch, receiver, opening));
+        let mut exited = false;
+        while let Ok(event) = heard.try_recv() {
+            exited |= matches!(event, HostEvent::Exited { failed: true, .. });
+        }
+        assert!(exited, "the conversation is told the agent stopped");
+    }
+
     #[test]
     fn updates_go_to_their_session_and_early_ones_wait() {
         let mut routes = Routes::default();
@@ -646,6 +729,22 @@ mod tests {
             routes.update(SessionId::new("c"), chunk("x"));
         }
         assert_eq!(routes.early[&SessionId::new("c")].len(), EARLY_UPDATES);
+        // And only so many such sessions keep any.
+        for n in 0..EARLY_SESSIONS * 2 {
+            routes.update(SessionId::new(format!("stray-{n}")), chunk("x"));
+        }
+        assert!(routes.early.len() <= EARLY_SESSIONS);
+
+        // The session reopened by another conversation keeps its route when the first one
+        // lets go; its own conversation removes it.
+        let (again_tx, mut again_rx) = mpsc::unbounded();
+        let (first_tx, _first_rx) = mpsc::unbounded();
+        routes.add(SessionId::new("b"), again_tx.clone());
+        assert!(!routes.remove(&SessionId::new("b"), &first_tx));
+        routes.update(SessionId::new("b"), chunk("still routed"));
+        assert_eq!(text(again_rx.try_recv().ok()), "still routed");
+        assert!(routes.remove(&SessionId::new("b"), &again_tx));
+        assert!(!routes.sessions.contains_key(&SessionId::new("b")));
     }
 }
 

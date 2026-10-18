@@ -11,9 +11,16 @@
 //! The agent learns the wrapper's path from its conversation's MCP instructions and the
 //! `omnigraph_cli` tool; `<cwd>/AGENTS.md` gives the rules shared by the graph's conversations.
 //! The token lives in a file because Codex's environment filter drops names like `*TOKEN*`.
+//!
+//! The agent can rewrite anything in its working directory, so `omnigraph_run`, which runs
+//! outside the agent's sandbox, never uses that folder: it starts the chosen CLI itself, with a
+//! second home of the same config in a private folder outside the working directory, and runs
+//! there.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+
+use crate::confined::Confined;
 use std::time::Duration;
 
 use futures::FutureExt as _;
@@ -26,52 +33,119 @@ pub struct CliHome {
     pub graph: String,
     pub branch: String,
     pub base: String,
+    /// The agent's working directory, and the home's folder in it. The agent writes there too,
+    /// so each write opens the folder again by handle (`confined`).
+    cwd: PathBuf,
+    folder: String,
+    /// The credentials file as written, so a later conversation's file in the same folder is
+    /// left alone when this one ends.
+    credentials: String,
+    /// The home `omnigraph_run` uses, outside the working directory; its runs stage there too.
+    private: PathBuf,
+    /// The CLI chosen for the conversation, which `omnigraph_run` starts itself.
+    cli: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl Drop for CliHome {
     fn drop(&mut self) {
-        std::fs::remove_file(self.dir.join("credentials")).ok();
+        if let Ok(home) = self.home()
+            && home.holds("credentials", self.credentials.as_bytes())
+        {
+            home.remove("credentials".as_ref()).ok();
+        }
+        std::fs::remove_dir_all(&self.private).ok();
     }
 }
 
 impl CliHome {
-    /// Writes the conversation's directory, config and credentials. The wrapper is written by
-    /// [`CliHome::use_cli`] once a CLI is chosen.
+    /// Writes the conversation's directory, config and credentials, and the private home
+    /// `omnigraph_run` uses, in a folder of its own under `private_root`. The wrapper is written
+    /// by [`CliHome::use_cli`] once a CLI is chosen.
     pub fn write(
         cwd: &Path,
+        private_root: &Path,
         port: u16,
         token: &str,
         graph: &str,
         branch: &str,
         base: &str,
     ) -> std::io::Result<Self> {
-        let parent = cwd.join(".studio");
-        let dir = parent.join(branch.replace('/', "-"));
-        std::fs::create_dir_all(&dir)?;
-        private_dir(&parent)?;
-        private_dir(&dir)?;
-        write_file(
-            &dir.join("config.yaml"),
-            &format!(
-                "# Written by OmniGraph Studio for one agent conversation (spec 013).\n\
-                 servers:\n  studio: {{ url: \"http://127.0.0.1:{port}\" }}\n\
-                 defaults:\n  server: studio\n  default_graph: {}\n",
-                yaml_string(graph)
-            ),
-            0o600,
-        )?;
-        write_file(
-            &dir.join("credentials"),
-            &format!("[studio]\ntoken = {token}\n"),
-            0o600,
-        )?;
+        let name = branch.replace('/', "-");
+        let config = format!(
+            "# Written by OmniGraph Studio for one agent conversation (spec 013).\n\
+             servers:\n  studio: {{ url: \"http://127.0.0.1:{port}\" }}\n\
+             defaults:\n  server: studio\n  default_graph: {}\n",
+            yaml_string(graph)
+        );
+        let credentials = format!("[studio]\ntoken = {token}\n");
+        // Private: the credentials hold the gateway's token.
+        let studio = Confined::open(cwd)?.dir(".studio")?;
+        studio.set_mode(0o700)?;
+        let home = studio.dir(&name)?;
+        home.set_mode(0o700)?;
+        home.write("config.yaml", config.as_bytes(), 0o600)?;
+        home.write("credentials", credentials.as_bytes(), 0o600)?;
+
+        std::fs::create_dir_all(private_root)?;
+        let root = Confined::open(private_root)?;
+        root.set_mode(0o700)?;
+        let folder = format!("{name}-{}", crate::confined::random_hex(8)?);
+        let own = root.dir(&folder)?;
+        own.set_mode(0o700)?;
+        own.write("config.yaml", config.as_bytes(), 0o600)?;
+        own.write("credentials", credentials.as_bytes(), 0o600)?;
+
+        let dir = cwd.join(".studio").join(&name);
         Ok(Self {
             command: dir.join("omnigraph"),
             dir,
             graph: graph.to_owned(),
             branch: branch.to_owned(),
             base: base.to_owned(),
+            cwd: cwd.to_owned(),
+            folder: format!(".studio/{name}"),
+            credentials,
+            private: private_root.join(folder),
+            cli: std::sync::Mutex::new(None),
         })
+    }
+
+    /// The CLI `omnigraph_run` starts, once one is chosen.
+    fn cli(&self) -> Option<PathBuf> {
+        self.cli.lock().ok()?.clone()
+    }
+
+    fn set_cli(&self, cli: Option<&Path>) {
+        if let Ok(mut chosen) = self.cli.lock() {
+            *chosen = cli.map(Path::to_owned);
+        }
+    }
+
+    /// The chosen CLI as `omnigraph_run` starts it, in `dir`: the private home, loopback
+    /// outside any proxy, and none of Studio's own OmniGraph variables (its tokens, profile or
+    /// home), so it speaks only to this conversation's gateway.
+    fn command(&self, cli: &Path, dir: &Path) -> std::process::Command {
+        let mut command = std::process::Command::new(cli);
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("OMNIGRAPH_") {
+                command.env_remove(name);
+            }
+        }
+        let no_proxy = match std::env::var("NO_PROXY") {
+            Ok(also) if !also.is_empty() => format!("127.0.0.1,localhost,{also}"),
+            _ => "127.0.0.1,localhost".to_owned(),
+        };
+        command
+            .env("OMNIGRAPH_HOME", &self.private)
+            .env("NO_PROXY", &no_proxy)
+            .env("no_proxy", &no_proxy)
+            .current_dir(dir);
+        command
+    }
+
+    /// The home's folder, opened by handle.
+    fn home(&self) -> std::io::Result<Confined> {
+        Confined::open(&self.cwd)?.dirs(&self.folder)
     }
 
     /// Points the wrapper at `cli`.
@@ -90,7 +164,9 @@ impl CliHome {
             home = shell_quote(&self.dir.to_string_lossy()),
             cli = shell_quote(&cli.to_string_lossy()),
         );
-        write_file(&self.command, &script, 0o700)
+        self.home()?.write("omnigraph", script.as_bytes(), 0o700)?;
+        self.set_cli(Some(cli));
+        Ok(())
     }
 
     /// Makes the wrapper run nothing and say `why`: the conversation has no CLI that speaks the
@@ -103,7 +179,8 @@ impl CliHome {
              exit 1\n",
             why = shell_quote(why),
         );
-        write_file(&self.command, &script, 0o700)
+        self.set_cli(None);
+        self.home()?.write("omnigraph", script.as_bytes(), 0o700)
     }
 
     /// What the agent is told about this conversation's CLI: in its MCP instructions and by the
@@ -172,7 +249,7 @@ pub fn write_agents_md(cwd: &Path, graph: &str) -> std::io::Result<()> {
          that file in your shell. Files it reads or writes must be in your working \
          directory.\n"
     );
-    write_file(&cwd.join("AGENTS.md"), &text, 0o644)
+    Confined::open(cwd)?.write("AGENTS.md", text.as_bytes(), 0o644)
 }
 
 /// The CLIs to try, in order: the configured one, `omnigraph` on PATH, then the usual places.
@@ -409,7 +486,7 @@ where
 /// process, outside the agent's sandbox, so it may only speak to this conversation's gateway
 /// and touch files in the conversation's working directory. Returns the arguments to run, with
 /// `--server studio` (and the conversation's graph unless one is named) added.
-pub fn check_run_args(args: &[String], cwd: &Path, graph: &str) -> Result<Vec<String>, String> {
+pub fn check_run_args(args: &[String], cwd: &Path, graph: &str) -> Result<RunPlan, String> {
     let Some(command) = args.first() else {
         return Err("Pass the omnigraph arguments, for example [\"query\", \"-e\", \"…\"].".into());
     };
@@ -451,6 +528,7 @@ pub fn check_run_args(args: &[String], cwd: &Path, graph: &str) -> Result<Vec<St
         }
     }
     let mut checked = Vec::with_capacity(args.len() + 4);
+    let mut files = Vec::new();
     let mut has_graph = false;
     let mut index = 0;
     while index < args.len() {
@@ -478,59 +556,219 @@ pub fn check_run_args(args: &[String], cwd: &Path, graph: &str) -> Result<Vec<St
                         .ok_or_else(|| format!("`{flag}` needs a path."))?
                 }
             };
-            let path = within(cwd, &value, flag == "--out")?;
+            let file = RunFile {
+                parts: inside(cwd, &value)?,
+                output: flag == "--out",
+            };
             checked.push(flag.to_owned());
-            checked.push(path.to_string_lossy().into_owned());
+            // Filled in with the staged copy's path when the run starts.
+            files.push((checked.len(), file));
+            checked.push(value);
         } else {
             checked.push(arg.clone());
         }
         index += 1;
     }
-    if lint {
-        return Ok(checked);
+    if !lint {
+        checked.extend(["--server".to_owned(), "studio".to_owned()]);
+        if !has_graph {
+            checked.extend(["--graph".to_owned(), graph.to_owned()]);
+        }
     }
-    checked.extend(["--server".to_owned(), "studio".to_owned()]);
-    if !has_graph {
-        checked.extend(["--graph".to_owned(), graph.to_owned()]);
-    }
-    Ok(checked)
+    Ok(RunPlan {
+        args: checked,
+        files,
+        save_to: None,
+    })
 }
 
-/// `value` as a path inside `cwd`, resolved against it. An existing path is resolved through
-/// its links; a file to be written (`create`) must have an existing parent inside `cwd`.
-pub fn within(cwd: &Path, value: &str, create: bool) -> Result<PathBuf, String> {
-    let root = std::fs::canonicalize(cwd).map_err(|error| error.to_string())?;
-    let path = cwd.join(value);
-    let resolved = if create && !path.exists() {
-        let parent = path.parent().ok_or("no parent directory")?;
-        let parent = std::fs::canonicalize(parent)
-            .map_err(|_| format!("{value}: its directory does not exist"))?;
-        parent.join(path.file_name().ok_or("no file name")?)
-    } else {
-        std::fs::canonicalize(&path).map_err(|_| format!("{value}: no such file"))?
-    };
-    if !resolved.starts_with(&root) {
-        return Err(format!(
+/// A checked run: the CLI's arguments, its file arguments by position, and where its standard
+/// output is saved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunPlan {
+    pub args: Vec<String>,
+    pub files: Vec<(usize, RunFile)>,
+    pub save_to: Option<RunFile>,
+}
+
+/// A file in the working directory, by its path's parts there, that a run reads or writes.
+///
+/// The CLI runs outside the agent's sandbox, so it never opens the working directory's files
+/// itself: the agent could change a part of the path into a link between Studio's check and
+/// the CLI's use. Studio copies each file it reads into a private folder before the run, by
+/// handle and without following a link (`confined`), and writes each output back the same way.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunFile {
+    pub parts: Vec<String>,
+    pub output: bool,
+}
+
+impl RunFile {
+    fn name(&self) -> &str {
+        self.parts.last().map_or("", String::as_str)
+    }
+
+    /// The folders it is in, `a/b`, or `None` when it is in the working directory itself.
+    fn folder(&self) -> Option<String> {
+        (self.parts.len() > 1).then(|| self.parts[..self.parts.len() - 1].join("/"))
+    }
+
+    fn shown(&self) -> String {
+        self.parts.join("/")
+    }
+
+    /// Copies the file from `cwd` to `to`.
+    fn copy_in(&self, cwd: &Path, to: &Path) -> std::io::Result<()> {
+        let root = Confined::open(cwd)?;
+        let mut file = match self.folder() {
+            Some(folder) => root.existing_dirs(&folder)?.file(self.name())?,
+            None => root.file(self.name())?,
+        };
+        std::io::copy(&mut file, &mut std::fs::File::create(to)?)?;
+        Ok(())
+    }
+
+    /// Writes what `fill` writes as the file in `cwd`, its folders made as needed.
+    fn write(
+        &self,
+        cwd: &Path,
+        fill: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let root = Confined::open(cwd)?;
+        match self.folder() {
+            Some(folder) => root.dirs(&folder)?.write_with(self.name(), 0o644, fill),
+            None => root.write_with(self.name(), 0o644, fill),
+        }
+    }
+}
+
+/// `value`, a path the agent gave, as its parts inside `cwd`: relative to it, or absolute and
+/// under it. Decided from the text alone, since Studio later opens each part by handle; `..`
+/// is refused.
+pub fn inside(cwd: &Path, value: &str) -> Result<Vec<String>, String> {
+    let outside = || {
+        format!(
             "{value}: omnigraph_run reads and writes files only in your working directory, {}.",
             cwd.display()
+        )
+    };
+    let path = Path::new(value);
+    let relative = if path.is_absolute() {
+        let canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_owned());
+        path.strip_prefix(cwd)
+            .or_else(|_| path.strip_prefix(&canonical))
+            .map_err(|_| outside())?
+    } else {
+        path
+    };
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(
+                part.to_str()
+                    .ok_or_else(|| format!("{value}: the path is not text"))?
+                    .to_owned(),
+            ),
+            std::path::Component::CurDir => {}
+            _ => return Err(outside()),
+        }
+    }
+    if parts.is_empty() {
+        return Err(format!("{value}: name a file"));
+    }
+    if parts[0] == ".studio" {
+        return Err(format!(
+            "{value}: the .studio folder holds Studio's own files for the conversation."
         ));
     }
-    Ok(resolved)
+    Ok(parts)
 }
 
-/// Runs this conversation's CLI with checked arguments in `cwd`, with no shell. Returns the
-/// tool's text and whether the command failed. `save_to` writes standard output to a file in
-/// `cwd` instead of returning it.
-pub async fn run(
-    home: &CliHome,
-    cwd: &Path,
-    args: Vec<String>,
-    save_to: Option<PathBuf>,
-) -> (String, bool) {
+/// Reads `from` into `into` until its end, or until it holds more than `cap` bytes: whether it
+/// went past. Large reads into one buffer: a byte stream read in small steps is slow.
+async fn read_capped(
+    mut from: impl futures::AsyncRead + Unpin,
+    into: &mut Vec<u8>,
+    cap: usize,
+) -> bool {
     use futures::AsyncReadExt as _;
-    let child = smol::process::Command::new(&home.command)
-        .args(&args)
-        .current_dir(cwd)
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        match from.read(&mut buffer).await {
+            Ok(0) | Err(_) => return false,
+            Ok(read) => {
+                into.extend_from_slice(&buffer[..read]);
+                if into.len() > cap {
+                    return true;
+                }
+            }
+        }
+    }
+}
+
+/// A run's private folder, in the conversation's private home, removed when the run ends. Not
+/// in the temporary directory: a sandboxed agent may write there.
+struct Stage(PathBuf);
+
+impl Stage {
+    fn new(home: &Path) -> std::io::Result<Self> {
+        let tag = crate::confined::random_hex(8)?;
+        let dir = home.join(format!("run-{tag}"));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&dir)?;
+        Ok(Self(dir))
+    }
+
+    /// Where the run's `index`th argument's file is staged; its name keeps the extension the
+    /// CLI may read the format from.
+    fn path(&self, index: usize, file: &RunFile) -> PathBuf {
+        self.0.join(format!("{index}-{}", file.name()))
+    }
+}
+
+impl Drop for Stage {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+/// Runs this conversation's CLI with a checked plan, with no shell. Returns the tool's text and
+/// whether the command failed. The plan's files are staged (see [`RunFile`]); its `save_to`
+/// writes standard output to a file in `cwd` instead of returning it.
+pub async fn run(home: &CliHome, cwd: &Path, plan: RunPlan) -> (String, bool) {
+    let Some(cli) = home.cli() else {
+        return (
+            "This conversation has no omnigraph CLI that speaks the graph's HTTP API.".into(),
+            true,
+        );
+    };
+    let stage = match Stage::new(&home.private) {
+        Ok(stage) => stage,
+        Err(error) => {
+            return (
+                format!("Studio could not stage the run's files: {error}"),
+                true,
+            );
+        }
+    };
+    let mut args = plan.args;
+    for (index, file) in &plan.files {
+        let staged = stage.path(*index, file);
+        if !file.output
+            && let Err(error) = file.copy_in(cwd, &staged)
+        {
+            return (
+                format!("Studio could not read {}: {error}", file.shown()),
+                true,
+            );
+        }
+        args[*index] = staged.to_string_lossy().into_owned();
+    }
+    let mut command = home.command(&cli, &stage.0);
+    command.args(&args);
+    let child = smol::process::Command::from(command)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -546,21 +784,50 @@ pub async fn run(
     let read = async {
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let limit = RUN_OUTPUT_MAX as u64 + 1;
-        let (mut stdout, mut stderr) = (stdout.take(limit), stderr.take(limit));
-        let (a, b) = futures::join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err));
-        a.ok();
-        b.ok();
+        // Past the cap a stream is no longer read, and a CLI writing more would wait on the
+        // full pipe until the timeout: the first stream past it stops the command, without
+        // waiting for the other to close.
+        let cut = {
+            let out_read = read_capped(stdout, &mut out, RUN_OUTPUT_MAX).fuse();
+            let err_read = read_capped(stderr, &mut err, RUN_OUTPUT_MAX).fuse();
+            futures::pin_mut!(out_read, err_read);
+            let mut cut = false;
+            loop {
+                futures::select! {
+                    past = out_read => cut |= past,
+                    past = err_read => cut |= past,
+                    complete => break,
+                }
+                if cut {
+                    break;
+                }
+            }
+            cut
+        };
+        if cut {
+            child.kill().ok();
+        }
         let status = child.status().await;
-        (out, err, status)
+        (out, err, status, cut)
     }
     .fuse();
     let timeout = smol::Timer::after(RUN_TIMEOUT).fuse();
     futures::pin_mut!(read, timeout);
-    let (out, err, status) = futures::select! {
+    let (out, err, status, cut) = futures::select! {
         done = read => done,
         _ = timeout => return ("The command took longer than 30 minutes and was stopped.".into(), true),
     };
+    if cut {
+        return (
+            format!(
+                "The command wrote more than {} MiB and was stopped; nothing was saved. Ask for \
+                 less (fewer rows or columns), or write a file with the command's own flag \
+                 (--out).",
+                RUN_OUTPUT_MAX / (1024 * 1024)
+            ),
+            true,
+        );
+    }
     let code = status.ok().and_then(|status| status.code());
     let failed = code != Some(0);
     let clip = |bytes: &[u8]| {
@@ -579,16 +846,33 @@ pub async fn run(
         "exit {}\n",
         code.map_or("signal".into(), |code| code.to_string())
     );
-    match save_to {
-        Some(path) if !failed => match std::fs::write(&path, &out[..out.len().min(RUN_OUTPUT_MAX)])
-        {
-            Ok(()) => text.push_str(&format!(
-                "output saved to {} ({} bytes)\n",
-                path.display(),
-                out.len().min(RUN_OUTPUT_MAX)
-            )),
-            Err(error) => return (format!("Studio could not save the output: {error}"), true),
-        },
+    // The files the CLI wrote, back into the working directory.
+    if !failed {
+        for (index, file) in plan.files.iter().filter(|(_, file)| file.output) {
+            let staged = stage.path(*index, file);
+            let Ok(mut written) = std::fs::File::open(&staged) else {
+                continue;
+            };
+            if let Err(error) = file.write(cwd, |to| std::io::copy(&mut written, to).map(|_| ())) {
+                return (
+                    format!("Studio could not save {}: {error}", file.shown()),
+                    true,
+                );
+            }
+        }
+    }
+    match &plan.save_to {
+        Some(file) if !failed => {
+            let saved = &out[..out.len().min(RUN_OUTPUT_MAX)];
+            match file.write(cwd, |to| to.write_all(saved)) {
+                Ok(()) => text.push_str(&format!(
+                    "output saved to {} ({} bytes)\n",
+                    file.shown(),
+                    saved.len()
+                )),
+                Err(error) => return (format!("Studio could not save the output: {error}"), true),
+            }
+        }
         _ => text.push_str(&clip(&out)),
     }
     if !err.is_empty() {
@@ -623,37 +907,6 @@ pub fn expand_home(path: &str) -> PathBuf {
         (Some(rest), Some(home)) => home.join(rest),
         _ => PathBuf::from(path),
     }
-}
-
-#[cfg(unix)]
-fn private_dir(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-}
-
-/// On Windows the conversation's directory inherits the person's own profile permissions.
-#[cfg(not(unix))]
-fn private_dir(_dir: &Path) -> std::io::Result<()> {
-    Ok(())
-}
-
-/// Writes `path` with `mode` from the start, so a secret is never readable by others. On
-/// Windows the file inherits its folder's permissions, which are the person's own.
-fn write_file(path: &Path, text: &str, mode: u32) -> std::io::Result<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
-    let mut file = options.open(path)?;
-    // An existing file keeps its old mode on open; set it.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
-    file.write_all(text.as_bytes())
 }
 
 fn shell_quote(text: &str) -> String {
@@ -704,7 +957,16 @@ mod tests {
             "omnigraph-0.15",
             r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.15.0","http_contract":"0.15"}'; exit 0; }; exit 2"#,
         );
-        let home = CliHome::write(&dir, 1, "t", "knowledge", "agent-x", "main").unwrap();
+        let home = CliHome::write(
+            &dir,
+            &dir.join("private"),
+            1,
+            "t",
+            "knowledge",
+            "agent-x",
+            "main",
+        )
+        .unwrap();
         let wrapper = || std::fs::read_to_string(&home.command).unwrap();
         let choose =
             |candidates: Vec<PathBuf>| smol::block_on(choose_cli(&home, candidates, "0.13"));
@@ -755,9 +1017,15 @@ mod tests {
         let cwd = std::fs::canonicalize(&cwd).unwrap();
         let args = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         let check = |list: &[&str]| check_run_args(&args(list), &cwd, "knowledge");
+        let file = |parts: &[&str], output: bool| RunFile {
+            parts: parts.iter().map(|part| (*part).to_owned()).collect(),
+            output,
+        };
 
         assert_eq!(
-            check(&["query", "-e", "query q() { … }", "--json"]).unwrap(),
+            check(&["query", "-e", "query q() { … }", "--json"])
+                .unwrap()
+                .args,
             args(&[
                 "query",
                 "-e",
@@ -769,22 +1037,24 @@ mod tests {
                 "knowledge"
             ])
         );
-        // A graph the agent names stays; a relative file becomes an absolute path inside.
+        // A graph the agent names stays; a file is noted by its place in the working
+        // directory, to be staged when the run starts.
+        let load = check(&[
+            "load",
+            "--data",
+            "data/rows.jsonl",
+            "--mode",
+            "append",
+            "--graph",
+            "notes",
+        ])
+        .unwrap();
         assert_eq!(
-            check(&[
-                "load",
-                "--data",
-                "data/rows.jsonl",
-                "--mode",
-                "append",
-                "--graph",
-                "notes"
-            ])
-            .unwrap(),
+            load.args,
             args(&[
                 "load",
                 "--data",
-                &cwd.join("data/rows.jsonl").to_string_lossy(),
+                "data/rows.jsonl",
                 "--mode",
                 "append",
                 "--graph",
@@ -793,21 +1063,27 @@ mod tests {
                 "studio",
             ])
         );
+        assert_eq!(load.files, vec![(2, file(&["data", "rows.jsonl"], false))]);
+        // An absolute path inside the working directory is the same file.
+        let absolute = cwd.join("data/rows.jsonl");
+        let absolute = check(&["load", "--data", &absolute.to_string_lossy()]).unwrap();
+        assert_eq!(absolute.files, load.files);
         // `lint` checks against a saved schema file, offline: no server is added.
+        let lint = check(&["lint", "--query", "q.gq", "--schema=schema.pg", "--json"]).unwrap();
         assert_eq!(
-            check(&["lint", "--query", "q.gq", "--schema=schema.pg", "--json"]).unwrap(),
-            args(&[
-                "lint",
-                "--query",
-                &cwd.join("q.gq").to_string_lossy(),
-                "--schema",
-                &cwd.join("schema.pg").to_string_lossy(),
-                "--json",
-            ])
+            lint.args,
+            args(&["lint", "--query", "q.gq", "--schema", "schema.pg", "--json"])
+        );
+        assert_eq!(
+            lint.files,
+            vec![
+                (2, file(&["q.gq"], false)),
+                (4, file(&["schema.pg"], false))
+            ]
         );
         let out = check(&["blob", "get", "--out=data/picture.png"]).unwrap();
-        assert_eq!(out[2], "--out");
-        assert_eq!(out[3], cwd.join("data/picture.png").to_string_lossy());
+        assert_eq!(out.args[2], "--out");
+        assert_eq!(out.files, vec![(3, file(&["data", "picture.png"], true))]);
 
         for refused in [
             &["init", "--store", "x"][..],
@@ -818,8 +1094,8 @@ mod tests {
             &["mutate", "--as", "someone"],
             &["load", "--data", "/etc/passwd"],
             &["load", "--data", "../outside.jsonl"],
-            &["blob", "put", "--file", "escape"],
-            &["blob", "get", "--out", "missing/dir/x"],
+            &["load", "--data", "data/../../outside.jsonl"],
+            &["blob", "get", "--out", "."],
             &["lint", "--query", "q.gq"],
             &[
                 "lint",
@@ -834,6 +1110,177 @@ mod tests {
         ] {
             assert!(check(refused).is_err(), "{refused:?} was let through");
         }
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// The agent can change a part of a path into a link after the check: Studio stages each
+    /// file by handle, so a link is refused on the way in and replaced on the way out.
+    #[test]
+    fn a_runs_files_are_staged_without_following_links() {
+        let cwd = std::env::temp_dir().join(format!("studio-run-stage-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("studio-run-outside-{}", std::process::id()));
+        for dir in [&cwd, &outside] {
+            std::fs::remove_dir_all(dir).ok();
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(outside.join("secret"), "private").unwrap();
+        std::fs::write(cwd.join("rows.jsonl"), "{}\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), cwd.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&outside, cwd.join("linked")).unwrap();
+        let stage = Stage::new(&cwd).unwrap();
+        let input = |parts: &[&str]| RunFile {
+            parts: parts.iter().map(|part| (*part).to_owned()).collect(),
+            output: false,
+        };
+
+        let rows = input(&["rows.jsonl"]);
+        rows.copy_in(&cwd, &stage.path(0, &rows)).unwrap();
+        assert_eq!(std::fs::read(stage.path(0, &rows)).unwrap(), b"{}\n");
+        for link in [input(&["escape"]), input(&["linked", "secret"])] {
+            assert!(
+                link.copy_in(&cwd, &stage.path(1, &link)).is_err(),
+                "{link:?}"
+            );
+        }
+
+        // An output written through a link replaces the link; its target is left alone.
+        let out = RunFile {
+            parts: vec!["escape".into()],
+            output: true,
+        };
+        out.write(&cwd, |file| file.write_all(b"result")).unwrap();
+        assert_eq!(std::fs::read(outside.join("secret")).unwrap(), b"private");
+        assert_eq!(std::fs::read(cwd.join("escape")).unwrap(), b"result");
+        let through = RunFile {
+            parts: vec!["linked".into(), "out.json".into()],
+            output: true,
+        };
+        assert!(through.write(&cwd, |file| file.write_all(b"x")).is_err());
+        assert!(!outside.join("out.json").exists());
+
+        let path = stage.0.clone();
+        drop(stage);
+        assert!(!path.exists(), "the stage is removed with the run");
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// The agent can rewrite its wrapper and its home's config, but `omnigraph_run` runs outside
+    /// its sandbox: it starts the chosen CLI itself, with the private home, in a private folder,
+    /// and without Studio's own OmniGraph variables. Ending the conversation leaves a later one's
+    /// credentials in the same folder alone.
+    #[test]
+    fn a_run_starts_the_chosen_cli_with_its_private_home() {
+        let cwd = std::env::temp_dir().join(format!("studio-run-private-{}", std::process::id()));
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd = std::fs::canonicalize(&cwd).unwrap();
+        let private = cwd
+            .parent()
+            .unwrap()
+            .join(format!("studio-run-homes-{}", std::process::id()));
+        let home = CliHome::write(&cwd, &private, 1, "t", "knowledge", "agent/x", "main").unwrap();
+        let plan = || RunPlan {
+            args: vec!["version".into()],
+            files: Vec::new(),
+            save_to: None,
+        };
+        let (text, failed) = smol::block_on(run(&home, &cwd, plan()));
+        assert!(failed && text.contains("no omnigraph CLI"), "{text}");
+
+        let cli = cwd.join("fake-cli");
+        std::fs::write(&cli, "#!/bin/sh\npwd\nenv\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        home.use_cli(&cli).unwrap();
+        // What the agent may do in its own folder.
+        std::fs::write(&home.command, "#!/bin/sh\necho rewritten\n").unwrap();
+        std::fs::write(home.dir.join("config.yaml"), "servers: {}\n").unwrap();
+
+        let (text, failed) = smol::block_on(run(&home, &cwd, plan()));
+        assert!(!failed, "{text}");
+        assert!(!text.contains("rewritten"), "{text}");
+        assert!(
+            text.contains(&format!("OMNIGRAPH_HOME={}", home.private.display())),
+            "{text}"
+        );
+        assert!(!home.private.starts_with(&cwd));
+        let pwd = text.lines().nth(1).unwrap();
+        assert!(
+            Path::new(pwd).starts_with(std::fs::canonicalize(&home.private).unwrap()),
+            "{text}"
+        );
+        for line in text.lines().filter(|line| line.starts_with("OMNIGRAPH_")) {
+            assert!(line.starts_with("OMNIGRAPH_HOME="), "{line}");
+        }
+        assert!(
+            std::fs::read_to_string(home.private.join("config.yaml"))
+                .unwrap()
+                .contains("studio: { url: \"http://127.0.0.1:1\" }")
+        );
+        assert!(
+            check_run_args(
+                &[
+                    "load".into(),
+                    "--data".into(),
+                    ".studio/agent-x/config.yaml".into()
+                ],
+                &cwd,
+                "knowledge"
+            )
+            .is_err()
+        );
+
+        // A conversation started again on the branch writes its own token before this one
+        // ends: the new token stays.
+        let again = CliHome::write(&cwd, &private, 2, "u", "knowledge", "agent/x", "main").unwrap();
+        let held = home.private.clone();
+        drop(home);
+        assert!(!held.exists());
+        assert_eq!(
+            std::fs::read_to_string(again.dir.join("credentials")).unwrap(),
+            "[studio]\ntoken = u\n"
+        );
+        drop(again);
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::remove_dir_all(&private).ok();
+    }
+
+    /// A command that writes past the output cap is stopped, not left blocked on its pipe
+    /// until the 30-minute timeout.
+    #[test]
+    fn a_run_that_writes_too_much_is_stopped() {
+        let cwd = std::env::temp_dir().join(format!("studio-run-cap-{}", std::process::id()));
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let home = CliHome::write(
+            &cwd,
+            &cwd.join("private"),
+            1,
+            "t",
+            "knowledge",
+            "agent/x",
+            "main",
+        )
+        .unwrap();
+        let cli = cwd.join("loud-cli");
+        let bytes = RUN_OUTPUT_MAX + 4 * 1024 * 1024;
+        std::fs::write(
+            &cli,
+            format!("#!/bin/sh\nhead -c {bytes} /dev/zero\nsleep 600\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        home.use_cli(&cli).unwrap();
+        let plan = RunPlan {
+            args: vec!["export".into()],
+            files: Vec::new(),
+            save_to: None,
+        };
+        let started = std::time::Instant::now();
+        let (text, failed) = smol::block_on(run(&home, &cwd, plan));
+        assert!(failed && text.contains("was stopped"), "{text}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(60));
         std::fs::remove_dir_all(&cwd).ok();
     }
 
@@ -868,6 +1315,7 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let home = CliHome::write(
             &cwd,
+            &cwd.join("private"),
             49152,
             "abc123",
             "knowledge",
@@ -929,6 +1377,11 @@ mod tests {
             graph: "g".repeat(64),
             branch: "agent/20261013-101500".into(),
             base: "b".repeat(64),
+            cwd: cwd.clone(),
+            folder: ".studio/agent-20261013-101500".into(),
+            credentials: String::new(),
+            private: cwd.join("private/longest"),
+            cli: Default::default(),
         };
         for ready in [None, Some(true), Some(false)] {
             let length = crate::mcp::INSTRUCTIONS.len() + 2 + longest.instructions(ready).len();

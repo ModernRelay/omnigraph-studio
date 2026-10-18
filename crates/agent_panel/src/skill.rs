@@ -9,6 +9,8 @@
 
 use std::path::Path;
 
+use crate::confined::{Confined, Kind};
+
 /// The skill's folder name, which matches the `name` in its `SKILL.md`.
 pub const NAME: &str = "omnigraph-studio";
 
@@ -76,41 +78,47 @@ const FILES: &[(&str, &str)] = &[
 ];
 
 /// Writes the skill under `cwd` for every agent, replacing files that differ and removing files
-/// a previous Studio wrote that this one does not. Nothing outside the skill's folders changes.
+/// a previous Studio wrote that this one does not. Nothing outside the skill's folders changes:
+/// the folders are opened by handle, never through a link the agent left (`confined`).
 pub fn write(cwd: &Path) -> std::io::Result<()> {
+    let cwd = Confined::open(cwd)?;
     for root in ROOTS {
-        write_tree(&cwd.join(root).join(NAME))?;
+        write_tree(&cwd.dirs(root)?.dir(NAME)?)?;
     }
     Ok(())
 }
 
-fn write_tree(dir: &Path) -> std::io::Result<()> {
+fn write_tree(dir: &Confined) -> std::io::Result<()> {
     for (path, text) in FILES {
-        let target = dir.join(path);
-        if std::fs::read(&target).is_ok_and(|current| current == text.as_bytes()) {
+        let nested;
+        let (folder, name) = match path.rsplit_once('/') {
+            Some((parent, name)) => {
+                nested = dir.dirs(parent)?;
+                (&nested, name)
+            }
+            None => (dir, *path),
+        };
+        if folder.holds(name, text.as_bytes()) {
             continue;
         }
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&target, text)?;
+        folder.write(name, text.as_bytes(), 0o644)?;
     }
-    remove_stale(dir, dir)
+    remove_stale(dir, "")
 }
 
-/// Removes files under `dir` that are not in [`FILES`], without following links.
-fn remove_stale(root: &Path, dir: &Path) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        let kind = std::fs::symlink_metadata(&path)?.file_type();
-        if kind.is_dir() {
-            remove_stale(root, &path)?;
-            continue;
-        }
-        let relative = path.strip_prefix(root).unwrap_or(&path);
-        let known = FILES.iter().any(|(name, _)| Path::new(name) == relative);
-        if !known {
-            std::fs::remove_file(&path)?;
+/// Removes files under `dir` that are not in [`FILES`]; `prefix` is `dir`'s path in the skill.
+fn remove_stale(dir: &Confined, prefix: &str) -> std::io::Result<()> {
+    for (name, kind) in dir.entries()? {
+        let relative = match prefix {
+            "" => name.to_string_lossy().into_owned(),
+            prefix => format!("{prefix}/{}", name.to_string_lossy()),
+        };
+        match (kind, name.to_str()) {
+            (Kind::Dir, Some(folder)) => remove_stale(&dir.dir(folder)?, &relative)?,
+            _ if FILES.iter().any(|(known, _)| *known == relative) => {}
+            // A folder whose name is not text holds nothing Studio wrote; it is left alone.
+            (Kind::Dir, None) => {}
+            (Kind::Other, _) => dir.remove(&name)?,
         }
     }
     Ok(())
@@ -188,5 +196,37 @@ mod tests {
         // A second write changes nothing.
         write(&cwd).unwrap();
         std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// An agent can turn the skill's folder into a link to anywhere, its home included:
+    /// Studio refuses to write through it, and removes nothing there.
+    #[cfg(unix)]
+    #[test]
+    fn a_skill_folder_linked_elsewhere_is_not_written_through() {
+        let cwd = std::env::temp_dir().join(format!("studio-skill-link-{}", std::process::id()));
+        let elsewhere =
+            std::env::temp_dir().join(format!("studio-skill-elsewhere-{}", std::process::id()));
+        for dir in [&cwd, &elsewhere] {
+            std::fs::remove_dir_all(dir).ok();
+        }
+        std::fs::create_dir_all(cwd.join(".claude/skills")).unwrap();
+        std::fs::create_dir_all(elsewhere.join("notes")).unwrap();
+        std::fs::write(elsewhere.join("notes/diary.md"), "mine").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, cwd.join(".claude/skills").join(NAME)).unwrap();
+
+        assert!(write(&cwd).is_err());
+        assert_eq!(
+            std::fs::read_to_string(elsewhere.join("notes/diary.md")).unwrap(),
+            "mine"
+        );
+        assert!(!elsewhere.join("SKILL.md").exists());
+        // A link higher up is refused the same way.
+        std::fs::remove_file(cwd.join(".claude/skills").join(NAME)).unwrap();
+        std::fs::remove_dir_all(cwd.join(".claude")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, cwd.join(".claude")).unwrap();
+        assert!(write(&cwd).is_err());
+        assert!(!elsewhere.join("skills").exists());
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::remove_dir_all(&elsewhere).ok();
     }
 }

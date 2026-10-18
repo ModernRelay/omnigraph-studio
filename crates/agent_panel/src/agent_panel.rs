@@ -5,6 +5,7 @@
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/011-agent-panel/plan.md`.
 
 mod cli_home;
+mod confined;
 mod connection;
 mod gateway;
 mod gateway_rules;
@@ -17,7 +18,7 @@ mod skill;
 mod socket;
 mod tools;
 
-pub use panel::{AgentPanel, PRESETS};
+pub use panel::PRESETS;
 pub use socket::proxy;
 
 use gpui::{App, AppContext as _};

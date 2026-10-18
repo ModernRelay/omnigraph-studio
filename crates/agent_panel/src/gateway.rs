@@ -9,7 +9,7 @@
 //! before anything is sent. One request per connection; the CLI opens a new one each time.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::channel::{mpsc, oneshot};
 use futures::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -26,6 +26,8 @@ use crate::gateway_rules::{self, Incoming, Sandbox, Verdict, WriteSummary};
 const MAX_HEAD: usize = 64 * 1024;
 /// The most a request body may take; a larger load is refused with 413.
 pub const MAX_BODY: usize = 64 * 1024 * 1024;
+/// How long a request may take to arrive whole, its body included.
+const READ_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
 /// The most a write's answer may take before the gateway stops reading it for the card.
 const MAX_WRITE_ANSWER: usize = 8 * 1024 * 1024;
 /// Request headers passed on to the server; the gateway sets the token and contract itself.
@@ -41,8 +43,6 @@ const FORWARDED_HEADERS: &[&str] = &[
 /// What the gateway tells the conversation.
 #[derive(Debug)]
 pub enum GatewayEvent {
-    /// The agent's CLI reached the gateway with this conversation's token.
-    Reached,
     /// A write for the agent's branch waits for `decide` (true sends it).
     Write {
         id: u64,
@@ -51,6 +51,9 @@ pub enum GatewayEvent {
     },
     /// How a forwarded write ended (constitution III).
     Finished { id: u64, outcome: Seen },
+    /// The CLI stopped waiting before the write was decided (its command timed out or was
+    /// stopped): nothing was sent, and nothing will be.
+    Abandoned { id: u64 },
 }
 
 /// A forwarded write's outcome, as the gateway saw the server's answer.
@@ -80,7 +83,7 @@ impl Gateway {
         let listener = TcpListener::try_from(listener)?;
         Ok(Self {
             port,
-            token: random_token()?,
+            token: crate::confined::random_hex(32)?,
             listener: Some(listener),
         })
     }
@@ -98,7 +101,6 @@ impl Gateway {
             token: self.token.clone(),
             events,
             next_id: AtomicU64::new(0),
-            reached: AtomicBool::new(false),
         });
         async move {
             let Some(listener) = listener else { return };
@@ -120,14 +122,6 @@ struct Shared {
     token: String,
     events: mpsc::UnboundedSender<GatewayEvent>,
     next_id: AtomicU64,
-    reached: AtomicBool,
-}
-
-/// 32 random bytes as hex.
-fn random_token() -> std::io::Result<String> {
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).map_err(std::io::Error::other)?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// One request, as read off the connection.
@@ -164,7 +158,18 @@ enum ReadFailure {
 }
 
 async fn serve_connection(mut stream: TcpStream, shared: Arc<Shared>) {
-    let request = match read_request(&mut stream).await {
+    // A local process that opens a connection and sends slowly, or nothing, holds it no longer
+    // than this.
+    let read = {
+        let read = futures::FutureExt::fuse(read_request(&mut stream, &shared.token));
+        let late = futures::FutureExt::fuse(smol::Timer::after(READ_WITHIN));
+        futures::pin_mut!(read, late);
+        futures::select! {
+            read = read => read,
+            _ = late => Err(ReadFailure::Gone),
+        }
+    };
+    let request = match read {
         Ok(request) => request,
         Err(ReadFailure::Gone) => return,
         Err(ReadFailure::Answer(status, code, message)) => {
@@ -189,23 +194,10 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
         })
         .unwrap_or_default();
     // The CLI probes `/healthz` with no token and no contract header before every request.
-    if matches!(request.method.as_str(), "GET" | "HEAD") && path == "/healthz" {
+    // Every other request carries the session's token, checked before its body was read.
+    if is_health(&request.method, &path) {
         let body = if request.method == "HEAD" { "" } else { "ok" };
         write_simple(&mut stream, 200, "text/plain", body.as_bytes()).await;
-        return;
-    }
-    let authorized = request
-        .header("authorization")
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|token| same(token.as_bytes(), shared.token.as_bytes()));
-    if !authorized {
-        answer(
-            &mut stream,
-            401,
-            "unauthorized",
-            "Studio: this token is not the one Studio wrote for this conversation.",
-        )
-        .await;
         return;
     }
     let contracts = request.headers_named(CONTRACT_HEADER);
@@ -227,9 +219,6 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
         )
         .await;
         return;
-    }
-    if !shared.reached.swap(true, Ordering::Relaxed) {
-        shared.events.unbounded_send(GatewayEvent::Reached).ok();
     }
     let json: Option<Value> = if request
         .header("content-type")
@@ -281,7 +270,36 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
                 .await;
                 return;
             }
-            if decision.await != Ok(true) {
+            // The person may decide after the CLI has given up (its shell's two-minute timeout):
+            // a write approved then would land with the agent told it failed. A closed
+            // connection while waiting ends the write unsent.
+            let gone = {
+                let mut watch = stream.clone();
+                async move {
+                    let mut byte = [0u8; 1];
+                    while matches!(
+                        futures::AsyncReadExt::read(&mut watch, &mut byte).await,
+                        Ok(1..)
+                    ) {}
+                }
+            };
+            let (decision, gone) = (
+                futures::FutureExt::fuse(decision),
+                futures::FutureExt::fuse(gone),
+            );
+            futures::pin_mut!(decision, gone);
+            let decided = futures::select! {
+                decided = decision => Some(decided),
+                () = gone => None,
+            };
+            let Some(decided) = decided else {
+                shared
+                    .events
+                    .unbounded_send(GatewayEvent::Abandoned { id })
+                    .ok();
+                return;
+            };
+            if decided != Ok(true) {
                 answer(
                     &mut stream,
                     403,
@@ -403,7 +421,14 @@ fn count_of(json: &Value, affected: &str, loaded: &str) -> i64 {
         .unwrap_or(0)
 }
 
-async fn read_request(stream: &mut TcpStream) -> Result<Request, ReadFailure> {
+/// The health probe, which carries no token.
+fn is_health(method: &str, path: &str) -> bool {
+    matches!(method, "GET" | "HEAD") && path == "/healthz"
+}
+
+/// Reads one request. Its token is checked once its headers are in, before its body (up to
+/// [`MAX_BODY`]) is read: only the conversation's CLI makes Studio read that much.
+async fn read_request(stream: &mut TcpStream, token: &str) -> Result<Request, ReadFailure> {
     let mut buffer = Vec::with_capacity(8 * 1024);
     let mut chunk = [0u8; 8 * 1024];
     let head_end = loop {
@@ -450,6 +475,19 @@ async fn read_request(stream: &mut TcpStream) -> Result<Request, ReadFailure> {
             )
         })
         .collect();
+    let path = target.split('?').next().unwrap_or_default();
+    let authorized = headers
+        .iter()
+        .find(|(name, _)| name == "authorization")
+        .and_then(|(_, value)| value.strip_prefix("Bearer "))
+        .is_some_and(|sent| same(sent.as_bytes(), token.as_bytes()));
+    if !authorized && !is_health(&method, path) {
+        return Err(ReadFailure::Answer(
+            401,
+            "unauthorized",
+            "Studio: this token is not the one Studio wrote for this conversation.".into(),
+        ));
+    }
     let mut rest = buffer[head_end..].to_vec();
     let chunked = headers.iter().any(|(name, value)| {
         name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked")
@@ -458,19 +496,8 @@ async fn read_request(stream: &mut TcpStream) -> Result<Request, ReadFailure> {
         .iter()
         .find(|(name, _)| name == "content-length")
         .and_then(|(_, value)| value.parse::<usize>().ok());
-    let too_large = || {
-        ReadFailure::Answer(
-            413,
-            "bad_request",
-            format!(
-                "Studio: a request through Studio may carry at most {} MiB. Load in smaller \
-                 parts. Nothing was sent.",
-                MAX_BODY / (1024 * 1024)
-            ),
-        )
-    };
     let body = if chunked {
-        read_chunked(stream, rest, &chunk).await?
+        read_chunked(stream, rest).await?
     } else if let Some(length) = length {
         if length > MAX_BODY {
             return Err(too_large());
@@ -498,11 +525,23 @@ async fn read_request(stream: &mut TcpStream) -> Result<Request, ReadFailure> {
     })
 }
 
+/// The refusal of a body past [`MAX_BODY`].
+fn too_large() -> ReadFailure {
+    ReadFailure::Answer(
+        413,
+        "bad_request",
+        format!(
+            "Studio: a request through Studio may carry at most {} MiB. Load in smaller parts. \
+             Nothing was sent.",
+            MAX_BODY / (1024 * 1024)
+        ),
+    )
+}
+
 /// Decodes a chunked body, at most [`MAX_BODY`].
 async fn read_chunked(
     stream: &mut TcpStream,
     mut pending: Vec<u8>,
-    _scratch: &[u8],
 ) -> Result<Vec<u8>, ReadFailure> {
     let mut body = Vec::new();
     let mut chunk = [0u8; 8 * 1024];
@@ -538,16 +577,10 @@ async fn read_chunked(
             )
         })?;
         pending.drain(..line_end + 2);
-        if body.len() + size > MAX_BODY {
-            return Err(ReadFailure::Answer(
-                413,
-                "bad_request",
-                format!(
-                    "Studio: a request through Studio may carry at most {} MiB. Load in smaller \
-                     parts. Nothing was sent.",
-                    MAX_BODY / (1024 * 1024)
-                ),
-            ));
+        // Compared without adding to `size`, which the request chose and may be near the
+        // largest number.
+        if size > MAX_BODY - body.len() {
+            return Err(too_large());
         }
         // The data and its CRLF; a zero size ends the body after the trailer's CRLF.
         while pending.len() < size + 2 {
@@ -853,6 +886,13 @@ mod tests {
             assert_eq!(status, 401);
             assert!(head.contains("omnigraph-http-api: 0.13"));
             assert!(body.contains("\"code\":\"unauthorized\""), "{body}");
+            // Its body is never waited for: one that says it is large, and never comes, is
+            // answered at once.
+            let declared = "POST /graphs/knowledge/load HTTP/1.1\r\nhost: x\r\n\
+                authorization: Bearer wrong\r\ncontent-length: 50000000\r\n\r\n"
+                .to_owned();
+            let (status, _, _) = call(port, declared).await;
+            assert_eq!(status, 401);
             let (status, _, body) =
                 call(port, post("/graphs/knowledge/query", &token, None, "{}")).await;
             assert_eq!(status, 400);
@@ -875,7 +915,6 @@ mod tests {
             .await;
             assert_eq!(status, 200);
             assert_eq!(body, r#"{"rows":[{"n":200}]}"#);
-            assert!(matches!(events.next().await, Some(GatewayEvent::Reached)));
             {
                 let seen = seen.lock().unwrap();
                 let (method, uri, auth, contract, body) = &seen[0];
@@ -956,6 +995,26 @@ mod tests {
             );
             assert_eq!(seen.lock().unwrap().len(), 2);
 
+            // The CLI gives up before the person decides (its command timed out): the write is
+            // never sent, even when allowed afterwards.
+            let mut hung_up = smol::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            hung_up
+                .write_all(post("/graphs/knowledge/mutate", &token, Some("0.13"), write).as_bytes())
+                .await
+                .unwrap();
+            let Some(GatewayEvent::Write { decide, id, .. }) = events.next().await else {
+                panic!("no write event")
+            };
+            drop(hung_up);
+            let Some(GatewayEvent::Abandoned { id: abandoned }) = events.next().await else {
+                panic!("the gateway did not see the CLI go")
+            };
+            assert_eq!(abandoned, id);
+            assert!(decide.send(true).is_err(), "nobody waits for the decision");
+            assert_eq!(seen.lock().unwrap().len(), 2, "nothing was sent");
+
             // A chunked body is read whole before the rules see it.
             let chunked = format!(
                 "POST /graphs/knowledge/query HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {token}\r\n\
@@ -965,6 +1024,17 @@ mod tests {
             let (status, _, _) = call(port, chunked).await;
             assert_eq!(status, 200);
             assert_eq!(seen.lock().unwrap()[2].4, r#"{"a":1}"#);
+
+            // A chunk size near the largest number is refused, not added to.
+            let huge = format!(
+                "POST /graphs/knowledge/query HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {token}\r\n\
+                 {CONTRACT_HEADER}: 0.13\r\ncontent-type: application/json\r\n\
+                 transfer-encoding: chunked\r\n\r\n1\r\n{{\r\n{:x}\r\n",
+                usize::MAX
+            );
+            let (status, _, body) = call(port, huge).await;
+            assert_eq!(status, 413, "{body}");
+            assert_eq!(seen.lock().unwrap().len(), 3, "nothing was sent");
         });
     }
 }
@@ -1019,8 +1089,16 @@ mod end_to_end {
         std::fs::create_dir_all(&cwd).unwrap();
 
         let mut gateway = Gateway::bind().unwrap();
-        let home =
-            CliHome::write(&cwd, gateway.port, &gateway.token, &graph, &branch, "main").unwrap();
+        let home = CliHome::write(
+            &cwd,
+            &cwd.join("private"),
+            gateway.port,
+            &gateway.token,
+            &graph,
+            &branch,
+            "main",
+        )
+        .unwrap();
         let (events_tx, mut events) = mpsc::unbounded();
         let serve = gateway.serve(
             client,
@@ -1047,7 +1125,7 @@ mod end_to_end {
                         let summary = summaries.remove(&id).unwrap_or_default();
                         kept.lock().unwrap().push((summary, outcome));
                     }
-                    GatewayEvent::Reached => {}
+                    GatewayEvent::Abandoned { .. } => {}
                 }
             }
         });
@@ -1087,18 +1165,20 @@ mod end_to_end {
             "--json",
         ]
         .map(str::to_owned);
-        let checked = cli_home::check_run_args(&read, &cwd, &graph).unwrap();
-        let (text, failed) = smol::block_on(cli_home::run(&home, &cwd, checked.clone(), None));
+        let mut plan = cli_home::check_run_args(&read, &cwd, &graph).unwrap();
+        let (text, failed) = smol::block_on(cli_home::run(&home, &cwd, plan.clone()));
         assert!(
             !failed && text.starts_with("exit 0") && text.contains("\"rows\""),
             "{text}"
         );
-        let saved = cli_home::within(&cwd, "count.json", true).unwrap();
-        let (text, failed) =
-            smol::block_on(cli_home::run(&home, &cwd, checked, Some(saved.clone())));
+        plan.save_to = Some(cli_home::RunFile {
+            parts: cli_home::inside(&cwd, "count.json").unwrap(),
+            output: true,
+        });
+        let (text, failed) = smol::block_on(cli_home::run(&home, &cwd, plan));
         assert!(!failed && text.contains("output saved to"), "{text}");
         assert!(
-            std::fs::read_to_string(&saved)
+            std::fs::read_to_string(cwd.join("count.json"))
                 .unwrap()
                 .contains("\"rows\"")
         );

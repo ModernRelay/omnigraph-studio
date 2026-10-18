@@ -215,9 +215,18 @@ session (the workspace's "Agent CLI: … committed" notice) and the agent branch
 
 Codex's default sandbox blocks loopback, so its CLI calls fail with "server discovery connection
 failed". For that agent Studio runs the CLI itself: `omnigraph_run` takes the arguments after
-`omnigraph` as a list, runs the conversation's wrapper with them (no shell, the agent's working
-directory, killed with the call), and returns the exit code, standard output and standard error.
-The same gateway, rules and cards apply, because the wrapper still speaks to the gateway.
+`omnigraph` as a list, runs the conversation's chosen CLI with them (no shell, killed with the
+call), and returns the exit code, standard output and standard error. The same gateway, rules
+and cards apply, because the CLI still speaks to the gateway.
+
+- The run is outside the agent's sandbox, and the agent can rewrite anything in its working
+  directory, its wrapper and `.studio/<branch>/config.yaml` included. So Studio never runs the
+  wrapper or reads that home: it starts the chosen CLI itself, with `OMNIGRAPH_HOME` set to a
+  copy of the conversation's config and credentials in a private folder outside every working
+  directory (`<data dir>/agent/homes/`, `0700`), with every `OMNIGRAPH_*` variable of Studio's
+  own removed, and with that folder as its current directory. Run files are staged there too,
+  not in the temporary directory, which a sandboxed agent may write. The folder goes with the
+  conversation.
 
 - Studio adds `--server studio` and `--graph <graph>` unless the arguments name them, and
   refuses `--server`, `--store`, `--uri`, `--cluster`, `--profile`, `--direct`, `--managed`,
@@ -228,15 +237,22 @@ The same gateway, rules and cards apply, because the wrapper still speaks to the
   only, no server added): 0.13 refuses `lint` with `--server`, and a positional storage URI
   would make Studio open storage itself.
 - Files given to `--query`, `--data`, `--params-file`, `--file`, `--out` and `--schema`, and
-  `save_to`, must
-  resolve inside the working directory, so the agent can process them in its own sandbox.
+  `save_to`, must be inside the working directory (relative, or absolute under it, never
+  through `..`, and never under `.studio`, which holds Studio's files for the conversation), so
+  the agent can process them in its own sandbox. Studio opens only regular files there, without
+  waiting on a pipe. The CLI runs outside that
+  sandbox, so it never opens them there: Studio copies each input into a private folder before
+  the run and writes each output back after it, opening every folder on the way by handle and
+  never through a link (`agent_panel::confined`). A link the agent makes between the check and
+  the run is refused on the way in and replaced, not followed, on the way out. The skill,
+  `AGENTS.md` and the conversation's CLI home are written the same way.
 - Output over 100 KB is cut with a note to use `save_to`; standard output is bounded at 64 MiB,
   and a run at 30 minutes.
 - A call made before Studio has chosen a CLI waits for that choice instead of failing.
 - A call answers within four minutes. A command still running then (a large load, or a write
   waiting for the person) answers with its run number and keeps going; `omnigraph_run` with
   `wait` set to that number waits for its outcome, again for up to four minutes. A run's
-  outcome is returned once; a new session kills runs still going.
+  outcome is returned once; a new session, or the agent stopping, kills runs still going.
 
 Giving Codex network access (a codex-acp mode with network) lets its shell reach the gateway
 too, and opens all network, so it stays the person's choice. E24 would let the sandbox allow one
@@ -299,7 +315,7 @@ same write would split the cards and the rules.
 | Studio tests each CLI once against the gateway | Map package versions to contracts | The package version does not determine the contract; a real request does, until E23 |
 | Codex gets network only when the person allows it | Always enable it; always refuse the CLI to Codex | Enabling it opens all network; refusing it gives up the CLI where the person accepts the risk |
 | The CLI is the only graph tool; `omnigraph_run` runs it for agents without network | Keep spec 011's schema, query and propose tools beside the CLI | The CLI covers every served route and composes; the old tools were a subset with their own write path. One path keeps one set of rules and cards |
-| `omnigraph_run` takes an argument list and runs the wrapper without a shell | A command string run by a shell | A list cannot smuggle a second command or a redirect, and the allowlist and file checks read the same arguments the CLI gets |
+| `omnigraph_run` takes an argument list and runs the chosen CLI without a shell, from a private home | A command string run by a shell; running the agent's wrapper | A list cannot smuggle a second command or a redirect, and the allowlist and file checks read the same arguments the CLI gets |
 | Long calls report MCP progress and answer within four minutes with a run number | Raise the agent's timeout | A timeout is the agent's setting and differs by agent. codex-acp drops a per-server `tool_timeout_sec`; setting it means declaring the server in `CODEX_CONFIG` instead of ACP `mcpServers`. A run number works for every agent |
 
 ## Deferred
@@ -351,6 +367,8 @@ CLI is the one they trust).
 | 2026-10-13 | `lint` runs offline under the conversation's home | `omnigraph` 0.13.0 with a home whose default server is unreachable | `lint --query --schema` reported the type error; `lint --server` is refused by the CLI |
 | 2026-10-13 | A slow run answers with its number and finishes later | `agent_panel` `a_slow_run_answers_with_its_number_and_keeps_going` | No outcome within the limit, the number and the `wait` call in the answer, then the outcome on a later wait |
 | 2026-10-13 | `omnigraph_run` checks its arguments | `agent_panel` `run_arguments_stay_on_the_gateway_and_in_the_working_directory` | `--server studio` and the graph added; other servers, stores, profiles, `--as` and unknown commands refused; files outside the working directory refused, including through `..` and symlinks |
+| 2026-10-18 | Studio writes into the working directory without following links | `agent_panel` `a_runs_files_are_staged_without_following_links`, `a_skill_folder_linked_elsewhere_is_not_written_through`, `confined::writes_stay_inside_and_links_are_not_followed` | A linked input is refused; an output written over a link replaces the link and leaves its target; a skill folder or `.claude` linked elsewhere is refused and nothing there is written or removed |
+| 2026-10-18 | `omnigraph_run` runs only what Studio chose | `agent_panel` `a_run_starts_the_chosen_cli_with_its_private_home`, `confined::writes_stay_inside_and_links_are_not_followed`, `socket::lines_are_read_whole_and_a_line_past_the_cap_ends_the_connection`, `gateway` chunked-size case | With the wrapper and the home's config rewritten, the run started the chosen CLI with the private home as `OMNIGRAPH_HOME` and current directory and no other `OMNIGRAPH_*` variable; `.studio` paths refused; a pipe refused without waiting; a later conversation's token kept when the earlier one ended; a socket line past the cap and a chunk size near `usize::MAX` refused |
 | 2026-10-13 | `omnigraph_run` reads and writes through the real gateway | The ignored end-to-end test, extended to call `cli_home::run` | A query inline and with `save_to`, the file in the working directory |
 | 2026-10-13 | A long call reports progress until it answers | `agent_panel` `a_long_call_reports_growing_progress_until_it_answers` | Progress notifications with the client's token and growing values, then the answer |
 | 2026-10-13 | The instructions fit Claude Code's cut | `a_conversation_home_holds_its_config_token_and_wrapper` | Server and conversation instructions within 2,048 characters for a CLI found, not yet found and missing, with a 120-character data directory |
@@ -360,6 +378,14 @@ CLI is the one they trust).
 
 
 ## Corrections
+
+- 2026-10-18 · `omnigraph_run` ran the conversation's wrapper from the agent's working
+  directory, with Studio's environment. The agent can rewrite that script and its home's config,
+  so a sandboxed agent could have run any command outside its sandbox with the person's
+  OmniGraph tokens, or pointed the CLI at another address. The run now starts the chosen CLI
+  from a private home, without Studio's OmniGraph variables. Ending a conversation also removed
+  the token file of a conversation started again on the same branch; it now removes only its
+  own.
 
 - 2026-10-14 · A conversation opened while the person's server was slow got Homebrew's
   omnigraph 0.11.0 with ~/.local/bin's 0.13.0 installed, and a notice that no CLI spoke 0.13:

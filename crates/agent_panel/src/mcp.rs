@@ -28,6 +28,9 @@ pub enum Incoming {
         arguments: Value,
         progress: Option<Value>,
     },
+    /// The client cancelled its call `id` (`notifications/cancelled`): send nothing, and stop
+    /// what the call started.
+    Cancelled { id: Value },
     /// A notification or a response: send nothing.
     Nothing,
 }
@@ -43,6 +46,11 @@ pub fn handle(line: &str, conversation: &str) -> Incoming {
         return Incoming::Nothing;
     };
     let Some(id) = message.get("id").cloned() else {
+        if method == "notifications/cancelled"
+            && let Some(id) = message.pointer("/params/requestId")
+        {
+            return Incoming::Cancelled { id: id.clone() };
+        }
         return Incoming::Nothing;
     };
     let params = message.get("params").cloned().unwrap_or(Value::Null);
@@ -204,6 +212,14 @@ mod tests {
         assert_eq!(
             handle(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#, ""),
             Incoming::Nothing
+        );
+        // A cancelled call is named, so what it started stops.
+        assert_eq!(
+            handle(
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":8,"reason":"timeout"}}"#,
+                ""
+            ),
+            Incoming::Cancelled { id: json!(8) }
         );
         let Incoming::Reply(reply) =
             handle(r#"{"jsonrpc":"2.0","id":4,"method":"resources/list"}"#, "")

@@ -88,6 +88,8 @@ log = "0.4"
 getrandom = "0.3"
 httparse = "1"
 percent-encoding = "2"
+# Opening directories by handle, for files written into a directory an agent also writes.
+rustix = { version = "1.1", features = ["fs"] }
 # The Agent Client Protocol at the version Zed v1.23.2 pins; stable v1 only (spec 011).
 agent-client-protocol = "=2.2.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

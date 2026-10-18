@@ -38,7 +38,7 @@ use crate::gateway_rules::{Sandbox, WriteSummary};
 use crate::host::{AgentLaunch, HostCommand, HostEvent, Opened, SessionLaunch};
 use crate::sessions::{AgentSessions, Live, SessionRecord};
 use crate::socket::{ToolRequest, ToolSocket};
-use crate::tools::ToolCall;
+use crate::tools::{Adapter, StudioTool, ToolCall};
 
 /// Presets offered when no agent is set: the ACP crate's own preset commands.
 pub const PRESETS: &[(&str, &[&str])] = &[
@@ -53,7 +53,7 @@ pub const PRESETS: &[(&str, &[&str])] = &[
 ];
 
 const UNKNOWN_OUTCOME: &str = "The server did not confirm this change. It was not retried; \
-check the branch history before proposing it again.";
+check the branch history before the agent tries it again.";
 
 /// Opens the agent for the workspace's graph: an agent tab already open (the shown one first),
 /// else the graph's last conversation with the agent, else a new one.
@@ -158,9 +158,9 @@ enum Decision {
 enum ProposalState {
     Waiting(oneshot::Sender<Decision>),
     Running,
-    /// The commit id, or `None` when the mutation matched nothing, and what changed.
+    /// The commit it made, and what changed. A write that made none is `Done`.
     Committed {
-        commit: Option<String>,
+        commit: String,
         nodes: i64,
         edges: i64,
     },
@@ -180,6 +180,12 @@ struct Proposal {
     state: ProposalState,
 }
 
+/// An `omnigraph_run` under way or done, and the stop that kills its command.
+struct CliRun {
+    task: Shared<Task<(String, bool)>>,
+    stop: Option<oneshot::Sender<()>>,
+}
+
 struct PermissionCard {
     title: String,
     options: Vec<PermissionOption>,
@@ -197,6 +203,8 @@ enum Entry {
         status: ToolCallStatus,
         /// The arguments the agent called it with, as it reported them.
         input: Option<Value>,
+        /// Which of Studio's tools it is, by what the agent's adapter said when it was called.
+        studio: Option<StudioTool>,
     },
     Plan(Vec<(String, PlanEntryStatus)>),
     Permission(PermissionCard),
@@ -225,6 +233,69 @@ enum Block {
         lead: bool,
     },
     Exited,
+}
+
+/// The thread's entries, and what each shows folded to a number, kept as they change: a
+/// streamed token rehashes the entry it lands in, not the whole conversation (a tool's input
+/// can hold a whole file). Every way to change an entry marks it, so none goes stale.
+#[derive(Default)]
+struct Entries {
+    list: Vec<Entry>,
+    hashes: Vec<u64>,
+    /// The first entry whose hash may be stale.
+    stale_from: usize,
+}
+
+impl std::ops::Deref for Entries {
+    type Target = [Entry];
+
+    fn deref(&self) -> &[Entry] {
+        &self.list
+    }
+}
+
+impl Entries {
+    fn push(&mut self, entry: Entry) {
+        self.list.push(entry);
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut Entry> {
+        self.stale_from = self.stale_from.min(index);
+        self.list.get_mut(index)
+    }
+
+    fn last_mut(&mut self) -> Option<&mut Entry> {
+        let last = self.list.len().checked_sub(1)?;
+        self.get_mut(last)
+    }
+
+    /// Every entry, to change any of them.
+    fn iter_mut(&mut self) -> std::slice::IterMut<'_, Entry> {
+        self.stale_from = 0;
+        self.list.iter_mut()
+    }
+
+    fn clear(&mut self) {
+        self.list.clear();
+        self.hashes.clear();
+        self.stale_from = 0;
+    }
+
+    /// Brings the hashes up to the entries.
+    fn rehash(&mut self) {
+        self.hashes.truncate(self.stale_from.min(self.list.len()));
+        for entry in &self.list[self.hashes.len()..] {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            hash_entry(entry, &mut hasher);
+            self.hashes.push(std::hash::Hasher::finish(&hasher));
+        }
+        self.stale_from = self.list.len();
+    }
+
+    /// What entry `index` shows, as of the last [`Entries::rehash`].
+    fn hash(&self, index: usize) -> u64 {
+        self.hashes.get(index).copied().unwrap_or_default()
+    }
 }
 
 /// Feeds what an entry shows to `hasher` (`AgentPanel::fingerprint`).
@@ -384,12 +455,16 @@ pub struct AgentPanel {
     /// block grows then.
     _markdown_watch: std::collections::HashMap<usize, Subscription>,
     state: State,
-    entries: Vec<Entry>,
+    entries: Entries,
     branch: Option<AgentBranch>,
     always_allow: bool,
+    /// The adapter the agent runs as, which says which of its tool calls are Studio's.
+    adapter: Adapter,
     host: Option<Host>,
-    /// A prompt sent before the agent was ready, sent once it is.
-    queued: Option<String>,
+    /// The agent comes back after it stopped, with the conversation on screen: when it replays
+    /// the conversation (`session/load`), the replay replaces what is shown instead of adding
+    /// to it.
+    replace_on_replay: bool,
     /// The conversation this tab holds: the one it loads before the agent answers, then the one
     /// the agent opened. `None` starts a new one.
     session_id: Option<String>,
@@ -415,9 +490,9 @@ pub struct AgentPanel {
     /// `omnigraph_run` calls made while Studio looks, answered once it knows.
     cli_waiting: Vec<oneshot::Sender<()>>,
     /// CLI runs whose outcome has not reached the agent yet, by run number. A run outlives the
-    /// call that started it when it takes longer than `RUN_ANSWER_WITHIN`; dropping it (a new
-    /// session) kills the command.
-    runs: std::collections::HashMap<u64, Shared<Task<(String, bool)>>>,
+    /// call that started it when it takes longer than `RUN_ANSWER_WITHIN`. A run stops (its
+    /// command killed) when its call is cancelled, at Stop and with a new session.
+    runs: std::collections::HashMap<u64, CliRun>,
     next_run: u64,
     /// The card of each write the gateway forwards, by the gateway's id: the entry, whether
     /// the write creates the agent's branch, and its summary.
@@ -537,12 +612,13 @@ impl AgentPanel {
             shown_blocks: Vec::new(),
             _markdown_watch: std::collections::HashMap::new(),
             state: State::Setup,
-            entries: Vec::new(),
+            entries: Entries::default(),
             markdown: std::collections::HashMap::new(),
             branch: None,
             always_allow: false,
+            adapter: Adapter::Other,
             host: None,
-            queued: None,
+            replace_on_replay: false,
             session_id,
             failed: false,
             cwd: None,
@@ -672,19 +748,19 @@ impl AgentPanel {
         let (gateway_tx, mut gateway_rx) = mpsc::unbounded::<GatewayEvent>();
         self.cli_ready = None;
         self.cli_waiting.clear();
+        self.stop_runs();
         self.runs.clear();
         self.gateway_cards.clear();
         let gateway = Gateway::bind().and_then(|mut gateway| {
             let home = CliHome::write(
                 &cwd,
+                &crate::sessions::private_homes(),
                 gateway.port,
                 &gateway.token,
                 &graph,
                 &agent_branch,
                 &agent_base,
             )?;
-            cli_home::write_agents_md(&cwd, &graph)?;
-            crate::skill::write(&cwd)?;
             let serve = gateway.serve(
                 self.session.read(cx).gateway_client(cx),
                 Sandbox {
@@ -710,6 +786,18 @@ impl AgentPanel {
                 (None, None)
             }
         };
+        // The shared rules and the skill help the agent; without them it still has the CLI.
+        if let Err(error) =
+            cli_home::write_agents_md(&cwd, &graph).and_then(|()| crate::skill::write(&cwd))
+        {
+            self.entries.push(Entry::Notice {
+                text: format!(
+                    "Studio could not write AGENTS.md and the omnigraph-studio skill for the \
+                     agent ({error}); it can still reach the graph."
+                ),
+                error: true,
+            });
+        }
         let instructions = cli_home
             .as_ref()
             .map(|home| home.instructions(None))
@@ -813,10 +901,12 @@ impl AgentPanel {
 
     fn stop_host(&mut self) {
         self.host = None;
+        // No agent is left to take a run's outcome.
+        self.stop_runs();
         // Options can only be set on a running session.
         self.config_options.clear();
         self.setting_option = None;
-        for entry in &mut self.entries {
+        for entry in self.entries.iter_mut() {
             match entry {
                 Entry::Permission(card) if card.reply.is_some() => {
                     card.reply = None;
@@ -836,12 +926,17 @@ impl AgentPanel {
     /// conversation when it can load it, else a new one begins in this tab.
     fn restart(&mut self, _: &Restart, _window: &mut Window, cx: &mut Context<Self>) {
         self.stop_host();
+        self.clear_thread();
+        self.start(cx);
+    }
+
+    /// Forgets the thread on screen, before the agent shows it again.
+    fn clear_thread(&mut self) {
         self.entries.clear();
         self.markdown.clear();
         self.expanded_activity.clear();
         self.folded_queries.clear();
         self.usage = None;
-        self.start(cx);
     }
 
     /// Records the open session, to come back to it at the next start.
@@ -899,6 +994,7 @@ impl AgentPanel {
 
     fn apply_event(&mut self, event: HostEvent, cx: &mut Context<Self>) {
         match event {
+            HostEvent::Adapter(adapter) => self.adapter = adapter,
             HostEvent::Ready {
                 agent,
                 session,
@@ -919,11 +1015,18 @@ impl AgentPanel {
                     }),
                 }
                 self.state = State::Ready { agent };
-                if let Some(text) = self.queued.take() {
+                self.replace_on_replay = false;
+                // What was sent before the agent was ready goes now, in order.
+                if let Some(text) = self.queue.on_turn_ended() {
                     self.prompt(text, cx);
                 }
             }
-            HostEvent::Update(update) => self.apply_update(update, cx),
+            HostEvent::Update(update) => {
+                if std::mem::take(&mut self.replace_on_replay) {
+                    self.clear_thread();
+                }
+                self.apply_update(update, cx)
+            }
             HostEvent::ConfigOptions(options) => {
                 self.config_options = options;
                 self.setting_option = None;
@@ -1008,7 +1111,7 @@ impl AgentPanel {
 
     /// Gives every tool still pending or running the status it ended with.
     fn settle_open_tools(&mut self, ended: ToolCallStatus) {
-        for entry in &mut self.entries {
+        for entry in self.entries.iter_mut() {
             if let Entry::Tool { status, .. } = entry
                 && matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress)
             {
@@ -1052,34 +1155,45 @@ impl AgentPanel {
                 }
             }
             SessionUpdate::ToolCall(call) => {
+                let studio =
+                    StudioTool::of(self.adapter, call.meta.as_ref(), call.raw_input.as_ref());
                 self.entries.push(Entry::Tool {
                     id: call.tool_call_id.to_string(),
                     title: call.title,
                     status: call.status,
                     input: call.raw_input,
+                    studio,
                 });
             }
             SessionUpdate::ToolCallUpdate(update) => {
                 let id = update.tool_call_id.to_string();
-                for entry in self.entries.iter_mut().rev() {
-                    if let Entry::Tool {
-                        id: existing,
-                        title,
-                        status,
-                        input,
-                    } = entry
-                        && *existing == id
-                    {
-                        if let Some(new_title) = update.fields.title.clone() {
-                            *title = new_title;
-                        }
-                        if let Some(new_status) = update.fields.status {
-                            *status = new_status;
-                        }
-                        if let Some(new_input) = update.fields.raw_input {
-                            *input = Some(new_input);
-                        }
-                        break;
+                let adapter = self.adapter;
+                let at = self.entries.iter().rposition(
+                    |entry| matches!(entry, Entry::Tool { id: existing, .. } if *existing == id),
+                );
+                if let Some(Entry::Tool {
+                    title,
+                    status,
+                    input,
+                    studio,
+                    ..
+                }) = at.and_then(|at| self.entries.get_mut(at))
+                {
+                    if let Some(new_title) = update.fields.title.clone() {
+                        *title = new_title;
+                    }
+                    if let Some(new_status) = update.fields.status {
+                        *status = new_status;
+                    }
+                    if studio.is_none() {
+                        *studio = StudioTool::of(
+                            adapter,
+                            update.meta.as_ref(),
+                            update.fields.raw_input.as_ref(),
+                        );
+                    }
+                    if let Some(new_input) = update.fields.raw_input {
+                        *input = Some(new_input);
                     }
                 }
             }
@@ -1178,20 +1292,21 @@ impl AgentPanel {
         if text.is_empty() {
             return;
         }
+        // A message sent while the agent works, starts or is still to be chosen waits its
+        // turn in the queue, with any sent before it.
         match &self.state {
             State::Ready { .. } => self.prompt(text, cx),
-            // While the agent works the message waits its turn.
-            State::Prompting { .. } => self.queue.push(text),
-            State::Starting => self.queued = Some(text),
+            State::Prompting { .. } | State::Starting => self.queue.push(text),
             State::Setup => {
-                self.queued = Some(text);
+                self.queue.push(text);
                 self.entries.push(Entry::Notice {
                     text: "Choose an agent to send this to.".into(),
                     error: false,
                 });
             }
             State::Idle | State::Exited { .. } => {
-                self.queued = Some(text);
+                self.queue.push(text);
+                self.replace_on_replay = !self.entries.is_empty();
                 self.start(cx);
             }
         }
@@ -1289,8 +1404,10 @@ impl AgentPanel {
         cx.notify();
     }
 
-    /// Stops the turn; the queue waits until the person sends again.
+    /// Stops the turn and the CLI runs it started; the queue waits until the person sends
+    /// again.
     fn stop(&mut self, _: &Stop, _window: &mut Window, cx: &mut Context<Self>) {
+        self.stop_runs();
         if let Some(host) = &self.host {
             host.commands.unbounded_send(HostCommand::Cancel).ok();
             if !self.queue.entries.is_empty() {
@@ -1400,13 +1517,14 @@ impl AgentPanel {
             name,
             arguments,
             reply,
+            cancelled,
         } = request;
         match ToolCall::parse(&name, &arguments) {
             Ok(ToolCall::Cli) => {
                 reply.send(self.cli_instructions()).ok();
             }
             Ok(ToolCall::Run { args, save_to }) => {
-                self.run_cli(&args, save_to.as_deref(), reply, cx);
+                self.run_cli(&args, save_to.as_deref(), reply, cancelled, cx);
             }
             Ok(ToolCall::Wait { run }) => {
                 self.answer_run(run, reply, cx);
@@ -1419,9 +1537,19 @@ impl AgentPanel {
 
     fn apply_gateway(&mut self, event: GatewayEvent, cx: &mut Context<Self>) {
         match event {
-            GatewayEvent::Reached => {}
             GatewayEvent::Write { id, write, decide } => self.gateway_write(id, write, decide, cx),
             GatewayEvent::Finished { id, outcome } => self.gateway_finished(id, outcome, cx),
+            GatewayEvent::Abandoned { id } => {
+                if let Some((index, ..)) = self.gateway_cards.remove(&id) {
+                    self.set_proposal_state(
+                        index,
+                        ProposalState::Refused(
+                            "Not sent: the CLI stopped waiting before you decided.".into(),
+                        ),
+                        cx,
+                    );
+                }
+            }
         }
     }
 
@@ -1462,13 +1590,17 @@ impl AgentPanel {
             }
             Some(decision) => {
                 cx.spawn(async move |this, cx| {
-                    let decision = decision.await.unwrap_or(Decision::Reject);
-                    let allow = !matches!(decision, Decision::Reject);
+                    // No decision when the card was settled otherwise (the CLI gave up): the
+                    // write is not sent, and the card keeps what it says.
+                    let decision = decision.await.ok();
+                    let allow = matches!(decision, Some(Decision::Allow | Decision::AllowAlways));
                     this.update(cx, |this, cx| {
-                        if let Decision::AllowAlways = decision {
+                        if let Some(Decision::AllowAlways) = decision {
                             this.always_allow = true;
                         }
-                        if !allow {
+                        if let Some(Decision::Reject) = decision {
+                            // Nothing is sent, so no outcome comes for the card.
+                            this.gateway_cards.remove(&id);
                             this.set_proposal_state(index, ProposalState::Rejected, cx);
                         }
                     })
@@ -1493,7 +1625,7 @@ impl AgentPanel {
                 edges,
             } => (
                 ProposalState::Committed {
-                    commit: Some(commit.clone()),
+                    commit: commit.clone(),
                     nodes: *nodes,
                     edges: *edges,
                 },
@@ -1610,6 +1742,7 @@ impl AgentPanel {
         args: &[String],
         save_to: Option<&str>,
         reply: oneshot::Sender<(String, bool)>,
+        cancelled: oneshot::Receiver<()>,
         cx: &mut Context<Self>,
     ) {
         let (Some(home), Some(cwd)) = (
@@ -1637,7 +1770,7 @@ impl AgentPanel {
                         return;
                     }
                     this.update(cx, |this, cx| {
-                        this.run_cli(&args, save_to.as_deref(), reply, cx)
+                        this.run_cli(&args, save_to.as_deref(), reply, cancelled, cx)
                     })
                     .ok();
                 })
@@ -1649,14 +1782,19 @@ impl AgentPanel {
                 return;
             }
         }
-        let checked = cli_home::check_run_args(args, &cwd, &home.graph).and_then(|args| {
-            let save = save_to
-                .map(|path| cli_home::within(&cwd, path, true))
+        let checked = cli_home::check_run_args(args, &cwd, &home.graph).and_then(|mut plan| {
+            plan.save_to = save_to
+                .map(|path| {
+                    cli_home::inside(&cwd, path).map(|parts| cli_home::RunFile {
+                        parts,
+                        output: true,
+                    })
+                })
                 .transpose()?;
-            Ok((args, save))
+            Ok(plan)
         });
-        let (args, save) = match checked {
-            Ok(checked) => checked,
+        let plan = match checked {
+            Ok(plan) => plan,
             Err(message) => {
                 reply.send((message, true)).ok();
                 return;
@@ -1664,11 +1802,61 @@ impl AgentPanel {
         };
         let run = self.next_run;
         self.next_run += 1;
+        let (stop, stopped) = oneshot::channel::<()>();
         let task = cx
-            .background_spawn(async move { cli_home::run(&home, &cwd, args, save).await })
+            .background_spawn(async move {
+                let ran = cli_home::run(&home, &cwd, plan).fuse();
+                // Only a stop sent stops it, never one dropped with its entry.
+                let stopped = async {
+                    if stopped.await.is_err() {
+                        futures::future::pending::<()>().await;
+                    }
+                }
+                .fuse();
+                futures::pin_mut!(ran, stopped);
+                // Dropping the run kills its command.
+                futures::select! {
+                    done = ran => done,
+                    () = stopped => (
+                        "The run was stopped before it finished; what it had already written \
+                         stays."
+                            .into(),
+                        true,
+                    ),
+                }
+            })
             .shared();
-        self.runs.insert(run, task);
+        self.runs.insert(
+            run,
+            CliRun {
+                task,
+                stop: Some(stop),
+            },
+        );
+        // The agent cancelling the call while it waits for the run stops the run.
+        cx.spawn(async move |this, cx| {
+            if cancelled.await.is_ok() {
+                this.update(cx, |this, _| this.stop_run(run)).ok();
+            }
+        })
+        .detach();
         self.answer_run(run, reply, cx);
+    }
+
+    fn stop_run(&mut self, run: u64) {
+        if let Some(stop) = self.runs.get_mut(&run).and_then(|run| run.stop.take()) {
+            stop.send(()).ok();
+        }
+    }
+
+    /// Stops every run still going: at Stop, when the agent stops and when a new session
+    /// starts.
+    fn stop_runs(&mut self) {
+        for run in self.runs.values_mut() {
+            if let Some(stop) = run.stop.take() {
+                stop.send(()).ok();
+            }
+        }
     }
 
     /// Answers with run `run`'s outcome once it finishes, or with its number if it is still
@@ -1679,7 +1867,7 @@ impl AgentPanel {
         reply: oneshot::Sender<(String, bool)>,
         cx: &mut Context<Self>,
     ) {
-        let Some(task) = self.runs.get(&run).cloned() else {
+        let Some(task) = self.runs.get(&run).map(|run| run.task.clone()) else {
             reply
                 .send((
                     format!(
@@ -1739,6 +1927,10 @@ impl AgentPanel {
     fn use_command(&mut self, command: Vec<String>, cx: &mut Context<Self>) {
         studio_settings::update(cx, move |settings| settings.agent.command = command);
         self.sync_setup_state(cx);
+        // A question asked before an agent was chosen is sent to it now, as the setup said.
+        if matches!(self.state, State::Idle) && !self.queue.entries.is_empty() {
+            self.start(cx);
+        }
         cx.notify();
     }
 }
@@ -2063,12 +2255,6 @@ fn format_cost(amount: f64, currency: &str) -> String {
     format!("{amount:.precision$} {currency}")
 }
 
-fn short_commit(id: &str) -> String {
-    let tail = id.rsplit('.').next().unwrap_or(id);
-    let skip = tail.chars().count().saturating_sub(8);
-    tail.chars().skip(skip).collect()
-}
-
 fn content_text(content: &ContentBlock) -> String {
     match content {
         ContentBlock::Text(text) => text.text.clone(),
@@ -2105,25 +2291,10 @@ fn gutter_row(icon: Option<Icon>, content: impl IntoElement) -> Div {
         .child(div().flex_1().min_w_0().child(content))
 }
 
-/// A short verb for one of Studio's tools, as Delta labels activity ("Edit", "Read").
-/// A query call the thread shows with its text: the query, and its parameters as one line
-/// ("id: p-1 · title: CTO"), when the agent reported them.
 /// An `omnigraph_run` call shown with its query: the subcommand ("query", "mutate"), the
 /// query text given with `-e`, and the other arguments on one line.
 fn shown_query(entry: &Entry) -> Option<(String, String, String)> {
-    let Entry::Tool { title, input, .. } = entry else {
-        return None;
-    };
-    if ToolKind::of(title) != ToolKind::Run {
-        return None;
-    }
-    let args: Vec<&str> = input
-        .as_ref()?
-        .get("args")?
-        .as_array()?
-        .iter()
-        .filter_map(Value::as_str)
-        .collect();
+    let args: Vec<&str> = run_args(entry)?.iter().filter_map(Value::as_str).collect();
     let at = args.iter().position(|arg| *arg == "-e")?;
     let text = (*args.get(at + 1)?).to_owned();
     let command = (*args.first()?).to_owned();
@@ -2137,12 +2308,33 @@ fn shown_query(entry: &Entry) -> Option<(String, String, String)> {
     Some((command, text, rest))
 }
 
+/// An `omnigraph_run` call's arguments.
+fn run_args(entry: &Entry) -> Option<&Vec<Value>> {
+    let Entry::Tool { input, studio, .. } = entry else {
+        return None;
+    };
+    if *studio != Some(StudioTool::Run) {
+        return None;
+    }
+    input.as_ref()?.get("args")?.as_array()
+}
+
+/// Whether [`shown_query`] shows the entry, read without copying its text: on every render,
+/// for every tool call in the thread.
+fn shows_query(entry: &Entry) -> bool {
+    let mut args = run_args(entry)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str);
+    args.by_ref().any(|arg| arg == "-e") && args.next().is_some()
+}
+
 /// Whether an entry folds into a run's summary line: thoughts, and tool calls other than the
 /// queries shown with their text.
 fn is_folded_step(entry: &Entry) -> bool {
     match entry {
         Entry::Thought(_) => true,
-        Entry::Tool { .. } => shown_query(entry).is_none(),
+        Entry::Tool { .. } => !shows_query(entry),
         _ => false,
     }
 }
@@ -2156,13 +2348,11 @@ enum ToolKind {
 }
 
 impl ToolKind {
-    fn of(title: &str) -> Self {
-        if title.contains("omnigraph_cli") {
-            Self::Cli
-        } else if title.contains("omnigraph_run") {
-            Self::Run
-        } else {
-            Self::Other
+    fn of(studio: Option<StudioTool>) -> Self {
+        match studio {
+            Some(StudioTool::Cli) => Self::Cli,
+            Some(StudioTool::Run) => Self::Run,
+            None => Self::Other,
         }
     }
 
@@ -2204,8 +2394,8 @@ fn activity_summary(thoughts: usize, tools: &[ToolKind]) -> String {
     }
 }
 
-fn tool_verb(title: &str) -> String {
-    match ToolKind::of(title) {
+fn tool_verb(title: &str, studio: Option<StudioTool>) -> String {
+    match ToolKind::of(studio) {
         ToolKind::Cli => "Look up the CLI".into(),
         ToolKind::Run => "Run omnigraph".into(),
         ToolKind::Other => title.to_owned(),
@@ -2372,8 +2562,8 @@ impl AgentPanel {
                                     .tooltip(Tooltip::text(
                                         "Studio runs the agent on this computer over the Agent \
                                          Client Protocol and gives it tools for this graph. It \
-                                         never sees your token; each change it proposes waits \
-                                         for you and lands on a branch of its own.",
+                                         never sees your token, and its changes land on a branch \
+                                         of its own, for you to review.",
                                     ))
                                     .child(
                                         Icon::new(IconName::Info)
@@ -2383,13 +2573,21 @@ impl AgentPanel {
                             ),
                     )
                     // A question asked before an agent was chosen waits, and says so.
-                    .children(self.queued.clone().map(|question| {
-                        div().mb_2().child(
-                            Label::new(format!("“{question}” is sent once you choose an agent."))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                    }))
+                    .children(
+                        self.queue
+                            .entries
+                            .first()
+                            .map(|queued| queued.text.clone())
+                            .map(|question| {
+                                div().mb_2().child(
+                                    Label::new(format!(
+                                        "“{question}” is sent once you choose an agent."
+                                    ))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                                )
+                            }),
+                    )
                     .children(PRESETS.iter().enumerate().map(|(index, (name, command))| {
                         let command: Vec<String> =
                             command.iter().map(|s| (*s).to_owned()).collect();
@@ -2484,7 +2682,7 @@ impl AgentPanel {
         while index < self.entries.len() {
             let entry = &self.entries[index];
             match entry {
-                Entry::Tool { .. } if shown_query(entry).is_some() => {
+                Entry::Tool { .. } if shows_query(entry) => {
                     blocks.push(Block::Query {
                         index,
                         lead: !marked,
@@ -2546,8 +2744,8 @@ impl AgentPanel {
                 0..0
             }
         };
-        for entry in &self.entries[entries] {
-            hash_entry(entry, &mut hasher);
+        for index in entries {
+            self.entries.hash(index).hash(&mut hasher);
         }
         hasher.finish()
     }
@@ -2555,6 +2753,7 @@ impl AgentPanel {
     /// Brings the list up to the thread: from the first block that differs from what it last
     /// drew, the blocks are measured again; those above keep their heights and the scroll.
     fn sync_thread(&mut self, _cx: &mut Context<Self>) {
+        self.entries.rehash();
         let blocks: Vec<(Block, u64)> = self
             .blocks()
             .into_iter()
@@ -2874,7 +3073,7 @@ impl AgentPanel {
         let tools: Vec<(ToolKind, &ToolCallStatus)> = steps
             .iter()
             .filter_map(|entry| match entry {
-                Entry::Tool { title, status, .. } => Some((ToolKind::of(title), status)),
+                Entry::Tool { studio, status, .. } => Some((ToolKind::of(*studio), status)),
                 _ => None,
             })
             .collect();
@@ -2964,7 +3163,12 @@ impl AgentPanel {
                 .text_color(cx.theme().colors().text_muted)
                 .child(text.trim().to_owned())
                 .into_any_element(),
-            Entry::Tool { title, status, .. } => {
+            Entry::Tool {
+                title,
+                status,
+                studio,
+                ..
+            } => {
                 let failed = matches!(status, ToolCallStatus::Failed);
                 let running =
                     matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
@@ -2974,9 +3178,9 @@ impl AgentPanel {
                     .tooltip(Tooltip::text(title.clone()))
                     .child(
                         Label::new(if failed {
-                            format!("{} failed", tool_verb(title))
+                            format!("{} failed", tool_verb(title, *studio))
                         } else {
-                            tool_verb(title)
+                            tool_verb(title, *studio)
                         })
                         .size(LabelSize::Small)
                         .color(if failed { Color::Error } else { Color::Muted })
@@ -3009,11 +3213,12 @@ impl AgentPanel {
                     .size(IconSize::XSmall)
                     .color(Color::Warning),
             )
+            // Whole, wrapped: the end of a long command is where a second one would hide.
             .child(
-                Label::new(card.title.clone())
-                    .size(LabelSize::Small)
-                    .single_line()
-                    .truncate(),
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Label::new(card.title.clone()).size(LabelSize::Small)),
             );
         let footer = match &card.answer {
             Some(answer) => studio_ui::ds::card_footer(cx).child(
@@ -3110,6 +3315,12 @@ impl AgentPanel {
                 })
                 .children(params)
         });
+        // The keys answer the card waiting longest; only that card shows them, so a key never
+        // answers a card other than the one it is shown on.
+        let keyed = self.pending_index() == Some(index);
+        let key = |action: &dyn gpui::Action, cx: &App| {
+            keyed.then(|| KeyBinding::for_action_in(action, &focus, cx))
+        };
         let footer = match &proposal.state {
             ProposalState::Waiting(_) => studio_ui::ds::card_footer(cx)
                 .child(
@@ -3120,7 +3331,7 @@ impl AgentPanel {
                                 .size(IconSize::XSmall)
                                 .color(Color::Success),
                         )
-                        .key_binding(KeyBinding::for_action_in(&Allow, &focus, cx))
+                        .when_some(key(&Allow, cx), |button, key| button.key_binding(key))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.decide(index, Decision::Allow, cx)
                         })),
@@ -3133,7 +3344,7 @@ impl AgentPanel {
                                 .size(IconSize::XSmall)
                                 .color(Color::Success),
                         )
-                        .key_binding(KeyBinding::for_action_in(&AllowAlways, &focus, cx))
+                        .when_some(key(&AllowAlways, cx), |button, key| button.key_binding(key))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.decide(index, Decision::AllowAlways, cx)
                         })),
@@ -3147,7 +3358,7 @@ impl AgentPanel {
                                 .size(IconSize::XSmall)
                                 .color(Color::Error),
                         )
-                        .key_binding(KeyBinding::for_action_in(&Reject, &focus, cx))
+                        .when_some(key(&Reject, cx), |button, key| button.key_binding(key))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.decide(index, Decision::Reject, cx)
                         })),
@@ -3159,7 +3370,7 @@ impl AgentPanel {
                             (IconName::ArrowCircle, Color::Accent, "Running".into(), None)
                         }
                         ProposalState::Committed {
-                            commit: Some(commit),
+                            commit,
                             nodes,
                             edges,
                         } => (
@@ -3169,12 +3380,6 @@ impl AgentPanel {
                             Some(format!(
                                 "Commit {commit}: {nodes} nodes and {edges} edges changed"
                             )),
-                        ),
-                        ProposalState::Committed { commit: None, .. } => (
-                            IconName::Check,
-                            Color::Muted,
-                            "No change".into(),
-                            Some("The mutation matched no rows".into()),
                         ),
                         ProposalState::Refused(message) => (
                             IconName::XCircle,
@@ -3195,10 +3400,10 @@ impl AgentPanel {
                     };
                 let commit = match state {
                     ProposalState::Committed {
-                        commit: Some(commit),
+                        commit,
                         nodes,
                         edges,
-                    } => Some((short_commit(commit), *nodes + *edges)),
+                    } => Some((studio_ui::short_commit_id(commit), *nodes + *edges)),
                     _ => None,
                 };
                 studio_ui::ds::card_footer(cx)
@@ -3543,6 +3748,56 @@ impl AgentPanel {
 mod tests {
     use super::*;
 
+    /// Rendering asks [`shows_query`] of every tool call; it agrees with [`shown_query`].
+    #[test]
+    fn a_run_shows_its_query_only_when_it_gives_one() {
+        let tool = |studio, input: Value| Entry::Tool {
+            id: "t".into(),
+            title: String::new(),
+            status: ToolCallStatus::Completed,
+            input: Some(input),
+            studio,
+        };
+        let run = Some(StudioTool::Run);
+        for (entry, shown) in [
+            (
+                tool(
+                    run,
+                    serde_json::json!({"args": ["query", "-e", "q", "--json"]}),
+                ),
+                true,
+            ),
+            (
+                tool(run, serde_json::json!({"args": ["query", 1, "-e", 2, "q"]})),
+                true,
+            ),
+            (
+                tool(run, serde_json::json!({"args": ["query", "-e"]})),
+                false,
+            ),
+            (
+                tool(run, serde_json::json!({"args": ["load", "--data", "x"]})),
+                false,
+            ),
+            (tool(run, serde_json::json!({})), false),
+            (
+                tool(None, serde_json::json!({"args": ["query", "-e", "q"]})),
+                false,
+            ),
+            (Entry::Thought("-e".into()), false),
+        ] {
+            assert_eq!(shows_query(&entry), shown, "{:?}", shown_query(&entry));
+            assert_eq!(shown_query(&entry).is_some(), shown);
+        }
+        assert_eq!(
+            shown_query(&tool(
+                run,
+                serde_json::json!({"args": ["query", "-e", "q", "--json"]})
+            )),
+            Some(("query".into(), "q".into(), "--json".into()))
+        );
+    }
+
     #[test]
     fn token_counts_and_costs_read_like_zeds() {
         assert_eq!(humanize_tokens(999), "999");
@@ -3581,6 +3836,35 @@ mod tests {
         assert_eq!(queue.entries.len(), 1);
     }
 
+    /// An entry changed by any way there is changes its hash; the others keep theirs, so the
+    /// thread measures again only what changed.
+    #[test]
+    fn a_changed_entry_changes_its_hash_and_no_other() {
+        let mut entries = Entries::default();
+        entries.push(Entry::User("question".into()));
+        entries.push(Entry::Agent("Ans".into()));
+        entries.rehash();
+        let (first, second) = (entries.hash(0), entries.hash(1));
+        if let Some(Entry::Agent(text)) = entries.last_mut() {
+            text.push_str("wer");
+        }
+        entries.rehash();
+        assert_eq!(entries.hash(0), first);
+        assert_ne!(entries.hash(1), second);
+        let second = entries.hash(1);
+        for entry in entries.iter_mut() {
+            if let Entry::User(text) = entry {
+                text.push('?');
+            }
+        }
+        entries.rehash();
+        assert_ne!(entries.hash(0), first);
+        assert_eq!(entries.hash(1), second);
+        entries.clear();
+        entries.rehash();
+        assert!(entries.is_empty() && entries.hash(0) == 0);
+    }
+
     #[test]
     fn a_run_of_steps_reads_as_one_sentence() {
         use ToolKind::*;
@@ -3593,7 +3877,7 @@ mod tests {
             "Looked up the CLI, ran 2 omnigraph commands, used 1 tool"
         );
         assert_eq!(activity_summary(2, &[]), "Thought 2 times");
-        assert_eq!(ToolKind::of("mcp__omnigraph__omnigraph_run"), Run);
+        assert_eq!(ToolKind::of(Some(StudioTool::Run)), Run);
     }
 
     #[test]

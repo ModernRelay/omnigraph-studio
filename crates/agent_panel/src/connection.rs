@@ -15,6 +15,9 @@ use crate::host::{self, AgentLaunch, ConnectionCommand, HostCommand, HostEvent, 
 
 pub struct AgentConnection {
     commands: mpsc::UnboundedSender<ConnectionCommand>,
+    /// Conversations asked for and not yet open: told why when the agent cannot start, also
+    /// before it reads their request.
+    opening: host::Opening,
     /// The process: dropping it stops the agent.
     _task: Task<()>,
 }
@@ -31,6 +34,9 @@ impl AgentConnection {
         events: mpsc::UnboundedSender<HostEvent>,
         commands: mpsc::UnboundedReceiver<HostCommand>,
     ) -> bool {
+        if let Ok(mut opening) = self.opening.lock() {
+            opening.push(events.clone());
+        }
         self.commands
             .unbounded_send(ConnectionCommand::Open {
                 launch,
@@ -74,9 +80,11 @@ pub fn connection(launch: AgentLaunch, cx: &mut App) -> Arc<AgentConnection> {
         return connection;
     }
     let (commands, receiver) = mpsc::unbounded();
-    let task = cx.background_spawn(host::run(launch.clone(), receiver));
+    let opening = host::Opening::default();
+    let task = cx.background_spawn(host::run(launch.clone(), receiver, opening.clone()));
     let connection = Arc::new(AgentConnection {
         commands,
+        opening,
         _task: task,
     });
     let connections = cx.default_global::<Connections>();

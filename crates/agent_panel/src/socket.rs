@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::channel::{mpsc, oneshot};
 use futures::{
-    AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, FutureExt, StreamExt as _,
+    AsyncBufRead, AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, FutureExt,
+    StreamExt as _,
 };
 use serde_json::Value;
 use smol::io::BufReader;
@@ -26,6 +27,9 @@ pub struct ToolRequest {
     pub arguments: Value,
     /// The result text, and whether it is an error.
     pub reply: oneshot::Sender<(String, bool)>,
+    /// Answers when the agent cancels the call (`notifications/cancelled`); dropped, without an
+    /// answer, once the call is answered.
+    pub cancelled: oneshot::Receiver<()>,
 }
 
 /// A bound socket. Dropping it removes the socket file.
@@ -220,6 +224,43 @@ impl ToolSocket {
     }
 }
 
+/// The most one message from the agent may hold; a longer one ends the connection.
+const LINE_MAX: usize = if cfg!(test) { 1024 } else { 64 * 1024 * 1024 };
+
+/// Reads the next line from `reader` into `line`, without its end: whether there was one. At
+/// the end of the stream, on an error and past [`LINE_MAX`] there is none.
+async fn next_line(reader: &mut (impl AsyncBufRead + Unpin), line: &mut Vec<u8>) -> bool {
+    line.clear();
+    loop {
+        let Ok(buffer) = reader.fill_buf().await else {
+            return false;
+        };
+        if buffer.is_empty() {
+            return !line.is_empty();
+        }
+        let (taken, ended) = match buffer.iter().position(|byte| *byte == b'\n') {
+            Some(end) => {
+                line.extend_from_slice(&buffer[..end]);
+                (end + 1, true)
+            }
+            None => {
+                line.extend_from_slice(buffer);
+                (buffer.len(), false)
+            }
+        };
+        reader.consume_unpin(taken);
+        if line.len() > LINE_MAX {
+            return false;
+        }
+        if ended {
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return true;
+        }
+    }
+}
+
 async fn serve_connection(
     reader: impl AsyncRead + Unpin + Send + 'static,
     mut writer: impl AsyncWrite + Unpin + Send + 'static,
@@ -238,17 +279,34 @@ async fn serve_connection(
         }
     });
 
-    let mut lines = BufReader::new(reader).lines();
-    let mut calls = Vec::new();
-    while let Some(Ok(line)) = lines.next().await {
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::new();
+    let mut calls: Vec<smol::Task<()>> = Vec::new();
+    // The calls under way, by their id as text, to tell them they were cancelled.
+    let cancels: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, oneshot::Sender<()>>>,
+    > = Default::default();
+    while next_line(&mut reader, &mut line).await {
+        let Ok(line) = std::str::from_utf8(&line) else {
+            break;
+        };
         if line.trim().is_empty() {
             continue;
         }
-        match mcp::handle(&line, &instructions) {
+        match mcp::handle(line, &instructions) {
             Incoming::Reply(reply) => {
                 replies_tx.unbounded_send(reply).ok();
             }
             Incoming::Nothing => {}
+            Incoming::Cancelled { id } => {
+                if let Some(cancel) = cancels
+                    .lock()
+                    .ok()
+                    .and_then(|mut c| c.remove(&id.to_string()))
+                {
+                    cancel.send(()).ok();
+                }
+            }
             Incoming::CallTool {
                 id,
                 name,
@@ -256,20 +314,30 @@ async fn serve_connection(
                 progress,
             } => {
                 let (reply, result) = oneshot::channel();
+                let (cancel, cancelled) = oneshot::channel();
+                if let Ok(mut cancels) = cancels.lock() {
+                    cancels.insert(id.to_string(), cancel);
+                }
                 if tools
                     .unbounded_send(ToolRequest {
                         name,
                         arguments,
                         reply,
+                        cancelled,
                     })
                     .is_err()
                 {
+                    if let Ok(mut cancels) = cancels.lock() {
+                        cancels.remove(&id.to_string());
+                    }
                     let reply =
                         mcp::tool_reply(id, "Studio closed the agent session.".into(), true);
                     replies_tx.unbounded_send(reply).ok();
                     continue;
                 }
+                calls.retain(|call| !call.is_finished());
                 let replies_tx = replies_tx.clone();
+                let cancels = cancels.clone();
                 // Each call answers on its own, so a change waiting for approval does not hold
                 // up the agent's reads. A long call reports progress, so the agent does not give
                 // up on it.
@@ -288,6 +356,10 @@ async fn serve_connection(
                             }
                         }
                     };
+                    // Answered: a cancellation after this stops nothing.
+                    if let Ok(mut cancels) = cancels.lock() {
+                        cancels.remove(&id.to_string());
+                    }
                     let (text, is_error) = answer
                         .unwrap_or_else(|_| ("Studio closed the agent session.".into(), true));
                     replies_tx
@@ -397,6 +469,30 @@ mod tests {
                 progress.windows(2).all(|pair| pair[0] < pair[1]),
                 "{progress:?}"
             );
+        });
+    }
+
+    /// Lines arrive in pieces and end with `\n` or `\r\n`; one past the cap ends the
+    /// connection rather than growing without end.
+    #[test]
+    fn lines_are_read_whole_and_a_line_past_the_cap_ends_the_connection() {
+        smol::block_on(async {
+            let text = format!("one\r\ntwo\n\n{}\nlast", "x".repeat(LINE_MAX + 1));
+            let mut reader =
+                futures::io::BufReader::with_capacity(3, futures::io::Cursor::new(text));
+            let mut line = Vec::new();
+            let mut read = Vec::new();
+            while next_line(&mut reader, &mut line).await {
+                read.push(String::from_utf8(line.clone()).unwrap());
+            }
+            assert_eq!(read, ["one", "two", ""]);
+
+            let mut reader = futures::io::Cursor::new("a\nend");
+            let mut read = Vec::new();
+            while next_line(&mut reader, &mut line).await {
+                read.push(String::from_utf8(line.clone()).unwrap());
+            }
+            assert_eq!(read, ["a", "end"]);
         });
     }
 

@@ -120,11 +120,15 @@ from the branch the person was on when the session started.
 
 ### The agent's own permission requests
 
-`session/request_permission` for one of Studio's tools (title or tool name containing
-`omnigraph_`) is answered with the agent's allow-once option at once: reads are read-only and
-writes have Studio's own approval, so asking twice would only add noise. Any other request
-(file edits, shell commands) shows a card with the agent's own options; closing the panel
-answers `Cancelled`.
+`session/request_permission` for one of Studio's tools is answered with the agent's
+allow-once option at once: reads are read-only and writes have Studio's own approval, so asking
+twice would only add noise. A call is Studio's by what the agent's adapter, named at
+`initialize`, says it is, never by its title, which the model writes (claude-agent-acp titles
+a shell call with its command): Claude's `_meta.claudeCode.toolName` is
+`mcp__omnigraph__omnigraph_run` or `…omnigraph_cli`, and a Codex MCP call's input names server
+`omnigraph` and the tool (`tools::StudioTool::of`). Another adapter's calls are never Studio's.
+Any other request (file edits, shell commands) shows a card with the agent's own options;
+closing the panel answers `Cancelled`.
 
 ### Thread
 

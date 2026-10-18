@@ -109,9 +109,17 @@ impl AgentSessions {
         }
     }
 
+    /// Writes the list on Studio's writer thread, in order with its other writes: a write
+    /// waits for the disk to sync it, too long for the main thread at every prompt.
     fn save(&self) {
         let value = serde_json::json!({ "version": 2, "sessions": self.records });
-        write(&self.path, &value);
+        if let Ok(text) = serde_json::to_string_pretty(&value) {
+            studio_settings::write_atomic_in_turn(
+                self.path.clone(),
+                text.into_bytes(),
+                studio_settings::Access::Private,
+            );
+        }
     }
 
     /// A graph's conversations that are not archived, most recently active first.
@@ -172,9 +180,13 @@ impl AgentSessions {
         cx: &mut Context<Self>,
     ) {
         if let Some(record) = self.records.iter_mut().find(|r| r.session == session) {
+            let before = record.clone();
             change(record);
-            self.save();
-            cx.notify();
+            // A title already set, or a pin already so, writes nothing.
+            if *record != before {
+                self.save();
+                cx.notify();
+            }
         }
     }
 
@@ -301,6 +313,12 @@ pub fn graph_cwd(graph: &str) -> PathBuf {
         .join(format!("{slug}-{hash:08x}"))
 }
 
+/// Where each conversation's private CLI home is made: outside every working directory, so
+/// an agent cannot change what `omnigraph_run` runs.
+pub fn private_homes() -> PathBuf {
+    studio_settings::data_dir().join("agent").join("homes")
+}
+
 /// Where conversations ran before each graph had a directory of its own.
 pub fn legacy_cwd() -> PathBuf {
     studio_settings::data_dir().join("agent").join("workspace")
@@ -321,44 +339,32 @@ fn provisional_title(message: &str) -> Option<String> {
     })
 }
 
-/// The records on disk. The first format kept one session per graph and agent, keyed
-/// `"{graph}\n{agent}"`; those become records of their own, dated now.
+/// The records on disk, each read on its own: one Studio cannot read (damaged, or written by a
+/// newer Studio) leaves the others. A file with any it cannot read is set aside first, so the
+/// next save, which writes only the ones read, loses nothing.
 fn read_records(path: &Path) -> Vec<SessionRecord> {
-    let Some(value) = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-    else {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
-    if let Some(sessions) = value.get("sessions") {
-        return serde_json::from_value(sessions.clone()).unwrap_or_default();
+    let records =
+        serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|value| match value.get("sessions") {
+                Some(Value::Array(records)) => Some(records.clone()),
+                _ => None,
+            });
+    let Some(records) = records else {
+        studio_settings::set_aside(path);
+        return Vec::new();
+    };
+    let read: Vec<SessionRecord> = records
+        .iter()
+        .filter_map(|record| serde_json::from_value(record.clone()).ok())
+        .collect();
+    if read.len() < records.len() {
+        studio_settings::set_aside(path);
     }
-    let now = Utc::now();
-    value
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter_map(|(key, record)| {
-            let (graph, agent) = key.split_once('\n')?;
-            Some(SessionRecord {
-                session: record.get("session")?.as_str()?.to_owned(),
-                graph: graph.to_owned(),
-                agent: agent.to_owned(),
-                title: None,
-                title_override: None,
-                created_at: now,
-                updated_at: now,
-                branch: record.get("branch")?.as_str()?.to_owned(),
-                branch_created: record
-                    .get("branch_created")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                pinned: false,
-                archived: false,
-                cwd: None,
-            })
-        })
-        .collect()
+    read
 }
 
 /// The file's object. A file that exists but is not a JSON object is set aside, so the next
@@ -376,15 +382,6 @@ fn read(path: &Path) -> Map<String, Value> {
     }
 }
 
-/// Replaces the file in one step, readable only by its owner: a crash mid-write leaves the
-/// previous list, never an empty one.
-fn write(path: &Path, value: &Value) {
-    let Ok(text) = serde_json::to_string_pretty(value) else {
-        return;
-    };
-    studio_settings::write_atomic(path, text.as_bytes(), studio_settings::Access::Private).ok();
-}
-
 /// The option values the person last chose for an agent (its model, mode, reasoning level),
 /// applied to its next new session: `{agent command: {option id: value id}}`.
 fn preferences_path() -> PathBuf {
@@ -393,31 +390,62 @@ fn preferences_path() -> PathBuf {
         .join("preferences.json")
 }
 
+/// The preferences, read from their file once and then kept; each change is written in turn,
+/// off the main thread.
+struct Preferences {
+    path: PathBuf,
+    records: Option<Map<String, Value>>,
+}
+
+impl Preferences {
+    fn records(&mut self) -> &mut Map<String, Value> {
+        let path = &self.path;
+        self.records.get_or_insert_with(|| read(path))
+    }
+
+    fn of(&mut self, command: &[String]) -> Map<String, Value> {
+        self.records()
+            .get(&command.join(" "))
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn prefer(&mut self, command: &[String], option: &str, value: Value) {
+        let records = self.records();
+        let agent = records
+            .entry(command.join(" "))
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Some(agent) = agent.as_object_mut() {
+            agent.insert(option.to_owned(), value);
+        }
+        if let Ok(text) = serde_json::to_vec_pretty(records) {
+            studio_settings::write_atomic_in_turn(
+                self.path.clone(),
+                text,
+                studio_settings::Access::Private,
+            );
+        }
+    }
+}
+
+fn with_preferences<T>(f: impl FnOnce(&mut Preferences) -> T) -> T {
+    static PREFERENCES: std::sync::Mutex<Option<Preferences>> = std::sync::Mutex::new(None);
+    let mut preferences = PREFERENCES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(preferences.get_or_insert_with(|| Preferences {
+        path: preferences_path(),
+        records: None,
+    }))
+}
+
 pub fn preferences(command: &[String]) -> Map<String, Value> {
-    preferences_from(&preferences_path(), command)
+    with_preferences(|preferences| preferences.of(command))
 }
 
 pub fn prefer(command: &[String], option: &str, value: Value) {
-    prefer_to(&preferences_path(), command, option, value);
-}
-
-fn preferences_from(path: &Path, command: &[String]) -> Map<String, Value> {
-    read(path)
-        .get(&command.join(" "))
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default()
-}
-
-fn prefer_to(path: &Path, command: &[String], option: &str, value: Value) {
-    let mut records = read(path);
-    let agent = records
-        .entry(command.join(" "))
-        .or_insert_with(|| Value::Object(Map::new()));
-    if let Some(agent) = agent.as_object_mut() {
-        agent.insert(option.to_owned(), value);
-    }
-    write(path, &Value::Object(records));
+    with_preferences(|preferences| preferences.prefer(command, option, value));
 }
 
 #[cfg(test)]
@@ -496,7 +524,8 @@ mod tests {
             assert!(store.get("old").is_none() && store.was_deleted("old"));
             assert!(store.get("fresh").is_some());
         });
-        // What was written comes back, owner-only.
+        // What was written comes back, owner-only, once the writer thread has written it.
+        studio_settings::writes_done();
         let reloaded = AgentSessions::load(path.clone());
         assert_eq!(reloaded.records.len(), 4);
         assert!(reloaded.get("old").is_none());
@@ -509,24 +538,36 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// One record Studio cannot read leaves the others, and the file is set aside before the
+    /// next save writes only those.
     #[test]
-    fn the_first_format_becomes_records() {
-        let dir = std::env::temp_dir().join(format!("studio-agent-v1-{}", std::process::id()));
+    fn a_record_that_cannot_be_read_leaves_the_others() {
+        let dir = std::env::temp_dir().join(format!("studio-agent-records-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sessions.json");
-        std::fs::write(
-            &path,
-            json!({ "server/crm\nclaude-code-acp": {
-                "session": "s-1", "branch": "agent/x", "branch_created": true
-            }})
-            .to_string(),
-        )
-        .unwrap();
+        let now = Utc::now();
+        let record = SessionRecord {
+            session: "s-1".into(),
+            graph: "server/crm".into(),
+            agent: "claude-code-acp".into(),
+            title: None,
+            title_override: None,
+            created_at: now,
+            updated_at: now,
+            branch: "agent/x".into(),
+            branch_created: true,
+            pinned: false,
+            archived: false,
+            cwd: None,
+        };
+        let file = json!({ "version": 2, "sessions": [record, { "session": 3 }] });
+        std::fs::write(&path, file.to_string()).unwrap();
         let records = read_records(&path);
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].graph, "server/crm");
-        assert_eq!(records[0].agent, "claude-code-acp");
-        assert!(records[0].branch_created);
+        assert_eq!(records[0].session, "s-1");
+        assert!(!path.exists(), "set aside before it is written again");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -545,14 +586,23 @@ mod tests {
         let path = dir.join("preferences.json");
         let claude = vec!["claude-code-acp".to_owned()];
         let other = vec!["other-agent".to_owned()];
-        prefer_to(&path, &claude, "model", json!("sonnet"));
-        prefer_to(&path, &claude, "model", json!("opus"));
-        prefer_to(&path, &claude, "fast", json!(true));
-        let chosen = preferences_from(&path, &claude);
-        assert_eq!(chosen.get("model"), Some(&json!("opus")));
-        assert_eq!(chosen.get("fast"), Some(&json!(true)));
-        // Another agent's options are its own.
-        assert!(preferences_from(&path, &other).is_empty());
+        let kept = |path: &Path| Preferences {
+            path: path.to_owned(),
+            records: None,
+        };
+        let mut preferences = kept(&path);
+        preferences.prefer(&claude, "model", json!("sonnet"));
+        preferences.prefer(&claude, "model", json!("opus"));
+        preferences.prefer(&claude, "fast", json!(true));
+        studio_settings::writes_done();
+        // As kept, and as the next start reads them.
+        for mut preferences in [preferences, kept(&path)] {
+            let chosen = preferences.of(&claude);
+            assert_eq!(chosen.get("model"), Some(&json!("opus")));
+            assert_eq!(chosen.get("fast"), Some(&json!(true)));
+            // Another agent's options are its own.
+            assert!(preferences.of(&other).is_empty());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
