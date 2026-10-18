@@ -23,7 +23,8 @@ impl std::fmt::Display for RevertUnavailable {
 /// The mutation that restores `change`'s before image on the branch it was read from.
 ///
 /// - Added node: delete it (its relationships go with it).
-/// - Removed node: insert it again with its before values.
+/// - Removed node: insert it again with its before values. A node without a key cannot be:
+///   it would come back under a new id, and its relationships' reverts would miss it.
 /// - Changed node: set each changed property back, each bound to the value the review saw, so
 ///   a value changed since then is left alone (zero affected rows).
 ///
@@ -50,6 +51,10 @@ pub fn revert_query(
     match change.net() {
         None => Err(RevertUnavailable("Nothing to revert.".into())),
         Some(NetChange::Added) => delete_node(schema, &node.name, &change.id).map_err(unavailable),
+        Some(NetChange::Removed) if node.key.is_none() => Err(RevertUnavailable(format!(
+            "{} has no key, so a revert would bring it back under a new id.",
+            node.name
+        ))),
         Some(NetChange::Removed) => {
             let before = &change
                 .before
@@ -417,6 +422,15 @@ mod tests {
                 .unwrap_err()
                 .0
                 .contains("Likes")
+        );
+        // A node without a key would come back under a new id.
+        let keyless = SchemaModel::parse("node Note {\n  text: String\n}\n").unwrap();
+        let removed = change(EntityKind::Node, "Note", Some(json!({"text": "x"})), None);
+        assert!(
+            revert_query(&keyless, &removed)
+                .unwrap_err()
+                .0
+                .contains("no key")
         );
         let gone = change(EntityKind::Node, "Robot", None, Some(json!({})));
         assert!(
