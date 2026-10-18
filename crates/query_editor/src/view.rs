@@ -1376,12 +1376,9 @@ impl QueryEditor {
                     short_commit_id(commit)
                 ));
             }
-            let label = source[outline.prefix.end..]
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_owned();
+            // The whole statement, on one line: its target can be on a line of its own, and the
+            // confirm bar names what runs.
+            let label = one_line_label(&source[outline.prefix.end..]);
             return Ok(Prepared {
                 text: source.clone(),
                 name: None,
@@ -3066,11 +3063,34 @@ fn facts_tooltip(facts: &[(String, String)]) -> String {
         .join("\n")
 }
 
+/// A statement's words on one line, at most [`LABEL_CHARS`] characters.
+fn one_line_label(statement: &str) -> String {
+    const LABEL_CHARS: usize = 200;
+    let words = statement.split_whitespace().collect::<Vec<_>>().join(" ");
+    if words.chars().count() <= LABEL_CHARS {
+        return words;
+    }
+    let kept: String = words.chars().take(LABEL_CHARS - 1).collect();
+    format!("{}…", kept.trim_end())
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// The confirm bar names the whole statement, its target included when it is on a line of
+    /// its own.
+    #[test]
+    fn a_statement_is_named_whole_on_one_line() {
+        assert_eq!(
+            one_line_label("branch merge feature\n    into release\n"),
+            "branch merge feature into release"
+        );
+        let long = one_line_label(&"word ".repeat(100));
+        assert!(long.chars().count() <= 200 && long.ends_with('…'), "{long}");
+    }
 
     fn param(kind: ParamKind) -> ParamDescriptor {
         ParamDescriptor {

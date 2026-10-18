@@ -2152,7 +2152,10 @@ impl GraphSession {
     ) -> Task<WriteOutcome<ChangeOutput>> {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
-        let branch = request
+        // A request naming no branch is a branch or commit statement, whose target is in its
+        // text: the answer names the branch it changed.
+        let statement = request.branch.is_none();
+        let asked = request
             .branch
             .clone()
             .unwrap_or_else(|| self.branch.clone());
@@ -2164,8 +2167,19 @@ impl GraphSession {
                 output.commit.as_ref().map(|c| c.graph_commit_id.clone())
             });
             let parent = parent_of(&outcome, |output: &ChangeOutput| output.commit.as_ref());
+            let branch = match &outcome {
+                WriteOutcome::Committed(output) if statement && !output.branch.is_empty() => {
+                    output.branch.clone()
+                }
+                _ => asked,
+            };
             this.update(cx, |this, cx| {
                 this.finish_write(branch, description, kind, parent, follow_up, cx);
+                // A statement may have made or deleted a branch: the list is read again, and a
+                // session on a branch it deleted moves to main.
+                if statement {
+                    this.reload_branches(cx);
+                }
             })
             .ok();
             outcome
@@ -2541,6 +2555,42 @@ mod tests {
         let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
         let branch = branch.to_owned();
         cx.new(|cx| GraphSession::new(connection, "knowledge".into(), branch, cx))
+    }
+
+    /// A branch statement names its target only in its text: its outcome is the branch the
+    /// answer names, not the session's, and the branch list is read again.
+    #[gpui::test]
+    async fn a_statement_is_recorded_on_the_branch_it_changed(cx: &mut TestAppContext) {
+        let body = serde_json::json!({
+            "branch": "release",
+            "query_name": "merge",
+            "affected_nodes": 0,
+            "affected_edges": 0,
+            "commit": { "graph_commit_id": "r9", "graph_manifest_version": 9, "created_at": 0 },
+            "branches": ["main", "release"],
+        });
+        let session = listing_session(body.to_string(), "main", cx);
+        cx.run_until_parked();
+        let write = session.update(cx, |session, cx| {
+            session.write_request(
+                ChangeRequest {
+                    query: "branch merge feature into release".into(),
+                    name: None,
+                    params: None,
+                    branch: None,
+                },
+                None,
+                "Run statement".into(),
+                cx,
+            )
+        });
+        write.await;
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.outcomes.last().unwrap().branch, "release");
+            assert_eq!(session.head("release"), Some("r9"));
+            assert_ne!(session.head("main"), Some("r9"), "main did not move");
+        });
     }
 
     /// A node type and an edge type may share a name; each keeps its own count.
