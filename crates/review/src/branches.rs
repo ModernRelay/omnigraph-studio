@@ -197,7 +197,7 @@ impl BranchList {
                         move |window: &mut Window, cx: &mut App| {
                             workspace
                                 .update(cx, |w, cx| {
-                                    open_review(w, name.clone(), TARGET.into(), false, window, cx)
+                                    open_review(w, name.clone(), TARGET.into(), window, cx)
                                 })
                                 .ok();
                         }
@@ -208,7 +208,7 @@ impl BranchList {
                         move |window: &mut Window, cx: &mut App| {
                             workspace
                                 .update(cx, |w, cx| {
-                                    open_review(w, name.clone(), TARGET.into(), true, window, cx)
+                                    open_review(w, name.clone(), TARGET.into(), window, cx)
                                 })
                                 .ok();
                         }
@@ -631,14 +631,14 @@ pub fn register(workspace: &mut Workspace) {
             return;
         };
         let branch = session.read(cx).branch.clone();
-        open_review(workspace, branch, TARGET.into(), false, window, cx);
+        open_review(workspace, branch, TARGET.into(), window, cx);
     });
     workspace.register_action(|workspace, _: &MergeBranch, window, cx| {
         let Some(session) = workspace.session() else {
             return;
         };
         let branch = session.read(cx).branch.clone();
-        open_review(workspace, branch, TARGET.into(), true, window, cx);
+        open_review(workspace, branch, TARGET.into(), window, cx);
     });
     workspace.register_action(|workspace, _: &CreateBranch, window, cx| {
         let Some(session) = workspace.session().cloned() else {

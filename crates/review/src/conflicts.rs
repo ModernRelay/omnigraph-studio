@@ -25,6 +25,7 @@ pub fn conflict_wording(kind: MergeConflictKind, here: Option<NetChange>, target
         MergeConflictKind::ValueConstraintViolation => {
             "A value breaks a constraint in the schema".into()
         }
+        MergeConflictKind::Other => "The two branches disagree".into(),
     }
 }
 

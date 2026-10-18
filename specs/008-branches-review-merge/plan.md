@@ -65,15 +65,20 @@ place), X (designed on 0.13; the better routes are deferred).
   insert cannot supply one). A changed relationship is not reverted here: edges cannot be
   updated, and the delete and insert it needs cannot share one mutation, so it would publish
   twice. Its card says so and points to the query editor.
-- Every fix is a write on the branch, bound to the reviewed head with
-  `/mutate/if-graph-commit`; a 412 says the branch moved and offers Refresh.
+- Every fix is a write on the branch, bound with `/mutate/if-graph-commit` to the reviewed head
+  or to the commit of the fix before it; a 412 says the branch moved and offers Refresh. Fixes
+  go one at a time, so a second one asked for quickly is bound to the first's commit, and each
+  outcome finds its card by the change's key, also after a Refresh. A reviewed mark is kept by
+  the change and its last commit: changed again since, it is reviewed again.
 - Data: change feed from the fork, folded per entity (first before, last after), capped at
   20,000 changes with "Partial: showing the first 20,000 changes" when capped.
 
 ### Merge
 
 - "Merge into <target>" names both branches. Before merging, the button checks the branch head
-  still equals the reviewed head.
+  still equals the reviewed head. It merges only a review on screen, with no fix out: never
+  while the review is being read (a head nobody has seen), and never from the branch list or
+  the menu, which open the review instead.
 - Outcome shown plainly: fast-forwarded, merged (with commit), already up to date.
 - A 409 opens a conflicts view: one row per conflict with its kind in words ("Changed on both
   branches", "Deleted on main, changed here", "Relationship points to a deleted node"), the
@@ -101,8 +106,10 @@ place), X (designed on 0.13; the better routes are deferred).
   - E8 merge preview with no effects: merge on request and show the 409 conflicts until then.
   - E9 branch details: derived from `GET /commits?branch=` until then.
   - E21 a branch from a commit: 0.13 forks only a branch's head (`from` names a branch).
-  - R2 unpublished commits: `as_commit` merge proposals only when the server advertises
-    `cluster_publishCommit`.
+  - R2 unpublished commits: `as_commit` merge proposals. The minimum server (0.14) serves
+    them; Studio does not use them yet.
+  - E28 a merge bound to the reviewed source head: until then a commit landing between the
+    head check and the merge is merged too, and the outcome says so.
 - Approvals and comments on reviews.
 
 ## Validation log

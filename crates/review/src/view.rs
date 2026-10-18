@@ -1,7 +1,7 @@
 //! The review tab (spec 008): what a branch changed since it forked from its target, folded per
 //! entity, with fixes bound to the reviewed head and a merge that checks the head first.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use editor::{Editor, EditorEvent};
 use gpui::{
@@ -68,6 +68,27 @@ struct CardState {
     revert_blocked: Option<String>,
 }
 
+/// What reading a merge's target showed of the merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Check {
+    /// The history is being read.
+    Reading,
+    Shown,
+    NotShown,
+    /// The history could not be read, or the source head was not known: Studio cannot tell.
+    Unread,
+}
+
+impl Check {
+    fn of(shown: Option<bool>) -> Self {
+        match shown {
+            Some(true) => Check::Shown,
+            Some(false) => Check::NotShown,
+            None => Check::Unread,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum MergeState {
     Idle,
@@ -79,15 +100,18 @@ enum MergeState {
     Merged {
         outcome: BranchMergeOutcome,
         commit: Option<String>,
-        /// `None` while Studio reads the target's history to confirm.
-        verified: Option<bool>,
+        /// What the target's history shows of it.
+        verified: Check,
+        /// The merge took a head of the branch other than the one reviewed: someone committed
+        /// to it between Studio's check and the merge.
+        beyond_review: bool,
     },
     Conflicts(Vec<MergeConflictOutput>),
     Refused(String),
     Unknown {
         reason: String,
-        /// What reading the target's history found, once read.
-        landed: Option<bool>,
+        /// What the target's history shows of it.
+        landed: Check,
     },
 }
 
@@ -106,6 +130,24 @@ struct ReviewData {
     partial: bool,
     /// The feed went past the reviewed head while reading: the branch moved.
     moved_while_reading: bool,
+}
+
+/// A fix asked for on a card: sent once the fixes before it are back.
+struct Fix {
+    /// The change's key, which finds its card when the outcome is back.
+    key: String,
+    request: ChangeRequest,
+    description: String,
+    edited: bool,
+}
+
+/// What a reviewed mark is kept by: the entity and the last commit that changed it.
+fn mark_key(change: &FoldedChange) -> String {
+    format!(
+        "{}@{}",
+        change.key(),
+        change.commits.last().map_or("", String::as_str)
+    )
 }
 
 /// A commit under review: from the commit list, or the cause of its change-feed block.
@@ -150,14 +192,18 @@ pub struct ReviewView {
     list_state: ListState,
     /// The head fixes and the merge bind to: the reviewed head, then each fix's own commit.
     bound_head: Option<String>,
-    /// Reviewed marks, by entity key, kept across Refresh.
+    /// Reviewed marks, by entity and the last commit that changed it, kept across Refresh: a
+    /// change made again since is reviewed again.
     reviewed_keys: HashSet<String>,
     merge: MergeState,
-    merge_when_loaded: bool,
     show_conflicts: bool,
     /// Someone else wrote to the branch after this review was read.
     newer: bool,
+    /// Fixes asked for and not yet back, the one out and those waiting for it.
     fixes_running: usize,
+    /// Fixes waiting for the one out: each is sent bound to the head the one before left.
+    fix_queue: VecDeque<Fix>,
+    fix_out: bool,
     /// The session saw the branch's head move while a fix or the merge was out; compared once
     /// they are back, since each moves the bound head itself.
     head_moved_while_writing: bool,
@@ -255,10 +301,11 @@ impl ReviewView {
             bound_head: None,
             reviewed_keys: HashSet::new(),
             merge: MergeState::Idle,
-            merge_when_loaded: false,
             show_conflicts: false,
             newer: false,
             fixes_running: 0,
+            fix_queue: VecDeque::new(),
+            fix_out: false,
             head_moved_while_writing: false,
             _head_watch: head_watch,
             _load_task: None,
@@ -269,10 +316,6 @@ impl ReviewView {
         };
         view.reload(cx);
         view
-    }
-
-    pub fn branch(&self) -> &str {
-        &self.branch
     }
 
     fn reviewed_head(&self) -> Option<String> {
@@ -287,9 +330,9 @@ impl ReviewView {
             .zip(self.data.iter().flat_map(|d| d.folded.changes.iter()))
         {
             if state.reviewed {
-                self.reviewed_keys.insert(change.key());
+                self.reviewed_keys.insert(mark_key(change));
             } else {
-                self.reviewed_keys.remove(&change.key());
+                self.reviewed_keys.remove(&mark_key(change));
             }
         }
         self.load = LoadState::Loading { folded: 0 };
@@ -320,7 +363,7 @@ impl ReviewView {
                     .changes
                     .iter()
                     .map(|change| CardState {
-                        reviewed: self.reviewed_keys.contains(&change.key()),
+                        reviewed: self.reviewed_keys.contains(&mark_key(change)),
                         fix: FixState::Idle,
                         revert_blocked: match &schema {
                             Some(schema) => revert_query(schema, change).err().map(|e| e.0),
@@ -338,9 +381,6 @@ impl ReviewView {
                 self.newer = data.moved_while_reading;
                 self.data = Some(data);
                 self.load = LoadState::Ready;
-                if std::mem::take(&mut self.merge_when_loaded) {
-                    self.merge(cx);
-                }
             }
             Err(error) => self.load = LoadState::Failed(error.into()),
         }
@@ -453,6 +493,10 @@ impl ReviewView {
     /// Restores a change's before image on the branch, bound to the head this review holds.
     /// Never retried; the card shows the outcome.
     fn revert(&mut self, ix: usize, cx: &mut Context<Self>) {
+        // A fix during a merge could land on either side of it.
+        if self.merging() {
+            return;
+        }
         let Some(data) = &self.data else { return };
         let Some(change) = data.folded.changes.get(ix) else {
             return;
@@ -482,19 +526,52 @@ impl ReviewView {
             params: query.params_value(),
             branch: Some(self.branch.clone()),
         };
-        let description = format!("Revert {} {}", change.type_name, change.id);
-        let if_commit = self.bound_head.clone();
+        let fix = Fix {
+            key: change.key(),
+            request,
+            description: format!("Revert {} {}", change.type_name, change.id),
+            edited: false,
+        };
         self.cards[ix].fix = FixState::Running;
+        self.queue_fix(fix, cx);
+    }
+
+    fn merging(&self) -> bool {
+        matches!(self.merge, MergeState::Checking | MergeState::Merging)
+    }
+
+    /// Sends `fix` once the fixes before it are back. Each is bound to the head the one before
+    /// left, so a second fix asked for quickly is not refused as "moved" by the first.
+    fn queue_fix(&mut self, fix: Fix, cx: &mut Context<Self>) {
         self.fixes_running += 1;
+        self.fix_queue.push_back(fix);
+        self.send_next_fix(cx);
+        cx.notify();
+    }
+
+    fn send_next_fix(&mut self, cx: &mut Context<Self>) {
+        if self.fix_out {
+            return;
+        }
+        let Some(Fix {
+            key,
+            request,
+            description,
+            edited,
+        }) = self.fix_queue.pop_front()
+        else {
+            return;
+        };
+        self.fix_out = true;
+        let if_commit = self.bound_head.clone();
         let task = self.session.update(cx, |session, cx| {
             session.write_request(request, if_commit, description, cx)
         });
         self._fix_tasks.push(cx.spawn(async move |this, cx| {
             let outcome = task.await;
-            this.update(cx, |this, cx| this.finish_fix(ix, outcome, false, cx))
+            this.update(cx, |this, cx| this.finish_fix(&key, outcome, edited, cx))
                 .ok();
         }));
-        cx.notify();
     }
 
     /// The editable properties of a node change, with what the branch holds now; `None` for
@@ -523,6 +600,29 @@ impl ReviewView {
         (!values.is_empty()).then_some(values)
     }
 
+    /// Whether a change offers Edit, as [`Self::edit_values`] would find, without copying them:
+    /// asked by every card drawn.
+    fn editable(&self, ix: usize, cx: &App) -> bool {
+        let Some(change) = self
+            .data
+            .as_ref()
+            .and_then(|data| data.folded.changes.get(ix))
+        else {
+            return false;
+        };
+        if change.is_edge() || change.after.is_none() {
+            return false;
+        }
+        self.session
+            .read(cx)
+            .schema_model()
+            .and_then(|schema| {
+                let node = schema.node(&change.type_name)?;
+                Some(node.properties.iter().any(|p| p.editable_in_cell()))
+            })
+            .unwrap_or(false)
+    }
+
     fn open_edit(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(values) = self.edit_values(ix, cx) else {
             return;
@@ -531,6 +631,7 @@ impl ReviewView {
             return;
         };
         let title = format!("{} {}", change.type_name, change.id);
+        let key = change.key();
         let branch = self.branch.clone();
         let view = cx.entity().downgrade();
         let Some(workspace) = workspace_for(window) else {
@@ -538,7 +639,7 @@ impl ReviewView {
         };
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, move |window, cx| {
-                crate::edit::EditModal::new(view, ix, title, branch, values, window, cx)
+                crate::edit::EditModal::new(view, key, title, branch, values, window, cx)
             })
         });
     }
@@ -547,10 +648,18 @@ impl ReviewView {
     /// in one mutation bound to the head this review holds. Never retried.
     pub(crate) fn save_edit(
         &mut self,
-        ix: usize,
+        key: &str,
         changes: Vec<(String, Value, Value)>,
         cx: &mut Context<Self>,
     ) {
+        // The form was filled from the change with this key; the review may have been read
+        // again since, and its cards moved.
+        if self.merging() {
+            return;
+        }
+        let Some(ix) = self.card_of(key) else {
+            return;
+        };
         let Some(change) = self.data.as_ref().and_then(|d| d.folded.changes.get(ix)) else {
             return;
         };
@@ -584,29 +693,35 @@ impl ReviewView {
             params: query.params_value(),
             branch: Some(self.branch.clone()),
         };
-        let description = format!("Edit {} {}", change.type_name, change.id);
-        let if_commit = self.bound_head.clone();
+        let fix = Fix {
+            key: key.to_owned(),
+            request,
+            description: format!("Edit {} {}", change.type_name, change.id),
+            edited: true,
+        };
         self.cards[ix].fix = FixState::Saving;
-        self.fixes_running += 1;
-        let task = self.session.update(cx, |session, cx| {
-            session.write_request(request, if_commit, description, cx)
-        });
-        self._fix_tasks.push(cx.spawn(async move |this, cx| {
-            let outcome = task.await;
-            this.update(cx, |this, cx| this.finish_fix(ix, outcome, true, cx))
-                .ok();
-        }));
-        cx.notify();
+        self.queue_fix(fix, cx);
+    }
+
+    /// The card of the change with `key` in the review as it is now.
+    fn card_of(&self, key: &str) -> Option<usize> {
+        self.data
+            .as_ref()?
+            .folded
+            .changes
+            .iter()
+            .position(|change| change.key() == key)
     }
 
     fn finish_fix(
         &mut self,
-        ix: usize,
+        key: &str,
         outcome: WriteOutcome<ChangeOutput>,
         edited: bool,
         cx: &mut Context<Self>,
     ) {
         self.fixes_running = self.fixes_running.saturating_sub(1);
+        self.fix_out = false;
         let fix = match outcome {
             WriteOutcome::Committed(output) => match output.commit {
                 Some(commit) => {
@@ -624,12 +739,14 @@ impl ReviewView {
             WriteOutcome::Refused(error) => FixState::Refused(error.body.error),
             WriteOutcome::Unknown { .. } => FixState::Unknown,
         };
-        if let Some(card) = self.cards.get_mut(ix) {
+        // Found by the change's key: a Refresh while the fix was out may have moved its card.
+        if let Some(card) = self.card_of(key).and_then(|ix| self.cards.get_mut(ix)) {
             if matches!(fix, FixState::Reverted { .. }) {
                 card.reviewed = true;
             }
             card.fix = fix;
         }
+        self.send_next_fix(cx);
         self.writes_settled(cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
@@ -673,15 +790,9 @@ impl ReviewView {
     /// Merges the branch into the target after checking the branch still sits at the head this
     /// review holds. The outcome is shown, then confirmed against the target's history.
     pub fn merge(&mut self, cx: &mut Context<Self>) {
-        match self.load {
-            LoadState::Loading { .. } => {
-                self.merge_when_loaded = true;
-                return;
-            }
-            LoadState::Failed(_) => return,
-            LoadState::Ready => {}
-        }
-        if matches!(self.merge, MergeState::Checking | MergeState::Merging) {
+        // Only a review on screen merges, with no fix out: a review being read shows a head
+        // nobody has seen, and a fix still out would land on either side of the merge.
+        if !matches!(self.load, LoadState::Ready) || self.merging() || self.fixes_running > 0 {
             return;
         }
         self.merge = MergeState::Checking;
@@ -729,17 +840,31 @@ impl ReviewView {
                     let BranchMergeOutput {
                         outcome, commit, ..
                     } = output;
+                    // The head the merge took: the merge commit's second parent, or the commit
+                    // a fast-forward moved the target to.
+                    let took = match outcome {
+                        BranchMergeOutcome::Merged => commit
+                            .as_ref()
+                            .and_then(|c| c.merged_parent_commit_id.clone()),
+                        BranchMergeOutcome::FastForward => {
+                            commit.as_ref().map(|c| c.graph_commit_id.clone())
+                        }
+                        // An outcome this build does not know names no head to compare.
+                        BranchMergeOutcome::AlreadyUpToDate | BranchMergeOutcome::Other => None,
+                    };
+                    let beyond_review = took.is_some() && took != bound;
                     let commit = commit.map(|c| c.graph_commit_id);
                     this.update(cx, |this, cx| {
                         this.merge = MergeState::Merged {
                             outcome,
                             commit: commit.clone(),
-                            verified: None,
+                            verified: Check::Reading,
+                            beyond_review,
                         };
                         cx.notify();
                     })
                     .ok();
-                    let verified = verify_merge(
+                    let verified = merge_shown(
                         &session,
                         &branch,
                         &target,
@@ -751,7 +876,8 @@ impl ReviewView {
                     MergeState::Merged {
                         outcome,
                         commit,
-                        verified: Some(verified),
+                        verified: Check::of(verified),
+                        beyond_review,
                     }
                 }
                 WriteOutcome::Refused(error) => match error.body.merge_conflicts {
@@ -762,7 +888,7 @@ impl ReviewView {
                     this.update(cx, |this, cx| {
                         this.merge = MergeState::Unknown {
                             reason: reason.clone(),
-                            landed: None,
+                            landed: Check::Reading,
                         };
                         cx.notify();
                     })
@@ -770,7 +896,10 @@ impl ReviewView {
                     // Settle by reading history, never by merging again (constitution III).
                     let landed =
                         merge_landed(&session, &branch, &target, bound.as_deref(), cx).await;
-                    MergeState::Unknown { reason, landed }
+                    MergeState::Unknown {
+                        reason,
+                        landed: Check::of(landed),
+                    }
                 }
             };
             this.update(cx, |this, cx| {
@@ -818,8 +947,8 @@ impl ReviewView {
         let colors = cx.theme().colors();
         let border = colors.border_variant;
         let focus = self.focus_handle.clone();
-        let mergeable = matches!(self.load, LoadState::Ready)
-            && !matches!(self.merge, MergeState::Checking | MergeState::Merging);
+        let mergeable =
+            matches!(self.load, LoadState::Ready) && !self.merging() && self.fixes_running == 0;
         let merge_button = studio_ui::ds::button(
             "merge",
             format!("Merge {} into {}", self.branch, self.target),
@@ -1104,6 +1233,7 @@ impl ReviewView {
                 outcome,
                 commit,
                 verified,
+                beyond_review,
             } => {
                 let what = match outcome {
                     BranchMergeOutcome::FastForward => {
@@ -1121,22 +1251,38 @@ impl ReviewView {
                             self.target, self.branch
                         )
                     }
+                    BranchMergeOutcome::Other => {
+                        format!("Merged {} into {}.", self.branch, self.target)
+                    }
                 };
                 let check = match verified {
-                    None => format!(" Checking {}'s history…", self.target),
-                    Some(true) => format!(" Confirmed in {}'s history.", self.target),
-                    Some(false) => format!(
+                    Check::Reading => format!(" Checking {}'s history…", self.target),
+                    Check::Shown => format!(" Confirmed in {}'s history.", self.target),
+                    Check::NotShown => format!(
                         " Not found in {}'s history yet; open History to check.",
                         self.target
                     ),
+                    Check::Unread => format!(
+                        " {}'s history could not be read to confirm it; open History to check.",
+                        self.target
+                    ),
+                };
+                let beyond = if *beyond_review {
+                    format!(
+                        " The merge took a commit of {} made after the review was read; open \
+                         History to see what else landed.",
+                        self.branch
+                    )
+                } else {
+                    String::new()
                 };
                 (
-                    if *verified == Some(false) {
+                    if matches!(verified, Check::NotShown | Check::Unread) || *beyond_review {
                         Severity::Warning
                     } else {
                         Severity::Success
                     },
-                    format!("{what}{check}"),
+                    format!("{what}{check}{beyond}"),
                     None,
                 )
             }
@@ -1173,16 +1319,20 @@ impl ReviewView {
             MergeState::Unknown { reason, landed } => (
                 Severity::Warning,
                 match landed {
-                    None => format!(
+                    Check::Reading => format!(
                         "The merge outcome is unknown ({reason}). Studio did not retry; reading {}'s history…",
                         self.target
                     ),
-                    Some(true) => format!(
+                    Check::Shown => format!(
                         "The merge response was lost ({reason}), but {}'s history shows the merge landed.",
                         self.target
                     ),
-                    Some(false) => format!(
+                    Check::NotShown => format!(
                         "The merge response was lost ({reason}) and {}'s history does not show it. Studio did not retry; merge again when ready.",
+                        self.target
+                    ),
+                    Check::Unread => format!(
+                        "The merge outcome is unknown ({reason}), and {}'s history could not be read to tell. Studio did not retry; open History before merging again.",
                         self.target
                     ),
                 },
@@ -1369,7 +1519,7 @@ impl ReviewView {
                         | FixState::Reverted { .. }
                         | FixState::Edited { .. }
                 );
-                let editable = self.edit_values(ix, cx).is_some();
+                let editable = self.editable(ix, cx);
                 let edit_button = editable.then(|| {
                     Button::new(("edit", ix), "Edit")
                         .label_size(LabelSize::XSmall)
@@ -1468,11 +1618,6 @@ fn search_text_of(change: &FoldedChange) -> String {
         }
     }
     text.to_lowercase()
-}
-
-#[cfg(test)]
-fn change_matches(change: &FoldedChange, query: &str) -> bool {
-    query.is_empty() || search_text_of(change).contains(query)
 }
 
 fn build_rows(data: &ReviewData, query: &str) -> Vec<Row> {
@@ -1789,20 +1934,6 @@ async fn read_review_by_histories(
     Ok(fed.into_review(fork, head, cx).await)
 }
 
-/// Whether the target holds the merge just reported.
-async fn verify_merge(
-    session: &Entity<GraphSession>,
-    source: &str,
-    target: &str,
-    commit: Option<&str>,
-    source_head: Option<&str>,
-    cx: &mut AsyncApp,
-) -> bool {
-    merge_shown(session, source, target, commit, source_head, cx)
-        .await
-        .unwrap_or(false)
-}
-
 /// After a lost merge response: whether the target holds the source head.
 async fn merge_landed(
     session: &Entity<GraphSession>,
@@ -1903,11 +2034,12 @@ impl Render for ReviewView {
 
 /// Opens (or activates) the review of `branch` against `target`. `merge` starts the merge as
 /// soon as the review has read the branch head.
+/// Opens the review of `branch` against `target`. A merge starts there, from a head the person
+/// has seen: opening never merges.
 pub fn open_review(
     workspace: &mut Workspace,
     branch: String,
     target: String,
-    merge: bool,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
@@ -1923,12 +2055,9 @@ pub fn open_review(
         return;
     }
     let key = review_key(&branch, &target);
-    let view = workspace.open_item::<ReviewView>(key, window, cx, |window, cx| {
+    workspace.open_item::<ReviewView>(key, window, cx, |window, cx| {
         ReviewView::new(session, branch, target, window, cx)
     });
-    if merge && let Some(view) = view {
-        view.update(cx, |view, cx| view.merge(cx));
-    }
 }
 
 #[cfg(test)]
@@ -1959,12 +2088,94 @@ mod tests {
             "person-000001",
             json!({"name": "Donald Dijkstra", "born": 1985}),
         );
-        assert!(change_matches(&c, ""));
-        assert!(change_matches(&c, "000001"));
-        assert!(change_matches(&c, "person"));
-        assert!(change_matches(&c, "dijkstra"));
-        assert!(change_matches(&c, "1985"));
-        assert!(!change_matches(&c, "lovelace"));
+        let text = search_text_of(&c);
+        for found in ["000001", "person", "dijkstra", "1985"] {
+            assert!(text.contains(found), "{found}");
+        }
+        assert!(!text.contains("lovelace"));
+    }
+
+    /// A reviewed mark holds for the change as it was reviewed: changed again since, it is
+    /// reviewed again.
+    #[test]
+    fn a_reviewed_mark_is_kept_by_the_change_and_its_last_commit() {
+        let reviewed = change("p1", json!({"name": "Ada"}));
+        let mut again = reviewed.clone();
+        again.commits.push("c2".into());
+        assert_eq!(mark_key(&reviewed), mark_key(&reviewed.clone()));
+        assert_ne!(mark_key(&reviewed), mark_key(&again));
+    }
+
+    /// Fixes asked for one after the other go one at a time, each bound to the commit the one
+    /// before made, and the merge waits for them.
+    #[gpui::test]
+    async fn fixes_go_one_at_a_time_each_bound_to_the_head_the_one_before_left(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, asked) = reviewed_server_writing(false, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        asked.lock().unwrap().clear();
+        view.update(cx, |view, cx| {
+            assert!(matches!(view.load, LoadState::Ready));
+            view.revert(0, cx);
+            view.revert(1, cx);
+            assert_eq!(view.fixes_running, 2);
+            view.merge(cx);
+            assert!(
+                matches!(view.merge, MergeState::Idle),
+                "no merge while fixes are out"
+            );
+        });
+        cx.run_until_parked();
+        let bound: Vec<String> = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.contains("/mutate"))
+            .map(|request| request.rsplit(' ').next().unwrap().to_owned())
+            .collect();
+        assert_eq!(bound, ["f2", "r1"]);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.fixes_running, 0);
+            assert_eq!(view.bound_head.as_deref(), Some("r2"));
+            for card in &view.cards {
+                assert!(
+                    matches!(card.fix, FixState::Reverted { .. }),
+                    "{:?}",
+                    card.fix
+                );
+            }
+        });
+    }
+
+    /// A merge that took a commit of the branch made after Studio's check says so: what landed
+    /// is more than was reviewed.
+    #[gpui::test]
+    async fn a_merge_of_a_head_newer_than_the_review_says_so(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        for (took, beyond) in [("f2", false), ("f3", true)] {
+            let (session, _) = review_server(false, None, took, |_| (500, json!({})), cx);
+            let (view, cx) = cx.add_window_view(|window, cx| {
+                ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+            });
+            cx.run_until_parked();
+            view.update(cx, |view, cx| view.merge(cx));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| match &view.merge {
+                MergeState::Merged { beyond_review, .. } => assert_eq!(*beyond_review, beyond),
+                _ => panic!("not merged"),
+            });
+        }
     }
 
     /// A server for a review of `feature` against `main`: `feature` forked at m1 and committed
@@ -1978,17 +2189,72 @@ mod tests {
         Entity<GraphSession>,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
+        review_server(merged_in, None, "f2", |_| (500, json!({})), cx)
+    }
+
+    /// As [`reviewed_server`], the branch's writes committing r1, r2, … each on the last.
+    fn reviewed_server_writing(
+        merged_in: bool,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        // Two people added: each revert deletes one.
+        let added = |id: &str| json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": id, "op": "insert", "before": null, "after": { "properties": { "slug": id, "name": "x" } } });
+        let block = |id: &str, parent: &str, change: Value| json!({ "cause": { "graph_commit_id": id, "parent_commit_id": parent, "authored_branch": "feature", "authored_at": 0, "actor_id": "act-dev" }, "changes": [change] });
+        let feed = json!({ "blocks": [block("f1", "m1", added("p1")), block("f2", "f1", added("p2"))], "cursor": "c", "caught_up": true });
+        review_server(
+            merged_in,
+            Some(feed),
+            "f2",
+            |n| {
+                let parent = if n == 0 {
+                    "f2".to_owned()
+                } else {
+                    format!("r{n}")
+                };
+                (
+                    200,
+                    json!({ "branch": "feature", "query_name": "q", "affected_nodes": 1, "affected_edges": 0,
+                        "commit": { "graph_commit_id": format!("r{}", n + 1), "graph_manifest_version": 3, "created_at": 0, "parent_commit_id": parent } }),
+                )
+            },
+            cx,
+        )
+    }
+
+    /// A merge commits m3, merging `took` of `feature`.
+    fn review_server(
+        merged_in: bool,
+        feed: Option<Value>,
+        took: &'static str,
+        write: impl Fn(usize) -> (u16, Value) + Send + Sync + 'static,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let writes = std::sync::atomic::AtomicUsize::new(0);
         let commit = |id: &str, parent: Option<&str>| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "created_at": 0, "parent_commit_id": parent, "actor_id": "act-dev" });
         let person = |id: &str, op: &str| json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": id, "op": op, "before": { "properties": { "slug": id } }, "after": { "properties": { "slug": id, "name": "x" } } });
         let block = |id: &str, parent: &str, change: Value| json!({ "cause": { "graph_commit_id": id, "parent_commit_id": parent, "authored_branch": "feature", "authored_at": 0, "actor_id": "act-dev" }, "changes": [change] });
         let base_id = if merged_in { "m2" } else { "m1" };
         let base = json!({ "merge_base": commit(base_id, Some("m1")), "source": "feature", "source_commit_id": "f2", "target": "main", "target_commit_id": "m2" });
-        let feed = json!({ "blocks": [block("f1", "m1", person("p1", "insert")), block("f2", "f1", person("p2", "update"))], "cursor": "c", "caught_up": true });
+        let feed = feed.unwrap_or_else(|| json!({ "blocks": [block("f1", "m1", person("p1", "insert")), block("f2", "f1", person("p2", "update"))], "cursor": "c", "caught_up": true }));
         let feature = json!({ "commits": [commit("f2", Some("f1")), commit("f1", Some("m1")), commit("m1", None)] });
         let main = json!({ "commits": [commit("m2", Some("m1")), commit("m1", None)] });
         fake_server(
             move |path, query| {
-                if path.ends_with("/schema") {
+                if path.contains("/mutate") {
+                    write(writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+                } else if path.ends_with("/branches/merge") {
+                    let merge = json!({ "graph_commit_id": "m3", "graph_manifest_version": 4, "created_at": 0, "parent_commit_id": "m2", "merged_parent_commit_id": took });
+                    (
+                        200,
+                        json!({ "source": "feature", "target": "main", "outcome": "merged", "commit": merge }),
+                    )
+                } else if path.ends_with("/schema") {
                     (
                         200,
                         json!({ "schema_source": "node Person {\n  slug: String @key\n  name: String?\n}\n" }),
@@ -2033,7 +2299,13 @@ mod tests {
         let http = FakeHttpClient::create(move |request| {
             let path = request.uri().path().to_owned();
             let query = request.uri().query().unwrap_or_default().to_owned();
-            seen.lock().unwrap().push(format!("{path}?{query}"));
+            let bound = request
+                .headers()
+                .get(graph_client::IF_GRAPH_COMMIT_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            seen.lock().unwrap().push(format!("{path}?{query} {bound}"));
             let (status, body) = answer(&path, &query);
             async move {
                 Ok(Response::builder()
@@ -2140,8 +2412,8 @@ mod tests {
             cx,
         );
         let mut async_cx = cx.to_async();
-        assert!(
-            verify_merge(
+        assert_eq!(
+            merge_shown(
                 &session,
                 "feature",
                 "main",
@@ -2149,7 +2421,8 @@ mod tests {
                 Some("f2"),
                 &mut async_cx
             )
-            .await
+            .await,
+            Some(true)
         );
         assert_eq!(
             merge_landed(&session, "feature", "main", Some("f2"), &mut async_cx).await,
@@ -2160,5 +2433,19 @@ mod tests {
             merge_landed(&session, "feature", "main", Some("f9"), &mut async_cx).await,
             Some(false)
         );
+
+        // A history that cannot be read tells nothing: not "not found".
+        let (session, _) = fake_server(|_, _| (500, json!({ "error": "down" })), cx);
+        let mut async_cx = cx.to_async();
+        let shown = merge_shown(
+            &session,
+            "feature",
+            "main",
+            Some("m3"),
+            Some("f2"),
+            &mut async_cx,
+        )
+        .await;
+        assert_eq!(Check::of(shown), Check::Unread);
     }
 }

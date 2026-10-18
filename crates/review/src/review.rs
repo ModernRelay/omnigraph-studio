@@ -12,23 +12,15 @@ use gpui::{App, AppContext as _, Focusable as _};
 use studio_workspace::{PanelPosition, Workspace};
 use ui::IconName;
 
-pub use branches::{BranchList, CreateBranchModal, DeleteBranchModal, TARGET};
-pub use conflicts::conflict_wording;
-pub use view::{ReviewView, open_review, review_key};
+use branches::BranchList;
+use view::open_review;
 
 /// Registers this surface with every new workspace.
 pub fn init(cx: &mut App) {
     studio_workspace::register_item_kind(cx, "review", |data, workspace, window, cx| {
         let field = |name: &str| data.get(name).and_then(|value| value.as_str());
         if let (Some(branch), Some(target)) = (field("branch"), field("target")) {
-            open_review(
-                workspace,
-                branch.to_owned(),
-                target.to_owned(),
-                false,
-                window,
-                cx,
-            );
+            open_review(workspace, branch.to_owned(), target.to_owned(), window, cx);
         }
     });
     cx.observe_new(|workspace: &mut Workspace, window, cx| {

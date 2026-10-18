@@ -26,7 +26,8 @@ struct Field {
 
 pub(crate) struct EditModal {
     view: WeakEntity<ReviewView>,
-    card: usize,
+    /// The change the form edits, by its key.
+    key: String,
     title: SharedString,
     branch: String,
     fields: Vec<Field>,
@@ -49,7 +50,7 @@ impl Focusable for EditModal {
 impl EditModal {
     pub(crate) fn new(
         view: WeakEntity<ReviewView>,
-        card: usize,
+        key: String,
         title: String,
         branch: String,
         values: Vec<(Property, Value)>,
@@ -75,7 +76,7 @@ impl EditModal {
             .collect();
         Self {
             view,
-            card,
+            key,
             title: title.into(),
             branch,
             fields,
@@ -109,9 +110,9 @@ impl EditModal {
         if changes.is_empty() {
             return;
         }
-        let card = self.card;
+        let key = self.key.clone();
         self.view
-            .update(cx, |view, cx| view.save_edit(card, changes, cx))
+            .update(cx, |view, cx| view.save_edit(&key, changes, cx))
             .ok();
     }
 }
