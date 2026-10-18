@@ -178,16 +178,16 @@ pub fn is_numeric(value: &Value) -> bool {
 }
 
 /// A small colored square for a node or edge type.
-pub fn type_swatch(type_name: &str) -> Div {
-    type_mark(type_name, type_name)
+pub fn type_swatch(type_name: &str, cx: &App) -> Div {
+    type_mark(type_name, type_name, cx)
 }
 
 /// A node type's tinted mark, or for a relationship a neutral arrow: a relationship is a line,
 /// not a thing, so only node types carry a colour.
-pub fn kind_swatch(type_name: &str, is_edge: bool) -> Div {
+pub fn kind_swatch(type_name: &str, is_edge: bool, cx: &App) -> Div {
     if is_edge {
         div()
-            .size(px(16.))
+            .size(px(ds::size::ROW_ICON))
             .flex_none()
             .flex()
             .items_center()
@@ -198,14 +198,14 @@ pub fn kind_swatch(type_name: &str, is_edge: bool) -> Div {
                     .color(Color::Muted),
             )
     } else {
-        type_swatch(type_name)
+        type_swatch(type_name, cx)
     }
 }
 
 /// The type mark: the initial of `label` (a node's label, or the type's name) in white on
 /// the type's tint, a 16-pixel rounded square. The tint says what kind of thing it is, the
 /// letter which one.
-pub fn type_mark(type_name: &str, label: &str) -> Div {
+pub fn type_mark(type_name: &str, label: &str, cx: &App) -> Div {
     let color: Hsla = type_color(type_name);
     let initial = label
         .trim()
@@ -216,12 +216,12 @@ pub fn type_mark(type_name: &str, label: &str) -> Div {
         .to_uppercase()
         .collect::<String>();
     div()
-        .size(px(16.))
+        .size(px(ds::size::ROW_ICON))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(ds::radius::XS))
+        .rounded(px(ds::radii(cx).xs))
         .bg(color)
         .text_color(gpui::white())
         .text_size(px(9.))

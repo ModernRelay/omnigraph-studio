@@ -289,6 +289,7 @@ impl StorageInspector {
                                 .child(studio_ui::kind_swatch(
                                     &dataset.type_name,
                                     dataset.entity_kind == graph_client::api::EntityKind::Edge,
+                                    cx,
                                 ))
                                 .child(
                                     CopyableValue::new(
@@ -509,7 +510,6 @@ impl Render for StorageInspector {
                     .child(
                         studio_ui::ds::button("refresh-storage", "Refresh")
                             .style(ButtonStyle::Subtle)
-                            .label_size(LabelSize::Small)
                             .start_icon(Icon::new(IconName::RotateCw).size(IconSize::Small))
                             .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
                     ),

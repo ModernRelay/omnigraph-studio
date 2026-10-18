@@ -7,7 +7,7 @@ use gpui::{
 };
 use studio_actions::agent::{Allow, AllowAlways, Reject};
 use studio_actions::table::{DeleteRow, EditCell, InsertRow, PeekRow};
-use studio_ui::ds::{self, ActivityRow, SidebarRow, radius, size, space, surface, text};
+use studio_ui::ds::{self, ActivityRow, SidebarRow, radii, size, space, surface, text};
 use studio_ui::{GridColumn, grid_header};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
@@ -92,13 +92,13 @@ impl Render for DesignGallery {
                     .child(text::meta(format!("{name} {value}")))
             }),
         );
-        let radii = h_flex().gap(px(space::XL)).children(
+        let corners = h_flex().gap(px(space::XL)).children(
             [
-                ("XS", radius::XS),
-                ("SM", radius::SM),
-                ("MD", radius::MD),
-                ("LG", radius::LG),
-                ("MODAL", radius::MODAL),
+                ("XS", radii(cx).xs),
+                ("SM", radii(cx).sm),
+                ("MD", radii(cx).md),
+                ("LG", radii(cx).lg),
+                ("MODAL", radii(cx).modal),
             ]
             .into_iter()
             .map(|(name, value)| {
@@ -123,11 +123,11 @@ impl Render for DesignGallery {
                 .child(
                     div()
                         .size(px(56.))
-                        .rounded(px(radius::MD))
+                        .rounded(px(radii(cx).md))
                         .bg(fill)
                         .border_1()
                         .border_color(surface::rule(cx))
-                        .when(shadow, |d| d.shadow(ds::elevation::raised())),
+                        .when(shadow, |d| d.shadow(ds::elevation::raised(cx))),
                 )
                 .child(text::meta(name))
         };
@@ -168,7 +168,7 @@ impl Render for DesignGallery {
         };
         let sidebar = v_flex()
             .w(px(size::SIDEBAR_WIDTH))
-            .rounded(px(radius::LG))
+            .rounded(px(radii(cx).lg))
             .relative()
             .overflow_hidden()
             .map(|d| {
@@ -206,18 +206,18 @@ impl Render for DesignGallery {
                     .child(ds::section_label("Types"))
                     .child(
                         SidebarRow::new("g-company", "Company")
-                            .start(studio_ui::type_swatch("Company"))
+                            .start(studio_ui::type_swatch("Company", cx))
                             .end(ds::sidebar_count("25")),
                     )
                     .child(
                         SidebarRow::new("g-person", "Person")
-                            .start(studio_ui::type_swatch("Person"))
+                            .start(studio_ui::type_swatch("Person", cx))
                             .end(ds::sidebar_count("200"))
                             .selected(true),
                     )
                     .child(
                         SidebarRow::new("g-knows", "Knows")
-                            .start(studio_ui::kind_swatch("Knows", true))
+                            .start(studio_ui::kind_swatch("Knows", true, cx))
                             .end(ds::sidebar_count("412"))
                             .muted(true),
                     )
@@ -250,7 +250,7 @@ impl Render for DesignGallery {
             .px(px(space::SM))
             .gap(px(space::XS))
             .items_center()
-            .rounded(px(radius::MD))
+            .rounded(px(radii(cx).md))
             .border_1()
             .border_color(surface::rule(cx))
             .child(ds::title_tab(
@@ -323,13 +323,12 @@ impl Render for DesignGallery {
         let table = ds::card(cx)
             .child(
                 ds::toolbar(cx)
-                    .child(studio_ui::type_swatch("Person"))
+                    .child(studio_ui::type_swatch("Person", cx))
                     .child(text::title("Person"))
                     .child(text::muted("200 rows"))
                     .child(div().flex_1())
                     .child(
                         studio_ui::ds::button("g-filter", "Filter")
-                            .label_size(LabelSize::Small)
                             .start_icon(Icon::new(IconName::Filter).size(IconSize::Small)),
                     ),
             )
@@ -384,7 +383,6 @@ impl Render for DesignGallery {
                 ds::card_footer(cx)
                     .child(
                         studio_ui::ds::button("g-allow", "Allow")
-                            .label_size(LabelSize::Small)
                             .start_icon(
                                 Icon::new(IconName::Check)
                                     .size(IconSize::XSmall)
@@ -394,7 +392,6 @@ impl Render for DesignGallery {
                     )
                     .child(
                         studio_ui::ds::button("g-always", "Always on this branch")
-                            .label_size(LabelSize::Small)
                             .start_icon(
                                 Icon::new(IconName::CheckDouble)
                                     .size(IconSize::XSmall)
@@ -405,7 +402,6 @@ impl Render for DesignGallery {
                     .child(div().flex_1())
                     .child(
                         studio_ui::ds::button("g-reject", "Reject")
-                            .label_size(LabelSize::Small)
                             .start_icon(
                                 Icon::new(IconName::Close)
                                     .size(IconSize::XSmall)
@@ -449,7 +445,7 @@ impl Render for DesignGallery {
 
         let empty = div()
             .h(px(240.))
-            .rounded(px(radius::MD))
+            .rounded(px(radii(cx).md))
             .border_1()
             .border_color(surface::rule(cx))
             .child(
@@ -458,7 +454,6 @@ impl Render for DesignGallery {
                         studio_ui::ds::button("g-search", "Search")
                             .full_width()
                             .style(ButtonStyle::Outlined)
-                            .label_size(LabelSize::Small)
                             .start_icon(
                                 Icon::new(IconName::MagnifyingGlass)
                                     .size(IconSize::Small)
@@ -472,7 +467,7 @@ impl Render for DesignGallery {
         let state_frame = || {
             div()
                 .h(px(160.))
-                .rounded(px(radius::MD))
+                .rounded(px(radii(cx).md))
                 .border_1()
                 .border_color(surface::rule(cx))
         };
@@ -519,7 +514,7 @@ impl Render for DesignGallery {
         let card_a = ds::card(cx)
             .p(px(space::LG))
             .gap(px(space::MD))
-            .child(ds::tile(IconName::Folder))
+            .child(ds::tile(IconName::Folder, cx))
             .child(div().h(px(space::XL)))
             .child(text::body("Saved queries").weight(gpui::FontWeight::MEDIUM))
             .child(ds::meta_row([
@@ -538,7 +533,7 @@ impl Render for DesignGallery {
         let card_b = ds::card(cx)
             .p(px(space::LG))
             .gap(px(space::MD))
-            .child(ds::tile(IconName::Code))
+            .child(ds::tile(IconName::Code, cx))
             .child(
                 v_flex()
                     .child(text::body("People without a company").weight(gpui::FontWeight::MEDIUM))
@@ -584,7 +579,7 @@ impl Render for DesignGallery {
                     .h(px(36.))
                     .px(px(space::LG))
                     .gap(px(space::SM))
-                    .rounded(px(radius::MD))
+                    .rounded(px(radii(cx).md))
                     .border_1()
                     .border_color(surface::raised_border(cx))
                     .bg(colors.editor_background)
@@ -663,7 +658,7 @@ impl Render for DesignGallery {
                                     .color(Color::Muted),
                             ),
                     )
-                    .child(ds::round_button("g-send", IconName::ArrowUp, true, cx)),
+                    .child(ds::composer_button("g-send", IconName::ArrowUp, true, cx)),
             );
 
         let settings_rows = ds::card(cx)
@@ -717,9 +712,7 @@ impl Render for DesignGallery {
                             .into_iter()
                             .enumerate()
                             .map(|(index, (label, variant))| {
-                                ds::Button::new(("g-variant", index), label)
-                                    .variant(variant)
-                                    .label_size(LabelSize::Small)
+                                ds::Button::new(("g-variant", index), label).variant(variant)
                             }),
                     ),
             )
@@ -731,7 +724,6 @@ impl Render for DesignGallery {
                         ds::Button::new(("g-size", index), label)
                             .variant(ds::Variant::Outline)
                             .size(size)
-                            .label_size(LabelSize::Small)
                     }))
                     .children(sizes.into_iter().enumerate().map(|(index, (_, size))| {
                         ds::IconButton::new(("g-icon-size", index), IconName::Plus)
@@ -744,20 +736,14 @@ impl Render for DesignGallery {
                 h_flex()
                     .gap(px(space::MD))
                     .items_center()
-                    .child(
-                        ds::Button::new("g-toggled", "Toggled")
-                            .label_size(LabelSize::Small)
-                            .toggle_state(true),
-                    )
+                    .child(ds::Button::new("g-toggled", "Toggled").toggle_state(true))
                     .child(
                         ds::Button::new("g-disabled", "Disabled")
                             .variant(ds::Variant::Primary)
-                            .label_size(LabelSize::Small)
                             .disabled(true),
                     )
                     .child(
                         ds::Button::new("g-icon-label", "Row")
-                            .label_size(LabelSize::Small)
                             .start_icon(Icon::new(IconName::Plus).size(IconSize::Small)),
                     )
                     .child(ds::icon_button("g-icon-ghost", IconName::Ellipsis))
@@ -777,7 +763,7 @@ impl Render for DesignGallery {
             )
             .child(
                 ds::modal_body().child(
-                    ds::row_list()
+                    ds::row_list(cx)
                         .bg(colors.editor_background)
                         .border_color(surface::floating_border(cx))
                         .child(
@@ -785,7 +771,7 @@ impl Render for DesignGallery {
                                 .h(px(size::SIDEBAR_ROW))
                                 .px(px(space::MD))
                                 .gap(px(space::MD))
-                                .child(studio_ui::type_swatch("Person"))
+                                .child(studio_ui::type_swatch("Person", cx))
                                 .child(Label::new("Ada Lovelace").size(LabelSize::Small))
                                 .child(div().flex_1())
                                 .child(
@@ -845,7 +831,7 @@ impl Render for DesignGallery {
                     .gap(px(space::XXXL))
                     .items_start()
                     .child(section("Spacing", scale))
-                    .child(section("Radii", radii)),
+                    .child(section("Radii", corners)),
             )
             .child(
                 h_flex()

@@ -775,7 +775,7 @@ impl InsertEdgeModal {
             let pick = cx.listener(move |this, index: &usize, window, cx| {
                 this.pick(end, *index, window, cx)
             });
-            studio_ui::ds::row_list()
+            studio_ui::ds::row_list(cx)
                 .id(("endpoint-suggestions", end as usize))
                 .max_h(px(208.))
                 .overflow_y_scroll()
@@ -1232,7 +1232,7 @@ impl DeleteRowModal {
             Loadable::Loaded(plan) if plan.dependents.is_empty() => None,
             Loadable::Loaded(plan) => {
                 let hidden = plan.dependents.len().saturating_sub(DEPENDENTS_NAMED);
-                let list = studio_ui::ds::row_list()
+                let list = studio_ui::ds::row_list(cx)
                     .bg(cx.theme().colors().editor_background)
                     .border_color(studio_ui::ds::surface::floating_border(cx))
                     .children(plan.dependents.iter().take(DEPENDENTS_NAMED).map(|d| {
@@ -1240,7 +1240,7 @@ impl DeleteRowModal {
                             .h(px(studio_ui::ds::size::SIDEBAR_ROW))
                             .px(px(studio_ui::ds::space::MD))
                             .gap(px(studio_ui::ds::space::MD))
-                            .child(studio_ui::type_swatch(&d.type_name))
+                            .child(studio_ui::type_swatch(&d.type_name, cx))
                             .child(
                                 div().min_w_0().flex_1().child(
                                     Label::new(d.label.clone().unwrap_or_else(|| d.id.clone()))

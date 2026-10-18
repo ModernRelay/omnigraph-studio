@@ -11,7 +11,7 @@
 #![allow(clippy::type_complexity, clippy::collapsible_if)]
 
 use crate::button::{Button, IconButton};
-use crate::ds::{elevation, radius, size, space, surface};
+use crate::ds::{elevation, radii, size, space, surface};
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, DismissEvent, Entity, EventEmitter, FocusHandle,
     Focusable, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Role,
@@ -2457,7 +2457,7 @@ pub fn menu_surface<E: Styled>(element: E, cx: &App) -> E {
         .bg(surface::floating(cx))
         .border_1()
         .border_color(surface::floating_border(cx))
-        .rounded(px(radius::MENU))
+        .rounded(px(radii(cx).menu()))
         .shadow(elevation::floating(cx))
 }
 
@@ -2500,7 +2500,7 @@ type HoverHandler = Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>;
 pub struct MenuRow {
     id: ElementId,
     height: f32,
-    radius: f32,
+    radius: Option<f32>,
     group: Option<SharedString>,
     disabled: bool,
     selectable: bool,
@@ -2522,7 +2522,7 @@ impl MenuRow {
         Self {
             id: id.into(),
             height: size::MENU_ROW,
-            radius: radius::MENU_ITEM,
+            radius: None,
             group: None,
             disabled: false,
             selectable: true,
@@ -2548,7 +2548,7 @@ impl MenuRow {
 
     /// The corner, for a row in a card other than a menu's: the card's radius less its inset.
     pub fn radius(mut self, radius: f32) -> Self {
-        self.radius = radius;
+        self.radius = Some(radius);
         self
     }
 
@@ -2640,7 +2640,7 @@ impl RenderOnce for MenuRow {
             .min_h(px(self.height))
             .px(px(space::MD))
             .gap(px(space::MD))
-            .rounded(px(self.radius))
+            .rounded(px(self.radius.unwrap_or_else(|| radii(cx).menu_item())))
             .when_some(self.role, |this, role| {
                 this.role(role)
                     .aria_selected(self.selected)

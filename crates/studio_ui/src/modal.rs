@@ -11,7 +11,7 @@ use ui::Tooltip;
 use ui::prelude::*;
 
 use crate::button::{Button, IconButton, Variant};
-use crate::ds::{elevation, radius, size, space, surface};
+use crate::ds::{elevation, radii, radius, size, space, surface};
 
 /// A modal's card: the floating fill, its hairline, the floating shadow and the modal radius,
 /// [`size::MODAL_WIDTH`] wide. Children are a [`ModalHeader`], [`modal_body`] and
@@ -20,7 +20,7 @@ pub fn modal(cx: &App) -> Div {
     v_flex()
         .w(px(size::MODAL_WIDTH))
         .max_w_full()
-        .rounded(px(radius::MODAL))
+        .rounded(px(radii(cx).modal))
         .bg(surface::floating(cx))
         .border_1()
         .border_color(surface::floating_border(cx))
@@ -140,21 +140,17 @@ pub fn modal_footer(cx: &App) -> Div {
         .border_color(surface::floating_border(cx))
         .bg(cx.theme().colors().text.opacity(0.025))
         // Its fill meets the card's bottom corners.
-        .rounded_b(px(radius::flush(radius::MODAL)))
+        .rounded_b(px(radius::flush(radii(cx).modal)))
 }
 
 /// A modal's Cancel: an outline pill at a control's height.
 pub fn cancel_button(id: impl Into<ElementId>) -> Button {
-    Button::new(id, "Cancel")
-        .variant(Variant::Outline)
-        .label_size(LabelSize::Small)
+    Button::new(id, "Cancel").variant(Variant::Outline)
 }
 
 /// A modal's action: solid ink; [`Variant::Destructive`] for one that deletes.
 pub fn action_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
-    Button::new(id, label)
-        .variant(Variant::Primary)
-        .label_size(LabelSize::Small)
+    Button::new(id, label).variant(Variant::Primary)
 }
 
 /// The branch a modal writes to, beside its title: a quiet pill.
@@ -162,11 +158,11 @@ pub fn write_target(branch: impl Into<SharedString>, cx: &App) -> Div {
     let branch: SharedString = branch.into();
     h_flex()
         .flex_none()
-        .h(px(20.))
+        .h(px(size::TAG))
         .px(px(space::MD))
         .gap(px(space::XS))
         .items_center()
-        .rounded_full()
+        .rounded(px(radii(cx).xs))
         .bg(surface::pressed(cx))
         .child(
             Icon::new(IconName::GitBranch)

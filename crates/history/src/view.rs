@@ -606,7 +606,7 @@ impl HistoryView {
                     .mx(px(studio_ui::ds::space::SM))
                     .pr(px(studio_ui::ds::space::MD))
                     .gap(px(studio_ui::ds::space::LG))
-                    .rounded(px(studio_ui::ds::radius::SM))
+                    .rounded(px(studio_ui::ds::radii(cx).sm))
                     .when(selected, |d| d.bg(selected_bg))
                     .when(!selected, |d| d.hover(|d| d.bg(hover_bg)))
                     .cursor_pointer()

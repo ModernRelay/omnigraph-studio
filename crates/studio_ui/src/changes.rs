@@ -4,7 +4,7 @@
 
 use std::rc::Rc;
 
-use crate::ds::{radius, space};
+use crate::ds::{radii, radius, space};
 use gpui::{AnyElement, App, ClickEvent, Div, ElementId, SharedString, Window};
 use serde_json::Value;
 use ui::prelude::*;
@@ -310,7 +310,7 @@ impl RenderOnce for ChangeCard {
         let card = h_flex()
             .id(self.id)
             .w_full()
-            .rounded(px(radius::MD))
+            .rounded(px(radii(cx).md))
             .border_1()
             .border_color(border)
             .overflow_hidden()
@@ -320,7 +320,7 @@ impl RenderOnce for ChangeCard {
                     .h_full()
                     .flex_none()
                     // Its fill meets the card's left corners.
-                    .rounded_l(px(radius::flush(radius::MD)))
+                    .rounded_l(px(radius::flush(radii(cx).md)))
                     .when(!self.hollow && kind != ChangeKind::Unchanged, |d| {
                         d.bg(accent)
                     }),
@@ -529,7 +529,7 @@ impl RenderOnce for RelationshipLine {
             .id(self.id)
             .min_w_0()
             .px(px(space::XS))
-            .rounded(px(radius::XS))
+            .rounded(px(radii(cx).xs))
             .when_some(self.hover_group, |d, group| d.group(group))
             .when(self.selected, |d| d.bg(colors.element_selected))
             .when(!self.selected, |d| d.hover(|d| d.bg(colors.element_hover)))
@@ -572,12 +572,13 @@ pub fn change_group_header(
     added: usize,
     changed: usize,
     removed: usize,
+    cx: &App,
 ) -> Div {
     h_flex()
         .gap(px(space::MD))
         .pt(px(space::LG))
         .pb(px(space::XS))
-        .child(crate::kind_swatch(type_name, is_edge))
+        .child(crate::kind_swatch(type_name, is_edge, cx))
         .child(Label::new(type_name.to_owned()).size(LabelSize::Small))
         .child(
             Label::new(if is_edge { "relationship" } else { "node" })

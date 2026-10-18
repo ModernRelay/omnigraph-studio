@@ -26,7 +26,7 @@ use studio_actions::review::{
     AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext,
 };
 use studio_ui::ds::Button;
-use studio_ui::ds::{radius, space};
+use studio_ui::ds::{radii, space};
 use studio_ui::menu::ContextMenu;
 use studio_ui::{
     ChangeCard, ChangeKind, PropertyRow, RelationshipLine, change_counts, change_group_header,
@@ -1114,7 +1114,6 @@ impl ReviewView {
             format!("Merge {} into {}", self.branch, self.target),
         )
         .style(ButtonStyle::Filled)
-        .label_size(LabelSize::Small)
         .start_icon(Icon::new(IconName::GitBranch).size(IconSize::Small))
         .key_binding(KeyBinding::for_action_in(&Merge, &focus, cx))
         .disabled(!mergeable)
@@ -1140,7 +1139,6 @@ impl ReviewView {
         .on_click(cx.listener(|this, _, _, cx| this.merge(cx)));
         let refresh = studio_ui::ds::button("refresh", "Refresh")
             .style(ButtonStyle::Subtle)
-            .label_size(LabelSize::Small)
             .start_icon(Icon::new(IconName::RotateCw).size(IconSize::Small))
             .on_click(cx.listener(|this, _, _, cx| this.reload(cx)));
 
@@ -1209,7 +1207,7 @@ impl ReviewView {
                 .children(data.counts.iter().map(|count| {
                     h_flex()
                         .gap(px(space::SM))
-                        .child(studio_ui::kind_swatch(&count.type_name, count.is_edge))
+                        .child(studio_ui::kind_swatch(&count.type_name, count.is_edge, cx))
                         .child(Label::new(count.type_name.clone()).size(LabelSize::Small))
                         .child(change_counts(count.added, count.changed, count.removed))
                 }))
@@ -1246,7 +1244,6 @@ impl ReviewView {
                     )
                     .action_slot(
                         studio_ui::ds::button("refresh-own", "Refresh")
-                            .label_size(LabelSize::Small)
                             .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
                     )
                     .into_any_element(),
@@ -1265,7 +1262,6 @@ impl ReviewView {
                     )
                     .action_slot(
                         studio_ui::ds::button("refresh-newer", "Refresh")
-                            .label_size(LabelSize::Small)
                             .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
                     )
                     .into_any_element(),
@@ -1307,7 +1303,6 @@ impl ReviewView {
             .trigger(
                 studio_ui::ds::button("review-scope-button", scope_label)
                     .style(ButtonStyle::Outlined)
-                    .label_size(LabelSize::Small)
                     .end_icon(
                         Icon::new(IconName::ChevronDown)
                             .size(IconSize::XSmall)
@@ -1362,7 +1357,6 @@ impl ReviewView {
                                 ToggleState::from(self.delete_branch),
                             )
                             .label(format!("Delete {}", self.branch))
-                            .label_size(LabelSize::Small)
                             .disabled(!mergeable)
                             .on_click(cx.listener(
                                 |this, state: &ToggleState, _, cx| {
@@ -1407,7 +1401,6 @@ impl ReviewView {
                 ),
                 Some(
                     studio_ui::ds::button("refresh-moved", "Refresh")
-                        .label_size(LabelSize::Small)
                         .on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
                         .into_any_element(),
                 ),
@@ -1501,7 +1494,6 @@ impl ReviewView {
                             "Show conflicts"
                         },
                     )
-                    .label_size(LabelSize::Small)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.show_conflicts = !this.show_conflicts;
                         cx.notify();
@@ -1581,7 +1573,7 @@ impl ReviewView {
                     .gap(px(space::LG))
                     .px(px(space::LG))
                     .py(px(space::MD))
-                    .rounded(px(radius::MD))
+                    .rounded(px(radii(cx).md))
                     .border_1()
                     .border_color(border)
                     .bg(surface)
@@ -1594,7 +1586,7 @@ impl ReviewView {
                             .child(
                                 h_flex()
                                     .gap(px(space::MD))
-                                    .child(type_swatch(&conflict.type_name))
+                                    .child(type_swatch(&conflict.type_name, cx))
                                     .child(
                                         Label::new(conflict.type_name.clone())
                                             .size(LabelSize::Small)
@@ -1655,6 +1647,7 @@ impl ReviewView {
                             header.added,
                             header.changed,
                             header.removed,
+                            cx,
                         )
                         .when(header.relationships > 0, |d| {
                             d.child(

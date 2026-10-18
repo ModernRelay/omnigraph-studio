@@ -306,7 +306,6 @@ impl OpenGraphModal {
             .child(
                 studio_ui::ds::button("add-server", "Add server…")
                     .style(ButtonStyle::Subtle)
-                    .label_size(LabelSize::Small)
                     .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
                     .on_click(cx.listener(|this, _, window, cx| this.show_add(true, window, cx))),
             )
@@ -358,7 +357,6 @@ impl OpenGraphModal {
                         ConnectionState::Connecting => row.child(
                             studio_ui::ds::button("cancel-connect", "Cancel")
                                 .style(ButtonStyle::Subtle)
-                                .label_size(LabelSize::Small)
                                 .on_click(cx.listener(move |_, _, _, cx| {
                                     selected.update(cx, |c, cx| c.cancel(cx));
                                 })),
@@ -366,7 +364,6 @@ impl OpenGraphModal {
                         ConnectionState::Unreachable(_) | ConnectionState::Idle => row.child(
                             studio_ui::ds::button("retry-connect", "Retry")
                                 .style(ButtonStyle::Subtle)
-                                .label_size(LabelSize::Small)
                                 .start_icon(Icon::new(IconName::RotateCw).size(IconSize::XSmall))
                                 .on_click(cx.listener(move |_, _, _, cx| {
                                     selected.update(cx, |c, cx| c.connect(cx));

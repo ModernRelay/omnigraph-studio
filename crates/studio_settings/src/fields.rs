@@ -377,6 +377,7 @@ mod tests {
                 "buffer_font_size",
                 "ui_density",
                 "studio.window_style",
+                "studio.corner_radius",
                 "studio.bottom_dock_layout",
                 "studio.type_table_page_size",
                 "studio.tree_page_size",

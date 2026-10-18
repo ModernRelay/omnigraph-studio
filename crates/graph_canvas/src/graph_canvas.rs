@@ -1883,8 +1883,9 @@ impl GraphCanvas {
     fn render_explore_start(&self, cx: &mut Context<Self>) -> AnyElement {
         studio_ui::ds::empty_state(IconName::Crosshair, "Explore from a node")
             .child(
+                // An empty state's action is an outline button, as every empty state's is.
                 studio_ui::ds::button("explore-search", "Search nodes")
-                    .style(ButtonStyle::Filled)
+                    .style(ButtonStyle::Outlined)
                     .start_icon(Icon::new(IconName::MagnifyingGlass).size(IconSize::Small))
                     .key_binding(ui::KeyBinding::for_action(
                         &studio_actions::workspace::GoTo,
@@ -1933,11 +1934,11 @@ impl GraphCanvas {
         };
         div()
             .absolute()
-            .bottom_3()
-            .left_3()
+            .bottom(px(space::LG))
+            .left(px(space::LG))
             .px(px(space::CONTROL_INSET))
             .py(px(space::XS))
-            .rounded_full()
+            .rounded(px(studio_ui::ds::radii(cx).bar()))
             .bg(if cx.theme().appearance.is_light() {
                 gpui::white()
             } else {
@@ -1945,7 +1946,7 @@ impl GraphCanvas {
             })
             .border_1()
             .border_color(colors.border_variant)
-            .shadow(studio_ui::ds::elevation::float())
+            .shadow(studio_ui::ds::elevation::float(cx))
             .child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted))
     }
 
@@ -2010,9 +2011,9 @@ impl GraphCanvas {
         let mode = self.mode;
         v_flex()
             .absolute()
-            .top_2()
-            .left_2()
-            .right_2()
+            .top(px(space::MD))
+            .left(px(space::MD))
+            .right(px(space::MD))
             .gap(px(space::MD))
             .child(
                 h_flex()
@@ -2032,10 +2033,7 @@ impl GraphCanvas {
                                 )
                                 .into_any_element()
                         } else {
-                            studio_ui::ds::segmented(cx)
-                                .id("canvas-mode")
-                                .shadow(studio_ui::ds::elevation::float())
-                                .occlude()
+                            panel("canvas-mode")
                                 .child(
                                     studio_ui::ds::segment(
                                         "mode-schema",
@@ -2380,7 +2378,7 @@ impl Render for GraphCanvas {
                     .top(from.y.min(to.y) - bounds.origin.y)
                     .w((to.x - from.x).abs())
                     .h((to.y - from.y).abs())
-                    .rounded(px(studio_ui::ds::radius::XS))
+                    .rounded(px(studio_ui::ds::radii(cx).xs))
                     .border_1()
                     .border_color(accent.opacity(0.6))
                     .bg(accent.opacity(0.08))

@@ -675,7 +675,6 @@ impl QueryEditor {
             .trigger(
                 studio_ui::ds::button("snapshot-picker-button", label)
                     .style(ButtonStyle::Subtle)
-                    .label_size(LabelSize::Small)
                     .start_icon(
                         Icon::new(if pinned.is_some() {
                             IconName::GitCommit

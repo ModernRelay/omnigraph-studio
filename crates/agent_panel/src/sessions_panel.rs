@@ -323,7 +323,7 @@ impl SessionsPanel {
                 .mx(px(ds::space::SM))
                 .px(px(ds::space::SM))
                 .items_center()
-                .rounded(px(ds::radius::SM))
+                .rounded(px(ds::radii(cx).sm))
                 .bg(ds::surface::selected_chrome(cx))
                 .key_context("ConversationTitle")
                 .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.commit_rename(cx)))

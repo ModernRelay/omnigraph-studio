@@ -2445,7 +2445,7 @@ impl Workspace {
                     .border_r_1()
                     .border_color(hairline)
                     .when(in_corner && index == 0, |tab| {
-                        tab.rounded_tl(px(studio_ui::ds::radius::LG))
+                        tab.rounded_tl(px(studio_ui::ds::radii(cx).lg))
                     })
                     .when(selected, |tab| tab.bg(editor_bg))
                     .when(!selected, |tab| {
@@ -3036,12 +3036,13 @@ impl Workspace {
                     h_flex()
                         .id("footer-graph")
                         .h(px(studio_ui::ds::size::BAR_BUTTON))
-                        .px(px(studio_ui::ds::space::SM))
-                        .gap(px(studio_ui::ds::space::SM))
+                        // A 22 px button's inset, so it reads as the branch button beside it.
+                        .px(px(studio_ui::ds::space::MD))
+                        .gap(px(studio_ui::ds::space::XS))
                         .items_center()
-                        .rounded_full()
+                        .rounded(px(studio_ui::ds::radii(cx).sm))
                         .cursor_pointer()
-                        .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                        .hover(|style| style.bg(studio_ui::ds::surface::highlight(cx)))
                         .map(|button| match unavailable.clone() {
                             Some(reason) => button.tooltip(Tooltip::text(format!(
                                 "This graph is unavailable: {reason}. Reads resume when it is \
@@ -3056,9 +3057,10 @@ impl Workspace {
                             }),
                         })
                         .child(
+                            // As a button's icon: 80 % of the label's ink.
                             Icon::new(IconName::DatabaseZap)
                                 .size(IconSize::XSmall)
-                                .color(Color::Muted),
+                                .color(Color::Custom(cx.theme().colors().text.opacity(0.8))),
                         )
                         .when(unavailable.is_some(), |button| {
                             button.child(Indicator::dot().color(Color::Warning))
@@ -3078,8 +3080,7 @@ impl Workspace {
                     PopoverMenu::new("branch-menu")
                         .anchor(gpui::Anchor::BottomLeft)
                         .trigger(
-                            studio_ui::ds::button("branch", branch.clone())
-                                .label_size(LabelSize::Small)
+                            studio_ui::ds::bar_button("branch", branch.clone())
                                 .style(ButtonStyle::Subtle)
                                 .tooltip(Tooltip::text(format!(
                                     "Reads and edits in this window use {branch}. Switch branch."
@@ -3296,8 +3297,8 @@ impl Workspace {
                 .bg(colors.editor_background)
                 .border_1()
                 .border_color(colors.border)
-                .rounded(px(studio_ui::ds::radius::LG))
-                .shadow(studio_ui::ds::elevation::float())
+                .rounded(px(studio_ui::ds::radii(cx).lg))
+                .shadow(studio_ui::ds::elevation::float(cx))
                 .overflow_hidden()
                 .occlude()
                 .child(content)
@@ -3317,7 +3318,6 @@ impl Workspace {
             studio_ui::ds::button(id, label)
                 .full_width()
                 .style(ButtonStyle::Outlined)
-                .label_size(LabelSize::Small)
                 .start_icon(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
                 .key_binding(binding)
                 .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
@@ -3432,8 +3432,8 @@ impl Workspace {
         // Under the header strips, so a toast never covers a document's footer or composer.
         v_flex()
             .absolute()
-            .top(px(HEADER_HEIGHT + 8.))
-            .right_3()
+            .top(px(HEADER_HEIGHT + studio_ui::ds::space::MD))
+            .right(px(studio_ui::ds::space::LG))
             .gap(px(studio_ui::ds::space::MD))
             .children(self.toasts.iter().map(|toast| {
                 let color = match toast.kind {
@@ -3454,7 +3454,7 @@ impl Workspace {
                     .px(px(studio_ui::ds::space::LG))
                     .py(px(studio_ui::ds::space::MD))
                     .max_w(px(420.))
-                    .rounded(px(studio_ui::ds::radius::MD))
+                    .rounded(px(studio_ui::ds::radii(cx).md))
                     .map(|toast| {
                         if studio_ui::ds::is_glass(cx) {
                             // A small floating glass surface, like the canvas's pills.
@@ -3464,13 +3464,13 @@ impl Workspace {
                                     0.9,
                                     cx,
                                 ))
-                                .shadow(studio_ui::ds::elevation::float())
+                                .shadow(studio_ui::ds::elevation::float(cx))
                         } else {
                             toast
                                 .bg(colors.elevated_surface_background)
                                 .border_1()
                                 .border_color(colors.border_variant)
-                                .shadow(studio_ui::ds::elevation::overlay())
+                                .shadow(studio_ui::ds::elevation::floating(cx))
                         }
                     })
                     .child(Indicator::dot().color(color))
@@ -3485,7 +3485,6 @@ impl Workspace {
                         let action = action.boxed_clone();
                         studio_ui::ds::button(("toast-action", id), label.clone())
                             .style(ButtonStyle::Subtle)
-                            .label_size(LabelSize::Small)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.dismiss_toast(id, cx);
                                 window.dispatch_action(action.boxed_clone(), cx);
@@ -3960,8 +3959,8 @@ impl Render for DraggedTab {
             .bg(colors.elevated_surface_background)
             .border_1()
             .border_color(colors.border)
-            .rounded_full()
-            .shadow(studio_ui::ds::elevation::float())
+            .rounded(px(studio_ui::ds::radii(cx).sm))
+            .shadow(studio_ui::ds::elevation::float(cx))
             .children(
                 self.icon
                     .map(|icon| Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)),
@@ -4274,7 +4273,6 @@ impl Render for ConfirmClose {
                     .child(
                         studio_ui::ds::Button::new("keep-open", "Keep open")
                             .variant(studio_ui::ds::Variant::Outline)
-                            .label_size(LabelSize::Small)
                             .key_binding(ui::KeyBinding::for_action_in(&menu::Cancel, &focus, cx))
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )

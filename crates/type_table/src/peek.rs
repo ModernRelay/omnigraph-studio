@@ -43,6 +43,9 @@ pub const NEIGHBOUR_LIMIT: u32 = 8;
 
 /// Neighbours a page reads at a time under each relationship group, with "Show more" for the
 /// next (constitution IX).
+/// Where a relationship group's children start: under the group's arrow, past its inset and
+/// disclosure chevron.
+const CHILD_INDENT: f32 = space::XS + studio_ui::ds::size::DISCLOSURE + space::SM;
 const PAGE_NEIGHBOURS: u32 = 50;
 
 /// The widest a page's text runs, as a document's measure.
@@ -846,7 +849,7 @@ impl NodePeek {
                             .flex()
                             .justify_center()
                             .p(px(space::MD))
-                            .rounded(px(studio_ui::ds::radius::MD))
+                            .rounded(px(studio_ui::ds::radii(cx).md))
                             .border_1()
                             .border_color(border)
                             .child(
@@ -2247,7 +2250,6 @@ impl NodePeek {
                         ButtonStyle::Subtle
                     })
                     .size(ButtonSize::Compact)
-                    .label_size(LabelSize::Small)
                     .on_click(cx.listener(|this, _, _, cx| this.discard_drafts(cx))),
                 )
                 .child(
@@ -2261,7 +2263,6 @@ impl NodePeek {
                     )
                     .style(ButtonStyle::Filled)
                     .size(ButtonSize::Compact)
-                    .label_size(LabelSize::Small)
                     .disabled(self.saving_drafts)
                     .tooltip(move |_, cx| {
                         Tooltip::for_action(format!("One commit to {branch}"), &SaveNodeDrafts, cx)
@@ -2366,10 +2367,12 @@ impl NodePeek {
                     .into_any_element();
             }
         };
-        let hover = cx.theme().colors().element_hover;
+        let hover = studio_ui::ds::surface::highlight(cx);
         let rows = self.property_rows();
         let label_width = if self.page { 160. } else { 96. };
+        // Pulled out by the rows' hover inset, as a relationship group's rows are.
         v_flex()
+            .mx(px(-space::XS))
             .gap(px(space::XXS))
             .children(
                 rows.into_iter()
@@ -2435,7 +2438,7 @@ impl NodePeek {
                             .py(px(space::XXS))
                             .gap(px(space::MD))
                             .items_start()
-                            .rounded(px(studio_ui::ds::radius::SM))
+                            .rounded(px(studio_ui::ds::radii(cx).sm))
                             .when(!editing, |row| row.hover(move |s| s.bg(hover)))
                             .when(opens_editor || !editable, |row| row.cursor_pointer())
                             .when(!editing, |row| {
@@ -2500,7 +2503,7 @@ impl NodePeek {
                                 row.child(
                                     div()
                                         .id(("peek-saving", index))
-                                        .pt(px(6.))
+                                        .pt(px(space::SM))
                                         .tooltip(Tooltip::text("Saving…"))
                                         .child(Indicator::dot().color(Color::Warning)),
                                 )
@@ -2575,7 +2578,6 @@ impl NodePeek {
                                 )
                                 .style(ButtonStyle::Subtle)
                                 .size(ButtonSize::Compact)
-                                .label_size(LabelSize::Small)
                                 .end_icon(
                                     Icon::new(IconName::ChevronDown)
                                         .size(IconSize::XSmall)
@@ -2790,7 +2792,7 @@ impl NodePeek {
 
     /// The row the groups with no neighbours fold into, with how many; a click shows them.
     fn render_empty_row(&self, cx: &mut Context<Self>) -> AnyElement {
-        let hover = cx.theme().colors().element_hover;
+        let hover = studio_ui::ds::surface::highlight(cx);
         let folded = (0..self.groups.len())
             .filter(|&index| self.place(index) == Place::Folded)
             .count();
@@ -2800,7 +2802,7 @@ impl NodePeek {
             .px(px(space::XS))
             .py(px(space::XXS))
             .gap(px(space::SM))
-            .rounded(px(studio_ui::ds::radius::SM))
+            .rounded(px(studio_ui::ds::radii(cx).sm))
             .hover(move |s| s.bg(hover))
             .cursor_pointer()
             .tooltip(Tooltip::text(if open {
@@ -2839,7 +2841,7 @@ impl NodePeek {
     /// One relationship group: its header (direction, name, the other type, "+", the count),
     /// then an open search, its notice and, when open, its neighbours.
     fn render_group(&self, index: usize, cx: &mut Context<Self>) -> Div {
-        let hover = cx.theme().colors().element_hover;
+        let hover = studio_ui::ds::surface::highlight(cx);
         let group = &self.groups[index];
         let icon = match group.group.direction {
             Direction::Outgoing => IconName::ArrowRight,
@@ -2865,7 +2867,7 @@ impl NodePeek {
             .px(px(space::XS))
             .py(px(space::XXS))
             .gap(px(space::SM))
-            .rounded(px(studio_ui::ds::radius::SM))
+            .rounded(px(studio_ui::ds::radii(cx).sm))
             .hover(move |s| s.bg(hover))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(index, cx)))
@@ -2906,7 +2908,7 @@ impl NodePeek {
             .map(|adding| self.render_add_row(adding, cx));
         let notice = self.group_notices.get(&index).map(|notice| {
             h_flex()
-                .pl(px(22.))
+                .pl(px(CHILD_INDENT))
                 .gap(px(space::SM))
                 .child(Indicator::dot().color(notice.tone.color()))
                 .child(
@@ -2979,7 +2981,7 @@ impl NodePeek {
     fn render_add_row(&self, adding: &AddEdge, cx: &mut Context<Self>) -> AnyElement {
         let index = adding.index;
         let other = self.groups[index].group.other_type.clone();
-        let hover = cx.theme().colors().element_hover;
+        let hover = studio_ui::ds::surface::highlight(cx);
         let selected = cx.theme().colors().element_selected;
         let branch = self.session.read(cx).branch.clone();
         let replaces = self.holds_one(index)
@@ -2997,7 +2999,7 @@ impl NodePeek {
                         .px(px(space::XS))
                         .py(px(space::XXS))
                         .gap(px(space::MD))
-                        .rounded(px(studio_ui::ds::radius::SM))
+                        .rounded(px(studio_ui::ds::radii(cx).sm))
                         .cursor_pointer()
                         .when(highlighted, |row| row.bg(selected))
                         .when(!highlighted, |row| row.hover(move |s| s.bg(hover)))
@@ -3007,7 +3009,7 @@ impl NodePeek {
                             }
                             this.add_highlighted(window, cx);
                         }))
-                        .child(studio_ui::type_swatch(&other))
+                        .child(studio_ui::type_swatch(&other, cx))
                         .child(
                             Label::new(node.label.clone().unwrap_or_else(|| node.id.clone()))
                                 .size(LabelSize::Small)
@@ -3047,7 +3049,7 @@ impl NodePeek {
                 cx.listener(|this, _: &menu::Confirm, window, cx| this.confirm_add(window, cx)),
             )
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel_add(cx)))
-            .pl(px(22.))
+            .pl(px(CHILD_INDENT))
             .py(px(space::XS))
             .gap(px(space::XS))
             .child(
@@ -3109,10 +3111,10 @@ impl NodePeek {
     }
 
     fn render_neighbours(&self, index: usize, group: &Group, cx: &mut Context<Self>) -> AnyElement {
-        let hover = cx.theme().colors().element_hover;
+        let hover = studio_ui::ds::surface::highlight(cx);
         match &group.neighbours {
             Loadable::Loaded(neighbours) if neighbours.is_empty() => div()
-                .pl(px(28.))
+                .pl(px(CHILD_INDENT))
                 .child(
                     Label::new("None at this commit")
                         .size(LabelSize::XSmall)
@@ -3168,7 +3170,7 @@ impl NodePeek {
                 });
                 let removes = self.edits_relationships();
                 v_flex()
-                    .pl(px(22.))
+                    .pl(px(CHILD_INDENT - space::XS))
                     .children(neighbours.iter().enumerate().map(|(n, neighbour)| {
                         let (peek, page) = node_actions(&other, &neighbour.id, at_commit.clone());
                         let row_group = SharedString::from(format!("peek-neighbour-{index}-{n}"));
@@ -3185,7 +3187,7 @@ impl NodePeek {
                             .px(px(space::XS))
                             .py(px(space::XXS))
                             .gap(px(space::MD))
-                            .rounded(px(studio_ui::ds::radius::SM))
+                            .rounded(px(studio_ui::ds::radii(cx).sm))
                             .hover(move |s| s.bg(hover))
                             .cursor_pointer()
                             .tooltip(Tooltip::text(format!(
@@ -3199,7 +3201,7 @@ impl NodePeek {
                                     window.dispatch_action(Box::new(peek.clone()), cx)
                                 }
                             })
-                            .child(studio_ui::type_swatch(&other))
+                            .child(studio_ui::type_swatch(&other, cx))
                             .child(
                                 Label::new(
                                     neighbour
@@ -3225,7 +3227,7 @@ impl NodePeek {
                     .into_any_element()
             }
             Loadable::Failed(error) => div()
-                .pl(px(28.))
+                .pl(px(CHILD_INDENT))
                 .child(
                     Label::new(error.clone())
                         .size(LabelSize::XSmall)
@@ -3233,7 +3235,7 @@ impl NodePeek {
                 )
                 .into_any_element(),
             _ => div()
-                .pl(px(28.))
+                .pl(px(CHILD_INDENT))
                 .child(
                     Label::new("Reading…")
                         .size(LabelSize::XSmall)
@@ -3251,7 +3253,7 @@ impl NodePeek {
             return None;
         };
         let values = self.values.loaded()?;
-        let hover = cx.theme().colors().element_hover;
+        let hover = studio_ui::ds::surface::highlight(cx);
         let at_commit = self.held_commit();
         let endpoint = |label: &'static str, ty: &String, key: &str| {
             let id = values.get(key).and_then(Value::as_str)?.to_owned();
@@ -3262,7 +3264,7 @@ impl NodePeek {
                     .px(px(space::XS))
                     .py(px(space::XXS))
                     .gap(px(space::MD))
-                    .rounded(px(studio_ui::ds::radius::SM))
+                    .rounded(px(studio_ui::ds::radii(cx).sm))
                     .hover(move |s| s.bg(hover))
                     .cursor_pointer()
                     .tooltip(Tooltip::text(format!("Peek {id} · ⌘-click opens its page")))
@@ -3278,7 +3280,7 @@ impl NodePeek {
                             .w(px(40.))
                             .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
                     )
-                    .child(studio_ui::type_swatch(ty))
+                    .child(studio_ui::type_swatch(ty, cx))
                     .child(Label::new(id).size(LabelSize::Small))
                     .child(
                         Label::new(ty.clone())
@@ -3509,7 +3511,12 @@ impl NodePeek {
             })
             .pt(px(space::XXS))
             .when(last, |item| item.pb(px(space::XL)))
-            .child(item)
+            .child(match self.list_items.get(ix) {
+                // A group's rows carry an `XS` inset for their hover fill; pulled out by it,
+                // their text sits on the section labels' edge.
+                Some(Item::Group(_) | Item::Empty) => div().mx(px(-space::XS)).child(item),
+                _ => div().child(item),
+            })
             .into_any_element()
     }
 
@@ -3536,7 +3543,7 @@ impl NodePeek {
             .child(
                 h_flex()
                     .gap(px(space::SM))
-                    .child(studio_ui::type_swatch(&type_name))
+                    .child(studio_ui::type_swatch(&type_name, cx))
                     .child(
                         Label::new(type_name.clone())
                             .size(LabelSize::Small)
@@ -3612,7 +3619,11 @@ impl NodePeek {
             )
             .children(drafts_bar)
             .children(
-                endpoints.map(|endpoints| v_flex().child(section("Endpoints")).child(endpoints)),
+                endpoints.map(|endpoints| {
+                    v_flex()
+                        .child(section("Endpoints"))
+                        .child(div().mx(px(-space::XS)).child(endpoints))
+                }),
             )
             .when(has_properties, |d| {
                 d.child(section("Properties")).child(properties)

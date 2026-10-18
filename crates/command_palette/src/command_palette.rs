@@ -30,7 +30,7 @@ use studio_actions::agent::Ask;
 use studio_actions::graph::{OpenNode, OpenQueryFile, OpenType};
 use studio_actions::palette::{AskAgent, ShowScope};
 use studio_actions::workspace::{GoTo, ShowKeyBindings, SwitchBranch, ToggleCommandPalette};
-use studio_ui::ds::{MenuRow, elevation, radius, size, space, surface};
+use studio_ui::ds::{MenuRow, elevation, radii, size, space, surface};
 use studio_workspace::{ToastKind, Workspace};
 use ui::HighlightedLabel;
 use ui::prelude::*;
@@ -722,10 +722,12 @@ impl CommandPalette {
                     Row::Saved { .. } => muted("saved".into()),
                 };
                 let start: Option<gpui::Div> = match row {
-                    Row::Type { kind, .. } => {
-                        Some(studio_ui::kind_swatch(&candidate.label, *kind == "edge"))
-                    }
-                    Row::Node { type_name, .. } => Some(studio_ui::type_swatch(type_name)),
+                    Row::Type { kind, .. } => Some(studio_ui::kind_swatch(
+                        &candidate.label,
+                        *kind == "edge",
+                        cx,
+                    )),
+                    Row::Node { type_name, .. } => Some(studio_ui::type_swatch(type_name, cx)),
                     Row::Branch { current, .. } => Some(
                         div().child(
                             Icon::new(if *current {
@@ -752,7 +754,7 @@ impl CommandPalette {
                         .child(
                             MenuRow::new(ix)
                                 .height(ROW_HEIGHT)
-                                .radius(radius::PALETTE_ROW)
+                                .radius(radii(cx).palette_row())
                                 .toggle_state(ix == self.selected)
                                 .when_some(start, |row, start| row.start_slot(start))
                                 .child(
@@ -995,7 +997,7 @@ impl Render for CommandPalette {
             .max_w_full()
             .p(px(space::XS))
             .gap(px(space::XS))
-            .rounded(px(radius::MODAL))
+            .rounded(px(radii(cx).modal))
             .bg(surface::floating(cx))
             .border_1()
             .border_color(surface::floating_border(cx))
@@ -1024,11 +1026,11 @@ impl Render for CommandPalette {
             .children(tabs)
             .child(
                 div()
-                    .rounded(px(radius::PALETTE_LIST))
+                    .rounded(px(radii(cx).palette_list()))
                     .bg(cx.theme().colors().editor_background)
                     .border_1()
                     .border_color(surface::floating_border(cx))
-                    .shadow(elevation::raised())
+                    .shadow(elevation::raised(cx))
                     .overflow_hidden()
                     .child(list),
             )

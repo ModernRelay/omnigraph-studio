@@ -414,30 +414,32 @@ than styling one-off elements.
 - **Sheet corners.** GPUI clips a glass sheet's children to its rectangle, not its rounded
   corners, so a child with a fill flush in a corner takes the sheet's radius (`radius::LG`):
   the first tab of the top-left pane, when the sidebar is shown.
-- **Concentric radii, in code.** A surface around rounded children has their radius plus the
-  gap between the edges (`ds::radius::around`); a child takes its container's less the gap
-  (`ds::radius::within`, square when the gap is wider). The gap counts a hairline border
-  (`size::HAIRLINE`), which GPUI draws inside the box: a menu row is `radius::MENU_ITEM`, the
-  menu's 10 px less its hairline and 4 px padding (5); the palette's results card is 11 in its
-  16 px frame, its rows 6. A fill flush with a bordered edge (a card's header, a modal's
-  footer) rounds its own corners at the container's radius less the hairline
-  (`radius::flush`): GPUI clips children to a rectangle, not to rounded corners, so the fill
-  otherwise shows a square corner outside the curve. Buttons are pills and circles (below), so
-  a surface around them needs no radius of theirs. Radii come from `ds::radius` by role (key
-  caps and chips XS 4, rows and fields SM 6, cards and menus 10, sheets LG 14, modals 16, and
-  round ends for anything clicked), never GPUI's `rounded_sm()`-style utilities.
-  The nested pieces are components: `ds::segmented`, `ds::row_list` (a field's offers),
-  `ds::float_bar` (the canvas's floating controls, 7 px around 22 px buttons 3 px in),
-  `ds::pill_button` (round, 4 px inside a pill's round end) and the context chip's tile. The
-  `ds` test `nested_radii_are_concentric` pins the pairs. A float bar holds
-  `ds::bar_button`s and `ds::bar_icon_button`s (`size::BAR_BUTTON`, 22 px): a medium button
-  does not fit inside its border. A pill button acts as Zed's buttons do: pressing it leaves
-  the focus in the pill's field, and its click goes no further.
-- **Control sizes, in code.** `size::CONTROL` (28 px: a medium button, a field, a segmented
-  track, a floating bar, a tile) and `size::PILL` (26 px: a filter, a composer's picker, a
-  dock's title tab); a segment is a control less its track's inset. Every single-line field is
-  `ds::field_frame` (a pill at a control's height with a 10 % hairline and a contact shadow,
-  the error border when invalid; Tower's inputs)
+- **Corners: one setting, one scale** (since 2026-10-18). `studio.corner_radius` (Appearance,
+  0–20 px, 10 by default) is the base every corner derives from, through `ds::radii(cx)`; no
+  view picks its own (`rounded_sm()`-style utilities and literal radii are gone). The scale is
+  additive, as Tower's (`--radius-sm` is `--radius` less 4 px), because the gaps between nested
+  surfaces are fixed: `md` (cards, menus, popovers) is the base; `sm` (rows, fields, segments,
+  tabs, icon buttons, status-bar items, tiles) is it less 4; `xs` (key caps, tags, chips, a
+  write target, a row list's rows) less 6; `lg` (glass sheets) plus 4; `modal` (modals, the
+  palette) plus 6. 0 squares every corner. Nested radii follow by `radius::within`/`around`,
+  and the gap counts a hairline border (`size::HAIRLINE`), which GPUI draws inside the box: a
+  menu row is the menu's radius less its hairline and 4 px padding, the palette's results card
+  and rows likewise, a floating bar is `sm` around its controls 3 px in (`Radii::bar`). A fill
+  flush with a bordered edge (a card's header, a modal's footer) rounds its own corners at the
+  container's radius less the hairline (`radius::flush`): GPUI clips children to a rectangle,
+  not to rounded corners. The `ds` test `nested_radii_are_concentric` holds every pair at every
+  base the setting allows.
+- **Round ends only for buttons with a label.** A text button, a labelled menu trigger (a
+  select, the composer's agent picker) and a filter chip are pills (`Shape::Pill`); everything
+  else takes the scale's corner: icon buttons (`Shape::Rounded`), fields, segments and tabs,
+  the status bar's pickers and panel buttons, floating bars and the buttons set into them
+  (`ds::bar_button`), chips, drag previews. Dots and count badges stay round.
+- **Control sizes, in code.** `size::CONTROL` (28 px: a medium button, a field, a floating
+  bar, a tile), `size::PILL` (26 px: a filter, a composer's picker, a dock's title tab),
+  `size::BAR_BUTTON` (22 px: a segment, a bar's button, the status bar's items), `size::TAG`
+  (18 px: tags, count badges, a write target), `size::DOT` and `size::DISCLOSURE`. Every
+  single-line field is `ds::field_frame` (the scale's `sm` corner at a control's height, a
+  10 % hairline and the control shadow, the error border when invalid)
   around `ds::field_input`, and every search box is `ds::search_field`, so fields line up
   with the buttons beside them: the settings search and text fields, the history and review
   searches, the dialogs' fields, the review editor's fields and the query's parameters. A
@@ -454,21 +456,27 @@ than styling one-off elements.
   buttons with 14 px icons, as do a dock header's zoom and hide; a dock header's title starts
   16 px in, the edge its panel's toolbar and rows start at.
 - **Buttons, after Tower's** (since 2026-10-18; `studio_ui::button`, `ds::Button`,
-  `ds::IconButton`). Every text button is a pill and every icon button a circle, medium
-  weight, in six variants: primary (solid ink; a surface's one action), secondary (a faint ink
+  `ds::IconButton`). A text button is a pill and an icon button takes the scale's corner
+  (above), medium weight, in six variants: primary (solid ink; a surface's one action), secondary (a faint ink
   fill), outline (the surface's own fill, a 10 % hairline and a contact shadow; Cancel),
   ghost (nothing until hovered; toolbars, rows), destructive (solid red) and glass (a floating
   pill). Zed's `ButtonStyle` picks the variant, so call sites keep `.style(…)`: Filled is
   primary, Outlined outline, Subtle ghost, Tinted(Error) destructive. Sizes keep Zed's
   heights: medium 28 px (`size::CONTROL`, 10 px in), default 22 px (the header strips and the
   status bar), compact 18 px (inside dense rows: a tab's close, a tree toggle, an inline Fix,
-  a setting's reset). A toggled button sits on the pressed fill; a disabled one fades to 64 %;
-  a key hint on a solid button takes its ink. Zed's `ButtonLike` keeps its corners at 4 px and
+  a setting's reset). A label is the body size at 28 px and up (13 px at the default 15 px
+  interface size, Tower's `text-sm`) and the small size below; a leading icon is 16 px at
+  28 px and 12 px below, a trailing one (a chevron) 12 px, both at 80 % of the label's ink.
+  A toggled button sits on the pressed fill; a disabled one fades to 64 %; a key hint on a
+  solid button takes its ink. Primary and destructive carry a 16 % white top edge inside and
+  a 24 % tinted contact shadow; outline buttons and fields the control shadow
+  (`elevation::control`: a 5 % contact shadow and a 4 % 1 px edge under them). A toolbar's
+  buttons sit in `ds::toolbar_actions`, with no gap beyond their own padding. Zed's `ButtonLike` keeps its corners at 4 px and
   its colours private, so Studio draws its own and keeps Zed's builder traits; no view
   constructs Zed's `Button` or `IconButton`.
 - **Menus** (`studio_ui::menu`, a fork of Zed's `ContextMenu` at v1.23.2, GPL-3.0-or-later,
   credited in the file). Zed's behaviour (keys, submenus, asides, actions, accessibility) with
-  Tower's drawing: the modal's fill, hairline and shadow at `radius::MENU` (10 px), a 4 px
+  Tower's drawing: the modal's fill, hairline and shadow at the scale's `md` corner (`Radii::menu`), a 4 px
   inset, 26 px rows (`ds::MenuRow`, `size::MENU_ROW`) rounded within it, the hovered or
   highlighted row on a faint ink (`surface::highlight`), group headers small and muted,
   separators edge to edge. Every view's menus are this one.
@@ -480,8 +488,17 @@ than styling one-off elements.
   licensed bundle, and a test keeps the count under the limit and every file to a row.
 - **Spacing.** Every gap and inset is a `ds::space` step (2, 4, 6, 8, 12, 16, 24, 32), never
   GPUI's rem utilities (`gap_2()`): since 2026-10-18 no view uses them.
-- **Text sizes.** The window's rem size is `ui_font_size` (16 px by default), as in Zed, so
-  every `ui` size scales with it. Body text is `Small`; labels, counts and metadata `XSmall`.
+- **Text sizes.** The window's rem size is `ui_font_size`, as in Zed, so every `ui` size
+  scales with it. Its default is 15 px since 2026-10-18 (16 before): Tower's root size
+  (93.75 %), at which Zed's `Default`, `Small` and `XSmall` labels are 13, 11 and 9 px, Tower's
+  `text-sm` and `text-xs`. Body text is `Small`; labels, counts and metadata `XSmall`; buttons
+  `Default`.
+- **Shadows, Tower's values** (`ds::elevation`, light and dark): `raised` for a solid item on
+  glass (4 %, 1/2 px; 30 % dark); `control` for outline buttons and fields; `sheet` for glass
+  sheets and everything that floats (an inner white rim at 70 %, 6 % dark; 4 % at 1/2 px and
+  11 % at 12/28 px, spread −9; 30 % and 60 % dark); `float` for floating bars and chips
+  (12 % at 6/14 px, spread −6; 50 % dark). Menus, popovers, modals and the palette use
+  `sheet` (`floating`), as Tower gives every popup the glass shadow.
 - **Sidebar rows.** `ds::SidebarRow`: section labels muted, not bold; the selected row a grey
   pill; counts muted and right-aligned. Footnotes become tooltips. What leads a label (an icon
   through `SidebarRow::icon`, at 14 px, or a type mark) sits in one 16 px slot
@@ -548,6 +565,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-18 | One corner setting; round ends only for labelled buttons; Tower's type scale, shadows and button type; spacing and alignment by token | `ds` `nested_radii_are_concentric` (the default scale, every pair at bases 1–20, 0 square); `studio_settings` row order with `studio.corner_radius`; `button` tests; workspace clippy `-D warnings`; offscreen snapshots in glass: a table, its peek, the canvas, settings, history, a query, the delete dialog, ⌘K | The canvas's mode switch was a bare 22 px segmented control beside two 28 px glass bars (the segmented track had been removed); it is a bar now, and all three share height, corner and shadow. The table's header text started 4 px right of its cells' (Zed pads a header cell); the inspector's rows 4 px right of their section labels (their hover inset); a peek group's children at 26 and 28 px under an arrow at 22. The branch picker was a 28 px pill with 13 px text beside a 22 px graph picker with 12 px text. Buttons were 12 px text with 14 px icons, 24–32 px apart in the table toolbar; they are 13 px with 16 px icons at 80 %, with their padding as their gap. Fourteen hover fills used Zed's theme hover; they use `surface::highlight` |
 | 2026-10-18 | Nested radii count the hairline; flush fills follow their container's corners; no raw radius utilities | `ds` test `nested_radii_are_concentric` (menu row, palette list and row, a row list, `radius::flush` for a card header and a modal footer); offscreen snapshots cropped at 2×: the gallery's card header, the delete dialog's footer, ⌘K's highlighted row, a tab's menu | Before, the card header's fill showed a square corner outside the card's curve; the menu row, palette card and palette row were 1 px rounder than their insets allowed, since the hairline was not counted. Fourteen `rounded_sm`/`rounded_md` calls became tokens by role: the inspector's rows SM, its image frame MD, a table cell's edit notice a menu surface, a dragged column, the agent picker and the tree's filter row pills |
 | 2026-10-18 | Tower's buttons, menus, modals and icons; spacing on the ds scale | `studio_ui` `button` tests (`controls_draw_at_their_sizes`: 28 px pills 10 px in, circles, pill fields; `zed_styles_pick_the_variants`), `menu` tests (Zed's six, on the fork), `studio_theme` `icons` tests (≤ 100 Nucleo drawings, each file named once, each replacing a Zed icon); the workspace suite; `cargo clippy --workspace --all-targets -D warnings`; offscreen snapshots in glass on a scratch cluster: the delete dialog with two dependents, ⌘K, a tab's context menu, the design gallery, a table with the new icons | The dialog read one muted paragraph under "Delete Acme", the dependents list, then Cancel and a red Delete with a light ↵; the palette a frame with the results card inside; the menu 26 px rows and edge-to-edge rules. A 97 % modal fill let the rows behind show through above the title; the fill is opaque now. The settings reset, a 28 px circle, made its row taller than the others; it is compact. A spacing conversion made both arms of one `if` equal (clippy); collapsed |
 | 2026-10-17 | Views read through the session; growing lists draw only their visible rows | `graph_store` `feature_reads_are_counted_while_they_run` (six held reads counted, then none once dropped); `studio_ui` `rows` `only_the_rows_between_a_shared_start_and_end_change`; the compiler, with the session's client private to `graph_store`; offscreen snapshots of History, Storage, Conversations, Queries and Activity against the dev server | History listed its 10 commits with their counts and the head's change; Storage showed the server, both graphs and main's snapshot; Queries and Activity kept their layout as lists. Conversations' empty note now wraps at the sidebar's width, where it was clipped, and its filter shows a funnel beside the sidebar's search |

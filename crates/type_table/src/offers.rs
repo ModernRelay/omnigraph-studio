@@ -81,7 +81,7 @@ impl Offers {
                     .px(px(studio_ui::ds::space::MD))
                     .gap(px(studio_ui::ds::space::MD))
                     // A row of a `ds::row_list`, which is concentric around this radius.
-                    .rounded(px(studio_ui::ds::radius::XS))
+                    .rounded(px(studio_ui::ds::radii(cx).xs))
                     .cursor_pointer()
                     .when(self.highlighted == Some(index), |row| row.bg(highlight))
                     .hover(|row| row.bg(highlight))

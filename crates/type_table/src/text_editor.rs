@@ -389,7 +389,7 @@ impl TextEditor {
             ),
         };
         studio_ui::ds::toolbar(cx)
-            .child(studio_ui::type_swatch(&self.type_name))
+            .child(studio_ui::type_swatch(&self.type_name, cx))
             .child(
                 Label::new(self.label.clone().unwrap_or_else(|| self.id.clone()))
                     .size(LabelSize::Small)

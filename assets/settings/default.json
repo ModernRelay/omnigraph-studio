@@ -5,12 +5,13 @@
     "dark": "One Dark"
   },
   "ui_font_family": null,
-  "ui_font_size": 16.0,
+  "ui_font_size": 15.0,
   "buffer_font_family": null,
   "buffer_font_size": 14.0,
   "ui_density": "default",
   "studio": {
     "window_style": "flat",
+    "corner_radius": 10,
     "bottom_dock_layout": "contained",
     "type_table_page_size": 100,
     "tree_page_size": 50,

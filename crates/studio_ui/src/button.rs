@@ -121,13 +121,23 @@ fn paint(variant: Variant, selected: bool, cx: &App) -> Paint {
                 hover: red.opacity(0.9),
                 active: red.opacity(0.84),
                 border: red,
-                shadows: vec![BoxShadow {
-                    color: red.opacity(0.24),
-                    offset: point(px(0.), px(1.)),
-                    blur_radius: px(2.),
-                    spread_radius: px(0.),
-                    inset: false,
-                }],
+                // As the primary: a light top edge inside, a tinted contact shadow.
+                shadows: vec![
+                    BoxShadow {
+                        color: gpui::white().opacity(0.16),
+                        offset: point(px(0.), px(1.)),
+                        blur_radius: px(0.),
+                        spread_radius: px(0.),
+                        inset: true,
+                    },
+                    BoxShadow {
+                        color: red.opacity(0.24),
+                        offset: point(px(0.), px(1.)),
+                        blur_radius: px(2.),
+                        spread_radius: px(0.),
+                        inset: false,
+                    },
+                ],
                 ink: Color::Custom(gpui::white()),
             }
         }
@@ -137,10 +147,10 @@ fn paint(variant: Variant, selected: bool, cx: &App) -> Paint {
             } else {
                 colors.editor_background
             },
-            hover: colors.editor_background.blend(ink.opacity(0.03)),
+            hover: colors.editor_background.blend(ink.opacity(0.02)),
             active: colors.editor_background.blend(pressed),
             border: ink.opacity(0.1),
-            shadows: ds::elevation::raised(),
+            shadows: ds::elevation::control(cx),
             ink: Color::Default,
         },
         Variant::Secondary => Paint {
@@ -168,9 +178,35 @@ fn paint(variant: Variant, selected: bool, cx: &App) -> Paint {
             hover: ds::surface::glass(colors.elevated_surface_background, 0.98, cx),
             active: ds::surface::glass(colors.elevated_surface_background, 0.98, cx).blend(pressed),
             border: ink.opacity(0.08),
-            shadows: ds::elevation::float(),
+            shadows: ds::elevation::float(cx),
             ink: Color::Default,
         },
+    }
+}
+
+/// A button's outline. A button with a label is a pill; an icon button, and a button set into
+/// a bar, takes the radius scale's `sm` corner (spec 002, "Corners").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    Pill,
+    Rounded,
+}
+
+/// A labelled button's text: the body size at a control's height and larger (Tower's text-sm,
+/// 13 px at the default 15 px interface size), the small size in the header strips and dense
+/// rows.
+fn label_size(size: ButtonSize) -> LabelSize {
+    match size {
+        ButtonSize::Large | ButtonSize::Medium => LabelSize::Default,
+        _ => LabelSize::Small,
+    }
+}
+
+/// A labelled button's icon: 16 px at a control's height, smaller with the button.
+fn label_icon_size(size: ButtonSize) -> IconSize {
+    match size {
+        ButtonSize::Large | ButtonSize::Medium => IconSize::Medium,
+        _ => IconSize::XSmall,
     }
 }
 
@@ -182,6 +218,7 @@ struct Base {
     id: ElementId,
     variant: Variant,
     size: ButtonSize,
+    shape: Shape,
     disabled: bool,
     selected: bool,
     width: Option<DefiniteLength>,
@@ -195,11 +232,12 @@ struct Base {
 }
 
 impl Base {
-    fn new(id: ElementId, variant: Variant, size: ButtonSize) -> Self {
+    fn new(id: ElementId, variant: Variant, size: ButtonSize, shape: Shape) -> Self {
         Self {
             id,
             variant,
             size,
+            shape,
             disabled: false,
             selected: false,
             width: None,
@@ -228,7 +266,10 @@ impl Base {
             .justify_center()
             .when_some(height(self.size), |this, h| this.h(px(h)))
             .when_some(self.width, |this, width| this.w(width))
-            .rounded_full()
+            .map(|this| match self.shape {
+                Shape::Pill => this.rounded_full(),
+                Shape::Rounded => this.rounded(px(ds::radii(cx).sm)),
+            })
             .border_1()
             .border_color(paint.border)
             .bg(paint.fill)
@@ -278,7 +319,7 @@ pub struct Button {
 impl Button {
     pub fn new(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Self {
         let label = label.into();
-        let mut base = Base::new(id.into(), Variant::Ghost, ButtonSize::Medium);
+        let mut base = Base::new(id.into(), Variant::Ghost, ButtonSize::Medium, Shape::Pill);
         base.aria_label = Some(label.clone());
         Self {
             base,
@@ -294,6 +335,12 @@ impl Button {
     /// The look, directly; `.style(ButtonStyle::…)` picks it from Zed's styles.
     pub fn variant(mut self, variant: Variant) -> Self {
         self.base.variant = variant;
+        self
+    }
+
+    /// The outline: a pill unless the button sits in a bar.
+    pub fn shape(mut self, shape: Shape) -> Self {
+        self.base.shape = shape;
         self
     }
 
@@ -414,7 +461,11 @@ impl RenderOnce for Button {
             Variant::Primary | Variant::Destructive => painted,
             _ => ink,
         };
-        let icon = |icon: Icon| icon.color(ink);
+        // Icons at the label's scale and, as Tower's, at 80 % of its ink.
+        let icon_ink = Color::Custom(ink.color(cx).opacity(0.8));
+        let icon = |icon: Icon| icon.size(label_icon_size(size)).color(icon_ink);
+        // A trailing icon is a chevron or a mark, not a picture: a step smaller.
+        let end_icon = |icon: Icon| icon.size(IconSize::XSmall).color(icon_ink);
         // A key on a solid fill takes the fill's ink, a little quieter; elsewhere its own.
         let key_ink = match self.base.variant {
             Variant::Primary | Variant::Destructive => {
@@ -440,14 +491,14 @@ impl RenderOnce for Button {
                             Label::new(self.label)
                                 .color(ink)
                                 .weight(FontWeight::MEDIUM)
-                                .size(self.label_size.unwrap_or(LabelSize::Small)),
+                                .size(self.label_size.unwrap_or(label_size(size))),
                         )
                         .children(self.key_binding.map(|key| match key_ink {
                             Some(ink) => key.color(ink),
                             None => key,
                         })),
                 )
-                .children(self.end_icon.map(icon)),
+                .children(self.end_icon.map(end_icon)),
         )
     }
 }
@@ -466,7 +517,12 @@ pub struct IconButton {
 impl IconButton {
     pub fn new(id: impl Into<ElementId>, icon: IconName) -> Self {
         Self {
-            base: Base::new(id.into(), Variant::Ghost, ButtonSize::Medium),
+            base: Base::new(
+                id.into(),
+                Variant::Ghost,
+                ButtonSize::Medium,
+                Shape::Rounded,
+            ),
             icon,
             icon_size: IconSize::Small,
             icon_color: None,
@@ -477,6 +533,12 @@ impl IconButton {
 
     pub fn variant(mut self, variant: Variant) -> Self {
         self.base.variant = variant;
+        self
+    }
+
+    /// The outline: the radius scale's corner unless asked to be round.
+    pub fn shape(mut self, shape: Shape) -> Self {
+        self.base.shape = shape;
         self
     }
 

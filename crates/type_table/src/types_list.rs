@@ -124,7 +124,6 @@ impl Render for TypesList {
                     )
                     .child(
                         studio_ui::ds::button("reload-schema", "Try again")
-                            .label_size(LabelSize::Small)
                             .style(ButtonStyle::Subtle)
                             .on_click(move |_, _, cx| {
                                 session.update(cx, |session, cx| session.reload_schema(cx))
@@ -250,7 +249,7 @@ impl TypesList {
                     preview: true,
                 };
                 studio_ui::ds::SidebarRow::new(("type", ix), name.clone())
-                    .start(studio_ui::kind_swatch(name, *is_edge))
+                    .start(studio_ui::kind_swatch(name, *is_edge, cx))
                     .end(studio_ui::ds::sidebar_count(count))
                     .muted(*is_edge)
                     .selected(selected)

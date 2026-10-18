@@ -15,7 +15,7 @@ use studio_settings::{StudioSettings, WindowStyle};
 use ui::prelude::*;
 use ui::{CommonAnimationExt as _, Tooltip, rems_from_px};
 
-pub use crate::button::{Button, IconButton, Variant};
+pub use crate::button::{Button, IconButton, Shape, Variant};
 pub use crate::menu::{MenuRow, menu_header, menu_separator, menu_surface};
 pub use crate::modal::{
     ModalHeader, action_button, cancel_button, modal, modal_body, modal_footer, write_target,
@@ -55,38 +55,16 @@ pub mod space {
     pub const PAGE: f32 = XXL;
 }
 
-/// Corner radii. Nested surfaces stay concentric: a surface holding rounded children has their
-/// radius plus the gap between its edge and theirs ([`around`]); a child takes its container's
-/// radius minus that gap ([`within`]). The same radius on both reads as a mistake: the gap is
-/// narrower along the sides than at the corners. Write nested radii with these, not sums.
+/// Corner radii. Every radius comes from one base, the person's corner radius setting
+/// (`studio.corner_radius`, 10 px by default), through [`radii`]; nothing picks its own.
+/// Nested surfaces stay concentric: a surface holding rounded children has their radius plus
+/// the gap between its edge and theirs ([`radius::around`]); a child takes its container's
+/// radius minus that gap ([`radius::within`]). The same radius on both reads as a mistake: the
+/// gap is narrower along the sides than at the corners. Buttons, fields, tabs, pills and
+/// floating bars are round at their ends (`rounded_full`) whatever the base.
 pub mod radius {
-    /// Key caps, chips, code blocks, the rows of a [`super::row_list`].
-    pub const XS: f32 = 4.;
-    /// Rows, fields, segments.
-    pub const SM: f32 = 6.;
-    /// Cards.
-    pub const MD: f32 = 10.;
-    /// Glass sheets.
-    pub const LG: f32 = 14.;
-    /// A modal: the largest radius, as it is the largest surface that floats.
-    pub const MODAL: f32 = 16.;
-    /// A context menu or popover.
-    pub const MENU: f32 = 10.;
-    /// A menu's rows, inside its hairline and [`super::space::XS`] of padding.
-    pub const MENU_ITEM: f32 = within(MENU, super::space::XS + super::size::HAIRLINE);
-    /// The command palette's results: a solid card inside its glass frame's hairline and
-    /// padding.
-    pub const PALETTE_LIST: f32 = within(MODAL, super::space::XS + super::size::HAIRLINE);
-    /// A palette row, inside the results card's hairline and padding.
-    pub const PALETTE_ROW: f32 = within(PALETTE_LIST, super::space::XS + super::size::HAIRLINE);
-    /// A fill flush with a bordered surface's edge (a card's header, a modal's footer): the
-    /// surface's radius less its hairline. GPUI clips children to a rectangle, not to their
-    /// container's corners, so such a fill rounds its own.
-    pub const fn flush(outer: f32) -> f32 {
-        within(outer, super::size::HAIRLINE)
-    }
-    // Buttons, fields, tabs, pills and floating bars have no radius here: they are round at
-    // the ends (`rounded_full`), so whatever holds them is a pill too.
+    /// The base when no settings are installed: the setting's default.
+    pub const DEFAULT_BASE: f32 = 10.;
 
     /// The radius of a surface whose children have radius `inner` and sit `gap` inside its
     /// edge (its border and padding).
@@ -99,6 +77,87 @@ pub mod radius {
     pub const fn within(outer: f32, gap: f32) -> f32 {
         if outer > gap { outer - gap } else { 0. }
     }
+
+    /// A fill flush with a bordered surface's edge (a card's header, a modal's footer): the
+    /// surface's radius less its hairline. GPUI clips children to a rectangle, not to their
+    /// container's corners, so such a fill rounds its own.
+    pub const fn flush(outer: f32) -> f32 {
+        within(outer, super::size::HAIRLINE)
+    }
+}
+
+/// The radii by role, for one base. The gaps between nested surfaces are fixed, so each
+/// radius is the base plus or minus the gap it nests across (as Tower's `--radius-sm` is
+/// `--radius` less 4 px), and they stay concentric at any base. A base of 0 squares every
+/// corner.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Radii {
+    /// Key caps, chips, tags, code blocks, the rows of a [`row_list`]: a card's radius less
+    /// [`space::SM`], as a chip sits that far inside a card.
+    pub xs: f32,
+    /// Rows, tiles, inline frames: a card's radius less [`space::XS`].
+    pub sm: f32,
+    /// Cards, menus and popovers: the base.
+    pub md: f32,
+    /// Glass sheets, which hold cards [`space::XS`] inside their edge.
+    pub lg: f32,
+    /// Modals and the command palette, the largest surfaces that float: a card's radius and
+    /// [`space::SM`].
+    pub modal: f32,
+}
+
+impl Radii {
+    pub fn new(base: f32) -> Self {
+        let md = base.max(0.).round();
+        let grow = |gap: f32| if md > 0. { radius::around(md, gap) } else { 0. };
+        Self {
+            xs: radius::within(md, space::SM),
+            sm: radius::within(md, space::XS),
+            md,
+            lg: grow(space::XS),
+            modal: grow(space::SM),
+        }
+    }
+
+    /// A context menu or popover: a card's radius.
+    pub fn menu(&self) -> f32 {
+        self.md
+    }
+
+    /// A menu's rows, inside its hairline and [`space::XS`] of padding.
+    pub fn menu_item(&self) -> f32 {
+        radius::within(self.menu(), space::XS + size::HAIRLINE)
+    }
+
+    /// The command palette's results: a solid card inside its frame's hairline and padding.
+    pub fn palette_list(&self) -> f32 {
+        radius::within(self.modal, space::XS + size::HAIRLINE)
+    }
+
+    /// A palette row, inside the results card's hairline and padding.
+    pub fn palette_row(&self) -> f32 {
+        radius::within(self.palette_list(), space::XS + size::HAIRLINE)
+    }
+
+    /// A [`float_bar`]: concentric around the `sm` controls set 3 px inside its edge.
+    pub fn bar(&self) -> f32 {
+        radius::around(self.sm, (size::CONTROL - size::BAR_BUTTON) / 2.)
+    }
+
+    /// A [`row_list`]: concentric around its `xs` rows, inside its hairline and padding.
+    pub fn row_list(&self) -> f32 {
+        radius::around(self.xs, space::XS + size::HAIRLINE)
+    }
+}
+
+/// The radii for the person's corner radius setting.
+pub fn radii(cx: &App) -> Radii {
+    Radii::new(
+        cx.try_global::<StudioSettings>()
+            .map_or(radius::DEFAULT_BASE, |settings| {
+                settings.studio.corner_radius as f32
+            }),
+    )
 }
 
 /// Fixed sizes.
@@ -142,6 +201,12 @@ pub mod size {
     pub const FIELD_LABEL: f32 = 112.;
     /// The gap around and between glass sheets.
     pub const SHEET_GAP: f32 = 8.;
+    /// A disclosure chevron (`IconSize::XSmall`).
+    pub const DISCLOSURE: f32 = 12.;
+    /// A status or type dot.
+    pub const DOT: f32 = 7.;
+    /// A tag, a count badge, a write target: the small chips inside rows and headers.
+    pub const TAG: f32 = 18.;
     /// A hairline border's width. A border sits inside its box, so it is part of the gap
     /// between a surface's edge and its children's (`radius::within`, `radius::around`).
     pub const HAIRLINE: f32 = 1.;
@@ -198,8 +263,12 @@ pub mod surface {
     }
 
     /// The hairline of a solid item that sits on glass.
-    pub fn raised_border(_cx: &App) -> Hsla {
-        gpui::black().opacity(0.07)
+    pub fn raised_border(cx: &App) -> Hsla {
+        if cx.theme().appearance.is_light() {
+            gpui::black().opacity(0.07)
+        } else {
+            gpui::white().opacity(0.07)
+        }
     }
 
     /// Sunken areas: header strips, code blocks, a card's header. The editor background, 2%
@@ -323,43 +392,82 @@ pub mod elevation {
         }
     }
 
-    /// A solid item on glass: only a contact shadow.
-    pub fn raised() -> Vec<BoxShadow> {
-        vec![shadow(0.04, 1., 2., 0.)]
+    fn dark(cx: &App) -> bool {
+        !cx.theme().appearance.is_light()
     }
 
-    /// A glass sheet: an inner rim and a soft downward shadow.
-    pub fn sheet() -> Vec<BoxShadow> {
-        vec![
-            rim(0.7),
-            shadow(0.04, 1., 2., 0.),
-            shadow(0.11, 12., 28., -9.),
-        ]
-    }
-
-    /// Small floating glass controls (pills, chips): a shorter, tighter shadow.
-    pub fn float() -> Vec<BoxShadow> {
-        vec![
-            rim(0.7),
-            shadow(0.05, 1., 2., 0.),
-            shadow(0.12, 6., 14., -6.),
-        ]
-    }
-
-    /// A modal or a context menu: the glass sheet's rim and shadow. A dark theme drops the
-    /// white rim, which would read as a light outline, and deepens the shadow to show on a
-    /// dark page.
-    pub fn floating(cx: &App) -> Vec<BoxShadow> {
-        if cx.theme().appearance.is_light() {
-            sheet()
-        } else {
-            vec![shadow(0.24, 1., 2., 0.), shadow(0.4, 12., 28., -9.)]
+    /// A 1 px line under (or, negative, over) an edge: Tower's `before:shadow-[0_1px_…]`.
+    fn edge(color: Hsla, y: f32) -> BoxShadow {
+        BoxShadow {
+            color,
+            offset: point(px(0.), px(y)),
+            blur_radius: px(0.),
+            spread_radius: px(0.),
+            inset: false,
         }
     }
 
-    /// Popovers and toasts.
-    pub fn overlay() -> Vec<BoxShadow> {
-        vec![shadow(0.06, 2., 4., 0.), shadow(0.10, 12., 32., -6.)]
+    // Tower's values, light and dark (`styles/glass.css`, `styles/theme.css`, `button.tsx`).
+
+    /// A solid item on glass (a card, a tile, the palette's results): only a contact shadow.
+    pub fn raised(cx: &App) -> Vec<BoxShadow> {
+        vec![shadow(if dark(cx) { 0.3 } else { 0.04 }, 1., 2., 0.)]
+    }
+
+    /// An outlined control (an outline button, a field): a faint contact shadow and a 1 px
+    /// edge under it; in a dark theme a 1 px light edge over it instead.
+    pub fn control(cx: &App) -> Vec<BoxShadow> {
+        if dark(cx) {
+            vec![
+                shadow(0.05, 1., 2., 0.),
+                edge(gpui::white().opacity(0.06), -1.),
+            ]
+        } else {
+            vec![
+                shadow(0.05, 1., 2., 0.),
+                edge(gpui::black().opacity(0.04), 1.),
+            ]
+        }
+    }
+
+    /// A glass sheet, and everything that floats over the page (a menu, a popover, a modal):
+    /// an inner rim, a contact shadow and a soft one offset downward.
+    pub fn sheet(cx: &App) -> Vec<BoxShadow> {
+        if dark(cx) {
+            vec![
+                rim(0.06),
+                shadow(0.3, 1., 2., 0.),
+                shadow(0.6, 12., 28., -9.),
+            ]
+        } else {
+            vec![
+                rim(0.7),
+                shadow(0.04, 1., 2., 0.),
+                shadow(0.11, 12., 28., -9.),
+            ]
+        }
+    }
+
+    /// Small floating glass controls (bars, chips over a canvas): a shorter, tighter shadow.
+    pub fn float(cx: &App) -> Vec<BoxShadow> {
+        if dark(cx) {
+            vec![
+                rim(0.06),
+                shadow(0.3, 1., 2., 0.),
+                shadow(0.5, 6., 14., -6.),
+            ]
+        } else {
+            vec![
+                rim(0.7),
+                shadow(0.05, 1., 2., 0.),
+                shadow(0.12, 6., 14., -6.),
+            ]
+        }
+    }
+
+    /// A modal, a menu or a popover: the glass sheet's shadow, as Tower gives every popup.
+    pub fn floating(cx: &App) -> Vec<BoxShadow> {
+        sheet(cx)
     }
 }
 
@@ -378,14 +486,14 @@ pub enum Status {
 /// repeat it.
 pub fn type_dot(type_name: &str) -> Div {
     div()
-        .size(px(16.))
+        .size(px(size::ROW_ICON))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
         .child(
             div()
-                .size(px(7.))
+                .size(px(size::DOT))
                 .rounded_full()
                 .bg(studio_theme::type_color(type_name)),
         )
@@ -393,7 +501,7 @@ pub fn type_dot(type_name: &str) -> Div {
 
 pub fn status_dot(status: Status) -> Div {
     div()
-        .size(px(7.))
+        .size(px(size::DOT))
         .flex_none()
         .rounded_full()
         .bg(surface::status(status))
@@ -618,11 +726,11 @@ impl RenderOnce for SidebarRow {
             .px(px(space::SM))
             .gap(px(space::MD))
             .items_center()
-            .rounded(px(radius::SM))
+            .rounded(px(radii(cx).sm))
             .cursor_pointer()
             .when(self.selected, |row| {
                 row.bg(selected_bg)
-                    .when(glass, |row| row.shadow(elevation::raised()))
+                    .when(glass, |row| row.shadow(elevation::raised(cx)))
             })
             .when(!self.selected, |row| {
                 row.hover(move |style| style.bg(hover_bg))
@@ -730,6 +838,11 @@ pub fn toolbar(cx: &App) -> Div {
         .border_color(surface::rule(cx))
 }
 
+/// A toolbar's buttons, set close: a ghost button's own padding is the space between them.
+pub fn toolbar_actions() -> Div {
+    h_flex().flex_none().items_center()
+}
+
 /// A short vertical hairline between groups in a strip (Delta's footer: context | facts).
 pub fn rule_v(cx: &App) -> Div {
     div().w(px(1.)).h(px(16.)).flex_none().bg(surface::rule(cx))
@@ -761,7 +874,7 @@ pub fn title_tab(
         .px(px(space::MD))
         .gap(px(space::SM))
         .items_center()
-        .rounded(px(radius::SM))
+        .rounded(px(radii(cx).sm))
         .when(selected && pill, |tab| tab.bg(surface::selected_chrome(cx)))
         .cursor_pointer()
         .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
@@ -809,7 +922,7 @@ pub fn meta_code(icon: IconName, value: impl Into<SharedString>, cx: &App) -> Di
 /// (`crate::button`). A button inside a dense row (a pill segment, a tree row, a tab) takes
 /// Zed's compact sizes through `.size`.
 pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
-    Button::new(id, label).label_size(LabelSize::Small)
+    Button::new(id, label)
 }
 
 /// Work under way that the person waits on (a search, a run, rows being read): a small turning
@@ -823,7 +936,9 @@ pub fn spinner() -> impl IntoElement {
 
 /// [`button`] inside a [`float_bar`]: Zed's default size, `size::BAR_BUTTON` tall.
 pub fn bar_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
-    button(id, label).size(ButtonSize::Default)
+    button(id, label)
+        .size(ButtonSize::Default)
+        .shape(Shape::Rounded)
 }
 
 /// [`icon_button`] inside a [`float_bar`].
@@ -850,7 +965,7 @@ pub fn field_frame(invalid: bool, cx: &App) -> Div {
         .px(px(space::CONTROL_INSET - 1.))
         .gap(px(space::SM))
         .items_center()
-        .rounded_full()
+        .rounded(px(radii(cx).sm))
         .border_1()
         .border_color(if invalid {
             cx.theme().status().error_border
@@ -858,7 +973,7 @@ pub fn field_frame(invalid: bool, cx: &App) -> Div {
             colors.text.opacity(0.1)
         })
         .bg(colors.editor_background)
-        .shadow(elevation::raised())
+        .shadow(elevation::control(cx))
 }
 
 /// A field's editor, filling what its [`field_frame`] leaves.
@@ -886,7 +1001,7 @@ pub fn sidebar_search(editor: impl IntoElement, cx: &App) -> Div {
         .mb(px(space::XS))
         .px(px(space::SM))
         .items_center()
-        .rounded(px(radius::SM))
+        .rounded(px(radii(cx).sm))
         .bg(surface::sunken(cx))
         .child(field_input(editor))
 }
@@ -930,7 +1045,7 @@ pub fn filter_pill(
         .border_1()
         .border_color(surface::raised_border(cx))
         .bg(cx.theme().colors().editor_background)
-        .shadow(elevation::raised())
+        .shadow(elevation::raised(cx))
         .overflow_hidden()
         .child(
             segment()
@@ -999,19 +1114,20 @@ pub fn pill_button(
         .child(Icon::new(icon).size(IconSize::XSmall).color(color))
 }
 
-/// A padded list of rounded rows, as a field's offers: rows of radius `radius::XS` inside a
+/// A padded list of rounded rows, as a field's offers: rows of radius `Radii::xs` inside a
 /// hairline, the list concentric around them. The caller colours the hairline and adds the
 /// fill and shadow.
-pub fn row_list() -> Div {
+pub fn row_list(cx: &App) -> Div {
     v_flex()
         .p(px(space::XS))
         .border_1()
-        .rounded(px(radius::around(radius::XS, space::XS + size::HAIRLINE)))
+        .rounded(px(radii(cx).row_list()))
 }
 
-/// A floating group of controls over a canvas: a glass pill 28 px tall holding
-/// [`bar_button`]s, [`bar_icon_button`]s (22 px) and [`segment`]s, 3 px inside its edge, so a
-/// pill holds pills. A medium button would not fit inside its border.
+/// A floating group of controls over a canvas: a glass bar 28 px tall holding
+/// [`bar_button`]s, [`bar_icon_button`]s (22 px) and [`segment`]s, 3 px inside its edge and
+/// rounded concentrically around them (`Radii::bar`). A medium button would not fit inside its
+/// border.
 pub fn float_bar(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
     let gap = (size::CONTROL - size::BAR_BUTTON) / 2.;
     let colors = cx.theme().colors();
@@ -1022,11 +1138,11 @@ pub fn float_bar(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
         // The border is part of the gap.
         .px(px(gap - 1.))
         .items_center()
-        .rounded_full()
+        .rounded(px(radii(cx).bar()))
         .bg(surface::glass(colors.elevated_surface_background, 0.92, cx))
         .border_1()
         .border_color(surface::floating_border(cx))
-        .shadow(elevation::float())
+        .shadow(elevation::float(cx))
         .occlude()
 }
 
@@ -1039,11 +1155,11 @@ pub fn tag(label: impl Into<SharedString>, cx: &App) -> Div {
     div()
         .flex_none()
         .max_w(px(TAG_MAX_WIDTH))
-        .h(px(18.))
+        .h(px(size::TAG))
         .px(px(space::SM))
         .flex()
         .items_center()
-        .rounded(px(radius::XS))
+        .rounded(px(radii(cx).xs))
         .bg(surface::tag(cx))
         .child(
             crate::cell_text(label, cx)
@@ -1065,13 +1181,13 @@ pub fn segment(
     selected: bool,
     cx: &App,
 ) -> Stateful<Div> {
-    let hover = cx.theme().colors().text.opacity(0.03);
+    let hover = surface::highlight(cx);
     h_flex()
         .id(id.into())
         .h(px(size::BAR_BUTTON))
         .px(px(space::MD + space::XXS))
         .items_center()
-        .rounded_full()
+        .rounded(px(radii(cx).sm))
         .cursor_pointer()
         .when(selected, |segment| segment.bg(surface::pressed(cx)))
         .when(!selected, |segment| {
@@ -1172,7 +1288,7 @@ fn code_frame(cx: &App) -> Div {
         .w_full()
         .px(px(space::LG))
         .py(px(space::MD))
-        .rounded(px(radius::SM))
+        .rounded(px(radii(cx).sm))
         .border_1();
     let block = if is_glass(cx) {
         block
@@ -1216,14 +1332,14 @@ pub fn field(label: impl Into<SharedString>, value: impl IntoElement) -> Div {
 pub fn card(cx: &App) -> Div {
     let card = v_flex()
         .w_full()
-        .rounded(px(radius::MD))
+        .rounded(px(radii(cx).md))
         .border_1()
         .bg(cx.theme().colors().editor_background)
         .overflow_hidden();
     if is_glass(cx) {
         // A solid item on glass: raised.
         card.border_color(surface::raised_border(cx))
-            .shadow(elevation::raised())
+            .shadow(elevation::raised(cx))
     } else {
         card.border_color(cx.theme().colors().border.opacity(0.7))
     }
@@ -1233,7 +1349,7 @@ pub fn card_header(cx: &App) -> Div {
     h_flex()
         .w_full()
         // Its fill meets the card's top corners.
-        .rounded_t(px(radius::flush(radius::MD)))
+        .rounded_t(px(radius::flush(radii(cx).md)))
         .min_h(px(size::SIDEBAR_ROW + space::MD))
         .px(px(space::LG))
         .gap(px(space::MD))
@@ -1333,17 +1449,17 @@ pub fn state_action(
 /// A raised glass sheet: a translucent fill over the wash, a light outline, and layered soft
 /// shadows instead of a border. GPUI clips its children to the sheet's rectangle, not its
 /// rounded corners, so a child with a background flush in a corner takes the sheet's radius
-/// there (`radius::LG`).
+/// there (`Radii::lg`).
 pub fn sheet(cx: &App) -> Div {
     div()
-        .rounded(px(radius::LG))
+        .rounded(px(radii(cx).lg))
         .overflow_hidden()
         .bg(surface::glass(
             cx.theme().colors().panel_background,
             0.8,
             cx,
         ))
-        .shadow(elevation::sheet())
+        .shadow(elevation::sheet(cx))
 }
 
 /// The rule under a list row: a hairline, dotted on glass.
@@ -1471,15 +1587,15 @@ impl RenderOnce for ActivityRow {
 // ---- components from the reference frames ----
 
 /// An icon on a small tile, as a card or entry leads with one.
-pub fn tile(icon: IconName) -> Div {
+pub fn tile(icon: IconName, cx: &App) -> Div {
     div()
         .size(px(size::CONTROL))
         .flex_none()
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(radius::SM))
-        .bg(gpui::black().opacity(0.04))
+        .rounded(px(radii(cx).sm))
+        .bg(surface::highlight(cx))
         .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
 }
 
@@ -1520,8 +1636,8 @@ pub fn section_rule(title: impl Into<SharedString>, cx: &App) -> Div {
 /// gets the same colour everywhere.
 pub fn number_badge(value: impl Into<SharedString>, hue: f32) -> Div {
     div()
-        .h(px(18.))
-        .min_w(px(18.))
+        .h(px(size::TAG))
+        .min_w(px(size::TAG))
         .px(px(space::SM))
         .flex()
         .items_center()
@@ -1537,6 +1653,7 @@ pub fn number_badge(value: impl Into<SharedString>, hue: f32) -> Div {
 
 /// A rounded-full control with a hairline: a picker in a composer ("Claude ▾").
 pub fn pill(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
+    let hover = surface::highlight(cx);
     h_flex()
         .id(id.into())
         .h(px(size::PILL))
@@ -1547,17 +1664,19 @@ pub fn pill(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
         .border_1()
         .border_color(cx.theme().colors().border_variant)
         .cursor_pointer()
-        .hover(|style| style.bg(gpui::black().opacity(0.03)))
+        .hover(move |style| style.bg(hover))
 }
 
-/// A circular icon button: attach, send.
-pub fn round_button(
+/// A composer's icon action (send, stop): a control-sized square at the scale's corner, solid
+/// ink when it is the action to take.
+pub fn composer_button(
     id: impl Into<ElementId>,
     icon: IconName,
     filled: bool,
     cx: &App,
 ) -> Stateful<Div> {
     let colors = cx.theme().colors();
+    let hover = surface::highlight(cx);
     div()
         .id(id.into())
         .size(px(size::CONTROL))
@@ -1565,7 +1684,7 @@ pub fn round_button(
         .flex()
         .items_center()
         .justify_center()
-        .rounded_full()
+        .rounded(px(radii(cx).sm))
         .cursor_pointer()
         .map(|button| {
             if filled {
@@ -1578,7 +1697,7 @@ pub fn round_button(
                 button
                     .border_1()
                     .border_color(colors.border_variant)
-                    .hover(|style| style.bg(gpui::black().opacity(0.03)))
+                    .hover(move |style| style.bg(hover))
                     .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
             }
         })
@@ -1755,28 +1874,49 @@ mod tests {
         assert!((dark.a - 0.8).abs() < 1e-6);
     }
 
-    /// The nested pairs the design system draws stay concentric (`radius::around`/`within`).
+    /// The nested pairs the design system draws stay concentric (`radius::around`/`within`),
+    /// at every base the corner radius setting allows.
     #[test]
     fn nested_radii_are_concentric() {
-        // A card `space::XS` inside a glass sheet.
-        assert_eq!(radius::within(radius::LG, space::XS), radius::MD);
-        // A context chip's tile; a row in a row list, inside its hairline and padding.
-        assert_eq!(radius::within(radius::MD, space::SM), radius::XS);
-        assert_eq!(radius::around(radius::XS, space::XS + size::HAIRLINE), 9.);
-        // A menu's rows, the palette's results and their rows: each inside a hairline and
-        // `space::XS` of padding.
-        assert_eq!(radius::MENU_ITEM, radius::MENU - space::XS - size::HAIRLINE);
+        // The default base draws the radii Studio was designed at.
+        let default = Radii::new(radius::DEFAULT_BASE);
         assert_eq!(
-            radius::PALETTE_LIST,
-            radius::MODAL - space::XS - size::HAIRLINE
+            (
+                default.xs,
+                default.sm,
+                default.md,
+                default.lg,
+                default.modal
+            ),
+            (4., 6., 10., 14., 16.)
         );
+        assert_eq!(default.menu_item(), 5.);
+        assert_eq!((default.palette_list(), default.palette_row()), (11., 6.));
+        assert_eq!(default.row_list(), 9.);
+        for base in 1..=20 {
+            let r = Radii::new(base as f32);
+            // A card `space::XS` inside a glass sheet; a chip `space::SM` inside a card; a
+            // card inside a modal's `space::SM`.
+            assert_eq!(radius::within(r.lg, space::XS), r.md, "base {base}");
+            assert_eq!(radius::within(r.md, space::SM), r.xs, "base {base}");
+            assert_eq!(radius::within(r.modal, space::SM), r.md, "base {base}");
+            // A menu's rows, the palette's results and their rows: each inside a hairline
+            // and `space::XS` of padding; a row list around its rows.
+            let inset = space::XS + size::HAIRLINE;
+            assert_eq!(r.menu_item(), radius::within(r.menu(), inset));
+            assert_eq!(r.palette_list(), radius::within(r.modal, inset));
+            assert_eq!(r.palette_row(), radius::within(r.palette_list(), inset));
+            assert_eq!(r.row_list(), radius::around(r.xs, inset));
+        }
+        // 0 squares everything.
+        let square = Radii::new(0.);
         assert_eq!(
-            radius::PALETTE_ROW,
-            radius::PALETTE_LIST - space::XS - size::HAIRLINE
+            (square.xs, square.sm, square.md, square.lg, square.modal),
+            (0., 0., 0., 0., 0.)
         );
         // A fill flush with a bordered edge: a card's header, a modal's footer.
-        assert_eq!(radius::flush(radius::MD), radius::MD - size::HAIRLINE);
-        assert_eq!(radius::flush(radius::MODAL), radius::MODAL - size::HAIRLINE);
+        assert_eq!(radius::flush(default.md), 9.);
+        assert_eq!(radius::flush(default.modal), 15.);
         // A pill button's half height is the pill's less the gap: round in its round end.
         let button = size::PILL - 2. * PILL_BUTTON_GAP;
         assert_eq!(
@@ -1784,6 +1924,6 @@ mod tests {
             button / 2.
         );
         // A gap wider than the radius leaves the child square.
-        assert_eq!(radius::within(radius::XS, space::XL), 0.);
+        assert_eq!(radius::within(default.xs, space::XL), 0.);
     }
 }

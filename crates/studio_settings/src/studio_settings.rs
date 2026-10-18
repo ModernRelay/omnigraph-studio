@@ -120,6 +120,14 @@ pub struct StudioOptions {
     /// Columns on solid panels, or the document as a sheet over a faint wash.
     #[schemars(title = "Window style", extend("x-section" = "Appearance"))]
     pub window_style: WindowStyle,
+    /// The corners of cards and menus, in pixels; every other corner follows from it, and
+    /// buttons with a label stay round at their ends. 0 is square.
+    #[schemars(
+        title = "Corner radius",
+        range(min = 0, max = 20),
+        extend("x-section" = "Appearance", "x-step" = 1)
+    )]
+    pub corner_radius: u32,
     /// Where the bottom panel spans: under the document, across the window, or with the
     /// sidebar or the inspector beside it.
     #[schemars(title = "Bottom panel", extend("x-section" = "Appearance"))]
@@ -162,6 +170,7 @@ impl Default for StudioOptions {
     fn default() -> Self {
         Self {
             window_style: WindowStyle::default(),
+            corner_radius: 10,
             bottom_dock_layout: BottomDockLayout::default(),
             type_table_page_size: 100,
             tree_page_size: 50,
@@ -322,7 +331,9 @@ impl Default for StudioSettings {
         Self {
             theme: ThemeChoice::default(),
             ui_font_family: None,
-            ui_font_size: 16.,
+            // Tower's root size (93.75 %): its text-sm is 13 px and text-xs 11 px, and Zed's
+            // label sizes at this rem land on them.
+            ui_font_size: 15.,
             buffer_font_family: None,
             buffer_font_size: 14.,
             ui_density: Density::default(),

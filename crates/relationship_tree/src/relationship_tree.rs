@@ -733,7 +733,7 @@ impl RelationshipTree {
                     // The root carries the type's mark; below it a dot, since each
                     // relationship already names the type it leads to.
                     .child(if root {
-                        type_swatch(&node.type_name)
+                        type_swatch(&node.type_name, cx)
                     } else {
                         studio_ui::ds::type_dot(&node.type_name)
                     })
@@ -767,7 +767,7 @@ impl RelationshipTree {
                 .flex_1()
                 .gap(px(space::SM))
                 .child(Label::new("↺").size(LabelSize::Small).color(Color::Muted))
-                .child(type_swatch(&node.type_name))
+                .child(type_swatch(&node.type_name, cx))
                 .child(
                     div().min_w_0().flex_shrink(1.).child(
                         Label::new(rows::node_text(state, node))
@@ -1263,7 +1263,7 @@ impl RelationshipTree {
                             .h(px(ROW_HEIGHT))
                             .px(px(space::MD))
                             .gap(px(space::SM))
-                            .rounded_full()
+                            .rounded(px(studio_ui::ds::radii(cx).sm))
                             .bg(field)
                             .child(
                                 Icon::new(IconName::MagnifyingGlass)

@@ -192,7 +192,6 @@ impl Render for SchemaView {
                         .child(
                             studio_ui::ds::button("newer-schema", "Newer schema · Refresh")
                                 .style(ButtonStyle::Tinted(TintColor::Accent))
-                                .label_size(LabelSize::Small)
                                 .tooltip(Tooltip::text(
                                     "The schema changed elsewhere; show the one the graph has now",
                                 ))

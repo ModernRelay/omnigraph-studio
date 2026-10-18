@@ -320,7 +320,6 @@ fn dropdown(target: &Target, current: Value, options: Options) -> AnyElement {
     PopoverMenu::new(target.id("menu"))
         .trigger(
             studio_ui::ds::button(target.id("trigger"), shown)
-                .label_size(LabelSize::Small)
                 .style(ButtonStyle::Outlined)
                 .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
         )

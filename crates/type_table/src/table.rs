@@ -1283,8 +1283,7 @@ impl TypeTable {
                                     None => "Set a property ▾".to_owned(),
                                 },
                             )
-                            .style(ButtonStyle::Outlined)
-                            .label_size(LabelSize::Small),
+                            .style(ButtonStyle::Outlined),
                         )
                         .menu(move |window, cx| {
                             let editable = editable.clone();
@@ -1326,7 +1325,6 @@ impl TypeTable {
                             },
                         )
                         .style(ButtonStyle::Tinted(TintColor::Accent))
-                        .label_size(LabelSize::Small)
                         .disabled(saving)
                         .tooltip(Tooltip::text(format!(
                             "One commit to {}; each row is bound to the value it shows",
@@ -1346,7 +1344,6 @@ impl TypeTable {
             .child(
                 studio_ui::ds::button("bulk-clear", "Clear")
                     .style(ButtonStyle::Subtle)
-                    .label_size(LabelSize::Small)
                     .tooltip(Tooltip::text("Clear the selection (Esc)"))
                     .on_click(cx.listener(|this, _, _, cx| this.clear_selection(cx))),
             )
@@ -1508,7 +1505,6 @@ impl TypeTable {
                     },
                 )
                 .style(ButtonStyle::Subtle)
-                .label_size(LabelSize::Small)
                 .start_icon(Icon::new(IconName::Eye).size(IconSize::Small))
                 .disabled(self.all_columns.len() < 2)
                 .when(!open, |button| {
@@ -1595,7 +1591,6 @@ impl TypeTable {
                     },
                 )
                 .style(ButtonStyle::Subtle)
-                .label_size(LabelSize::Small)
                 .start_icon(Icon::new(IconName::ListTree).size(IconSize::Small))
                 .disabled(choices.is_empty())
                 .when(!open, |button| {
@@ -1726,7 +1721,6 @@ impl TypeTable {
             .trigger(
                 studio_ui::ds::button("views", active.clone().unwrap_or_else(|| "Views".into()))
                     .style(ButtonStyle::Subtle)
-                    .label_size(LabelSize::Small)
                     .start_icon(Icon::new(IconName::Star).size(IconSize::Small))
                     .when(!open, |button| {
                         button.tooltip(Tooltip::text(
@@ -4078,11 +4072,11 @@ impl TypeTable {
             .py(px(space::XS))
             .gap(px(space::MD))
             .items_center()
-            .rounded(px(studio_ui::ds::radius::LG))
+            .rounded(px(studio_ui::ds::radii(cx).lg))
             .bg(fill)
             .border_1()
             .border_color(border)
-            .shadow(studio_ui::ds::elevation::float())
+            .shadow(studio_ui::ds::elevation::float(cx))
             .child(Indicator::dot().color(Color::Accent))
             .child(
                 Label::new(if saving {
@@ -4116,13 +4110,11 @@ impl TypeTable {
                     } else {
                         ButtonStyle::Subtle
                     })
-                    .label_size(LabelSize::Small)
                     .on_click(cx.listener(|this, _, _, cx| this.discard_drafts(cx))),
                 )
                 .child(
                     studio_ui::ds::button("drafts-save", "Save as one commit")
                         .style(ButtonStyle::Tinted(TintColor::Accent))
-                        .label_size(LabelSize::Small)
                         .tooltip(move |_, cx| {
                             Tooltip::for_action_in(save_tooltip.clone(), &SaveDrafts, &focus, cx)
                         })
@@ -4883,6 +4875,7 @@ impl TypeTable {
             .child(studio_ui::kind_swatch(
                 &self.type_name,
                 self.kind == TableKind::Edge,
+                cx,
             ))
             .child(
                 Label::new(self.type_name.clone())
@@ -4920,7 +4913,6 @@ impl TypeTable {
                 d.child(
                     studio_ui::ds::button("newer-data", "Newer data · Refresh")
                         .style(ButtonStyle::Tinted(TintColor::Accent))
-                        .label_size(LabelSize::Small)
                         .tooltip(|_, cx| {
                             Tooltip::for_action("Read the branch head again", &RefreshTable, cx)
                         })
@@ -4928,41 +4920,42 @@ impl TypeTable {
                 )
             })
             .child(div().flex_1())
-            .child(self.render_views_menu(cx))
-            .child(self.render_columns_menu(cx))
-            .child(self.render_group_menu(cx))
             .child(
-                studio_ui::ds::button("add-filter", "Filter")
-                    .style(ButtonStyle::Subtle)
-                    .label_size(LabelSize::Small)
-                    .start_icon(Icon::new(IconName::Filter).size(IconSize::Small))
-                    .tooltip(|_, cx| Tooltip::for_action("Add a filter", &AddFilter, cx))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_filter_draft(window, cx)),
+                studio_ui::ds::toolbar_actions()
+                    .child(self.render_views_menu(cx))
+                    .child(self.render_columns_menu(cx))
+                    .child(self.render_group_menu(cx))
+                    .child(
+                        studio_ui::ds::button("add-filter", "Filter")
+                            .style(ButtonStyle::Subtle)
+                            .start_icon(Icon::new(IconName::Filter).size(IconSize::Small))
+                            .tooltip(|_, cx| Tooltip::for_action("Add a filter", &AddFilter, cx))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_filter_draft(window, cx)
+                            })),
+                    )
+                    .child(
+                        studio_ui::ds::button("insert-row", "Row")
+                            .style(ButtonStyle::Subtle)
+                            .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
+                            .disabled(pinned)
+                            .tooltip(move |_, cx| {
+                                if pinned {
+                                    Tooltip::simple("Read-only at an older commit", cx)
+                                } else {
+                                    Tooltip::for_action("Add a row", &InsertRow, cx)
+                                }
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.on_insert(&InsertRow, window, cx)
+                            })),
+                    )
+                    .child(
+                        studio_ui::ds::icon_button("refresh-table", IconName::RotateCw)
+                            .icon_size(IconSize::Small)
+                            .tooltip(|_, cx| Tooltip::for_action("Refresh", &RefreshTable, cx))
+                            .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
                     ),
-            )
-            .child(
-                studio_ui::ds::button("insert-row", "Row")
-                    .style(ButtonStyle::Subtle)
-                    .label_size(LabelSize::Small)
-                    .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
-                    .disabled(pinned)
-                    .tooltip(move |_, cx| {
-                        if pinned {
-                            Tooltip::simple("Read-only at an older commit", cx)
-                        } else {
-                            Tooltip::for_action("Add a row", &InsertRow, cx)
-                        }
-                    })
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.on_insert(&InsertRow, window, cx)),
-                    ),
-            )
-            .child(
-                studio_ui::ds::icon_button("refresh-table", IconName::RotateCw)
-                    .icon_size(IconSize::Small)
-                    .tooltip(|_, cx| Tooltip::for_action("Refresh", &RefreshTable, cx))
-                    .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
             )
             .into_any_element()
     }
@@ -5042,7 +5035,6 @@ impl TypeTable {
                         .trigger(
                             Button::new("filter-property-button", chosen)
                                 .style(ButtonStyle::Subtle)
-                                .label_size(LabelSize::Small)
                                 .start_icon(
                                     Icon::new(chosen_icon)
                                         .size(IconSize::XSmall)
@@ -5092,7 +5084,6 @@ impl TypeTable {
                         .trigger(
                             Button::new("filter-op-button", draft.op.label())
                                 .style(ButtonStyle::Subtle)
-                                .label_size(LabelSize::Small)
                                 .color(Color::Muted)
                                 .end_icon(chevron()),
                         )
@@ -5185,7 +5176,6 @@ impl TypeTable {
             bar = bar.child(div().flex_1()).child(
                 studio_ui::ds::button("clear-filters", "Clear all")
                     .style(ButtonStyle::Subtle)
-                    .label_size(LabelSize::Small)
                     .tooltip(|_, cx| Tooltip::for_action("Remove every filter", &ClearFilters, cx))
                     .on_click(cx.listener(|this, _, _, cx| this.clear_filters(cx))),
             );
@@ -5215,7 +5205,7 @@ impl TypeTable {
                         .offset(point(px(-4.), px(28.)))
                         .snap_to_window_with_margin(px(8.))
                         .child(
-                            studio_ui::ds::row_list()
+                            studio_ui::ds::row_list(cx)
                                 .id("filter-suggestions")
                                 .occlude()
                                 .min_w(px(220.))
@@ -5224,7 +5214,7 @@ impl TypeTable {
                                 .overflow_y_scroll()
                                 .border_color(border)
                                 .bg(bg)
-                                .shadow(studio_ui::ds::elevation::overlay())
+                                .shadow(studio_ui::ds::elevation::floating(cx))
                                 .children(items),
                         ),
                 )
@@ -5364,7 +5354,10 @@ impl TypeTable {
                         }),
                     )
                     .h(px(studio_ui::HEADER_HEIGHT))
-                    .px(px(space::XL))
+                    // Zed's table pads a header cell by `space::XS` (its `px_1`) and leaves the
+                    // body's cells to draw their own, so the header's text starts that much
+                    // closer to sit on the cells' edge.
+                    .px(px(space::XL - space::XS))
                     .gap(px(space::SM))
                     .w_full()
                     .overflow_hidden()
@@ -6355,7 +6348,6 @@ impl TypeTable {
                                                     "Open history",
                                                 )
                                                 .style(ButtonStyle::Subtle)
-                                                .label_size(LabelSize::Small)
                                                 .on_click(|_, window, cx| {
                                                     window.dispatch_action(
                                                         Box::new(
@@ -6624,7 +6616,7 @@ impl Render for DraggedColumn {
         div()
             .px(px(space::MD))
             .py(px(space::XS))
-            .rounded_full()
+            .rounded(px(studio_ui::ds::radii(cx).sm))
             .bg(cx.theme().colors().elevated_surface_background)
             .border_1()
             .border_color(cx.theme().colors().border)

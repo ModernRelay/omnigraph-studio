@@ -2285,7 +2285,7 @@ fn gutter_row(icon: Option<Icon>, content: impl IntoElement) -> Div {
                 .w(px(GUTTER))
                 .flex_none()
                 // Centers a small icon on the first line of `text_sm` content.
-                .pt(px(4.))
+                .pt(px(ds::space::XS))
                 .flex()
                 .justify_center()
                 .children(icon),
@@ -2479,11 +2479,11 @@ impl AgentPanel {
             State::Ready { .. } | State::Idle | State::Exited { .. } | State::Starting
         ) && !self.composer.read(cx).text(cx).trim().is_empty();
         let send_or_stop = if running {
-            ds::round_button("stop", IconName::Stop, false, cx)
+            ds::composer_button("stop", IconName::Stop, false, cx)
                 .tooltip(|_, cx| Tooltip::for_action("Stop", &Stop, cx))
                 .on_click(cx.listener(|this, _, window, cx| this.stop(&Stop, window, cx)))
         } else {
-            ds::round_button("send", IconName::Send, can_send, cx)
+            ds::composer_button("send", IconName::Send, can_send, cx)
                 .tooltip(|_, cx| Tooltip::for_action("Send", &Send, cx))
                 .on_click(cx.listener(|this, _, window, cx| this.send(&Send, window, cx)))
         };
@@ -2597,7 +2597,6 @@ impl AgentPanel {
                         studio_ui::ds::button(("preset", index), *name)
                             .full_width()
                             .style(ButtonStyle::Outlined)
-                            .label_size(LabelSize::Small)
                             .start_icon(
                                 Icon::new(IconName::ZedAssistant)
                                     .size(IconSize::Small)
@@ -3241,7 +3240,6 @@ impl AgentPanel {
                         ("permission", index * 16 + option_index),
                         option.name.clone(),
                     )
-                    .label_size(LabelSize::Small)
                     .start_icon(Icon::new(icon).size(IconSize::XSmall).color(color))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.choose_option(index, option_index, cx)
@@ -3327,7 +3325,6 @@ impl AgentPanel {
             ProposalState::Waiting(_) => studio_ui::ds::card_footer(cx)
                 .child(
                     studio_ui::ds::button(("allow", index), "Allow")
-                        .label_size(LabelSize::Small)
                         .start_icon(
                             Icon::new(IconName::Check)
                                 .size(IconSize::XSmall)
@@ -3340,7 +3337,6 @@ impl AgentPanel {
                 )
                 .child(
                     studio_ui::ds::button(("always", index), "Always on this branch")
-                        .label_size(LabelSize::Small)
                         .start_icon(
                             Icon::new(IconName::CheckDouble)
                                 .size(IconSize::XSmall)
@@ -3354,7 +3350,6 @@ impl AgentPanel {
                 .child(div().flex_1())
                 .child(
                     studio_ui::ds::button(("reject", index), "Reject")
-                        .label_size(LabelSize::Small)
                         .start_icon(
                             Icon::new(IconName::Close)
                                 .size(IconSize::XSmall)
@@ -3516,7 +3511,7 @@ impl AgentPanel {
                         .items_center()
                         .rounded_full()
                         .cursor_pointer()
-                        .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
+                        .hover(|style| style.bg(ds::surface::highlight(cx)))
                         .tooltip(Tooltip::text(about))
                         .child(Indicator::dot().color(dot))
                         .child(
@@ -3697,7 +3692,7 @@ impl AgentPanel {
             v_flex()
                 .mb(px(ds::space::MD))
                 .ml(px(ds::space::SM))
-                .rounded(px(ds::radius::SM))
+                .rounded(px(ds::radii(cx).sm))
                 .border_1()
                 .border_color(border)
                 .bg(ds::surface::sunken(cx))
@@ -3737,7 +3732,6 @@ impl AgentPanel {
                 .child(div().flex_1())
                 .child(
                     studio_ui::ds::button("review", "Review")
-                        .label_size(LabelSize::Small)
                         .start_icon(Icon::new(IconName::Eye).size(IconSize::XSmall))
                         .on_click(cx.listener(|this, _, window, cx| this.review(window, cx))),
                 )
