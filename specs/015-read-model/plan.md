@@ -283,6 +283,15 @@ A first cut of parts 1 and 4, ahead of the shared cache:
   and review then reads both lists as before. A merge checks the head and confirms its landing
   through the merge base too. Review still offers Refresh on every move.
 
+- A node page or peek at a commit made before one of its type's properties was added (or
+  renamed) was refused whole (`return { $n }` reads every current property). It now reads the
+  node again as fields without the property the refusal names, once per property, and shows it
+  as "Added after this commit" or by the name it had. On the personal graph 38 of 101 types are
+  refused at the oldest commit; an `Account` there reads after two retries
+  (`provider_subtype`, `tax_wrapper`). Tables at a commit and relationship groups whose label or
+  edge properties are newer than the commit still fail; the server names one property per
+  refusal and only in its message (an engine change could name them all, typed).
+
 ### Expected effect, to be measured
 
 A Person page on the personal graph: from about 185 requests in three waves, all at once and all
@@ -369,7 +378,7 @@ commit can be cleaned up; measure first).
 | 2026-10-18 | A feed poll across a schema apply | `plan_intervals` (`crates/omnigraph/src/changes/enumerate.rs`) and `first_or_boundary` (`changes/feed.rs`) at `d883c49e`; not run live | The gate ignores the request's filters: a type added or removed with rows, or a changed column fingerprint, is `409 schema_boundary` for the whole commit; as a poll's first commit it is the answer, later it ends the page with `caught_up: false`. A rename's block is not known, hence the `/schema` check |
 | 2026-10-18 | Schema apply needs a graph with only `main` | `schema_apply.rs` at `d883c49e` ("schema apply requires a graph with only main") | Confirmed |
 | 2026-10-18 | What a carry-forward feed read costs | `GET /changes?start=after:<id>` on the personal graph (0.14 edge) with one `type` per name a view reads: a Person page 143 names, an Artifact page 165 | One commit: 0.47–0.68 s, 1–2 KB; five commits: 1.6–2.1 s, 2–5 KB. Every change in them was a `WorkflowRun`, so a Person page moves along with nothing read again. The `/schema` read after it is about 0.5 s and 199 KB |
-| 2026-10-18 | Carry-forward | `graph_store` `carry::tests` (5) and `a_head_move_reads_the_change_feed_for_the_types_views_read`; `an_exploration_moves_its_pin_past_commits_to_other_types`; `type_table` `a_page_moves_to_a_commit_that_changed_nothing_it_shows`, `a_table_moves_its_pin_past_commits_to_other_types`, `relationship_columns_read_while_drawn`, `refresh_reads_again_only_the_groups_a_commit_changed`; `graph_store` `a_read_at_a_new_head_is_answered_from_an_earlier_commit_it_still_holds_for` | Pass |
+| 2026-10-18 | Carry-forward | `graph_store` `carry::tests` (5) and `a_head_move_reads_the_change_feed_for_the_types_views_read`; `an_exploration_moves_its_pin_past_commits_to_other_types`; `type_table` `a_page_moves_to_a_commit_that_changed_nothing_it_shows`, `a_table_moves_its_pin_past_commits_to_other_types`, `relationship_columns_read_while_drawn`, `refresh_reads_again_only_the_groups_a_commit_changed`; `a_page_at_a_commit_before_a_property_was_added_shows_the_rest`; `graph_store` `a_read_at_a_new_head_is_answered_from_an_earlier_commit_it_still_holds_for`; `review` `a_review_reads_the_merge_base_and_the_feed_after_it` | Pass |
 | 2026-10-17 | Historical reads use the live schema contract | `docs/user/branching/index.md`; `omnigraph.rs` ("a point-in-time read keeps the LIVE contract") | Confirmed: the schema epoch belongs in every key |
 
 ## Corrections

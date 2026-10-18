@@ -830,6 +830,48 @@ pub fn node_by_id(
     })
 }
 
+/// The column a property is read into by [`node_fields_by_id`].
+pub fn field_column(property: &str) -> String {
+    format!("v_{property}")
+}
+
+/// One node by `@id` as columns: `id`, then [`field_column`] for every property but those in
+/// `without` and those a projection cannot read (Blob, vector). A read at a commit made before
+/// a property was added, or renamed, is refused for `return { $n }`; this reads the rest.
+pub fn node_fields_by_id(
+    schema: &SchemaModel,
+    type_name: &str,
+    id: &str,
+    without: &[String],
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, type_name)?;
+    let depends = Depends::Node {
+        type_name: node.name.clone(),
+        id: id.to_owned(),
+    };
+    let mut params = Params::new();
+    let id = params.add("id", "String", Value::String(id.to_owned()));
+    let mut columns = vec!["$n.@id as id".to_owned()];
+    columns.extend(
+        node.properties
+            .iter()
+            .filter(|p| p.projectable() && !without.contains(&p.name))
+            .map(|p| format!("$n.{} as {}", p.name, field_column(&p.name))),
+    );
+    let text = format!(
+        "query studio_node_fields({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n  }}\n  return {{ {columns} }}\n  limit 1\n}}\n",
+        sig = params.signature(),
+        ty = node.name,
+        columns = columns.join(", "),
+    );
+    Ok(BuiltQuery {
+        name: "studio_node_fields".into(),
+        text,
+        params: params.values,
+        depends,
+    })
+}
+
 /// A read that returns no rows, sent only for the commit its answer names: a branch's head
 /// when it is read at the branch. `None` when the schema has no node type to match.
 pub fn head_probe(schema: &SchemaModel) -> Option<BuiltQuery> {
@@ -2812,6 +2854,16 @@ mod tests {
         let query = node_by_id(&schema, "Person", "person-000000").unwrap();
         assert_compiles(&query);
         assert_eq!(query.params["id"], json!("person-000000"));
+    }
+
+    #[test]
+    fn a_node_read_as_fields_leaves_out_the_properties_named() {
+        let schema = dev();
+        let query =
+            node_fields_by_id(&schema, "Person", "person-000000", &["born".to_owned()]).unwrap();
+        assert_compiles(&query);
+        assert!(query.text.contains("$n.name as v_name"), "{}", query.text);
+        assert!(!query.text.contains("born"), "{}", query.text);
     }
 
     #[test]

@@ -216,6 +216,16 @@ fn serve_with(
                 request.into_body().read_to_end(&mut bytes).await.ok();
                 let asked: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
                 let rows = rows(&asked);
+                // An answer `{"refuse": message}` is the server refusing the read.
+                if let Some(message) = rows.get("refuse").and_then(Value::as_str) {
+                    return Ok(Response::builder()
+                        .status(400)
+                        .header(graph_client::CONTRACT_HEADER, "0.13")
+                        .body(AsyncBody::from(
+                            json!({ "error": message, "code": "bad_request" }).to_string(),
+                        ))
+                        .unwrap());
+                }
                 // A read at a commit is answered there; a read of the branch at the other
                 // writer's newest commit, or c1.
                 let at = asked["snapshot"]

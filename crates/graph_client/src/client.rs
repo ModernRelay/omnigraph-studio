@@ -62,6 +62,69 @@ pub struct ApiErrorSummary {
     pub diagnostic: Option<Value>,
 }
 
+/// What a read at a commit was refused for because the commit predates the current schema: a
+/// historical read is written against the current schema, and a type or property the commit
+/// does not hold under its current name is refused, named, rather than read as null.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoricalGap {
+    /// The node or edge type did not exist at the commit.
+    Type { name: String },
+    /// The property did not exist at the commit, or had another name then (`named`).
+    Property {
+        owner: String,
+        property: String,
+        named: Option<String>,
+    },
+}
+
+impl ApiErrorSummary {
+    /// The type or property a historical read was refused for. The server says it only in the
+    /// message (`property 'P' of node type 'T' does not exist at this snapshot`, `… is named
+    /// 'Q' at this snapshot; …`, `node type 'T' does not exist at this snapshot`).
+    pub fn historical_gap(&self) -> Option<HistoricalGap> {
+        if self.status != 400 {
+            return None;
+        }
+        let message = self.message.trim();
+        let (subject, named) =
+            if let Some(subject) = message.strip_suffix(" does not exist at this snapshot") {
+                (subject, None)
+            } else {
+                let (head, _) = message.split_once(" at this snapshot; ")?;
+                let (subject, named) = head.rsplit_once(" is named ")?;
+                (subject, Some(quoted(named)?))
+            };
+        match subject.strip_prefix("property ") {
+            Some(rest) => {
+                let (property, owner) = rest.split_once(" of ")?;
+                let owner = owner
+                    .strip_prefix("node type ")
+                    .or_else(|| owner.strip_prefix("edge type "))?;
+                Some(HistoricalGap::Property {
+                    owner: quoted(owner)?,
+                    property: quoted(property)?,
+                    named,
+                })
+            }
+            None if named.is_none() => {
+                let name = subject
+                    .strip_prefix("node type ")
+                    .or_else(|| subject.strip_prefix("edge type "))?;
+                Some(HistoricalGap::Type {
+                    name: quoted(name)?,
+                })
+            }
+            None => None,
+        }
+    }
+}
+
+/// `'name'` without its quotes.
+fn quoted(text: &str) -> Option<String> {
+    let inner = text.strip_prefix('\'')?.strip_suffix('\'')?;
+    (!inner.is_empty() && !inner.contains('\'')).then(|| inner.to_owned())
+}
+
 impl std::fmt::Display for ReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1392,6 +1455,52 @@ mod tests {
         assert_eq!(server_version("edge"), None);
         assert!(server_version("0.13.0").unwrap() < MIN_SERVER_VERSION);
         assert!(server_version("0.15.1").unwrap() > MIN_SERVER_VERSION);
+    }
+
+    #[test]
+    fn a_refused_historical_read_names_its_type_or_property() {
+        let gap = |message: &str| {
+            ApiErrorSummary {
+                status: 400,
+                message: message.into(),
+                code: None,
+                diagnostic: None,
+            }
+            .historical_gap()
+        };
+        assert_eq!(
+            gap("property 'actual_end' of node type 'Event' does not exist at this snapshot"),
+            Some(HistoricalGap::Property {
+                owner: "Event".into(),
+                property: "actual_end".into(),
+                named: None,
+            })
+        );
+        assert_eq!(
+            gap(
+                "property 'remark' of node type 'Person' is named 'memo' at this snapshot; a historical query cannot read a property across a rename"
+            ),
+            Some(HistoricalGap::Property {
+                owner: "Person".into(),
+                property: "remark".into(),
+                named: Some("memo".into()),
+            })
+        );
+        assert_eq!(
+            gap("property 'since' of edge type 'Knows' does not exist at this snapshot"),
+            Some(HistoricalGap::Property {
+                owner: "Knows".into(),
+                property: "since".into(),
+                named: None,
+            })
+        );
+        assert_eq!(
+            gap("node type 'Reservation' does not exist at this snapshot"),
+            Some(HistoricalGap::Type {
+                name: "Reservation".into()
+            })
+        );
+        assert_eq!(gap("parse error: expected not_expr"), None);
     }
 
     #[test]

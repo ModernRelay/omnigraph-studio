@@ -28,10 +28,10 @@ use crate::blob::{
     IMAGE_MAX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, save_value, suggested_file_name,
 };
 use crate::model::{
-    FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, display_value, format_count, node_rows,
-    reads_as_markdown, same_value, save_result, short_commit,
+    FROM_COLUMN, ID_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, display_value, format_count,
+    node_rows, reads_as_markdown, same_value, save_result, short_commit,
 };
-use graph_client::{BlobCell, BlobMeta};
+use graph_client::{BlobCell, BlobMeta, HistoricalGap, ReadError};
 
 /// First neighbours shown under an expanded relationship group.
 pub const NEIGHBOUR_LIMIT: u32 = 8;
@@ -196,6 +196,9 @@ pub struct NodePeek {
     confirm_discard: bool,
     /// What the view reads, told to the session for the branch named.
     reads: Option<(String, ReadWatch)>,
+    /// Properties the commit shown does not hold under their current name: added after it, or
+    /// named otherwise then (the name it had). The node is read without them.
+    absent: HashMap<String, Option<String>>,
     /// The head moved and the session is reading what changed: the view decides when it is in.
     awaiting_changes: bool,
     _tasks: Vec<Task<()>>,
@@ -319,6 +322,7 @@ impl NodePeek {
             confirm_discard: false,
             show_empty: false,
             reads: None,
+            absent: HashMap::new(),
             awaiting_changes: false,
             _tasks: Vec::new(),
             _subscription: subscription,
@@ -409,6 +413,7 @@ impl NodePeek {
         // What the table read belongs to the old commit.
         self.known.clear();
         self.groups.clear();
+        self.absent.clear();
         self._tasks.clear();
         self.load_node(cx);
         cx.notify();
@@ -422,13 +427,23 @@ impl NodePeek {
             self.values = Loadable::Failed("The schema is still loading.".into());
             return;
         };
-        let query = match builder::node_by_id(&schema, type_name, id) {
+        // At a commit made before a property was added or renamed, the whole node is refused:
+        // the rest of it is read as fields.
+        let fields = !self.absent.is_empty();
+        let query = if fields {
+            let without: Vec<String> = self.absent.keys().cloned().collect();
+            builder::node_fields_by_id(&schema, type_name, id, &without)
+        } else {
+            builder::node_by_id(&schema, type_name, id)
+        };
+        let query = match query {
             Ok(query) => query,
             Err(error) => {
                 self.values = Loadable::Failed(error.to_string());
                 return;
             }
         };
+        let type_name = type_name.clone();
         self.values = Loadable::Loading;
         let snapshot = self.snapshot.clone();
         let read = self
@@ -442,9 +457,17 @@ impl NodePeek {
                         if this.snapshot.is_none() {
                             this.snapshot = output.graph_commit_id.clone();
                         }
-                        match node_rows(&output.rows).into_iter().next() {
-                            Some(row) => {
-                                this.values = Loadable::Loaded(row.values);
+                        let values = if fields {
+                            field_values(&output.rows)
+                        } else {
+                            node_rows(&output.rows)
+                                .into_iter()
+                                .next()
+                                .map(|row| row.values)
+                        };
+                        match values {
+                            Some(values) => {
+                                this.values = Loadable::Loaded(values);
                                 this.load_groups(false, cx);
                                 this.load_blobs(false, cx);
                             }
@@ -455,6 +478,30 @@ impl NodePeek {
                             }
                         }
                     }
+                    Err(ReadError::Refused(refusal)) => match refusal.historical_gap() {
+                        Some(HistoricalGap::Property {
+                            owner,
+                            property,
+                            named,
+                        }) if owner == type_name
+                            && !this.absent.contains_key(&property)
+                            && this
+                                .schema
+                                .as_ref()
+                                .and_then(|schema| schema.node(&type_name))
+                                .is_some_and(|node| node.property(&property).is_some()) =>
+                        {
+                            // Once per property, so this ends.
+                            this.absent.insert(property, named);
+                            this.load_node(cx);
+                        }
+                        Some(HistoricalGap::Type { name }) if name == type_name => {
+                            this.values = Loadable::Failed(format!(
+                                "{type_name} did not exist at this commit."
+                            ));
+                        }
+                        _ => this.values = Loadable::Failed(refusal.message),
+                    },
                     Err(error) => this.values = Loadable::Failed(error.to_string()),
                 }
                 cx.notify();
@@ -475,7 +522,9 @@ impl NodePeek {
         properties
             .into_iter()
             .flatten()
-            .filter(|p| p.kind == gq_language::ScalarKind::Blob)
+            .filter(|p| {
+                p.kind == gq_language::ScalarKind::Blob && !self.absent.contains_key(&p.name)
+            })
             .map(|p| p.name.clone())
             .collect()
     }
@@ -2073,6 +2122,15 @@ impl NodePeek {
                             .and_then(|p| self.render_picker(index, p, &value, cx));
                         let opens_editor = editable && picker.is_none() && !editing && !saving;
                         let body = match (self.edits.get(&name), picker) {
+                            _ if self.absent.contains_key(&name) => Label::new(
+                                match self.absent.get(&name).cloned().flatten() {
+                                    Some(then) => format!("Named “{then}” at this commit"),
+                                    None => "Added after this commit".to_owned(),
+                                },
+                            )
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .into_any_element(),
                             (Some(edit), _) => self.render_field_edit(edit, window, cx),
                             (None, _) if draft.is_some() => {
                                 let text = draft.as_ref().map(|d| d.text.clone()).unwrap_or_default();
@@ -3217,6 +3275,25 @@ impl NodePeek {
     }
 }
 
+/// A node read as fields (`builder::node_fields_by_id`), as a whole-node read gives it: `@id`
+/// and the properties that hold a value.
+fn field_values(rows: &Value) -> Option<Map<String, Value>> {
+    let row = rows.as_array()?.first()?.as_object()?;
+    let prefix = builder::field_column("");
+    let mut values = Map::new();
+    for (column, value) in row {
+        if value.is_null() {
+            continue;
+        }
+        if column == "id" {
+            values.insert(ID_COLUMN.to_owned(), value.clone());
+        } else if let Some(property) = column.strip_prefix(prefix.as_str()) {
+            values.insert(property.to_owned(), value.clone());
+        }
+    }
+    Some(values)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3397,6 +3474,55 @@ mod tests {
             reads("studio_page_degrees"),
             1,
             "a count only past the page: {asked:?}"
+        );
+    }
+
+    /// At a commit made before a property was added, the whole node is refused, naming it: the
+    /// page reads the rest as fields and shows the property as added after the commit.
+    #[gpui::test]
+    async fn a_page_at_a_commit_before_a_property_was_added_shows_the_rest(
+        cx: &mut TestAppContext,
+    ) {
+        const BORN: &str = "node Person {\n  slug: String @key\n  name: String\n  born: Date?\n}\n";
+        let (session, asked) = session_routing(
+            BORN,
+            |request| match request["name"].as_str() {
+                Some("studio_node") => json!({
+                    "refuse": "property 'born' of node type 'Person' does not exist at this snapshot"
+                }),
+                Some("studio_node_fields") => {
+                    assert!(!request["query"].as_str().unwrap().contains("born"));
+                    json!([{ "id": "p1", "v_slug": "p1", "v_name": "Ada" }])
+                }
+                _ => json!([]),
+            },
+            cx,
+        );
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            NodePeek::page(session, "Person".into(), "p1".into(), Some("c0".into()), cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            let values = view.values.loaded().expect("the rest is read");
+            assert_eq!(values.get("name"), Some(&json!("Ada")));
+            assert_eq!(values.get("@id"), Some(&json!("p1")));
+            assert_eq!(
+                view.absent.get("born"),
+                Some(&None),
+                "added after this commit"
+            );
+        });
+        let names = asked.lock().unwrap().clone();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.starts_with("studio_node"))
+                .collect::<Vec<_>>(),
+            ["studio_node", "studio_node_fields"]
         );
     }
 
