@@ -42,8 +42,9 @@ pub struct CliHome {
     credentials: String,
     /// The home `omnigraph_run` uses, outside the working directory; its runs stage there too.
     private: PathBuf,
-    /// The CLI chosen for the conversation, which `omnigraph_run` starts itself.
-    cli: std::sync::Mutex<Option<PathBuf>>,
+    /// The CLI chosen for the conversation, which `omnigraph_run` starts itself, or why there
+    /// is none.
+    cli: std::sync::Mutex<Result<PathBuf, String>>,
 }
 
 impl Drop for CliHome {
@@ -106,18 +107,21 @@ impl CliHome {
             folder: format!(".studio/{name}"),
             credentials,
             private: private_root.join(folder),
-            cli: std::sync::Mutex::new(None),
+            cli: std::sync::Mutex::new(Err("Studio has not chosen an omnigraph CLI yet.".into())),
         })
     }
 
-    /// The CLI `omnigraph_run` starts, once one is chosen.
-    fn cli(&self) -> Option<PathBuf> {
-        self.cli.lock().ok()?.clone()
+    /// The CLI `omnigraph_run` starts, or why there is none.
+    fn cli(&self) -> Result<PathBuf, String> {
+        self.cli
+            .lock()
+            .map_err(|_| "Studio lost track of the conversation's CLI.".to_owned())?
+            .clone()
     }
 
-    fn set_cli(&self, cli: Option<&Path>) {
+    fn set_cli(&self, cli: Result<&Path, &str>) {
         if let Ok(mut chosen) = self.cli.lock() {
-            *chosen = cli.map(Path::to_owned);
+            *chosen = cli.map(Path::to_owned).map_err(str::to_owned);
         }
     }
 
@@ -165,7 +169,7 @@ impl CliHome {
             cli = shell_quote(&cli.to_string_lossy()),
         );
         self.home()?.write("omnigraph", script.as_bytes(), 0o700)?;
-        self.set_cli(Some(cli));
+        self.set_cli(Ok(cli));
         Ok(())
     }
 
@@ -179,7 +183,7 @@ impl CliHome {
              exit 1\n",
             why = shell_quote(why),
         );
-        self.set_cli(None);
+        self.set_cli(Err(why));
         self.home()?.write("omnigraph", script.as_bytes(), 0o700)
     }
 
@@ -738,11 +742,9 @@ impl Drop for Stage {
 /// whether the command failed. The plan's files are staged (see [`RunFile`]); its `save_to`
 /// writes standard output to a file in `cwd` instead of returning it.
 pub async fn run(home: &CliHome, cwd: &Path, plan: RunPlan) -> (String, bool) {
-    let Some(cli) = home.cli() else {
-        return (
-            "This conversation has no omnigraph CLI that speaks the graph's HTTP API.".into(),
-            true,
-        );
+    let cli = match home.cli() {
+        Ok(cli) => cli,
+        Err(why) => return (why, true),
     };
     let stage = match Stage::new(&home.private) {
         Ok(stage) => stage,
@@ -1187,7 +1189,13 @@ mod tests {
             save_to: None,
         };
         let (text, failed) = smol::block_on(run(&home, &cwd, plan()));
-        assert!(failed && text.contains("no omnigraph CLI"), "{text}");
+        assert!(failed && text.contains("not chosen"), "{text}");
+        home.refuse("No omnigraph CLI here speaks 0.13").unwrap();
+        let (text, failed) = smol::block_on(run(&home, &cwd, plan()));
+        assert!(
+            failed && text == "No omnigraph CLI here speaks 0.13",
+            "{text}"
+        );
 
         let cli = cwd.join("fake-cli");
         std::fs::write(&cli, "#!/bin/sh\npwd\nenv\n").unwrap();
@@ -1381,7 +1389,7 @@ mod tests {
             folder: ".studio/agent-20261013-101500".into(),
             credentials: String::new(),
             private: cwd.join("private/longest"),
-            cli: Default::default(),
+            cli: std::sync::Mutex::new(Err(String::new())),
         };
         for ready in [None, Some(true), Some(false)] {
             let length = crate::mcp::INSTRUCTIONS.len() + 2 + longest.instructions(ready).len();

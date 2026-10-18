@@ -202,8 +202,10 @@ and Delta's sidebar.
   message the person sent, the agent branch its changes go to, and whether it is pinned or
   archived. Ids and titles only; the conversation stays with the agent. The agent's own
   `session/list` is not the source: every graph's agent works in the same directory, so it
-  cannot tell graphs apart. The first format (one session per graph and agent) is read as
-  records of their own.
+  cannot tell graphs apart. Each record is read on its own: one Studio cannot read is skipped
+  and the file set aside first, so the next save loses nothing. A file in another shape is set
+  aside whole. (The first format, one session per graph and agent, predates v0.1.0 and is not
+  read.)
 - **Titles.** The agent's `session_info_update` title wins; until it sends one, the first line
   of the first message (cut at 80 characters); "New conversation" before that.
 - **One tab per conversation.** Each conversation is its own Agent tab, titled after it, and
