@@ -75,6 +75,8 @@ pub struct ChangeCard {
     rows: Vec<PropertyRow>,
     relationships: Vec<RelationshipLine>,
     relationship_counts: (usize, usize, usize),
+    /// Below the relationship lines: for example a control that shows the ones left out.
+    relationships_footer: Option<AnyElement>,
     selected: bool,
     hollow: bool,
     status: Option<(SharedString, Color)>,
@@ -97,6 +99,7 @@ impl ChangeCard {
             rows: Vec::new(),
             relationships: Vec::new(),
             relationship_counts: (0, 0, 0),
+            relationships_footer: None,
             selected: false,
             hollow: false,
             status: None,
@@ -131,6 +134,12 @@ impl ChangeCard {
     ) -> Self {
         self.relationship_counts = (added, changed, removed);
         self.relationships = lines;
+        self
+    }
+
+    /// Shown below the relationship lines.
+    pub fn relationships_footer(mut self, footer: impl IntoElement) -> Self {
+        self.relationships_footer = Some(footer.into_any_element());
         self
     }
 
@@ -291,6 +300,7 @@ impl RenderOnce for ChangeCard {
             .children(self.actions);
         let rows = self.rows.iter().map(|row| property_row(row, kind));
         let (added, changed, removed) = self.relationship_counts;
+        let footer = self.relationships_footer;
         let relationships = (!self.relationships.is_empty()).then(|| {
             v_flex()
                 .pt(px(space::XS))
@@ -306,6 +316,7 @@ impl RenderOnce for ChangeCard {
                         .child(change_counts(added, changed, removed)),
                 )
                 .children(self.relationships)
+                .children(footer)
         });
         let card = h_flex()
             .id(self.id)
@@ -451,7 +462,6 @@ impl RelationshipLine {
 
 impl RenderOnce for RelationshipLine {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let colors = cx.theme().colors();
         let mirror = self.kind.is_none();
         let symbol = match self.kind {
             Some(kind) => Label::new(kind.symbol())
@@ -531,8 +541,11 @@ impl RenderOnce for RelationshipLine {
             .px(px(space::XS))
             .rounded(px(radii(cx).xs))
             .when_some(self.hover_group, |d, group| d.group(group))
-            .when(self.selected, |d| d.bg(colors.element_selected))
-            .when(!self.selected, |d| d.hover(|d| d.bg(colors.element_hover)))
+            .when(self.selected, |d| d.bg(crate::ds::surface::pressed(cx)))
+            .when(!self.selected, |d| {
+                let hover = crate::ds::surface::highlight(cx);
+                d.hover(move |d| d.bg(hover))
+            })
             .when(self.hollow, |d| d.opacity(0.6))
             .child(line)
             .children(rows);

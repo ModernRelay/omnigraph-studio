@@ -41,8 +41,15 @@ use crate::conflicts::{conflict_wording, resolution_hint};
 /// How long typing in the search pauses before the cards are filtered.
 const SEARCH_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
 
-/// Changes asked for per change-feed page.
-const FEED_PAGE: usize = 1_000;
+/// Changes asked for per change-feed page: the server's most (`COMMIT_CHANGES_MAX_CHANGES`),
+/// as the CLI asks when it follows every page. Each page restarts the server's comparison
+/// after the last change returned, so fewer, larger pages cost fewer reads; the server's byte
+/// budget still bounds what one page holds.
+const FEED_PAGE: usize = 8_192;
+
+/// Relationship lines a card shows until it is opened: a node that gained hundreds of
+/// relationships stays one readable card, and one row the list lays out quickly.
+const CARD_LINES: usize = 20;
 
 /// One row of the review's list.
 #[derive(Debug, Clone, Copy)]
@@ -224,6 +231,9 @@ pub struct ReviewView {
     /// Names of the nodes the review knows only by id, read at the reviewed head after it
     /// loads; until then, and for a node without a name, its id shows.
     names: NodeNames,
+    /// Cards showing every relationship line, by entity `(type, id)`; the others show
+    /// [`CARD_LINES`].
+    open_cards: HashSet<(String, String)>,
     list_state: ListState,
     /// The head fixes and the merge bind to: the reviewed head, then each fix's own commit.
     bound_head: Option<String>,
@@ -337,6 +347,7 @@ impl ReviewView {
             headers: Vec::new(),
             selected: None,
             names: NodeNames::default(),
+            open_cards: HashSet::new(),
             list_state: ListState::new(0, ListAlignment::Top, px(800.)),
             bound_head: None,
             reviewed_keys: HashSet::new(),
@@ -1792,8 +1803,21 @@ impl ReviewView {
 
         let entries = data.groups.entries(&data.folded, ix, schema, &self.names);
         let counts = relationship_counts(&entries);
+        // A card of many relationships shows its first few until opened, and opens by itself
+        // for a relationship selected below them (from a mirror, or a change of a fix).
+        let card_key = (group.type_name.clone(), group.id.clone());
+        let selected_at = self
+            .selected
+            .and_then(|s| entries.iter().position(|entry| entry.change == s));
+        let shown = lines_shown(
+            entries.len(),
+            self.open_cards.contains(&card_key),
+            selected_at,
+        );
+        let left_out = entries.len() - shown;
         let lines = entries
             .into_iter()
+            .take(shown)
             .map(|entry| {
                 let change = entry.change;
                 let mirror = entry.net.is_none();
@@ -1855,6 +1879,22 @@ impl ReviewView {
             })
             .collect();
         card = card.relationships(counts, lines);
+        if left_out > 0 {
+            card = card.relationships_footer(
+                studio_ui::ds::button(
+                    ("more-relationships", ix),
+                    match left_out {
+                        1 => "Show 1 more relationship".to_owned(),
+                        n => format!("Show {} more relationships", group_digits(n)),
+                    },
+                )
+                .style(ButtonStyle::Subtle)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_cards.insert(card_key.clone());
+                    cx.notify();
+                })),
+            );
+        }
         card.on_click(cx.listener(move |this, _, _, cx| {
             let primary = this
                 .data
@@ -1864,6 +1904,16 @@ impl ReviewView {
                 this.select(change, cx);
             }
         }))
+    }
+}
+
+/// How many of a card's `total` relationship lines show: all once the card is opened or when
+/// the selected one is past the first [`CARD_LINES`], else at most those.
+fn lines_shown(total: usize, open: bool, selected_at: Option<usize>) -> usize {
+    if open || selected_at.is_some_and(|at| at >= CARD_LINES) {
+        total
+    } else {
+        total.min(CARD_LINES)
     }
 }
 
@@ -2575,6 +2625,17 @@ pub(crate) mod tests {
             assert!(text.contains(found), "{found}");
         }
         assert!(!text.contains("lovelace"));
+    }
+
+    /// A card of many relationships shows its first few until opened, or until the one selected
+    /// is past them.
+    #[test]
+    fn a_card_shows_its_first_relationships_until_opened() {
+        assert_eq!(lines_shown(5, false, None), 5);
+        assert_eq!(lines_shown(400, false, None), CARD_LINES);
+        assert_eq!(lines_shown(400, false, Some(3)), CARD_LINES);
+        assert_eq!(lines_shown(400, false, Some(CARD_LINES)), 400);
+        assert_eq!(lines_shown(400, true, None), 400);
     }
 
     /// A card shows when its own change or a relationship on it matches the search, the first

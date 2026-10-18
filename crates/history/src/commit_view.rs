@@ -22,10 +22,11 @@ use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 use ui::{PopoverMenu, Tooltip};
 
-/// Changes asked for per page.
-const PAGE: u32 = 500;
 /// Changes read before asking the person to load more (constitution IX).
 const CAP: usize = 5_000;
+/// Changes asked for per page: the whole of [`CAP`], since each page restarts the server's
+/// comparison after the last change returned; the server's byte budget still bounds a page.
+const PAGE: u32 = CAP as u32;
 
 /// A commit's counts, once its changes are read; History shows them in its list.
 #[derive(Debug, Clone)]
