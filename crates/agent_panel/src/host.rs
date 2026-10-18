@@ -861,9 +861,11 @@ fn without_variables(
     Ok(("/usr/bin/env".into(), wrapped))
 }
 
-/// OmniGraph's credential and addressing variables among `names`, except those the agent's own
-/// settings set. Windows reads a variable by its name in any case, so there `fold_case` matches
-/// names in any ASCII case: `omnigraph_profile` is the profile the CLI reads.
+/// OmniGraph's variables among `names`, every `OMNIGRAPH_*` one, except those the agent's own
+/// settings set: tokens for other servers (`OMNIGRAPH_MR_BEARER_TOKEN`), a local server's
+/// token list and the CLI's addressing alike. Windows reads a variable by its name in any case,
+/// so there `fold_case` matches names in any ASCII case: `omnigraph_profile` is the profile the
+/// CLI reads.
 fn credential_variables(
     names: impl Iterator<Item = std::ffi::OsString>,
     configured: &std::collections::BTreeMap<String, String>,
@@ -884,16 +886,7 @@ fn credential_variables(
             } else {
                 name.clone()
             };
-            name.starts_with("OMNIGRAPH_TOKEN_")
-                || matches!(
-                    name.as_str(),
-                    "OMNIGRAPH_BEARER_TOKEN"
-                        | "OMNIGRAPH_PROFILE"
-                        | "OMNIGRAPH_HOME"
-                        | "OMNIGRAPH_CONTROL_TOKEN"
-                        | "OMNIGRAPH_CONTROL_API"
-                        | "OMNIGRAPH_STUDIO_TOKEN"
-                )
+            name.starts_with("OMNIGRAPH_")
         })
         .filter(|name| !configured.keys().any(|key| same(key, name)))
         .collect();
@@ -1043,6 +1036,8 @@ mod credential_tests {
             "ANTHROPIC_API_KEY",
             "AWS_PROFILE",
             "OMNIGRAPH_HOME",
+            "OMNIGRAPH_MR_BEARER_TOKEN",
+            "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
         ]
         .map(std::ffi::OsString::from);
         let mut configured = std::collections::BTreeMap::new();
@@ -1051,7 +1046,9 @@ mod credential_tests {
             credential_variables(names.into_iter(), &configured, false),
             [
                 "OMNIGRAPH_BEARER_TOKEN",
+                "OMNIGRAPH_MR_BEARER_TOKEN",
                 "OMNIGRAPH_PROFILE",
+                "OMNIGRAPH_SERVER_BEARER_TOKENS_JSON",
                 "OMNIGRAPH_STUDIO_TOKEN",
                 "OMNIGRAPH_TOKEN_PERSONAL",
             ]

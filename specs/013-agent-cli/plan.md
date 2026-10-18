@@ -150,9 +150,9 @@ the command. Codex reads `AGENTS.md`; Claude reads it when there is no `CLAUDE.m
 
 The ACP crate can add variables to the agent's process but not remove them, and its
 `spawn_process` cannot be replaced, so the agent starts through a command that removes them. It
-removes `OMNIGRAPH_TOKEN_*`, `OMNIGRAPH_BEARER_TOKEN`, `OMNIGRAPH_PROFILE`, `OMNIGRAPH_HOME`,
-`OMNIGRAPH_CONTROL_TOKEN`, `OMNIGRAPH_CONTROL_API` and `OMNIGRAPH_STUDIO_TOKEN` when Studio holds
-them, unless `agent.env` sets them. Cloud variables (`AWS_*`, `AZURE_*`, Google's) stay: the
+removes every `OMNIGRAPH_*` variable Studio holds, unless `agent.env` sets it: the CLI's
+tokens and addressing, and tokens kept for other servers (`OMNIGRAPH_MR_BEARER_TOKEN`) or a local
+server's token list alike (in any case on Windows). Cloud variables (`AWS_*`, `AZURE_*`, Google's) stay: the
 agent may need them for its model, as Claude Code on Bedrock does. This closes the gap where the
 agent inherited the person's graph tokens. With none of these variables set, the agent starts as
 it is.
