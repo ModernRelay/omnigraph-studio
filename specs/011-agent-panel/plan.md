@@ -126,7 +126,9 @@ twice would only add noise. A call is Studio's by what the agent's adapter, name
 `initialize`, says it is, never by its title, which the model writes (claude-agent-acp titles
 a shell call with its command): Claude's `_meta.claudeCode.toolName` is
 `mcp__omnigraph__omnigraph_run` or `…omnigraph_cli`, and a Codex MCP call's input names server
-`omnigraph` and the tool (`tools::StudioTool::of`). Another adapter's calls are never Studio's.
+`omnigraph` and the tool (`tools::StudioTool::of`). Codex asks permission for an MCP call by
+its id alone (codex-acp 2.2.2), so a call is also Studio's when its first update said so.
+Another adapter's calls are never Studio's.
 Any other request (file edits, shell commands) shows a card with the agent's own options;
 closing the panel answers `Cancelled`.
 

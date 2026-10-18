@@ -719,6 +719,7 @@ impl AgentPanel {
             }
         };
         let base = self.session.read(cx).branch.clone();
+        let graph_key = self.session.read(cx).settings_key(cx);
         // A resumed conversation keeps writing to its branch.
         self.failed = false;
         self.branch = Some(match &saved {
@@ -729,7 +730,10 @@ impl AgentPanel {
                 changes: 0,
             },
             None => AgentBranch {
-                name: format!("agent/{}", chrono::Local::now().format("%Y%m%d-%H%M%S")),
+                name: self.sessions.read(cx).unused_branch(
+                    &graph_key,
+                    format!("agent/{}", chrono::Local::now().format("%Y%m%d-%H%M%S")),
+                ),
                 base,
                 created: false,
                 changes: 0,

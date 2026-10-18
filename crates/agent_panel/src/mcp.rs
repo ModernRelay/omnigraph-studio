@@ -42,6 +42,15 @@ pub fn handle(line: &str, conversation: &str) -> Incoming {
         Ok(message) => message,
         Err(_) => return Incoming::Reply(error(Value::Null, -32700, "Parse error")),
     };
+    // 2025-03-26 allowed batches, which no client this serves sends; one is answered rather
+    // than left to wait.
+    if message.is_array() {
+        return Incoming::Reply(error(
+            Value::Null,
+            -32600,
+            "Studio's tool server takes one message per line, not a batch",
+        ));
+    }
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         return Incoming::Nothing;
     };
@@ -227,6 +236,12 @@ mod tests {
             panic!()
         };
         assert_eq!(reply["error"]["code"], -32601);
+        // A batch is answered, not left to wait.
+        let Incoming::Reply(reply) = handle(r#"[{"jsonrpc":"2.0","id":5,"method":"ping"}]"#, "")
+        else {
+            panic!()
+        };
+        assert_eq!(reply["error"]["code"], -32600);
         let Incoming::Reply(reply) = handle("not json", "") else {
             panic!()
         };

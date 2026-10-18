@@ -16,7 +16,7 @@ pub struct Sandbox {
 }
 
 /// One request as the gateway read it. `path` is percent-encoded as it came, query pairs are
-/// decoded, and `json` is the body when it is a JSON object.
+/// decoded, and `json` is the body when it is JSON.
 #[derive(Debug)]
 pub struct Incoming<'a> {
     pub method: &'a str,
@@ -51,8 +51,6 @@ pub struct WriteSummary {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
-    /// `/healthz`: the gateway answers it itself.
-    Health,
     /// Forward as it came.
     Read,
     /// Forward with this JSON body instead of the one that came.
@@ -72,16 +70,16 @@ pub fn classify(request: &Incoming<'_>, sandbox: &Sandbox) -> Verdict {
         .collect();
     let reading = matches!(request.method, "GET" | "HEAD");
     match segments.as_slice() {
-        ["healthz"] if reading => Verdict::Health,
         ["readyz"] | ["openapi.json"] if reading => Verdict::Read,
         ["graphs"] | ["graphs", "discovery"] if reading => Verdict::Read,
         ["cluster", ..] if reading => Verdict::Read,
         ["cluster", ..] => Verdict::Refuse(
-            "Studio does not let the agent change the cluster's configuration.".into(),
+            "Studio does not let the agent change the cluster's configuration. Nothing was sent."
+                .into(),
         ),
         ["graphs", graph, rest @ ..] => graph_route(request, sandbox, graph, rest),
         _ => Verdict::Refuse(format!(
-            "Studio does not forward {} {}.",
+            "Studio does not forward {} {}. Nothing was sent.",
             request.method, request.path
         )),
     }
@@ -99,7 +97,7 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
     }
     if decode(graph) != sandbox.graph {
         return Verdict::Refuse(format!(
-            "Studio forwards the agent's writes to graph {} only.",
+            "Studio forwards the agent's writes to graph {} only. Nothing was sent.",
             sandbox.graph
         ));
     }
@@ -274,9 +272,9 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                     object.insert("expect_mutation".into(), Value::Bool(false));
                     Verdict::ReadWith(body)
                 }
-                None => {
-                    Verdict::Refuse("Studio: a stored query's body must be a JSON object.".into())
-                }
+                None => Verdict::Refuse(
+                    "Studio: a stored query's body must be a JSON object. Nothing was sent.".into(),
+                ),
             }
         }
         ("POST", ["commits", _, "publish"]) | ("DELETE", ["commits", _]) => Verdict::Refuse(
@@ -297,12 +295,14 @@ fn branch_refusal(sandbox: &Sandbox) -> String {
     )
 }
 
+/// A mutation naming no branch: a plain mutation without `--branch`, or branch and commit
+/// statements, whose target is only in the query text.
 fn statement_refusal(sandbox: &Sandbox) -> String {
     format!(
-        "Studio: branch and commit statements are not forwarded, since their target is only in \
-         the query text. Use `omnigraph branch create {} --from {}` and `omnigraph mutate \
-         --branch {} …` instead. Nothing was sent.",
-        sandbox.branch, sandbox.base, sandbox.branch
+        "Studio: the mutation names no branch. Pass `--branch {}` (create it first with \
+         `omnigraph branch create {} --from {}`); branch and commit statements, whose target is \
+         only in the query text, are not forwarded. Nothing was sent.",
+        sandbox.branch, sandbox.branch, sandbox.base
     )
 }
 
@@ -360,7 +360,6 @@ mod tests {
 
     #[test]
     fn reads_go_anywhere_and_health_is_answered_here() {
-        assert_eq!(verdict("HEAD", "/healthz", &[], None), Verdict::Health);
         for (method, path) in [
             ("GET", "/graphs"),
             ("GET", "/graphs/other/schema"),

@@ -8,7 +8,7 @@
 //! ACP request handlers hold the connection's dispatch loop until they return, so a permission
 //! request that waits for the person is answered from a task spawned on the connection.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -152,16 +152,49 @@ pub enum ConnectionCommand {
 struct Routes {
     sessions: HashMap<SessionId, mpsc::UnboundedSender<HostEvent>>,
     early: HashMap<SessionId, VecDeque<SessionUpdate>>,
+    /// The tool calls that are Studio's own, by id, as their first update said: Codex asks
+    /// permission for an MCP call with its id alone.
+    studio_calls: HashMap<String, tools::StudioTool>,
+    /// Sessions their conversation closed: an update that comes after is not kept as early,
+    /// where it would take the place of a session about to open.
+    closed: HashSet<SessionId>,
 }
 
+/// The most closed sessions remembered, so their late updates are dropped.
+const CLOSED_SESSIONS: usize = 256;
+/// The most of Studio's tool calls remembered for their permission requests.
+const STUDIO_CALLS: usize = 256;
+
 impl Routes {
+    /// Remembers a tool call that is one of Studio's tools, by what the adapter said of it.
+    fn note_tool_call(&mut self, adapter: tools::Adapter, update: &SessionUpdate) {
+        let (id, studio) = match update {
+            SessionUpdate::ToolCall(call) => (
+                &call.tool_call_id,
+                tools::StudioTool::of(adapter, call.meta.as_ref(), call.raw_input.as_ref()),
+            ),
+            SessionUpdate::ToolCallUpdate(call) => (
+                &call.tool_call_id,
+                tools::StudioTool::of(adapter, call.meta.as_ref(), call.fields.raw_input.as_ref()),
+            ),
+            _ => return,
+        };
+        if let Some(studio) = studio {
+            if self.studio_calls.len() >= STUDIO_CALLS {
+                self.studio_calls.clear();
+            }
+            self.studio_calls.insert(id.to_string(), studio);
+        }
+    }
+
     fn update(&mut self, session: SessionId, update: SessionUpdate) {
         match self.sessions.get(&session) {
             Some(events) => {
                 events.unbounded_send(HostEvent::Update(update)).ok();
             }
+            None if self.closed.contains(&session) => {}
             // Kept for a session about to be routed (a load's replay can come first), for a
-            // few sessions at a time: updates for one that closed are not kept for ever.
+            // few sessions at a time.
             None if self.early.contains_key(&session) || self.early.len() < EARLY_SESSIONS => {
                 let early = self.early.entry(session).or_default();
                 if early.len() < EARLY_UPDATES {
@@ -182,12 +215,17 @@ impl Routes {
             .is_some_and(|routed| routed.same_receiver(events))
         {
             self.sessions.remove(session);
+            if self.closed.len() >= CLOSED_SESSIONS {
+                self.closed.clear();
+            }
+            self.closed.insert(session.clone());
             return true;
         }
         false
     }
 
     fn add(&mut self, session: SessionId, events: mpsc::UnboundedSender<HostEvent>) {
+        self.closed.remove(&session);
         for update in self.early.remove(&session).unwrap_or_default() {
             events.unbounded_send(HostEvent::Update(update)).ok();
         }
@@ -196,9 +234,9 @@ impl Routes {
 }
 
 type SharedRoutes = Arc<Mutex<Routes>>;
-/// Conversations asked to open but not yet routed: they hear an exit too.
-/// The conversations asked for and not yet open; `AgentConnection::open` adds each before the
-/// agent reads its request, so one asked for before the agent fails to start hears why.
+/// The conversations asked for and not yet routed, which hear an exit too:
+/// `AgentConnection::open` adds each before the agent reads its request, so one asked for before
+/// the agent fails to start hears why.
 pub type Opening = Arc<Mutex<Vec<mpsc::UnboundedSender<HostEvent>>>>;
 
 /// Runs one agent until every handle to it is dropped or it exits; then every open conversation
@@ -259,17 +297,7 @@ async fn connect(
     // starts through `env -u`. Model providers' variables (AWS, Azure, Google) stay: the agent
     // may need them for its model.
     let removed = credential_variables(std::env::vars_os().map(|(name, _)| name), &launch.env);
-    let (program, args): (String, Vec<String>) = if removed.is_empty() {
-        (program.clone(), args.to_vec())
-    } else {
-        let mut wrapped: Vec<String> = removed
-            .into_iter()
-            .flat_map(|name| ["-u".to_owned(), name])
-            .collect();
-        wrapped.push(program.clone());
-        wrapped.extend(args.iter().cloned());
-        ("/usr/bin/env".to_owned(), wrapped)
-    };
+    let (program, args) = without_variables(&removed, program, args);
     let config = AcpAgentConfig::new(&program)
         .args(args.iter().cloned())
         .envs(launch.env.clone());
@@ -280,7 +308,13 @@ async fn connect(
             return;
         }
         if let Ok(mut lines) = stderr.lock() {
-            lines.push_back(line.chars().take(STDERR_BYTES).collect());
+            // Cut by bytes, the budget's unit, on a character: a long line cut by characters
+            // could still be over the budget and push itself out.
+            let mut end = line.len().min(STDERR_BYTES);
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            lines.push_back(line[..end].to_owned());
             while lines.len() > STDERR_LINES
                 || lines.iter().map(String::len).sum::<usize>() > STDERR_BYTES
             {
@@ -294,12 +328,15 @@ async fn connect(
     // Known once the agent answers `initialize`, before any session or permission request.
     let adapter: Arc<Mutex<tools::Adapter>> = Arc::default();
     let asked_by = adapter.clone();
+    let noted_by = adapter.clone();
     agent_client_protocol::Client
         .builder()
         .name("omnigraph-studio")
         .on_receive_notification(
             async move |notification: SessionNotification, _connection| {
+                let adapter = noted_by.lock().map(|adapter| *adapter).unwrap_or_default();
                 if let Ok(mut routes) = updates.lock() {
+                    routes.note_tool_call(adapter, &notification.update);
                     routes.update(notification.session_id, notification.update);
                 }
                 Ok(())
@@ -314,7 +351,14 @@ async fn connect(
                     adapter,
                     call.meta.as_ref(),
                     call.fields.raw_input.as_ref(),
-                );
+                )
+                .or_else(|| {
+                    let routes = permissions.lock().ok()?;
+                    routes
+                        .studio_calls
+                        .get(&call.tool_call_id.to_string())
+                        .copied()
+                });
                 if studio.is_some() {
                     // Studio's reads are read-only and its writes wait for Studio's own
                     // approval, so the agent's prompt for them is answered at once.
@@ -661,6 +705,28 @@ mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::{ContentChunk, TextContent};
 
+    /// Codex asks permission for an MCP call by its id alone: the call is Studio's tool by what
+    /// its first update said.
+    #[test]
+    fn a_tool_call_is_remembered_as_studios_by_its_first_update() {
+        use agent_client_protocol::schema::v1::ToolCall;
+        let mut routes = Routes::default();
+        let call = |id: &str, server: &str| {
+            SessionUpdate::ToolCall(ToolCall::new(id.to_owned(), "Call").raw_input(
+                serde_json::json!({ "server": server, "tool": "omnigraph_run", "arguments": {} }),
+            ))
+        };
+        routes.note_tool_call(tools::Adapter::Codex, &call("t1", "omnigraph"));
+        routes.note_tool_call(tools::Adapter::Codex, &call("t2", "elsewhere"));
+        routes.note_tool_call(tools::Adapter::Other, &call("t3", "omnigraph"));
+        assert_eq!(routes.studio_calls.get("t1"), Some(&tools::StudioTool::Run));
+        assert!(!routes.studio_calls.contains_key("t2"));
+        assert!(
+            !routes.studio_calls.contains_key("t3"),
+            "only by its adapter's word"
+        );
+    }
+
     fn chunk(text: &str) -> SessionUpdate {
         SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(
             text,
@@ -745,7 +811,36 @@ mod tests {
         assert_eq!(text(again_rx.try_recv().ok()), "still routed");
         assert!(routes.remove(&SessionId::new("b"), &again_tx));
         assert!(!routes.sessions.contains_key(&SessionId::new("b")));
+
+        // An update for a session its conversation closed is dropped, not kept as early, until
+        // the session opens again.
+        routes.early.clear();
+        routes.update(SessionId::new("b"), chunk("late"));
+        assert!(routes.early.is_empty());
+        let (back_tx, mut back_rx) = mpsc::unbounded();
+        routes.add(SessionId::new("b"), back_tx);
+        routes.update(SessionId::new("b"), chunk("again"));
+        assert_eq!(text(back_rx.try_recv().ok()), "again");
     }
+}
+
+/// The command that runs `program` with `args` and none of `removed` in its environment: as it
+/// is when nothing is removed, else through `env -u`. `env` reads a word holding `=` as an
+/// assignment, so such a program runs through `sh`, which takes it as its own argument.
+fn without_variables(removed: &[String], program: &str, args: &[String]) -> (String, Vec<String>) {
+    if removed.is_empty() {
+        return (program.to_owned(), args.to_vec());
+    }
+    let mut wrapped: Vec<String> = removed
+        .iter()
+        .flat_map(|name| ["-u".to_owned(), name.clone()])
+        .collect();
+    if program.contains('=') {
+        wrapped.extend(["/bin/sh", "-c", "exec \"$0\" \"$@\""].map(str::to_owned));
+    }
+    wrapped.push(program.to_owned());
+    wrapped.extend(args.iter().cloned());
+    ("/usr/bin/env".to_owned(), wrapped)
 }
 
 /// OmniGraph's credential and addressing variables among `names`, except those the agent's own
@@ -777,6 +872,39 @@ fn credential_variables(
 #[cfg(test)]
 mod credential_tests {
     use super::*;
+
+    /// A program path holding `=` still runs, with the variables removed: `env` would read it
+    /// as an assignment.
+    #[cfg(unix)]
+    #[test]
+    fn a_program_whose_path_holds_an_equals_sign_runs_without_the_variables() {
+        let dir = std::env::temp_dir().join(format!("studio-agent=dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("agent");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\necho \"ran $1 ${STUDIO_TEST_GONE:-unset}\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (command, args) = without_variables(
+            &["STUDIO_TEST_GONE".to_owned()],
+            &program.to_string_lossy(),
+            &["one".to_owned()],
+        );
+        let output = std::process::Command::new(command)
+            .args(args)
+            .env("STUDIO_TEST_GONE", "secret")
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "ran one unset\n");
+        assert_eq!(
+            without_variables(&[], "npx", &["x".into()]),
+            ("npx".to_owned(), vec!["x".to_owned()])
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn the_agent_starts_without_omnigraph_credentials() {

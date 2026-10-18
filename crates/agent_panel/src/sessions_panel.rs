@@ -16,7 +16,7 @@ use editor::{Editor, EditorEvent};
 use gpui::{
     App, AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
     IntoElement, ListAlignment, ListState, ParentElement, Render, SharedString, Styled,
-    Subscription, Task, WeakEntity, Window, div, list,
+    Subscription, WeakEntity, Window, div, list,
 };
 use studio_actions::agent::{NewConversation, OpenConversation};
 use studio_settings::StudioSettings;
@@ -45,7 +45,6 @@ pub struct SessionsPanel {
     /// The search field shows: asked for in the header, or holding text.
     search_open: bool,
     /// An import or delete at the agent in flight; it holds the agent's process while it runs.
-    _agent_task: Option<Task<()>>,
     /// The list drawn, as descriptors: only the visible rows are built (constitution IX).
     list_state: ListState,
     rows: Vec<ListRow>,
@@ -114,7 +113,6 @@ impl SessionsPanel {
             search,
             renaming: None,
             search_open: false,
-            _agent_task: None,
             list_state: ListState::new(0, ListAlignment::Top, px(ds::size::SIDEBAR_ROW * 8.)),
             rows: Vec::new(),
             _subscriptions: subscriptions,
@@ -221,7 +219,7 @@ impl SessionsPanel {
         };
         let connection = connection::connection(agent, cx);
         let answer = connection.delete(id);
-        self._agent_task = Some(cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let (kind, note) = match answer.await {
                 Ok(Ok(())) => (
                     ToastKind::Success,
@@ -238,7 +236,10 @@ impl SessionsPanel {
             };
             drop(connection);
             this.update(cx, |this, cx| this.toast(kind, note, cx)).ok();
-        }));
+        })
+        // An import's or a delete's outcome, said when the agent answers: a second one does not
+        // cancel the first, and the connection stays until then.
+        .detach();
     }
 
     /// Says how an import or a delete went, as Studio reports work that finishes away from where
@@ -270,7 +271,7 @@ impl SessionsPanel {
         let agent_name = agent.command.join(" ");
         let connection: Arc<AgentConnection> = connection::connection(agent, cx);
         let answer = connection.list(cwd.clone());
-        self._agent_task = Some(cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let result = answer.await;
             drop(connection);
             this.update(cx, |this, cx| {
@@ -301,7 +302,10 @@ impl SessionsPanel {
                 this.toast(kind, note, cx);
             })
             .ok();
-        }));
+        })
+        // An import's or a delete's outcome, said when the agent answers: a second one does not
+        // cancel the first, and the connection stays until then.
+        .detach();
     }
 
     // ---- rows ----

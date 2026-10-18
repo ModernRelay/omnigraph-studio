@@ -255,7 +255,6 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
         &shared.sandbox,
     );
     match verdict {
-        Verdict::Health => write_simple(&mut stream, 200, "text/plain", b"ok").await,
         Verdict::Refuse(message) => answer(&mut stream, 403, "forbidden", &message).await,
         Verdict::Read => {
             let response = shared.client.forward(forward_request(&request, None)).await;

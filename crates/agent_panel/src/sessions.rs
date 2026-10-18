@@ -249,10 +249,28 @@ impl AgentSessions {
     }
 
     /// Adds conversations the agent knows and the list does not; returns how many were new.
+    /// `name`, or `name-2`, `name-3`, … when another of `graph`'s conversations writes to it:
+    /// an agent branch is named after the second a conversation began, which two can share.
+    pub fn unused_branch(&self, graph: &str, name: String) -> String {
+        let taken = |candidate: &str| {
+            self.records
+                .iter()
+                .any(|record| record.graph == graph && record.branch == candidate)
+        };
+        if !taken(&name) {
+            return name;
+        }
+        (2..)
+            .map(|n| format!("{name}-{n}"))
+            .find(|candidate| !taken(candidate))
+            .expect("a free name")
+    }
+
     pub fn import(&mut self, records: Vec<SessionRecord>, cx: &mut Context<Self>) -> usize {
         let mut added = 0;
-        for record in records {
+        for mut record in records {
             if self.get(&record.session).is_none() && !self.deleted.contains(&record.session) {
+                record.branch = self.unused_branch(&record.graph, record.branch);
                 self.records.push(record);
                 added += 1;
             }
@@ -535,6 +553,23 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+        // Two conversations that began in the same second write to branches of their own.
+        let second = "agent/20261018-101500";
+        store.update(cx, |store, cx| {
+            let same = |session: &str| SessionRecord {
+                branch: second.into(),
+                ..record(session, "server/crm", "claude", 0)
+            };
+            store.import(vec![same("same-a"), same("same-b")], cx);
+            assert_eq!(store.get("same-a").unwrap().branch, second);
+            assert_eq!(store.get("same-b").unwrap().branch, format!("{second}-2"));
+            assert_eq!(
+                store.unused_branch("server/crm", second.into()),
+                format!("{second}-3")
+            );
+            assert_eq!(store.unused_branch("server/notes", second.into()), second);
+        });
+        studio_settings::writes_done();
         std::fs::remove_dir_all(&dir).ok();
     }
 
