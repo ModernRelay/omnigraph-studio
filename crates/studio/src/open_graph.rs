@@ -60,44 +60,85 @@ impl OpenGraphModal {
     ) -> Self {
         let registry = ConnectionRegistry::global(cx);
         let connections = registry.read(cx).connections.clone();
-        let mut subscriptions = vec![cx.observe(&registry, |_, _, cx| cx.notify())];
+        // A reload of the operator's files can replace the selected server: the selection moves
+        // to one the registry still holds.
+        let mut subscriptions = vec![cx.observe(&registry, |this, registry, cx| {
+            let connections = &registry.read(cx).connections;
+            if this
+                .selected
+                .as_ref()
+                .is_some_and(|selected| !connections.contains(selected))
+            {
+                this.selected = first_choice(connections, cx);
+            }
+            cx.notify();
+        })];
         for connection in &connections {
             subscriptions
                 .push(cx.subscribe(connection, |_, _, _: &ConnectionEvent, cx| cx.notify()));
         }
         let graph_id = input("Graph id, for example knowledge", window, cx);
-        subscriptions.push(cx.subscribe_in(
-            &graph_id,
-            window,
-            |this, _, event: &EditorEvent, _, cx| {
-                if let EditorEvent::BufferEdited = event {
-                    this.error = None;
-                    cx.notify();
-                }
-            },
-        ));
+        let new_name = input("Name, for example dev", window, cx);
+        let new_url = input("http://127.0.0.1:8787", window, cx);
         let new_token = input("Token (stored in the keychain)", window, cx);
         new_token.update(cx, |editor, cx| editor.set_masked(true, cx));
         let replacement_token = input("New token", window, cx);
         replacement_token.update(cx, |editor, cx| editor.set_masked(true, cx));
-        let selected = connections
-            .iter()
-            .find(|c| c.read(cx).state == ConnectionState::Ready)
-            .or_else(|| connections.first())
-            .cloned();
+        // An error is about what was typed: typing again clears it.
+        for editor in [&graph_id, &new_url, &new_token, &replacement_token] {
+            subscriptions.push(cx.subscribe_in(
+                editor,
+                window,
+                |this, _, event: &EditorEvent, _, cx| {
+                    if let EditorEvent::BufferEdited = event {
+                        this.error = None;
+                        cx.notify();
+                    }
+                },
+            ));
+        }
+        let selected = first_choice(&connections, cx);
+        // A server the dialog shows first is connected, as one chosen in it is.
+        if let Some(connection) = &selected
+            && matches!(connection.read(cx).state, ConnectionState::Idle)
+        {
+            connection.update(cx, |c, cx| c.connect(cx));
+        }
         Self {
             workspace,
             focus_handle: cx.focus_handle(),
             selected,
             graph_id,
             adding: connections.is_empty(),
-            new_name: input("Name, for example dev", window, cx),
-            new_url: input("http://127.0.0.1:8787", window, cx),
+            new_name,
+            new_url,
             new_token,
             replacement_token,
             error: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// Enter: adds the server being added, else saves a new token being typed, else opens the
+    /// graph named.
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.adding {
+            self.add_server(window, cx);
+        } else if self.replacement_token.focus_handle(cx).is_focused(window) {
+            self.update_token(window, cx);
+        } else {
+            let graph_id = self.graph_id.read(cx).text(cx);
+            self.open(graph_id, window, cx);
+        }
+    }
+
+    fn show_add(&mut self, adding: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.adding = adding;
+        self.error = None;
+        if adding {
+            window.focus(&self.new_url.focus_handle(cx), cx);
+        }
+        cx.notify();
     }
 
     fn select(&mut self, connection: Entity<Connection>, cx: &mut Context<Self>) {
@@ -168,6 +209,10 @@ impl OpenGraphModal {
                     .push(cx.subscribe(&connection, |_, _, _: &ConnectionEvent, cx| cx.notify()));
                 connection.update(cx, |c, cx| c.connect(cx));
                 self.select(connection, cx);
+                // A second server is typed fresh, not added again from the first one's fields.
+                for editor in [&self.new_name, &self.new_url, &self.new_token] {
+                    editor.update(cx, |editor, cx| editor.set_text("", window, cx));
+                }
                 window.focus(&self.graph_id.focus_handle(cx), cx);
             }
             Err(error) => {
@@ -249,11 +294,7 @@ impl OpenGraphModal {
                     .style(ButtonStyle::Subtle)
                     .label_size(LabelSize::Small)
                     .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.adding = true;
-                        window.focus(&this.new_url.focus_handle(cx), cx);
-                        cx.notify();
-                    })),
+                    .on_click(cx.listener(|this, _, window, cx| this.show_add(true, window, cx))),
             )
     }
 
@@ -439,16 +480,20 @@ impl OpenGraphModal {
                                 cx.listener(|this, _, window, cx| this.add_server(window, cx)),
                             ),
                     )
-                    .child(
-                        studio_ui::ds::button("cancel-add", "Cancel").on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.adding = false;
-                                cx.notify();
-                            },
-                        )),
-                    ),
+                    .child(studio_ui::ds::button("cancel-add", "Cancel").on_click(
+                        cx.listener(|this, _, window, cx| this.show_add(false, window, cx)),
+                    )),
             )
     }
+}
+
+/// The server a dialog starts on: the first ready one, else the first.
+fn first_choice(connections: &[Entity<Connection>], cx: &App) -> Option<Entity<Connection>> {
+    connections
+        .iter()
+        .find(|c| c.read(cx).state == ConnectionState::Ready)
+        .or_else(|| connections.first())
+        .cloned()
 }
 
 fn state_color(state: &ConnectionState) -> Color {
@@ -475,6 +520,7 @@ impl Render for OpenGraphModal {
             .key_context("OpenGraphModal")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.confirm(window, cx)))
             .w(px(760.))
             .max_h(px(560.))
             .p_4()
