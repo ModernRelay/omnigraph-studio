@@ -1,7 +1,7 @@
 //! The fake server this crate's tests read from: a schema, two people on every read, and one
 //! answer for every write.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use gpui::{AppContext as _, Entity, TestAppContext};
 use graph_store::{Connection, GraphSession, ServerEntry, ServerSource};
@@ -58,6 +58,27 @@ pub(crate) fn session_reading(
     serve(schema, rows, 200, committed("c2", "c1"), cx)
 }
 
+/// As [`session`], each read answered with the rows `answer` gives for its request body
+/// (`query`, `name`, `params`, …); every read's query name is recorded, in order.
+pub(crate) fn session_routing(
+    schema: &str,
+    answer: impl Fn(&Value) -> Value + Send + Sync + 'static,
+    cx: &mut TestAppContext,
+) -> (Entity<GraphSession>, Arc<Mutex<Vec<String>>>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    let rows: Rows = Arc::new(move |request: &Value| {
+        let name = request["name"].as_str().unwrap_or_default().to_owned();
+        seen.lock().unwrap().push(name);
+        answer(request)
+    });
+    let session = serve_with(schema, rows, 200, committed("c2", "c1"), cx);
+    (session, asked)
+}
+
+/// The rows a read answers with, from its request body.
+type Rows = Arc<dyn Fn(&Value) -> Value + Send + Sync>;
+
 fn serve(
     schema: &str,
     rows: Value,
@@ -65,8 +86,25 @@ fn serve(
     write_body: Value,
     cx: &mut TestAppContext,
 ) -> Entity<GraphSession> {
+    let rows = Arc::new(rows);
+    serve_with(
+        schema,
+        Arc::new(move |_: &Value| (*rows).clone()),
+        write_status,
+        write_body,
+        cx,
+    )
+}
+
+fn serve_with(
+    schema: &str,
+    rows: Rows,
+    write_status: u16,
+    write_body: Value,
+    cx: &mut TestAppContext,
+) -> Entity<GraphSession> {
+    use futures::AsyncReadExt as _;
     let schema: Arc<str> = schema.into();
-    let rows: Arc<Value> = Arc::new(rows);
     let write_body: Arc<Value> = Arc::new(write_body);
     let http = FakeHttpClient::create(move |request| {
         let (schema, rows, write_body) = (schema.clone(), rows.clone(), write_body.clone());
@@ -75,6 +113,10 @@ fn serve(
             let (status, body) = if path.ends_with("/schema") {
                 (200, json!({ "schema_source": &*schema }))
             } else if path.ends_with("/query") {
+                let mut bytes = Vec::new();
+                request.into_body().read_to_end(&mut bytes).await.ok();
+                let asked: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                let rows = rows(&asked);
                 (
                     200,
                     json!({
@@ -82,7 +124,7 @@ fn serve(
                         "target": {"branch": "main", "snapshot": null},
                         "row_count": rows.as_array().map_or(0, Vec::len),
                         "columns": ["n"],
-                        "rows": &*rows,
+                        "rows": rows,
                         "graph_commit_id": "c1",
                     }),
                 )

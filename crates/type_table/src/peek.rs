@@ -789,7 +789,7 @@ impl NodePeek {
     }
 
     fn load_groups(&mut self, debounce: bool, cx: &mut Context<Self>) {
-        let PeekSubject::Node { type_name, id } = self.subject.clone() else {
+        let PeekSubject::Node { type_name, .. } = self.subject.clone() else {
             return;
         };
         let Some(schema) = self.schema.clone() else {
@@ -821,41 +821,107 @@ impl NodePeek {
                 }
                 continue;
             }
-            // The session's batched counts, which the explorer asks the same way: a node
-            // open in both is read once at the commit.
-            let session = self.session.downgrade();
-            let snapshot = self.snapshot.clone();
-            let relationship = self.groups[index].group.clone();
-            let (type_name, id) = (type_name.clone(), id.clone());
-            self.groups[index]._task = Some(cx.spawn(async move |this, cx| {
-                if debounce {
-                    cx.background_executor().timer(COUNT_DELAY).await;
+            self.load_group(index, debounce, false, cx);
+        }
+        cx.notify();
+    }
+
+    /// Reads a group's first neighbours, one more than the view shows: when they fit, that read
+    /// is also the group's exact count, so most groups cost one read rather than a count and
+    /// then a page (spec 015). A group past the page shows its first neighbours and reads its
+    /// count through the session's batched counts. `debounce` delays the read, for a peek that
+    /// follows a moving cursor; `open` opens the group when it has any neighbours, as after the
+    /// person's own write to it, where otherwise only a small one opens by itself.
+    fn load_group(&mut self, index: usize, debounce: bool, open: bool, cx: &mut Context<Self>) {
+        let PeekSubject::Node { type_name, id } = self.subject.clone() else {
+            return;
+        };
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        let limit = self.neighbour_limit();
+        let Some(group) = self.groups.get_mut(index) else {
+            return;
+        };
+        group.count = Loadable::Loading;
+        group.neighbours = Loadable::Loading;
+        group.expanded = false;
+        group.more = None;
+        let query = match builder::neighbours(
+            &schema,
+            &type_name,
+            &group.group,
+            &id,
+            None,
+            builder::Narrow::default(),
+            limit + 1,
+        ) {
+            Ok(query) => query,
+            Err(error) => {
+                group.count = Loadable::Failed(error.to_string());
+                group.neighbours = Loadable::NotLoaded;
+                return;
+            }
+        };
+        let session = self.session.downgrade();
+        let snapshot = self.snapshot.clone();
+        let relationship = group.group.clone();
+        group._task = Some(cx.spawn(async move |this, cx| {
+            if debounce {
+                cx.background_executor().timer(COUNT_DELAY).await;
+            }
+            let Ok(read) =
+                session.update(cx, |session, cx| session.read(&query, snapshot.clone(), cx))
+            else {
+                return;
+            };
+            let first = match read.await {
+                Ok(output) => neighbours_from(&output.rows),
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        if let Some(group) = this.groups.get_mut(index) {
+                            group.count = Loadable::Failed(error.to_string());
+                            group.neighbours = Loadable::NotLoaded;
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
                 }
+            };
+            let fits = first.len() <= limit as usize;
+            let mut shown = first;
+            shown.truncate(limit as usize);
+            let count = if fits {
+                Ok(shown.len() as u64)
+            } else {
+                // More than a page: the exact count, batched with every other one asked now.
                 let Ok(count) = session.update(cx, |session, cx| {
                     session.degree(&type_name, &relationship, &id, snapshot, cx)
                 }) else {
                     return;
                 };
-                let result = count.await;
-                this.update(cx, |this, cx| {
-                    let count = match result {
-                        Ok(n) => Loadable::Loaded(i64::try_from(n).unwrap_or(i64::MAX)),
-                        Err(error) => Loadable::Failed(error),
-                    };
-                    let opens = matches!(count, Loadable::Loaded(n) if this.opens_by_itself(n));
-                    if let Some(group) = this.groups.get_mut(index) {
-                        group.count = count;
-                        // A small group shows its neighbours without a click.
-                        if opens && !group.expanded {
-                            this.toggle_group(index, cx);
-                        }
-                    }
-                    cx.notify();
-                })
-                .ok();
-            }));
-        }
-        cx.notify();
+                count.await
+            };
+            this.update(cx, |this, cx| {
+                let count = match count {
+                    Ok(n) => Loadable::Loaded(i64::try_from(n).unwrap_or(i64::MAX)),
+                    Err(error) => Loadable::Failed(error),
+                };
+                let opens = matches!(
+                    count,
+                    Loadable::Loaded(n) if if open { n > 0 } else { this.opens_by_itself(n) }
+                );
+                if let Some(group) = this.groups.get_mut(index) {
+                    group.count = count;
+                    group.neighbours = Loadable::Loaded(shown);
+                    // A small group shows its neighbours without a click.
+                    group.expanded = opens;
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn toggle_group(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1625,42 +1691,7 @@ impl NodePeek {
 
     /// Reads a group's count and neighbours again at the view's commit.
     fn reload_group(&mut self, index: usize, cx: &mut Context<Self>) {
-        let PeekSubject::Node { type_name, id } = self.subject.clone() else {
-            return;
-        };
-        let Some(group) = self.groups.get_mut(index) else {
-            return;
-        };
-        group.count = Loadable::Loading;
-        group.neighbours = Loadable::NotLoaded;
-        group.expanded = false;
-        group.more = None;
-        let session = self.session.downgrade();
-        let snapshot = self.snapshot.clone();
-        let relationship = group.group.clone();
-        group._task = Some(cx.spawn(async move |this, cx| {
-            let Ok(count) = session.update(cx, |session, cx| {
-                session.degree(&type_name, &relationship, &id, snapshot, cx)
-            }) else {
-                return;
-            };
-            let result = count.await;
-            this.update(cx, |this, cx| {
-                let count = match result {
-                    Ok(n) => Loadable::Loaded(i64::try_from(n).unwrap_or(i64::MAX)),
-                    Err(error) => Loadable::Failed(error),
-                };
-                let open = matches!(count, Loadable::Loaded(n) if n > 0);
-                if let Some(group) = this.groups.get_mut(index) {
-                    group.count = count;
-                }
-                if open {
-                    this.toggle_group(index, cx);
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
+        self.load_group(index, false, true, cx);
     }
 
     /// ⌘S: the node's drafts as one mutation, bound to the values the view shows, so one commit.
@@ -3119,7 +3150,7 @@ mod tests {
     use gpui::{TestAppContext, VisualTestContext};
     use serde_json::json;
 
-    use crate::test_support::{PEOPLE, session, session_answering};
+    use crate::test_support::{PEOPLE, session, session_answering, session_routing};
 
     fn page(
         session: Entity<GraphSession>,
@@ -3232,6 +3263,67 @@ mod tests {
 
     const KNOWS: &str =
         "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n";
+
+    /// A page reads each relationship group once: its first neighbours and one more, which is
+    /// the group's exact count when they fit. Only a group past the page reads its count.
+    #[gpui::test]
+    async fn a_group_that_fits_its_page_is_read_once(cx: &mut TestAppContext) {
+        let neighbours = |n: usize| {
+            Value::from(
+                (0..n)
+                    .map(|i| json!({ "id": format!("p{:03}", i + 10), "edge_id": format!("e{i}") }))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (session, asked) = session_routing(
+            KNOWS,
+            move |request| {
+                let query = request["query"].as_str().unwrap_or_default();
+                match request["name"].as_str() {
+                    Some("studio_node") => {
+                        json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }])
+                    }
+                    Some("studio_neighbours") if query.contains("$n $e:knows $m") => neighbours(3),
+                    Some("studio_neighbours") => neighbours(PAGE_NEIGHBOURS as usize + 1),
+                    Some("studio_page_degrees") => json!([{ "id": "p1", "n": 120 }]),
+                    _ => json!([]),
+                }
+            },
+            cx,
+        );
+        let (view, cx) = page(session, cx);
+        view.read_with(cx, |view, _| {
+            let group = |direction: Direction| {
+                view.groups
+                    .iter()
+                    .find(|group| group.group.direction == direction)
+                    .unwrap()
+            };
+            let out = group(Direction::Outgoing);
+            assert_eq!(out.count, Loadable::Loaded(3), "the read was the count");
+            assert_eq!(out.neighbours.loaded().map(Vec::len), Some(3));
+            assert!(out.expanded, "a page opens every group with neighbours");
+            let back = group(Direction::Incoming);
+            assert_eq!(back.count, Loadable::Loaded(120), "counted past the page");
+            assert_eq!(
+                back.neighbours.loaded().map(Vec::len),
+                Some(PAGE_NEIGHBOURS as usize),
+                "the page shows a page"
+            );
+        });
+        let asked = asked.lock().unwrap().clone();
+        let reads = |name: &str| asked.iter().filter(|asked| *asked == name).count();
+        assert_eq!(
+            reads("studio_neighbours"),
+            2,
+            "one read per group: {asked:?}"
+        );
+        assert_eq!(
+            reads("studio_page_degrees"),
+            1,
+            "a count only past the page: {asked:?}"
+        );
+    }
 
     /// A relationship is removed on the second press of its ×, as its own commit, which the
     /// view moves to (spec 014).

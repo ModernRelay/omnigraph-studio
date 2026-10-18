@@ -10854,6 +10854,7 @@ dependencies = [
  "chrono",
  "collections",
  "editor",
+ "futures",
  "gpui",
  "gq_language",
  "graph_client",
