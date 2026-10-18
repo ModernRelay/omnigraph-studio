@@ -2303,7 +2303,7 @@ impl Workspace {
                 let tab = h_flex()
                     .id(SharedString::from(format!("tab-{pane_id}-{index}")))
                     .debug_selector(move || format!("tab-{pane_id}-{index}"))
-                    .group(group.clone())
+                    .group(group)
                     .h(px(HEADER_HEIGHT))
                     .px(px(studio_ui::ds::space::XS))
                     .gap(px(studio_ui::ds::space::XS))
@@ -2738,7 +2738,7 @@ impl Workspace {
             }
             container = container.child(cell);
         }
-        let path_for_drag = path.clone();
+        let path_for_drag = path;
         container
             .on_drag_move(
                 cx.listener(move |this, event: &DragMoveEvent<DraggedSplit>, _, cx| {

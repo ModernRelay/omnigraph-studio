@@ -1874,7 +1874,7 @@ impl NodePeek {
         self.edge_writes.insert(index);
         self.group_notices.remove(&index);
         let session = self.session.clone();
-        let edge = group.edge.clone();
+        let edge = group.edge;
         // Detached: closing the page or moving the peek never cancels a write.
         cx.spawn_in(window, async move |this, cx| {
             let mut outcome = None;
@@ -2286,7 +2286,7 @@ impl NodePeek {
                         let expands =
                             opens_editor && property.as_ref().is_some_and(reads_as_markdown);
                         let group = SharedString::from(format!("peek-property-{index}"));
-                        let expand_name = name.clone();
+                        let expand_name = name;
                         h_flex()
                             .id(("peek-property", index))
                             .group(group.clone())

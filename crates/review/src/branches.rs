@@ -155,7 +155,6 @@ impl BranchList {
         right_click_menu(("branch-menu", index))
             .trigger({
                 let session = session.clone();
-                let name = name.clone();
                 move |_, _, _| {
                     let (when, tooltip) = detail.clone().unzip();
                     let row = studio_ui::ds::SidebarRow::new(("branch", index), name.clone())
@@ -170,7 +169,6 @@ impl BranchList {
                     };
                     row.on_click({
                         let session = session.clone();
-                        let name = name.clone();
                         move |_, _, cx| {
                             if let Some(session) = &session {
                                 session.update(cx, |s, cx| s.set_branch(name.clone(), cx));

@@ -473,11 +473,11 @@ impl GraphCanvas {
         } else {
             Mode::Explore
         };
-        let key = (mode, root.clone().filter(|_| mode == Mode::Explore));
+        let key = (mode, root.filter(|_| mode == Mode::Explore));
         if self.layout_key.as_ref() != Some(&key) {
             self.known.clear();
             self.fit_pending = true;
-            self.layout_key = Some(key.clone());
+            self.layout_key = Some(key);
         }
         self.mode = mode;
         self.layout_generation += 1;
@@ -1304,7 +1304,7 @@ impl GraphCanvas {
                             "Open in table",
                             None,
                             open_action(OpenType {
-                                type_name: type_name.clone(),
+                                type_name,
                                 at_commit: None,
                                 filter_id: Some(key.clone()),
                                 via: None,
@@ -1323,7 +1323,6 @@ impl GraphCanvas {
                         if *open { "Close" } else { "Open" },
                         None,
                         Self::on_menu(&this, {
-                            let id = id.clone();
                             move |canvas, window, cx| {
                                 if let Some(index) = canvas.scene.index_of(&id) {
                                     canvas.activate(index, false, window, cx);
@@ -1375,9 +1374,9 @@ impl GraphCanvas {
                         "Open related table",
                         None,
                         open_action(OpenType {
-                            type_name: group.other_type.clone(),
+                            type_name: group.other_type,
                             at_commit: None,
-                            filter_id: Some(owner.id.clone()),
+                            filter_id: Some(owner.id),
                             via: Some(gq_language::builder::relationship_key(&back)),
                             preview: false,
                         }),
@@ -1957,7 +1956,7 @@ impl GraphCanvas {
                             panel("canvas-mode")
                                 .child(
                                     div().px_2().child(
-                                        Label::new(summary.clone())
+                                        Label::new(summary)
                                             .size(LabelSize::Small)
                                             .color(Color::Muted)
                                             .single_line(),

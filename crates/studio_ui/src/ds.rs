@@ -831,7 +831,7 @@ pub fn filter_pill(
             .flex_none()
     };
     h_flex()
-        .id(id.clone())
+        .id(id)
         .h(px(size::PILL))
         .flex_none()
         .rounded_full()
@@ -1018,7 +1018,7 @@ pub fn setting_row(
 ) -> Stateful<Div> {
     let id: ElementId = id.into();
     h_flex()
-        .id(id.clone())
+        .id(id)
         .w_full()
         .min_h(px(size::ROW + space::XL))
         .py(px(space::MD))

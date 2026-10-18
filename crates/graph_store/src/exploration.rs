@@ -581,7 +581,7 @@ impl ExploreState {
                 Loadable::Loaded(()) => {}
                 Loadable::Failed(message) => {
                     out.push(Entry {
-                        path: path.clone(),
+                        path,
                         depth: depth + 1,
                         parent: Some(index),
                         kind: EntryKind::Error {
@@ -593,7 +593,7 @@ impl ExploreState {
                 }
                 Loadable::NotLoaded | Loadable::Loading => {
                     out.push(Entry {
-                        path: path.clone(),
+                        path,
                         depth: depth + 1,
                         parent: Some(index),
                         kind: EntryKind::Loading {

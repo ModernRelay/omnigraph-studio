@@ -757,7 +757,7 @@ impl AgentPanel {
             }
         }));
         if let Some(home) = cli_home.clone() {
-            let configured = settings.omnigraph_cli.clone();
+            let configured = settings.omnigraph_cli;
             tasks.push(cx.spawn(async move |this, cx| {
                 let wanted = configured.clone();
                 let chosen = cx
@@ -1076,7 +1076,7 @@ impl AgentPanel {
                         if let Some(new_status) = update.fields.status {
                             *status = new_status;
                         }
-                        if let Some(new_input) = update.fields.raw_input.clone() {
+                        if let Some(new_input) = update.fields.raw_input {
                             *input = Some(new_input);
                         }
                         break;

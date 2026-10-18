@@ -1109,7 +1109,7 @@ impl TypeTable {
         self.saves_in_flight += 1;
         cx.notify();
         let branch = self.branch.clone();
-        let column = property.name.clone();
+        let column = property.name;
         // Detached: a write is never cancelled by closing the tab.
         cx.spawn_in(window, async move |this, cx| {
             let outcome = write.await;
@@ -1720,7 +1720,6 @@ impl TypeTable {
                     );
                     if let Some(name) = active.clone() {
                         let graph = graph.clone();
-                        let type_name = type_name.clone();
                         menu = menu.entry(format!("Delete “{name}”"), None, move |_, cx| {
                             let (graph, type_name, name) =
                                 (graph.clone(), type_name.clone(), name.clone());
@@ -4314,7 +4313,7 @@ impl TypeTable {
             self.toast(ToastKind::Info, "This table has no filterable columns.", cx);
             return;
         };
-        self.set_draft_property(property.name.clone(), window, cx);
+        self.set_draft_property(property.name, window, cx);
     }
 
     fn set_draft_property(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
@@ -5265,7 +5264,7 @@ impl TypeTable {
                         return range.map(|ix| this.render_row(ix, window, cx)).collect();
                     };
                     let range = range.start.min(lines.len())..range.end.min(lines.len());
-                    let shown = &lines[range.clone()];
+                    let shown = &lines[range];
                     // An open section reads its first rows when its read line comes into view.
                     for line in shown {
                         if let Line::More(index) = *line
@@ -5956,7 +5955,7 @@ impl TypeTable {
         };
         let content: AnyElement = match column.property() {
             _ if draft.is_some() => {
-                let text = draft.clone().unwrap_or_default();
+                let text = draft.unwrap_or_default();
                 let empty = text.trim().is_empty();
                 Label::new(if empty { "—".to_owned() } else { text })
                     .size(LabelSize::Small)

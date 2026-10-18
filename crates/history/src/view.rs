@@ -669,7 +669,6 @@ impl HistoryView {
                         .menu(move |window, cx| {
                             let copy_id = copy_id.clone();
                             ContextMenu::build(window, cx, move |menu, _, _| {
-                                let copy_id = copy_id.clone();
                                 let open_id = copy_id.clone();
                                 menu.entry("Copy commit id", None, move |_, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(

@@ -71,12 +71,7 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
         let mut items: Vec<Completion> = Vec::new();
         let names = parameters(source, signature.as_ref())
             .into_iter()
-            .chain(bindings(
-                schema,
-                source,
-                declaration.clone(),
-                signature.as_ref(),
-            ));
+            .chain(bindings(schema, source, declaration, signature.as_ref()));
         for (name, detail) in names {
             if matches(&name) && name != prefix && !items.iter().any(|i| i.label == name) {
                 items.push(Completion {
@@ -116,7 +111,7 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
         if var_start > 0 && before.as_bytes()[var_start - 1] == b'$' {
             let var = &before[var_start..var_end];
             let mut items = Vec::new();
-            let bound = bindings(schema, source, declaration.clone(), signature.as_ref())
+            let bound = bindings(schema, source, declaration, signature.as_ref())
                 .into_iter()
                 .find(|(name, _)| name == var)
                 .map(|(_, type_name)| type_name);

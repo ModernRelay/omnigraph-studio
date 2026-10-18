@@ -137,7 +137,7 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone> Memo<K, V, P> {
             self.order.remove(&old.used);
         }
         self.bytes += weight;
-        self.order.insert(used, key.clone());
+        self.order.insert(used, key);
         // The least recently used go first; the answer just kept stays, whatever it weighs.
         let over_budget = |memo: &Self| memo.budget.is_some_and(|(budget, _)| memo.bytes > budget);
         while self.entries.len() > self.capacity || over_budget(self) {

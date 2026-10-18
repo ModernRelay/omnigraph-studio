@@ -658,10 +658,7 @@ impl Render for SettingsView {
                                         "Show settings.json · {}",
                                         path.display()
                                     )))
-                                    .on_click({
-                                        let path = path.clone();
-                                        move |_, _, cx| cx.reveal_path(&path)
-                                    }),
+                                    .on_click(move |_, _, cx| cx.reveal_path(&path)),
                             )
                             .child(
                                 studio_ui::ds::icon_button("reveal-keymap", IconName::Keyboard)

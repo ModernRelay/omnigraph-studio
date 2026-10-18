@@ -278,10 +278,10 @@ impl Connection {
         }
         let next = match health {
             Ok(health) if !health.contract_supported() => ConnectionState::ContractMismatch {
-                served: health.contract.clone(),
+                served: health.contract,
             },
             Ok(health) if !health.version_supported() => ConnectionState::TooOld {
-                version: health.health.version.clone(),
+                version: health.health.version,
             },
             Ok(_) if self.state == ConnectionState::Ready => ConnectionState::Ready,
             // Recovered: probe capabilities and graphs again, which schedules the next check.
