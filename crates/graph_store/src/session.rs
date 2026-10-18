@@ -458,8 +458,9 @@ impl GraphSession {
         self.stored_queries = Loadable::Loading;
         let client = self.client(cx);
         let graph = self.graph_id.clone();
+        let read = cx.background_spawn(async move { client.stored_queries(&graph).await });
         self._stored_queries_task = Some(cx.spawn(async move |this, cx| {
-            let read = client.stored_queries(&graph).await;
+            let read = read.await;
             this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
             let result = match read {
                 Ok(output) => Loadable::Loaded(Arc::new(output.queries)),
@@ -552,12 +553,22 @@ impl GraphSession {
         self.schema = Loadable::Loading;
         let client = self.client(cx);
         let graph = self.graph_id.clone();
-        self._schema_task = Some(cx.spawn(async move |this, cx| {
+        // Read and compiled off the main thread: a large schema takes a while to compile.
+        let read = cx.background_spawn(async move {
             let read = client.schema(&graph).await;
+            let parsed = read
+                .as_ref()
+                .ok()
+                .map(|output| parse_schema(&output.schema_source));
+            (read.map(|_| ()), parsed)
+        });
+        self._schema_task = Some(cx.spawn(async move |this, cx| {
+            let (read, parsed) = read.await;
             this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
-            let result = match read {
-                Ok(output) => parse_schema(&output.schema_source),
-                Err(error) => Loadable::Failed(error.to_string()),
+            let result = match (read, parsed) {
+                (Ok(()), Some(parsed)) => parsed,
+                (Err(error), _) => Loadable::Failed(error.to_string()),
+                (Ok(()), None) => Loadable::Failed("The schema could not be read.".into()),
             };
             this.update(cx, |this, cx| this.install_schema(result, cx))
                 .ok();
@@ -600,13 +611,23 @@ impl GraphSession {
     fn recheck_schema(&mut self, cx: &mut Context<Self>) {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
-        self._schema_task = Some(cx.spawn(async move |this, cx| {
+        let known = self.schema_text.clone();
+        let read = cx.background_spawn(async move {
             let read = client.schema(&graph).await;
+            // Compiled off the main thread, and only when it is another text.
+            let parsed = read
+                .as_ref()
+                .ok()
+                .filter(|output| known.as_deref() != Some(output.schema_source.as_str()))
+                .map(|output| parse_schema(&output.schema_source));
+            (read.map(|_| ()), parsed)
+        });
+        self._schema_task = Some(cx.spawn(async move |this, cx| {
+            let (read, parsed) = read.await;
             this.update(cx, |this, cx| {
                 this.note_read(&read, cx);
-                if let Ok(output) = read
-                    && this.schema_text.as_deref() != Some(output.schema_source.as_str())
-                    && let Loadable::Loaded(model) = parse_schema(&output.schema_source)
+                if let Some(Loadable::Loaded(model)) = parsed
+                    && this.schema_text.as_deref() != Some(&*model.source)
                 {
                     // The session reads under it from now; views take it on Refresh.
                     this.start_schema_epoch(&model);
@@ -623,8 +644,9 @@ impl GraphSession {
         self.branches = Loadable::Loading;
         let client = self.client(cx);
         let graph = self.graph_id.clone();
+        let read = cx.background_spawn(async move { client.branches(&graph).await });
         self._branches_task = Some(cx.spawn(async move |this, cx| {
-            let read = client.branches(&graph).await;
+            let read = read.await;
             this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
             let result = match read {
                 Ok(output) => Loadable::Loaded(branch_order(output.branches)),
@@ -651,8 +673,9 @@ impl GraphSession {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let branch = self.branch.clone();
+        let read = cx.background_spawn(async move { client.snapshot(&graph, &branch).await });
         self._datasets_task = Some(cx.spawn(async move |this, cx| {
-            let read = client.snapshot(&graph, &branch).await;
+            let read = read.await;
             this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
             let result = match read {
                 Ok(output) => Loadable::Loaded(output.datasets),
@@ -926,7 +949,11 @@ impl GraphSession {
         let mut fold = FeedFold::new(Arc::new(names));
         let key = branch.to_owned();
         let branch = branch.to_owned();
-        let read = cx.spawn(async move |this, cx| {
+        // The feed's pages are read and folded off the main thread: each change carries its
+        // images, and a page can be large.
+        let feed_branch = branch.clone();
+        let fed = cx.background_spawn(async move {
+            let branch = feed_branch;
             let mut next = Some(FeedNext::Start(format!("after:{from}")));
             let mut failed = None;
             for _ in 0..FEED_PAGES {
@@ -962,6 +989,10 @@ impl GraphSession {
             } else {
                 Some(client.schema(&graph).await)
             };
+            (commits, failed, next, schema_read)
+        });
+        let read = cx.spawn(async move |this, cx| {
+            let (commits, failed, next, schema_read) = fed.await;
             this.update(cx, |this, cx| {
                 this.change_reads.remove(&branch);
                 if let Some(error) = failed.clone() {
@@ -1059,8 +1090,9 @@ impl GraphSession {
             let client = self.client(cx);
             let graph = self.graph_id.clone();
             let key = branch.clone();
+            let probe = cx.background_spawn(async move { client.query(&graph, &request).await });
             let read = cx.spawn(async move |this, cx| {
-                let read = client.query(&graph, &request).await;
+                let read = probe.await;
                 this.update(cx, |this, cx| {
                     this.head_reads.remove(&branch);
                     this.note_read(&read, cx);
@@ -1086,8 +1118,9 @@ impl GraphSession {
         }
         let client = self.client(cx);
         let graph = self.graph_id.clone();
+        let read = cx.background_spawn(async move { client.branches(&graph).await });
         self.branch_recheck = Some(cx.spawn(async move |this, cx| {
-            let read = client.branches(&graph).await;
+            let read = read.await;
             this.update(cx, |this, cx| {
                 this.branch_recheck = None;
                 this.note_read(&read, cx);
@@ -1393,9 +1426,9 @@ impl GraphSession {
     /// nobody waits for any more (its task dropped, as a search does when the text changes)
     /// stops, and is counted out either way: a count that only came down on an answer would
     /// leave "queries running" up for reads that no longer exist.
-    fn counted_read<T: 'static>(
+    fn counted_read<T: Send + 'static>(
         &mut self,
-        request: impl Future<Output = Result<T, ReadError>> + 'static,
+        request: impl Future<Output = Result<T, ReadError>> + Send + 'static,
         cx: &mut Context<Self>,
     ) -> Task<Result<T, ReadError>> {
         self.reads_in_flight += 1;
@@ -1403,6 +1436,9 @@ impl GraphSession {
         let (answer_tx, answer_rx) = oneshot::channel();
         // Held by the caller's task: dropping that task drops this, which stops the read.
         let (waiting_tx, waiting_rx) = oneshot::channel::<std::convert::Infallible>();
+        // The request, its body and its decoding run off the main thread, which only takes the
+        // answer: a large page or feed decoded there would hold up frames.
+        let request = cx.background_spawn(request);
         cx.spawn(async move |this, cx| {
             let result = match select(std::pin::pin!(request), waiting_rx).await {
                 Either::Left((result, _)) => Some(result),
