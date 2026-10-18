@@ -174,10 +174,11 @@ it is.
 1. `agent.omnigraph_cli` (Settings → Agent → OmniGraph CLI), then each `omnigraph` on PATH, then
    `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`, without duplicates.
 2. Each says which HTTP contract it speaks, without a server, bounded to 5 s: `omnigraph
-   version --json` reports `http_contract` (OmniGraph #987, E23), and 0.13.x, which predates
-   it, speaks `0.13`. Studio speaks 0.13 and later only, so an older release, or one that does
-   not answer, fits nothing. The first that speaks Studio's contract goes in the wrapper, so a
-   slow or unavailable server never decides which CLI a conversation gets.
+   version --json` reports `http_contract` (OmniGraph #987, E23), as every release Studio
+   supports (0.14 and later) does. An older release, or one that does not answer, fits
+   nothing; its `--version` only names it in the notice. The first that speaks Studio's
+   contract goes in the wrapper, so a slow or unavailable server never decides which CLI a
+   conversation gets.
 3. If none fits, the wrapper runs nothing and prints why, so `omnigraph_run` and the agent's
    shell refuse rather than run a CLI the server would refuse. A notice in the thread names the
    contract and each CLI found with its release and what it speaks, and the `omnigraph_cli`

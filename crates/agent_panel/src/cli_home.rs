@@ -299,18 +299,25 @@ pub fn candidates(configured: Option<&str>) -> Vec<PathBuf> {
 /// speaks (the `Omnigraph-Http-Api` value, which a server takes only when it is its own).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliFacts {
-    /// Its release, as it reports it ("0.13.0").
+    /// Its release, as it reports it ("0.14.0").
     pub version: Option<String>,
-    /// `None` for a CLI from before 0.13, or one that did not answer.
+    /// `None` for a CLI older than Studio's minimum, 0.14, which has no `version --json`, or
+    /// one that did not answer.
     pub contract: Option<String>,
 }
 
-/// How long a CLI may take to print its version.
-const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a CLI may take to print its version. The tests' stand-ins are shell scripts that a
+/// loaded machine can take seconds to start, and the choice, not the limit, is what they check.
+const VERSION_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(60)
+} else {
+    Duration::from_secs(5)
+};
 
 /// Reads a CLI's release and contract by running it, never a server. `version --json` reports
-/// the contract (`http_contract`, OmniGraph #987); 0.13.0, which predates it, speaks `0.13`.
-/// Studio speaks 0.13 and later only, so an older release has no contract here.
+/// both (`http_contract`, in every OmniGraph Studio supports). An older CLI answers only
+/// `--version`: its release names it in the message that says why it was not chosen, and it
+/// has no contract here.
 pub async fn cli_facts(cli: &Path) -> CliFacts {
     if let Some(json) = output(cli, &["version", "--json"]).await
         && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&json)
@@ -324,15 +331,11 @@ pub async fn cli_facts(cli: &Path) -> CliFacts {
             contract: Some(contract.to_owned()),
         };
     }
-    let version = output(cli, &["--version"])
-        .await
-        .and_then(|text| release(&String::from_utf8_lossy(&text)));
     CliFacts {
-        contract: version
-            .as_deref()
-            .filter(|version| version.starts_with("0.13."))
-            .map(|_| "0.13".to_owned()),
-        version,
+        version: output(cli, &["--version"])
+            .await
+            .and_then(|text| release(&String::from_utf8_lossy(&text))),
+        contract: None,
     }
 }
 
@@ -378,11 +381,9 @@ pub enum CliChoice {
 /// With no match the wrapper runs nothing and says why, rather than pointing at a CLI the server
 /// would refuse.
 pub async fn choose_cli(home: &CliHome, candidates: Vec<PathBuf>, contract: &str) -> CliChoice {
-    let mut found = Vec::new();
-    for cli in candidates {
-        let facts = cli_facts(&cli).await;
-        found.push((cli, facts));
-    }
+    // Each probe waits on a process; together they take as long as the slowest, not the sum.
+    let facts = futures::future::join_all(candidates.iter().map(|cli| cli_facts(cli))).await;
+    let found: Vec<(PathBuf, CliFacts)> = candidates.into_iter().zip(facts).collect();
     if let Some((cli, facts)) = found
         .iter()
         .find(|(_, facts)| facts.contract.as_deref() == Some(contract))
@@ -408,7 +409,7 @@ pub fn no_cli_text(contract: &str, found: &[(PathBuf, CliFacts)]) -> String {
             .map(|(cli, facts)| {
                 let what = match (&facts.version, &facts.contract) {
                     (Some(version), Some(speaks)) => format!("{version}, which speaks {speaks}"),
-                    (Some(version), None) => format!("{version}, older than 0.13"),
+                    (Some(version), None) => format!("{version}, older than 0.14"),
                     (None, _) => "did not say its version".to_owned(),
                 };
                 format!("{} is {what}", cli.display())
@@ -948,17 +949,13 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path
         };
-        // 0.11 and 0.13.0 predate `version --json`; every other command fails, as one would with
-        // no server behind the gateway.
+        // 0.13.0 predates `version --json`; every other command fails, as one would with no
+        // server behind the gateway.
         let old = fake(
-            "omnigraph-0.11",
-            r#"[ "$1" = --version ] && { echo "omnigraph 0.11.0"; exit 0; }; exit 2"#,
-        );
-        let current = fake(
             "omnigraph-0.13",
             r#"[ "$1" = --version ] && { echo "omnigraph 0.13.0"; exit 0; }; exit 2"#,
         );
-        let reports = fake(
+        let current = fake(
             "omnigraph-0.14",
             r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.14.0","http_contract":"0.13"}'; exit 0; }; exit 2"#,
         );
@@ -983,21 +980,21 @@ mod tests {
         match choose(vec![old.clone(), current.clone()]) {
             CliChoice::Chosen { cli, version } => {
                 assert_eq!(cli, current);
-                assert_eq!(version.as_deref(), Some("0.13.0"));
+                assert_eq!(version.as_deref(), Some("0.14.0"));
             }
             other => panic!("{other:?}"),
         }
         assert!(wrapper().contains(&*current.to_string_lossy()));
 
-        match choose(vec![other.clone(), reports.clone()]) {
-            CliChoice::Chosen { cli, .. } => assert_eq!(cli, reports),
+        match choose(vec![other.clone(), current.clone()]) {
+            CliChoice::Chosen { cli, .. } => assert_eq!(cli, current),
             other => panic!("{other:?}"),
         }
 
         match choose(vec![old.clone(), other.clone()]) {
             CliChoice::NoMatch { found } => {
                 let text = no_cli_text("0.13", &found);
-                assert!(text.contains("0.11.0, older than 0.13"), "{text}");
+                assert!(text.contains("0.13.0, older than 0.14"), "{text}");
                 assert!(text.contains("0.15.0, which speaks 0.15"), "{text}");
             }
             other => panic!("{other:?}"),
