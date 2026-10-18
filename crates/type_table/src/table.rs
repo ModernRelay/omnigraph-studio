@@ -304,6 +304,12 @@ pub struct TypeTable {
     /// read for each page at the page's commit.
     relations: HashMap<(String, String), Relation>,
     relation_tasks: Vec<Task<()>>,
+    /// The relationship columns rows drew in the last frame, by key. Only these read their
+    /// neighbours: a type with dozens of relationships reads the few on screen (spec 015).
+    relations_drawn: HashSet<String>,
+    /// Rows and relationship keys whose read is out or done, so a column scrolled back into
+    /// view is not asked again.
+    relations_asked: HashSet<(String, String)>,
     peek: Option<(String, Entity<NodePeek>)>,
     newer: bool,
     /// Writes out for this table: its own saves and the dialogs' inserts and deletes. Each moves
@@ -526,6 +532,8 @@ impl TypeTable {
             blob_tasks: HashMap::new(),
             relations: HashMap::new(),
             relation_tasks: Vec::new(),
+            relations_drawn: HashSet::new(),
+            relations_asked: HashSet::new(),
             peek: None,
             newer: false,
             saves_in_flight: 0,
@@ -728,21 +736,21 @@ impl TypeTable {
     }
 
     /// Reads the neighbours of a relationship column that has just come into view, for the rows
-    /// already read; a column that was shown before keeps what it read.
+    /// already read; a column that was drawn before keeps what it read.
     fn load_shown_relations(&mut self, cx: &mut Context<Self>) {
         let groups: Vec<(RelationshipGroup, Vec<String>)> = self
-            .columns
-            .iter()
-            .filter_map(ColumnSpec::relationship)
+            .drawn_relationships()
+            .into_iter()
             .map(|group| {
-                let key = builder::relationship_key(group);
+                let key = builder::relationship_key(&group);
                 let missing = self
                     .rows
                     .iter()
-                    .filter(|row| !self.relations.contains_key(&(row.id.clone(), key.clone())))
-                    .map(|row| row.id.clone())
+                    .map(|row| (row.id.clone(), key.clone()))
+                    .filter(|asked| !self.relations_asked.contains(asked))
+                    .map(|(id, _)| id)
                     .collect();
-                (group.clone(), missing)
+                (group, missing)
             })
             .filter(|(_, missing): &(RelationshipGroup, Vec<String>)| !missing.is_empty())
             .collect();
@@ -1780,6 +1788,7 @@ impl TypeTable {
             self.blob_tasks.clear();
             self.relations.clear();
             self.relation_tasks.clear();
+            self.relations_asked.clear();
         }
         self.blob_rows = None;
         self._blob_wait = None;
@@ -2327,14 +2336,44 @@ impl TypeTable {
     /// Reads the relationship columns for one page's rows: per relationship, how many
     /// neighbours each row has, and the first few for the chips. Pinned to the page's commit.
     fn load_relations(&mut self, ids: Vec<String>, cx: &mut Context<Self>) {
-        // A hidden relationship column reads nothing until it shows.
-        let groups: Vec<_> = self
-            .columns
+        // A relationship column reads nothing until rows draw it.
+        let groups = self.drawn_relationships();
+        self.load_relation_groups(groups, ids, cx);
+    }
+
+    /// The relationship columns rows drew in the last frame.
+    fn drawn_relationships(&self) -> Vec<RelationshipGroup> {
+        self.columns
             .iter()
+            .filter(|column| self.relations_drawn.contains(&column.key))
             .filter_map(ColumnSpec::relationship)
             .cloned()
+            .collect()
+    }
+
+    /// Notes the relationship columns this frame draws; one that was not drawn before reads
+    /// its neighbours for the rows read so far, once the frame is out.
+    fn want_relations(&mut self, drawn: &[bool], window: &mut Window, cx: &mut Context<Self>) {
+        // Before the grid's first layout every column counts as drawn.
+        let handle = &self.table_state.read(cx).horizontal_scroll_handle;
+        if handle.bounds().size.width <= px(0.) {
+            return;
+        }
+        let keys: HashSet<String> = self
+            .columns
+            .iter()
+            .zip(drawn)
+            .filter(|(column, drawn)| **drawn && column.relationship().is_some())
+            .map(|(column, _)| column.key.clone())
             .collect();
-        self.load_relation_groups(groups, ids, cx);
+        if keys == self.relations_drawn {
+            return;
+        }
+        let new = !keys.is_subset(&self.relations_drawn);
+        self.relations_drawn = keys;
+        if new {
+            cx.defer_in(window, |this, _, cx| this.load_shown_relations(cx));
+        }
     }
 
     fn load_relation_groups(
@@ -2352,15 +2391,20 @@ impl TypeTable {
         let snapshot = self.paging.pinned.clone();
         for group in groups {
             let key = builder::relationship_key(&group);
-            // Rows whose relationship was read at this commit already need no read.
+            // Rows whose relationship was read at this commit, or is being read, need no read.
             let ids: Vec<String> = ids
                 .iter()
-                .filter(|id| !self.relations.contains_key(&((*id).clone(), key.clone())))
+                .filter(|id| {
+                    let asked = ((*id).clone(), key.clone());
+                    !self.relations.contains_key(&asked) && !self.relations_asked.contains(&asked)
+                })
                 .cloned()
                 .collect();
             if ids.is_empty() {
                 continue;
             }
+            self.relations_asked
+                .extend(ids.iter().map(|id| (id.clone(), key.clone())));
             let Ok(degrees) = builder::page_degrees(&schema, &self.type_name, &group, &ids) else {
                 continue;
             };
@@ -5088,6 +5132,7 @@ impl TypeTable {
                 cx.processor(|this, range: Range<usize>, window, cx| {
                     this.note_looks(range.clone());
                     let drawn = this.drawn_columns(window, cx);
+                    this.want_relations(&drawn, window, cx);
                     #[cfg(test)]
                     {
                         this.frame_drawn = drawn.clone();
@@ -6486,6 +6531,82 @@ mod tests {
                 Some("name".to_owned())
             );
         });
+    }
+
+    /// A type with many relationships reads the neighbours of the relationship columns rows
+    /// draw, and of the others as they scroll into view, once each (spec 015).
+    #[gpui::test]
+    async fn relationship_columns_read_while_drawn(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let edges: String = (1..=20)
+            .map(|i| format!("edge R{i:02}: Person -> Person\n"))
+            .collect();
+        let schema = format!("{PEOPLE}{edges}");
+        let (session, names) = crate::test_support::session_routing(
+            &schema,
+            |request| match request["name"].as_str() {
+                Some("studio_page_degrees") => serde_json::json!([]),
+                _ => serde_json::json!([
+                    {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
+                    {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
+                ]),
+            },
+            cx,
+        );
+        let degree_reads = move || {
+            names
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|name| *name == "studio_page_degrees")
+                .count()
+        };
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session.clone(),
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let read_for = |cx: &mut gpui::VisualTestContext| {
+            table.read_with(cx, |table, _| {
+                let mut keys: Vec<String> = table
+                    .relations_asked
+                    .iter()
+                    .map(|(_, key)| key.clone())
+                    .collect();
+                keys.sort();
+                keys.dedup();
+                keys
+            })
+        };
+        let first = read_for(cx);
+        assert!(!first.is_empty(), "the columns in view are read");
+        assert!(first.len() < 20, "not every relationship: {first:?}");
+        assert_eq!(degree_reads(), first.len(), "one read per column drawn");
+        let last = table.read_with(cx, |table, _| table.columns.last().unwrap().key.clone());
+        assert!(!first.contains(&last));
+
+        // Scrolled to the far end: the last relationship is read, and none is read twice.
+        table.update_in(cx, |table, window, cx| {
+            let rem = window.rem_size();
+            let total = table.widths.read(cx).scrollable_width(1, rem);
+            let handle = table.table_state.read(cx).horizontal_scroll_handle.clone();
+            let viewport = handle.bounds().size.width;
+            handle.set_offset(point(-(total - viewport), px(0.)));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let read = read_for(cx);
+        assert!(read.contains(&last));
+        assert_eq!(degree_reads(), read.len(), "none read twice");
     }
 
     /// A row draws the columns in view, one either side, the pinned first and the cursor's;

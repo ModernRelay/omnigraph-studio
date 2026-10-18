@@ -262,6 +262,10 @@ A first cut of parts 1 and 4, ahead of the shared cache:
   each relationship's edge and other type, and those types' relationships, which grouping a
   relationship column by its neighbours' relationships reads. Otherwise "Newer data · Refresh"
   shows as before.
+- Tables read a relationship column's neighbours only once rows draw it (the columns in the
+  horizontal view and one either side), and each row's once: a Person table on the personal
+  graph has 92 relationship columns, each two reads per page. The default cap of 8 columns
+  (part 4) is not built; with reads limited to the screen it is a layout choice, not a cost.
 - Not yet: the tree and canvas (`Exploration`) and review still offer Refresh on every move;
   answers are not shared across commits (part 2), so a moved view's later reads are new reads.
 
