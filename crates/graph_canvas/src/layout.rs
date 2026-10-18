@@ -293,6 +293,71 @@ pub fn ontology_positions(nodes: &[OntologyNode], edges: &[OntologyEdge]) -> Vec
     position
 }
 
+/// Graph distances between a group's types along relationship lengths, by Dijkstra from each
+/// type over the sparse relationships, nearest first from a heap; and how strongly each pair
+/// pulls (several relationships between two types pull harder). `local` maps a type to its
+/// place in `members`.
+fn graph_distances(
+    members: &[usize],
+    adjacency: &[Vec<(usize, f32, u32)>],
+    local: &HashMap<usize, usize>,
+) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    let m = members.len();
+    let mut distance = vec![vec![f32::INFINITY; m]; m];
+    let mut strength = vec![vec![1f32; m]; m];
+    for source in 0..m {
+        let row = &mut distance[source];
+        row[source] = 0.;
+        let mut done = vec![false; m];
+        let mut nearest = std::collections::BinaryHeap::from([Nearest(0., source)]);
+        while let Some(Nearest(at_distance, at)) = nearest.pop() {
+            if std::mem::replace(&mut done[at], true) {
+                continue;
+            }
+            for &(other, hop, count) in &adjacency[members[at]] {
+                let Some(&k) = local.get(&other) else {
+                    continue;
+                };
+                if at_distance + hop < row[k] {
+                    row[k] = at_distance + hop;
+                    nearest.push(Nearest(row[k], k));
+                }
+                if at == source {
+                    // Several relationships between two types pull them together harder.
+                    strength[source][k] = 1. + 0.5 * (count.saturating_sub(1)) as f32;
+                }
+            }
+        }
+    }
+    (distance, strength)
+}
+
+/// A type and its distance from Dijkstra's source, ordered nearest first in a max-heap.
+struct Nearest(f32, usize);
+
+impl PartialEq for Nearest {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Nearest {}
+
+impl PartialOrd for Nearest {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Nearest {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .0
+            .total_cmp(&self.0)
+            .then_with(|| other.1.cmp(&self.1))
+    }
+}
+
 /// One connected group by stress majorization, in the group's own frame (or, when a type in
 /// it is placed, in the frame of the placed types).
 fn stress_layout(
@@ -302,35 +367,7 @@ fn stress_layout(
 ) -> Vec<Vec2> {
     let m = members.len();
     let local: HashMap<usize, usize> = members.iter().enumerate().map(|(k, &i)| (i, k)).collect();
-    // Graph distances along relationship lengths (Dijkstra from each type; groups are small).
-    let mut distance = vec![vec![f32::INFINITY; m]; m];
-    let mut strength = vec![vec![1f32; m]; m];
-    for source in 0..m {
-        let row = &mut distance[source];
-        row[source] = 0.;
-        let mut done = vec![false; m];
-        for _ in 0..m {
-            let Some(at) = (0..m)
-                .filter(|&k| !done[k] && row[k].is_finite())
-                .min_by(|&a, &b| row[a].total_cmp(&row[b]))
-            else {
-                break;
-            };
-            done[at] = true;
-            for &(other, hop, count) in &adjacency[members[at]] {
-                let Some(&k) = local.get(&other) else {
-                    continue;
-                };
-                if row[at] + hop < row[k] {
-                    row[k] = row[at] + hop;
-                }
-                if at == source {
-                    // Several relationships between two types pull them together harder.
-                    strength[source][k] = 1. + 0.5 * (count.saturating_sub(1)) as f32;
-                }
-            }
-        }
-    }
+    let (distance, strength) = graph_distances(members, adjacency, &local);
     let fixed: Vec<Option<Vec2>> = members.iter().map(|&i| nodes[i].pinned).collect();
     let mut x = classical_mds(&distance);
     let anchored: Vec<usize> = (0..m).filter(|&k| fixed[k].is_some()).collect();
@@ -1061,7 +1098,10 @@ mod tests {
     #[test]
     fn a_gap_one_rounding_short_of_a_column_is_passed_over() {
         let (low, high, total) = (202.546_78_f32, 922.546_75_f32, 720.);
-        assert!(high - low >= total && high - total < low, "the rounding this guards");
+        assert!(
+            high - low >= total && high - total < low,
+            "the rounding this guards"
+        );
         let taken = [[0., 100., 0., low], [0., 100., high, 1_000.]];
         let start = free_top(300., total, (0., 100.), &taken, false);
         assert_eq!(start, 1_000., "below every chip");
@@ -1458,6 +1498,49 @@ mod tests {
                     at[other]
                 );
             }
+        }
+    }
+
+    /// Dijkstra from each type gives the shortest distances Floyd–Warshall gives.
+    #[test]
+    fn graph_distances_are_the_shortest_paths() {
+        let mut next = 7_u64;
+        let mut draw = |below: u64| {
+            next = next
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (next >> 33) % below
+        };
+        for _ in 0..50 {
+            let m = 1 + draw(25) as usize;
+            let mut adjacency: Vec<Vec<(usize, f32, u32)>> = vec![Vec::new(); m];
+            for _ in 0..draw(3 * m as u64) {
+                let (a, b) = (draw(m as u64) as usize, draw(m as u64) as usize);
+                let hop = 1. + draw(50) as f32;
+                adjacency[a].push((b, hop, 1));
+                adjacency[b].push((a, hop, 1));
+            }
+            let members: Vec<usize> = (0..m).collect();
+            let local = members.iter().map(|&i| (i, i)).collect();
+            let (distance, _) = graph_distances(&members, &adjacency, &local);
+            let mut expected = vec![vec![f32::INFINITY; m]; m];
+            for (a, edges) in adjacency.iter().enumerate() {
+                expected[a][a] = 0.;
+                for &(b, hop, _) in edges {
+                    expected[a][b] = expected[a][b].min(hop);
+                }
+            }
+            for k in 0..m {
+                for a in 0..m {
+                    for b in 0..m {
+                        let through = expected[a][k] + expected[k][b];
+                        if through < expected[a][b] {
+                            expected[a][b] = through;
+                        }
+                    }
+                }
+            }
+            assert_eq!(distance, expected);
         }
     }
 

@@ -316,6 +316,15 @@ impl RelationshipTree {
 
     fn selected_row(&self) -> Option<usize> {
         let id = self.selected.as_ref()?;
+        // Where it last was first: the list asks every frame, and rows rarely move.
+        if let Some(hint) = self.selected_row_index_hint
+            && self
+                .visible
+                .get(hint)
+                .is_some_and(|ix| rows::is_row(&self.entries[*ix], id))
+        {
+            return Some(hint);
+        }
         rows::find(&self.visible, &self.entries, id)
     }
 

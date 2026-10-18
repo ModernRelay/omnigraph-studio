@@ -138,12 +138,14 @@ pub fn filter(
         .collect()
 }
 
-/// The visible row with this identity. Compared in place: the list asks every frame.
+/// Whether `entry` is the row with this identity. Compared in place: the list asks every frame.
+pub fn is_row(entry: &Entry, id: &RowId) -> bool {
+    row_tag(entry) == id.tag && entry.path == id.path
+}
+
+/// The visible row with this identity.
 pub fn find(visible: &[usize], entries: &[Entry], id: &RowId) -> Option<usize> {
-    visible.iter().position(|ix| {
-        let entry = &entries[*ix];
-        row_tag(entry) == id.tag && entry.path == id.path
-    })
+    visible.iter().position(|ix| is_row(&entries[*ix], id))
 }
 
 /// The visible row with this identity, else the closest visible ancestor by path.
@@ -172,10 +174,11 @@ pub fn first_child(visible: &[usize], entries: &[Entry], row: usize) -> Option<u
     (next < visible.len() && entries[visible[next]].parent == Some(parent)).then_some(next)
 }
 
-/// The visible row of a visible row's parent.
+/// The visible row of a visible row's parent. `visible` holds entry indices in order, and a
+/// parent comes before its children.
 pub fn parent_row(visible: &[usize], entries: &[Entry], row: usize) -> Option<usize> {
     let parent = entries[visible[row]].parent?;
-    visible.iter().position(|ix| *ix == parent)
+    visible[..row].binary_search(&parent).ok()
 }
 
 /// The entry indices from the root down to the parent of `entry`.
