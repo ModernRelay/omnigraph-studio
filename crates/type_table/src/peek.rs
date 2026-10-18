@@ -49,16 +49,33 @@ const PAGE_WIDTH: f32 = 760.;
 /// does not send a burst of reads.
 const COUNT_DELAY: Duration = Duration::from_millis(120);
 
-/// One item of a page's list.
+/// How far past the rows in view the view's list lays rows out. A group is read once its row
+/// is laid out, so this is how far ahead of a scroll the groups are read: a few rows.
+const DRAW_AHEAD: f32 = 160.;
+
+/// One item of the view's list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PageItem {
+enum Item {
     /// Everything above the relationship groups, ending with the Relationships heading.
     Head,
-    /// "This type takes part in no relationships", or "Reading…" until a count arrives.
+    /// "This type takes part in no relationships".
     Note(&'static str),
     Group(usize),
     /// The row the groups with no neighbours fold into.
     Empty,
+}
+
+/// Where a relationship group's row sits in the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// Among the groups listed first: known to have neighbours, its count failed, or the
+    /// person is working in it.
+    Listed,
+    /// Among the groups counted only once their rows are drawn, in schema order after the
+    /// listed ones. It stays there whatever it holds, so a count arriving moves no row in view.
+    AsDrawn,
+    /// Under the empty row: counted before the view laid it out, and known to have none.
+    Folded,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +130,11 @@ pub struct KnownRelation {
 struct Group {
     group: RelationshipGroup,
     count: Loadable<i64>,
+    /// The view laid the group out without its count: it is read once its row is drawn, and
+    /// keeps its place among such groups (`Place::AsDrawn`).
+    as_drawn: bool,
+    /// Its row was drawn: a group not counted yet is read then, and a small one opens.
+    drawn: bool,
     expanded: bool,
     neighbours: Loadable<Vec<Neighbour>>,
     /// The next page of neighbours being read (a page's "Show more").
@@ -190,6 +212,9 @@ pub struct NodePeek {
     holds_commit: bool,
     /// Drawn as a node's page rather than the inspector's peek.
     page: bool,
+    /// The peek follows a moving cursor: a group drawn waits a moment before it is read, so
+    /// rows the cursor passes read nothing.
+    debounce: bool,
     /// Text values with markup, rendered as markdown: by property, the text and its view.
     markdown: HashMap<String, (String, Entity<Markdown>)>,
     /// Text values found to read as themselves, by property: not parsed again each frame.
@@ -217,10 +242,11 @@ pub struct NodePeek {
     /// What the view shows, as read (spec 015): the session decides from it whether a head move
     /// changed anything shown. `None` while the view holds a commit.
     scope: Option<ReadScope>,
-    /// A page draws as a list: its head, then each relationship group shown. Only what is in
-    /// view is laid out, so a node with dozens of open groups scrolls without drawing them all.
-    page_list: ListState,
-    page_items: Vec<PageItem>,
+    /// The view draws as a list, a page and the peek alike: its head, then each relationship
+    /// group shown. Only what is in view is laid out, and a group is read once its row is, so
+    /// a node with dozens of groups neither draws nor reads them all.
+    list: ListState,
+    list_items: Vec<Item>,
     /// Properties the commit shown does not hold under their current name, and what they were
     /// then. The node is read without them.
     absent: HashMap<String, PropertyThen>,
@@ -364,6 +390,7 @@ impl NodePeek {
             newer: false,
             holds_commit: false,
             page,
+            debounce,
             markdown: HashMap::new(),
             plain_text: HashMap::new(),
             edits: HashMap::new(),
@@ -377,8 +404,8 @@ impl NodePeek {
             confirm_discard: false,
             show_empty: false,
             scope: Some(scope),
-            page_list: ListState::new(0, ListAlignment::Top, px(600.)),
-            page_items: Vec::new(),
+            list: ListState::new(0, ListAlignment::Top, px(DRAW_AHEAD)),
+            list_items: Vec::new(),
             absent: HashMap::new(),
             groups_absent: Vec::new(),
             awaiting_changes: false,
@@ -400,7 +427,7 @@ impl NodePeek {
                 };
                 this.note_shown(depends, None, cx);
                 this.values = Loadable::Loaded(values);
-                this.load_groups(debounce, cx);
+                this.load_groups(cx);
                 this.load_blobs(debounce, cx);
             }
             None => this.load_node(cx),
@@ -552,7 +579,7 @@ impl NodePeek {
                         match values {
                             Some(values) => {
                                 this.values = Loadable::Loaded(values);
-                                this.load_groups(false, cx);
+                                this.load_groups(cx);
                                 this.load_blobs(false, cx);
                             }
                             None => {
@@ -933,7 +960,10 @@ impl NodePeek {
             .into_any_element()
     }
 
-    fn load_groups(&mut self, debounce: bool, cx: &mut Context<Self>) {
+    /// Lays out the node's relationship groups. What the table read for them is shown as read;
+    /// the rest are read as their rows are drawn ([`Self::drawn`]), so a type with dozens of
+    /// relationships reads only those in view.
+    fn load_groups(&mut self, cx: &mut Context<Self>) {
         let PeekSubject::Node { type_name, .. } = self.subject.clone() else {
             return;
         };
@@ -945,7 +975,9 @@ impl NodePeek {
             .iter()
             .map(|group| Group {
                 group: group.clone(),
-                count: Loadable::Loading,
+                count: Loadable::NotLoaded,
+                as_drawn: true,
+                drawn: false,
                 expanded: false,
                 neighbours: Loadable::NotLoaded,
                 more: None,
@@ -954,35 +986,67 @@ impl NodePeek {
             .collect();
         for index in 0..self.groups.len() {
             let key = builder::relationship_key(&self.groups[index].group);
-            if let Some(known) = self.known.get(&key).cloned() {
-                // What the table read for the row's relationship is what the view shows of it.
-                let relationship = self.groups[index].group.clone();
-                if let PeekSubject::Node { id, .. } = &self.subject {
-                    let listed = known
-                        .first
-                        .as_ref()
-                        .map(|first| first.iter().map(|n| n.id.clone()).collect());
-                    let depends = Depends::EdgesAt {
-                        edge: relationship.edge.clone(),
-                        nodes: vec![id.clone()],
-                        listed: Some((relationship.other_type.clone(), "id".to_owned())),
-                    };
-                    self.note_shown(depends, listed, cx);
-                }
-                let group = &mut self.groups[index];
-                group.count = Loadable::Loaded(known.count);
-                if let Some(first) = known.first {
-                    group.neighbours = Loadable::Loaded(first);
-                }
-                // A small group shows its neighbours without a click, as below.
-                if self.opens_by_itself(known.count) {
-                    self.toggle_group(index, cx);
-                }
+            let Some(known) = self.known.get(&key).cloned() else {
                 continue;
+            };
+            // What the table read for the row's relationship is what the view shows of it.
+            let relationship = self.groups[index].group.clone();
+            if let PeekSubject::Node { id, .. } = &self.subject {
+                let listed = known
+                    .first
+                    .as_ref()
+                    .map(|first| first.iter().map(|n| n.id.clone()).collect());
+                let depends = Depends::EdgesAt {
+                    edge: relationship.edge.clone(),
+                    nodes: vec![id.clone()],
+                    listed: Some((relationship.other_type.clone(), "id".to_owned())),
+                };
+                self.note_shown(depends, listed, cx);
             }
-            self.load_group(index, debounce, false, cx);
+            // A small group shows its neighbours without a click; those the table did not read
+            // are read once its row is drawn.
+            let opens = self.opens_by_itself(known.count);
+            let group = &mut self.groups[index];
+            group.count = Loadable::Loaded(known.count);
+            group.as_drawn = false;
+            if let Some(first) = known.first {
+                group.neighbours = Loadable::Loaded(first);
+                group.expanded = opens;
+            }
         }
         cx.notify();
+    }
+
+    /// A group's row is laid out, in view or just past it: a group not counted yet is read, and
+    /// a small one counted already opens. Once per group; the work waits until the frame is
+    /// drawn.
+    fn drawn(&mut self, index: usize, window: &Window, cx: &mut Context<Self>) {
+        let Some(group) = self.groups.get_mut(index) else {
+            return;
+        };
+        if std::mem::replace(&mut group.drawn, true) {
+            return;
+        }
+        cx.defer_in(window, move |this, _, cx| {
+            let Some(group) = this.groups.get(index) else {
+                return;
+            };
+            // The groups were laid out again meanwhile: this one is read when it is drawn.
+            if !group.drawn {
+                return;
+            }
+            match group.count {
+                Loadable::NotLoaded => this.load_group(index, this.debounce, false, cx),
+                Loadable::Loaded(n)
+                    if !group.expanded
+                        && matches!(group.neighbours, Loadable::NotLoaded)
+                        && this.opens_by_itself(n) =>
+                {
+                    this.toggle_group(index, cx)
+                }
+                _ => {}
+            }
+        });
     }
 
     /// Reads a group's first neighbours, one more than the view shows: when they fit, that read
@@ -2693,15 +2757,16 @@ impl NodePeek {
             .into_any_element()
     }
 
-    /// Whether a group sits among those listed above the empty row: it has neighbours, or its
-    /// count failed and says why, or a write or its outcome is out on it. One with none, or
-    /// still being counted, waits under the empty row, so opening that row moves nothing.
-    fn listed_by_default(&self, index: usize) -> bool {
+    /// Where a group's row sits. One the view laid out without its count keeps its place
+    /// among those read as they are drawn. Of the others, one known to have none waits under
+    /// the empty row, so opening that row moves nothing, unless a write or its outcome is out
+    /// on it; the rest are listed first.
+    fn place(&self, index: usize) -> Place {
         let Some(group) = self.groups.get(index) else {
-            return false;
+            return Place::Folded;
         };
         let working = self.edge_writes.contains(&index) || self.group_notices.contains_key(&index);
-        lists_group(&group.count, working)
+        place_of(group, working)
     }
 
     /// Whether a group under the empty row shows: the row is open, or the person is adding to
@@ -2714,52 +2779,11 @@ impl NodePeek {
                 .is_some_and(|adding| adding.index == index)
     }
 
-    fn render_relationships(&self, cx: &mut Context<Self>) -> AnyElement {
-        if self.groups.is_empty() {
-            return Label::new("This type takes part in no relationships.")
-                .size(LabelSize::Small)
-                .color(Color::Muted)
-                .into_any_element();
-        }
-        let (listed, folded): (Vec<usize>, Vec<usize>) =
-            (0..self.groups.len()).partition(|&index| self.listed_by_default(index));
-        let counting = folded.iter().any(|&index| {
-            matches!(
-                self.groups[index].count,
-                Loadable::NotLoaded | Loadable::Loading
-            )
-        });
-        // Until a count arrives nothing says a group holds anything; once every group is
-        // counted, the ones with none fold into one row after the rest and open beneath it.
-        let reading = (listed.is_empty() && counting).then(|| {
-            Label::new("Reading…")
-                .size(LabelSize::Small)
-                .color(Color::Muted)
-                .into_any_element()
-        });
-        let empty_row = (!folded.is_empty() && !counting).then(|| self.render_empty_row(cx));
-        let mut column = v_flex().gap_0p5().children(reading);
-        for index in listed {
-            column = column.child(self.render_group(index, cx));
-        }
-        column = column.children(empty_row);
-        if !counting {
-            for index in folded {
-                if self.folded_shown(index) {
-                    column = column.child(self.render_group(index, cx));
-                }
-            }
-        }
-        column.into_any_element()
-    }
-
-    /// One relationship group: its header (direction, name, the other type, "+", the count),
-    /// then an open search, its notice and, when open, its neighbours.
     /// The row the groups with no neighbours fold into, with how many; a click shows them.
     fn render_empty_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let hover = cx.theme().colors().element_hover;
         let folded = (0..self.groups.len())
-            .filter(|&index| !self.listed_by_default(index))
+            .filter(|&index| self.place(index) == Place::Folded)
             .count();
         let open = self.show_empty;
         h_flex()
@@ -2803,6 +2827,8 @@ impl NodePeek {
             .into_any_element()
     }
 
+    /// One relationship group: its header (direction, name, the other type, "+", the count),
+    /// then an open search, its notice and, when open, its neighbours.
     fn render_group(&self, index: usize, cx: &mut Context<Self>) -> Div {
         let hover = cx.theme().colors().element_hover;
         let group = &self.groups[index];
@@ -2810,10 +2836,11 @@ impl NodePeek {
             Direction::Outgoing => IconName::ArrowRight,
             Direction::Incoming => IconName::ArrowLeft,
         };
+        // Until its count is read a group says nothing about what it holds.
         let count = match &group.count {
             Loadable::Loaded(n) => format_count(*n),
             Loadable::Failed(_) => "?".into(),
-            _ => "…".into(),
+            Loadable::NotLoaded | Loadable::Loading => "…".into(),
         };
         let failed = match &group.count {
             Loadable::Failed(error) => Some(error.clone()),
@@ -3277,10 +3304,17 @@ fn node_actions(type_name: &str, id: &str, at_commit: Option<String>) -> (PeekNo
     )
 }
 
-/// Whether a relationship group is listed by default: it has neighbours, the person is working
-/// in it, or its count failed. One with none, or not counted yet, is not.
-fn lists_group(count: &Loadable<i64>, active: bool) -> bool {
-    active || matches!(count, Loadable::Loaded(n) if *n > 0) || matches!(count, Loadable::Failed(_))
+/// Where a relationship group's row sits (`NodePeek::place`); `active` when the person is
+/// working in it. A group read again after a write is listed until its count says it has none,
+/// and one whose count failed is listed with why.
+fn place_of(group: &Group, active: bool) -> Place {
+    if group.as_drawn {
+        Place::AsDrawn
+    } else if !active && matches!(group.count, Loadable::Loaded(0)) {
+        Place::Folded
+    } else {
+        Place::Listed
+    }
 }
 
 /// How far Zed's editor sets its text in from its left edge without a gutter: the font's
@@ -3331,92 +3365,78 @@ fn section(title: &'static str) -> impl IntoElement {
 }
 
 impl Render for NodePeek {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_markdown(cx);
-        if self.page {
-            return self.render_page(cx).into_any_element();
-        }
-        // A node's relationships are listed once the node is read: while it loads, or when it
-        // does not exist at this commit, an empty list would say its type has none.
-        let relationships = self
-            .shows_relationships()
-            .then(|| self.render_relationships(cx));
-        self.render_head(window, cx)
-            .id("node-peek")
-            .key_context("NodeView")
-            .on_action(cx.listener(Self::save_drafts))
-            .on_action(cx.listener(Self::on_save_field))
-            .on_action(cx.listener(Self::on_cancel_field))
-            .on_action(cx.listener(Self::on_expand_field))
-            .p_4()
-            .gap_1p5()
-            .children(relationships.map(|relationships| {
-                v_flex()
-                    .child(section("Relationships"))
-                    .child(relationships)
-            }))
-            .into_any_element()
+        self.render_list(cx)
     }
 }
 
 impl NodePeek {
-    /// Whether the relationships are listed: once a node is read.
+    /// Whether the relationships are listed: once a node is read. While it loads, or when it
+    /// does not exist at this commit, an empty list would say its type has none.
     fn shows_relationships(&self) -> bool {
         matches!(self.subject, PeekSubject::Node { .. }) && self.values.loaded().is_some()
     }
 
-    /// What a page's list holds now, in order, as [`Self::render_relationships`] lays the
-    /// groups out for the peek.
-    fn page_items(&self) -> Vec<PageItem> {
-        let mut items = vec![PageItem::Head];
+    /// What the view's list holds now, in order: the head; the groups listed; those laid out
+    /// without their count, each in its place; then the empty row, with the groups under it
+    /// that show.
+    fn list_items(&self) -> Vec<Item> {
+        let mut items = vec![Item::Head];
         if !self.shows_relationships() {
             return items;
         }
         if self.groups.is_empty() {
-            items.push(PageItem::Note("This type takes part in no relationships."));
+            items.push(Item::Note("This type takes part in no relationships."));
             return items;
         }
-        let (listed, folded): (Vec<usize>, Vec<usize>) =
-            (0..self.groups.len()).partition(|&index| self.listed_by_default(index));
-        let counting = folded.iter().any(|&index| {
-            matches!(
-                self.groups[index].count,
-                Loadable::NotLoaded | Loadable::Loading
-            )
-        });
-        if listed.is_empty() && counting {
-            items.push(PageItem::Note("Reading…"));
+        let (mut listed, mut as_drawn, mut folded) = (Vec::new(), Vec::new(), Vec::new());
+        for index in 0..self.groups.len() {
+            match self.place(index) {
+                Place::Listed => listed.push(Item::Group(index)),
+                Place::AsDrawn => as_drawn.push(Item::Group(index)),
+                Place::Folded => folded.push(index),
+            }
         }
-        items.extend(listed.into_iter().map(PageItem::Group));
-        if !folded.is_empty() && !counting {
-            items.push(PageItem::Empty);
+        items.extend(listed);
+        items.extend(as_drawn);
+        if !folded.is_empty() {
+            items.push(Item::Empty);
             items.extend(
                 folded
                     .into_iter()
                     .filter(|&index| self.folded_shown(index))
-                    .map(PageItem::Group),
+                    .map(Item::Group),
             );
         }
         items
     }
 
-    /// A node's page: its items as a list, told what changed since it was last drawn.
-    fn render_page(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
-        let items = self.page_items();
-        if items != self.page_items {
-            // Items before the first change keep their place and the scroll position.
-            let same = items
+    /// The view's items as a list, told what changed since it was last drawn.
+    fn render_list(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let items = self.list_items();
+        if items != self.list_items {
+            // Only the items between an unchanged start and an unchanged end are replaced:
+            // the others keep their place, and the list keeps showing what is in view.
+            let old = &self.list_items;
+            let start = items
                 .iter()
-                .zip(&self.page_items)
+                .zip(old)
                 .take_while(|(new, old)| new == old)
                 .count();
-            self.page_list
-                .splice(same..self.page_items.len(), items.len() - same);
-            self.page_items = items;
+            let end = items[start..]
+                .iter()
+                .rev()
+                .zip(old[start..].iter().rev())
+                .take_while(|(new, old)| new == old)
+                .count();
+            self.list
+                .splice(start..old.len() - end, items.len() - start - end);
+            self.list_items = items;
         }
         // What an item holds may have changed (a group's neighbours came in, a field opened):
         // those drawn are measured again, the others keep the height they had.
-        self.page_list.remeasure();
+        self.list.remeasure();
         div()
             .id("node-peek")
             .key_context("NodeView")
@@ -3427,48 +3447,66 @@ impl NodePeek {
             .size_full()
             .child(
                 list(
-                    self.page_list.clone(),
+                    self.list.clone(),
                     cx.processor(|this, ix: usize, window, cx| {
-                        this.render_page_item(ix, window, cx)
+                        this.render_list_item(ix, window, cx)
                     }),
                 )
                 .size_full(),
             )
     }
 
-    fn render_page_item(
+    fn render_list_item(
         &mut self,
         ix: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let last = ix + 1 == self.page_items.len();
-        let item = match self.page_items.get(ix).copied() {
-            Some(PageItem::Head) => self
-                .render_head(window, cx)
-                .pt(px(studio_ui::ds::space::XL))
-                .gap_2()
-                .when(self.shows_relationships(), |head| {
+        let page = self.page;
+        let last = ix + 1 == self.list_items.len();
+        let item = match self.list_items.get(ix).copied() {
+            Some(Item::Head) => {
+                let head = self.render_head(window, cx);
+                let head = if page {
+                    head.pt(px(studio_ui::ds::space::XL)).gap_2()
+                } else {
+                    head.pt_4().gap_1p5()
+                };
+                head.when(self.shows_relationships(), |head| {
                     head.child(section("Relationships"))
                 })
-                .into_any_element(),
-            Some(PageItem::Note(text)) => Label::new(text)
+                .into_any_element()
+            }
+            Some(Item::Note(text)) => Label::new(text)
                 .size(LabelSize::Small)
                 .color(Color::Muted)
                 .into_any_element(),
-            Some(PageItem::Group(index)) if index < self.groups.len() => {
+            Some(Item::Group(index)) if index < self.groups.len() => {
+                self.drawn(index, window, cx);
                 self.render_group(index, cx).into_any_element()
             }
-            Some(PageItem::Empty) => self.render_empty_row(cx),
+            Some(Item::Empty) => self.render_empty_row(cx),
             _ => div().into_any_element(),
         };
-        // A page reads at a document's width, with its margins.
+        // A page reads at a document's width, with its margins; the peek fills its dock.
         div()
             .w_full()
-            .max_w(px(PAGE_WIDTH))
-            .px(px(studio_ui::ds::space::PAGE))
+            .map(|item| {
+                if page {
+                    item.max_w(px(PAGE_WIDTH))
+                        .px(px(studio_ui::ds::space::PAGE))
+                } else {
+                    item.px_4()
+                }
+            })
             .pt_0p5()
-            .when(last, |item| item.pb(px(studio_ui::ds::space::XL)))
+            .when(last, |item| {
+                if page {
+                    item.pb(px(studio_ui::ds::space::XL))
+                } else {
+                    item.pb_4()
+                }
+            })
             .child(item)
             .into_any_element()
     }
@@ -3851,6 +3889,185 @@ mod tests {
         );
     }
 
+    /// A type with many relationships reads only the groups whose rows are drawn, and a few
+    /// rows past them; scrolling reads the rest, each once. A group read as having none keeps
+    /// its row, so its count arriving pulls no further group into view.
+    #[gpui::test]
+    async fn only_the_groups_drawn_are_read_and_scrolling_reads_the_rest_once(
+        cx: &mut TestAppContext,
+    ) {
+        let mut schema = PEOPLE.to_owned();
+        for n in 0..30 {
+            schema.push_str(&format!("edge Rel{n:02}: Person -> Person\n"));
+        }
+        let read = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = read.clone();
+        let (session, _) = session_routing(
+            &schema,
+            move |request| match request["name"].as_str() {
+                Some("studio_node") => {
+                    json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }])
+                }
+                Some("studio_neighbours") => {
+                    let query = request["query"].as_str().unwrap_or_default().to_owned();
+                    seen.lock().unwrap().push(query);
+                    json!([])
+                }
+                _ => json!([]),
+            },
+            cx,
+        );
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let window = cx.open_window(gpui::size(px(480.), px(360.)), move |_, cx| {
+            NodePeek::page(session, "Person".into(), "p1".into(), None, cx)
+        });
+        let view = window.root(cx).unwrap();
+        let cx = VisualTestContext::from_window(window.into(), cx).into_mut();
+        cx.run_until_parked();
+
+        let drawn = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                view.groups.iter().take_while(|group| group.drawn).count()
+            })
+        };
+        let groups = view.read_with(cx, |view, _| view.groups.len());
+        assert_eq!(groups, 60, "each relationship out and in");
+        let first = drawn(cx);
+        assert!(
+            0 < first && first < groups / 2,
+            "only the rows in view and a few past them: {first} of {groups}"
+        );
+        view.read_with(cx, |view, _| {
+            for (index, group) in view.groups.iter().enumerate() {
+                assert_eq!(group.drawn, index < first, "the rows from the top");
+                let counted = matches!(group.count, Loadable::Loaded(0));
+                assert_eq!(counted, group.drawn, "read once drawn, and only then");
+                assert_eq!(view.place(index), Place::AsDrawn, "each keeps its row");
+            }
+        });
+        assert_eq!(
+            read.lock().unwrap().len(),
+            first,
+            "one read per group drawn"
+        );
+
+        let mut scrolls = 0;
+        while drawn(cx) < groups {
+            scrolls += 1;
+            assert!(scrolls < 100, "scrolling reaches the last group");
+            view.update(cx, |view, cx| {
+                view.list.scroll_by(px(120.));
+                cx.notify();
+            });
+            cx.run_until_parked();
+        }
+        let read = read.lock().unwrap().clone();
+        let once: HashSet<&String> = read.iter().collect();
+        assert_eq!(read.len(), groups, "every group read: {read:?}");
+        assert_eq!(once.len(), groups, "each once");
+    }
+
+    /// A peek of a table's row shows what the table counted without reading it again, and
+    /// opens a small group, reading the neighbours the table did not list once its row is
+    /// drawn; the groups the table did not count are read as drawn.
+    #[gpui::test]
+    async fn a_peek_reads_only_what_the_table_did_not(cx: &mut TestAppContext) {
+        const KNOWS_AND_LIKES: &str = "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\nedge Likes: Person -> Person\n";
+        let read = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = read.clone();
+        let (session, _) = session_routing(
+            KNOWS_AND_LIKES,
+            move |request| match request["name"].as_str() {
+                Some("studio_neighbours") => {
+                    let query = request["query"].as_str().unwrap_or_default().to_owned();
+                    seen.lock().unwrap().push(query);
+                    json!([{ "id": "p010", "edge_id": "e1" }, { "id": "p011", "edge_id": "e2" }])
+                }
+                _ => json!([]),
+            },
+            cx,
+        );
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        cx.run_until_parked();
+        let schema = session.read_with(cx, |session, _| session.schema_model().unwrap());
+        let relationship = |edge: &str, direction: Direction| {
+            schema
+                .relationships_of("Person")
+                .iter()
+                .find(|group| group.edge == edge && group.direction == direction)
+                .unwrap()
+                .clone()
+        };
+        let knows = relationship("Knows", Direction::Outgoing);
+        let likes = relationship("Likes", Direction::Outgoing);
+        let first = vec![Neighbour {
+            id: "p010".into(),
+            label: None,
+            edge_id: None,
+        }];
+        let known = HashMap::from([
+            (
+                builder::relationship_key(&knows),
+                KnownRelation {
+                    count: 1,
+                    first: Some(first),
+                },
+            ),
+            (
+                builder::relationship_key(&likes),
+                KnownRelation {
+                    count: 2,
+                    first: None,
+                },
+            ),
+        ]);
+        let values: Map<String, Value> =
+            serde_json::from_value(json!({ "@id": "p1", "slug": "p1", "name": "Ada" })).unwrap();
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            NodePeek::new(
+                session,
+                PeekSubject::Node {
+                    type_name: "Person".into(),
+                    id: "p1".into(),
+                },
+                Some(values),
+                Some("c1".into()),
+                known,
+                false,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            for group in &view.groups {
+                assert!(group.drawn, "every row fits");
+                assert!(group.expanded, "a small group opens");
+                let n = group.neighbours.loaded().map(Vec::len);
+                if group.group == knows {
+                    assert_eq!(n, Some(1), "as the table listed them");
+                } else {
+                    assert_eq!(n, Some(2), "as read");
+                }
+            }
+        });
+        let read = read.lock().unwrap().clone();
+        assert_eq!(
+            read.len(),
+            3,
+            "likes' neighbours, and both groups in: {read:?}"
+        );
+        assert!(
+            !read.iter().any(|query| query.contains("$n $e:knows $m")),
+            "knows out as the table read it: {read:?}"
+        );
+    }
+
     /// At a commit made before a property was added, the whole node is refused, naming it: the
     /// page reads the rest as fields and shows the property as added after the commit.
     #[gpui::test]
@@ -4182,32 +4399,44 @@ mod tests {
         });
     }
 
-    /// A node lists the relationships it has; the ones with none fold into one row, which
-    /// lists them when opened. One the person is adding to stays listed while empty.
+    /// A node lists first the relationships it is known to have; the ones known to have none
+    /// fold into one row, which lists them when opened. One the person is adding to stays
+    /// listed while empty. A group laid out before it was counted keeps its place whatever its
+    /// count says, so a count arriving moves no row.
     #[gpui::test]
     async fn relationships_with_none_fold_away_until_asked_for(cx: &mut TestAppContext) {
         let (view, cx) = page(session(KNOWS, cx), cx);
         view.update_in(cx, |view, window, cx| {
             assert!(view.groups.len() >= 2, "knows, out and in");
+            assert_eq!(view.groups[1].count, Loadable::Loaded(0), "read as drawn");
+            assert_eq!(view.place(1), Place::AsDrawn, "it has none, in its place");
+            // As if the table had counted them before the page laid them out.
             for group in &mut view.groups {
-                group.count = Loadable::Loading;
+                group.as_drawn = false;
             }
-            assert!(!view.listed_by_default(0), "not counted yet");
             view.groups[0].count = Loadable::Loaded(2);
-            for group in view.groups.iter_mut().skip(1) {
-                group.count = Loadable::Loaded(0);
-            }
-            assert!(view.listed_by_default(0), "it has neighbours");
-            assert!(!view.listed_by_default(1), "it has none");
+            assert_eq!(view.place(0), Place::Listed, "it has neighbours");
+            assert_eq!(view.place(1), Place::Folded, "it has none");
             assert!(!view.folded_shown(1), "folded under the empty row");
+            assert_eq!(
+                view.list_items()[1..],
+                [Item::Group(0), Item::Empty],
+                "listed, then the empty row"
+            );
             view.groups[1].count = Loadable::Failed("unreachable".into());
-            assert!(view.listed_by_default(1), "a failed count says why");
+            assert_eq!(view.place(1), Place::Listed, "a failed count says why");
+            view.groups[1].count = Loadable::Loading;
+            assert_eq!(view.place(1), Place::Listed, "read again after a write");
             view.groups[1].count = Loadable::Loaded(0);
             view.edge_writes.insert(1);
-            assert!(view.listed_by_default(1), "a write is out on it");
+            assert_eq!(view.place(1), Place::Listed, "a write is out on it");
             view.edge_writes.clear();
             view.show_empty = true;
-            assert!(!view.listed_by_default(1), "opening the row moves nothing");
+            assert_eq!(
+                view.place(1),
+                Place::Folded,
+                "opening the row moves nothing"
+            );
             assert!(view.folded_shown(1), "it shows under the open row");
             view.show_empty = false;
             view.start_add(1, window, cx);

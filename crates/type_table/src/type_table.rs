@@ -303,7 +303,10 @@ fn peek_node(
         }
         peek
     });
-    workspace.set_inspector(Some(peek.into()), cx);
+    let peek: gpui::AnyView = peek.into();
+    workspace.set_inspector(Some(peek.clone()), cx);
+    // The peek is a list that draws, and reads, only the relationship groups in view.
+    workspace.set_panel_scrolls_itself(&peek, cx);
 }
 
 /// Opens a text property in its editor, or shows the tab it is in.

@@ -3192,9 +3192,12 @@ impl TypeTable {
             peek
         });
         if let Some(workspace) = self.workspace.upgrade() {
-            let view = peek.clone();
+            let view: gpui::AnyView = peek.clone().into();
             workspace.update(cx, |workspace, cx| {
-                workspace.set_inspector(Some(view.into()), cx);
+                workspace.set_inspector(Some(view.clone()), cx);
+                // The peek is a list that draws, and reads, only the relationship groups in
+                // view.
+                workspace.set_panel_scrolls_itself(&view, cx);
                 // A peek asked for (Space, ↵, a click) shows the inspector even when its dock
                 // is hidden; one that follows the cursor does not reopen it.
                 if !debounce {

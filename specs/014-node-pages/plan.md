@@ -174,13 +174,21 @@ Four parts, built in this order; each lands on its own.
 
 ### 4. Relationships from the node
 
-- **Only the relationships a node has are listed**, on the page and in the peek: a group with
-  neighbours, one whose count failed (its reason in the tooltip), and one with a write or its
-  outcome out. The groups with none fold into one "Empty" row after them, with their number;
-  opening it lists them beneath it, each with its "+", so the rows above do not move. While the
-  counts are read and none has arrived, the section reads "Reading…"; the empty row waits until
-  every group is counted. A group whose last neighbour is removed moves under the empty row; one
-  added to from there moves up once it has a neighbour.
+- **A group is read when its row is drawn.** The page and the peek draw as one list, which lays
+  out only the rows in view and a few past them. A group is read (its first neighbours and one
+  more, its count past that) when its row is first laid out, so a type with dozens of
+  relationships reads only those in view, and scrolling reads the rest, each once. The peek that
+  follows a table's cursor waits a moment before reading, and a hidden inspector reads nothing.
+  What the table counted for the row is shown without a read.
+- **The relationships a node is known to have are listed first**: a group with neighbours, one
+  whose count failed (its reason in the tooltip), and one with a write or its outcome out. The
+  groups not counted yet follow in schema order, each with "…" until it is read; once read, a
+  group keeps its row whatever it holds, so a count arriving never moves the rows in view.
+  Folding a group found empty would pull the next ones into view and read them all. The groups
+  known to have none before they were laid out (the table counted them) fold into one "Empty"
+  row after the rest, with their number; opening it lists them beneath it, each with its "+",
+  so the rows above do not move. A listed group whose last neighbour is removed moves under the
+  empty row; one added to from there moves up once it has a neighbour.
 - **Built so far**: a group's "+" (always on the page, under the pointer in the peek) opens a
   search over the other type, eight matches by name or id; ↑↓ choose and ↵ adds, written at
   once as one commit with this node at the end its group points from. On an outgoing
@@ -243,6 +251,7 @@ Four parts, built in this order; each lands on its own.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-18 | A node's relationship groups are read as their rows are drawn | `type_table` `only_the_groups_drawn_are_read_and_scrolling_reads_the_rest_once` (60 groups on a 480 × 360 page, then scrolled to the end), `a_peek_reads_only_what_the_table_did_not`, `relationships_with_none_fold_away_until_asked_for`; offscreen snapshots against a local server holding a made-up graph whose Person takes part in 72 relationship groups, with the server's read requests counted | The table alone took 13 requests and the table with a row's peek 37, where the peek used to read all 72 groups and the node. Opening the page took 31 requests; scrolled to its end, 79, each group read once. Groups read as empty kept their rows, and small ones opened once read |
 | 2026-10-17 | A node lists only the relationships it has | `type_table` `relationships_with_none_fold_away_until_asked_for` (not counted, with neighbours, with none, a failed count, a write out, the row open, adding with it closed); offscreen snapshots of Leslie Wirth's page, then with Empty opened | Three groups with neighbours, then "Empty 1"; opened, `contributes Project` with "+" and 0 appeared under it and the rows above stayed where they were |
 | 2026-10-16 | One draft per branch, shared by tables and pages | `graph_store` `drafts_wait_with_their_branch`; `type_table` `a_field_left_changed_is_a_draft_the_table_shows_and_save_lands` (a page's draft in the type's table, ⌘S on the page: one commit, gone from both), and the table's own tests unchanged; an offscreen snapshot of Project Fable 36 with name left changed | "Project Fable 36 (draft)" with a dot and "1 change not saved · Discard · Save" under the title |
 | 2026-10-16 | A text cell with lines or markup opens in the editor | `type_table` `a_text_cell_with_lines_opens_in_the_editor_not_the_cell`; an offscreen click on keyset-paging's body cell in the `notes` graph | The click opened "Keyset paging · body" in the editor; a plain name still edits in its cell |
