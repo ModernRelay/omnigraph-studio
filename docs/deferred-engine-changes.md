@@ -32,6 +32,7 @@ one is picked up it goes through OmniGraph's own RFC process.
 | E25 | One mutation that both adds and removes (lift rule D2 for one write) | 014 | A relationship replacement saves as two ordered commits, or through a branch and a merge |
 | E26 | Edge update (T16) | 014 | An unkeyed edge's properties save as delete and insert, with a new id |
 | E27 | Annotation-only schema changes (a display hint on an existing property) | 014 | Every String reads as markdown; a hint can go only on a new property or type |
+| E28 | Merge bound to the reviewed source head (a precondition on the source, as `If-Graph-Commit` binds a write to its target) | 008 | Checks the source head just before merging; a commit landing in between is merged too, and the outcome says the merge took a commit made after the review was read |
 
 In OmniGraph 0.14 (`edge-20261017-d883c49`, checked 2026-10-17; the HTTP contract header is
 still `0.13`), and so on every server Studio supports. Studio uses E7: a review reads its fork

@@ -4,7 +4,8 @@ Status: deferred · 2026-10-11; E6, E7, E8, E23 and E24 landed on OmniGraph main
 (see "On OmniGraph main, 2026-10-15"), none of them released yet. Studio ships against the 0.13
 contract (constitution X). When a change is picked up it becomes an OmniGraph RFC and issue in
 `ModernRelay/omnigraph`, follows that repository's invariants and test ownership, and Studio
-adopts it only when a server's OpenAPI document advertises it.
+adopts it once its minimum server serves it, or before then only when a server's OpenAPI
+document advertises it.
 
 ## Problem
 
@@ -205,15 +206,23 @@ annotations other than `@description` and `@instruction` ("changing annotations 
 changes no data and no index, so it could apply as metadata. *Waits:* 014. *Today:* Studio
 reads every String as markdown; a hint can be declared only on a new property or type.
 
-### Already on OmniGraph main, not in 0.13.0
+**E28. Merge bound to the reviewed source head.** A write is bound to its target's head by
+`If-Graph-Commit`; a merge has no such binding on its source. Studio reads the source head just
+before it merges, so a commit landing between that read and the merge is merged unseen. A
+precondition on the source head would refuse such a merge instead. *Waits:* 008. *Today:* the
+merge commit's merged parent (or a fast-forward's commit) is compared with the reviewed head,
+and the outcome says when the merge took a commit made after the review was read.
 
-**R1. Blob writes** (`PUT`/`DELETE /graphs/{id}/blob`). Studio offers Blob upload and clear only
-when the server advertises `cluster_putBlob` and `cluster_clearBlob`. *Spec:* 004.
+### In 0.14, not in 0.13.0
+
+Studio's minimum server serves these, so it uses them without asking the server's OpenAPI
+document (constitution X).
+
+**R1. Blob writes** (`PUT`/`DELETE /graphs/{id}/blob`). Blob upload and clear. *Spec:* 004.
 
 **R2. Unpublished commits** (`as_commit` on mutations and merges, `POST
 /commits/{id}/publish`, `DELETE /commits/{id}`). The planned way to stage edits as a reviewable
-proposal and to preview a merge. Used only when the server advertises
-`cluster_publishCommit`. *Specs:* 004, 008.
+proposal and to preview a merge. *Specs:* 004, 008.
 
 ## Order if picked up
 

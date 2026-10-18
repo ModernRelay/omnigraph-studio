@@ -12,7 +12,7 @@ other: what two features share moves down a layer.
 | Layer | Crates | Role | Allowed dependencies |
 |---|---|---|---|
 | 0 | `studio_actions` | Every action type, with doc comments that become palette descriptions | `gpui` |
-| 1 | `studio_settings`, `studio_theme` | Typed layered settings; graph tokens over Zed's themes, set up through Zed's `theme_settings`, and the themes Studio bundles | `gpui`, `theme`, `theme_settings`, serde |
+| 1 | `studio_settings`, `studio_theme` | Typed layered settings; graph tokens over Zed's themes, set up through Zed's `theme_settings`, and the themes Studio bundles | `gpui`, `settings`, `theme`, `theme_settings`, `assets`, serde |
 | 2 | `graph_client` | Every HTTP request: contract header, DTOs for the 0.14 API, write outcomes, change-feed paging. **No `gpui`** | Zed `http_client` (Apache-2.0), serde |
 | 2 | `gq_language` | Schema and query intelligence on `omnigraph-compiler`: parse, diagnostics, completion items, hover text, result-column types. **No `gpui`** | `omnigraph-compiler` |
 | 2 | `studio_ui` | Studio components on Zed's `ui`: the design system (`ds`), state chips, write-outcome banners, empty and error states, text read as markdown | `ui`, `theme`, `studio_theme`, `pulldown-cmark` |
@@ -48,12 +48,12 @@ view (layer 5) ──reads──▶ entity in graph_store ──calls──▶ g
 
 | Entity | Holds | Notes |
 |---|---|---|
-| `Connection` | server URL, token source, contract check, capability set from the served OpenAPI document, state (`connecting`, `ready`, `contract-mismatch`, `unauthorized`, `unreachable`) | One per server; the status-bar chip renders it |
-| `GraphSession` | graph id, branch, **snapshot pin** (a `graph_commit_id`), actor | One per open graph tab; views share it |
-| `SchemaModel` | the `.pg` source from `GET /schema`, compiled with `omnigraph-compiler` into node, edge and property shapes | Rebuilt when the pinned commit changes |
+| `Connection` | server URL, token, contract and version check, health and latency, the graph list, state (`connecting`, `ready`, `contract-mismatch`, `unauthorized`, `unreachable`) | One per server; the status-bar chip renders it |
+| `GraphSession` | graph id, branch, schema, branch list, type counts, the heads it watches, the read memo, drafts and the outcome log | One per open graph in a window; its views share it. Each view holds its own snapshot pin |
+| `SchemaModel` | the `.pg` source from `GET /schema`, compiled with `omnigraph-compiler` into node, edge and property shapes | One per session, rebuilt when the schema is read again (Refresh, or another writer's schema seen at a head move) |
 | `Exploration` | the set of expanded paths (node → relationship group → node …) | Shared by the relationship tree and the canvas |
-| `Draft` | staged cell edits, inserts and deletes for one branch, with the commit they were read at | Published as one mutation; kept until the outcome is known |
-| `OutcomeLog` | every write and its outcome (committed, refused, unknown) | Rendered in the activity panel |
+| Drafts (`GraphSession::drafts`) | unsaved property values by branch, each with the value it was read at (spec 014) | A branch's wait while another is shown; a save is one mutation bound to the values read |
+| Outcomes (`GraphSession::outcomes`) | each write and its outcome (committed, refused, unknown), the newest 1,000 | Rendered in the activity panel |
 
 ### Snapshot pins
 
