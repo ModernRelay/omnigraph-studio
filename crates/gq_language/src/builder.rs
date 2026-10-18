@@ -1570,6 +1570,20 @@ impl GroupBy {
 
     /// What a group's neighbours can be grouped by: the other type's properties, then the
     /// edge's, in schema order, then the other type's relationships.
+    /// Whether [`GroupBy::choices`] offers anything, without building them.
+    pub fn has_choices(schema: &SchemaModel, group: &RelationshipGroup) -> bool {
+        let node = schema
+            .node(&group.other_type)
+            .map(|node| node.properties.as_slice())
+            .unwrap_or_default();
+        let edge = schema
+            .edge(&group.edge)
+            .map(|edge| edge.properties.as_slice())
+            .unwrap_or_default();
+        node.iter().chain(edge).any(Self::allowed)
+            || !schema.relationships_of(&group.other_type).is_empty()
+    }
+
     pub fn choices(schema: &SchemaModel, group: &RelationshipGroup) -> Vec<GroupBy> {
         let node = schema
             .node(&group.other_type)
@@ -3090,6 +3104,20 @@ mod tests {
         .unwrap();
         assert_compiles(&edges);
         assert!(!edges.text.contains("role"), "{}", edges.text);
+    }
+
+    #[test]
+    fn a_group_has_choices_exactly_when_it_offers_some() {
+        let schema = dev();
+        for node in &schema.nodes {
+            for group in schema.relationships_of(&node.name) {
+                assert_eq!(
+                    GroupBy::has_choices(&schema, group),
+                    !GroupBy::choices(&schema, group).is_empty(),
+                    "{group:?}"
+                );
+            }
+        }
     }
 
     #[test]

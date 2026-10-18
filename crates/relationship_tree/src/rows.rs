@@ -25,7 +25,15 @@ pub struct RowId {
 }
 
 pub fn row_id(entry: &Entry) -> RowId {
-    let tag = match entry.kind {
+    RowId {
+        path: entry.path.clone(),
+        tag: row_tag(entry),
+    }
+}
+
+/// What kind of row an entry draws as.
+fn row_tag(entry: &Entry) -> RowTag {
+    match entry.kind {
         EntryKind::Node { .. } => RowTag::Node,
         EntryKind::Cycle { .. } => RowTag::Cycle,
         EntryKind::Field { .. } => RowTag::Field,
@@ -35,10 +43,6 @@ pub fn row_id(entry: &Entry) -> RowId {
         EntryKind::More { .. } => RowTag::More,
         EntryKind::Loading { .. } => RowTag::Loading,
         EntryKind::Error { .. } => RowTag::Error,
-    };
-    RowId {
-        path: entry.path.clone(),
-        tag,
     }
 }
 
@@ -134,9 +138,12 @@ pub fn filter(
         .collect()
 }
 
-/// The visible row with this identity.
+/// The visible row with this identity. Compared in place: the list asks every frame.
 pub fn find(visible: &[usize], entries: &[Entry], id: &RowId) -> Option<usize> {
-    visible.iter().position(|ix| row_id(&entries[*ix]) == *id)
+    visible.iter().position(|ix| {
+        let entry = &entries[*ix];
+        row_tag(entry) == id.tag && entry.path == id.path
+    })
 }
 
 /// The visible row with this identity, else the closest visible ancestor by path.

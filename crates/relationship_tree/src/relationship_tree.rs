@@ -1083,8 +1083,7 @@ impl RelationshipTree {
     ) -> Option<AnyElement> {
         let exploration = self.exploration.clone()?;
         let schema = exploration.read(cx).schema(cx)?;
-        let choices = GroupBy::choices(&schema, group);
-        if choices.is_empty() {
+        if !GroupBy::has_choices(&schema, group) {
             return None;
         }
         let current = exploration.read(cx).grouping(group).cloned();
@@ -1114,12 +1113,13 @@ impl RelationshipTree {
             )
             .anchor(gpui::Anchor::TopRight)
             .menu(move |window, cx| {
-                let (exploration, group, path, current, choices) = (
+                // Built when the menu opens, not for every row drawn.
+                let choices = GroupBy::choices(&schema, &group);
+                let (exploration, group, path, current) = (
                     exploration.clone(),
                     group.clone(),
                     path.clone(),
                     current.clone(),
-                    choices.clone(),
                 );
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                     // Choosing a property opens the group on its values.
