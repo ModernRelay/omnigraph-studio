@@ -36,15 +36,25 @@ pub fn first_line(text: &str) -> String {
     }
     let mut line = String::new();
     let (mut ended, mut more) = (false, false);
-    for event in Parser::new(text) {
+    'events: for event in Parser::new(text) {
         match event {
-            Event::Text(part) | Event::Code(part) if ended => {
-                if !part.trim().is_empty() {
-                    more = true;
-                    break;
+            // One text can hold several lines (a code block's); the line ends at the first.
+            Event::Text(part) | Event::Code(part) => {
+                let mut pieces = part.split('\n').peekable();
+                while let Some(piece) = pieces.next() {
+                    if ended {
+                        if !piece.trim().is_empty() {
+                            more = true;
+                            break 'events;
+                        }
+                        continue;
+                    }
+                    line.push_str(piece);
+                    if pieces.peek().is_some() {
+                        ended = !line.trim().is_empty();
+                    }
                 }
             }
-            Event::Text(part) | Event::Code(part) => line.push_str(&part),
             Event::SoftBreak
             | Event::HardBreak
             | Event::End(
@@ -96,5 +106,10 @@ mod tests {
         assert_eq!(first_line("first line\nsecond line"), "first line…");
         assert_eq!(first_line("- one\n- two"), "one…");
         assert_eq!(first_line("see [docs](https://example.com)"), "see docs");
+        assert_eq!(
+            first_line("```\nlet a = 1;\nlet b = 2;\n```"),
+            "let a = 1;…"
+        );
+        assert_eq!(first_line("```\nlet a = 1;\n```"), "let a = 1;");
     }
 }

@@ -25,7 +25,7 @@ pub use document::Reading;
 
 pub use files::{Access, set_aside, write_atomic, write_atomic_in_turn, writes_done};
 
-pub use fields::{Choice, FieldKind, Scope, SettingField, fields, sections};
+pub use fields::{Choice, FieldKind, Scope, SettingField, SettingsValues, fields, sections};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -352,11 +352,17 @@ impl Global for SettingsFileState {}
 
 /// Studio's data directory, for every crate: `OMNIGRAPH_STUDIO_DATA`, else
 /// `~/Library/Application Support/OmniGraph Studio` on macOS, `%APPDATA%\OmniGraph Studio` on
-/// Windows, `$XDG_CONFIG_HOME/omnigraph-studio` elsewhere. A binary run from a Cargo build directory (`cargo run`, an example) uses a
-/// sibling directory ending in "Dev" instead, so a development run never rewrites the tabs,
-/// drafts and conversations of the app the person uses. A bundled app is not a development run,
-/// whichever profile built it.
+/// Windows, `$XDG_CONFIG_HOME/omnigraph-studio` elsewhere. A binary run from a Cargo build
+/// directory (`cargo run`, an example) uses a sibling directory ending in "Dev" instead, so a
+/// development run never rewrites the tabs, drafts and conversations of the app the person
+/// uses. A bundled app is not a development run, whichever profile built it. Found once, at the
+/// first call: a run keeps one directory.
 pub fn data_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(find_data_dir).clone()
+}
+
+fn find_data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("OMNIGRAPH_STUDIO_DATA")
         && !dir.is_empty()
     {
@@ -644,33 +650,33 @@ fn notify(cx: &mut App) {
     cx.refresh_windows();
 }
 
-/// What the settings file says, or `None` with the problem when its syntax is broken. A missing
-/// file is the defaults.
+/// What the settings file says, or `None` with the problem when its syntax is broken or it
+/// cannot be read. A missing file is the defaults.
 fn read_file() -> (Option<Reading>, Option<SystemTime>, Option<String>) {
     let path = settings_path();
     let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-    match std::fs::read_to_string(&path) {
-        Ok(text) => match StudioSettings::read(&text) {
-            Ok(reading) => (Some(reading), modified, None),
-            Err(error) => (
-                None,
-                modified,
-                Some(format!(
-                    "{} could not be read: {error}. The settings in effect stay until it reads \
-                     again.",
-                    path.display()
-                )),
-            ),
-        },
-        Err(_) => (
-            Some(Reading {
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let defaults = Reading {
                 settings: StudioSettings::default(),
                 problems: Vec::new(),
-            }),
-            modified,
-            None,
-        ),
+            };
+            return (Some(defaults), modified, None);
+        }
+        Err(error) => return (None, modified, Some(unreadable(&path, &error.to_string()))),
+    };
+    match StudioSettings::read(&text) {
+        Ok(reading) => (Some(reading), modified, None),
+        Err(error) => (None, modified, Some(unreadable(&path, &error))),
     }
+}
+
+fn unreadable(path: &std::path::Path, error: &str) -> String {
+    format!(
+        "{} could not be read: {error}. The settings in effect stay until it reads again.",
+        path.display()
+    )
 }
 
 fn apply(settings: StudioSettings, cx: &mut App) {

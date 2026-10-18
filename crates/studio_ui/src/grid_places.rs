@@ -37,6 +37,16 @@ pub fn columns_in_view(widths: &[Pixels], shown: Range<Pixels>) -> Vec<bool> {
         .collect()
 }
 
+/// How far a scrolled grid is scrolled this frame: the scroll handle's offset (`scrolled`,
+/// positive), held within what `content` wide can scroll in a view no wider than `window`. GPUI
+/// holds the offset within the scroll range only when it lays the grid out, after the columns
+/// to draw are chosen; a window widened while scrolled to the right would otherwise draw from
+/// the old offset and leave the columns it uncovers empty for a frame. The bound is never past
+/// the one GPUI applies, so the columns chosen from it cover the view.
+pub fn scrolled_within(scrolled: Pixels, content: Pixels, window: Pixels) -> Pixels {
+    scrolled.min((content - window).max(Pixels::ZERO))
+}
+
 /// The places a frame draws, from the columns it draws and every column's width.
 pub fn grid_places(drawn: &[bool], widths: &[Pixels]) -> Vec<GridPlace> {
     let mut places = Vec::new();
@@ -54,6 +64,21 @@ pub fn grid_places(drawn: &[bool], widths: &[Pixels]) -> Vec<GridPlace> {
 mod tests {
     use super::*;
     use gpui::px;
+
+    /// A window widened while scrolled to the right shows the columns at the end, from where
+    /// the scroll will be held, not from the offset of the narrower window.
+    #[test]
+    fn a_widened_window_draws_from_where_the_scroll_is_held() {
+        // 2,000 wide, scrolled 1,400 in a 600 view; the window grows to 1,000.
+        let held = scrolled_within(px(1400.), px(2000.), px(1000.));
+        assert_eq!(held, px(1000.));
+        let widths = vec![px(200.); 10];
+        let drawn = columns_in_view(&widths, held..held + px(1000.));
+        assert!(drawn[5..].iter().all(|drawn| *drawn), "{drawn:?}");
+        // Narrower than its content, nothing scrolls; within range, the offset stands.
+        assert_eq!(scrolled_within(px(300.), px(800.), px(1000.)), px(0.));
+        assert_eq!(scrolled_within(px(300.), px(2000.), px(1000.)), px(300.));
+    }
 
     #[test]
     fn the_columns_a_frame_leaves_out_are_one_gap_per_run() {

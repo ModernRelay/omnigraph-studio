@@ -96,17 +96,6 @@ pub struct Tween<T: Lerp> {
 }
 
 impl<T: Lerp> Tween<T> {
-    /// A value at rest.
-    pub fn at(value: T) -> Self {
-        Self {
-            from: value.clone(),
-            to: value,
-            started: None,
-            duration: Duration::ZERO,
-            ease: Ease::Linear,
-        }
-    }
-
     /// A value gliding from `from` to `to`, starting `now`.
     pub fn glide(from: T, to: T, duration: Duration, ease: Ease, now: Instant) -> Self {
         Self {
@@ -116,25 +105,6 @@ impl<T: Lerp> Tween<T> {
             duration,
             ease,
         }
-    }
-
-    /// Glides from wherever the value is `now` to `to`; with `animate` false, jumps.
-    pub fn set(&mut self, to: T, duration: Duration, ease: Ease, now: Instant, animate: bool) {
-        if animate && !duration.is_zero() {
-            self.from = self.value(now);
-            self.started = Some(now);
-            self.duration = duration;
-            self.ease = ease;
-        } else {
-            self.from = to.clone();
-            self.started = None;
-        }
-        self.to = to;
-    }
-
-    /// Where the glide ends.
-    pub fn target(&self) -> &T {
-        &self.to
     }
 
     /// The value at `now`.
@@ -189,22 +159,16 @@ mod tests {
     }
 
     #[test]
-    fn a_tween_glides_and_retargets_from_where_it_is() {
+    fn a_tween_glides_from_where_it_starts_to_where_it_ends() {
         let start = Instant::now();
-        let mut x = Tween::glide(0f32, 100., Duration::from_millis(100), Ease::Linear, start);
+        let x = Tween::glide(0f32, 100., Duration::from_millis(100), Ease::Linear, start);
         assert_eq!(x.value(start), 0.);
         let half = start + Duration::from_millis(50);
         assert!((x.value(half) - 50.).abs() < 1e-3);
         assert!(x.is_running(half));
-        // A new target mid-glide starts from 50, not from 0 or 100.
-        x.set(0., Duration::from_millis(100), Ease::Linear, half, true);
-        assert!((x.value(half) - 50.).abs() < 1e-3);
-        let end = half + Duration::from_millis(100);
-        assert_eq!(x.value(end), 0.);
+        let end = start + Duration::from_millis(100);
+        assert_eq!(x.value(end), 100.);
         assert!(!x.is_running(end));
-        // Without animation it jumps.
-        x.set(7., Duration::from_millis(100), Ease::Linear, end, false);
-        assert_eq!(x.value(end), 7.);
     }
 
     #[test]

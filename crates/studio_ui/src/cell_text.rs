@@ -25,10 +25,11 @@ pub struct CellText {
     style: TextStyleRefinement,
 }
 
-/// `text` on one line, from the start of its room, as a small label draws it.
+/// `text` on one line, from the start of its room, as a small label draws it. A control
+/// character (a line break, a tab) shows as its picture, as a single-line label has it.
 pub fn cell_text(text: impl Into<SharedString>, cx: &App) -> CellText {
     CellText {
-        text: text.into(),
+        text: one_line(text.into()),
         align: TextAlign::Left,
         hug: false,
         style: TextStyleRefinement {
@@ -230,6 +231,14 @@ impl CellText {
     }
 }
 
+/// `text` with each control character as its picture: GPUI shapes one line only.
+fn one_line(text: SharedString) -> SharedString {
+    match ui::utils::replace_control_characters(&text) {
+        std::borrow::Cow::Owned(replaced) => replaced.into(),
+        std::borrow::Cow::Borrowed(_) => text,
+    }
+}
+
 /// The height of a line of the text style in effect, on whole pixels as GPUI's text is.
 fn line_height(window: &Window) -> Pixels {
     let text_style = window.text_style();
@@ -239,4 +248,20 @@ fn line_height(window: &Window) -> Pixels {
             .line_height
             .to_pixels(font_size.into(), window.rem_size()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_value_with_line_breaks_is_drawn_on_one_line() {
+        assert_eq!(one_line("plain".into()), SharedString::from("plain"));
+        let shown = one_line("first\nsecond\tthird".into());
+        assert!(!shown.contains('\n') && !shown.contains('\t'), "{shown}");
+        assert!(
+            shown.starts_with("first") && shown.ends_with("third"),
+            "{shown}"
+        );
+    }
 }

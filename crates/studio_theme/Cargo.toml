@@ -10,6 +10,7 @@ path = "src/studio_theme.rs"
 
 [dependencies]
 gpui = { workspace = true }
+log = { workspace = true }
 theme = { workspace = true }
 theme_settings = { workspace = true }
 settings = { workspace = true }

@@ -23,14 +23,14 @@ mod values;
 
 pub use cell_text::{CellText, cell_text};
 pub use changes::{ChangeCard, ChangeKind, PropertyRow, change_counts, change_group_header};
-pub use grid_places::{GridPlace, columns_in_view, grid_places};
+pub use grid_places::{GridPlace, columns_in_view, grid_places, scrolled_within};
 pub use overlay_slot::{OverlaySlot, OverlaySlotElement};
 pub use resize::{
     COLUMN_MAX_WIDTH, COLUMN_MIN_WIDTH, ColumnDrag, ColumnResize, clamp_width, column_resize_handle,
 };
 pub use values::{
     CopyableValue, format_bytes, group_digits, now_micros, relative_time, short_commit_id,
-    utc_date_time,
+    utc_date_time, value_text,
 };
 
 /// A column in a data grid.

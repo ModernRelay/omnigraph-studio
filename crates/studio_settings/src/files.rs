@@ -37,8 +37,12 @@ fn writer() -> &'static std::sync::mpsc::Sender<Job> {
             .spawn(move || {
                 for job in queue {
                     match job {
+                        // Said in the log, by its path only: a full disk would otherwise stop
+                        // every save without a word.
                         Job::Write(path, contents, access) => {
-                            write_atomic(&path, &contents, access).ok();
+                            if let Err(error) = write_atomic(&path, &contents, access) {
+                                log::warn!("Studio could not write {}: {error}", path.display());
+                            }
                         }
                         Job::Done(done) => {
                             done.send(()).ok();

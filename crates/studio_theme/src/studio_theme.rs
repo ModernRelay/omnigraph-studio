@@ -70,7 +70,7 @@ pub fn init_settings_store(cx: &mut App) {
 pub fn init_themes(cx: &mut App) {
     theme_settings::init(theme::LoadThemes::All(Box::new(Assets)), cx);
     if let Err(error) = Assets.load_fonts(cx) {
-        log_font_error(&error);
+        log::warn!("Studio could not load its bundled fonts: {error}");
     }
 }
 
@@ -80,10 +80,6 @@ pub fn init_themes(cx: &mut App) {
 pub fn init_test(cx: &mut App) {
     init_settings_store(cx);
     theme_settings::init(theme::LoadThemes::JustBase, cx);
-}
-
-fn log_font_error(error: &dyn std::fmt::Display) {
-    eprintln!("Studio could not load its bundled fonts: {error}");
 }
 
 /// A stable color for a node or edge type, derived from its name so the same type has the same

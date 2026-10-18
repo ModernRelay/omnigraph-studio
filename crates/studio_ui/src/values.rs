@@ -6,6 +6,16 @@ use gpui::{App, ClipboardItem, ElementId, SharedString, Window};
 use ui::Tooltip;
 use ui::prelude::*;
 
+/// A value as plain text: a string as it is, nothing for null, anything else as JSON. What a
+/// copied cell holds, and what a text field shows and reads back.
+pub fn value_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// The last segment of a graph commit id, eight characters long, for display. Commit ids such as
 /// `hb1.<ulid>.7.<ulid>` end in a ULID whose tail is random.
 pub fn short_commit_id(id: &str) -> String {

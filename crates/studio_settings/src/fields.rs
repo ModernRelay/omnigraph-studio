@@ -243,14 +243,56 @@ fn sentence(key: &str) -> String {
     }
 }
 
+/// The settings in their JSON form, serialized once: for reading many settings at a time, as
+/// the settings tab does for every row it draws.
+pub struct SettingsValues(Value);
+
+impl SettingsValues {
+    /// The value at `path`; `Null` where there is none.
+    pub fn at(&self, path: &[String]) -> &Value {
+        at(&self.0, path)
+    }
+
+    /// Whether the setting at `path` has its default value.
+    pub fn is_default_at(&self, path: &[String]) -> bool {
+        self.at(path) == at(defaults(), path)
+    }
+
+    /// The value `field` has in `scope`: a graph's override, else the shared value.
+    pub fn value_in(&self, scope: &Scope, field: &SettingField) -> &Value {
+        match override_path(scope, field).map(|path| self.at(&path)) {
+            Some(value) if !value.is_null() => value,
+            _ => self.at(&field.path),
+        }
+    }
+
+    /// Whether `field` is unchanged in `scope`: at its default, or not overridden by the graph.
+    pub fn is_default_in(&self, scope: &Scope, field: &SettingField) -> bool {
+        match override_path(scope, field) {
+            Some(path) => self.at(&path).is_null(),
+            None => self.is_default_at(&field.path),
+        }
+    }
+}
+
+fn at<'a>(document: &'a Value, path: &[String]) -> &'a Value {
+    static NULL: Value = Value::Null;
+    path.iter()
+        .try_fold(document, |value, key| value.get(key))
+        .unwrap_or(&NULL)
+}
+
+/// The default settings in their JSON form, serialized once.
+fn defaults() -> &'static Value {
+    static DEFAULTS: LazyLock<Value> =
+        LazyLock::new(|| serde_json::to_value(StudioSettings::default()).unwrap_or_default());
+    &DEFAULTS
+}
+
 impl StudioSettings {
-    /// The value at `path` in the document's JSON form; `Null` where there is none.
-    pub fn value_at(&self, path: &[String]) -> Value {
-        let document = serde_json::to_value(self).unwrap_or_default();
-        path.iter()
-            .try_fold(&document, |value, key| value.get(key))
-            .cloned()
-            .unwrap_or(Value::Null)
+    /// The document's values, to read by path.
+    pub fn values(&self) -> SettingsValues {
+        SettingsValues(serde_json::to_value(self).unwrap_or_default())
     }
 
     /// The document with `value` at `path`, or why it does not fit there.
@@ -270,34 +312,10 @@ impl StudioSettings {
         serde_json::from_value(document).map_err(|e| e.to_string())
     }
 
-    /// Whether the setting at `path` has its default value.
-    pub fn is_default_at(&self, path: &[String]) -> bool {
-        self.value_at(path) == StudioSettings::default().value_at(path)
-    }
-
     /// The document with the setting at `path` back at its default.
     pub fn reset_at(&self, path: &[String]) -> Self {
-        self.with_value(path, StudioSettings::default().value_at(path))
+        self.with_value(path, at(defaults(), path).clone())
             .unwrap_or_else(|_| self.clone())
-    }
-
-    /// The value `field` has in `scope`: a graph's override, else the shared value.
-    pub fn value_in(&self, scope: &Scope, field: &SettingField) -> Value {
-        match override_path(scope, field) {
-            Some(path) => match self.value_at(&path) {
-                Value::Null => self.value_at(&field.path),
-                value => value,
-            },
-            None => self.value_at(&field.path),
-        }
-    }
-
-    /// Whether `field` is unchanged in `scope`: at its default, or not overridden by the graph.
-    pub fn is_default_in(&self, scope: &Scope, field: &SettingField) -> bool {
-        match override_path(scope, field) {
-            Some(path) => self.value_at(&path).is_null(),
-            None => self.is_default_at(&field.path),
-        }
     }
 
     /// The document with `value` for `field` in `scope`.
@@ -427,7 +445,7 @@ mod tests {
     fn values_are_read_written_and_reset_by_path() {
         let path = |p: &str| p.split('.').map(str::to_owned).collect::<Vec<_>>();
         let settings = StudioSettings::default();
-        assert_eq!(settings.value_at(&path("studio.tree_page_size")), 50);
+        assert_eq!(settings.values().at(&path("studio.tree_page_size")), 50);
         let changed = settings
             .with_value(&path("studio.window_style"), "glass".into())
             .unwrap()
@@ -437,8 +455,8 @@ mod tests {
             .unwrap();
         assert_eq!(changed.studio.window_style, WindowStyle::Glass);
         assert_eq!(changed.ui_density, Density::Compact);
-        assert!(!changed.is_default_at(&path("ui_font_family")));
-        assert!(changed.is_default_at(&path("theme.mode")));
+        assert!(!changed.values().is_default_at(&path("ui_font_family")));
+        assert!(changed.values().is_default_at(&path("theme.mode")));
         let reset = changed.reset_at(&path("ui_font_family"));
         assert_eq!(reset.ui_font_family, None);
         assert_eq!(reset.ui_density, Density::Compact, "only that setting");
@@ -457,19 +475,19 @@ mod tests {
         let scope = Scope::Graph("dev/knowledge".into());
         let settings = StudioSettings::default();
         assert_eq!(
-            settings.value_in(&scope, page),
+            *settings.values().value_in(&scope, page),
             50,
             "the shared value shows through"
         );
-        assert!(settings.is_default_in(&scope, page));
+        assert!(settings.values().is_default_in(&scope, page));
         let changed = settings.with_value_in(&scope, page, 20.into()).unwrap();
-        assert_eq!(changed.value_in(&scope, page), 20);
+        assert_eq!(*changed.values().value_in(&scope, page), 20);
         assert_eq!(
             changed.studio.tree_page_size, 50,
             "the shared value is untouched"
         );
-        assert!(!changed.is_default_in(&scope, page));
-        assert!(changed.is_default_in(&Scope::All, page));
+        assert!(!changed.values().is_default_in(&scope, page));
+        assert!(changed.values().is_default_in(&Scope::All, page));
         assert_eq!(changed.for_graph("dev", "knowledge").tree_page_size, 20);
         let cleared = changed.reset_in(&scope, page);
         assert!(
