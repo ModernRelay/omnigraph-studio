@@ -4,6 +4,7 @@
 //! asks the change feed about the types the view reads, and decides whether a head move changed
 //! anything the view shows; views keep no read set of their own.
 
+use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
 use gq_language::builder::Depends;
@@ -30,16 +31,39 @@ pub enum ScopeSince {
     Changed,
 }
 
-/// One answer the view shows: what it depends on, and the nodes it listed once it came in
-/// (`None` while it is read, or when the answer lists none).
+/// What the view shows of one dependence: the nodes its answers listed, and how many of its
+/// reads are still out. While one is, what it will list is not known, so the whole listed type
+/// counts.
 struct Entry {
     depends: Depends,
-    listed: Option<Vec<String>>,
+    listed: Vec<String>,
+    /// An answer came in, or a caller gave one with the nodes it lists.
+    known: bool,
+    pending: usize,
+}
+
+impl Entry {
+    /// The nodes listed, when they are all known.
+    fn listed(&self) -> Option<&[String]> {
+        (self.known && self.pending == 0).then_some(self.listed.as_slice())
+    }
+
+    fn list(&mut self, ids: Vec<String>) {
+        for id in ids {
+            if !self.listed.contains(&id) {
+                self.listed.push(id);
+            }
+        }
+    }
 }
 
 pub(crate) struct Scope {
     pub(crate) branch: String,
     entries: Vec<Entry>,
+    /// Where each dependence is among the entries: the same read made again (a Blob cell
+    /// scrolled back into view, a page read again) is one entry, so a scope grows with what the
+    /// view shows, not with how often it reads it.
+    index: HashMap<Depends, usize>,
     /// Moves when the scope is reset, so a read that comes back afterwards changes nothing.
     generation: u64,
     alive: Weak<()>,
@@ -58,6 +82,7 @@ impl Scope {
         let scope = Self {
             branch,
             entries: Vec::new(),
+            index: HashMap::new(),
             generation: 0,
             alive: Rc::downgrade(&alive),
         };
@@ -70,20 +95,44 @@ impl Scope {
 
     /// A read the view sends: it counts from now, before its answer is in.
     pub(crate) fn add(&mut self, depends: Depends) -> EntryAt {
-        self.entries.push(Entry {
-            depends,
-            listed: None,
-        });
+        let index = self.entry(depends);
+        self.entries[index].pending += 1;
         EntryAt {
             generation: self.generation,
-            index: self.entries.len() - 1,
+            index,
         }
     }
 
     /// An answer the view shows that was read elsewhere (a table's row and relationships, given
-    /// to its peek), with the nodes it lists.
+    /// to its peek), with the nodes it lists (`None` when not known: the whole listed type
+    /// counts).
     pub(crate) fn add_known(&mut self, depends: Depends, listed: Option<Vec<String>>) {
-        self.entries.push(Entry { depends, listed });
+        let index = self.entry(depends);
+        let entry = &mut self.entries[index];
+        match listed {
+            Some(ids) => {
+                entry.known = true;
+                entry.list(ids);
+            }
+            // Never known: counted as a read that stays out.
+            None => entry.pending += 1,
+        }
+    }
+
+    /// The entry of `depends`, made when the view first shows it.
+    fn entry(&mut self, depends: Depends) -> usize {
+        if let Some(&index) = self.index.get(&depends) {
+            return index;
+        }
+        let index = self.entries.len();
+        self.index.insert(depends.clone(), index);
+        self.entries.push(Entry {
+            depends,
+            listed: Vec::new(),
+            known: false,
+            pending: 0,
+        });
+        index
     }
 
     /// The read at `at` came in with `rows`.
@@ -91,14 +140,19 @@ impl Scope {
         if at.generation != self.generation {
             return;
         }
-        if let Some(entry) = self.entries.get_mut(at.index) {
-            entry.listed = listed_ids(&entry.depends, rows);
-        }
+        let Some(entry) = self.entries.get_mut(at.index) else {
+            return;
+        };
+        let listed = listed_ids(&entry.depends, rows).unwrap_or_default();
+        entry.known = true;
+        entry.pending = entry.pending.saturating_sub(1);
+        entry.list(listed);
     }
 
     /// The view shows none of what it read: it reads again (Refresh, another order).
     pub(crate) fn reset(&mut self, branch: String) {
         self.entries.clear();
+        self.index.clear();
         self.generation += 1;
         self.branch = branch;
     }
@@ -115,7 +169,7 @@ impl Scope {
     pub(crate) fn unchanged(&self, since: &ChangesSince) -> bool {
         self.entries
             .iter()
-            .all(|entry| depends_unchanged(since, &entry.depends, entry.listed.as_deref()))
+            .all(|entry| depends_unchanged(since, &entry.depends, entry.listed()))
     }
 }
 
@@ -211,6 +265,22 @@ mod tests {
             "any person may be listed"
         );
         assert!(scope.unchanged(&since(json!([]), &asked)));
+    }
+
+    #[test]
+    fn a_list_read_twice_is_one_entry_listing_both_answers() {
+        let (mut scope, _handle) = Scope::new(1, "main".into());
+        let first = scope.add(neighbours_of("p1"));
+        scope.answered(first, &json!([{ "id": "p2" }]));
+        let asked = ["Person", "Knows"];
+        // The next page is out: what it lists is not known yet.
+        let next = scope.add(neighbours_of("p1"));
+        assert_eq!(scope.entries.len(), 1);
+        assert!(!scope.unchanged(&since(json!([node("Person", "p9")]), &asked)));
+        scope.answered(next, &json!([{ "id": "p3" }]));
+        assert!(scope.unchanged(&since(json!([node("Person", "p9")]), &asked)));
+        assert!(!scope.unchanged(&since(json!([node("Person", "p2")]), &asked)));
+        assert!(!scope.unchanged(&since(json!([node("Person", "p3")]), &asked)));
     }
 
     #[test]

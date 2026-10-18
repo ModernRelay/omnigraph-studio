@@ -41,7 +41,7 @@ pub enum Seeds {
 
 /// What a generated query's answer depends on, so that an answer read at one commit stands for
 /// a later commit of the branch whose changes left all of it alone (spec 015, carry-forward).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub enum Depends {
     /// Not described: the answer is read again at every commit.
     #[default]
