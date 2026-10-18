@@ -16,8 +16,9 @@ use graph_client::api::{
 use graph_client::{ReadError, WriteOutcome};
 use graph_store::fixes::compose;
 use graph_store::{
-    ChangeFold, FoldedChange, FoldedChanges, GraphSession, HeadWatch, NetChange, REVIEW_CHANGE_CAP,
-    SessionEvent, TypeCounts, commits_since, contains_merge_of, fork_point, revert_query,
+    ChangeFold, EntityGroup, EntityGroups, FoldedChange, FoldedChanges, GraphSession, GroupRun,
+    GroupSection, HeadWatch, NetChange, REVIEW_CHANGE_CAP, RelationshipEntry, SessionEvent,
+    TypeCounts, commits_since, contains_merge_of, entity_name, fork_point, revert_query,
     summary_sentence,
 };
 use serde_json::Value;
@@ -25,11 +26,11 @@ use studio_actions::review::{
     AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext,
 };
 use studio_ui::ds::Button;
-use studio_ui::ds::space;
+use studio_ui::ds::{radius, space};
 use studio_ui::menu::ContextMenu;
 use studio_ui::{
-    ChangeCard, ChangeKind, PropertyRow, change_counts, change_group_header, group_digits,
-    short_commit_id, type_swatch,
+    ChangeCard, ChangeKind, PropertyRow, RelationshipLine, change_counts, change_group_header,
+    group_digits, short_commit_id, type_swatch,
 };
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace, workspace_for};
 use ui::prelude::*;
@@ -46,8 +47,10 @@ const FEED_PAGE: usize = 1_000;
 /// One row of the review's list.
 #[derive(Debug, Clone, Copy)]
 enum Row {
-    Group(usize),
-    Card(usize),
+    /// The header of a run of one type's cards, by its index in the view's runs.
+    Header(usize),
+    /// An entity's card, by its group in [`ReviewData::groups`].
+    Entity(usize),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,6 +142,8 @@ struct ReviewData {
     /// The branch's commits since the fork, newest first.
     commits: Vec<ReviewCommit>,
     folded: FoldedChanges,
+    /// The changes by entity: each node with the relationship changes reviewed on its card.
+    groups: EntityGroups,
     /// Each change's search text, lowercase, made when it was folded: a search goes through
     /// these, not through every value of every change on each key.
     search: Vec<String>,
@@ -208,8 +213,13 @@ pub struct ReviewView {
     focus_handle: FocusHandle,
     load: LoadState,
     data: Option<ReviewData>,
+    /// Each change's state, by its index in the fold: a card's own change and each
+    /// relationship line have one.
     cards: Vec<CardState>,
     rows: Vec<Row>,
+    /// The runs of one type the rows show, each under its header.
+    headers: Vec<GroupRun>,
+    /// The selected change: an entity's own, or one relationship on its card.
     selected: Option<usize>,
     list_state: ListState,
     /// The head fixes and the merge bind to: the reviewed head, then each fix's own commit.
@@ -320,6 +330,7 @@ impl ReviewView {
             data: None,
             cards: Vec::new(),
             rows: Vec::new(),
+            headers: Vec::new(),
             selected: None,
             list_state: ListState::new(0, ListAlignment::Top, px(800.)),
             bound_head: None,
@@ -393,12 +404,12 @@ impl ReviewView {
                         revert_blocked: blocked.clone(),
                     })
                     .collect();
-                self.rows = build_rows(&data, &self.search_text(cx));
+                (self.rows, self.headers) = build_rows(&data, &self.search_text(cx));
                 self.list_state.reset(self.rows.len());
-                self.selected = self.rows.iter().find_map(|row| match row {
-                    Row::Card(ix) => Some(*ix),
-                    Row::Group(_) => None,
-                });
+                self.selected = self
+                    .visible_groups()
+                    .first()
+                    .and_then(|&group| data.groups.groups[group].primary());
                 self.bound_head = data.head.clone();
                 self.newer = data.moved_while_reading;
                 self.data = Some(data);
@@ -414,47 +425,59 @@ impl ReviewView {
         self.data.as_ref().map_or(0, |d| d.folded.changes.len())
     }
 
-    fn row_of_change(&self, change: usize) -> Option<usize> {
-        self.rows
-            .iter()
-            .position(|row| matches!(row, Row::Card(ix) if *ix == change))
+    /// The group whose card a change is reviewed on.
+    fn group_of(&self, change: usize) -> Option<usize> {
+        self.data.as_ref()?.groups.home.get(change).copied()
     }
 
+    fn row_of_group(&self, group: usize) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|row| matches!(row, Row::Entity(ix) if *ix == group))
+    }
+
+    /// Selects a change, on its entity's card, and scrolls the card into view.
     fn select(&mut self, change: usize, cx: &mut Context<Self>) {
         if change < self.change_count() {
             self.selected = Some(change);
-            if let Some(row) = self.row_of_change(change) {
+            if let Some(row) = self.group_of(change).and_then(|g| self.row_of_group(g)) {
                 self.list_state.scroll_to_reveal_item(row);
             }
             cx.notify();
         }
     }
 
-    /// The cards the search leaves, in list order.
-    fn visible_cards(&self) -> Vec<usize> {
+    /// The groups the search leaves, in list order.
+    fn visible_groups(&self) -> Vec<usize> {
         self.rows
             .iter()
             .filter_map(|row| match row {
-                Row::Card(ix) => Some(*ix),
-                Row::Group(_) => None,
+                Row::Entity(ix) => Some(*ix),
+                Row::Header(_) => None,
             })
             .collect()
     }
 
+    /// Moves to the next or previous entity, selecting its own change (or its first
+    /// relationship's).
     fn step(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let visible = self.visible_cards();
+        let Some(data) = &self.data else { return };
+        let visible = self.visible_groups();
         let Some(&first) = visible.first() else {
             return;
         };
         let next = match self
             .selected
-            .and_then(|s| visible.iter().position(|&ix| ix == s))
+            .and_then(|s| data.groups.home.get(s))
+            .and_then(|g| visible.iter().position(|ix| ix == g))
         {
             Some(at) if forward => visible[(at + 1).min(visible.len() - 1)],
             Some(at) => visible[at.saturating_sub(1)],
             None => first,
         };
-        self.select(next, cx);
+        if let Some(change) = data.groups.groups[next].primary() {
+            self.select(change, cx);
+        }
     }
 
     fn select_next(&mut self, _: &NextChange, _: &mut Window, cx: &mut Context<Self>) {
@@ -469,14 +492,21 @@ impl ReviewView {
         self.search.read(cx).text(cx).trim().to_lowercase()
     }
 
-    /// Shows only the cards matching the search, keeping the selection when it still shows.
+    /// Shows only the cards matching the search, keeping the selection when its card still
+    /// shows.
     fn apply_search(&mut self, cx: &mut Context<Self>) {
         let Some(data) = &self.data else { return };
-        self.rows = build_rows(data, &self.search_text(cx));
+        (self.rows, self.headers) = build_rows(data, &self.search_text(cx));
         self.list_state.reset(self.rows.len());
-        let visible = self.visible_cards();
-        if !self.selected.is_some_and(|s| visible.contains(&s)) {
-            self.selected = visible.first().copied();
+        let visible = self.visible_groups();
+        let shown = self
+            .selected
+            .and_then(|s| data.groups.home.get(s))
+            .is_some_and(|g| visible.contains(g));
+        if !shown {
+            self.selected = visible
+                .first()
+                .and_then(|&group| data.groups.groups[group].primary());
         }
         cx.notify();
     }
@@ -489,11 +519,10 @@ impl ReviewView {
         }
     }
 
+    /// Marks the selected entity's card reviewed, every change on it, and moves to the next.
     fn accept_and_next(&mut self, _: &AcceptAndNext, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ix) = self.selected {
-            if let Some(card) = self.cards.get_mut(ix) {
-                card.reviewed = true;
-            }
+        if let Some(group) = self.selected.and_then(|s| self.group_of(s)) {
+            self.set_group_reviewed(group, true);
             self.select_next(&NextChange, window, cx);
         }
     }
@@ -505,11 +534,29 @@ impl ReviewView {
         }
     }
 
-    fn toggle_reviewed(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if let Some(card) = self.cards.get_mut(ix) {
-            card.reviewed = !card.reviewed;
-            cx.notify();
+    /// How many changes on a group's card are not reviewed.
+    fn group_unreviewed(&self, group: &EntityGroup) -> usize {
+        group
+            .changes()
+            .filter(|&c| !self.cards.get(c).is_some_and(|card| card.reviewed))
+            .count()
+    }
+
+    fn set_group_reviewed(&mut self, group: usize, reviewed: bool) {
+        let Some(data) = &self.data else { return };
+        for change in data.groups.groups[group].changes() {
+            if let Some(card) = self.cards.get_mut(change) {
+                card.reviewed = reviewed;
+            }
         }
+    }
+
+    /// Marks a card reviewed, or not: every change on it at once.
+    fn toggle_reviewed(&mut self, group: usize, cx: &mut Context<Self>) {
+        let Some(data) = &self.data else { return };
+        let all = self.group_unreviewed(&data.groups.groups[group]) == 0;
+        self.set_group_reviewed(group, !all);
+        cx.notify();
     }
 
     /// Restores a change's before image on the branch, bound to the head this review holds.
@@ -1473,7 +1520,7 @@ impl ReviewView {
                     .gap(px(space::LG))
                     .px(px(space::LG))
                     .py(px(space::MD))
-                    .rounded_md()
+                    .rounded(px(radius::MD))
                     .border_1()
                     .border_color(border)
                     .bg(surface)
@@ -1527,106 +1574,147 @@ impl ReviewView {
             return div().into_any_element();
         };
         match self.rows.get(row).copied() {
-            Some(Row::Group(ix)) => {
-                let count = &data.counts[ix];
-                div()
+            Some(Row::Header(ix)) => {
+                let header = &self.headers[ix];
+                let title = header.section.map(|section| match section {
+                    GroupSection::Existing => format!("Changes to what {} has", self.target),
+                    GroupSection::Added => format!("Added on {}", self.branch),
+                });
+                v_flex()
                     .px(px(space::XL))
-                    .child(change_group_header(
-                        &count.type_name,
-                        count.is_edge,
-                        count.added,
-                        count.changed,
-                        count.removed,
-                    ))
+                    .children(title.map(|title| {
+                        div()
+                            .pt(px(space::XL))
+                            .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
+                    }))
+                    .child(
+                        change_group_header(
+                            &header.type_name,
+                            header.is_edge,
+                            header.added,
+                            header.changed,
+                            header.removed,
+                        )
+                        .when(header.relationships > 0, |d| {
+                            d.child(
+                                Label::new(match header.relationships {
+                                    1 => "· 1 relationship".to_owned(),
+                                    n => format!("· {} relationships", group_digits(n)),
+                                })
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                            )
+                        }),
+                    )
                     .into_any_element()
             }
-            Some(Row::Card(ix)) => {
-                let change = &data.folded.changes[ix];
-                let state = self.cards[ix].clone();
+            Some(Row::Entity(group)) => {
                 let schema = self.session.read(cx).schema_model();
-                let mut card = change_card(change, schema.as_deref(), ("change", ix))
-                    .selected(self.selected == Some(ix))
-                    .hollow(state.reviewed);
-                card = match &state.fix {
-                    FixState::Idle => card,
-                    FixState::Running => card.status("Reverting…", Color::Muted),
-                    FixState::Saving => card.status("Saving…", Color::Muted),
-                    FixState::Reverted { commit } => card.status(
-                        format!("Reverted in {}", short_commit_id(commit)),
-                        Color::Success,
-                    ),
-                    FixState::Edited { commit } => card.status(
-                        format!("Edited in {}", short_commit_id(commit)),
-                        Color::Success,
-                    ),
-                    FixState::Unchanged => card.status(
-                        "Not written: the value changed since this review. Refresh.",
-                        Color::Warning,
-                    ),
-                    FixState::Moved => card.status(
-                        "Not written: the branch moved. Refresh, then try again.",
-                        Color::Warning,
-                    ),
-                    FixState::Refused(message) => {
-                        card.status(format!("Refused: {message}"), Color::Error)
-                    }
-                    FixState::Unknown => card.status(
-                        "Outcome unknown. Check History before trying again.",
-                        Color::Warning,
-                    ),
-                };
-                let focus = self.focus_handle.clone();
-                let reviewed_label = if state.reviewed {
-                    "Reviewed"
-                } else {
-                    "Mark reviewed"
-                };
-                let review_button = Button::new(("reviewed", ix), reviewed_label)
-                    .label_size(LabelSize::XSmall)
-                    .style(ButtonStyle::Subtle)
-                    .toggle_state(state.reviewed)
-                    .when(state.reviewed, |b| {
-                        b.start_icon(Icon::new(IconName::Check).size(IconSize::XSmall))
-                    })
-                    .tooltip({
-                        let focus = focus.clone();
-                        move |_, cx| {
-                            Tooltip::for_action_in(
-                                "Mark reviewed and go to the next change",
-                                &AcceptAndNext,
-                                &focus,
-                                cx,
-                            )
-                        }
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_reviewed(ix, cx)));
-                let blocked = state.revert_blocked.clone();
-                let done = state.fix.done();
-                let editable = self.editable(ix, cx);
-                let edit_button = editable.then(|| {
+                let card = self.entity_card(data, group, schema.as_deref(), cx);
+                div()
+                    .px(px(space::XL))
+                    .py(px(space::XS))
+                    .child(card)
+                    .into_any_element()
+            }
+            None => div().into_any_element(),
+        }
+    }
+
+    /// One entity's card: its own change, with Mark reviewed, Edit and Revert, then each
+    /// relationship change reviewed on it, each with its own Revert, then the relationships
+    /// reviewed on another card that it is an end of.
+    fn entity_card(
+        &self,
+        data: &ReviewData,
+        ix: usize,
+        schema: Option<&SchemaModel>,
+        cx: &mut Context<Self>,
+    ) -> ChangeCard {
+        let group = &data.groups.groups[ix];
+        let changes = &data.folded.changes;
+        let focus = self.focus_handle.clone();
+        let selected_group = self.selected.and_then(|s| data.groups.home.get(s).copied());
+        let unreviewed = self.group_unreviewed(group);
+        let total = group.changes().count();
+        let reviewed = unreviewed == 0;
+
+        let mut card = match group.change {
+            Some(own) => change_card(&changes[own], schema, ("change", ix))
+                .name(entity_name(&changes[own], schema)),
+            None => ChangeCard::new(("change", ix), ChangeKind::Unchanged, group.id.clone()),
+        }
+        .selected(selected_group == Some(ix))
+        .hollow(reviewed);
+        if let Some((text, color)) = group
+            .change
+            .and_then(|own| fix_status(&self.cards[own].fix))
+        {
+            card = card.status(text, color);
+        } else if !reviewed && unreviewed < total {
+            card = card.status(
+                format!("{unreviewed} of {total} not reviewed"),
+                Color::Muted,
+            );
+        }
+
+        let review_button = Button::new(
+            ("reviewed", ix),
+            if reviewed {
+                "Reviewed"
+            } else {
+                "Mark reviewed"
+            },
+        )
+        .label_size(LabelSize::XSmall)
+        .style(ButtonStyle::Subtle)
+        .toggle_state(reviewed)
+        .when(reviewed, |b| {
+            b.start_icon(Icon::new(IconName::Check).size(IconSize::XSmall))
+        })
+        .tooltip({
+            let focus = focus.clone();
+            move |_, cx| {
+                Tooltip::for_action_in(
+                    "Mark this card reviewed and go to the next",
+                    &AcceptAndNext,
+                    &focus,
+                    cx,
+                )
+            }
+        })
+        .on_click(cx.listener(move |this, _, _, cx| this.toggle_reviewed(ix, cx)));
+        card = card.action(review_button);
+
+        if let Some(own) = group.change {
+            let state = &self.cards[own];
+            let done = state.fix.done();
+            if self.editable(own, cx) {
+                let branch = self.branch.clone();
+                let focus = focus.clone();
+                card = card.action(
                     Button::new(("edit", ix), "Edit")
                         .label_size(LabelSize::XSmall)
                         .style(ButtonStyle::Subtle)
                         .start_icon(Icon::new(IconName::Pencil).size(IconSize::XSmall))
                         .disabled(done)
-                        .tooltip({
-                            let focus = focus.clone();
-                            let branch = self.branch.clone();
-                            move |_, cx| {
-                                Tooltip::for_action_in(
-                                    format!("Change what {branch} holds now"),
-                                    &EditChange,
-                                    &focus,
-                                    cx,
-                                )
-                            }
+                        .tooltip(move |_, cx| {
+                            Tooltip::for_action_in(
+                                format!("Change what {branch} holds now"),
+                                &EditChange,
+                                &focus,
+                                cx,
+                            )
                         })
                         .on_click(
-                            cx.listener(move |this, _, window, cx| this.open_edit(ix, window, cx)),
-                        )
-                });
-                let branch = self.branch.clone();
-                let revert_button = Button::new(("revert", ix), "Revert")
+                            cx.listener(move |this, _, window, cx| this.open_edit(own, window, cx)),
+                        ),
+                );
+            }
+            let blocked = state.revert_blocked.clone();
+            let branch = self.branch.clone();
+            card = card.action(
+                Button::new(("revert", ix), "Revert")
                     .label_size(LabelSize::XSmall)
                     .style(ButtonStyle::Subtle)
                     .start_icon(Icon::new(IconName::Undo).size(IconSize::XSmall))
@@ -1640,21 +1728,153 @@ impl ReviewView {
                             cx,
                         ),
                     })
-                    .on_click(cx.listener(move |this, _, _, cx| this.revert(ix, cx)));
-                div()
-                    .px(px(space::XL))
-                    .py(px(space::XS))
-                    .child(
-                        card.action(review_button)
-                            .when_some(edit_button, |card, button| card.action(button))
-                            .action(revert_button)
-                            .on_click(cx.listener(move |this, _, _, cx| this.select(ix, cx))),
-                    )
-                    .into_any_element()
-            }
-            None => div().into_any_element(),
+                    .on_click(cx.listener(move |this, _, _, cx| this.revert(own, cx))),
+            );
         }
+
+        let entries = data.groups.entries(&data.folded, ix, schema);
+        let counts = relationship_counts(&entries);
+        let lines = entries
+            .into_iter()
+            .map(|entry| {
+                let change = entry.change;
+                let mirror = entry.net.is_none();
+                let mut line = relationship_line(entry, &changes[change], schema)
+                    .on_click(cx.listener(move |this, _, _, cx| this.select(change, cx)));
+                if mirror {
+                    return line;
+                }
+                let state = &self.cards[change];
+                let hover = SharedString::from(format!("relationship-{change}"));
+                let blocked = state.revert_blocked.clone();
+                let branch = self.branch.clone();
+                let revert =
+                    studio_ui::ds::icon_button(("revert-relationship", change), IconName::Undo)
+                        .icon_size(IconSize::XSmall)
+                        .style(ButtonStyle::Subtle)
+                        .visible_on_hover(hover.clone())
+                        .disabled(blocked.is_some() || state.fix.done())
+                        .tooltip(move |_, cx| match &blocked {
+                            Some(reason) => Tooltip::simple(reason.clone(), cx),
+                            None => Tooltip::with_meta(
+                                "Revert this relationship change",
+                                Some(&RevertAndNext),
+                                format!("Writes to {branch}, bound to the reviewed head"),
+                                cx,
+                            ),
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| this.revert(change, cx)));
+                line = line
+                    .selected(self.selected == Some(change) && group.change.is_some())
+                    .hollow(state.reviewed)
+                    .hover_group(hover)
+                    .action(revert);
+                if let Some((text, color)) = fix_status(&state.fix) {
+                    line = line.status(text, color);
+                }
+                line
+            })
+            .collect();
+        card = card.relationships(counts, lines);
+        card.on_click(cx.listener(move |this, _, _, cx| {
+            let primary = this
+                .data
+                .as_ref()
+                .and_then(|data| data.groups.groups[ix].primary());
+            if let Some(change) = primary {
+                this.select(change, cx);
+            }
+        }))
     }
+}
+
+/// Added, changed and removed relationships among a card's entries; mirrors are counted on
+/// their own card.
+pub(crate) fn relationship_counts(entries: &[RelationshipEntry]) -> (usize, usize, usize) {
+    entries
+        .iter()
+        .fold((0, 0, 0), |(added, changed, removed), entry| {
+            match entry.net {
+                Some(NetChange::Added) => (added + 1, changed, removed),
+                Some(NetChange::Changed) => (added, changed + 1, removed),
+                Some(NetChange::Removed) => (added, changed, removed + 1),
+                None => (added, changed, removed),
+            }
+        })
+}
+
+/// A card's line for one relationship entry: what changed, which way it points, the other
+/// end, and a changed relationship's property rows. A mirror says where it is reviewed.
+pub(crate) fn relationship_line(
+    entry: RelationshipEntry,
+    edge: &FoldedChange,
+    schema: Option<&SchemaModel>,
+) -> RelationshipLine {
+    let kind = entry.net.map(|net| match net {
+        NetChange::Added => ChangeKind::Added,
+        NetChange::Changed => ChangeKind::Changed,
+        NetChange::Removed => ChangeKind::Removed,
+    });
+    let id = if kind.is_some() {
+        ("relationship", entry.change)
+    } else {
+        ("mirror", entry.change)
+    };
+    let rows = if kind.is_some() {
+        edge.card_diffs(schema)
+            .into_iter()
+            .map(|diff| PropertyRow {
+                name: diff.name.into(),
+                before: diff.before,
+                after: diff.after,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let note = match kind {
+        // The other end is the card it is reviewed on.
+        None => Some("reviewed there".to_owned()),
+        Some(_) if entry.other_is_new => Some("new".to_owned()),
+        Some(_) => None,
+    };
+    let line = RelationshipLine::new(id, kind, entry.words, entry.outgoing, entry.other)
+        .other_detail(entry.other_type)
+        .rows(rows);
+    match note {
+        Some(note) => line.note(note),
+        None => line,
+    }
+}
+
+/// What a fix on a change says on its card or line, once one was asked for.
+fn fix_status(fix: &FixState) -> Option<(String, Color)> {
+    Some(match fix {
+        FixState::Idle => return None,
+        FixState::Running => ("Reverting…".to_owned(), Color::Muted),
+        FixState::Saving => ("Saving…".to_owned(), Color::Muted),
+        FixState::Reverted { commit } => (
+            format!("Reverted in {}", short_commit_id(commit)),
+            Color::Success,
+        ),
+        FixState::Edited { commit } => (
+            format!("Edited in {}", short_commit_id(commit)),
+            Color::Success,
+        ),
+        FixState::Unchanged => (
+            "Not written: the value changed since this review. Refresh.".to_owned(),
+            Color::Warning,
+        ),
+        FixState::Moved => (
+            "Not written: the branch moved. Refresh, then try again.".to_owned(),
+            Color::Warning,
+        ),
+        FixState::Refused(message) => (format!("Refused: {message}"), Color::Error),
+        FixState::Unknown => (
+            "Outcome unknown. Check History before trying again.".to_owned(),
+            Color::Warning,
+        ),
+    })
 }
 
 /// The card for one folded change.
@@ -1684,11 +1904,13 @@ pub(crate) fn change_card(
     card
 }
 
-/// Whether a change's id, type or any before or after value contains `query` (lowercase).
-/// What a search finds a change by, lowercase: its id, its type and each value before and
-/// after, one per line, so a search never matches across two of them.
+/// What a search finds a change by, lowercase: its id, its type, a relationship's two ends and
+/// each value before and after, one per line, so a search never matches across two of them.
 fn search_text_of(change: &FoldedChange) -> String {
     let mut text = format!("{}\n{}", change.id, change.type_name);
+    if let Some((from, to)) = change.endpoints() {
+        text.push_str(&format!("\n{from}\n{to}"));
+    }
     for value in [&change.before, &change.after]
         .into_iter()
         .flatten()
@@ -1703,25 +1925,26 @@ fn search_text_of(change: &FoldedChange) -> String {
     text.to_lowercase()
 }
 
-fn build_rows(data: &ReviewData, query: &str) -> Vec<Row> {
+/// The list's rows: each card the search leaves, under a header for each run of one type, the
+/// first of a section carrying its title. A card matches when its own change or a
+/// relationship reviewed on it does. The headers count what the run shows.
+fn build_rows(data: &ReviewData, query: &str) -> (Vec<Row>, Vec<GroupRun>) {
+    let matches = |change: usize| {
+        query.is_empty()
+            || data
+                .search
+                .get(change)
+                .is_some_and(|text| text.contains(query))
+    };
+    let runs = data
+        .groups
+        .runs(&data.folded, |group| group.changes().any(matches));
     let mut rows = Vec::new();
-    let mut group = None;
-    let mut group_index = 0;
-    for (ix, change) in data.folded.changes.iter().enumerate() {
-        if !query.is_empty() && !data.search.get(ix).is_some_and(|text| text.contains(query)) {
-            continue;
-        }
-        let key = (change.is_edge(), change.type_id.as_str());
-        if group != Some(key) {
-            if group.is_some() {
-                group_index += 1;
-            }
-            group = Some(key);
-            rows.push(Row::Group(group_index));
-        }
-        rows.push(Row::Card(ix));
+    for (ix, run) in runs.iter().enumerate() {
+        rows.push(Row::Header(ix));
+        rows.extend(run.groups.iter().map(|&group| Row::Entity(group)));
     }
-    rows
+    (rows, runs)
 }
 
 /// Reads what the branch changed since its merge base with the target: the base and the head
@@ -1750,6 +1973,7 @@ async fn read_review(
                 head: Some(head),
                 commits: Vec::new(),
                 folded: ChangeFold::new().finish(),
+                groups: EntityGroups::default(),
                 search: Vec::new(),
                 counts: Vec::new(),
                 revert_blocked: Vec::new(),
@@ -1789,10 +2013,11 @@ impl Fed {
     ) -> ReviewData {
         let fold = self.fold;
         let schema = session.read_with(cx, |session, _| session.schema_model());
-        let (folded, search, revert_blocked) = cx
+        let (folded, groups, search, revert_blocked) = cx
             .background_executor()
             .spawn(async move {
                 let folded = fold.finish();
+                let groups = EntityGroups::new(&folded, schema.as_deref());
                 let search = folded.changes.iter().map(search_text_of).collect();
                 let revert_blocked = folded
                     .changes
@@ -1802,7 +2027,7 @@ impl Fed {
                         revert_query(schema, change).err().map(|e| e.0)
                     })
                     .collect();
-                (folded, search, revert_blocked)
+                (folded, groups, search, revert_blocked)
             })
             .await;
         let counts = folded.counts();
@@ -1813,6 +2038,7 @@ impl Fed {
             head,
             commits,
             folded,
+            groups,
             search,
             counts,
             revert_blocked,
@@ -2255,6 +2481,75 @@ pub(crate) mod tests {
             assert!(text.contains(found), "{found}");
         }
         assert!(!text.contains("lovelace"));
+    }
+
+    /// A card shows when its own change or a relationship on it matches the search, the first
+    /// run of a section carries its title, and each header counts what its run shows.
+    #[test]
+    fn a_search_keeps_the_cards_whose_changes_match_and_headers_count_what_shows() {
+        let schema = SchemaModel::parse(
+            "node Person {\n    slug: String @key\n    name: String?\n}\n\
+             node Note {\n    slug: String @key\n    title: String?\n}\n\
+             edge About: Note -> Person\n",
+        )
+        .unwrap();
+        let mut note = change("lunch", json!({"slug": "lunch", "title": "Lunch notes"}));
+        note.type_id = "t-Note".into();
+        note.type_name = "Note".into();
+        let mut about = change("e1", json!({}));
+        about.kind = EntityKind::Edge;
+        about.type_id = "t-About".into();
+        about.type_name = "About".into();
+        about.after.as_mut().unwrap().endpoints = Some(json!({"from": "lunch", "to": "maya"}));
+        let folded = FoldedChanges {
+            changes: vec![
+                change("maya", json!({"slug": "maya", "name": "Ada"})),
+                note,
+                about,
+            ],
+            raw_changes: 3,
+        };
+        let groups = EntityGroups::new(&folded, Some(&schema));
+        let data = ReviewData {
+            fork: None,
+            head: None,
+            commits: Vec::new(),
+            search: folded.changes.iter().map(search_text_of).collect(),
+            counts: folded.counts(),
+            revert_blocked: vec![None; 3],
+            folded,
+            groups,
+            partial: false,
+            moved_while_reading: false,
+            merged_in: false,
+        };
+        let shown = |query: &str| {
+            let (rows, headers) = build_rows(&data, query);
+            rows.iter()
+                .map(|row| match row {
+                    Row::Header(ix) => {
+                        let h = &headers[*ix];
+                        format!(
+                            "{}{} +{} r{}",
+                            if h.section.is_some() { "§ " } else { "" },
+                            h.type_name,
+                            h.added,
+                            h.relationships
+                        )
+                    }
+                    Row::Entity(ix) => data.groups.groups[*ix].id.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shown(""), ["§ Person +1 r0", "maya", "Note +1 r1", "lunch"]);
+        assert_eq!(shown("ada"), ["§ Person +1 r0", "maya"]);
+        // A section's title goes with its first run that shows.
+        assert_eq!(shown("lunch notes"), ["§ Note +1 r1", "lunch"]);
+        // An end of a relationship finds the card it is reviewed on.
+        assert_eq!(
+            shown("maya"),
+            ["§ Person +1 r0", "maya", "Note +1 r1", "lunch"]
+        );
     }
 
     /// A reviewed mark holds for the change as it was reviewed: changed again since, it is

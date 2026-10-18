@@ -24,7 +24,9 @@ pub mod text;
 mod values;
 
 pub use cell_text::{CellText, cell_text};
-pub use changes::{ChangeCard, ChangeKind, PropertyRow, change_counts, change_group_header};
+pub use changes::{
+    ChangeCard, ChangeKind, PropertyRow, RelationshipLine, change_counts, change_group_header,
+};
 pub use grid_places::{GridPlace, columns_in_view, grid_places, scrolled_within};
 pub use overlay_slot::{OverlaySlot, OverlaySlotElement};
 pub use resize::{

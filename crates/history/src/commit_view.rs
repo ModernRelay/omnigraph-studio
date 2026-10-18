@@ -8,12 +8,15 @@ use gpui::{
 use gq_language::SchemaModel;
 use graph_client::ReadError;
 use graph_client::api::{ChangeCauseOutput, CommitOutput};
-use graph_store::{ChangeFold, FoldedChange, FoldedChanges, GraphSession, NetChange, TypeCounts};
+use graph_store::{
+    ChangeFold, EntityGroups, FoldedChange, FoldedChanges, GraphSession, GroupRun, GroupSection,
+    NetChange, RelationshipEntry, TypeCounts, entity_name,
+};
 use studio_actions::graph::{OpenCommit, OpenQueryAt, OpenType};
 use studio_ui::menu::ContextMenu;
 use studio_ui::{
-    ChangeCard, ChangeKind, PropertyRow, change_group_header, now_micros, relative_time,
-    short_commit_id, utc_date_time,
+    ChangeCard, ChangeKind, PropertyRow, RelationshipLine, change_group_header, group_digits,
+    now_micros, relative_time, short_commit_id, utc_date_time,
 };
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
@@ -37,8 +40,10 @@ pub struct CommitCounts {
 
 #[derive(Debug, Clone, Copy)]
 enum Row {
-    Group(usize),
-    Card(usize),
+    /// The header of a run of one type's cards, by its index in `runs`.
+    Header(usize),
+    /// An entity's card, by its group.
+    Entity(usize),
 }
 
 enum State {
@@ -55,6 +60,10 @@ pub struct CommitView {
     state: State,
     fold: ChangeFold,
     folded: FoldedChanges,
+    /// The changes by entity, each node with its relationship changes, as the review shows
+    /// them.
+    groups: EntityGroups,
+    runs: Vec<GroupRun>,
     counts: Vec<TypeCounts>,
     rows: Vec<Row>,
     next_page_token: Option<String>,
@@ -115,6 +124,8 @@ impl CommitView {
             state: State::Loading,
             fold: ChangeFold::new(),
             folded: FoldedChanges::default(),
+            groups: EntityGroups::default(),
+            runs: Vec::new(),
             counts: Vec::new(),
             rows: Vec::new(),
             next_page_token: None,
@@ -176,13 +187,15 @@ impl CommitView {
             let read_any = fold.raw_changes() > start;
             // Finished, counted and laid out off the main thread; the fold is kept for the
             // next pages.
-            let (fold, folded, counts, rows) = cx
+            let schema = session.read_with(cx, |session, _| session.schema_model());
+            let (fold, folded, groups, runs, counts, rows) = cx
                 .background_executor()
                 .spawn(async move {
                     let folded = fold.clone().finish();
                     let counts = folded.counts();
-                    let rows = build_rows(&folded);
-                    (fold, folded, counts, rows)
+                    let groups = EntityGroups::new(&folded, schema.as_deref());
+                    let (rows, runs) = build_rows(&folded, &groups);
+                    (fold, folded, groups, runs, counts, rows)
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -200,6 +213,8 @@ impl CommitView {
                         this.cause = cause.or(this.cause.take());
                         this.counts = counts;
                         this.rows = rows;
+                        this.runs = runs;
+                        this.groups = groups;
                         this.folded = folded;
                         this.next_page_token = token;
                         // Rows read further down keep the place the person scrolled to.
@@ -453,30 +468,68 @@ impl CommitView {
     ) -> AnyElement {
         let more = self.next_page_token.is_some();
         match self.rows.get(row).copied() {
-            Some(Row::Group(ix)) => {
-                let count = &self.counts[ix];
-                div()
+            Some(Row::Header(ix)) => {
+                let run = &self.runs[ix];
+                let title = run.section.map(|section| match section {
+                    GroupSection::Existing => "Changes to existing entities",
+                    GroupSection::Added => "Added",
+                });
+                v_flex()
                     .px(px(studio_ui::ds::space::EDGE))
-                    .child(change_group_header(
-                        &count.type_name,
-                        count.is_edge,
-                        count.added,
-                        count.changed,
-                        count.removed,
-                    ))
+                    .children(title.map(|title| {
+                        div()
+                            .pt(px(studio_ui::ds::space::XL))
+                            .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
+                    }))
+                    .child(
+                        change_group_header(
+                            &run.type_name,
+                            run.is_edge,
+                            run.added,
+                            run.changed,
+                            run.removed,
+                        )
+                        .when(run.relationships > 0, |d| {
+                            d.child(
+                                Label::new(match run.relationships {
+                                    1 => "· 1 relationship".to_owned(),
+                                    n => format!("· {} relationships", group_digits(n)),
+                                })
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                            )
+                        }),
+                    )
                     .into_any_element()
             }
-            Some(Row::Card(ix)) => {
+            Some(Row::Entity(ix)) => {
                 let schema = self.session.read(cx).schema_model();
-                let change = &self.folded.changes[ix];
+                let schema = schema.as_deref();
+                let group = &self.groups.groups[ix];
+                let card = match group.change {
+                    Some(own) => {
+                        change_card(&self.folded.changes[own], schema, ("commit-change", ix))
+                            .name(entity_name(&self.folded.changes[own], schema))
+                    }
+                    None => ChangeCard::new(
+                        ("commit-change", ix),
+                        ChangeKind::Unchanged,
+                        group.id.clone(),
+                    ),
+                };
+                let entries = self.groups.entries(&self.folded, ix, schema);
+                let counts = relationship_counts(&entries);
+                let lines = entries
+                    .into_iter()
+                    .map(|entry| {
+                        let edge = &self.folded.changes[entry.change];
+                        relationship_line(entry, edge, schema)
+                    })
+                    .collect();
                 div()
                     .px(px(studio_ui::ds::space::EDGE))
                     .py(px(studio_ui::ds::space::XS))
-                    .child(change_card(
-                        change,
-                        schema.as_deref(),
-                        ("commit-change", ix),
-                    ))
+                    .child(card.relationships(counts, lines))
                     .into_any_element()
             }
             None if more => h_flex()
@@ -544,22 +597,66 @@ pub(crate) fn change_card(
     card
 }
 
-fn build_rows(folded: &FoldedChanges) -> Vec<Row> {
-    let mut rows = Vec::new();
-    let mut group = None;
-    let mut group_index = 0;
-    for (ix, change) in folded.changes.iter().enumerate() {
-        let key = (change.is_edge(), change.type_id.as_str());
-        if group != Some(key) {
-            if group.is_some() {
-                group_index += 1;
+/// Added, changed and removed relationships among a card's entries; mirrors are counted on
+/// their own card.
+fn relationship_counts(entries: &[RelationshipEntry]) -> (usize, usize, usize) {
+    entries
+        .iter()
+        .fold((0, 0, 0), |(added, changed, removed), entry| {
+            match entry.net {
+                Some(NetChange::Added) => (added + 1, changed, removed),
+                Some(NetChange::Changed) => (added, changed + 1, removed),
+                Some(NetChange::Removed) => (added, changed, removed + 1),
+                None => (added, changed, removed),
             }
-            group = Some(key);
-            rows.push(Row::Group(group_index));
-        }
-        rows.push(Row::Card(ix));
+        })
+}
+
+/// A card's line for one relationship entry, as the review draws it, without its actions.
+fn relationship_line(
+    entry: RelationshipEntry,
+    edge: &FoldedChange,
+    schema: Option<&SchemaModel>,
+) -> RelationshipLine {
+    let kind = entry.net.map(|net| match net {
+        NetChange::Added => ChangeKind::Added,
+        NetChange::Changed => ChangeKind::Changed,
+        NetChange::Removed => ChangeKind::Removed,
+    });
+    let (id, rows) = match kind {
+        Some(_) => (
+            ("relationship", entry.change),
+            edge.card_diffs(schema)
+                .into_iter()
+                .map(|diff| PropertyRow {
+                    name: diff.name.into(),
+                    before: diff.before,
+                    after: diff.after,
+                })
+                .collect(),
+        ),
+        None => (("mirror", entry.change), Vec::new()),
+    };
+    let line = RelationshipLine::new(id, kind, entry.words, entry.outgoing, entry.other)
+        .other_detail(entry.other_type)
+        .rows(rows);
+    match kind {
+        // The other end is the card it is shown on.
+        None => line.note("shown there"),
+        Some(_) if entry.other_is_new => line.note("new"),
+        Some(_) => line,
     }
-    rows
+}
+
+/// The list's rows: a header for each run of one type, then its cards.
+fn build_rows(folded: &FoldedChanges, groups: &EntityGroups) -> (Vec<Row>, Vec<GroupRun>) {
+    let runs = groups.runs(folded, |_| true);
+    let mut rows = Vec::new();
+    for (ix, run) in runs.iter().enumerate() {
+        rows.push(Row::Header(ix));
+        rows.extend(run.groups.iter().map(|&group| Row::Entity(group)));
+    }
+    (rows, runs)
 }
 
 impl Render for CommitView {

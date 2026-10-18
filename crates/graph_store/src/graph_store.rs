@@ -9,6 +9,7 @@ pub mod cli_config;
 mod connection;
 mod degrees;
 pub mod deletes;
+mod entity_groups;
 mod exploration;
 pub mod fixes;
 mod memo;
@@ -28,6 +29,10 @@ pub use changes::{
 };
 pub use connection::{
     Connection, ConnectionEvent, ConnectionState, GraphListing, ServerEntry, ServerSource,
+};
+pub use entity_groups::{
+    EntityGroup, EntityGroups, GroupRelationship, GroupRun, GroupSection, RelationshipEntry,
+    entity_name, relationship_words,
 };
 pub use exploration::*;
 pub use fixes::{RevertUnavailable, revert_query};

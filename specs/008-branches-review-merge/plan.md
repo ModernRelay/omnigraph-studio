@@ -49,17 +49,32 @@ place), X (designed on 0.13; the better routes are deferred).
 - Opens as a tab "Review <branch> → <target>".
 - Scope selector: since the fork (default), or one commit (its own changes, read from
   `GET /graphs/{g}/commits/{id}/changes`).
-- Search: a field narrows the cards to those whose id, type or a before or after value
-  contains the text; J/K move among the cards it leaves.
+- Search: a field narrows the cards to those whose own change or a relationship on them has an
+  id, type, relationship end, or before or after value containing the text; J/K move among
+  the cards it leaves.
 - Header: one sentence ("17 entities and 22 relationships changed in 3 commits by act-alice"),
   then per-type counts (+ added, ~ changed, − removed).
-- Body: one scroll of entity cards grouped by type, changes to existing data first. A changed
-  entity shows only its changed properties, before and after; a removed one stays as a real,
-  searchable row; edges show endpoint changes. A card's header is the kind's symbol (+ ~ −)
-  and the entity's id; its type is the group header's, never repeated per card. Cards are
-  hairline frames on the document, values in the UI font.
-- Act in place: Revert (restore the before image), Edit, Mark reviewed (card turns hollow but
-  stays). Keys: J/K between cards, ↵ edit, ⌘Y accept and next, ⌥⌘Z revert and next.
+- Body: one scroll of entity cards (`graph_store::EntityGroups`) in two sections: changes to
+  what the target has (changed, removed, or unchanged with relationships that changed), then
+  what the branch added. Inside a section, cards run by type under one header counting what the
+  run shows. A card is one node: its changed properties, before and after (a removed one stays
+  as a real, searchable row), then the relationship changes that came with it.
+- A relationship change is on one card, its home: the end the branch added, else an end it
+  changed or removed, else its source, which then stands unchanged for its relationships.
+  There it is counted, reviewed and reverted. When the other end has a card too, the
+  relationship shows there as well, muted, "reviewed there", so either entity tells its whole
+  story. A line reads as the relationship in words (`WorksAt` is "works at", `NoteAboutPerson`
+  from Note to Person is "about"), an arrow for its direction and the other end by its label
+  property, else its id; "new" marks an end the branch added, and a changed relationship's
+  properties follow it. A relationship whose type the schema lacks stands alone as its own
+  card. A card's header is the kind's symbol (+ ~ −, · for unchanged), the entity's name and
+  its id; its type is the run's header's. Cards are hairline frames on the document, values in
+  the UI font.
+- Act in place: Revert (restore the before image), Edit, Mark reviewed (every change on the
+  card; the card turns hollow but stays, and says how many are not reviewed when some are).
+  Each relationship line has its own Revert, shown on hover. Keys: J/K between cards, ↵ edit,
+  ⌘Y accept the card and go to the next, ⌥⌘Z revert the selected change (the card's own, or
+  the relationship line clicked) and go to the next.
 - Edit (a node that is added or changed): a form of its editable properties filled with what
   the branch holds; Save writes only the fields that changed, each bound to that value, as one
   mutation on the reviewed branch bound to the reviewed head. After a fix the card's other
@@ -101,6 +116,7 @@ place), X (designed on 0.13; the better routes are deferred).
 |---|---|---|
 | Review from the change feed | Wait for a diff route | Works on 0.13; the route is deferred |
 | Stat cards removed from the header | Stat cards above the changes | They read as cluttered in an earlier design |
+| A node's card carries its relationship changes, mirrored at the other end | Sections by type with edges in their own; a relationship on one card only | A reader joined a node and its edges by hand, from keys alone; a mirror lets either end tell the whole story while each change is counted and reverted once |
 | Conflicts resolved by editing the source branch | Ours/theirs buttons | 0.13 has no resolution API; edits are ordinary writes |
 
 ## Deferred
@@ -140,6 +156,8 @@ place), X (designed on 0.13; the better routes are deferred).
 | 2026-10-12 | A revert of several properties publishes once | live server, scratch branch: two `update` statements joined by `graph_store::fixes::compose` | One commit, `affected_nodes: 2` |
 | 2026-10-12 | Fixes bound to the reviewed head | offscreen snapshot: Revert on `feature-x` `person-000002` through `/mutate/if-graph-commit` | Committed; the value read back as before; the card stays, hollow, "Reverted in …" |
 | 2026-10-12 | Merge refuses a moved branch | offscreen snapshot: a second writer committed on `feature-v` after the review was read | "feature-v moved to …"; no merge request sent; main unchanged |
+| 2026-10-18 | Relationships are reviewed with the entity they came with | `graph_store` `entity_groups` tests (home rule, mirrors, self relationships, a type the schema lacks, edge types in words); `review` test `a_search_keeps_the_cards_whose_changes_match_and_headers_count_what_shows` | Each change on exactly one card; mirrors name their card; headers count what shows |
+| 2026-10-18 | Entity cards render | offscreen snapshot against a scratch dev server on edge `0a62bb7`: branch `review-demo` adds Person `person-900000` with `WorksAt` and `Knows`, retitles `person-000001` and adds its `Contributes`, removes `WorksAt person-000000 → company-00002`, adds `Knows person-000155 → person-000005` | Donald Dijkstra's card carries his new `contributes`; Theo Brandt's carries `works at` and `knows`, mirrored on `person-000000`'s card with the removed `works at` struck through; the scratch server and its data were deleted after |
 
 ## Corrections
 
