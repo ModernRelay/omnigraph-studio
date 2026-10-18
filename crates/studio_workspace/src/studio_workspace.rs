@@ -645,28 +645,41 @@ impl Workspace {
         self.dedupe_across_panes = false;
         for (id, saved_pane) in panes.iter().enumerate() {
             self.active_pane = id;
-            for item in &saved_pane.items {
+            // A saved tab can decline to open (a type the schema dropped, a kind removed): the
+            // pins and the active tab are counted over the tabs that opened, not by position.
+            let mut pinned = 0;
+            let mut active = 0;
+            for (index, item) in saved_pane.items.iter().enumerate() {
+                let before = self.pane(id).map_or(0, |pane| pane.items.len());
                 if let Some(open) = persistence::opener(cx, &item.kind) {
                     open(&item.data, self, window, cx);
                 }
+                let now = self.pane(id).map_or(0, |pane| pane.items.len());
+                if now > before {
+                    pinned += usize::from(index < saved_pane.pinned);
+                    // The saved active tab, or the nearest one before it that opened.
+                    if index <= saved_pane.active {
+                        active = now - 1;
+                    }
+                }
             }
             if let Some(pane) = self.pane_mut(id) {
-                pane.pinned = saved_pane.pinned.min(pane.items.len());
+                pane.pinned = pinned.min(pane.items.len());
                 pane.preview = None;
-                pane.active = saved_pane.active.min(pane.items.len().saturating_sub(1));
+                pane.active = active.min(pane.items.len().saturating_sub(1));
             }
         }
         self.dedupe_across_panes = true;
+        // The saved active pane, by its place in the saved order, before empty panes go.
+        let wanted = self.center.panes().get(saved.active_pane).copied();
         // A pane whose tabs could not be reopened is dropped.
         for id in self.center.panes() {
             if self.pane(id).is_some_and(|p| p.items.is_empty()) && self.panes.len() > 1 {
                 self.remove_pane(id);
             }
         }
-        let order = self.center.panes();
-        let active = order
-            .get(saved.active_pane)
-            .copied()
+        let active = wanted
+            .filter(|id| self.pane(*id).is_some())
             .unwrap_or_else(|| self.center.top_left());
         let index = self.pane(active).map_or(0, |p| p.active);
         self.activate_in(active, index, false, window, cx);
@@ -4750,6 +4763,57 @@ mod tests {
             assert_eq!(tabs(workspace), 1);
             workspace.show_graph(behind.entity_id(), window, cx);
             assert_eq!(tabs(workspace), 2);
+        });
+    }
+
+    /// A saved tab that declines to open (a type the schema dropped) takes neither its pin nor
+    /// the active place with it to the tab after it.
+    #[gpui::test]
+    fn a_saved_tab_that_does_not_open_leaves_the_pins_and_the_active_tab_in_place(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+            persistence::register_item_kind(cx, "maybe", |data, workspace, window, cx| {
+                let key = data.as_str().unwrap_or_default();
+                if key != "gone" {
+                    open_tab(workspace, key, window, cx);
+                }
+            });
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let item = |key: &str| SavedItem {
+            kind: "maybe".into(),
+            data: serde_json::json!(key),
+        };
+        let restored = |workspace: &mut Workspace,
+                        saved: SavedPane,
+                        window: &mut Window,
+                        cx: &mut Context<Workspace>| {
+            let saved = SavedWorkspace {
+                panes: vec![saved],
+                ..workspace.snapshot(cx)
+            };
+            workspace.restore_saved(saved, window, cx);
+            let pane = workspace.pane(workspace.active_pane).unwrap();
+            (pane.items.len(), pane.pinned, pane.active)
+        };
+        workspace.update_in(cx, |workspace, window, cx| {
+            // The pinned first tab is gone: b is not pinned in its place, and b stays active.
+            let pane = SavedPane {
+                items: vec![item("gone"), item("b"), item("c")],
+                active: 1,
+                pinned: 1,
+            };
+            assert_eq!(restored(workspace, pane, window, cx), (2, 0, 0));
+            // The active tab is gone: the one before it is active, not the one after.
+            let pane = SavedPane {
+                items: vec![item("a"), item("gone"), item("c")],
+                active: 1,
+                pinned: 0,
+            };
+            assert_eq!(restored(workspace, pane, window, cx), (2, 0, 0));
         });
     }
 
