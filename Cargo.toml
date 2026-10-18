@@ -78,7 +78,7 @@ theme_settings = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2
 assets = { git = "https://github.com/zed-industries/zed", tag = "v1.23.2" }
 
 # OmniGraph's parser and type checker. MIT; no Lance dependency.
-omnigraph-compiler = { git = "https://github.com/ModernRelay/omnigraph", tag = "v0.13.0" }
+omnigraph-compiler = { git = "https://github.com/ModernRelay/omnigraph", tag = "edge-20261017-d883c49" }
 
 # Third party
 anyhow = "1"

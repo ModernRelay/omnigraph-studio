@@ -932,6 +932,7 @@ mod tests {
             parent_commit_id: None,
             merged_parent_commit_id: None,
             actor_id: Some("act-Dev".into()),
+            kind: Default::default(),
         };
         assert!(commit_matches(&commit, "hb1.01m4r"));
         assert!(commit_matches(&commit, "dev"));

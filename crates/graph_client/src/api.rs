@@ -1,6 +1,6 @@
-//! Request and response types for the OmniGraph 0.13 HTTP contract.
+//! Request and response types for the OmniGraph 0.14 HTTP API.
 //!
-//! Field names and optionality follow `openapi/omnigraph-0.13.0.json`; the test at the bottom
+//! Field names and optionality follow `openapi/omnigraph-0.14.0-edge.json`; the test at the bottom
 //! of this file fails if a type here and the contract disagree. Add fields only as surfaces
 //! need them, and add each new type to the test.
 
@@ -346,6 +346,22 @@ pub struct CommitOutput {
     pub merged_parent_commit_id: Option<String>,
     #[serde(default)]
     pub actor_id: Option<String>,
+    /// Always sent by 0.14; a commit of a branch's history is `published`.
+    #[serde(default)]
+    pub kind: CommitKind,
+}
+
+/// Which kind of commit a commit is (`CommitKindOutput`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitKind {
+    /// A commit of a branch's history.
+    #[default]
+    Published,
+    /// A proposal written `as commit`, awaiting `commit publish`.
+    Unpublished,
+    /// An unattached snapshot, written `as unattached branch`, which never publishes.
+    Unattached,
 }
 
 // ---- changes ----
@@ -452,6 +468,8 @@ pub enum ErrorCode {
     ServiceUnavailable,
     GraphUnavailable,
     Internal,
+    /// `commit publish` of an unattached snapshot, which never publishes.
+    UnattachedCannotPublish,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -489,7 +507,7 @@ mod contract_tests {
 
     use serde_json::Value;
 
-    const CONTRACT: &str = include_str!("../openapi/omnigraph-0.13.0.json");
+    const CONTRACT: &str = include_str!("../openapi/omnigraph-0.14.0-edge.json");
 
     /// (schema name, the fields our type declares). Fields we declare must exist in the
     /// contract, and every field the contract requires must be declared.
@@ -609,6 +627,7 @@ mod contract_tests {
                 "parent_commit_id",
                 "merged_parent_commit_id",
                 "actor_id",
+                "kind",
             ],
         ),
         (
@@ -696,7 +715,12 @@ mod contract_tests {
                 "service_unavailable",
                 "graph_unavailable",
                 "internal",
+                "unattached_cannot_publish",
             ],
+        ),
+        (
+            "CommitKindOutput",
+            &["published", "unpublished", "unattached"],
         ),
         (
             "MergeConflictKindOutput",

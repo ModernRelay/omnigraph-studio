@@ -33,7 +33,7 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// The wait when a 429 names none.
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// How many reads one connection has on the wire at once (spec 003). A server admits a bounded
-/// number of reads across all its clients (0.13 refuses past its read ingress cap, 64 by
+/// number of reads across all its clients (it refuses past its read ingress cap, 64 by
 /// default), so a view that asks for many counts at once queues here rather than being refused
 /// there.
 pub const READ_CONCURRENCY: usize = 8;
@@ -48,7 +48,7 @@ pub enum ReadError {
     ContractMismatch { served: Option<String> },
     /// The server refused the read.
     Refused(ApiErrorSummary),
-    /// The body did not match the 0.13 contract.
+    /// The body did not match the contract.
     Decode(String),
 }
 
@@ -97,6 +97,24 @@ impl ServerHealth {
             .as_deref()
             .is_some_and(|served| SUPPORTED_CONTRACTS.contains(&served))
     }
+
+    /// Whether the server is OmniGraph [`MIN_SERVER_VERSION`] or later, by the version
+    /// `/healthz` names. Its contract header did not change at 0.14, so the version is what
+    /// tells a 0.13 server apart; one Studio cannot read is not supported.
+    pub fn version_supported(&self) -> bool {
+        server_version(&self.health.version).is_some_and(|version| version >= MIN_SERVER_VERSION)
+    }
+}
+
+/// The oldest OmniGraph server Studio supports, as (major, minor): 0.14, the first with the
+/// graph diff and its branch review, merge-base and merge dry run.
+pub const MIN_SERVER_VERSION: (u64, u64) = (0, 14);
+
+/// A server version's major and minor numbers: `0.14.0`, and an edge build such as
+/// `0.14.0-edge+d883c49`, are both (0, 14).
+pub fn server_version(version: &str) -> Option<(u64, u64)> {
+    let mut parts = version.trim().split(['.', '-', '+']);
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
 struct RawResponse {
@@ -1340,14 +1358,25 @@ mod tests {
     }
 
     #[test]
+    fn a_server_version_is_its_major_and_minor() {
+        assert_eq!(server_version("0.14.0"), Some((0, 14)));
+        assert_eq!(server_version("0.14.0-edge+d883c49"), Some((0, 14)));
+        assert_eq!(server_version("1.2"), Some((1, 2)));
+        assert_eq!(server_version("edge"), None);
+        assert!(server_version("0.13.0").unwrap() < MIN_SERVER_VERSION);
+        assert!(server_version("0.15.1").unwrap() > MIN_SERVER_VERSION);
+    }
+
+    #[test]
     fn operation_ids_come_from_the_served_document() {
         let document: Value =
-            serde_json::from_str(include_str!("../openapi/omnigraph-0.13.0.json")).unwrap();
+            serde_json::from_str(include_str!("../openapi/omnigraph-0.14.0-edge.json")).unwrap();
         let ids = operation_ids(&document);
         assert!(ids.contains("cluster_query"));
+        assert!(ids.contains("cluster_getDiff"), "0.14 has the graph diff");
         assert!(
-            !ids.contains("cluster_publishCommit"),
-            "0.13.0 has no commit publish"
+            !ids.contains("cluster_getNodeNeighborhood"),
+            "a route the document does not list is not there"
         );
     }
 

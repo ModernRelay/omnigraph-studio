@@ -1,7 +1,7 @@
 # Deferred OmniGraph engine changes
 
-Studio ships against the released HTTP contract (0.13) and changes nothing in the OmniGraph
-repository for now (constitution X). This is the index; the design of each change, its engine
+Studio's oldest supported server is OmniGraph 0.14 (`edge-20261017-d883c49`; its HTTP contract
+header is still `0.13`), and Studio changes nothing in the OmniGraph repository (constitution X). This is the index; the design of each change, its engine
 rules and its evidence are in [spec 012](../specs/012-omnigraph-engine-changes/plan.md). When
 one is picked up it goes through OmniGraph's own RFC process.
 
@@ -25,7 +25,7 @@ one is picked up it goes through OmniGraph's own RFC process.
 | E16 | Neighbourhood counts per node | 005, 006 | One count query per edge type, concurrent, cached per pinned commit |
 | E17 | `omnigraph lsp` language server | 007 | `gq_language` calls `omnigraph-compiler` in-process |
 | E18 | Tree-sitter grammars and a Zed extension in the OmniGraph repository | E17 | Grammars in this repository under `grammars/` |
-| E19 | Publish `omnigraph-compiler` to crates.io again (stops at 0.8.0) | 001 | Git dependency on tag `v0.13.0` |
+| E19 | Publish `omnigraph-compiler` to crates.io again (stops at 0.8.0) | 001 | Git dependency on tag `edge-20261017-d883c49` |
 | E20 | Delegated, branch-scoped credentials for agents, recorded in history beside the actor ([#978](https://github.com/ModernRelay/omnigraph/issues/978)) | 011, 013 | Agent commits are recorded under the person's actor, on a branch named `agent/<stamp>`; Studio's gateway keeps the agent's writes on that branch |
 | E22 | The CLI reports a write refused at authentication, policy or the contract as not started ([#976](https://github.com/ModernRelay/omnigraph/issues/976)) | 013 | `AGENTS.md` says a Studio refusal wrote nothing |
 | E23 | `omnigraph version --json` with the HTTP contract ([#977](https://github.com/ModernRelay/omnigraph/issues/977)) | 013 | Each installed CLI is tested once against the gateway |
@@ -34,9 +34,9 @@ one is picked up it goes through OmniGraph's own RFC process.
 | E26 | Edge update (T16) | 014 | An unkeyed edge's properties save as delete and insert, with a new id |
 | E27 | Annotation-only schema changes (a display hint on an existing property) | 014 | Every String reads as markdown; a hint can go only on a new property or type |
 
-On OmniGraph main (checked 2026-10-15 at `fe69c039`, server version 0.14.0, not yet released;
-the HTTP contract header is still `0.13`), each to be used only when a server's `/openapi.json`
-advertises it. Studio uses none of them yet.
+In OmniGraph 0.14 (`edge-20261017-d883c49`, checked 2026-10-17; the HTTP contract header is
+still `0.13`), and so on every server Studio supports. Studio uses none of them yet. Paged commit
+lists (E10, #1013) landed on main after that build.
 
 | ID | Feature | Operation | Spec |
 |---|---|---|---|

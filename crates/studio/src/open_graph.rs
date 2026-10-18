@@ -439,7 +439,7 @@ fn state_color(state: &ConnectionState) -> Color {
     match state {
         ConnectionState::Ready => Color::Success,
         ConnectionState::Connecting | ConnectionState::Idle => Color::Muted,
-        ConnectionState::ContractMismatch { .. } => Color::Warning,
+        ConnectionState::ContractMismatch { .. } | ConnectionState::TooOld { .. } => Color::Warning,
         ConnectionState::Unauthorized | ConnectionState::Unreachable(_) => Color::Error,
     }
 }

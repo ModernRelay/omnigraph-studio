@@ -234,10 +234,13 @@ pub struct Outline {
 /// A statement that is not a query declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Statement {
-    /// `show …` and `branch list`: answered as rows.
+    /// `show …`, `branch list` and `explain load …`: answered as rows.
     Read,
-    /// `branch create`, `branch delete`, `branch merge`: changes branches.
+    /// `branch create`, `branch delete`, `branch merge`, `commit publish`, `commit drop`:
+    /// changes branches or commits, each naming its own target.
     Write,
+    /// `load csv … into …`: loads into the request's branch, as a mutation does.
+    Load,
 }
 
 /// The declarations of a source and its settings prefix.
@@ -290,6 +293,18 @@ pub fn outline(source: &str) -> Outline {
             } else {
                 Statement::Write
             });
+            return outline;
+        }
+        "commit" => {
+            outline.statement = Some(Statement::Write);
+            return outline;
+        }
+        "load" => {
+            outline.statement = Some(Statement::Load);
+            return outline;
+        }
+        "explain" if tokens.get(first + 1).map(text) == Some("load") => {
+            outline.statement = Some(Statement::Read);
             return outline;
         }
         _ => {}
@@ -532,6 +547,18 @@ mod tests {
         assert!(outline_explain.declarations[0].explained);
         assert_eq!(outline("branch list").statement, Some(Statement::Read));
         assert_eq!(outline("show all;").statement, Some(Statement::Read));
+        assert_eq!(
+            outline("commit publish \"c1\"").statement,
+            Some(Statement::Write)
+        );
+        assert_eq!(
+            outline("load csv \"s3://b/p.csv\" into node:Person mode append").statement,
+            Some(Statement::Load)
+        );
+        assert_eq!(
+            outline("explain load csv \"s3://b/p.csv\" into node:Person mode append").statement,
+            Some(Statement::Read)
+        );
         assert_eq!(
             outline("branch create x from main").statement,
             Some(Statement::Write)

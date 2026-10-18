@@ -6,7 +6,9 @@
 #   script/dev-server            # first run applies the cluster and loads dev/seed.jsonl
 #   script/dev-server --reset    # start again from an empty graph
 #
-# Needs OmniGraph 0.13 (`omnigraph` and `omnigraph-server`). Data lives in dev/.data.
+# Needs OmniGraph 0.14 (`omnigraph` and `omnigraph-server`; until it is released, the edge build
+# `edge-20261017-d883c49`, named by OMNIGRAPH_BIN and OMNIGRAPH_SERVER_BIN when not on PATH).
+# Data lives in dev/.data; 0.14 stamps it format 16 on its first write, which 0.13 cannot open.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -24,8 +26,8 @@ fi
 # line into a closed pipe, which `pipefail` turns into a failed start.
 version=$("$CLI" version)
 version=${version%%$'\n'*}
-if [[ "$version" != "omnigraph 0.13."* ]]; then
-  echo "dev-server needs OmniGraph 0.13; found: $version (set OMNIGRAPH_BIN)" >&2
+if [[ "$version" != "omnigraph 0.14."* ]]; then
+  echo "dev-server needs OmniGraph 0.14; found: $version (set OMNIGRAPH_BIN and OMNIGRAPH_SERVER_BIN)" >&2
   exit 1
 fi
 

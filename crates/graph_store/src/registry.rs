@@ -494,7 +494,7 @@ mod tests {
                 Ok(Response::builder()
                     .status(200)
                     .header(graph_client::CONTRACT_HEADER, "0.13")
-                    .body(AsyncBody::from(r#"{"status":"ok","version":"0.13.0"}"#))
+                    .body(AsyncBody::from(r#"{"status":"ok","version":"0.14.0"}"#))
                     .unwrap())
             }
         });

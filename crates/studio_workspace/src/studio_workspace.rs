@@ -2076,7 +2076,9 @@ impl Workspace {
                 let color = match &connection.state {
                     ConnectionState::Ready => Color::Success,
                     ConnectionState::Connecting | ConnectionState::Idle => Color::Muted,
-                    ConnectionState::ContractMismatch { .. } => Color::Warning,
+                    ConnectionState::ContractMismatch { .. } | ConnectionState::TooOld { .. } => {
+                        Color::Warning
+                    }
                     _ => Color::Error,
                 };
                 // The server's round trip from the last health check, beside its state.

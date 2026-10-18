@@ -1685,7 +1685,7 @@ checksum = "ba7a06c0b31fff5ff2e1e7d37dbf940864e2a974b336e1a2938d10af6e8fb283"
 dependencies = [
  "serde",
  "termcolor",
- "unicode-width 0.2.2",
+ "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -4557,7 +4557,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.56.0",
 ]
 
 [[package]]
@@ -6943,8 +6943,8 @@ dependencies = [
 
 [[package]]
 name = "omnigraph-compiler"
-version = "0.13.0"
-source = "git+https://github.com/ModernRelay/omnigraph?tag=v0.13.0#926ba3528c51583049c862f02a9604a610a9f560"
+version = "0.14.0"
+source = "git+https://github.com/ModernRelay/omnigraph?tag=edge-20261017-d883c49#d883c49e741f0c2d2b863c1d500601c023bd41f5"
 dependencies = [
  "ahash",
  "arrow-array",

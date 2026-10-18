@@ -79,7 +79,7 @@ pub struct QueryInfo {
 pub struct QueryCheck {
     pub diagnostics: Vec<Diagnostic>,
     pub queries: Vec<QueryInfo>,
-    /// The source is a single statement (`branch …`, `show …`, `explain …`) rather than
+    /// The source is a single statement (`branch …`, `show …`, `commit …`, `load …`, `explain load …`) rather than
     /// query declarations.
     pub statement: bool,
 }
@@ -99,7 +99,11 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
     let decls = match file.body {
         FileBody::Queries(decls) => decls,
         FileBody::Explain(decl) => vec![decl],
-        FileBody::Branch(_) | FileBody::Show(_) => {
+        FileBody::Branch(_)
+        | FileBody::Show(_)
+        | FileBody::Commit(_)
+        | FileBody::Load(_)
+        | FileBody::ExplainLoad(_) => {
             result.statement = true;
             return result;
         }
@@ -127,7 +131,8 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
                             let Expr::Variable(var) = &projection.expr else {
                                 return None;
                             };
-                            let Some(BoundVariable::Node { type_name }) = context.bindings.get(var)
+                            let Some(BoundVariable::Node { type_name }) =
+                                context.bindings().get(var)
                             else {
                                 return None;
                             };

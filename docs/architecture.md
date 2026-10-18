@@ -13,7 +13,7 @@ other: what two features share moves down a layer.
 |---|---|---|---|
 | 0 | `studio_actions` | Every action type, with doc comments that become palette descriptions | `gpui` |
 | 1 | `studio_settings`, `studio_theme` | Typed layered settings; graph tokens over Zed's themes, set up through Zed's `theme_settings`, and the themes Studio bundles | `gpui`, `theme`, `theme_settings`, serde |
-| 2 | `graph_client` | Every HTTP request: contract header, DTOs for the 0.13 API, write outcomes, change-feed paging. **No `gpui`** | Zed `http_client` (Apache-2.0), serde |
+| 2 | `graph_client` | Every HTTP request: contract header, DTOs for the 0.14 API, write outcomes, change-feed paging. **No `gpui`** | Zed `http_client` (Apache-2.0), serde |
 | 2 | `gq_language` | Schema and query intelligence on `omnigraph-compiler`: parse, diagnostics, completion items, hover text, result-column types. **No `gpui`** | `omnigraph-compiler` |
 | 2 | `studio_ui` | Studio components on Zed's `ui`: the design system (`ds`), state chips, write-outcome banners, empty and error states, text read as markdown | `ui`, `theme`, `studio_theme`, `pulldown-cmark` |
 | 3 | `graph_store` | GPUI entities: connections, graph sessions, schema model, snapshot pins, exploration, drafts | `gpui`, `graph_client`, `gq_language`, Zed's `reqwest_client` |
@@ -109,10 +109,10 @@ a 412 reopens the draft.
 ## Testing
 
 - `#[gpui::test]` for views and entities, against `graph_client` driven by Zed's
-  `FakeHttpClient` with recorded 0.13 responses.
+  `FakeHttpClient` with recorded responses.
 - `graph_client` and `gq_language` have plain unit tests; they do not depend on GPUI.
-- `crates/graph_client/openapi/omnigraph-0.13.0.json` is the contract; a test checks every DTO
-  and route against it.
+- `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` (OmniGraph `edge-20261017-d883c49`)
+  is the contract; a test checks every DTO and route against it.
 - macOS screenshot tests for the main views, once the views exist.
 
 ## Connecting to graphs today

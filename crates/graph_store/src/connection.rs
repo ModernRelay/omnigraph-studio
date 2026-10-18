@@ -35,7 +35,14 @@ pub enum ConnectionState {
     Idle,
     Connecting,
     Ready,
-    ContractMismatch { served: Option<String> },
+    ContractMismatch {
+        served: Option<String>,
+    },
+    /// The server is older than Studio supports (`graph_client::MIN_SERVER_VERSION`), by the
+    /// version its `/healthz` names.
+    TooOld {
+        version: String,
+    },
     Unauthorized,
     Unreachable(String),
 }
@@ -48,9 +55,16 @@ impl ConnectionState {
             ConnectionState::Connecting => "Connecting…".into(),
             ConnectionState::Ready => format!("contract {}", graph_client::SUPPORTED_CONTRACTS[0]),
             ConnectionState::ContractMismatch { served } => match served {
-                Some(served) => format!("Server speaks {served}; Studio speaks 0.13"),
+                Some(served) => format!(
+                    "Server speaks {served}; Studio speaks {}",
+                    graph_client::SUPPORTED_CONTRACTS.join(", ")
+                ),
                 None => "Server did not say which contract it speaks".into(),
             },
+            ConnectionState::TooOld { version } => {
+                let (major, minor) = graph_client::MIN_SERVER_VERSION;
+                format!("OmniGraph {version}; Studio needs {major}.{minor} or later")
+            }
             ConnectionState::Unauthorized => "Token refused".into(),
             ConnectionState::Unreachable(_) => "Unreachable".into(),
         }
@@ -266,6 +280,9 @@ impl Connection {
             Ok(health) if !health.contract_supported() => ConnectionState::ContractMismatch {
                 served: health.contract.clone(),
             },
+            Ok(health) if !health.version_supported() => ConnectionState::TooOld {
+                version: health.health.version.clone(),
+            },
             Ok(_) if self.state == ConnectionState::Ready => ConnectionState::Ready,
             // Recovered: probe capabilities and graphs again, which schedules the next check.
             Ok(_) => {
@@ -310,6 +327,11 @@ async fn probe(client: &GraphClient) -> Probe {
             served: health.contract.clone(),
         });
     }
+    if !health.version_supported() {
+        return Probe::Failed(ConnectionState::TooOld {
+            version: health.health.version.clone(),
+        });
+    }
     let operations = client.operations().await.unwrap_or_default();
     let graphs = match client.graphs().await {
         Ok(list) => GraphListing::Listed(list.graphs),
@@ -324,5 +346,56 @@ async fn probe(client: &GraphClient) -> Probe {
         latency,
         operations,
         graphs,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{AppContext as _, TestAppContext};
+    use http_client::{AsyncBody, FakeHttpClient, Response};
+
+    /// A server answering `/healthz` with `version`, and every other read with no graphs.
+    fn connect_to(version: &'static str, cx: &mut TestAppContext) -> ConnectionState {
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            async move {
+                let body = if path.ends_with("/healthz") {
+                    format!(r#"{{"status":"ok","version":"{version}","internal_schema_version":16}}"#)
+                } else {
+                    r#"{"graphs":[]}"#.to_owned()
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        connection.read_with(cx, |connection, _| connection.state.clone())
+    }
+
+    /// A 0.13 server speaks the same contract header as 0.14, so its version is what refuses
+    /// it; an edge build of 0.14 connects.
+    #[gpui::test]
+    async fn a_server_older_than_0_14_is_refused_by_its_version(cx: &mut TestAppContext) {
+        let refused = connect_to("0.13.0", cx);
+        assert_eq!(
+            refused,
+            ConnectionState::TooOld {
+                version: "0.13.0".into()
+            }
+        );
+        assert_eq!(refused.label(), "OmniGraph 0.13.0; Studio needs 0.14 or later");
+        assert_eq!(connect_to("0.14.0-edge+d883c49", cx), ConnectionState::Ready);
     }
 }

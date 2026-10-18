@@ -28,8 +28,10 @@ Requirements:
 - macOS: the Command Line Tools (GPUI compiles its Metal shaders when Studio starts); full
   Xcode to compile them into a release build (`script/bundle-mac`). Linux: the Wayland, X11 and
   Vulkan development packages listed in `.github/workflows/ci.yml`.
-- An OmniGraph 0.13 server. For the sample graph, the `omnigraph` and `omnigraph-server` 0.13
-  binaries on `PATH`.
+- An OmniGraph 0.14 server or later; Studio refuses an older one. For the sample graph, the
+  `omnigraph` and `omnigraph-server` 0.14 binaries: until 0.14 is released, the edge build
+  `edge-20261017-d883c49` (`VERSION=edge-20261017-d883c49` with OmniGraph's `scripts/install.sh`),
+  on `PATH` or named by `OMNIGRAPH_BIN` and `OMNIGRAPH_SERVER_BIN`.
 
 Run against the sample graph (200 people, 25 companies, 40 projects):
 
@@ -94,8 +96,9 @@ Studio is a client of the OmniGraph HTTP API and nothing else. These rules are i
 `.specify/memory/constitution.md` and each feature plan records how it follows them.
 
 - **HTTP only.** No access to graph storage and no engine crate except `omnigraph-compiler`,
-  which is linked for parsing and type checking. Every request sends `omnigraph-http-api: 0.13`,
-  and a response without the header is treated as having an unknown effect.
+  which is linked for parsing and type checking. Every request sends `omnigraph-http-api: 0.13`
+  (unchanged in 0.14), and a response without the header is treated as having an unknown effect.
+  A server older than 0.14, by the version its `/healthz` names, is refused.
 - **One commit per view.** A view records the `graph_commit_id` of its first read and passes it
   as `snapshot` on every later read. When the branch head moves, the view shows "Newer data ·
   Refresh" and keeps its data until refreshed.
@@ -107,7 +110,7 @@ Studio is a client of the OmniGraph HTTP API and nothing else. These rules are i
   draft is kept until then.
 - **Server policy.** Authorization is the server's Cedar policy; Studio enforces no rules of its
   own. A 403 is shown as a refusal and the draft stays.
-- **Newer routes on demand.** Routes beyond 0.13 are used only when the server's OpenAPI
+- **Newer routes on demand.** Routes beyond 0.14 are used only when the server's OpenAPI
   document advertises them. Engine changes Studio would use, and what it does without them, are
   listed in `docs/deferred-engine-changes.md` and [spec 012](specs/012-omnigraph-engine-changes/plan.md).
 
@@ -166,7 +169,7 @@ what is deferred, and a dated validation log of the checks behind each claim.
 
 ## Status
 
-Built against OmniGraph 0.13; macOS is the primary platform, and Linux and Windows build and
+Built against OmniGraph 0.14 (`edge-20261017-d883c49`); macOS is the primary platform, and Linux and Windows build and
 test in CI. Not implemented:
 
 - Signed and notarized releases, a Windows installer, auto-update.

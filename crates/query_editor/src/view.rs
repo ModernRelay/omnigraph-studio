@@ -1300,8 +1300,10 @@ impl QueryEditor {
                 text: source.clone(),
                 name: None,
                 label,
-                write: statement == Statement::Write,
-                statement: true,
+                write: statement != Statement::Read,
+                // A load writes to the request's branch, as a mutation does; the others name
+                // their own targets.
+                statement: statement != Statement::Load,
                 params: None,
                 columns: None,
                 map: SourceMap {

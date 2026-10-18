@@ -1,11 +1,12 @@
-//! The only crate that makes HTTP requests: the 0.13 contract header, request and response
-//! types, typed errors, write outcomes, change-feed paging. No GPUI.
+//! The only crate that makes HTTP requests: the contract header, request and response types,
+//! typed errors, write outcomes, change-feed paging. No GPUI.
 //!
 //! Layer 2 (`docs/architecture.md`). Plan: `specs/003-connections/plan.md`.
 //!
 //! Built on Zed's `http_client::HttpClient` (Apache-2.0): the app passes `reqwest_client`,
-//! tests pass Zed's fake client. The contract is `openapi/omnigraph-0.13.0.json`, copied from
-//! OmniGraph `v0.13.0` (MIT).
+//! tests pass Zed's fake client. The contract is `openapi/omnigraph-0.14.0-edge.json`, copied
+//! from OmniGraph at `edge-20261017-d883c49` (`0.14.0-edge+d883c49`, MIT), the oldest server
+//! Studio supports. Its contract header is still `0.13`.
 
 pub mod api;
 mod client;
@@ -13,7 +14,8 @@ mod client;
 pub use api::ErrorOutput;
 pub use client::{
     ApiErrorSummary, BLOB_READ_MAX, BlobAt, BlobCell, BlobMeta, CommitChanges, ForwardRequest,
-    ForwardResponse, GraphClient, ReadError, ServerHealth, server_root,
+    ForwardResponse, GraphClient, MIN_SERVER_VERSION, ReadError, ServerHealth, server_root,
+    server_version,
 };
 pub use http_client::{
     AsyncBody,
@@ -24,7 +26,8 @@ pub use http_client::{
 /// (`omnigraph-api-types` `HTTP_API_CONTRACT_HEADER` at OmniGraph v0.13.0).
 pub const CONTRACT_HEADER: &str = "omnigraph-http-api";
 
-/// The contracts this client speaks (`HTTP_API_CONTRACT` at OmniGraph v0.13.0).
+/// The contracts this client speaks: `HTTP_API_CONTRACT`, unchanged from OmniGraph 0.13 to
+/// 0.14.
 pub const SUPPORTED_CONTRACTS: &[&str] = &["0.13"];
 
 /// Header that binds a write to the commit it was read at.
