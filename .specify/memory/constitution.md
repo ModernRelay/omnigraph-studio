@@ -1,7 +1,7 @@
 # OmniGraph Studio constitution
 
-Version 1.1.0 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
-put back)
+Version 1.2.0 · ratified 2026-10-11 · amended 2026-10-17 (IV: ↵ and Undo for what Studio can
+put back) · amended 2026-10-18 (IV: ↵ for what loses no data)
 
 OmniGraph Studio is a native desktop app for exploring and changing OmniGraph graphs: type
 tables, a relationship tree, a graph canvas, a `.gq` query editor, branches, review, merge and
@@ -37,7 +37,8 @@ known.
 Every surface that writes shows the branch it writes to. A destructive action says exactly what
 it destroys, including what goes with it, before it runs. When Studio can put it all back, it
 is confirmed with ↵ and its outcome offers Undo; when it cannot, it is confirmed by typing the
-name or key of what is destroyed. Studio reflects the server's policy and never
+name or key of what is destroyed. An action that destroys no data, such as deleting a branch
+whose every commit is already in its target, is confirmed with ↵. Studio reflects the server's policy and never
 enforces its own: a hidden button is a courtesy, a 403 is shown as a denial, and the draft
 stays.
 

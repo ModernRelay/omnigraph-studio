@@ -30,7 +30,7 @@ use studio_ui::{
 };
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace, workspace_for};
 use ui::prelude::*;
-use ui::{Banner, ContextMenu, KeyBinding, PopoverMenu, Severity, Tooltip};
+use ui::{Banner, Checkbox, ContextMenu, KeyBinding, PopoverMenu, Severity, ToggleState, Tooltip};
 
 use crate::conflicts::{conflict_wording, resolution_hint};
 
@@ -105,6 +105,8 @@ enum MergeState {
         /// The merge took a head of the branch other than the one reviewed: someone committed
         /// to it between Studio's check and the merge.
         beyond_review: bool,
+        /// The branch's deletion after the merge, when asked for: done, or why not.
+        deleted: Option<Result<(), String>>,
     },
     Conflicts(Vec<MergeConflictOutput>),
     Refused(String),
@@ -199,6 +201,8 @@ pub struct ReviewView {
     /// change made again since is reviewed again.
     reviewed_keys: HashSet<String>,
     merge: MergeState,
+    /// Whether the merge deletes the branch once it lands; on unless the person turns it off.
+    delete_branch: bool,
     show_conflicts: bool,
     /// Someone else wrote to the branch after this review was read.
     newer: bool,
@@ -304,6 +308,7 @@ impl ReviewView {
             bound_head: None,
             reviewed_keys: HashSet::new(),
             merge: MergeState::Idle,
+            delete_branch: true,
             show_conflicts: false,
             newer: false,
             fixes_running: 0,
@@ -790,6 +795,11 @@ impl ReviewView {
         }
     }
 
+    /// Whether the merge deletes the branch: as the checkbox says, and never `main`.
+    fn delete_after_merge(&self) -> bool {
+        self.delete_branch && self.branch != "main"
+    }
+
     /// Merges the branch into the target after checking the branch still sits at the head this
     /// review holds. The outcome is shown, then confirmed against the target's history.
     pub fn merge(&mut self, cx: &mut Context<Self>) {
@@ -833,7 +843,10 @@ impl ReviewView {
             let Ok(task) = this.update(cx, |this, cx| {
                 this.merge = MergeState::Merging;
                 cx.notify();
-                session.update(cx, |s, cx| s.merge(branch.clone(), target.clone(), cx))
+                let delete = this.delete_after_merge();
+                session.update(cx, |s, cx| {
+                    s.merge(branch.clone(), target.clone(), delete, cx)
+                })
             }) else {
                 return;
             };
@@ -841,8 +854,21 @@ impl ReviewView {
             let state = match outcome {
                 WriteOutcome::Committed(output) => {
                     let BranchMergeOutput {
-                        outcome, commit, ..
+                        outcome,
+                        commit,
+                        branch_deleted,
+                        branch_delete_error_details,
+                        ..
                     } = output;
+                    let deleted = branch_deleted.map(|deleted| {
+                        if deleted {
+                            Ok(())
+                        } else {
+                            Err(branch_delete_error_details
+                                .map(|details| details.error)
+                                .unwrap_or_else(|| "the server did not say why".into()))
+                        }
+                    });
                     // The head the merge took: the merge commit's second parent, or the commit
                     // a fast-forward moved the target to.
                     let took = match outcome {
@@ -863,6 +889,7 @@ impl ReviewView {
                             commit: commit.clone(),
                             verified: Check::Reading,
                             beyond_review,
+                            deleted: deleted.clone(),
                         };
                         cx.notify();
                     })
@@ -881,6 +908,7 @@ impl ReviewView {
                         commit,
                         verified: Check::of(verified),
                         beyond_review,
+                        deleted,
                     }
                 }
                 WriteOutcome::Refused(error) => match error.body.merge_conflicts {
@@ -963,8 +991,14 @@ impl ReviewView {
         .disabled(!mergeable)
         .tooltip({
             let cli = format!(
-                "omnigraph branch merge {} --into {}",
-                self.branch, self.target
+                "omnigraph branch merge {} --into {}{}",
+                self.branch,
+                self.target,
+                if self.delete_after_merge() {
+                    " --delete-branch"
+                } else {
+                    ""
+                }
             );
             move |_, cx| {
                 Tooltip::with_meta(
@@ -1193,6 +1227,23 @@ impl ReviewView {
                     )
                     .child(div().flex_1())
                     .child(refresh)
+                    .when(self.branch != "main", |row| {
+                        row.child(
+                            Checkbox::new(
+                                "delete-after-merge",
+                                ToggleState::from(self.delete_branch),
+                            )
+                            .label(format!("Delete {}", self.branch))
+                            .label_size(LabelSize::Small)
+                            .disabled(!mergeable)
+                            .on_click(cx.listener(
+                                |this, state: &ToggleState, _, cx| {
+                                    this.delete_branch = state.selected();
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                    })
                     .child(merge_button),
             )
             .child(h_flex().gap_2().child(scope_menu).child(search))
@@ -1243,6 +1294,7 @@ impl ReviewView {
                 commit,
                 verified,
                 beyond_review,
+                deleted,
             } => {
                 let what = match outcome {
                     BranchMergeOutcome::FastForward => {
@@ -1285,8 +1337,17 @@ impl ReviewView {
                 } else {
                     String::new()
                 };
+                let deletion = match deleted {
+                    None => String::new(),
+                    Some(Ok(())) => format!(" Deleted {}.", self.branch),
+                    Some(Err(why)) => format!(" {} was not deleted: {why}.", self.branch),
+                };
+                let beyond = format!("{beyond}{deletion}");
                 (
-                    if matches!(verified, Check::NotShown | Check::Unread) || *beyond_review {
+                    if matches!(verified, Check::NotShown | Check::Unread)
+                        || *beyond_review
+                        || matches!(deleted, Some(Err(_)))
+                    {
                         Severity::Warning
                     } else {
                         Severity::Success
@@ -2137,7 +2198,7 @@ pub fn open_review(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use graph_client::api::{ChangeImageOutput, EntityKind};
     use serde_json::json;
 
@@ -2254,6 +2315,48 @@ mod tests {
         }
     }
 
+    /// A merge deletes the branch unless the person turns that off, and says what became of it.
+    #[gpui::test]
+    async fn a_merge_deletes_the_branch_unless_the_person_says_not(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        for delete in [true, false] {
+            let (session, asked) = review_server(false, None, "f2", |_| (500, json!({})), cx);
+            let (view, cx) = cx.add_window_view(|window, cx| {
+                ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+            });
+            cx.run_until_parked();
+            view.update(cx, |view, cx| {
+                assert!(view.delete_branch, "on unless turned off");
+                view.delete_branch = delete;
+                view.merge(cx);
+            });
+            cx.run_until_parked();
+            let merges: Vec<String> = asked
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.contains("/branches/merge?"))
+                .cloned()
+                .collect();
+            assert_eq!(merges.len(), 1, "{merges:?}");
+            assert_eq!(merges[0].contains("\"delete_branch\":true"), delete);
+            view.read_with(cx, |view, cx| {
+                match &view.merge {
+                    MergeState::Merged { deleted, .. } => {
+                        assert_eq!(deleted.as_ref().map(Result::is_ok), delete.then_some(true));
+                    }
+                    _ => panic!("not merged"),
+                }
+                // A session on the deleted branch moves to the branch it was merged into.
+                let branch = view.session.read(cx).branch.clone();
+                assert_eq!(branch, if delete { "main" } else { "feature" });
+            });
+        }
+    }
+
     /// A server for a review of `feature` against `main`: `feature` forked at m1 and committed
     /// f1 (a person added) and f2 (one changed). Every request's path and query is recorded.
     /// With `merged_in`, `main`'s m2 was merged into `feature`: the merge base is m2, off
@@ -2341,15 +2444,16 @@ mod tests {
         };
         let main = json!({ "commits": [commit("m2", Some("m1")), commit("m1", None)] });
         fake_server(
-            move |path, query| {
+            move |path, query, sent| {
                 if path.contains("/mutate") {
                     write(writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
                 } else if path.ends_with("/branches/merge") {
                     let merge = json!({ "graph_commit_id": "m3", "graph_manifest_version": 4, "created_at": 0, "parent_commit_id": "m2", "merged_parent_commit_id": took });
-                    (
-                        200,
-                        json!({ "source": "feature", "target": "main", "outcome": "merged", "commit": merge }),
-                    )
+                    let mut answer = json!({ "source": "feature", "target": "main", "outcome": "merged", "commit": merge });
+                    if sent.contains("\"delete_branch\":true") {
+                        answer["branch_deleted"] = json!(true);
+                    }
+                    (200, answer)
                 } else if path.ends_with("/schema") {
                     (
                         200,
@@ -2378,10 +2482,10 @@ mod tests {
         )
     }
 
-    /// A session on a server answering each request's path and query with `answer`; every
-    /// request is recorded.
-    fn fake_server(
-        answer: impl Fn(&str, &str) -> (u16, Value) + Send + Sync + 'static,
+    /// A session on a server answering each request's path, query and body with `answer`;
+    /// every request is recorded, a merge with its body.
+    pub(crate) fn fake_server(
+        answer: impl Fn(&str, &str, &str) -> (u16, Value) + Send + Sync + 'static,
         cx: &mut gpui::TestAppContext,
     ) -> (
         Entity<GraphSession>,
@@ -2394,6 +2498,7 @@ mod tests {
 
         let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = asked.clone();
+        let answer = std::sync::Arc::new(answer);
         let http = FakeHttpClient::create(move |request| {
             let path = request.uri().path().to_owned();
             let query = request.uri().query().unwrap_or_default().to_owned();
@@ -2403,9 +2508,20 @@ mod tests {
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default()
                 .to_owned();
-            seen.lock().unwrap().push(format!("{path}?{query} {bound}"));
-            let (status, body) = answer(&path, &query);
+            let (seen, answer) = (seen.clone(), answer.clone());
             async move {
+                use futures::AsyncReadExt as _;
+                let mut sent = String::new();
+                request.into_body().read_to_string(&mut sent).await.ok();
+                let merge = if path.ends_with("/branches/merge") {
+                    format!(" {sent}")
+                } else {
+                    String::new()
+                };
+                seen.lock()
+                    .unwrap()
+                    .push(format!("{path}?{query} {bound}{merge}"));
+                let (status, body) = answer(&path, &query, &sent);
                 Ok(Response::builder()
                     .status(status)
                     .header(graph_client::CONTRACT_HEADER, "0.13")
@@ -2510,7 +2626,7 @@ mod tests {
         let base = json!({ "merge_base": commit("f3", None), "source": "feature", "source_commit_id": "f3", "target": "main", "target_commit_id": "m4" });
         let main = json!({ "commits": [commit("m4", Some("f3")), commit("m3", Some("f2")), commit("m1", None)] });
         let (session, _) = fake_server(
-            move |path, _| {
+            move |path, _, _| {
                 if path.ends_with("/branches/merge-base") {
                     (200, base.clone())
                 } else if path.ends_with("/commits") {
@@ -2545,7 +2661,7 @@ mod tests {
         );
 
         // A history that cannot be read tells nothing: not "not found".
-        let (session, _) = fake_server(|_, _| (500, json!({ "error": "down" })), cx);
+        let (session, _) = fake_server(|_, _, _| (500, json!({ "error": "down" })), cx);
         let mut async_cx = cx.to_async();
         let shown = merge_shown(
             &session,

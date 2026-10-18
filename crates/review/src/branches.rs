@@ -467,15 +467,31 @@ impl Render for CreateBranchModal {
     }
 }
 
-/// "Delete branch": confirmed by typing the branch's name (constitution IV). `main` cannot be
-/// deleted.
+/// What deleting a branch would lose, read from its merge base with [`TARGET`] when the
+/// dialog opens.
+#[derive(Debug, Clone, PartialEq)]
+enum Holds {
+    Reading,
+    /// Its head is in the target: deleting it loses no commit.
+    Merged,
+    /// It has commits the target does not.
+    Unmerged,
+    /// The check could not be read: treated as unmerged.
+    Unknown(String),
+}
+
+/// "Delete branch" (constitution IV). A branch whose every commit is already in `main` loses
+/// nothing with it, so ↵ deletes it; one with commits only it holds, or one the check could not
+/// read, is deleted by typing its name. `main` cannot be deleted.
 pub struct DeleteBranchModal {
     session: Entity<GraphSession>,
     branch: String,
+    holds: Holds,
     confirm: Entity<Editor>,
     error: Option<SharedString>,
     running: bool,
     focus_handle: FocusHandle,
+    _check: Task<()>,
     _task: Option<Task<()>>,
     _subscription: Subscription,
 }
@@ -490,8 +506,8 @@ impl ModalView for DeleteBranchModal {
 }
 
 impl Focusable for DeleteBranchModal {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.confirm.focus_handle(cx)
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
@@ -504,7 +520,7 @@ impl DeleteBranchModal {
     ) -> Self {
         let confirm = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text(&format!("Type {branch} to confirm"), window, cx);
+            editor.set_placeholder_text(&format!("Type {branch} to delete it"), window, cx);
             editor
         });
         let subscription = cx.subscribe(&confirm, |this, _, event: &EditorEvent, cx| {
@@ -513,20 +529,48 @@ impl DeleteBranchModal {
                 cx.notify();
             }
         });
+        let read = session.update(cx, |session, cx| session.merge_base(&branch, TARGET, cx));
+        let check = cx.spawn_in(window, async move |this, cx| {
+            let holds = match read.await {
+                Ok(base) if base.merge_base.graph_commit_id == base.source_commit_id => {
+                    Holds::Merged
+                }
+                Ok(_) => Holds::Unmerged,
+                Err(error) => Holds::Unknown(error.to_string()),
+            };
+            this.update_in(cx, |this, window, cx| {
+                if holds != Holds::Merged {
+                    window.focus(&this.confirm.focus_handle(cx), cx);
+                }
+                this.holds = holds;
+                cx.notify();
+            })
+            .ok();
+        });
         Self {
             session,
             branch,
+            holds: Holds::Reading,
             confirm,
             error: None,
             running: false,
             focus_handle: cx.focus_handle(),
+            _check: check,
             _task: None,
             _subscription: subscription,
         }
     }
 
+    /// Whether Delete may run: a merged branch at once, any other once its name is typed.
     fn confirmed(&self, cx: &App) -> bool {
-        self.branch != TARGET && self.confirm.read(cx).text(cx).trim() == self.branch
+        self.branch != TARGET
+            && match self.holds {
+                Holds::Reading => false,
+                Holds::Merged => true,
+                Holds::Unmerged | Holds::Unknown(_) => {
+                    self.confirm.read(cx).text(cx).trim() == self.branch
+                }
+            }
     }
 
     fn delete(&mut self, cx: &mut Context<Self>) {
@@ -562,34 +606,43 @@ impl DeleteBranchModal {
 impl Render for DeleteBranchModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let confirmed = self.confirmed(cx);
-        let is_target = self.branch == TARGET;
-        let reason = if is_target {
-            Some(format!("{TARGET} cannot be deleted."))
-        } else if !confirmed {
-            Some(format!("Type {} to enable Delete.", self.branch))
-        } else {
-            None
+        let branch = &self.branch;
+        let (what, typing) = match &self.holds {
+            Holds::Reading => (
+                format!("Checking whether {branch} is merged into {TARGET}…"),
+                false,
+            ),
+            Holds::Merged => (
+                format!("Everything on {branch} is in {TARGET}, so deleting it loses nothing."),
+                false,
+            ),
+            Holds::Unmerged => (
+                format!(
+                    "{branch} has commits that are not in {TARGET}. Deleting it loses them, and \
+                     Studio cannot bring them back."
+                ),
+                true,
+            ),
+            Holds::Unknown(error) => (
+                format!(
+                    "Studio could not tell whether {branch} is merged into {TARGET} ({error}). \
+                     Deleting it may lose commits."
+                ),
+                true,
+            ),
         };
-        studio_ui::ds::dialog(format!("Delete branch {}", self.branch), cx)
+        let cli = format!("omnigraph branch delete {branch}");
+        studio_ui::ds::dialog(format!("Delete {branch}?"), cx)
             .key_context("DeleteBranchModal")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.delete(cx)))
-            .child(
-                Label::new(format!(
-                    "Its commits stay reachable only if merged. Type {} to confirm.",
-                    self.branch
-                ))
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-            )
-            .child(field(&self.confirm, cx))
-            .child(
-                Label::new(format!("omnigraph branch delete {}", self.branch))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
-                    .buffer_font(cx),
-            )
+            .child(Label::new(what).size(LabelSize::Small).color(if typing {
+                Color::Warning
+            } else {
+                Color::Muted
+            }))
+            .when(typing, |dialog| dialog.child(field(&self.confirm, cx)))
             .children(
                 self.error
                     .clone()
@@ -599,9 +652,6 @@ impl Render for DeleteBranchModal {
                 h_flex()
                     .gap_2()
                     .justify_end()
-                    .children(
-                        reason.map(|r| Label::new(r).size(LabelSize::XSmall).color(Color::Muted)),
-                    )
                     .child(
                         studio_ui::ds::button("cancel", "Cancel")
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
@@ -618,6 +668,9 @@ impl Render for DeleteBranchModal {
                         .style(ButtonStyle::Filled)
                         .color(Color::Error)
                         .disabled(!confirmed || self.running)
+                        .tooltip(move |_, cx| {
+                            Tooltip::with_meta("Delete the branch", None, cli.clone(), cx)
+                        })
                         .on_click(cx.listener(|this, _, _, cx| this.delete(cx))),
                     ),
             )
@@ -665,4 +718,84 @@ pub fn register(workspace: &mut Workspace) {
             DeleteBranchModal::new(session, branch, window, cx)
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::view::tests::fake_server;
+
+    /// A merged branch is deleted with ↵; one with commits only it holds waits for its name.
+    #[gpui::test]
+    async fn a_merged_branch_deletes_at_once_and_an_unmerged_one_by_its_name(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let commit = |id: &str| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "created_at": 0 });
+        let (session, asked) = fake_server(
+            move |path, query, _| {
+                if path.ends_with("/branches/merge-base") {
+                    // `feature`'s head is in main; `spike` has a commit of its own.
+                    let (base, head) = if query.contains("source=feature") {
+                        ("f1", "f1")
+                    } else {
+                        ("m1", "s1")
+                    };
+                    (
+                        200,
+                        json!({ "merge_base": commit(base), "source": "x", "source_commit_id": head, "target": "main", "target_commit_id": "m2" }),
+                    )
+                } else if path.contains("/branches/") {
+                    (200, json!({}))
+                } else {
+                    (200, json!({ "branches": ["main", "feature", "spike"] }))
+                }
+            },
+            cx,
+        );
+        let deletes = || {
+            asked
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| {
+                    request.contains("/branches/feature?") || request.contains("/branches/spike?")
+                })
+                .count()
+        };
+        let (merged, cx) = cx.add_window_view(|window, cx| {
+            DeleteBranchModal::new(session.clone(), "feature".into(), window, cx)
+        });
+        cx.run_until_parked();
+        merged.update(cx, |modal, cx| {
+            assert_eq!(modal.holds, Holds::Merged);
+            modal.delete(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(deletes(), 1, "deleted with no name typed");
+
+        let (unmerged, cx) = cx.add_window_view(|window, cx| {
+            DeleteBranchModal::new(session.clone(), "spike".into(), window, cx)
+        });
+        cx.run_until_parked();
+        unmerged.update(cx, |modal, cx| {
+            assert_eq!(modal.holds, Holds::Unmerged);
+            modal.delete(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(deletes(), 1, "not without its name");
+        unmerged.update_in(cx, |modal, window, cx| {
+            modal
+                .confirm
+                .update(cx, |editor, cx| editor.set_text("spike", window, cx));
+            modal.delete(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(deletes(), 2);
+    }
 }

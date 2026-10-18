@@ -8536,6 +8536,7 @@ name = "review"
 version = "0.2.1"
 dependencies = [
  "editor",
+ "futures",
  "gpui",
  "gq_language",
  "graph_client",

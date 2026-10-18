@@ -37,8 +37,12 @@ place), X (designed on 0.13; the better routes are deferred).
 ### Branches
 
 - Sidebar list with current branch marked; ⌘⇧B switch; create from the current branch or a
-  commit; delete by typing the branch name. Fork point and last commit derived from
-  `GET /commits?branch=`.
+  commit. Fork point and last commit derived from `GET /commits?branch=`.
+- Delete asks once, saying what goes with the branch, read from its merge base with `main` as
+  the dialog opens: a branch whose head is in `main` loses nothing and is deleted with ↵; one
+  with commits only it holds, or one the check could not read, is deleted by typing its name
+  (constitution IV). The dialog holds that one sentence, the name field when it is needed,
+  and Cancel and Delete; the CLI command is the Delete button's tooltip.
 
 ### Review (`review` crate)
 
@@ -79,6 +83,10 @@ place), X (designed on 0.13; the better routes are deferred).
   still equals the reviewed head. It merges only a review on screen, with no fix out: never
   while the review is being read (a head nobody has seen), and never from the branch list or
   the menu, which open the review instead.
+- "Delete <branch>", beside the button and on by default, deletes the branch once the merge
+  lands (`delete_branch`): the server reports the deletion on the answer and never undoes the
+  merge for it, and the outcome says "Deleted <branch>." or why it was not. A session on the
+  deleted branch moves to the target. Not offered for `main`.
 - Outcome shown plainly: fast-forwarded, merged (with commit), already up to date.
 - A 409 opens a conflicts view: one row per conflict with its kind in words ("Changed on both
   branches", "Deleted on main, changed here", "Relationship points to a deleted node"), the

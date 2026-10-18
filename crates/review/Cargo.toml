@@ -22,6 +22,7 @@ graph_store = { workspace = true }
 gq_language = { workspace = true }
 
 [dev-dependencies]
+futures = { workspace = true }
 gpui = { workspace = true, features = ["test-support"] }
 http_client = { workspace = true }
 studio_theme = { workspace = true, features = ["test-support"] }

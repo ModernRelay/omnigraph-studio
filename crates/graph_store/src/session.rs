@@ -2318,19 +2318,27 @@ impl GraphSession {
         Self::to_outcome(work, cx)
     }
 
+    /// Merges `source` into `target`, and deletes `source` after a merge that lands when
+    /// `delete_branch` is set: the deletion is the server's, reported on the answer, and never
+    /// undoes the merge. A session on the deleted branch moves to `target`.
     pub fn merge(
         &mut self,
         source: String,
         target: String,
+        delete_branch: bool,
         cx: &mut Context<Self>,
     ) -> Task<WriteOutcome<BranchMergeOutput>> {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
-        let description = format!("Merge {source} into {target}");
+        let description = if delete_branch {
+            format!("Merge {source} into {target} and delete {source}")
+        } else {
+            format!("Merge {source} into {target}")
+        };
         let request = BranchMergeRequest {
-            source,
+            source: source.clone(),
             target: Some(target.clone()),
-            delete_branch: false,
+            delete_branch,
         };
         self.writes_in_flight += 1;
         cx.emit(SessionEvent::ActivityChanged);
@@ -2342,8 +2350,21 @@ impl GraphSession {
             let parent = parent_of(&outcome, |output: &BranchMergeOutput| {
                 output.commit.as_ref()
             });
+            let deleted = matches!(
+                &outcome,
+                WriteOutcome::Committed(BranchMergeOutput {
+                    branch_deleted: Some(true),
+                    ..
+                })
+            );
             this.update(cx, |this, cx| {
-                this.finish_write(target, description, kind, parent, None, cx);
+                this.finish_write(target.clone(), description, kind, parent, None, cx);
+                if deleted {
+                    if this.branch == source {
+                        this.set_branch(target, cx);
+                    }
+                    this.reload_branches(cx);
+                }
             })
             .ok();
             outcome
