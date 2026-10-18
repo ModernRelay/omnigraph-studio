@@ -54,7 +54,6 @@ pub struct SceneNode {
     pub parent: Option<usize>,
     /// Where this node sits in the exploration: a node path, or a hub's group path.
     pub path: Option<ExplorePath>,
-    pub radius: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,18 +79,6 @@ impl Scene {
     }
 }
 
-/// The radius of a type in the schema view: grows with the log of its count. Counts change
-/// sizes, never positions (spec 006, constitution V).
-pub fn type_radius(count: Option<i64>) -> f32 {
-    let count = count.unwrap_or(0).max(0) as f32;
-    22. + 7. * (count + 1.).log10()
-}
-
-pub const NODE_RADIUS: f32 = 9.;
-pub const ROOT_RADIUS: f32 = 13.;
-pub const HUB_RADIUS: f32 = 6.;
-pub const MORE_RADIUS: f32 = 7.;
-
 /// The schema graph: one node per type, sorted by name, one edge per edge type.
 pub fn schema_scene(schema: &SchemaModel, count_of: impl Fn(&str) -> Option<i64>) -> Scene {
     let mut names: Vec<&str> = schema.nodes.iter().map(|n| n.name.as_str()).collect();
@@ -107,7 +94,6 @@ pub fn schema_scene(schema: &SchemaModel, count_of: impl Fn(&str) -> Option<i64>
                 color_key: (*name).to_owned(),
                 parent: None,
                 path: None,
-                radius: type_radius(count),
             }
         })
         .collect();
@@ -153,7 +139,6 @@ pub fn results_scene(
             color_key: node.type_name.clone(),
             parent: None,
             path: None,
-            radius: NODE_RADIUS,
         })
         .collect();
     let shown = scene_nodes.len();
@@ -191,7 +176,6 @@ pub fn results_scene(
 pub fn explore_scene(
     entries: &[Entry],
     state: &ExploreState,
-    schema: &SchemaModel,
     limits: &HashMap<GroupKey, usize>,
     cap: usize,
 ) -> Scene {
@@ -272,7 +256,6 @@ pub fn explore_scene(
                         color_key: node.type_name.clone(),
                         parent: parent_scene,
                         path: Some(entry.path.clone()),
-                        radius: if root { ROOT_RADIUS } else { NODE_RADIUS },
                     },
                 );
                 if let Some(hub) = parent_scene {
@@ -330,7 +313,6 @@ pub fn explore_scene(
                         color_key: key.group.edge.clone(),
                         parent: Some(owner),
                         path: Some(entry.path.clone()),
-                        radius: HUB_RADIUS,
                     },
                 );
                 push_edge(&mut scene, &mut lines, owner, hub);
@@ -370,7 +352,6 @@ pub fn explore_scene(
                                 color_key: key.group.edge.clone(),
                                 parent: Some(owner),
                                 path: Some(entry.path.clone()),
-                                radius: HUB_RADIUS,
                             },
                         );
                         push_edge(&mut scene, &mut lines, owner, hub);
@@ -399,7 +380,6 @@ pub fn explore_scene(
                             color_key: target.node.type_name.clone(),
                             parent: Some(hub),
                             path: None,
-                            radius: NODE_RADIUS,
                         },
                     ),
                     None => continue,
@@ -450,7 +430,6 @@ pub fn explore_scene(
                 color_key: key.group.edge.clone(),
                 parent: Some(hub),
                 path: scene.nodes[hub].path.clone(),
-                radius: MORE_RADIUS,
             };
             let index = add(&mut scene, &mut by_id, more);
             push_edge(&mut scene, &mut lines, hub, index);
@@ -465,7 +444,6 @@ pub fn explore_scene(
             .expect("not empty");
         scene.capped = Some((total, type_name));
     }
-    let _ = schema;
     scene
 }
 
@@ -516,7 +494,6 @@ mod tests {
         let names: Vec<&str> = scene.nodes.iter().map(|n| n.label.as_str()).collect();
         assert_eq!(names, ["Company", "Person"]);
         assert_eq!(scene.edges.len(), 2);
-        assert!(scene.nodes[1].radius > scene.nodes[0].radius);
         let knows = scene
             .edges
             .iter()
@@ -610,13 +587,7 @@ mod tests {
             },
         );
         // Expanding Ada shows the relationship, not the company it reaches.
-        let closed = explore_scene(
-            &state.entries(&schema),
-            &state,
-            &schema,
-            &HashMap::new(),
-            NODE_CAP,
-        );
+        let closed = explore_scene(&state.entries(&schema), &state, &HashMap::new(), NODE_CAP);
         let hub = closed
             .index_of(&SceneId::Hub(key.clone()))
             .expect("a hub for the relationship");
@@ -629,13 +600,7 @@ mod tests {
         state
             .expanded
             .insert(ExplorePath::root().child_group(&employer));
-        let open = explore_scene(
-            &state.entries(&schema),
-            &state,
-            &schema,
-            &HashMap::new(),
-            NODE_CAP,
-        );
+        let open = explore_scene(&state.entries(&schema), &state, &HashMap::new(), NODE_CAP);
         let hub = open.index_of(&SceneId::Hub(key)).unwrap();
         let company = open
             .index_of(&SceneId::Node(acme))
@@ -648,7 +613,7 @@ mod tests {
     fn hubs_show_eight_then_more_and_draw_each_node_once() {
         let (schema, state) = exploration();
         let entries = state.entries(&schema);
-        let scene = explore_scene(&entries, &state, &schema, &HashMap::new(), NODE_CAP);
+        let scene = explore_scene(&entries, &state, &HashMap::new(), NODE_CAP);
         let people = scene
             .nodes
             .iter()
@@ -684,7 +649,7 @@ mod tests {
             })
             .unwrap();
         limits.insert(key, HUB_STEP * 3);
-        let wider = explore_scene(&entries, &state, &schema, &limits, NODE_CAP);
+        let wider = explore_scene(&entries, &state, &limits, NODE_CAP);
         assert!(
             !wider
                 .nodes
@@ -703,7 +668,7 @@ mod tests {
                 limits.insert(key.clone(), 100);
             }
         }
-        let scene = explore_scene(&entries, &state, &schema, &limits, 6);
+        let scene = explore_scene(&entries, &state, &limits, 6);
         assert!(scene.nodes.len() <= 6);
         let (hidden, type_name) = scene.capped.clone().unwrap();
         assert!(hidden > 0);

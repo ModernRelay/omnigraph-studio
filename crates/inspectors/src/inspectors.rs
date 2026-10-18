@@ -9,7 +9,7 @@ use gpui::App;
 use studio_actions::graph::OpenInspector;
 use studio_workspace::Workspace;
 
-pub use storage::{STORAGE_KEY, StorageInspector};
+use storage::{STORAGE_KEY, StorageInspector};
 
 /// Registers this surface with every new workspace.
 pub fn init(cx: &mut App) {
@@ -26,18 +26,14 @@ pub fn init(cx: &mut App) {
             let Some(session) = workspace.session().cloned() else {
                 return;
             };
-            let open = workspace
-                .items()
-                .iter()
-                .any(|item| item.dedupe_key(cx).as_deref() == Some(STORAGE_KEY));
+            // An inspector already open, in any pane, reads again; a new one reads as it is made.
+            let mut made = false;
             let view = workspace.open_item::<StorageInspector>(STORAGE_KEY, window, cx, |_, cx| {
+                made = true;
                 StorageInspector::new(session, cx)
             });
-            if open {
-                // An open inspector reads again, at the session's branch.
-                if let Some(view) = view {
-                    view.update(cx, |view, cx| view.reload(cx));
-                }
+            if !made && let Some(view) = view {
+                view.update(cx, |view, cx| view.reload(cx));
             }
         });
     })

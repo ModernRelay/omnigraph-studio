@@ -168,6 +168,34 @@ struct Drag {
     followers: Vec<(usize, Vec2)>,
     /// A drag begun with ⇧ on empty space draws an area instead of moving the view.
     area: bool,
+    /// The scene the indices above are in. Reads that finish during the drag lay the canvas
+    /// out again, which can move a chip to another index or remove it.
+    scene: Arc<Scene>,
+}
+
+impl Drag {
+    /// Points the drag's indices into `scene`, by the chips' ids, when the canvas was laid out
+    /// again since; a chip no longer drawn stops moving.
+    fn follow(&mut self, scene: &Arc<Scene>) {
+        if Arc::ptr_eq(&self.scene, scene) {
+            return;
+        }
+        let moved = |index: usize| {
+            self.scene
+                .nodes
+                .get(index)
+                .and_then(|node| scene.index_of(&node.id))
+        };
+        self.node = self
+            .node
+            .and_then(|(index, from)| Some((moved(index)?, from)));
+        self.followers = self
+            .followers
+            .iter()
+            .filter_map(|&(index, from)| Some((moved(index)?, from)))
+            .collect();
+        self.scene = scene.clone();
+    }
 }
 
 /// The key a placed chip is remembered by: a type on the schema canvas, a node or a
@@ -236,6 +264,10 @@ pub struct GraphCanvas {
     layout_key: Option<(Mode, Option<NodeRef>)>,
     layout_generation: u64,
     _layout_task: Option<Task<()>>,
+    /// The ontology's last layout: what it was laid out from, and where it put each type. The
+    /// same types, sizes, pins and relationships are not laid out again: a count changes no
+    /// place, since each type has room for a six-digit one.
+    ontology_layout: Option<(Vec<OntologyNode>, Vec<OntologyEdge>, Vec<Vec2>)>,
     hub_limits: HashMap<GroupKey, usize>,
     center: Vec2,
     zoom: f32,
@@ -373,6 +405,7 @@ impl GraphCanvas {
             layout_key: None,
             layout_generation: 0,
             _layout_task: None,
+            ontology_layout: None,
             hub_limits: HashMap::new(),
             center: Vec2::default(),
             zoom: 1.,
@@ -487,7 +520,9 @@ impl GraphCanvas {
             Mode::Results => {}
             Mode::Schema => {
                 let session = self.session.read(cx);
-                let scene = model::schema_scene(&schema, |name| session.count_of(name));
+                let scene = model::schema_scene(&schema, |name| {
+                    session.count_of(graph_store::EntityKind::Node, name)
+                });
                 let measure = measurer(cx, &self.char_widths);
                 let widths = half_widths(&scene, &measure);
                 // From the schema and the placed types only: each type is laid out with room
@@ -521,12 +556,25 @@ impl GraphCanvas {
                         },
                     })
                     .collect();
-                let positions =
-                    cx.background_spawn(async move { layout::ontology_positions(&nodes, &edges) });
+                if let Some((_, _, positions)) = self
+                    .ontology_layout
+                    .as_ref()
+                    .filter(|(laid, links, _)| *laid == nodes && *links == edges)
+                {
+                    let positions = positions.clone();
+                    self._layout_task = None;
+                    self.apply_layout(scene, widths, positions, cx);
+                    return;
+                }
+                let positions = cx.background_spawn(async move {
+                    let positions = layout::ontology_positions(&nodes, &edges);
+                    (nodes, edges, positions)
+                });
                 self._layout_task = Some(cx.spawn(async move |this, cx| {
-                    let positions = positions.await;
+                    let (nodes, edges, positions) = positions.await;
                     this.update(cx, |this, cx| {
                         if this.layout_generation == generation {
+                            this.ontology_layout = Some((nodes, edges, positions.clone()));
                             this.apply_layout(scene, widths, positions, cx);
                         }
                     })
@@ -538,7 +586,6 @@ impl GraphCanvas {
                 let scene = model::explore_scene(
                     &entries,
                     exploration.state(),
-                    &schema,
                     &self.hub_limits,
                     self.node_cap(cx),
                 );
@@ -567,19 +614,31 @@ impl GraphCanvas {
                         },
                     })
                     .collect();
-                let positions =
-                    cx.background_spawn(async move { layout::explore_positions(&nodes) });
-                self._layout_task = Some(cx.spawn(async move |this, cx| {
-                    let positions = positions.await;
-                    this.update(cx, |this, cx| {
-                        if this.layout_generation == generation {
-                            this.apply_layout(scene, widths, positions, cx);
-                        }
-                    })
-                    .ok();
-                }));
+                self.lay_out(scene, widths, move || layout::explore_positions(&nodes), cx);
             }
         }
+    }
+
+    /// Places `scene` off the main thread with `place`, and shows it unless a newer layout
+    /// began meanwhile.
+    fn lay_out(
+        &mut self,
+        scene: Scene,
+        widths: Vec<f32>,
+        place: impl FnOnce() -> Vec<Vec2> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self.layout_generation;
+        let positions = cx.background_spawn(async move { place() });
+        self._layout_task = Some(cx.spawn(async move |this, cx| {
+            let positions = positions.await;
+            this.update(cx, |this, cx| {
+                if this.layout_generation == generation {
+                    this.apply_layout(scene, widths, positions, cx);
+                }
+            })
+            .ok();
+        }));
     }
 
     /// Lays out a query's nodes: a node first reached through a row hangs off the node before
@@ -622,17 +681,7 @@ impl GraphCanvas {
         self.layout_key = Some((Mode::Results, None));
         self.mode = Mode::Results;
         self.layout_generation += 1;
-        let generation = self.layout_generation;
-        let positions = cx.background_spawn(async move { layout::explore_positions(&nodes) });
-        self._layout_task = Some(cx.spawn(async move |this, cx| {
-            let positions = positions.await;
-            this.update(cx, |this, cx| {
-                if this.layout_generation == generation {
-                    this.apply_layout(scene, widths, positions, cx);
-                }
-            })
-            .ok();
-        }));
+        self.lay_out(scene, widths, move || layout::explore_positions(&nodes), cx);
     }
 
     fn apply_layout(
@@ -951,6 +1000,7 @@ impl GraphCanvas {
             node,
             followers,
             area: hit.is_none() && event.modifiers.shift,
+            scene: self.scene.clone(),
         });
     }
 
@@ -1017,6 +1067,7 @@ impl GraphCanvas {
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         if let (Some(drag), true) = (&mut self.drag, event.dragging()) {
+            drag.follow(&self.scene);
             let dx = f32::from(event.position.x - drag.start.x);
             let dy = f32::from(event.position.y - drag.start.y);
             if drag.area {
@@ -1041,8 +1092,9 @@ impl GraphCanvas {
                             {
                                 *position = at;
                             }
-                            let id = self.scene.nodes[index].id.clone();
-                            self.known.insert(id, at);
+                            if let Some(node) = self.scene.nodes.get(index) {
+                                self.known.insert(node.id.clone(), at);
+                            }
                         }
                     }
                     None => {
@@ -1063,9 +1115,10 @@ impl GraphCanvas {
     }
 
     fn mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(drag) = self.drag.take() else {
+        let Some(mut drag) = self.drag.take() else {
             return;
         };
+        drag.follow(&self.scene);
         if drag.area {
             // The chips the area touches are marked, added to those marked before.
             if let Some((from, to)) = self.area.take() {
@@ -1084,24 +1137,7 @@ impl GraphCanvas {
             return;
         }
         if drag.moved {
-            // A dragged node or pill stays where it was dropped, and is remembered there, as
-            // does each marked chip that moved with it; the pills that moved with a node keep
-            // their new places without being pinned.
-            if let Some((index, _)) = drag.node {
-                let mut placed = vec![index];
-                if self.is_marked(index) {
-                    placed.extend(drag.followers.iter().map(|(ix, _)| *ix));
-                    placed.retain(|ix| self.is_marked(*ix));
-                }
-                for ix in placed {
-                    if let (Some(key), Some(at)) =
-                        (pin_key(&self.scene.nodes[ix].id), self.positions.get(ix))
-                    {
-                        self.pinned.insert(key, *at);
-                    }
-                }
-                cx.emit(ItemEvent::UpdateTab);
-            }
+            self.place_dragged(&drag, cx);
             return;
         }
         let hit = self.hit(event.position, window);
@@ -1173,11 +1209,41 @@ impl GraphCanvas {
         );
     }
 
+    /// A drag released outside the canvas ends as one released on it, and an area is dropped.
     fn mouse_up_out(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.drag = None;
+        if let Some(mut drag) = self.drag.take()
+            && drag.moved
+            && !drag.area
+        {
+            drag.follow(&self.scene);
+            self.place_dragged(&drag, cx);
+        }
         if self.area.take().is_some() {
             cx.notify();
         }
+    }
+
+    /// A dragged node or pill stays where it was dropped, and is remembered there, as does
+    /// each marked chip that moved with it; the pills that moved with a node keep their new
+    /// places without being pinned.
+    fn place_dragged(&mut self, drag: &Drag, cx: &mut Context<Self>) {
+        let Some((index, _)) = drag.node else {
+            return;
+        };
+        let mut placed = vec![index];
+        if self.is_marked(index) {
+            placed.extend(drag.followers.iter().map(|(ix, _)| *ix));
+            placed.retain(|ix| self.is_marked(*ix));
+        }
+        for ix in placed {
+            if let (Some(key), Some(at)) = (
+                self.scene.nodes.get(ix).and_then(|node| pin_key(&node.id)),
+                self.positions.get(ix),
+            ) {
+                self.pinned.insert(key, *at);
+            }
+        }
+        cx.emit(ItemEvent::UpdateTab);
     }
 
     // ---- the right-click menu ----
@@ -2385,6 +2451,50 @@ impl Render for GraphCanvas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reads that finish during a drag lay the canvas out again: the drag keeps moving the
+    /// chips it took, wherever they now are, and stops moving one that is gone.
+    #[test]
+    fn a_drag_follows_its_chips_into_a_new_layout() {
+        let scene = |names: &[&str]| {
+            Arc::new(Scene {
+                nodes: names
+                    .iter()
+                    .map(|name| crate::model::SceneNode {
+                        id: SceneId::Type((*name).into()),
+                        kind: SceneKind::Type { count: None },
+                        label: (*name).into(),
+                        color_key: (*name).into(),
+                        parent: None,
+                        path: None,
+                    })
+                    .collect(),
+                edges: Vec::new(),
+                capped: None,
+            })
+        };
+        let before = scene(&["A", "B", "C"]);
+        let mut drag = Drag {
+            start: point(px(0.), px(0.)),
+            center: Vec2::new(0., 0.),
+            moved: true,
+            node: Some((1, Vec2::new(1., 1.))),
+            followers: vec![(2, Vec2::new(2., 2.)), (0, Vec2::new(0., 0.))],
+            area: false,
+            scene: before.clone(),
+        };
+        drag.follow(&before);
+        assert_eq!(drag.node, Some((1, Vec2::new(1., 1.))), "the same scene");
+        // A chip inserted ahead of B, and A gone.
+        let after = scene(&["New", "B", "Other", "C"]);
+        drag.follow(&after);
+        assert_eq!(drag.node, Some((1, Vec2::new(1., 1.))));
+        assert_eq!(drag.followers, vec![(3, Vec2::new(2., 2.))]);
+        // The dragged chip itself gone: the drag moves nothing.
+        drag.follow(&scene(&["C"]));
+        assert_eq!(drag.node, None);
+        assert_eq!(drag.followers, vec![(0, Vec2::new(2., 2.))]);
+    }
 
     #[test]
     fn an_area_marks_the_chips_it_touches() {

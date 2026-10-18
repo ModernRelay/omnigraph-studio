@@ -38,7 +38,7 @@ use studio_workspace::{PanelPosition, Workspace, WorkspaceEvent};
 use ui::prelude::*;
 use ui::{ContextMenu, IndentGuideColors, PopoverMenu, StickyCandidate, Tooltip};
 
-pub use rows::{RowId, RowTag};
+use rows::{RowId, RowTag};
 
 /// The tree's panel id in the left dock.
 const EXPLORE_PANEL: &str = "explore";
@@ -89,6 +89,16 @@ fn reveal(
     cx: &mut App,
 ) {
     let exploration = Exploration::for_session(session, cx);
+    // Activated on its own row: it stays there, not on its first place in the tree.
+    let selected = exploration.read(cx).root().is_some_and(|root| {
+        exploration
+            .read(cx)
+            .selection()
+            .is_some_and(|path| path.ends_at_node() && *path.node(root) == node)
+    });
+    if selected {
+        return;
+    }
     let visible = exploration.update(cx, |exploration, cx| {
         let visible = exploration
             .schema(cx)
@@ -776,10 +786,13 @@ impl RelationshipTree {
                     .flex_1()
                     .gap_1p5()
                     .child(
-                        Label::new(format!("{} →", graph_store_traversal(&key.group.edge)))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .single_line(),
+                        Label::new(format!(
+                            "{} →",
+                            gq_language::traversal_name(&key.group.edge)
+                        ))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted)
+                        .single_line(),
                     )
                     // The target's dot, as on a neighbour row; none when there is no target.
                     .when(target.is_some(), |row| {
@@ -1061,7 +1074,10 @@ impl RelationshipTree {
                             | EntryKind::Cycle { .. }
                     )
                 );
-                if single_activates || event.click_count() >= 2 {
+                // A row a click opens takes a double click's second click as nothing more, so
+                // it does not close again; a node row opens on the second.
+                let clicks = event.click_count();
+                if (single_activates && clicks == 1) || (!single_activates && clicks == 2) {
                     this.activate(row, window, cx);
                 }
             }))
@@ -1356,10 +1372,6 @@ impl RelationshipTree {
         .h(height)
         .into_any_element()
     }
-}
-
-fn graph_store_traversal(edge: &str) -> String {
-    gq_language::traversal_name(edge)
 }
 
 fn open_node(node: &NodeRef, window: &mut Window, cx: &mut App) {

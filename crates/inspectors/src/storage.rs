@@ -4,13 +4,13 @@
 
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString,
-    Task, Window,
+    Subscription, Task, Window,
 };
 use graph_client::ServerHealth;
 use graph_client::api::{
     EntityKind, GraphInfo, GraphListResponse, ReadinessOutput, SnapshotOutput,
 };
-use graph_store::{GraphSession, Loadable};
+use graph_store::{GraphSession, Loadable, SessionEvent};
 use studio_ui::CopyableValue;
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
@@ -24,8 +24,10 @@ pub struct StorageInspector {
     health: Loadable<ServerHealth>,
     readiness: Loadable<ReadinessOutput>,
     graphs: Loadable<GraphListResponse>,
+    /// Its datasets nodes first, each kind by type name, as the table lists them.
     snapshot: Loadable<SnapshotOutput>,
     _task: Option<Task<()>>,
+    _subscription: Subscription,
 }
 
 impl EventEmitter<ItemEvent> for StorageInspector {}
@@ -60,6 +62,12 @@ impl Item for StorageInspector {
 impl StorageInspector {
     pub fn new(session: Entity<GraphSession>, cx: &mut Context<Self>) -> Self {
         let branch = session.read(cx).branch.clone();
+        // What it shows is the session branch's: another branch is read at once.
+        let subscription = cx.subscribe(&session, |this: &mut Self, _, event, cx| {
+            if let SessionEvent::BranchChanged = event {
+                this.reload(cx);
+            }
+        });
         let mut view = Self {
             session,
             branch,
@@ -69,6 +77,7 @@ impl StorageInspector {
             graphs: Loadable::NotLoaded,
             snapshot: Loadable::NotLoaded,
             _task: None,
+            _subscription: subscription,
         };
         view.reload(cx);
         view
@@ -91,7 +100,13 @@ impl StorageInspector {
                 this.health = loadable(state.health);
                 this.readiness = loadable(state.readiness);
                 this.graphs = loadable(state.graphs);
-                this.snapshot = loadable(state.snapshot);
+                this.snapshot = loadable(state.snapshot.map(|mut snapshot| {
+                    snapshot.datasets.sort_by(|a, b| {
+                        (matches!(a.entity_kind, EntityKind::Edge), &a.type_name)
+                            .cmp(&(matches!(b.entity_kind, EntityKind::Edge), &b.type_name))
+                    });
+                    snapshot
+                }));
                 cx.notify();
             })
             .ok();
@@ -250,12 +265,7 @@ impl StorageInspector {
                     .child(div().flex_1().child(heading("Dataset path")))
                     .into_any_element(),
             );
-            let mut datasets = snapshot.datasets.clone();
-            datasets.sort_by(|a, b| {
-                (matches!(a.entity_kind, EntityKind::Edge), &a.type_name)
-                    .cmp(&(matches!(b.entity_kind, EntityKind::Edge), &b.type_name))
-            });
-            for (ix, dataset) in datasets.iter().enumerate() {
+            for (ix, dataset) in snapshot.datasets.iter().enumerate() {
                 rows.push(
                     h_flex()
                         .gap_2()

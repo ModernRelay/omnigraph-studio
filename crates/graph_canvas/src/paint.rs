@@ -184,10 +184,12 @@ pub(crate) struct ChipText {
 }
 
 pub(crate) fn chip_text(node: &SceneNode) -> ChipText {
+    // A label is drawn on one line: a control character shows as its picture.
+    let label = ui::utils::replace_control_characters(&node.label);
     match &node.kind {
         SceneKind::Type { count } => ChipText {
             mark: true,
-            pieces: std::iter::once((node.label.clone(), Role::RootName))
+            pieces: std::iter::once((label.into_owned(), Role::RootName))
                 .chain(count.map(|count| (format_count(count), Role::Count)))
                 .collect(),
             size: CHIP_TEXT,
@@ -195,15 +197,15 @@ pub(crate) fn chip_text(node: &SceneNode) -> ChipText {
         SceneKind::Node { root, .. } => ChipText {
             mark: true,
             pieces: vec![(
-                truncate(&node.label, 32),
+                truncate(&label, 32),
                 if *root { Role::RootName } else { Role::Name },
             )],
             size: CHIP_TEXT,
         },
         SceneKind::Hub { open, .. } => {
-            let (name, count) = match node.label.rsplit_once(" · ") {
+            let (name, count) = match label.rsplit_once(" · ") {
                 Some((name, count)) => (name.to_owned(), Some(count.to_owned())),
-                None => (node.label.clone(), None),
+                None => (label.clone().into_owned(), None),
             };
             ChipText {
                 mark: false,
@@ -215,7 +217,7 @@ pub(crate) fn chip_text(node: &SceneNode) -> ChipText {
         }
         SceneKind::More { .. } => ChipText {
             mark: false,
-            pieces: vec![(node.label.clone(), Role::Muted)],
+            pieces: vec![(label.into_owned(), Role::Muted)],
             size: HUB_TEXT,
         },
     }
@@ -308,7 +310,8 @@ pub(crate) fn paint(
     let mut loops: Vec<(usize, usize, Tone)> = Vec::new();
     for (edge, route) in scene.edges.iter().zip(&routes) {
         let (a, b) = (screen[edge.from], screen[edge.to]);
-        if !visible(a, 400.) && !visible(b, 400.) {
+        // Zoomed in, a line can cross the view with both ends far outside it.
+        if !crosses(a, b, bounds, 400.) {
             continue;
         }
         let kinds = (&scene.nodes[edge.from].kind, &scene.nodes[edge.to].kind);
@@ -933,21 +936,34 @@ fn truncate(text: &str, max: usize) -> String {
     }
 }
 
+/// A row count with its thousands grouped, as the rest of Studio writes it.
 pub(crate) fn format_count(count: i64) -> String {
-    let digits = count.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
+    studio_ui::group_digits(count.max(0) as usize)
+}
+
+/// Whether the box around the line from `a` to `b` meets `bounds` grown by `margin`: a curve
+/// bends within the margin.
+fn crosses(a: Point<Pixels>, b: Point<Pixels>, bounds: Bounds<Pixels>, margin: f32) -> bool {
+    let margin = px(margin);
+    a.x.max(b.x) >= bounds.left() - margin
+        && a.x.min(b.x) <= bounds.right() + margin
+        && a.y.max(b.y) >= bounds.top() - margin
+        && a.y.min(b.y) <= bounds.bottom() + margin
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A line is drawn when it crosses the view, though both its ends are outside it.
+    #[test]
+    fn a_line_across_the_view_is_drawn_with_both_ends_outside() {
+        let view = Bounds::new(point(px(0.), px(0.)), size(px(800.), px(600.)));
+        let (left, right) = (point(px(-5000.), px(300.)), point(px(5000.), px(300.)));
+        assert!(crosses(left, right, view, 400.));
+        let below = (point(px(-5000.), px(5000.)), point(px(5000.), px(5000.)));
+        assert!(!crosses(below.0, below.1, view, 400.));
+    }
 
     #[test]
     fn a_dotted_line_is_cut_into_dashes_across_its_bends() {
