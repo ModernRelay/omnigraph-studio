@@ -16,11 +16,18 @@ pub(crate) enum Held<V, P> {
     Pending(P),
 }
 
+/// How a memo weighs one answer, in bytes.
+pub(crate) type Weigh<V> = fn(&V) -> usize;
+
 pub(crate) struct Memo<K, V, P> {
-    entries: HashMap<K, Held<V, P>>,
+    /// Each key's entry, and what its answer weighs (nothing while under way).
+    entries: HashMap<K, (Held<V, P>, usize)>,
     /// Keys from least to most recently used.
     order: VecDeque<K>,
     capacity: usize,
+    /// The most the answers held may weigh together, and how one is weighed.
+    budget: Option<(usize, Weigh<V>)>,
+    bytes: usize,
 }
 
 impl<K: Hash + Eq + Clone, V: Clone, P: Clone> Memo<K, V, P> {
@@ -29,12 +36,22 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone> Memo<K, V, P> {
             entries: HashMap::new(),
             order: VecDeque::new(),
             capacity: capacity.max(1),
+            budget: None,
+            bytes: 0,
+        }
+    }
+
+    /// A memo that also keeps the answers it holds within `budget`, as `weigh` measures them.
+    pub(crate) fn weighed(capacity: usize, budget: usize, weigh: Weigh<V>) -> Self {
+        Self {
+            budget: Some((budget, weigh)),
+            ..Self::new(capacity)
         }
     }
 
     /// What is held for `key`, marking it used.
     pub(crate) fn get(&mut self, key: &K) -> Option<Held<V, P>> {
-        let held = self.entries.get(key)?.clone();
+        let held = self.entries.get(key)?.0.clone();
         self.touch(key);
         Some(held)
     }
@@ -47,18 +64,9 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone> Memo<K, V, P> {
     /// Records how a read for `key` ended: an answer is kept, a failure forgotten.
     pub(crate) fn finish<E>(&mut self, key: &K, result: &Result<V, E>) {
         match result {
-            Ok(value) => {
-                if self.entries.contains_key(key) {
-                    self.entries.insert(key.clone(), Held::Done(value.clone()));
-                } else {
-                    // Evicted while under way: keep the answer as newly used.
-                    self.put(key.clone(), Held::Done(value.clone()));
-                }
-            }
-            Err(_) => {
-                self.entries.remove(key);
-                self.order.retain(|k| k != key);
-            }
+            // Evicted while under way, the answer is kept as newly used.
+            Ok(value) => self.put(key.clone(), Held::Done(value.clone())),
+            Err(_) => self.forget(key),
         }
     }
 
@@ -69,21 +77,26 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone> Memo<K, V, P> {
 
     /// Every answer held, in no order.
     pub(crate) fn answers(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.entries.iter().filter_map(|(key, held)| match held {
-            Held::Done(value) => Some((key, value)),
-            Held::Pending(_) => None,
-        })
+        self.entries
+            .iter()
+            .filter_map(|(key, (held, _))| match held {
+                Held::Done(value) => Some((key, value)),
+                Held::Pending(_) => None,
+            })
     }
 
     /// Forgets what is held for `key`: the next read asks again.
     pub(crate) fn forget(&mut self, key: &K) {
-        self.entries.remove(key);
+        if let Some((_, weight)) = self.entries.remove(key) {
+            self.bytes -= weight;
+        }
         self.order.retain(|k| k != key);
     }
 
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
+        self.bytes = 0;
     }
 
     #[cfg(test)]
@@ -91,14 +104,34 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone> Memo<K, V, P> {
         self.entries.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
     fn put(&mut self, key: K, held: Held<V, P>) {
-        self.entries.insert(key.clone(), held);
+        let weight = match (&held, self.budget) {
+            (Held::Done(value), Some((_, weigh))) => weigh(value),
+            _ => 0,
+        };
+        if let Some((_, old)) = self.entries.insert(key.clone(), (held, weight)) {
+            self.bytes -= old;
+        }
+        self.bytes += weight;
         self.touch(&key);
-        while self.entries.len() > self.capacity {
-            let Some(oldest) = self.order.pop_front() else {
+        // The least recently used go first; the answer just kept stays, whatever it weighs.
+        let over_budget = |memo: &Self| memo.budget.is_some_and(|(budget, _)| memo.bytes > budget);
+        while self.entries.len() > self.capacity || over_budget(self) {
+            let Some(oldest) = self.order.front().cloned() else {
                 break;
             };
-            self.entries.remove(&oldest);
+            if oldest == key {
+                break;
+            }
+            self.order.pop_front();
+            if let Some((_, weight)) = self.entries.remove(&oldest) {
+                self.bytes -= weight;
+            }
         }
     }
 
@@ -150,5 +183,28 @@ mod tests {
         memo.start("d", ());
         assert_eq!(done(&mut memo, "c"), None);
         assert_eq!(done(&mut memo, "b"), Some(2));
+    }
+
+    #[test]
+    fn a_weighed_memo_keeps_its_answers_within_the_budget() {
+        // Each answer weighs its value; ten bytes at most.
+        let mut memo: Memo<&'static str, u32, ()> = Memo::weighed(100, 10, |value| *value as usize);
+        memo.insert("a", 4);
+        memo.insert("b", 4);
+        assert_eq!(memo.bytes(), 8);
+        memo.insert("c", 4);
+        assert_eq!(done(&mut memo, "a"), None, "the oldest went to make room");
+        assert_eq!(memo.bytes(), 8);
+        // An answer heavier than the budget is kept alone.
+        memo.insert("d", 30);
+        assert_eq!(memo.len(), 1);
+        assert_eq!(memo.bytes(), 30);
+        memo.forget(&"d");
+        assert_eq!(memo.bytes(), 0);
+        // Under way, an answer weighs nothing; kept, it weighs what it is.
+        memo.start("e", ());
+        assert_eq!(memo.bytes(), 0);
+        memo.finish::<()>(&"e", &Ok(3));
+        assert_eq!(memo.bytes(), 3);
     }
 }

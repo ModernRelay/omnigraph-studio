@@ -124,8 +124,10 @@ pub enum SessionEvent {
 }
 
 /// How many answers to reads pinned to a commit, and Blob cells at a commit, a session keeps. A
-/// node page holds one per relationship group, up to about a hundred.
-const PINNED_READS: usize = 1_024;
+/// node page holds one per relationship group, up to about a hundred; the answers together are
+/// kept within [`PINNED_READ_BYTES`], least recently used first out.
+const PINNED_READS: usize = 4_096;
+const PINNED_READ_BYTES: usize = 64 * 1024 * 1024;
 const PINNED_BLOBS: usize = 2_048;
 
 /// How many branches' commit lists a session keeps.
@@ -178,6 +180,24 @@ struct PinnedRead {
 /// The first wait before a graph that answered 503 is asked again; it doubles up to the cap.
 const RECHECK_FIRST: Duration = Duration::from_secs(5);
 const RECHECK_CAP: Duration = Duration::from_secs(60);
+
+/// About what an answer takes in memory: its rows' text and numbers, and their containers.
+fn read_bytes(output: &ReadOutput) -> usize {
+    fn weight(value: &Value) -> usize {
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => 16,
+            Value::String(text) => 24 + text.len(),
+            Value::Array(items) => 24 + items.iter().map(weight).sum::<usize>(),
+            Value::Object(map) => {
+                48 + map
+                    .iter()
+                    .map(|(key, item)| 24 + key.len() + weight(item))
+                    .sum::<usize>()
+            }
+        }
+    }
+    256 + weight(&output.rows) + output.columns.iter().map(|c| 24 + c.len()).sum::<usize>()
+}
 
 fn parse_schema(source: &str) -> Loadable<Arc<SchemaModel>> {
     match SchemaModel::parse(source) {
@@ -288,7 +308,7 @@ impl GraphSession {
             writes_in_flight: 0,
             unavailable: None,
             recheck_after: RECHECK_FIRST,
-            pinned_reads: Memo::new(PINNED_READS),
+            pinned_reads: Memo::weighed(PINNED_READS, PINNED_READ_BYTES, read_bytes),
             pinned_blobs: Memo::new(PINNED_BLOBS),
             schema_epoch: 0,
             schema_text: None,
