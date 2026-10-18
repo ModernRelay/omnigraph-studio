@@ -272,8 +272,8 @@ pub fn edit(text: &str, old: &StudioSettings, new: &StudioSettings) -> Result<St
         text.to_owned()
     };
     let tab = settings::infer_json_indent_size(&text);
-    for (path, value) in changes {
-        match value {
+    for (path, value) in &changes {
+        match value.clone() {
             None => remove_in_text(&mut text, &path),
             Some(value) => {
                 let present = settings::find_value_range_in_json_text(&text, &path).is_some();
@@ -286,7 +286,19 @@ pub fn edit(text: &str, old: &StudioSettings, new: &StudioSettings) -> Result<St
         }
     }
     // The edit must leave a document that still reads; otherwise the file stays as it was.
-    parse(&text).map_err(|error| format!("the change would break the file ({error})"))?;
+    let edited =
+        parse(&text).map_err(|error| format!("the change would break the file ({error})"))?;
+    // And one that reads as changed: a key the file sets twice is edited where it first
+    // appears, while the last one applies, so the change would be lost without a word.
+    for (path, value) in &changes {
+        let read = path.iter().try_fold(&edited, |at, key| at.get(key));
+        if read != value.as_ref() {
+            let at = display(&path.iter().cloned().map(Step::Key).collect::<Vec<_>>());
+            return Err(format!(
+                "{at} is set more than once, and only the last one applies; remove the others"
+            ));
+        }
+    }
     Ok(text)
 }
 
@@ -507,6 +519,22 @@ mod tests {
             ),
             "{}",
             reading.problems[0]
+        );
+    }
+
+    /// A key the file sets twice is edited where it first appears while the last one applies:
+    /// the edit is refused, naming the key, rather than lost without a word.
+    #[test]
+    fn an_edit_of_a_key_set_twice_is_refused() {
+        let text = "{\n  \"ui_font_size\": 13,\n  \"ui_font_size\": 15\n}\n";
+        assert_eq!(read(text).unwrap().settings.ui_font_size, 15.);
+        let old = read(text).unwrap().settings;
+        let mut new = old.clone();
+        new.ui_font_size = 18.;
+        let error = edit(text, &old, &new).unwrap_err();
+        assert!(
+            error.contains("ui_font_size") && error.contains("more than once"),
+            "{error}"
         );
     }
 

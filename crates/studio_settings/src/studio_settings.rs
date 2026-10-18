@@ -731,7 +731,8 @@ pub fn update(cx: &mut App, f: impl FnOnce(&mut StudioSettings)) {
 
 /// How writing one change into the settings file went.
 enum Written {
-    /// The file could not be read, or its syntax is broken: nothing was written.
+    /// The file could not be read, its syntax is broken, or the change could not be edited
+    /// into it: nothing was written.
     Unread(String),
     Saved {
         /// The file as it reads now, edits from elsewhere included; `None` when the write
@@ -747,7 +748,7 @@ fn write_change(path: &Path, old: &StudioSettings, new: &StudioSettings) -> Writ
     let text = match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(format!("it could not be read ({error})")),
     };
     let edited = text.and_then(|text| {
         let edited = document::edit(&text, old, new)?;
@@ -787,8 +788,8 @@ fn saved(edit: u64, written: Written, cx: &mut App) {
     match written {
         Written::Unread(error) => {
             state.error = Some(format!(
-                "{} could not be read, so the change was not saved and holds only until Studio \
-                 quits: {error}. Fix the file and try again.",
+                "{} was not changed: {error}. The change holds only until Studio quits; fix the \
+                 file and try again.",
                 path.display()
             ));
             // They were found in an earlier version of the file.
