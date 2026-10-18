@@ -601,8 +601,9 @@ impl GraphSession {
             let kind = outcome_kind(&outcome, |output: &ChangeOutput| {
                 output.commit.as_ref().map(|c| c.graph_commit_id.clone())
             });
+            let parent = parent_of(&outcome, |output: &ChangeOutput| output.commit.as_ref());
             this.update(cx, |this, cx| {
-                this.finish_write(branch, description, kind, None, cx);
+                this.finish_write(branch, description, kind, parent, None, cx);
             })
             .ok();
             outcome
@@ -1212,44 +1213,48 @@ impl GraphSession {
             return;
         }
         self.recheck_branches(cx);
+        for branch in watched {
+            if !self.head_reads.contains_key(&branch) {
+                self.read_head(branch, cx);
+            }
+        }
+    }
+
+    /// Reads `branch`'s head with a read that returns no rows.
+    fn read_head(&mut self, branch: String, cx: &mut Context<Self>) {
         let Some(probe) = self
             .schema_model()
             .and_then(|schema| builder::head_probe(&schema))
         else {
             return;
         };
-        for branch in watched {
-            if self.head_reads.contains_key(&branch) {
-                continue;
-            }
-            let request = QueryRequest {
-                query: probe.text.clone(),
-                name: Some(probe.name.clone()),
-                params: None,
-                branch: Some(branch.clone()),
-                snapshot: None,
-            };
-            let client = self.client(cx);
-            let graph = self.graph_id.clone();
-            let key = branch.clone();
-            let probe = cx.background_spawn(async move { client.query(&graph, &request).await });
-            let read = cx.spawn(async move |this, cx| {
-                let read = probe.await;
-                this.update(cx, |this, cx| {
-                    this.head_reads.remove(&branch);
-                    this.note_read(&read, cx);
-                    if let Ok(ReadOutput {
-                        graph_commit_id: Some(head),
-                        ..
-                    }) = read
-                    {
-                        this.saw_head(branch, head, false, cx);
-                    }
-                })
-                .ok();
-            });
-            self.head_reads.insert(key, read);
-        }
+        let request = QueryRequest {
+            query: probe.text,
+            name: Some(probe.name),
+            params: None,
+            branch: Some(branch.clone()),
+            snapshot: None,
+        };
+        let client = self.client(cx);
+        let graph = self.graph_id.clone();
+        let key = branch.clone();
+        let probe = cx.background_spawn(async move { client.query(&graph, &request).await });
+        let read = cx.spawn(async move |this, cx| {
+            let read = probe.await;
+            this.update(cx, |this, cx| {
+                this.head_reads.remove(&branch);
+                this.note_read(&read, cx);
+                if let Ok(ReadOutput {
+                    graph_commit_id: Some(head),
+                    ..
+                }) = read
+                {
+                    this.saw_head(branch, head, false, None, cx);
+                }
+            })
+            .ok();
+        });
+        self.head_reads.insert(key, read);
     }
 
     /// Reads the branch list again once it has been read, so a branch made or deleted elsewhere
@@ -1288,7 +1293,14 @@ impl GraphSession {
     /// Records `branch`'s head. A move from a head already seen that is not one of Studio's own
     /// commits (`own`) is another writer's commit: the branch's commit list and counts are read
     /// again, as after Studio's own.
-    fn saw_head(&mut self, branch: String, head: String, own: bool, cx: &mut Context<Self>) {
+    fn saw_head(
+        &mut self,
+        branch: String,
+        head: String,
+        own: bool,
+        parent: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
         if own {
             // A head read sent before this commit could answer with the head before it.
             self.head_reads.remove(&branch);
@@ -1296,6 +1308,16 @@ impl GraphSession {
         let previous = self.heads.insert(branch.clone(), head.clone());
         if previous.as_deref() == Some(head.as_str()) {
             return;
+        }
+        if own
+            && previous.is_some()
+            && parent != previous.as_deref()
+            && self.watched_branches().contains(&branch)
+        {
+            // Not on top of the head it replaces, which may be newer: a write that took
+            // minutes answers after the watch saw another writer's commit on top of it. The
+            // head is read again now rather than at the next poll.
+            self.read_head(branch.clone(), cx);
         }
         // Before views hear of the move, so they find the read under way.
         self.read_changes(&branch, cx);
@@ -1602,7 +1624,7 @@ impl GraphSession {
     /// pinned to a commit resolves the commit and opens the graph at it, 0.5 s or more slower
     /// (spec 015). Its answer counts only if it comes back at that commit, so the read still
     /// sees exactly the commit asked for; one from a newer head is read again, pinned. Only the
-    /// head watch moves a head, since reads can finish out of order.
+    /// head watch and Studio's own commits move a head, since reads can finish out of order.
     fn read_at_commit(
         &mut self,
         request: QueryRequest,
@@ -2099,8 +2121,9 @@ impl GraphSession {
             let kind = outcome_kind(&outcome, |output: &ChangeOutput| {
                 output.commit.as_ref().map(|c| c.graph_commit_id.clone())
             });
+            let parent = parent_of(&outcome, |output: &ChangeOutput| output.commit.as_ref());
             this.update(cx, |this, cx| {
-                this.finish_write(branch, description, kind, follow_up, cx);
+                this.finish_write(branch, description, kind, parent, follow_up, cx);
             })
             .ok();
             outcome
@@ -2126,7 +2149,7 @@ impl GraphSession {
         };
         self.log_outcome(branch.clone(), description, outcome, None);
         if let Some(commit) = commit {
-            self.committed(branch, commit, cx);
+            self.committed(branch, commit, None, cx);
         }
         if branch_created {
             self.reload_branches(cx);
@@ -2160,6 +2183,7 @@ impl GraphSession {
         branch: String,
         description: String,
         outcome: OutcomeKind,
+        parent: Option<String>,
         follow_up: Option<FollowUp>,
         cx: &mut Context<Self>,
     ) {
@@ -2170,14 +2194,21 @@ impl GraphSession {
         };
         self.log_outcome(branch.clone(), description, outcome, follow_up);
         if let Some(commit) = commit {
-            self.committed(branch, commit, cx);
+            self.committed(branch, commit, parent, cx);
         }
         cx.emit(SessionEvent::ActivityChanged);
         cx.notify();
     }
 
-    /// One of Studio's writes committed `commit` on `branch`: it is the branch's head.
-    fn committed(&mut self, branch: String, commit: String, cx: &mut Context<Self>) {
+    /// One of Studio's writes committed `commit` on `branch`, over `parent` when the answer
+    /// says: it is the branch's head.
+    fn committed(
+        &mut self,
+        branch: String,
+        commit: String,
+        parent: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         // The counts are the session's branch's: a commit elsewhere (an agent's branch) leaves
         // them as they are.
         if branch == self.branch {
@@ -2187,7 +2218,7 @@ impl GraphSession {
         cx.emit(SessionEvent::Committed {
             branch: branch.clone(),
         });
-        self.saw_head(branch, commit, true, cx);
+        self.saw_head(branch, commit, true, parent.as_deref(), cx);
     }
 
     pub fn create_branch(
@@ -2208,7 +2239,7 @@ impl GraphSession {
                 .await;
             let kind = outcome_kind(&outcome, |_| None);
             this.update(cx, |this, cx| {
-                this.finish_write(branch, description, kind, None, cx);
+                this.finish_write(branch, description, kind, None, None, cx);
                 this.reload_branches(cx);
             })
             .ok();
@@ -2236,7 +2267,7 @@ impl GraphSession {
                 if this.branch == name && matches!(outcome, WriteOutcome::Committed(_)) {
                     this.set_branch("main".into(), cx);
                 }
-                this.finish_write(name, description, kind, None, cx);
+                this.finish_write(name, description, kind, None, None, cx);
                 this.reload_branches(cx);
             })
             .ok();
@@ -2266,8 +2297,11 @@ impl GraphSession {
             let kind = outcome_kind(&outcome, |output: &BranchMergeOutput| {
                 output.commit.as_ref().map(|c| c.graph_commit_id.clone())
             });
+            let parent = parent_of(&outcome, |output: &BranchMergeOutput| {
+                output.commit.as_ref()
+            });
             this.update(cx, |this, cx| {
-                this.finish_write(target, description, kind, None, cx);
+                this.finish_write(target, description, kind, parent, None, cx);
             })
             .ok();
             outcome
@@ -2293,6 +2327,17 @@ fn outcome_kind<T>(
         WriteOutcome::Unknown { reason } => OutcomeKind::Unknown {
             reason: reason.clone(),
         },
+    }
+}
+
+/// The parent of the commit a write's answer names.
+fn parent_of<T>(
+    outcome: &WriteOutcome<T>,
+    commit: impl Fn(&T) -> Option<&CommitOutput>,
+) -> Option<String> {
+    match outcome {
+        WriteOutcome::Committed(value) => commit(value)?.parent_commit_id.clone(),
+        _ => None,
     }
 }
 
@@ -3506,6 +3551,36 @@ mod tests {
         });
     }
 
+    /// A write that answers after the watch saw a newer commit on top of it does not leave the
+    /// head on the older one: the head is read again at once.
+    #[gpui::test]
+    async fn a_late_answer_of_studios_own_write_does_not_leave_an_older_head(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::test_server::followed_session;
+        use serde_json::json;
+
+        const SCHEMA: &str = "node Person {\n  slug: String @key\n}\n";
+        let (session, served) = followed_session(SCHEMA, |_| json!([]), cx);
+        cx.run_until_parked();
+        let _watch = session.update(cx, |session, _| watching(session, &["Person"], &[]));
+        // Studio's write commits m; another writer commits n on top; the watch sees n first.
+        served.lock().unwrap().commit("m", Vec::new());
+        served.lock().unwrap().commit("n", Vec::new());
+        session.update(cx, |session, cx| {
+            session.saw_head("main".into(), "n".into(), false, None, cx)
+        });
+        cx.run_until_parked();
+        session.update(cx, |session, cx| {
+            session.committed("main".into(), "m".into(), Some("c1".into()), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            session.read_with(cx, |session, _| session.head("main").map(str::to_owned)),
+            Some("n".into())
+        );
+    }
+
     /// A head move reads the change feed after the commit the log last holds, asked only about
     /// the types views read; a range answers once that read is in, and is unknown when nobody
     /// read the branch or the schema changed meanwhile.
@@ -3525,7 +3600,7 @@ mod tests {
         let commit = |cx: &mut TestAppContext, id: &str, changes| {
             served.lock().unwrap().commit(id, changes);
             session.update(cx, |session, cx| {
-                session.saw_head("main".into(), id.into(), false, cx)
+                session.saw_head("main".into(), id.into(), false, None, cx)
             });
         };
         let since = |cx: &mut TestAppContext, from: &str, to: &str| {
