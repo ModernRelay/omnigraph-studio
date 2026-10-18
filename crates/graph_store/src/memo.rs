@@ -6,7 +6,7 @@
 //! Only successful answers are kept; a failure is forgotten so the next read asks again. The
 //! memo holds at most `capacity` entries and forgets the least recently used first.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 
 /// What the memo holds for a key: an answer, or the read under way (`P`, a shareable future).
@@ -19,11 +19,20 @@ pub(crate) enum Held<V, P> {
 /// How a memo weighs one answer, in bytes.
 pub(crate) type Weigh<V> = fn(&V) -> usize;
 
+/// One key's entry: what is held, what its answer weighs (nothing while under way), and when
+/// it was last used.
+struct Slot<V, P> {
+    held: Held<V, P>,
+    weight: usize,
+    used: u64,
+}
+
 pub(crate) struct Memo<K, V, P> {
-    /// Each key's entry, and what its answer weighs (nothing while under way).
-    entries: HashMap<K, (Held<V, P>, usize)>,
-    /// Keys from least to most recently used.
-    order: VecDeque<K>,
+    entries: HashMap<K, Slot<V, P>>,
+    /// Keys by when they were last used, least recently first: using one moves it to the end
+    /// in logarithmic time, as many reads a frame do.
+    order: BTreeMap<u64, K>,
+    clock: u64,
     capacity: usize,
     /// The most the answers held may weigh together, and how one is weighed.
     budget: Option<(usize, Weigh<V>)>,
@@ -34,7 +43,8 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone> Memo<K, V, P> {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             entries: HashMap::new(),
-            order: VecDeque::new(),
+            order: BTreeMap::new(),
+            clock: 0,
             capacity: capacity.max(1),
             budget: None,
             bytes: 0,
@@ -51,9 +61,17 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone> Memo<K, V, P> {
 
     /// What is held for `key`, marking it used.
     pub(crate) fn get(&mut self, key: &K) -> Option<Held<V, P>> {
-        let held = self.entries.get(key)?.0.clone();
+        let held = self.entries.get(key)?.held.clone();
         self.touch(key);
         Some(held)
+    }
+
+    /// The answer held for `key`, without marking it used.
+    pub(crate) fn peek(&self, key: &K) -> Option<&V> {
+        match &self.entries.get(key)?.held {
+            Held::Done(value) => Some(value),
+            Held::Pending(_) => None,
+        }
     }
 
     /// Records a read under way for `key`.
@@ -80,22 +98,12 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone> Memo<K, V, P> {
         self.put(key, Held::Done(value));
     }
 
-    /// Every answer held, in no order.
-    pub(crate) fn answers(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.entries
-            .iter()
-            .filter_map(|(key, (held, _))| match held {
-                Held::Done(value) => Some((key, value)),
-                Held::Pending(_) => None,
-            })
-    }
-
     /// Forgets what is held for `key`: the next read asks again.
     pub(crate) fn forget(&mut self, key: &K) {
-        if let Some((_, weight)) = self.entries.remove(key) {
-            self.bytes -= weight;
+        if let Some(slot) = self.entries.remove(key) {
+            self.bytes -= slot.weight;
+            self.order.remove(&slot.used);
         }
-        self.order.retain(|k| k != key);
     }
 
     pub(crate) fn clear(&mut self) {
@@ -119,30 +127,42 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone> Memo<K, V, P> {
             (Held::Done(value), Some((_, weigh))) => weigh(value),
             _ => 0,
         };
-        if let Some((_, old)) = self.entries.insert(key.clone(), (held, weight)) {
-            self.bytes -= old;
+        self.clock += 1;
+        let used = self.clock;
+        if let Some(old) = self
+            .entries
+            .insert(key.clone(), Slot { held, weight, used })
+        {
+            self.bytes -= old.weight;
+            self.order.remove(&old.used);
         }
         self.bytes += weight;
-        self.touch(&key);
+        self.order.insert(used, key.clone());
         // The least recently used go first; the answer just kept stays, whatever it weighs.
         let over_budget = |memo: &Self| memo.budget.is_some_and(|(budget, _)| memo.bytes > budget);
         while self.entries.len() > self.capacity || over_budget(self) {
-            let Some(oldest) = self.order.front().cloned() else {
+            let Some((&oldest, _)) = self.order.first_key_value() else {
                 break;
             };
-            if oldest == key {
+            if oldest == used {
                 break;
             }
-            self.order.pop_front();
-            if let Some((_, weight)) = self.entries.remove(&oldest) {
-                self.bytes -= weight;
+            if let Some(gone) = self.order.remove(&oldest)
+                && let Some(slot) = self.entries.remove(&gone)
+            {
+                self.bytes -= slot.weight;
             }
         }
     }
 
     fn touch(&mut self, key: &K) {
-        self.order.retain(|k| k != key);
-        self.order.push_back(key.clone());
+        let Some(slot) = self.entries.get_mut(key) else {
+            return;
+        };
+        self.clock += 1;
+        self.order.remove(&slot.used);
+        slot.used = self.clock;
+        self.order.insert(slot.used, key.clone());
     }
 }
 

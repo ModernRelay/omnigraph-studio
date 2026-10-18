@@ -188,6 +188,27 @@ struct DegreeAt {
 /// How many nodes' counts a session keeps.
 const DEGREE_COUNTS: usize = 16_384;
 
+/// Adds `commit` to the commits kept for `family`, the newest last and the last 16 at most. A
+/// map grown past `cap` families starts again: carrying across commits is a saving, not a need.
+fn remember<F: std::hash::Hash + Eq>(
+    map: &mut HashMap<F, Vec<String>>,
+    family: F,
+    commit: &str,
+    cap: usize,
+) {
+    if map.len() > cap && !map.contains_key(&family) {
+        map.clear();
+    }
+    let commits = map.entry(family).or_default();
+    if commits.last().map(String::as_str) != Some(commit) {
+        commits.retain(|kept| kept != commit);
+        commits.push(commit.to_owned());
+        if commits.len() > 16 {
+            commits.remove(0);
+        }
+    }
+}
+
 /// A query's parameters as a memo key holds them: as sent.
 fn params_key(params: &serde_json::Map<String, Value>) -> String {
     if params.is_empty() {
@@ -268,6 +289,12 @@ pub struct GraphSession {
     /// Each node's count through a group, by commit: read in a batch, or what a page's counts
     /// gave (`builder::Seeds`). Shared by the table, the peek, the tree and the canvas.
     degree_counts: Memo<DegreeAt, u64, ()>,
+    /// The commits each read's answer is kept at, by its query, parameters and schema epoch,
+    /// and each node's count: where a miss at one commit looks for the same read at another,
+    /// rather than going through every answer kept. Entries the memo let go are skipped and
+    /// dropped as they are met.
+    pinned_commits: HashMap<(String, String, u64), Vec<String>>,
+    degree_commits: HashMap<(String, RelationshipGroup, String, u64), Vec<String>>,
     /// Which schema the session reads under: a new number each time the schema's text changes,
     /// the first one included. A read at an old commit uses the current schema, so the same
     /// query at the same commit can mean something else after a rename, a drop or an addition;
@@ -335,6 +362,8 @@ impl GraphSession {
             pinned_reads: Memo::weighed(PINNED_READS, PINNED_READ_BYTES, read_bytes),
             pinned_blobs: Memo::new(PINNED_BLOBS),
             degree_counts: Memo::new(DEGREE_COUNTS),
+            pinned_commits: HashMap::new(),
+            degree_commits: HashMap::new(),
             schema_epoch: 0,
             schema_text: None,
             commit_lists: Memo::new(COMMIT_LISTS),
@@ -598,6 +627,8 @@ impl GraphSession {
         self.pinned_reads.clear();
         self.pinned_blobs.clear();
         self.degree_counts.clear();
+        self.pinned_commits.clear();
+        self.degree_commits.clear();
         // Each log starts again at its branch's head, so the next move is read.
         self.change_logs = self
             .heads
@@ -1204,6 +1235,7 @@ impl GraphSession {
                         schema: epoch,
                     };
                     if !self.pinned_reads.holds(&key) {
+                        self.kept_at(&key);
                         let answer = ReadOutput {
                             query_name: query.name,
                             target: ReadTargetOutput {
@@ -1234,6 +1266,7 @@ impl GraphSession {
                         schema: epoch,
                     };
                     let n = counts.get(id).copied().unwrap_or(0);
+                    self.count_kept_at(&key);
                     self.degree_counts.insert(key, n);
                 }
             }
@@ -1246,53 +1279,88 @@ impl GraphSession {
         if let Some(Held::Done(n)) = self.degree_counts.get(key) {
             return Some(n);
         }
-        let carried = self
-            .degree_counts
-            .answers()
-            .filter(|(at, _)| {
-                at.type_name == key.type_name
-                    && at.group == key.group
-                    && at.id == key.id
-                    && at.schema == key.schema
-                    && at.commit != key.commit
-            })
-            .find_map(|(at, n)| {
-                match self.changes_since(&self.branch, &at.commit, &key.commit) {
-                    Since::Known(since) if !since.edges_at(&key.group.edge, &key.id) => Some(*n),
+        let family = (
+            key.type_name.clone(),
+            key.group.clone(),
+            key.id.clone(),
+            key.schema,
+        );
+        let commits = self.degree_commits.get(&family)?.clone();
+        let carried = commits
+            .iter()
+            .rev()
+            .filter(|commit| **commit != key.commit)
+            .find_map(|commit| {
+                let at = DegreeAt {
+                    commit: commit.clone(),
+                    ..key.clone()
+                };
+                let n = *self.degree_counts.peek(&at)?;
+                match self.changes_since(&self.branch, commit, &key.commit) {
+                    Since::Known(since) if !since.edges_at(&key.group.edge, &key.id) => Some(n),
                     _ => None,
                 }
             })?;
+        self.count_kept_at(key);
         self.degree_counts.insert(key.clone(), carried);
         Some(carried)
+    }
+
+    /// Notes that a count for `key` is kept, so a miss at another commit finds it.
+    fn count_kept_at(&mut self, key: &DegreeAt) {
+        let family = (
+            key.type_name.clone(),
+            key.group.clone(),
+            key.id.clone(),
+            key.schema,
+        );
+        remember(&mut self.degree_commits, family, &key.commit, DEGREE_COUNTS);
     }
 
     /// An answer to the same query and parameters read at an earlier commit of the session's
     /// branch, standing for `key`'s commit because no commit in between changed what it
     /// depends on (spec 015, carry-forward). Answered as read at `key`'s commit.
-    fn carried(&self, key: &PinnedRead, depends: &Depends) -> Option<ReadOutput> {
+    fn carried(&mut self, key: &PinnedRead, depends: &Depends) -> Option<ReadOutput> {
         if *depends == Depends::Unknown {
             return None;
         }
-        self.pinned_reads
-            .answers()
-            .filter(|(read, _)| {
-                read.query == key.query
-                    && read.params == key.params
-                    && read.schema == key.schema
-                    && read.commit != key.commit
-            })
-            .find_map(|(read, output)| {
-                match self.changes_since(&self.branch, &read.commit, &key.commit) {
-                    Since::Known(since) if answer_unchanged(&since, depends, &output.rows) => {
-                        let mut output = output.clone();
-                        output.graph_commit_id = Some(key.commit.clone());
-                        output.target.branch = None;
-                        output.target.snapshot = Some(key.commit.clone());
-                        Some(output)
-                    }
-                    _ => None,
-                }
-            })
+        let family = (key.query.clone(), key.params.clone(), key.schema);
+        let commits = self.pinned_commits.get(&family)?.clone();
+        let mut gone = Vec::new();
+        let mut found = None;
+        // The newest first: the fewest commits to walk.
+        for commit in commits.iter().rev().filter(|commit| **commit != key.commit) {
+            let at = PinnedRead {
+                commit: commit.clone(),
+                ..key.clone()
+            };
+            let Some(output) = self.pinned_reads.peek(&at) else {
+                gone.push(commit.clone());
+                continue;
+            };
+            if let Since::Known(since) = self.changes_since(&self.branch, commit, &key.commit)
+                && answer_unchanged(&since, depends, &output.rows)
+            {
+                let mut output = output.clone();
+                output.graph_commit_id = Some(key.commit.clone());
+                output.target.branch = None;
+                output.target.snapshot = Some(key.commit.clone());
+                found = Some(output);
+                break;
+            }
+        }
+        if !gone.is_empty()
+            && let Some(commits) = self.pinned_commits.get_mut(&family)
+        {
+            commits.retain(|commit| !gone.contains(commit));
+        }
+        found
+    }
+
+    /// Notes that an answer for `key` is kept, so a miss at another commit finds it.
+    fn kept_at(&mut self, key: &PinnedRead) {
+        let family = (key.query.clone(), key.params.clone(), key.schema);
+        remember(&mut self.pinned_commits, family, &key.commit, PINNED_READS);
     }
 
     /// Runs a read on the session's branch, or at `snapshot` when given (constitution II). A
@@ -1347,6 +1415,7 @@ impl GraphSession {
             Some(Held::Done(output)) => return Task::ready(Ok(output)),
             Some(Held::Pending(shared)) => shared,
             None if let Some(output) = self.carried(&key, &query.depends) => {
+                self.kept_at(&key);
                 self.pinned_reads.insert(key, output.clone());
                 return Task::ready(Ok(output));
             }
@@ -1358,8 +1427,13 @@ impl GraphSession {
         };
         cx.spawn(async move |this, cx| {
             let result = shared.await;
-            this.update(cx, |this, _| this.pinned_reads.finish(&key, &result))
-                .ok();
+            this.update(cx, |this, _| {
+                this.pinned_reads.finish(&key, &result);
+                if result.is_ok() {
+                    this.kept_at(&key);
+                }
+            })
+            .ok();
             result
         })
     }
