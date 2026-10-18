@@ -30,6 +30,8 @@ pub struct CommitCounts {
     pub added: usize,
     pub changed: usize,
     pub removed: usize,
+    /// More changes are still to read: the counts are of those read so far.
+    pub partial: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +57,9 @@ pub struct CommitView {
     counts: Vec<TypeCounts>,
     rows: Vec<Row>,
     next_page_token: Option<String>,
+    /// Why the last read of more changes stopped: what was read before it stays, and the next
+    /// press goes on from the page that failed.
+    more_error: Option<SharedString>,
     list_state: ListState,
     focus_handle: FocusHandle,
     _task: Option<Task<()>>,
@@ -112,6 +117,7 @@ impl CommitView {
             counts: Vec::new(),
             rows: Vec::new(),
             next_page_token: None,
+            more_error: None,
             list_state: ListState::new(0, ListAlignment::Top, px(600.)),
             focus_handle: cx.focus_handle(),
             _task: None,
@@ -127,6 +133,7 @@ impl CommitView {
     /// Reads the next pages of changes, up to [`CAP`] more.
     fn load_more(&mut self, cx: &mut Context<Self>) {
         self.state = State::Loading;
+        self.more_error = None;
         let session = self.session.clone();
         let commit_id = self.commit_id.clone();
         let mut token = self.next_page_token.take();
@@ -160,17 +167,30 @@ impl CommitView {
                     Err(error) => break Err(describe(&error)),
                 }
             };
+            let read_any = fold.raw_changes() > start;
             let folded = fold.clone().finish();
             this.update(cx, |this, cx| {
+                // A failure after changes were shown keeps them, and those read since.
+                let result = match result {
+                    Err(message) if read_any || !this.rows.is_empty() => {
+                        this.more_error = Some(message.into());
+                        Ok(())
+                    }
+                    result => result,
+                };
                 match result {
                     Ok(()) => {
                         this.cause = cause.or(this.cause.take());
                         this.fold = fold;
                         this.counts = folded.counts();
                         this.rows = build_rows(&folded);
-                        this.list_state.reset(this.rows.len());
                         this.folded = folded;
                         this.next_page_token = token;
+                        // Rows read further down keep the place the person scrolled to.
+                        let top = this.list_state.logical_scroll_top();
+                        let more = usize::from(this.next_page_token.is_some());
+                        this.list_state.reset(this.rows.len() + more);
+                        this.list_state.scroll_to(top);
                         this.state = State::Ready;
                         let (added, changed, removed) =
                             this.counts.iter().fold((0, 0, 0), |(a, c, r), t| {
@@ -181,6 +201,7 @@ impl CommitView {
                             added,
                             changed,
                             removed,
+                            partial: this.next_page_token.is_some(),
                         });
                     }
                     Err(message) => this.state = State::Failed(message.into()),
@@ -442,14 +463,25 @@ impl CommitView {
                     ))
                     .into_any_element()
             }
-            None if more => div()
+            None if more => h_flex()
                 .px_4()
                 .py_2()
+                .gap_2()
                 .child(
-                    studio_ui::ds::button("load-more", "Load more changes")
-                        .style(ButtonStyle::Subtle)
-                        .on_click(cx.listener(|this, _, _, cx| this.load_more(cx))),
+                    studio_ui::ds::button(
+                        "load-more",
+                        if self.more_error.is_some() {
+                            "Try again"
+                        } else {
+                            "Load more changes"
+                        },
+                    )
+                    .style(ButtonStyle::Subtle)
+                    .on_click(cx.listener(|this, _, _, cx| this.load_more(cx))),
                 )
+                .children(self.more_error.clone().map(|error| {
+                    studio_ui::ds::text::muted(format!("More changes could not be read: {error}"))
+                }))
                 .into_any_element(),
             None => div().into_any_element(),
         }
@@ -549,5 +581,83 @@ impl Render for CommitView {
             .size_full()
             .child(header)
             .child(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use gpui::TestAppContext;
+    use graph_store::{Connection, ServerEntry, ServerSource};
+    use http_client::{AsyncBody, FakeHttpClient, Response};
+    use serde_json::json;
+
+    use super::*;
+
+    /// A failed read of more changes keeps those read before it, and the next press goes on
+    /// from the page that failed; the counts say they are partial until the last page is in.
+    #[gpui::test]
+    async fn a_failed_page_keeps_what_was_read_and_goes_on_from_it(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let failures = Arc::new(AtomicUsize::new(0));
+        let failed = failures.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let query = request.uri().query().unwrap_or_default().to_owned();
+            let failed = failed.clone();
+            async move {
+                let change = |id: &str| json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": id, "op": "insert", "before": null, "after": { "properties": { "slug": id } } });
+                let cause = json!({ "graph_commit_id": "c9", "parent_commit_id": "c8", "authored_branch": "main", "authored_at": 0 });
+                let (status, body) = if !query.contains("page_token") {
+                    (
+                        200,
+                        json!({ "cause": cause, "changes": [change("p1")], "next_page_token": "t2" }),
+                    )
+                } else if failed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    (500, json!({ "error": "busy" }))
+                } else {
+                    (200, json!({ "cause": cause, "changes": [change("p2")] }))
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        let view = cx.new(|cx| CommitView::new(session, "c9".into(), None, cx));
+        let partial = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heard = partial.clone();
+        cx.update(|cx| {
+            cx.subscribe(&view, move |_, counts: &CommitCounts, _| {
+                heard.lock().unwrap().push(counts.partial)
+            })
+            .detach()
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.state, State::Ready));
+            assert_eq!(view.folded.changes.len(), 1, "the first page stays");
+            assert_eq!(view.next_page_token.as_deref(), Some("t2"));
+            assert!(view.more_error.is_some());
+        });
+        view.update(cx, |view, cx| view.load_more(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.folded.changes.len(), 2);
+            assert_eq!(view.next_page_token, None);
+            assert!(view.more_error.is_none());
+        });
+        assert_eq!(*partial.lock().unwrap(), [true, false]);
     }
 }

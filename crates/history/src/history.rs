@@ -13,10 +13,8 @@ use studio_actions::graph::{OpenCommit, OpenHistory};
 use studio_workspace::{PanelPosition, Workspace};
 use ui::IconName;
 
-pub use commit_view::{CommitCounts, CommitView, commit_key};
-pub use lanes::{Graph, GraphCommit, GraphRow, LaneLine, assign_lanes};
-pub use merged::{branch_heads, with_merged_commits};
-pub use view::{HistoryView, LONG_HISTORY, history_key};
+use commit_view::{CommitView, commit_key};
+use view::{HistoryView, history_key};
 
 /// Registers this surface with every new workspace.
 pub fn init(cx: &mut App) {

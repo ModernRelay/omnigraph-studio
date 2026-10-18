@@ -308,6 +308,9 @@ impl HistoryView {
                 this.heads = heads;
                 this.own_count = own_count;
                 this.state = State::Ready;
+                // The matches and the drawn rows' counts were found in the list before.
+                this.match_commits(cx);
+                this.count_rows = None;
                 let keep = previous
                     .and_then(|id| this.commits.iter().position(|c| c.graph_commit_id == id));
                 match keep {
@@ -322,8 +325,18 @@ impl HistoryView {
         cx.notify();
     }
 
-    /// The commits whose id starts with, or whose actor contains, the search text.
+    /// The commits the search text finds ([`commit_matches`]); the first is selected.
     fn find(&mut self, cx: &mut Context<Self>) {
+        self.match_commits(cx);
+        self.match_at = (!self.matches.is_empty()).then_some(0);
+        if let Some(&ix) = self.matches.first() {
+            self.select(ix, cx);
+        }
+        cx.notify();
+    }
+
+    /// Finds the search text's commits in the list as it is now, keeping the selection.
+    fn match_commits(&mut self, cx: &App) {
         let query = self.search.read(cx).text(cx).trim().to_lowercase();
         self.matches = if query.is_empty() {
             Vec::new()
@@ -335,11 +348,10 @@ impl HistoryView {
                 .map(|(ix, _)| ix)
                 .collect()
         };
-        self.match_at = (!self.matches.is_empty()).then_some(0);
-        if let Some(&ix) = self.matches.first() {
-            self.select(ix, cx);
-        }
-        cx.notify();
+        self.match_at = self
+            .match_at
+            .filter(|_| !self.matches.is_empty())
+            .map(|at| at.min(self.matches.len() - 1));
     }
 
     fn step_match(&mut self, forward: bool, cx: &mut Context<Self>) {
@@ -377,7 +389,11 @@ impl HistoryView {
             let detail = cx.new(|cx| CommitView::new(session, id, Some(commit), cx));
             self._detail_subscription =
                 Some(cx.subscribe(&detail, |this, _, counts: &CommitCounts, cx| {
-                    this.partial_counts.remove(&counts.commit_id);
+                    if counts.partial {
+                        this.partial_counts.insert(counts.commit_id.clone());
+                    } else {
+                        this.partial_counts.remove(&counts.commit_id);
+                    }
                     this.counts.insert(
                         counts.commit_id.clone(),
                         (counts.added, counts.changed, counts.removed),
@@ -718,8 +734,13 @@ impl HistoryView {
 }
 
 /// Whether a commit's id starts with, or its actor contains, `query` (lowercase).
+/// Whether the search text begins the commit's id, either as stored or as a row shows it (its
+/// last eight characters), or is in its actor.
 fn commit_matches(commit: &CommitOutput, query: &str) -> bool {
     commit.graph_commit_id.to_lowercase().starts_with(query)
+        || short_commit_id(&commit.graph_commit_id)
+            .to_lowercase()
+            .starts_with(query)
         || commit
             .actor_id
             .as_ref()
@@ -927,7 +948,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn search_finds_commits_by_id_prefix_or_actor() {
+    fn search_finds_commits_by_the_start_of_their_id_or_their_actor() {
         let commit = CommitOutput {
             graph_commit_id: "hb1.01M4R84Z6GANJ0B8MJ4S3Y6CKK.2.01M4R865CRM266GRK5EP12CTBE".into(),
             graph_manifest_version: 3,
@@ -941,8 +962,13 @@ mod tests {
         assert!(commit_matches(&commit, "hb1.01m4r"));
         assert!(commit_matches(&commit, "dev"));
         assert!(
-            !commit_matches(&commit, "ep12ctbe"),
-            "an id matches by prefix only"
+            commit_matches(&commit, "ep12ctbe"),
+            "the id as a row shows it"
+        );
+        assert!(commit_matches(&commit, "ep12"));
+        assert!(
+            !commit_matches(&commit, "12ctbe"),
+            "an id matches by its start only"
         );
         assert!(!commit_matches(&commit, "alice"));
     }

@@ -38,6 +38,8 @@ pub struct GraphRow {
     pub outgoing: Vec<LaneLine>,
 }
 
+/// The lanes at a row's edges, which the lane tests check meet from row to row.
+#[cfg(test)]
 impl GraphRow {
     /// Lanes occupied at the top edge of the row.
     pub fn top(&self) -> impl Iterator<Item = LaneLine> + '_ {
