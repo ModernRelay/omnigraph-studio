@@ -1,7 +1,8 @@
 //! Settings reach Zed's theme: the theme in `settings.json` is the one Studio starts with, a
 //! change made in the running app switches the active theme, and the file Studio writes is the
 //! one it reads back. A change rewrites only its own setting: the person's comments and an edit
-//! Studio has not read yet stay, and a file that does not parse is not written.
+//! Studio has not read yet stay, and a file that does not parse is not written: the change holds
+//! until Studio quits, and the settings page says so.
 //!
 //! `harness = false`: the macOS platform must be created on the main thread, and libtest runs
 //! tests on worker threads.
@@ -46,7 +47,7 @@ fn settings_choose_the_active_theme(cx: &mut HeadlessAppContext, data: &Path) {
     // Input handlers run in a flushed update, as an `AsyncApp` update is.
     let app = cx.update(|cx| cx.to_async());
     app.update(|cx| studio_settings::update(cx, |s| s.theme.mode = ThemeMode::Light));
-    cx.run_until_parked();
+    settle(cx);
     assert_eq!(
         cx.update(|cx| cx.theme().name.to_string()),
         "Vitesse Refined Light",
@@ -59,7 +60,7 @@ fn settings_choose_the_active_theme(cx: &mut HeadlessAppContext, data: &Path) {
             s.theme.dark = "Gruvbox Dark".into();
         })
     });
-    cx.run_until_parked();
+    settle(cx);
     assert_eq!(cx.update(|cx| cx.theme().name.to_string()), "Gruvbox Dark");
 
     let written = std::fs::read_to_string(data.join("settings.json")).unwrap();
@@ -89,7 +90,7 @@ fn a_change_keeps_the_persons_text(cx: &mut HeadlessAppContext, data: &Path) {
     std::fs::write(&path, by_hand).unwrap();
     let app = cx.update(|cx| cx.to_async());
     app.update(|cx| studio_settings::update(cx, |s| s.studio.tree_page_size = 20));
-    cx.run_until_parked();
+    settle(cx);
     let written = std::fs::read_to_string(&path).unwrap();
     assert!(
         written.contains("\n  // Chosen by hand\n  \"ui_font_size\": 13,\n"),
@@ -110,7 +111,7 @@ fn a_change_keeps_the_persons_text(cx: &mut HeadlessAppContext, data: &Path) {
     let by_hand = written.replace("\"ui_font_size\": 13", "\"ui_font_size\": 12");
     std::fs::write(&path, &by_hand).unwrap();
     app.update(|cx| studio_settings::update(cx, |s| s.studio.tree_page_size = 20));
-    cx.run_until_parked();
+    settle(cx);
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
         by_hand,
@@ -121,7 +122,7 @@ fn a_change_keeps_the_persons_text(cx: &mut HeadlessAppContext, data: &Path) {
     let broken = "{\n  \"ui_font_size\": 13\n  \"studio\": {}\n}\n";
     std::fs::write(&path, broken).unwrap();
     app.update(|cx| studio_settings::update(cx, |s| s.studio.tree_page_size = 30));
-    cx.run_until_parked();
+    settle(cx);
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
         broken,
@@ -129,10 +130,18 @@ fn a_change_keeps_the_persons_text(cx: &mut HeadlessAppContext, data: &Path) {
     );
     assert!(
         cx.update(|cx| studio_settings::file_error(cx))
-            .is_some_and(|error| error.contains("the change was not saved")),
+            .is_some_and(|error| error.contains("holds only until Studio quits")),
     );
     assert_eq!(
         cx.update(|cx| StudioSettings::get(cx).studio.tree_page_size),
-        20
+        30,
+        "the change applies though the file could not take it"
     );
+}
+
+/// Waits for the settings file's write, which runs on Studio's write thread, then runs what its
+/// answer wakes on the main thread.
+fn settle(cx: &mut HeadlessAppContext) {
+    studio_settings::writes_done();
+    cx.run_until_parked();
 }

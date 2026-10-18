@@ -274,12 +274,12 @@ pub fn edit(text: &str, old: &StudioSettings, new: &StudioSettings) -> Result<St
     let tab = settings::infer_json_indent_size(&text);
     for (path, value) in &changes {
         match value.clone() {
-            None => remove_in_text(&mut text, &path),
+            None => remove_in_text(&mut text, path),
             Some(value) => {
-                let present = settings::find_value_range_in_json_text(&text, &path).is_some();
-                if present || !add_in_text(&mut text, &path, &value, tab) {
+                let present = settings::find_value_range_in_json_text(&text, path).is_some();
+                if present || !add_in_text(&mut text, path, &value, tab) {
                     let (range, replacement) =
-                        settings::replace_value_in_json_text(&text, &path, tab, Some(&value), None);
+                        settings::replace_value_in_json_text(&text, path, tab, Some(&value), None);
                     text.replace_range(range, &replacement);
                 }
             }
