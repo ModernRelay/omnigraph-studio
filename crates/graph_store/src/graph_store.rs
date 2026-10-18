@@ -14,6 +14,8 @@ pub mod fixes;
 mod memo;
 mod registry;
 mod session;
+#[cfg(test)]
+mod test_server;
 
 use std::sync::Arc;
 

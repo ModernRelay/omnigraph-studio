@@ -13,7 +13,7 @@
 //! relationship grouped by a property shows one row per value, from
 //! `builder::neighbour_values`, each opening to the neighbours with that value.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
@@ -26,7 +26,8 @@ use graph_client::ReadError;
 use graph_client::api::ReadOutput;
 use serde_json::Value;
 
-use crate::session::{GraphSession, Loadable, SessionEvent};
+use crate::carry::{Since, TypeRef, node_reads};
+use crate::session::{GraphSession, Loadable, ReadWatch, SessionEvent};
 
 /// One node, by type and key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1111,6 +1112,12 @@ pub struct Exploration {
     newer_available: bool,
     generation: u64,
     tasks: HashMap<LoadTarget, Task<()>>,
+    /// What the exploration reads, told to the session for the branch named: a head move
+    /// that changed none of it moves the pin without reading again (spec 015).
+    reads: BTreeSet<TypeRef>,
+    watch: Option<(String, ReadWatch)>,
+    /// The head moved and the session is reading what changed.
+    awaiting_changes: bool,
     _subscription: Subscription,
 }
 
@@ -1148,14 +1155,13 @@ impl Exploration {
                     this.root_at(root, cx);
                 }
             }
-            SessionEvent::HeadMoved { branch, head }
-                if *branch == session.read(cx).branch
-                    && this.pin.as_deref().is_some_and(|pin| pin != head)
-                    && !this.newer_available =>
+            SessionEvent::HeadMoved { branch, .. } if *branch == session.read(cx).branch => {
+                this.compare_head(cx)
+            }
+            SessionEvent::ChangesRead { branch }
+                if this.awaiting_changes && *branch == session.read(cx).branch =>
             {
-                this.newer_available = true;
-                cx.emit(ExplorationEvent::Changed);
-                cx.notify();
+                this.compare_head(cx)
             }
             _ => {}
         });
@@ -1166,8 +1172,72 @@ impl Exploration {
             newer_available: false,
             generation: 0,
             tasks: HashMap::new(),
+            reads: BTreeSet::new(),
+            watch: None,
+            awaiting_changes: false,
             _subscription: subscription,
         }
+    }
+
+    /// Offers Refresh when the branch head is not the commit the exploration shows, unless
+    /// nothing it reads changed in between: then the pin moves to the head.
+    fn compare_head(&mut self, cx: &mut Context<Self>) {
+        self.awaiting_changes = false;
+        if self.newer_available {
+            return;
+        }
+        let session = self.session.read(cx);
+        let (Some(pin), Some(head)) = (self.pin.clone(), session.head(&session.branch)) else {
+            return;
+        };
+        if pin == head {
+            return;
+        }
+        match session.changes_since(&session.branch, &pin, head) {
+            Since::Pending => self.awaiting_changes = true,
+            Since::Known(since) if !since.any_changed(&self.reads) => {
+                self.pin = Some(head.to_owned())
+            }
+            Since::Known(_) | Since::Unknown => {
+                self.newer_available = true;
+                self.changed(cx);
+            }
+        }
+    }
+
+    /// Tells the session what the exploration reads: each shown node's type, its
+    /// relationships' edges and other types, and for a relationship grouped by its neighbours'
+    /// relationships those too. Told again when that changes.
+    fn watch_reads(&mut self, cx: &mut Context<Self>) {
+        let Some(schema) = self.schema(cx) else {
+            return;
+        };
+        let types: BTreeSet<&str> = self
+            .state
+            .root
+            .iter()
+            .chain(self.state.labels.keys())
+            .map(|node| node.type_name.as_str())
+            .collect();
+        let mut reads: BTreeSet<TypeRef> = types
+            .into_iter()
+            .flat_map(|ty| node_reads(&schema, ty))
+            .collect();
+        for (group, by) in &self.state.grouping {
+            if by.on == GroupOn::Relationship {
+                reads.extend(node_reads(&schema, &group.other_type));
+            }
+        }
+        let branch = self.session.read(cx).branch.clone();
+        if reads == self.reads && self.watch.as_ref().is_some_and(|(at, _)| *at == branch) {
+            return;
+        }
+        let types = reads.clone();
+        let watch = self
+            .session
+            .update(cx, |session, _| session.watch_reads(&branch, types));
+        self.watch = Some((branch, watch));
+        self.reads = reads;
     }
 
     pub fn session(&self) -> &Entity<GraphSession> {
@@ -1436,6 +1506,7 @@ impl Exploration {
     }
 
     fn changed(&mut self, cx: &mut Context<Self>) {
+        self.watch_reads(cx);
         cx.emit(ExplorationEvent::Changed);
         cx.notify();
     }
@@ -1585,6 +1656,7 @@ impl Exploration {
                     return;
                 }
                 this.apply(&key, result);
+                this.watch_reads(cx);
                 this.loaded(&key, cx);
             })
             .ok();
@@ -2223,5 +2295,51 @@ mod tests {
         assert_eq!(state.root_status, Loadable::Loaded(()));
         assert!(!state.reroot(&ExplorePath::root()));
         let _ = schema;
+    }
+
+    /// Another writer's commit to none of the types the exploration reads moves its pin to the
+    /// head without reading again; one to a shown type offers Refresh (spec 015).
+    #[gpui::test]
+    async fn an_exploration_moves_its_pin_past_commits_to_other_types(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::test_server::{followed_session, node_change};
+        const PEOPLE_AND_NOTES: &str = "node Person {\n  slug: String @key\n  name: String\n}\nnode Note {\n  slug: String @key\n}\n";
+        let (session, served) = followed_session(
+            PEOPLE_AND_NOTES,
+            |_| json!([{ "id": "p1", "label": "Ada", "n": 0 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| exploration.root_at(person("p1"), cx));
+        cx.run_until_parked();
+        let pin = |cx: &mut gpui::TestAppContext| {
+            exploration.read_with(cx, |exploration, _| {
+                (
+                    exploration.pin().map(str::to_owned),
+                    exploration.newer_available(),
+                )
+            })
+        };
+        assert_eq!(pin(cx), (Some("c1".into()), false));
+        let reads_before = served.lock().unwrap().feeds.len();
+
+        served
+            .lock()
+            .unwrap()
+            .commit("c2", vec![node_change("Note", "n1")]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        assert_eq!(pin(cx), (Some("c2".into()), false), "moved to the head");
+        assert_eq!(served.lock().unwrap().feeds.len(), reads_before + 1);
+
+        served
+            .lock()
+            .unwrap()
+            .commit("c3", vec![node_change("Person", "p9")]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        assert_eq!(pin(cx), (Some("c2".into()), true), "a person changed");
     }
 }

@@ -2584,116 +2584,18 @@ mod tests {
     #[gpui::test]
     async fn a_head_move_reads_the_change_feed_for_the_types_views_read(cx: &mut TestAppContext) {
         use crate::carry::{Since, TypeRef};
-        use serde_json::{Value, json};
+        use crate::test_server::{followed_session, node_change};
+        use serde_json::json;
 
         const SCHEMA: &str = "node Person {\n  slug: String @key\n}\nnode Company {\n  slug: String @key\n}\nedge WorksAt: Person -> Company\n";
-        struct Served {
-            head: String,
-            schema: String,
-            /// Each commit with its parent and changes, oldest first.
-            commits: Vec<(String, String, Vec<Value>)>,
-            /// The query string of every feed read.
-            feeds: Vec<String>,
-        }
-        let served = Arc::new(std::sync::Mutex::new(Served {
-            head: "c1".into(),
-            schema: SCHEMA.into(),
-            commits: Vec::new(),
-            feeds: Vec::new(),
-        }));
-        let state = served.clone();
-        let http = FakeHttpClient::create(move |request| {
-            let path = request.uri().path().to_owned();
-            let query = request.uri().query().unwrap_or_default().to_owned();
-            let state = state.clone();
-            async move {
-                let mut served = state.lock().unwrap();
-                let body = if path.ends_with("/schema") {
-                    json!({ "schema_source": served.schema })
-                } else if path.ends_with("/changes") {
-                    served.feeds.push(query.clone());
-                    let pairs: Vec<(String, String)> =
-                        url::form_urlencoded::parse(query.as_bytes())
-                            .into_owned()
-                            .collect();
-                    let types: Vec<&str> = pairs
-                        .iter()
-                        .filter(|(key, _)| key == "type")
-                        .map(|(_, value)| value.as_str())
-                        .collect();
-                    let after = pairs
-                        .iter()
-                        .find(|(key, _)| key == "start")
-                        .and_then(|(_, value)| value.strip_prefix("after:"))
-                        .unwrap_or_default()
-                        .to_owned();
-                    let start = served
-                        .commits
-                        .iter()
-                        .position(|(commit, ..)| *commit == after)
-                        .map_or(0, |at| at + 1);
-                    let blocks: Vec<Value> = served.commits[start..]
-                        .iter()
-                        .map(|(commit, parent, changes)| {
-                            let changes: Vec<&Value> = changes
-                                .iter()
-                                .filter(|change| {
-                                    types.is_empty()
-                                        || types.contains(&change["type"]["name"].as_str().unwrap())
-                                })
-                                .collect();
-                            json!({
-                                "cause": {
-                                    "graph_commit_id": commit,
-                                    "parent_commit_id": parent,
-                                    "authored_branch": "main",
-                                    "authored_at": 0,
-                                },
-                                "changes": changes,
-                            })
-                        })
-                        .collect();
-                    json!({ "blocks": blocks, "cursor": "cursor", "caught_up": true })
-                } else if path.ends_with("/query") {
-                    json!({
-                        "query_name": "studio_head",
-                        "target": { "branch": "main" },
-                        "row_count": 0,
-                        "columns": [],
-                        "rows": [],
-                        "graph_commit_id": served.head,
-                    })
-                } else {
-                    json!({ "branches": ["main"] })
-                };
-                Ok(Response::builder()
-                    .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
-                    .body(AsyncBody::from(body.to_string()))
-                    .unwrap())
-            }
-        });
-        let server = ServerEntry {
-            name: "dev".into(),
-            url: "http://127.0.0.1:8787".into(),
-            source: ServerSource::Environment,
-            known_graphs: Vec::new(),
-        };
-        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
-        let session =
-            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        let (session, served) = followed_session(SCHEMA, |_| json!([]), cx);
         cx.run_until_parked();
         assert_eq!(
             session.read_with(cx, |session, _| session.head("main").map(str::to_owned)),
             Some("c1".into())
         );
-        let node = |ty: &str, id: &str| json!({ "kind": "node", "type": { "id": ty, "name": ty }, "id": id, "op": "update", "before": { "properties": {} }, "after": { "properties": {} } });
-        let commit = |cx: &mut TestAppContext, id: &str, changes: Vec<Value>| {
-            {
-                let mut served = served.lock().unwrap();
-                let parent = std::mem::replace(&mut served.head, id.to_owned());
-                served.commits.push((id.to_owned(), parent, changes));
-            }
+        let commit = |cx: &mut TestAppContext, id: &str, changes| {
+            served.lock().unwrap().commit(id, changes);
             session.update(cx, |session, cx| {
                 session.saw_head("main".into(), id.into(), false, cx)
             });
@@ -2701,24 +2603,24 @@ mod tests {
         let since = |cx: &mut TestAppContext, from: &str, to: &str| {
             session.read_with(cx, |session, _| session.changes_since("main", from, to))
         };
+        let feeds = || served.lock().unwrap().feeds.clone();
         let person = TypeRef::Node("Person".into());
         let company = TypeRef::Node("Company".into());
 
         let watch = session.update(cx, |session, _| {
             session.watch_reads("main", BTreeSet::from([person.clone()]))
         });
-        commit(cx, "c2", vec![node("Company", "co1")]);
+        commit(cx, "c2", vec![node_change("Company", "co1")]);
         assert!(
             matches!(since(cx, "c1", "c2"), Since::Pending),
             "the read is under way"
         );
         cx.run_until_parked();
-        let feeds = served.lock().unwrap().feeds.clone();
-        assert_eq!(feeds.len(), 1);
+        assert_eq!(feeds().len(), 1);
         assert!(
-            feeds[0].contains("start=after%3Ac1") && feeds[0].contains("type=Person"),
+            feeds()[0].contains("start=after%3Ac1") && feeds()[0].contains("type=Person"),
             "{}",
-            feeds[0]
+            feeds()[0]
         );
         let Since::Known(range) = since(cx, "c1", "c2") else {
             panic!("known")
@@ -2732,9 +2634,9 @@ mod tests {
             "the feed was not asked about Company"
         );
 
-        commit(cx, "c3", vec![node("Person", "p1")]);
+        commit(cx, "c3", vec![node_change("Person", "p1")]);
         cx.run_until_parked();
-        assert!(served.lock().unwrap().feeds[1].contains("start=after%3Ac2"));
+        assert!(feeds()[1].contains("start=after%3Ac2"));
         let Since::Known(range) = since(cx, "c1", "c3") else {
             panic!("known")
         };
@@ -2743,9 +2645,9 @@ mod tests {
 
         // Nobody reads the branch: no feed read, and the range is not known.
         drop(watch);
-        commit(cx, "c4", vec![node("Person", "p2")]);
+        commit(cx, "c4", vec![node_change("Person", "p2")]);
         cx.run_until_parked();
-        assert_eq!(served.lock().unwrap().feeds.len(), 2);
+        assert_eq!(feeds().len(), 2);
         assert!(matches!(since(cx, "c3", "c4"), Since::Unknown));
 
         // A schema changed in between: what the feed said does not count.
@@ -2754,9 +2656,9 @@ mod tests {
         });
         served.lock().unwrap().schema =
             format!("{SCHEMA}node Project {{\n  slug: String @key\n}}\n");
-        commit(cx, "c5", vec![node("Company", "co2")]);
+        commit(cx, "c5", vec![node_change("Company", "co2")]);
         cx.run_until_parked();
-        assert_eq!(served.lock().unwrap().feeds.len(), 3);
+        assert_eq!(feeds().len(), 3);
         assert!(matches!(since(cx, "c4", "c5"), Since::Unknown));
     }
 }
