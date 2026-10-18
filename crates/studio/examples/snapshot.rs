@@ -15,7 +15,7 @@
 //! (for a write from outside to land between steps); `measure:<n>[,refresh]` draws n frames
 //! after notifying the workspace (or redrawing everything) and prints their times;
 //! `measure:<n>,scroll=<dy>` first scrolls at the window's centre each frame (a zoom on the
-//! canvas), and `measure:<n>,drag=<dx>:<dy>` drags from the centre by that much a frame (a pan),
+//! canvas; `scroll=<dx>:<dy>` scrolls sideways too), and `measure:<n>,drag=<dx>:<dy>` drags from the centre by that much a frame (a pan),
 //! both back and forth every 30 frames; `measure:<n>,type` types a letter into the focused
 //! field and takes it back, alternately. Each also prints the main thread's CPU time per
 //! frame, which a busy machine does not inflate. `SNAPSHOT_WAIT_MS` (default 1500) is how
@@ -221,15 +221,21 @@ fn main() {
                 .expect("measure:<frames>");
             let mut refresh = false;
             let mut typing = false;
-            let mut scroll: Option<f32> = None;
+            let mut scroll: Option<(f32, f32)> = None;
             let mut drag: Option<(f32, f32)> = None;
             for part in parts {
                 if part == "refresh" {
                     refresh = true;
                 } else if part == "type" {
                     typing = true;
-                } else if let Some(dy) = part.strip_prefix("scroll=") {
-                    scroll = Some(dy.parse().expect("scroll=<pixels>"));
+                } else if let Some(delta) = part.strip_prefix("scroll=") {
+                    scroll = Some(match delta.split_once(':') {
+                        Some((dx, dy)) => (
+                            dx.parse().expect("scroll=<dx>:<dy>"),
+                            dy.parse().expect("scroll=<dx>:<dy>"),
+                        ),
+                        None => (0., delta.parse().expect("scroll=<pixels>")),
+                    });
                 } else if let Some(delta) = part.strip_prefix("drag=") {
                     let (dx, dy) = delta.split_once(':').expect("drag=<dx>:<dy>");
                     drag = Some((dx.parse().expect("drag dx"), dy.parse().expect("drag dy")));
@@ -268,11 +274,11 @@ fn main() {
                             gpui::Keystroke::parse(key).expect("a keystroke"),
                             cx,
                         );
-                    } else if let Some(dy) = scroll {
+                    } else if let Some((dx, dy)) = scroll {
                         window.dispatch_event(
                             PlatformInput::ScrollWheel(ScrollWheelEvent {
                                 position: center,
-                                delta: ScrollDelta::Pixels(point(px(0.), px(dy * sign))),
+                                delta: ScrollDelta::Pixels(point(px(dx * sign), px(dy * sign))),
                                 modifiers: Modifiers::default(),
                                 touch_phase: TouchPhase::Moved,
                             }),

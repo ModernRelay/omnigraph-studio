@@ -35,8 +35,10 @@ Measured against Zed v1.23.2 (`crates/gpui/src/window.rs`, `view.rs`):
   anyway.
 - Work done for each drawn row or cell scales with what is shown, never with what is loaded
   (spec 004, table performance). A grid wider than its view draws only the columns in view,
-  one either side, and the ones the cursor or an editor needs; the rest are empty cells at
-  their width, so the scroll range does not change.
+  one either side, and the ones the cursor or an editor needs; each run of the others is one
+  empty gap as wide as they are, so a line lays out a handful of cells, its header the same
+  ones, and the scroll range does not change. The columns are picked as the grid draws, from
+  the scroll offset and the window's width, which bounds the view's.
 
 ## Guards
 
@@ -46,7 +48,7 @@ the interaction and asserts the count:
 | Guard | Holds |
 | --- | --- |
 | `type_table` `typing_in_a_field_leaves_the_grid_as_it_was` | The grid follows the table's `notify`; typing in the filter field or a cell does not draw it |
-| `type_table` `rows_draw_only_the_columns_in_view` | A 21-column type draws the pinned column and those in view; scrolled to the end, the last; the cursor's column always; widened, every column in the frame of the resize (the header learns the width before the rows are picked) |
+| `type_table` `rows_draw_only_the_columns_in_view` | A 21-column type draws the pinned column and those in view; scrolled to the end, the last; the cursor's column always; a line lays out one gap for the rest, as wide as they are; widened, every column in the frame of the resize |
 | `query_editor` `typing_in_the_query_leaves_the_results_as_they_were` | The result area follows the tab's `notify`; typing in the query does not draw it |
 | `studio_workspace` `a_tab_that_caches_its_parts_keeps_them_while_a_field_changes` | A tab that caches its parts keeps them while a field changes; a cached tab draws them again, which is the GPUI behavior the opt-out exists for |
 
@@ -65,7 +67,7 @@ footer, and a build with `--features perf` (GPUI's `profiler`) has GPUI's frame-
 ⌘⌥⇧F (`studio::ToggleFrameOverlay`): frame times, then their distribution, then hidden.
 
 `crates/studio/examples/snapshot.rs` draws Studio offscreen against a server and measures frames:
-`measure:<n>` with `,type` (a key into the focused field), `,scroll=<dy>` or `,drag=<dx>:<dy>`.
+`measure:<n>` with `,type` (a key into the focused field), `,scroll=<dy>` (`,scroll=<dx>:<dy>` sideways) or `,drag=<dx>:<dy>`.
 It prints wall time and the main thread's CPU time per frame; compare CPU times, in the same
 session, on the `release-fast` profile:
 

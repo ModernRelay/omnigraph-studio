@@ -126,6 +126,29 @@ struct RowLook {
     header: bool,
 }
 
+/// One place across a line as a frame draws it: a column, or the columns between two drawn
+/// ones, which a line leaves as one empty space at their width. A wide type draws a handful of
+/// columns, so a line lays out a handful of cells, not one per column (`docs/drawing.md`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Place {
+    Column(usize),
+    Gap(Pixels),
+}
+
+/// The places a frame draws, from the columns it draws and every column's width. The pinned
+/// first column is always drawn, so it is always the first place.
+fn frame_places(drawn: &[bool], widths: &[Pixels]) -> Vec<Place> {
+    let mut places = Vec::new();
+    for (col, (&drawn, &width)) in drawn.iter().zip(widths).enumerate() {
+        match places.last_mut() {
+            _ if drawn => places.push(Place::Column(col)),
+            Some(Place::Gap(gap)) => *gap += width,
+            _ => places.push(Place::Gap(width)),
+        }
+    }
+    places
+}
+
 /// How long scrolling must pause before the drawn rows' Blob cells are read.
 const BLOB_READ_AFTER: Duration = Duration::from_millis(120);
 
@@ -262,6 +285,8 @@ pub struct TypeTable {
     frame_lines: Option<Rc<Vec<Line>>>,
     /// How the lines drawn this frame look, filled by the row callback for the row styling.
     frame_looks: Rc<RefCell<HashMap<usize, RowLook>>>,
+    /// The places this frame's lines draw.
+    frame_places: Rc<[Place]>,
     /// The columns the last drawn rows drew.
     #[cfg(test)]
     frame_drawn: Vec<bool>,
@@ -522,6 +547,7 @@ impl TypeTable {
             grouping: None,
             frame_lines: None,
             frame_looks: Rc::default(),
+            frame_places: Rc::from([]),
             #[cfg(test)]
             frame_drawn: Vec::new(),
             frame_now: chrono::Local::now(),
@@ -4979,7 +5005,7 @@ impl TypeTable {
             .into_any_element()
     }
 
-    fn render_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_body(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         self.frame_now = chrono::Local::now();
         self.edit_slot.clear();
         if self.missing {
@@ -5053,7 +5079,7 @@ impl TypeTable {
             };
             return state.into_any_element();
         }
-        let grid = self.render_grid(cx);
+        let grid = self.render_grid(window, cx);
         // A column's edge dragged anywhere over the grid resizes it until released.
         div()
             .size_full()
@@ -5070,16 +5096,28 @@ impl TypeTable {
             .into_any_element()
     }
 
-    fn render_grid(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_grid(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let selected_bg = studio_ui::ds::surface::selected_document(cx);
         let hover_bg = studio_ui::ds::surface::hover(cx);
         let drop_bg = studio_ui::ds::surface::selected_document(cx);
         let menu_open = self.header_menu.is_some();
-        let headers: Vec<AnyElement> = self
+        // The header and every line draw the same places: the columns in view and gaps.
+        let drawn = Rc::new(self.drawn_columns(window, cx));
+        let column_widths: Vec<Pixels> = self
             .columns
             .iter()
-            .enumerate()
-            .map(|(index, column)| {
+            .map(|c| px(self.layout.width(c)))
+            .collect();
+        let places: Rc<[Place]> = frame_places(&drawn, &column_widths).into();
+        self.frame_places = places.clone();
+        let headers: Vec<AnyElement> = places
+            .iter()
+            .map(|place| {
+                let index = match *place {
+                    Place::Column(index) => index,
+                    Place::Gap(_) => return div().into_any_element(),
+                };
+                let column = &self.columns[index];
                 let sortable = column.property().filter(|p| Sort::allowed(p));
                 let sorted = self
                     .sort
@@ -5203,12 +5241,14 @@ impl TypeTable {
         // Widths fitted to each column's type unless dragged. Not Zed's resizable columns: they
         // draw a full-height rule between every column, which the visual language leaves out
         // (spec 002); the header's edges resize instead.
-        let widths: Vec<_> = self
-            .columns
+        let widths: Vec<Pixels> = places
             .iter()
-            .map(|c| px(self.layout.width(c)))
+            .map(|place| match *place {
+                Place::Column(col) => column_widths[col],
+                Place::Gap(width) => width,
+            })
             .collect();
-        Table::new(self.columns.len())
+        Table::new(places.len())
             .interactable(&self.table_state)
             .width_config(ColumnWidthConfig::explicit(widths))
             .header(headers)
@@ -5229,13 +5269,12 @@ impl TypeTable {
             .uniform_list(
                 "type-table-rows",
                 line_count,
-                cx.processor(|this, range: Range<usize>, window, cx| {
+                cx.processor(move |this, range: Range<usize>, window, cx| {
                     this.note_looks(range.clone());
-                    let drawn = this.drawn_columns(window, cx);
                     this.want_relations(&drawn, window, cx);
                     #[cfg(test)]
                     {
-                        this.frame_drawn = drawn.clone();
+                        this.frame_drawn = drawn.to_vec();
                     }
                     let Some(lines) = this.frame_lines.clone() else {
                         if this.more_error.is_none()
@@ -5246,9 +5285,7 @@ impl TypeTable {
                             cx.defer_in(window, |this, _, cx| this.load_more(cx));
                         }
                         this.want_blob_metas(range.clone(), cx);
-                        return range
-                            .map(|ix| this.render_row(ix, &drawn, window, cx))
-                            .collect();
+                        return range.map(|ix| this.render_row(ix, window, cx)).collect();
                     };
                     let range = range.start.min(lines.len())..range.end.min(lines.len());
                     let shown = &lines[range.clone()];
@@ -5283,7 +5320,7 @@ impl TypeTable {
                     shown
                         .iter()
                         .map(|line| match *line {
-                            Line::Row(row) => this.render_row(row, &drawn, window, cx),
+                            Line::Row(row) => this.render_row(row, window, cx),
                             Line::Header(index) => this.render_section_header(index, cx),
                             Line::More(index) => this.render_section_more(index, cx),
                             Line::OtherValues => this.render_other_values(),
@@ -5483,10 +5520,10 @@ impl TypeTable {
         )
     }
 
-    /// A line's cells: its content in the first (pinned) column, the others empty.
+    /// A line's cells: its content in the first (pinned) column, the other places empty.
     fn line_cells(&self, first: AnyElement) -> Vec<AnyElement> {
         std::iter::once(first)
-            .chain((1..self.columns.len()).map(|_| div().h(px(ROW_HEIGHT)).into_any_element()))
+            .chain((1..self.frame_places.len()).map(|_| div().h(px(ROW_HEIGHT)).into_any_element()))
             .collect()
     }
 
@@ -5763,53 +5800,50 @@ impl TypeTable {
             .into_any_element()
     }
 
-    /// A row's cells; a column `drawn` leaves out is an empty cell at its width.
+    /// A row's cells at this frame's places; a gap is one empty cell.
     fn render_row(
         &self,
         ix: usize,
-        drawn: &[bool],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let Some(row) = self.rows.get(ix) else {
             return Vec::new();
         };
-        (0..self.columns.len())
-            .map(|col| {
-                if drawn.get(col).copied().unwrap_or(true) {
-                    self.render_cell(ix, col, row, window, cx)
-                } else {
-                    div().into_any_element()
-                }
+        self.frame_places
+            .clone()
+            .iter()
+            .map(|place| match *place {
+                Place::Column(col) => self.render_cell(ix, col, row, window, cx),
+                Place::Gap(_) => div().into_any_element(),
             })
             .collect()
     }
 
     /// The columns rows draw this frame: the pinned first, those in the horizontal view with
-    /// one either side so a quick scroll shows no empty column, the cursor's and the edited
-    /// cell's. A row lays out each cell it draws, so a wide type would otherwise pay for every
-    /// column on every scroll (`docs/drawing.md`).
+    /// one either side, the cursor's and the edited cell's. A row lays out each cell it draws,
+    /// so a wide type would otherwise pay for every column on every scroll
+    /// (`docs/drawing.md`). Worked out as the frame is drawn, so the header draws the same.
     fn drawn_columns(&self, window: &Window, cx: &App) -> Vec<bool> {
         let count = self.columns.len();
         let handle = &self.table_state.read(cx).horizontal_scroll_handle;
-        // The header's scrolled part tracks the same handle and is laid out before the list
-        // draws its rows, so this is this frame's width, also right after a resize.
-        let viewport = handle.bounds().size.width;
-        if viewport <= px(0.) {
-            return vec![true; count];
-        }
-        let rem = window.rem_size();
-        let widths = self.widths.read(cx);
-        let total = widths.scrollable_width(1, rem);
+        // The scrolled part is never wider than the window, whose width is this frame's, also
+        // in the frame that resizes it; the offset is this frame's too, as a scroll draws again.
         let shown_left = -handle.offset().x;
-        let shown_right = shown_left + viewport;
-        let in_view: Vec<bool> = (0..count)
-            .map(|col| {
-                col == 0 || {
-                    let left = total - widths.scrollable_width(col, rem);
-                    let right = total - widths.scrollable_width(col + 1, rem);
-                    right > shown_left && left < shown_right
+        let shown_right = shown_left + window.viewport_size().width;
+        let mut left = px(0.);
+        let in_view: Vec<bool> = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(col, column)| {
+                if col == 0 {
+                    return true;
                 }
+                let right = left + px(self.layout.width(column));
+                let shown = right > shown_left && left < shown_right;
+                left = right;
+                shown
             })
             .collect();
         let mut drawn: Vec<bool> = (0..count)
@@ -5935,11 +5969,8 @@ impl TypeTable {
         };
         let numeric = column.align_right;
         if let Some(group) = column.relationship() {
-            let rem = window.rem_size();
-            let widths = self.widths.read(cx);
-            let width = widths.scrollable_width(col, rem) - widths.scrollable_width(col + 1, rem);
             // The cell's padding (`px_4`) on both sides.
-            let available = f32::from(width) - 32.;
+            let available = self.layout.width(column) - 32.;
             return cell
                 .child(self.render_relation_cell(row, &column.key, group, available, cx))
                 .when(is_cursor, |cell| cell.child(ring()))
@@ -6344,13 +6375,13 @@ impl TableGrid {
 }
 
 impl Render for TableGrid {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(test)]
         {
             self.renders += 1;
         }
         self.table
-            .update(cx, |table, cx| table.render_body(cx))
+            .update(cx, |table, cx| table.render_body(window, cx))
             .unwrap_or_else(|_| gpui::Empty.into_any_element())
     }
 }
@@ -6850,6 +6881,24 @@ mod tests {
         assert_eq!(degree_reads(), read.len(), "none read twice");
     }
 
+    #[test]
+    fn the_columns_a_frame_leaves_out_are_one_gap_per_run() {
+        let widths: Vec<Pixels> = [10., 20., 30., 40., 50., 60.].map(px).to_vec();
+        assert_eq!(
+            frame_places(&[true, false, false, true, false, false], &widths),
+            vec![
+                Place::Column(0),
+                Place::Gap(px(50.)),
+                Place::Column(3),
+                Place::Gap(px(110.)),
+            ]
+        );
+        assert_eq!(
+            frame_places(&[true, true], &widths[..2]),
+            vec![Place::Column(0), Place::Column(1)]
+        );
+    }
+
     /// A row draws the columns in view, one either side, the pinned first and the cursor's;
     /// the rest are empty at their width.
     #[gpui::test]
@@ -6918,6 +6967,20 @@ mod tests {
             table.read_with(cx, |table, _| table.frame_drawn.clone())
         };
         assert!(!rows_drew(cx)[20], "{:?}", rows_drew(cx));
+        // A line lays out the drawn columns and one gap for the rest, as wide as they are, so
+        // the grid scrolls as far as before.
+        table.read_with(cx, |table, _| {
+            let places = &table.frame_places;
+            assert!(places.len() < table.columns.len(), "{places:?}");
+            assert!(matches!(places.last(), Some(Place::Gap(_))), "{places:?}");
+            let width = |place: &Place| match *place {
+                Place::Column(col) => table.layout.width(&table.columns[col]),
+                Place::Gap(width) => f32::from(width),
+            };
+            let drawn: f32 = places.iter().map(width).sum();
+            let all: f32 = table.columns.iter().map(|c| table.layout.width(c)).sum();
+            assert!((drawn - all).abs() < 0.5, "{drawn} of {all}");
+        });
         cx.simulate_resize(gpui::size(px(6000.), px(800.)));
         assert!(
             rows_drew(cx).iter().all(|drawn| *drawn),
