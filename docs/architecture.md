@@ -12,10 +12,10 @@ other: what two features share moves down a layer.
 | Layer | Crates | Role | Allowed dependencies |
 |---|---|---|---|
 | 0 | `studio_actions` | Every action type, with doc comments that become palette descriptions | `gpui` |
-| 1 | `studio_settings`, `studio_theme` | Typed layered settings; graph tokens over Zed's themes, set up through Zed's `theme_settings`, and the themes Studio bundles | `gpui`, `settings`, `theme`, `theme_settings`, `assets`, serde |
+| 1 | `studio_settings`, `studio_theme` | Typed layered settings; graph tokens over Zed's themes, set up through Zed's `theme_settings`, the themes Studio bundles, and Studio's icons in place of Zed's | `gpui`, `settings`, `theme`, `theme_settings`, `assets`, serde |
 | 2 | `graph_client` | Every HTTP request: contract header, DTOs for the 0.14 API, write outcomes, change-feed paging. **No `gpui`** | Zed `http_client` (Apache-2.0), serde |
 | 2 | `gq_language` | Schema and query intelligence on `omnigraph-compiler`: parse, diagnostics, completion items, hover text, result-column types. **No `gpui`** | `omnigraph-compiler` |
-| 2 | `studio_ui` | Studio components on Zed's `ui`: the design system (`ds`), state chips, write-outcome banners, empty and error states, text read as markdown | `ui`, `theme`, `studio_theme`, `pulldown-cmark` |
+| 2 | `studio_ui` | Studio components on Zed's `ui`: the design system (`ds`: buttons, modals, the context menu forked from Zed's), state chips, write-outcome banners, empty and error states, text read as markdown | `ui`, `menu`, `theme`, `studio_theme`, `pulldown-cmark` |
 | 3 | `graph_store` | GPUI entities: connections, graph sessions, schema model, snapshot pins, exploration, drafts | `gpui`, `graph_client`, `gq_language`, Zed's `reqwest_client` |
 | 4 | `studio_workspace` | The window frame: panes, tabs, docks, panels, status bar, modal and toast layers | `gpui`, `ui`, `studio_ui`, `studio_actions`, `studio_settings` |
 | 5 | `command_palette`, `type_table`, `relationship_tree`, `graph_canvas`, `query_editor`, `review`, `history`, `inspectors`, `agent_panel` | One surface each | layers 0–4 |
@@ -104,7 +104,9 @@ a 412 reopens the draft.
   and writes edit only the keys that changed (`studio_settings::document`).
 - `studio_theme` sets up Zed's `theme_settings` with Zed's themes and the ones Studio bundles
   (Vitesse Refined, the default light theme), and adds graph tokens: one color per node type,
-  edge colors, diff colors.
+  edge colors, diff colors. Its asset source serves Nucleo drawings for the Zed icon paths
+  `studio_theme::icons` lists, so every `IconName` Studio or Zed's components draw is Tower's
+  icon (spec 002, "Icons").
 
 ## Testing
 

@@ -235,6 +235,11 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   then Studio's actions, node and edge types, and the rest. A type row dispatches
   `studio_graph::OpenType` and appears only when that action is available where the person is.
   ↑/↓ move, ↵ runs after the palette closes and focus returns, Esc closes.
+- Since 2026-10-18 the palette is Tower's: a 580 px glass frame (`ds::surface::floating`,
+  `radius::MODAL`, 4 px inset) holding the search and scope tabs on the frame, one solid card
+  of results rounded within it (`radius::PALETTE_LIST`), and the description and count under
+  it. Its rows are menu rows (`ds::MenuRow`, 32 px). It sits a tenth of the window down over a
+  light veil (`ModalPlacement::Palette`), not a dialog's dim.
 
 ### Tooltips and disabled states
 
@@ -298,6 +303,19 @@ A modal is a `ModalView`. As in Zed's modal layer, the workspace asks its
 modal's own dismissal. A dialog with a write running (insert or delete a row or an edge,
 create or delete a branch) says no, so the outcome it shows is not lost and the task that
 waits for it is not dropped.
+
+Since 2026-10-18 every dialog is one card, after Tower's dialogs (`studio_ui::modal`, through
+`ds`): `ds::modal` (480 px, `size::MODAL_WIDE` 720 for Open a graph; 16 px corners, the
+floating fill, an 8 % hairline and the sheet shadow), then `ds::ModalHeader` (the title,
+semibold; beside it what the dialog writes to, `ds::write_target`; a round outline close
+button, faded while a write runs), `ds::modal_body` and `ds::modal_footer` (a strip under a
+hairline, the actions on the right: Cancel an outline pill, `ds::cancel_button`; the action
+solid, `ds::action_button`, red for a delete). Explanation is one muted paragraph, the
+header's description; the body holds only what that paragraph names (a list, fields) and a
+write's outcome, and is left out when empty. The workspace places a dialog over a dim
+(`surface::backdrop`) a quarter of the way down the space it leaves free, Tower's `1fr auto
+3fr`; a click on the dim closes it. Modals are opaque: GPUI cannot blur what is behind them,
+and a 97 % fill let the text behind show through.
 
 ### Files, logs and the data directory
 
@@ -398,8 +416,9 @@ than styling one-off elements.
   the first tab of the top-left pane, when the sidebar is shown.
 - **Concentric radii, in code.** A surface around rounded children has their radius plus the
   gap between the edges (`ds::radius::around`); a child takes its container's less the gap
-  (`ds::radius::within`, square when the gap is wider). Zed's buttons are 4 px
-  (`radius::BUTTON`) and take no other radius, so surfaces around them are sized from that.
+  (`ds::radius::within`, square when the gap is wider). Buttons are pills and circles (below),
+  so a surface around them needs no radius of theirs; a menu row is `radius::MENU_ITEM`, the
+  menu's 10 px less its 4 px inset.
   The nested pieces are components: `ds::segmented`, `ds::row_list` (a field's offers),
   `ds::float_bar` (the canvas's floating controls, 7 px around 22 px buttons 3 px in),
   `ds::pill_button` (round, 4 px inside a pill's round end) and the context chip's tile. The
@@ -410,7 +429,8 @@ than styling one-off elements.
 - **Control sizes, in code.** `size::CONTROL` (28 px: a medium button, a field, a segmented
   track, a floating bar, a tile) and `size::PILL` (26 px: a filter, a composer's picker, a
   dock's title tab); a segment is a control less its track's inset. Every single-line field is
-  `ds::field_frame` (a hairline box at a control's height, the error border when invalid)
+  `ds::field_frame` (a pill at a control's height with a 10 % hairline and a contact shadow,
+  the error border when invalid; Tower's inputs)
   around `ds::field_input`, and every search box is `ds::search_field`, so fields line up
   with the buttons beside them: the settings search and text fields, the history and review
   searches, the dialogs' fields, the review editor's fields and the query's parameters. A
@@ -426,14 +446,33 @@ than styling one-off elements.
   strip's Back/Forward and its end buttons sit in Zed's regions: 6 px padding, 4 px gaps, 22 px
   buttons with 14 px icons, as do a dock header's zoom and hide; a dock header's title starts
   16 px in, the edge its panel's toolbar and rows start at.
-- **Buttons.** `ds::button` (28 px, Zed's medium 8 px inset) and `ds::icon_button` (Zed's
-  medium size, 28 px square) for every button in a toolbar, panel, card footer or dialog, so a
-  hover or pressed fill has room around its label; the header strips and the status bar hold
-  Zed's 22 px buttons with 14 px icons. Zed keeps its button colours private, so `ds::button`
-  is Studio's own `Button`: Zed's `ButtonLike` (colours and states) at 28 px around its own
-  icon, label and key row. Buttons inside a dense row (a filter pill's segments, a
-  tab's close, a tree row's toggle, an inline Fix or Run, the sidebar header's icons) keep
-  Zed's compact default.
+- **Buttons, after Tower's** (since 2026-10-18; `studio_ui::button`, `ds::Button`,
+  `ds::IconButton`). Every text button is a pill and every icon button a circle, medium
+  weight, in six variants: primary (solid ink; a surface's one action), secondary (a faint ink
+  fill), outline (the surface's own fill, a 10 % hairline and a contact shadow; Cancel),
+  ghost (nothing until hovered; toolbars, rows), destructive (solid red) and glass (a floating
+  pill). Zed's `ButtonStyle` picks the variant, so call sites keep `.style(…)`: Filled is
+  primary, Outlined outline, Subtle ghost, Tinted(Error) destructive. Sizes keep Zed's
+  heights: medium 28 px (`size::CONTROL`, 10 px in), default 22 px (the header strips and the
+  status bar), compact 18 px (inside dense rows: a tab's close, a tree toggle, an inline Fix,
+  a setting's reset). A toggled button sits on the pressed fill; a disabled one fades to 64 %;
+  a key hint on a solid button takes its ink. Zed's `ButtonLike` keeps its corners at 4 px and
+  its colours private, so Studio draws its own and keeps Zed's builder traits; no view
+  constructs Zed's `Button` or `IconButton`.
+- **Menus** (`studio_ui::menu`, a fork of Zed's `ContextMenu` at v1.23.2, GPL-3.0-or-later,
+  credited in the file). Zed's behaviour (keys, submenus, asides, actions, accessibility) with
+  Tower's drawing: the modal's fill, hairline and shadow at `radius::MENU` (10 px), a 4 px
+  inset, 26 px rows (`ds::MenuRow`, `size::MENU_ROW`) rounded within it, the hovered or
+  highlighted row on a faint ink (`surface::highlight`), group headers small and muted,
+  separators edge to edge. Every view's menus are this one.
+- **Icons** (since 2026-10-18): Nucleo's `ui` family, outline-duo at 18 px, as Tower's.
+  Views keep naming Zed's `IconName`; `studio_theme::Assets` serves a Nucleo drawing for each
+  path `studio_theme::icons::NUCLEO` lists, so Zed's own components change with them. Brand
+  marks and key-cap glyphs keep Zed's. Nucleo's licence allows an open-source project 100
+  icons with its notice: `script/vendor-icons.py` copies only the listed drawings from the
+  licensed bundle, and a test keeps the count under the limit and every file to a row.
+- **Spacing.** Every gap and inset is a `ds::space` step (2, 4, 6, 8, 12, 16, 24, 32), never
+  GPUI's rem utilities (`gap_2()`): since 2026-10-18 no view uses them.
 - **Text sizes.** The window's rem size is `ui_font_size` (16 px by default), as in Zed, so
   every `ui` size scales with it. Body text is `Small`; labels, counts and metadata `XSmall`.
 - **Sidebar rows.** `ds::SidebarRow`: section labels muted, not bold; the selected row a grey
@@ -502,6 +541,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-18 | Tower's buttons, menus, modals and icons; spacing on the ds scale | `studio_ui` `button` tests (`controls_draw_at_their_sizes`: 28 px pills 10 px in, circles, pill fields; `zed_styles_pick_the_variants`), `menu` tests (Zed's six, on the fork), `studio_theme` `icons` tests (≤ 100 Nucleo drawings, each file named once, each replacing a Zed icon); the workspace suite; `cargo clippy --workspace --all-targets -D warnings`; offscreen snapshots in glass on a scratch cluster: the delete dialog with two dependents, ⌘K, a tab's context menu, the design gallery, a table with the new icons | The dialog read one muted paragraph under "Delete Acme", the dependents list, then Cancel and a red Delete with a light ↵; the palette a frame with the results card inside; the menu 26 px rows and edge-to-edge rules. A 97 % modal fill let the rows behind show through above the title; the fill is opaque now. The settings reset, a 28 px circle, made its row taller than the others; it is compact. A spacing conversion made both arms of one `if` equal (clippy); collapsed |
 | 2026-10-17 | Views read through the session; growing lists draw only their visible rows | `graph_store` `feature_reads_are_counted_while_they_run` (six held reads counted, then none once dropped); `studio_ui` `rows` `only_the_rows_between_a_shared_start_and_end_change`; the compiler, with the session's client private to `graph_store`; offscreen snapshots of History, Storage, Conversations, Queries and Activity against the dev server | History listed its 10 commits with their counts and the head's change; Storage showed the server, both graphs and main's snapshot; Queries and Activity kept their layout as lists. Conversations' empty note now wraps at the sidebar's width, where it was clipped, and its filter shows a funnel beside the sidebar's search |
 | 2026-10-17 | A tab's menu shows its keys; every action has a key or is palette-only; the lights' room only where they show; one loading and one error state | `studio` `keymaps` `every_action_has_a_key_or_is_palette_only` (red on `studio_graph::OpenSchema` while optional-field actions counted; then on none); `studio_workspace` `strips_make_room_for_traffic_lights_only_when_they_show`; offscreen snapshots: the right-click menu on the first and on the last of two tabs, and the design gallery's state row | The menu read Close ⌘W, Close Others ⌥⌘T, Close All ⌥⌘W, Split Right `⌘\`, Split Down `⌘⇧\`; on the last tab "Close to the Right" was disabled. Five actions gained keys from Zed's (⌥⌘O, ⌘R, ⌥⌘T, ⌥⌘W, ⌘N in the agent panel), sixteen stay palette-only. The old centred-sentence helper is gone; its callers read the schema, history, changes, review, Blob and table states through `ds::loading_state`, `ds::error_state` and `ds::empty_state` |
 | 2026-10-16 | The status bar lists keys behind one button | Offscreen snapshots of Person's table: the bar, then the keyboard button pressed | The bar reads the panels, the server, knowledge / main, ⌨, the memory and the docks; the menu lists Edit ↵, Peek ␣, Open page ⌘↵, Explore G, Copy ⌘C, Filter by this value ⌥⌘F, New row ⌘N, Delete row ⌘⌫, Save drafts ⌘S, Refresh ⌘R. A Studio view built as the menu closed itself at once; Zed's context menu does not |
