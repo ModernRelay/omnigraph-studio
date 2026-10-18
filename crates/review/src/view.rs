@@ -34,6 +34,9 @@ use ui::{Banner, ContextMenu, KeyBinding, PopoverMenu, Severity, Tooltip};
 
 use crate::conflicts::{conflict_wording, resolution_hint};
 
+/// How long typing in the search pauses before the cards are filtered.
+const SEARCH_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
+
 /// Changes asked for per change-feed page.
 const FEED_PAGE: usize = 1_000;
 
@@ -96,6 +99,9 @@ struct ReviewData {
     /// The branch's commits since the fork, newest first.
     commits: Vec<ReviewCommit>,
     folded: FoldedChanges,
+    /// Each change's search text, lowercase, made when it was folded: a search goes through
+    /// these, not through every value of every change on each key.
+    search: Vec<String>,
     counts: Vec<TypeCounts>,
     partial: bool,
     /// The feed went past the reviewed head while reading: the branch moved.
@@ -159,6 +165,7 @@ pub struct ReviewView {
     _head_watch: HeadWatch,
     _load_task: Option<Task<()>>,
     _merge_task: Option<Task<()>>,
+    _search_task: Option<Task<()>>,
     _fix_tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -216,7 +223,11 @@ impl ReviewView {
         });
         let search_subscription = cx.subscribe(&search, |this, _, event: &EditorEvent, cx| {
             if let EditorEvent::BufferEdited = event {
-                this.apply_search(cx);
+                // Once typing pauses: each search goes through every change.
+                this._search_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(SEARCH_DELAY).await;
+                    this.update(cx, |this, cx| this.apply_search(cx)).ok();
+                }));
             }
         });
         let subscription =
@@ -252,6 +263,7 @@ impl ReviewView {
             _head_watch: head_watch,
             _load_task: None,
             _merge_task: None,
+            _search_task: None,
             _fix_tasks: Vec::new(),
             _subscriptions: vec![subscription, search_subscription],
         };
@@ -1440,21 +1452,27 @@ pub(crate) fn change_card(
 }
 
 /// Whether a change's id, type or any before or after value contains `query` (lowercase).
-fn change_matches(change: &FoldedChange, query: &str) -> bool {
-    if query.is_empty() {
-        return true;
+/// What a search finds a change by, lowercase: its id, its type and each value before and
+/// after, one per line, so a search never matches across two of them.
+fn search_text_of(change: &FoldedChange) -> String {
+    let mut text = format!("{}\n{}", change.id, change.type_name);
+    for value in [&change.before, &change.after]
+        .into_iter()
+        .flatten()
+        .flat_map(|image| image.properties.values())
+    {
+        text.push('\n');
+        match value {
+            Value::String(value) => text.push_str(value),
+            other => text.push_str(&other.to_string()),
+        }
     }
-    let found = |text: &str| text.to_lowercase().contains(query);
-    found(&change.id)
-        || found(&change.type_name)
-        || [&change.before, &change.after]
-            .into_iter()
-            .flatten()
-            .flat_map(|image| image.properties.values())
-            .any(|value| match value {
-                Value::String(text) => found(text),
-                other => found(&other.to_string()),
-            })
+    text.to_lowercase()
+}
+
+#[cfg(test)]
+fn change_matches(change: &FoldedChange, query: &str) -> bool {
+    query.is_empty() || search_text_of(change).contains(query)
 }
 
 fn build_rows(data: &ReviewData, query: &str) -> Vec<Row> {
@@ -1462,7 +1480,7 @@ fn build_rows(data: &ReviewData, query: &str) -> Vec<Row> {
     let mut group = None;
     let mut group_index = 0;
     for (ix, change) in data.folded.changes.iter().enumerate() {
-        if !change_matches(change, query) {
+        if !query.is_empty() && !data.search.get(ix).is_some_and(|text| text.contains(query)) {
             continue;
         }
         let key = (change.is_edge(), change.type_id.as_str());
@@ -1504,6 +1522,7 @@ async fn read_review(
                 head: Some(head),
                 commits: Vec::new(),
                 folded: ChangeFold::new().finish(),
+                search: Vec::new(),
                 counts: Vec::new(),
                 partial: false,
                 moved_while_reading: false,
@@ -1536,9 +1555,13 @@ impl Fed {
         cx: &mut AsyncApp,
     ) -> ReviewData {
         let fold = self.fold;
-        let folded = cx
+        let (folded, search) = cx
             .background_executor()
-            .spawn(async move { fold.finish() })
+            .spawn(async move {
+                let folded = fold.finish();
+                let search = folded.changes.iter().map(search_text_of).collect();
+                (folded, search)
+            })
             .await;
         let counts = folded.counts();
         let mut commits = self.commits;
@@ -1548,6 +1571,7 @@ impl Fed {
             head,
             commits,
             folded,
+            search,
             counts,
             partial: self.partial,
             moved_while_reading: self.moved_while_reading,
