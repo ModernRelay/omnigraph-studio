@@ -196,6 +196,14 @@ fn relation_samples(rows: &Value) -> Vec<(String, String, Option<String>)> {
         .collect()
 }
 
+/// What the Group menu offers for a table's columns: its submenus, and every choice by key and
+/// how it reads.
+#[derive(Default)]
+struct GroupingChoices {
+    menus: Rc<Vec<GroupMenu>>,
+    choices: Rc<Vec<(String, String)>>,
+}
+
 /// A submenu of the Group menu (see [`TypeTable::group_menus`]).
 #[derive(Clone)]
 struct GroupMenu {
@@ -313,6 +321,8 @@ pub struct TypeTable {
     /// Properties the commit shown does not hold under their current name, and what they were
     /// then. Rows are read without them.
     absent: HashMap<String, PropertyThen>,
+    /// What the Group menu offers for these columns: its submenus and every choice.
+    grouping_choices: GroupingChoices,
     peek: Option<(String, Entity<NodePeek>)>,
     newer: bool,
     /// Writes out for this table: its own saves and the dialogs' inserts and deletes. Each moves
@@ -538,6 +548,7 @@ impl TypeTable {
             relations_drawn: HashSet::new(),
             relations_asked: HashSet::new(),
             absent: HashMap::new(),
+            grouping_choices: Default::default(),
             peek: None,
             newer: false,
             saves_in_flight: 0,
@@ -664,6 +675,7 @@ impl TypeTable {
             self.missing = true;
             self.schema = Some(schema);
             self.all_columns.clear();
+            self.grouping_choices = Default::default();
             self.columns.clear();
             self.rows.clear();
             cx.notify();
@@ -680,6 +692,7 @@ impl TypeTable {
         self.all_columns = columns;
         self.show_columns(cx);
         self.schema = Some(schema);
+        self.build_grouping_choices();
         self.reload(false, cx);
     }
 
@@ -1415,11 +1428,8 @@ impl TypeTable {
     /// The toolbar's Columns menu: every column but the pinned one, checked while it shows. It
     /// stays open while columns are picked.
     fn render_columns_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let hidden = self
-            .column_choices()
-            .iter()
-            .filter(|(_, _, shown)| !shown)
-            .count();
+        // The columns not shown: counted every render, so not by matching each column.
+        let hidden = self.all_columns.len().saturating_sub(self.columns.len());
         let table = cx.entity().downgrade();
         let open = self.toolbar_menus[1].is_deployed();
         PopoverMenu::new("columns-menu")
@@ -1555,7 +1565,7 @@ impl TypeTable {
                             set(None),
                         )
                         .separator();
-                    for (key, label) in &choices {
+                    for (key, label) in choices.iter() {
                         if !builder::parse_group_key(key).is_own_property() {
                             break;
                         }
@@ -1570,7 +1580,7 @@ impl TypeTable {
                     if !menus.is_empty() {
                         menu = menu.separator();
                     }
-                    for group in &menus {
+                    for group in menus.iter() {
                         let holds_current = current.as_ref().is_some_and(|current| {
                             group
                                 .neighbour
@@ -1896,7 +1906,27 @@ impl TypeTable {
 
     /// What the rows can be grouped by: each groupable property, then what each submenu of
     /// [`Self::group_menus`] offers. Key and how the choice reads.
-    fn group_choices(&self) -> Vec<(String, String)> {
+    fn group_choices(&self) -> Rc<Vec<(String, String)>> {
+        self.grouping_choices.choices.clone()
+    }
+
+    /// The Group menu's submenus, as [`Self::build_group_menus`] built them for these columns.
+    fn group_menus(&self) -> Rc<Vec<GroupMenu>> {
+        self.grouping_choices.menus.clone()
+    }
+
+    /// Builds what the Group menu offers, once the columns are known: the toolbar draws it on
+    /// every render, and a type with dozens of relationships offers thousands of choices.
+    fn build_grouping_choices(&mut self) {
+        let menus = self.build_group_menus();
+        let choices = self.build_group_choices(&menus);
+        self.grouping_choices = GroupingChoices {
+            menus: Rc::new(menus),
+            choices: Rc::new(choices),
+        };
+    }
+
+    fn build_group_choices(&self, menus: &[GroupMenu]) -> Vec<(String, String)> {
         let mut choices: Vec<(String, String)> = self
             .all_columns
             .iter()
@@ -1904,7 +1934,7 @@ impl TypeTable {
             .filter(|p| builder::GroupBy::allowed(p))
             .map(|p| (p.name.clone(), p.name.clone()))
             .collect();
-        for menu in self.group_menus() {
+        for menu in menus {
             choices.extend(menu.neighbour.clone());
             choices.extend(
                 menu.properties
@@ -1918,7 +1948,7 @@ impl TypeTable {
     /// The Group menu's submenus: in a node table one per relationship, by each neighbour or
     /// by a property of the neighbours; in an edge table one per end, by a property of the
     /// node at it.
-    fn group_menus(&self) -> Vec<GroupMenu> {
+    fn build_group_menus(&self) -> Vec<GroupMenu> {
         let Some(schema) = &self.schema else {
             return Vec::new();
         };
