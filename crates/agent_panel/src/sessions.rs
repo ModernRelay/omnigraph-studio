@@ -43,8 +43,8 @@ pub struct SessionRecord {
     pub pinned: bool,
     #[serde(default)]
     pub archived: bool,
-    /// The directory the agent worked in for it; none for conversations from before each graph
-    /// had its own, which ran in [`legacy_cwd`].
+    /// The directory the agent worked in for it. Every record Studio writes has one; one
+    /// without runs in its graph's ([`graph_cwd`]).
     #[serde(default)]
     pub cwd: Option<PathBuf>,
 }
@@ -335,11 +335,6 @@ pub fn graph_cwd(graph: &str) -> PathBuf {
 /// an agent cannot change what `omnigraph_run` runs.
 pub fn private_homes() -> PathBuf {
     studio_settings::data_dir().join("agent").join("homes")
-}
-
-/// Where conversations ran before each graph had a directory of its own.
-pub fn legacy_cwd() -> PathBuf {
-    studio_settings::data_dir().join("agent").join("workspace")
 }
 
 /// The first line of a message, cut to a title's length on a character.

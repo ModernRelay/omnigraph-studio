@@ -682,15 +682,11 @@ impl AgentPanel {
             .session_id
             .as_ref()
             .and_then(|id| self.sessions.read(cx).get(id).cloned());
-        // A conversation runs where it ran before; a new one in the graph's own directory.
-        let cwd = match (&saved, &self.session_id) {
-            (Some(saved), _) => saved
-                .cwd
-                .clone()
-                .unwrap_or_else(crate::sessions::legacy_cwd),
-            (None, Some(_)) => crate::sessions::legacy_cwd(),
-            (None, None) => crate::sessions::graph_cwd(&self.session.read(cx).settings_key(cx)),
-        };
+        // A conversation runs where it ran before; any other in the graph's own directory.
+        let cwd = saved
+            .as_ref()
+            .and_then(|saved| saved.cwd.clone())
+            .unwrap_or_else(|| crate::sessions::graph_cwd(&self.session.read(cx).settings_key(cx)));
         if let Err(error) = std::fs::create_dir_all(&cwd) {
             self.fail_start(
                 format!("Studio could not create {}: {error}", cwd.display()),
