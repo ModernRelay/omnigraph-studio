@@ -370,6 +370,35 @@ pub fn node_rows(rows: &Value) -> Vec<Row> {
         .collect()
 }
 
+/// Rows of a node read as fields (`builder::node_fields_by_id`, `builder::node_page_fields`),
+/// shaped as a whole-node read gives them: `@id` and the properties that hold a value.
+pub fn field_rows(rows: &Value) -> Vec<Row> {
+    let prefix = gq_language::builder::field_column("");
+    let Some(rows) = rows.as_array() else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| {
+            let row = row.as_object()?;
+            let id = row.get("id")?.as_str()?.to_owned();
+            let mut values: Map<String, Value> = row
+                .iter()
+                .filter(|(_, value)| !value.is_null())
+                .filter_map(|(column, value)| {
+                    let property = column.strip_prefix(prefix.as_str())?;
+                    Some((property.to_owned(), value.clone()))
+                })
+                .collect();
+            values.insert(ID_COLUMN.to_owned(), Value::String(id.clone()));
+            Some(Row {
+                id,
+                values,
+                dimmed: false,
+            })
+        })
+        .collect()
+}
+
 /// Rows of `edge_page`: `edge_id`, `from_id`, `to_id` and `e_<property>` columns.
 pub fn edge_rows(edge: &EdgeType, rows: &Value) -> Vec<Row> {
     let Some(rows) = rows.as_array() else {

@@ -28,10 +28,10 @@ use crate::blob::{
     IMAGE_MAX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, save_value, suggested_file_name,
 };
 use crate::model::{
-    FROM_COLUMN, ID_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, display_value, format_count,
+    FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, display_value, field_rows, format_count,
     node_rows, reads_as_markdown, same_value, save_result, short_commit,
 };
-use graph_client::{BlobCell, BlobMeta, HistoricalGap, ReadError};
+use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError};
 
 /// First neighbours shown under an expanded relationship group.
 pub const NEIGHBOUR_LIMIT: u32 = 8;
@@ -196,9 +196,12 @@ pub struct NodePeek {
     confirm_discard: bool,
     /// What the view reads, told to the session for the branch named.
     reads: Option<(String, ReadWatch)>,
-    /// Properties the commit shown does not hold under their current name: added after it, or
-    /// named otherwise then (the name it had). The node is read without them.
-    absent: HashMap<String, Option<String>>,
+    /// Properties the commit shown does not hold under their current name, and what they were
+    /// then. The node is read without them.
+    absent: HashMap<String, PropertyThen>,
+    /// Properties relationship groups read (a neighbour's label, an edge's properties) that the
+    /// commit shown does not hold, by owner type and property: groups are read without them.
+    groups_absent: Vec<(String, String)>,
     /// The head moved and the session is reading what changed: the view decides when it is in.
     awaiting_changes: bool,
     _tasks: Vec<Task<()>>,
@@ -323,6 +326,7 @@ impl NodePeek {
             show_empty: false,
             reads: None,
             absent: HashMap::new(),
+            groups_absent: Vec::new(),
             awaiting_changes: false,
             _tasks: Vec::new(),
             _subscription: subscription,
@@ -417,6 +421,7 @@ impl NodePeek {
         self.known.clear();
         self.groups.clear();
         self.absent.clear();
+        self.groups_absent.clear();
         self._tasks.clear();
         self.load_node(cx);
         cx.notify();
@@ -460,14 +465,12 @@ impl NodePeek {
                         if this.snapshot.is_none() {
                             this.snapshot = output.graph_commit_id.clone();
                         }
-                        let values = if fields {
-                            field_values(&output.rows)
+                        let rows = if fields {
+                            field_rows(&output.rows)
                         } else {
                             node_rows(&output.rows)
-                                .into_iter()
-                                .next()
-                                .map(|row| row.values)
                         };
+                        let values = rows.into_iter().next().map(|row| row.values);
                         match values {
                             Some(values) => {
                                 this.values = Loadable::Loaded(values);
@@ -485,7 +488,7 @@ impl NodePeek {
                         Some(HistoricalGap::Property {
                             owner,
                             property,
-                            named,
+                            then,
                         }) if owner == type_name
                             && !this.absent.contains_key(&property)
                             && this
@@ -495,7 +498,7 @@ impl NodePeek {
                                 .is_some_and(|node| node.property(&property).is_some()) =>
                         {
                             // Once per property, so this ends.
-                            this.absent.insert(property, named);
+                            this.absent.insert(property, then);
                             this.load_node(cx);
                         }
                         Some(HistoricalGap::Type { name }) if name == type_name => {
@@ -902,6 +905,7 @@ impl NodePeek {
             return;
         };
         let limit = self.neighbour_limit();
+        let without = self.groups_absent.clone();
         let Some(group) = self.groups.get_mut(index) else {
             return;
         };
@@ -909,7 +913,7 @@ impl NodePeek {
         group.neighbours = Loadable::Loading;
         group.expanded = false;
         group.more = None;
-        let query = match builder::neighbours(
+        let query = match builder::neighbours_without_properties(
             &schema,
             &type_name,
             &group.group,
@@ -917,6 +921,7 @@ impl NodePeek {
             None,
             builder::Narrow::default(),
             limit + 1,
+            &without,
         ) {
             Ok(query) => query,
             Err(error) => {
@@ -928,6 +933,7 @@ impl NodePeek {
         let session = self.session.downgrade();
         let snapshot = self.snapshot.clone();
         let relationship = group.group.clone();
+        let read_without = without;
         group._task = Some(cx.spawn(async move |this, cx| {
             if debounce {
                 cx.background_executor().timer(COUNT_DELAY).await;
@@ -941,10 +947,7 @@ impl NodePeek {
                 Ok(output) => neighbours_from(&output.rows),
                 Err(error) => {
                     this.update(cx, |this, cx| {
-                        if let Some(group) = this.groups.get_mut(index) {
-                            group.count = Loadable::Failed(error.to_string());
-                            group.neighbours = Loadable::NotLoaded;
-                        }
+                        this.group_refused(index, &relationship, &read_without, error, open, cx);
                         cx.notify();
                     })
                     .ok();
@@ -986,6 +989,58 @@ impl NodePeek {
         }));
     }
 
+    /// A group's read was refused. At a commit made before its edge type or the type at its
+    /// other end existed, it had no neighbours; one made before a property it reads (the
+    /// neighbour's label, an edge property) was added or renamed is read again without it, once
+    /// per property: `read_without` is what this read left out already.
+    fn group_refused(
+        &mut self,
+        index: usize,
+        relationship: &RelationshipGroup,
+        read_without: &[(String, String)],
+        error: ReadError,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let gap = match &error {
+            ReadError::Refused(refusal) => refusal.historical_gap(),
+            _ => None,
+        };
+        let ends = [&relationship.edge, &relationship.other_type];
+        match gap {
+            Some(HistoricalGap::Type { name }) if ends.contains(&&name) => {
+                if let Some(group) = self.groups.get_mut(index) {
+                    group.count = Loadable::Loaded(0);
+                    group.neighbours = Loadable::Loaded(Vec::new());
+                    group.expanded = false;
+                }
+            }
+            Some(HistoricalGap::Property {
+                owner, property, ..
+            }) if ends.contains(&&owner)
+                && !read_without
+                    .iter()
+                    .any(|(o, p)| *o == owner && *p == property) =>
+            {
+                // Another group's read may have found it first.
+                if !self
+                    .groups_absent
+                    .iter()
+                    .any(|(o, p)| *o == owner && *p == property)
+                {
+                    self.groups_absent.push((owner, property));
+                }
+                self.load_group(index, false, open, cx);
+            }
+            _ => {
+                if let Some(group) = self.groups.get_mut(index) {
+                    group.count = Loadable::Failed(error.to_string());
+                    group.neighbours = Loadable::NotLoaded;
+                }
+            }
+        }
+    }
+
     fn toggle_group(&mut self, index: usize, cx: &mut Context<Self>) {
         let PeekSubject::Node { type_name, id } = self.subject.clone() else {
             return;
@@ -994,6 +1049,7 @@ impl NodePeek {
             return;
         };
         let limit = self.neighbour_limit();
+        let without = self.groups_absent.clone();
         let Some(group) = self.groups.get_mut(index) else {
             return;
         };
@@ -1002,7 +1058,7 @@ impl NodePeek {
             cx.notify();
             return;
         }
-        let query = match builder::neighbours(
+        let query = match builder::neighbours_without_properties(
             &schema,
             &type_name,
             &group.group,
@@ -1010,6 +1066,7 @@ impl NodePeek {
             None,
             builder::Narrow::default(),
             limit,
+            &without,
         ) {
             Ok(query) => query,
             Err(error) => {
@@ -1050,6 +1107,7 @@ impl NodePeek {
         let Some(schema) = self.schema.clone() else {
             return;
         };
+        let without = self.groups_absent.clone();
         let Some(group) = self.groups.get(index) else {
             return;
         };
@@ -1064,7 +1122,7 @@ impl NodePeek {
         if group.more.is_some() {
             return;
         }
-        let query = match builder::neighbours(
+        let query = match builder::neighbours_without_properties(
             &schema,
             &type_name,
             &group.group,
@@ -1072,6 +1130,7 @@ impl NodePeek {
             Some(&after),
             builder::Narrow::default(),
             PAGE_NEIGHBOURS,
+            &without,
         ) {
             Ok(query) => query,
             Err(_) => return,
@@ -2125,11 +2184,8 @@ impl NodePeek {
                             .and_then(|p| self.render_picker(index, p, &value, cx));
                         let opens_editor = editable && picker.is_none() && !editing && !saving;
                         let body = match (self.edits.get(&name), picker) {
-                            _ if self.absent.contains_key(&name) => Label::new(
-                                match self.absent.get(&name).cloned().flatten() {
-                                    Some(then) => format!("Named “{then}” at this commit"),
-                                    None => "Added after this commit".to_owned(),
-                                },
+                            _ if let Some(then) = self.absent.get(&name) => Label::new(
+                                absence_text(then, true),
                             )
                             .size(LabelSize::Small)
                             .color(Color::Muted)
@@ -3278,23 +3334,23 @@ impl NodePeek {
     }
 }
 
-/// A node read as fields (`builder::node_fields_by_id`), as a whole-node read gives it: `@id`
-/// and the properties that hold a value.
-fn field_values(rows: &Value) -> Option<Map<String, Value>> {
-    let row = rows.as_array()?.first()?.as_object()?;
-    let prefix = builder::field_column("");
-    let mut values = Map::new();
-    for (column, value) in row {
-        if value.is_null() {
-            continue;
-        }
-        if column == "id" {
-            values.insert(ID_COLUMN.to_owned(), value.clone());
-        } else if let Some(property) = column.strip_prefix(prefix.as_str()) {
-            values.insert(property.to_owned(), value.clone());
-        }
+/// What a property the commit shown does not hold under its name was then, in a sentence's
+/// case (`capital`) or a header's.
+pub(crate) fn absence_text(then: &PropertyThen, capital: bool) -> String {
+    let text = match then {
+        PropertyThen::Absent => "added after this commit".to_owned(),
+        PropertyThen::Named(name) => format!("named “{name}” at this commit"),
+        PropertyThen::Unwitnessed => "not readable at this commit".to_owned(),
+    };
+    if capital {
+        let mut chars = text.chars();
+        chars
+            .next()
+            .map(|first| first.to_uppercase().chain(chars).collect())
+            .unwrap_or_default()
+    } else {
+        text
     }
-    Some(values)
 }
 
 #[cfg(test)]
@@ -3515,7 +3571,7 @@ mod tests {
             assert_eq!(values.get("@id"), Some(&json!("p1")));
             assert_eq!(
                 view.absent.get("born"),
-                Some(&None),
+                Some(&PropertyThen::Absent),
                 "added after this commit"
             );
             assert!(
@@ -3531,6 +3587,60 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["studio_node", "studio_node_fields"]
         );
+    }
+
+    /// At a commit made before an edge type existed, its groups had no neighbours; one made
+    /// before an edge property was added reads the group without it (spec 015).
+    #[gpui::test]
+    async fn groups_at_a_commit_before_their_edge_or_its_property_existed(cx: &mut TestAppContext) {
+        const SCHEMA: &str = "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\nedge Likes: Person -> Person {\n  since: I32?\n}\n";
+        let (session, _) = session_routing(
+            SCHEMA,
+            |request| {
+                let query = request["query"].as_str().unwrap_or_default();
+                match request["name"].as_str() {
+                    Some("studio_node") => {
+                        json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }])
+                    }
+                    Some("studio_neighbours") if query.contains(":knows") => json!({
+                        "refuse": "edge type 'Knows' does not exist at this snapshot"
+                    }),
+                    Some("studio_neighbours") if query.contains("e_since") => json!({
+                        "refuse": "property 'since' of edge type 'Likes' does not exist at this snapshot"
+                    }),
+                    Some("studio_neighbours") => {
+                        json!([{ "id": "p010", "edge_id": "e1", "label": "Grace" }])
+                    }
+                    _ => json!([]),
+                }
+            },
+            cx,
+        );
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            NodePeek::page(session, "Person".into(), "p1".into(), Some("c0".into()), cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            for group in &view.groups {
+                match group.group.edge.as_str() {
+                    "Knows" => {
+                        assert_eq!(group.count, Loadable::Loaded(0), "no Knows at the commit");
+                    }
+                    _ => {
+                        assert_eq!(group.count, Loadable::Loaded(1));
+                        assert_eq!(group.neighbours.loaded().map(Vec::len), Some(1));
+                    }
+                }
+            }
+            assert_eq!(
+                view.groups_absent,
+                [("Likes".to_owned(), "since".to_owned())]
+            );
+        });
     }
 
     /// Another writer's commit that changed nothing the page shows moves the page to it without

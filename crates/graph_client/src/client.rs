@@ -69,30 +69,46 @@ pub struct ApiErrorSummary {
 pub enum HistoricalGap {
     /// The node or edge type did not exist at the commit.
     Type { name: String },
-    /// The property did not exist at the commit, or had another name then (`named`).
     Property {
         owner: String,
         property: String,
-        named: Option<String>,
+        then: PropertyThen,
     },
+}
+
+/// What a property was at a commit a read of it was refused at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PropertyThen {
+    /// It did not exist: added since, or dropped and added again.
+    Absent,
+    /// It had this name; a historical read does not follow a rename.
+    Named(String),
+    /// Its column carries no property identity (data written before OmniGraph 0.10), so the
+    /// server cannot tell which property it was.
+    Unwitnessed,
 }
 
 impl ApiErrorSummary {
     /// The type or property a historical read was refused for. The server says it only in the
-    /// message (`property 'P' of node type 'T' does not exist at this snapshot`, `… is named
-    /// 'Q' at this snapshot; …`, `node type 'T' does not exist at this snapshot`).
+    /// message (`omnigraph-core`'s `missing_graph_type_at_snapshot`,
+    /// `missing_graph_property_at_snapshot`, `renamed_graph_property_at_snapshot`,
+    /// `unwitnessed_graph_property_at_snapshot`).
     pub fn historical_gap(&self) -> Option<HistoricalGap> {
         if self.status != 400 {
             return None;
         }
         let message = self.message.trim();
-        let (subject, named) =
+        let (subject, then) =
             if let Some(subject) = message.strip_suffix(" does not exist at this snapshot") {
-                (subject, None)
+                (subject, PropertyThen::Absent)
+            } else if let Some(subject) =
+                message.strip_suffix(" has no persisted property-lifetime witness at this snapshot")
+            {
+                (subject, PropertyThen::Unwitnessed)
             } else {
                 let (head, _) = message.split_once(" at this snapshot; ")?;
                 let (subject, named) = head.rsplit_once(" is named ")?;
-                (subject, Some(quoted(named)?))
+                (subject, PropertyThen::Named(quoted(named)?))
             };
         match subject.strip_prefix("property ") {
             Some(rest) => {
@@ -103,10 +119,10 @@ impl ApiErrorSummary {
                 Some(HistoricalGap::Property {
                     owner: quoted(owner)?,
                     property: quoted(property)?,
-                    named,
+                    then,
                 })
             }
-            None if named.is_none() => {
+            None if then == PropertyThen::Absent => {
                 let name = subject
                     .strip_prefix("node type ")
                     .or_else(|| subject.strip_prefix("edge type "))?;
@@ -1473,7 +1489,7 @@ mod tests {
             Some(HistoricalGap::Property {
                 owner: "Event".into(),
                 property: "actual_end".into(),
-                named: None,
+                then: PropertyThen::Absent,
             })
         );
         assert_eq!(
@@ -1483,7 +1499,7 @@ mod tests {
             Some(HistoricalGap::Property {
                 owner: "Person".into(),
                 property: "remark".into(),
-                named: Some("memo".into()),
+                then: PropertyThen::Named("memo".into()),
             })
         );
         assert_eq!(
@@ -1491,7 +1507,23 @@ mod tests {
             Some(HistoricalGap::Property {
                 owner: "Knows".into(),
                 property: "since".into(),
-                named: None,
+                then: PropertyThen::Absent,
+            })
+        );
+        assert_eq!(
+            gap(
+                "property 'note' of node type 'Doc' has no persisted property-lifetime witness at this snapshot"
+            ),
+            Some(HistoricalGap::Property {
+                owner: "Doc".into(),
+                property: "note".into(),
+                then: PropertyThen::Unwitnessed,
+            })
+        );
+        assert_eq!(
+            gap("edge type 'Knows' does not exist at this snapshot"),
+            Some(HistoricalGap::Type {
+                name: "Knows".into()
             })
         );
         assert_eq!(

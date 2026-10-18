@@ -25,7 +25,7 @@ use gq_language::{
     SchemaModel, Sort, builder,
 };
 use graph_client::api::ReadOutput;
-use graph_client::{BlobCell, BlobMeta, ReadError};
+use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError};
 use graph_store::carry::{Since, TypeRef, edge_reads, node_reads};
 use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, ReadWatch, SessionEvent};
 use serde_json::Value;
@@ -51,9 +51,9 @@ use crate::grouping::{GROUP_LIMIT, Grouping, Line, SECTION_FIRST_PAGE};
 use crate::model::{
     ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN, Row, SaveResult,
     TableKind, Tone, changed_elsewhere, chips_that_fit, copy_text, count_of, display_value,
-    edge_columns, edge_rows, edit_text, filter_parts, format_count, insert_position, node_columns,
-    node_rows, parse_filter_list, parse_filter_value, parse_input, preset_start, reads_as_markdown,
-    relation_sample, row_matches, same_value, save_result, short_commit,
+    edge_columns, edge_rows, edit_text, field_rows, filter_parts, format_count, insert_position,
+    node_columns, node_rows, parse_filter_list, parse_filter_value, parse_input, preset_start,
+    reads_as_markdown, relation_sample, row_matches, same_value, save_result, short_commit,
 };
 use crate::offers::Offers;
 use crate::peek::{KnownRelation, NEIGHBOUR_LIMIT, Neighbour, NodePeek, PeekSubject};
@@ -310,6 +310,9 @@ pub struct TypeTable {
     /// Rows and relationship keys whose read is out or done, so a column scrolled back into
     /// view is not asked again.
     relations_asked: HashSet<(String, String)>,
+    /// Properties the commit shown does not hold under their current name, and what they were
+    /// then. Rows are read without them.
+    absent: HashMap<String, PropertyThen>,
     peek: Option<(String, Entity<NodePeek>)>,
     newer: bool,
     /// Writes out for this table: its own saves and the dialogs' inserts and deletes. Each moves
@@ -534,6 +537,7 @@ impl TypeTable {
             relation_tasks: Vec::new(),
             relations_drawn: HashSet::new(),
             relations_asked: HashSet::new(),
+            absent: HashMap::new(),
             peek: None,
             newer: false,
             saves_in_flight: 0,
@@ -842,13 +846,30 @@ impl TypeTable {
         let mut filters = self.resolved_filters();
         filters.extend(section.cloned());
         let sort = self.sort.as_ref();
+        // At a commit made before a property was added or renamed, rows are read without it.
+        let without: Vec<String> = self.absent.keys().cloned().collect();
         match self.kind {
-            TableKind::Node => {
+            TableKind::Node if without.is_empty() => {
                 builder::node_page(schema, &self.type_name, &filters, sort, start, limit)
             }
-            TableKind::Edge => {
-                builder::edge_page(schema, &self.type_name, &filters, sort, start, limit)
-            }
+            TableKind::Node => builder::node_page_fields(
+                schema,
+                &self.type_name,
+                &filters,
+                sort,
+                start,
+                limit,
+                &without,
+            ),
+            TableKind::Edge => builder::edge_page_without(
+                schema,
+                &self.type_name,
+                &filters,
+                sort,
+                start,
+                limit,
+                &without,
+            ),
         }
     }
 
@@ -1755,6 +1776,7 @@ impl TypeTable {
 
     fn rows_from(&self, rows: &Value) -> Vec<Row> {
         match self.kind {
+            TableKind::Node if !self.absent.is_empty() => field_rows(rows),
             TableKind::Node => node_rows(rows),
             TableKind::Edge => self
                 .schema
@@ -1774,6 +1796,8 @@ impl TypeTable {
         if keep_pin {
             self.paging.restart();
         } else {
+            // Another commit, or another schema: what it holds is found out again.
+            self.absent.clear();
             self.paging.reset();
             // A table opened at a commit stays pinned to it (constitution II).
             self.paging.pinned = self.at_commit.clone();
@@ -2320,9 +2344,21 @@ impl TypeTable {
                     self.loading_more = false;
                 }
             }
+            Err(ReadError::Refused(refusal)) if self.read_without(refusal.historical_gap()) => {
+                self.reload(true, cx);
+                return;
+            }
             Err(error) => {
                 if first {
-                    self.first_page = Loadable::Failed(error.to_string());
+                    self.first_page = Loadable::Failed(match &error {
+                        ReadError::Refused(refusal) => match refusal.historical_gap() {
+                            Some(HistoricalGap::Type { name }) if name == self.type_name => {
+                                format!("{name} did not exist at this commit.")
+                            }
+                            _ => error.to_string(),
+                        },
+                        _ => error.to_string(),
+                    });
                     self.count = Loadable::NotLoaded;
                 } else {
                     self.loading_more = false;
@@ -2331,6 +2367,33 @@ impl TypeTable {
             }
         }
         cx.notify();
+    }
+
+    /// Notes a property the commit shown does not hold under its current name, so the rows are
+    /// read again without it; false when the refusal names no new property of the table's type.
+    /// Once per property, so the reads end.
+    fn read_without(&mut self, gap: Option<HistoricalGap>) -> bool {
+        let Some(HistoricalGap::Property {
+            owner,
+            property,
+            then,
+        }) = gap
+        else {
+            return false;
+        };
+        let known = self.schema.as_ref().is_some_and(|schema| match self.kind {
+            TableKind::Node => schema
+                .node(&self.type_name)
+                .is_some_and(|node| node.property(&property).is_some()),
+            TableKind::Edge => schema
+                .edge(&self.type_name)
+                .is_some_and(|edge| edge.properties.iter().any(|p| p.name == property)),
+        });
+        if owner != self.type_name || !known || self.absent.contains_key(&property) {
+            return false;
+        }
+        self.absent.insert(property, then);
+        true
     }
 
     /// Reads the relationship columns for one page's rows: per relationship, how many
@@ -5017,11 +5080,14 @@ impl TypeTable {
                             .single_line(),
                     )
                     .child(
-                        Label::new(column.detail.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Disabled)
-                            .single_line()
-                            .truncate(),
+                        Label::new(match self.absent.get(&column.key) {
+                            Some(then) => crate::peek::absence_text(then, false),
+                            None => column.detail.clone(),
+                        })
+                        .size(LabelSize::XSmall)
+                        .color(Color::Disabled)
+                        .single_line()
+                        .truncate(),
                     )
                     .children(sorted.map(|sort| {
                         Icon::new(if sort.descending {
@@ -6531,6 +6597,61 @@ mod tests {
                 Some("name".to_owned())
             );
         });
+    }
+
+    /// At a commit made before a property was added, the rows are refused, naming it: the
+    /// table reads them again without it, and its header says so.
+    #[gpui::test]
+    async fn a_table_at_a_commit_before_a_property_was_added_reads_the_rest(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = PEOPLE.replace("  name: String\n", "  name: String\n  born: Date?\n");
+        let (session, names) = crate::test_support::session_routing(
+            &schema,
+            |request| match request["name"].as_str() {
+                Some("studio_page") => serde_json::json!({
+                    "refuse": "property 'born' of node type 'Person' does not exist at this snapshot"
+                }),
+                Some("studio_page_fields") => serde_json::json!([
+                    { "id": "p1", "v_slug": "p1", "v_name": "Ada" },
+                    { "id": "p2", "v_slug": "p2", "v_name": "Grace" },
+                ]),
+                _ => serde_json::json!([]),
+            },
+            cx,
+        );
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                Some("c0".into()),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.rows.len(), 2);
+            assert_eq!(
+                table.rows[0].values.get("name"),
+                Some(&serde_json::json!("Ada"))
+            );
+            assert_eq!(table.absent.get("born"), Some(&PropertyThen::Absent));
+            assert!(matches!(table.first_page, Loadable::Loaded(())));
+        });
+        let names = names.lock().unwrap().clone();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.starts_with("studio_page"))
+                .collect::<Vec<_>>(),
+            ["studio_page", "studio_page_fields"]
+        );
     }
 
     /// A type with many relationships reads the neighbours of the relationship columns rows

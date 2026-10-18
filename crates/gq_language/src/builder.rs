@@ -747,6 +747,40 @@ pub fn node_page(
     start: &PageStart,
     limit: u32,
 ) -> Result<BuiltQuery, BuildError> {
+    node_page_reading(schema, type_name, filters, sort, start, limit, None)
+}
+
+/// [`node_page`] with each row as columns, as [`node_fields_by_id`] reads one node: for a
+/// commit made before the properties in `without` were added or renamed.
+pub fn node_page_fields(
+    schema: &SchemaModel,
+    type_name: &str,
+    filters: &[Filter],
+    sort: Option<&Sort>,
+    start: &PageStart,
+    limit: u32,
+    without: &[String],
+) -> Result<BuiltQuery, BuildError> {
+    node_page_reading(
+        schema,
+        type_name,
+        filters,
+        sort,
+        start,
+        limit,
+        Some(without),
+    )
+}
+
+fn node_page_reading(
+    schema: &SchemaModel,
+    type_name: &str,
+    filters: &[Filter],
+    sort: Option<&Sort>,
+    start: &PageStart,
+    limit: u32,
+    fields_without: Option<&[String]>,
+) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
     let mut params = Params::new();
     let (keyset, order) = keyset("n", &node.name, &node.properties, sort, start, &mut params)?;
@@ -760,13 +794,17 @@ pub fn node_page(
         filters,
         &mut params,
     )?);
+    let (name, returned) = match fields_without {
+        None => ("studio_page", "$n".to_owned()),
+        Some(without) => ("studio_page_fields", field_columns(node, without)),
+    };
     let text = format!(
-        "query studio_page({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ $n }}\n  order {{ {order} }}\n  limit {limit}\n}}\n",
+        "query {name}({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ {returned} }}\n  order {{ {order} }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         clauses = clauses.join("\n    "),
     );
     Ok(BuiltQuery {
-        name: "studio_page".into(),
+        name: name.into(),
         text,
         params: params.values,
         depends: Depends::rows_of(schema, &node.name, false, filters),
@@ -830,9 +868,22 @@ pub fn node_by_id(
     })
 }
 
-/// The column a property is read into by [`node_fields_by_id`].
+/// The column a property is read into by [`node_fields_by_id`] and [`node_page_fields`].
 pub fn field_column(property: &str) -> String {
     format!("v_{property}")
+}
+
+/// `$n.@id as id`, then each property but those in `without` and those a projection cannot
+/// read (Blob, vector) into its [`field_column`].
+fn field_columns(node: &NodeType, without: &[String]) -> String {
+    let mut columns = vec!["$n.@id as id".to_owned()];
+    columns.extend(
+        node.properties
+            .iter()
+            .filter(|p| p.projectable() && !without.contains(&p.name))
+            .map(|p| format!("$n.{} as {}", p.name, field_column(&p.name))),
+    );
+    columns.join(", ")
 }
 
 /// One node by `@id` as columns: `id`, then [`field_column`] for every property but those in
@@ -851,18 +902,11 @@ pub fn node_fields_by_id(
     };
     let mut params = Params::new();
     let id = params.add("id", "String", Value::String(id.to_owned()));
-    let mut columns = vec!["$n.@id as id".to_owned()];
-    columns.extend(
-        node.properties
-            .iter()
-            .filter(|p| p.projectable() && !without.contains(&p.name))
-            .map(|p| format!("$n.{} as {}", p.name, field_column(&p.name))),
-    );
     let text = format!(
         "query studio_node_fields({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n  }}\n  return {{ {columns} }}\n  limit 1\n}}\n",
         sig = params.signature(),
         ty = node.name,
-        columns = columns.join(", "),
+        columns = field_columns(node, without),
     );
     Ok(BuiltQuery {
         name: "studio_node_fields".into(),
@@ -910,6 +954,20 @@ pub fn edge_page(
     start: &PageStart,
     limit: u32,
 ) -> Result<BuiltQuery, BuildError> {
+    edge_page_without(schema, edge_name, filters, sort, start, limit, &[])
+}
+
+/// [`edge_page`] without the properties in `without`: for a commit made before they were added
+/// or renamed.
+pub fn edge_page_without(
+    schema: &SchemaModel,
+    edge_name: &str,
+    filters: &[Filter],
+    sort: Option<&Sort>,
+    start: &PageStart,
+    limit: u32,
+    without: &[String],
+) -> Result<BuiltQuery, BuildError> {
     let edge = edge(schema, edge_name)?;
     let mut params = Params::new();
     let (keyset, order) = keyset("e", &edge.name, &edge.properties, sort, start, &mut params)?;
@@ -931,7 +989,11 @@ pub fn edge_page(
         "$a.@id as from_id".to_owned(),
         "$b.@id as to_id".to_owned(),
     ];
-    for property in edge.properties.iter().filter(|p| p.projectable()) {
+    for property in edge
+        .properties
+        .iter()
+        .filter(|p| p.projectable() && !without.contains(&p.name))
+    {
         columns.push(format!(
             "$e.{} as {}",
             property.name,
@@ -1530,6 +1592,25 @@ pub fn neighbours(
     narrow: Narrow<'_>,
     limit: u32,
 ) -> Result<BuiltQuery, BuildError> {
+    neighbours_without_properties(schema, node_type, group, id, after, narrow, limit, &[])
+}
+
+/// [`neighbours`] without the properties in `without`, each named with its owner, the other
+/// node type (its label) or the edge type: for a commit made before they were added or
+/// renamed.
+#[allow(clippy::too_many_arguments)]
+pub fn neighbours_without_properties(
+    schema: &SchemaModel,
+    node_type: &str,
+    group: &RelationshipGroup,
+    id: &str,
+    after: Option<&str>,
+    narrow: Narrow<'_>,
+    limit: u32,
+    without: &[(String, String)],
+) -> Result<BuiltQuery, BuildError> {
+    let left_out =
+        |owner: &str, property: &str| without.iter().any(|(o, p)| o == owner && p == property);
     let node = node(schema, node_type)?;
     let edge = schema
         .edge(&group.edge)
@@ -1556,10 +1637,15 @@ pub fn neighbours(
     let mut columns = vec!["$m.@id as id".to_owned(), "$e.@id as edge_id".to_owned()];
     if let Some(label) = other.label_property()
         && Some(label) != other.key.as_deref()
+        && !left_out(&other.name, label)
     {
         columns.push(format!("$m.{label} as label"));
     }
-    for property in edge.properties.iter().filter(|p| p.projectable()) {
+    for property in edge
+        .properties
+        .iter()
+        .filter(|p| p.projectable() && !left_out(&edge.name, &p.name))
+    {
         columns.push(format!("$e.{0} as e_{0}", property.name));
     }
     let mut extra = String::new();
@@ -2864,6 +2950,37 @@ mod tests {
         assert_compiles(&query);
         assert!(query.text.contains("$n.name as v_name"), "{}", query.text);
         assert!(!query.text.contains("born"), "{}", query.text);
+    }
+
+    #[test]
+    fn a_page_read_as_fields_leaves_out_the_properties_named() {
+        let schema = dev();
+        let without = ["born".to_owned()];
+        let query = node_page_fields(
+            &schema,
+            "Person",
+            &[],
+            None,
+            &PageStart::First,
+            50,
+            &without,
+        )
+        .unwrap();
+        assert_compiles(&query);
+        assert!(query.text.contains("$n.name as v_name"), "{}", query.text);
+        assert!(!query.text.contains("born"), "{}", query.text);
+        let edges = edge_page_without(
+            &schema,
+            "WorksAt",
+            &[],
+            None,
+            &PageStart::First,
+            50,
+            &["role".to_owned()],
+        )
+        .unwrap();
+        assert_compiles(&edges);
+        assert!(!edges.text.contains("role"), "{}", edges.text);
     }
 
     #[test]
