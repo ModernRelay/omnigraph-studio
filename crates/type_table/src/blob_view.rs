@@ -31,12 +31,16 @@ use crate::pdf;
 
 /// The largest value the tab reads whole to show.
 pub const VIEW_MAX: u64 = 64 * 1024 * 1024;
-/// How many pages of a PDF are drawn.
-const PDF_PAGES: usize = 100;
+/// How many pages of a PDF are drawn: a letter page drawn 1,600 pixels wide holds about 13 MB
+/// of pixels while the tab is open, so a hundred would hold over a gigabyte.
+const PDF_PAGES: usize = 20;
 /// How wide a PDF page is drawn, in pixels: twice the width it is shown at, for a sharp page.
 const PDF_DRAW_WIDTH: u32 = 1600;
 /// How much of a binary value the hex dump shows.
 const HEX_MAX: usize = 64 * 1024;
+/// How much of a text value the tab shows: an editor of a whole 64 MiB value would take seconds
+/// to make on the main thread.
+const TEXT_SHOWN: usize = 4 * 1024 * 1024;
 const ZOOM_STEP: f32 = 1.25;
 const ZOOM_MIN: f32 = 0.05;
 const ZOOM_MAX: f32 = 20.;
@@ -55,9 +59,11 @@ enum Content {
         pages: Vec<(ShownImage, u32, u32)>,
         count: usize,
     },
-    Text(Entity<Editor>),
+    /// The text, and whether it is cut at [`TEXT_SHOWN`].
+    Text(Entity<Editor>, bool),
     Bytes {
-        hex: String,
+        /// Shared, so each frame's code block takes it without a copy.
+        hex: SharedString,
     },
     TooLarge,
     External(String),
@@ -222,13 +228,16 @@ impl BlobView {
                         format: name,
                     },
                     Kind::Pdf { pages, count } => Content::Pdf { pages, count },
-                    Kind::Text(text) => Content::Text(cx.new(|cx| {
-                        let mut editor = Editor::multi_line(window, cx);
-                        editor.set_text(text, window, cx);
-                        editor.set_read_only(true);
-                        editor
-                    })),
-                    Kind::Bytes(hex) => Content::Bytes { hex },
+                    Kind::Text(text, cut) => Content::Text(
+                        cx.new(|cx| {
+                            let mut editor = Editor::multi_line(window, cx);
+                            editor.set_text(text, window, cx);
+                            editor.set_read_only(true);
+                            editor
+                        }),
+                        cut,
+                    ),
+                    Kind::Bytes(hex) => Content::Bytes { hex: hex.into() },
                     Kind::Unreadable(reason) => {
                         this.content = Loadable::Failed(reason);
                         this.bytes = Some(bytes.clone());
@@ -394,13 +403,23 @@ impl BlobView {
     /// folder in Studio's data directory that keeps a day's worth.
     fn open_elsewhere(&mut self, cx: &mut Context<Self>) {
         let directory = studio_settings::data_dir().join("blobs");
-        if let Err(error) = prepare_open_folder(&directory) {
-            self.export = Some(Export::Failed(format!("Could not write: {error}")));
-            cx.notify();
-            return;
-        }
         let path = directory.join(self.file_name());
-        self.write_to(path, true, cx);
+        self.export = Some(Export::Busy("Opening…"));
+        cx.notify();
+        // The folder is made private and emptied of day-old files off the main thread.
+        self._export = Some(cx.spawn(async move |this, cx| {
+            let prepared = cx
+                .background_spawn(async move { prepare_open_folder(&directory) })
+                .await;
+            this.update(cx, |this, cx| match prepared {
+                Ok(()) => this.write_to(path, true, cx),
+                Err(error) => {
+                    this.export = Some(Export::Failed(format!("Could not write: {error}")));
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     // ---- what the tab says ----
@@ -424,13 +443,19 @@ impl BlobView {
                     n => format!("{n} pages"),
                 });
             }
-            Loadable::Loaded(Content::Text(_)) => facts.push("Text".into()),
+            Loadable::Loaded(Content::Text(_, cut)) => {
+                facts.push("Text".into());
+                if *cut {
+                    let shown = studio_ui::format_bytes(TEXT_SHOWN as u64);
+                    facts.push(format!("the first {shown} shown"));
+                }
+            }
             Loadable::Loaded(Content::Bytes { .. }) => facts.push("Binary".into()),
             _ => {}
         }
         facts.extend(size);
         if let Some(commit) = &self.snapshot {
-            facts.push(format!("at {}", crate::model::short_commit(commit)));
+            facts.push(format!("at {}", studio_ui::short_commit_id(commit)));
         }
         facts.join(" · ")
     }
@@ -621,7 +646,8 @@ enum Kind {
         pages: Vec<(ShownImage, u32, u32)>,
         count: usize,
     },
-    Text(String),
+    /// The text, cut at [`TEXT_SHOWN`] on a character's boundary, and whether it was.
+    Text(String, bool),
     Bytes(String),
     Unreadable(String),
 }
@@ -652,7 +678,7 @@ fn classify(bytes: &[u8], svg: &SvgRenderer) -> Kind {
                 pages: pages
                     .into_iter()
                     .filter_map(|page| {
-                        let image = ShownImage::decode(ImageFormat::Png, page.png, svg)?;
+                        let image = ShownImage::from_rgba(page.width, page.height, page.rgba)?;
                         Some((image, page.width, page.height))
                     })
                     .collect(),
@@ -662,8 +688,11 @@ fn classify(bytes: &[u8], svg: &SvgRenderer) -> Kind {
         };
     }
     if let Ok(text) = std::str::from_utf8(bytes) {
-        let head = &text[..text.len().min(4096)];
-        if head.contains("<svg") {
+        // Looked for in the bytes: a character may straddle the 4,096th.
+        if bytes[..bytes.len().min(4096)]
+            .windows(4)
+            .any(|window| window == b"<svg")
+        {
             return match ShownImage::decode(ImageFormat::Svg, bytes.to_vec(), svg) {
                 Some(image) => Kind::Image {
                     image,
@@ -673,7 +702,11 @@ fn classify(bytes: &[u8], svg: &SvgRenderer) -> Kind {
                 None => unreadable(),
             };
         }
-        return Kind::Text(text.to_owned());
+        let mut end = text.len().min(TEXT_SHOWN);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        return Kind::Text(text[..end].to_owned(), end < text.len());
     }
     Kind::Bytes(hex_dump_lines(&bytes[..bytes.len().min(HEX_MAX)], 16))
 }
@@ -695,7 +728,7 @@ impl Item for BlobView {
         Some(match &self.content {
             Loadable::Loaded(Content::Image { .. }) => IconName::Image,
             Loadable::Loaded(Content::Pdf { .. }) => IconName::FileDoc,
-            Loadable::Loaded(Content::Text(_)) => IconName::FileTextOutlined,
+            Loadable::Loaded(Content::Text(..)) => IconName::FileTextOutlined,
             _ => IconName::File,
         })
     }
@@ -923,7 +956,7 @@ impl Render for BlobView {
                     .child(self.render_pdf(pages, *count, cx))
                     .into_any_element()
             }
-            Loadable::Loaded(Content::Text(editor)) => div()
+            Loadable::Loaded(Content::Text(editor, _)) => div()
                 .size_full()
                 .px(px(ds::space::LG))
                 .py(px(ds::space::MD))
@@ -946,7 +979,7 @@ impl Render for BlobView {
         };
         // Images and PDFs take zoom keys; text keeps its keys for the editor.
         let context = match &self.content {
-            Loadable::Loaded(Content::Text(_)) => "BlobText",
+            Loadable::Loaded(Content::Text(..)) => "BlobText",
             _ => "BlobView",
         };
         div()
@@ -1000,8 +1033,19 @@ mod tests {
             }
         ));
         assert!(
-            matches!(classify(b"plain notes", &svg()), Kind::Text(text) if text == "plain notes")
+            matches!(classify(b"plain notes", &svg()), Kind::Text(text, false) if text == "plain notes")
         );
+        // A character straddling the 4,096th byte, where the SVG check stops looking.
+        let long = format!("{}é more", "a".repeat(4095));
+        assert!(
+            matches!(classify(long.as_bytes(), &svg()), Kind::Text(text, false) if text == long)
+        );
+        // A text past what is shown is cut on a character's boundary, and says so.
+        let huge = format!("{}é", "a".repeat(TEXT_SHOWN - 1));
+        assert!(matches!(
+            classify(huge.as_bytes(), &svg()),
+            Kind::Text(text, true) if text.len() == TEXT_SHOWN - 1
+        ));
         assert!(matches!(
             classify(&[0xff, 0x00, 0x13], &svg()),
             Kind::Bytes(_)

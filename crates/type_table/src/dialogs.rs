@@ -31,13 +31,6 @@ struct Field {
     error: Option<String>,
 }
 
-fn notice_color(tone: Tone) -> Color {
-    match tone {
-        Tone::Refused | Tone::Invalid => Color::Error,
-        Tone::Conflict | Tone::Unknown => Color::Warning,
-    }
-}
-
 fn write_target(branch: &str, cx: &App) -> impl IntoElement {
     let border = cx.theme().colors().border_variant;
     div()
@@ -215,12 +208,13 @@ impl InsertRowModal {
         self.saving = true;
         self.notice = None;
         cx.notify();
+        // On the branch the dialog was opened on, which its checks read.
+        let branch = self.branch.clone();
         let write = self.session.update(cx, |session, cx| {
-            session.write(&query, None, description, cx)
+            session.write_on(&branch, &query, None, description, None, cx)
         });
         let table = self.table.clone();
         table.update(cx, |table, _| table.save_started()).ok();
-        let branch = self.branch.clone();
         let values: Map<String, Value> = values.into_iter().collect();
         // The write is never cancelled with the dialog: the table hears the outcome even when the
         // dialog was closed meanwhile.
@@ -230,7 +224,14 @@ impl InsertRowModal {
             table
                 .update(cx, |table, cx| {
                     if let SaveResult::Saved { commit, parent } = &result {
-                        table.row_inserted(key.clone(), values, commit, parent.as_deref(), cx);
+                        table.row_inserted(
+                            &branch,
+                            key.clone(),
+                            values,
+                            commit,
+                            parent.as_deref(),
+                            cx,
+                        );
                     }
                     table.save_finished(cx);
                 })
@@ -367,7 +368,7 @@ impl Render for InsertRowModal {
             .children(self.notice.clone().map(|notice| {
                 Label::new(notice.message)
                     .size(LabelSize::Small)
-                    .color(notice_color(notice.tone))
+                    .color(notice.tone.color())
             }))
             .child(
                 h_flex()
@@ -404,6 +405,8 @@ struct Endpoint {
     /// Counts searches, so an answer for older text is dropped.
     generation: u64,
     search: Option<Task<()>>,
+    /// The text `offers` answers; while it differs from the field, a search is out.
+    answers: Option<String>,
     error: Option<String>,
 }
 
@@ -497,6 +500,8 @@ impl InsertEdgeModal {
                 picked: None,
                 generation: 0,
                 search: None,
+                // An empty field answers itself: nothing is being looked up.
+                answers: Some(String::new()),
                 error: None,
             }
         };
@@ -577,6 +582,7 @@ impl InsertEdgeModal {
         if text.is_empty() || endpoint.picked.as_deref() == Some(text.as_str()) {
             endpoint.offers.clear();
             endpoint.search = None;
+            endpoint.answers = Some(text);
             cx.notify();
             return;
         }
@@ -592,15 +598,20 @@ impl InsertEdgeModal {
             };
             let read = cx
                 .update(|cx| session.update(cx, |session, cx| session.read(&query, snapshot, cx)));
-            let Ok(output) = read.await else { return };
+            let result = read.await;
             this.update(cx, |this, cx| {
                 let endpoint = this.endpoint_mut(end);
                 if endpoint.generation != generation {
                     return;
                 }
-                endpoint
-                    .offers
-                    .set(suggest::from_node_rows(&output.rows), true);
+                // A failed search offers nothing, not what an earlier one found.
+                match result {
+                    Ok(output) => endpoint
+                        .offers
+                        .set(suggest::from_node_rows(&output.rows), true),
+                    Err(_) => endpoint.offers.clear(),
+                }
+                endpoint.answers = Some(text);
                 cx.notify();
             })
             .ok();
@@ -645,10 +656,15 @@ impl InsertEdgeModal {
         cx.notify();
     }
 
-    /// ↵ picks the highlighted node in an endpoint field, and inserts otherwise.
+    /// ↵ picks the highlighted node in an endpoint field, and inserts otherwise. While the
+    /// field's search is out it waits: the nodes offered were found for earlier text.
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(end) = self.focused_end(window, cx) {
             let endpoint = self.endpoint_mut(end);
+            let typed = endpoint.editor.read(cx).text(cx);
+            if endpoint.answers.as_deref() != Some(typed.trim()) {
+                return;
+            }
             if let Some(index) = endpoint.offers.highlighted() {
                 self.pick(end, index, window, cx);
                 return;
@@ -701,12 +717,13 @@ impl InsertEdgeModal {
         self.notice = None;
         cx.notify();
         let description = format!("Insert {} {from} → {to}", self.edge_name);
+        // On the branch the dialog was opened on, which its checks read.
+        let branch = self.branch.clone();
         let write = self.session.update(cx, |session, cx| {
-            session.write(&query, None, description, cx)
+            session.write_on(&branch, &query, None, description, None, cx)
         });
         let table = self.table.clone();
         table.update(cx, |table, _| table.save_started()).ok();
-        let branch = self.branch.clone();
         // The write is never cancelled with the dialog: the table hears the outcome even when the
         // dialog was closed meanwhile.
         cx.spawn_in(window, async move |this, cx| {
@@ -715,7 +732,14 @@ impl InsertEdgeModal {
             table
                 .update(cx, |table, cx| {
                     if let SaveResult::Saved { commit, parent } = &result {
-                        table.row_inserted(None, Map::new(), commit, parent.as_deref(), cx);
+                        table.row_inserted(
+                            &branch,
+                            None,
+                            Map::new(),
+                            commit,
+                            parent.as_deref(),
+                            cx,
+                        );
                     }
                     table.save_finished(cx);
                 })
@@ -870,7 +894,7 @@ impl Render for InsertEdgeModal {
             .children(self.notice.clone().map(|notice| {
                 Label::new(notice.message)
                     .size(LabelSize::Small)
-                    .color(notice_color(notice.tone))
+                    .color(notice.tone.color())
             }))
             .child(
                 h_flex()
@@ -1145,12 +1169,13 @@ impl DeleteRowModal {
             .undo_unavailable
             .is_none()
             .then_some(FollowUp::UndoDelete);
+        let (branch, session) = (self.branch.clone(), self.session.clone());
         let write = self.session.update(cx, |session, cx| {
-            session.write_with(&query, self.if_commit.clone(), description, follow_up, cx)
+            let if_commit = self.if_commit.clone();
+            session.write_on(&branch, &query, if_commit, description, follow_up, cx)
         });
         let table = self.table.clone();
         table.update(cx, |table, _| table.save_started()).ok();
-        let (branch, session) = (self.branch.clone(), self.session.clone());
         let several = self.targets.len() > 1 || dependents > 0;
         cx.spawn_in(window, async move |this, cx| {
             let outcome = write.await;
@@ -1160,22 +1185,24 @@ impl DeleteRowModal {
             if let SaveResult::Saved { .. } = &result {
                 session
                     .update(cx, |session, cx| {
+                        // The deleted rows' drafts on the branch they were deleted from, though
+                        // the window moved to another branch meanwhile.
                         let keys: Vec<DraftKey> = session
-                            .drafts()
+                            .drafts_on(&branch)
                             .filter(|(key, _)| {
                                 removed.iter().any(|(t, id)| key.type_name == *t && key.id == *id)
                             })
                             .map(|(key, _)| key.clone())
                             .collect();
                         for key in &keys {
-                            session.remove_draft(key, cx);
+                            session.remove_draft_on(&branch, key, cx);
                         }
                     });
             }
             table
                 .update(cx, |table, cx| {
                     if let SaveResult::Saved { commit, parent } = &result {
-                        table.rows_deleted(&own, commit, parent.as_deref(), cx);
+                        table.rows_deleted(&branch, &own, commit, parent.as_deref(), cx);
                     } else if moved {
                         table.branch_moved(cx);
                     }
@@ -1364,7 +1391,7 @@ impl Render for DeleteRowModal {
             .children(self.notice.clone().map(|notice| {
                 Label::new(notice.message)
                     .size(LabelSize::Small)
-                    .color(notice_color(notice.tone))
+                    .color(notice.tone.color())
             }))
             .child(
                 h_flex()

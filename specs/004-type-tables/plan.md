@@ -66,8 +66,9 @@ stay put), IX (paged, virtualized).
   shown for what its bytes are, as Zed shows an image: an image fitted to the tab (never past its
   own size) on a checkerboard with a hairline, ⌘-scroll or `=`/`-` zooming about the pointer,
   `1` its actual size, `0` fit again, a drag to pan; an SVG fitted; a PDF's pages drawn by the
-  system (CoreGraphics on macOS, twice the width shown, the first 100 pages) and stacked to
-  scroll; UTF-8 text in a read-only editor (⌘F searches it); anything else as a hex dump of its
+  system (CoreGraphics on macOS, twice the width shown, the first 20 pages: a page's pixels are
+  about 13 MB, held while the tab is open) and stacked to scroll; UTF-8 text, its first 4 MiB, in
+  a read-only editor (⌘F searches it); anything else as a hex dump of its
   first 64 KB, sixteen bytes a line. The footer gives the kind, the pixel size or page count,
   the size and the commit; zoom (−, the percentage, +, Fit) for an image or a PDF; Save…; and
   "Open in default app", which writes the value to an owner-only folder in Studio's data
@@ -296,9 +297,8 @@ kept answers.
 
 - Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
   - E11 typed result columns: column types come from `describe_query_operation` until then.
-  - R1 Blob writes: upload and clear only when the server advertises `cluster_putBlob`.
-  - R2 unpublished commits: staged edits as a reviewable proposal only when the server
-    advertises `cluster_publishCommit`.
+  - R2 unpublished commits: staged edits as a reviewable proposal. The minimum server (0.14)
+    serves them; Studio does not use them yet. Blob writes (R1) are served there and used.
 - Per-row history beyond the commits that the change feed can cheaply return.
 
 ## Validation log

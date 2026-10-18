@@ -72,7 +72,7 @@ pub(crate) fn session_routing(
         seen.lock().unwrap().push(name);
         answer(request)
     });
-    let session = serve_with(schema, rows, 200, committed("c2", "c1"), None, cx);
+    let session = serve_with(schema, rows, always(200, committed("c2", "c1")), None, cx);
     (session, asked)
 }
 
@@ -173,8 +173,7 @@ pub(crate) fn session_followed(
     let session = serve_with(
         schema,
         rows,
-        200,
-        committed("c2", "c1"),
+        always(200, committed("c2", "c1")),
         Some(writer.clone()),
         cx,
     );
@@ -183,6 +182,42 @@ pub(crate) fn session_followed(
 
 /// The rows a read answers with, from its request body.
 type Rows = Arc<dyn Fn(&Value) -> Value + Send + Sync>;
+
+/// How the next write is answered: its status and body.
+type Writes = Arc<dyn Fn() -> (u16, Value) + Send + Sync>;
+
+fn always(status: u16, body: Value) -> Writes {
+    Arc::new(move || (status, body.clone()))
+}
+
+/// As [`session`], the writes answered in turn by `answers`; any after the last get the last.
+pub(crate) fn session_writing(
+    schema: &str,
+    answers: Vec<(u16, Value)>,
+    cx: &mut TestAppContext,
+) -> Entity<GraphSession> {
+    let answers = Mutex::new(
+        answers
+            .into_iter()
+            .collect::<std::collections::VecDeque<_>>(),
+    );
+    let writes: Writes = Arc::new(move || {
+        let mut answers = answers.lock().unwrap();
+        match answers.len() {
+            0 => (500, json!({})),
+            1 => answers[0].clone(),
+            _ => answers.pop_front().unwrap(),
+        }
+    });
+    let rows = Arc::new(people());
+    serve_with(
+        schema,
+        Arc::new(move |_: &Value| (*rows).clone()),
+        writes,
+        None,
+        cx,
+    )
+}
 
 fn serve(
     schema: &str,
@@ -195,8 +230,7 @@ fn serve(
     serve_with(
         schema,
         Arc::new(move |_: &Value| (*rows).clone()),
-        write_status,
-        write_body,
+        always(write_status, write_body),
         None,
         cx,
     )
@@ -205,16 +239,14 @@ fn serve(
 fn serve_with(
     schema: &str,
     rows: Rows,
-    write_status: u16,
-    write_body: Value,
+    writes: Writes,
     writer: Option<Arc<Writer>>,
     cx: &mut TestAppContext,
 ) -> Entity<GraphSession> {
     use futures::AsyncReadExt as _;
     let schema: Arc<str> = schema.into();
-    let write_body: Arc<Value> = Arc::new(write_body);
     let http = FakeHttpClient::create(move |request| {
-        let (schema, rows, write_body) = (schema.clone(), rows.clone(), write_body.clone());
+        let (schema, rows, writes) = (schema.clone(), rows.clone(), writes.clone());
         let writer = writer.clone();
         async move {
             let path = request.uri().path().to_owned();
@@ -263,9 +295,10 @@ fn serve_with(
             } else if let Some(writer) = writer.as_ref().filter(|_| path.ends_with("/changes")) {
                 (200, writer.feed(&query))
             } else if path.contains("/mutate") {
-                (write_status, (*write_body).clone())
+                writes()
             } else {
-                (200, json!({ "branches": ["main"] }))
+                // A second branch, for views that follow the window to another one.
+                (200, json!({ "branches": ["main", "fix"] }))
             };
             Ok(Response::builder()
                 .status(status)

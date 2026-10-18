@@ -57,6 +57,17 @@ impl ShownImage {
             .map(ShownImage::Raster)
     }
 
+    /// An image of pixels already drawn, RGBA row by row from the top; call it from a
+    /// background task. `None` when they do not fill `width` by `height`.
+    pub fn from_rgba(width: u32, height: u32, mut rgba: Vec<u8>) -> Option<Self> {
+        // What GPUI draws is BGRA, as its own decoding leaves it.
+        for pixel in rgba.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+        }
+        let frame = image::Frame::new(image::RgbaImage::from_raw(width, height, rgba)?);
+        Some(ShownImage::Raster(Arc::new(RenderImage::new(vec![frame]))))
+    }
+
     pub fn source(&self) -> ImageSource {
         match self {
             ShownImage::Raster(image) => ImageSource::Render(image.clone()),

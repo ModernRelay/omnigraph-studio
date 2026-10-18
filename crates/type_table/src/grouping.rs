@@ -268,9 +268,24 @@ impl Grouping {
         lines
     }
 
-    /// The line showing a row, while its section is open.
+    /// The line showing a row, while its section is open: counted as [`Self::lines`] lays them
+    /// out, without making them.
     pub fn line_of_row(&self, row: usize) -> Option<usize> {
-        self.lines().iter().position(|line| *line == Line::Row(row))
+        let mut line = 0;
+        for section in self.sections() {
+            line += 1;
+            if !section.expanded {
+                continue;
+            }
+            if section.range.contains(&row) {
+                return Some(line + row - section.range.start);
+            }
+            line += section.range.len();
+            if section.loading || section.error.is_some() || section.has_more() {
+                line += 1;
+            }
+        }
+        None
     }
 
     /// The row `step` rows away from `row` among the rows shown, staying at the ends; from no
@@ -414,6 +429,12 @@ mod tests {
         );
         assert_eq!(grouping.step_row(None, 1), Some(3));
         assert_eq!(grouping.line_of_row(1), None);
+        // Counted where the lines put each row.
+        let lines = grouping.lines();
+        for row in 0..6 {
+            let at = lines.iter().position(|line| *line == Line::Row(row));
+            assert_eq!(grouping.line_of_row(row), at, "row {row}");
+        }
         assert_eq!(grouping.rows_between(4, 3), [3, 4]);
 
         grouping.removed(3);

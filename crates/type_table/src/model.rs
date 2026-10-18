@@ -628,15 +628,6 @@ pub fn relative_value(
     }
 }
 
-/// The text copied for a cell: the raw string, or JSON for anything else.
-pub fn copy_text(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
 /// Parses a filter's value: one element for a list's membership test.
 pub fn parse_filter_value(property: &Property, text: &str) -> Result<Value, String> {
     let element = Property {
@@ -790,6 +781,16 @@ pub enum Tone {
     Invalid,
 }
 
+impl Tone {
+    /// Red for what was refused or cannot be sent, amber for a conflict or an unknown outcome.
+    pub fn color(self) -> ui::Color {
+        match self {
+            Tone::Refused | Tone::Invalid => ui::Color::Error,
+            Tone::Conflict | Tone::Unknown => ui::Color::Warning,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub tone: Tone,
@@ -886,13 +887,6 @@ pub fn format_count(n: i64) -> String {
         out.push(c);
     }
     if n < 0 { format!("-{out}") } else { out }
-}
-
-/// The last segment of a graph commit id, for display.
-pub fn short_commit(id: &str) -> String {
-    let tail = id.rsplit('.').next().unwrap_or(id);
-    let start = tail.len().saturating_sub(8);
-    tail[start..].to_owned()
 }
 
 /// The most chips a relationship cell shows: two names say what a row links to; more crowd
@@ -1464,10 +1458,6 @@ mod tests {
         assert_eq!(format_count(12480), "12\u{a0}480");
         assert_eq!(format_count(200), "200");
         assert_eq!(format_count(1_000_000), "1\u{a0}000\u{a0}000");
-        assert_eq!(
-            short_commit("hb1.01M4.3.01M4RAGY10QYVXPVTS7S94HEZ3"),
-            "7S94HEZ3"
-        );
         assert!(same_value(&json!(1), &json!(1.0)));
         assert!(!same_value(&json!(["a"]), &json!(["b"])));
         assert_eq!(display_value(None, &Value::Null), "—");

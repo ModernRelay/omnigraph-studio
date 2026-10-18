@@ -224,7 +224,12 @@ impl TypesList {
                 .into_any_element(),
             Row::Type { name, is_edge } => {
                 let s = session.read(cx);
-                let count = match s.count_of(name) {
+                let entity = if *is_edge {
+                    graph_store::EntityKind::Edge
+                } else {
+                    graph_store::EntityKind::Node
+                };
+                let count = match s.count_of(entity, name) {
                     Some(n) => format_count(n),
                     None if matches!(s.datasets, Loadable::Loading | Loadable::NotLoaded) => {
                         "…".into()

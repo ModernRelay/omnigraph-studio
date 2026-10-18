@@ -47,6 +47,8 @@ pub struct TextEditor {
     property: String,
     /// What saves are bound to: the value as it was read, or as it was last saved.
     old: Loadable<Value>,
+    /// The text differs from `old`: found once per edit, not on every draw of the tab.
+    unsaved: bool,
     /// The commit the value is read at: the one a field was being edited at, else the head.
     read_at: Option<String>,
     /// Text typed in a field before it was opened here, kept over the value read.
@@ -93,6 +95,8 @@ impl TextEditor {
             cx.subscribe_in(&editor, window, |this, _, event: &EditorEvent, _, cx| {
                 if let EditorEvent::BufferEdited = event {
                     let text = this.editor.read(cx).text(cx);
+                    this.unsaved =
+                        matches!(&this.old, Loadable::Loaded(old) if text != edit_text(old));
                     this.preview
                         .update(cx, |preview, cx| preview.replace(text, cx));
                     if matches!(this.state, State::Saved) {
@@ -111,6 +115,7 @@ impl TextEditor {
             id,
             property,
             old: Loadable::Loading,
+            unsaved: false,
             read_at,
             typed,
             label: None,
@@ -166,6 +171,7 @@ impl TextEditor {
                             let value = row.values.get(&property).cloned().unwrap_or(Value::Null);
                             this.label = this.label_from(&row.values);
                             let text = this.typed.take().unwrap_or_else(|| edit_text(&value));
+                            this.unsaved = text != edit_text(&value);
                             this.set_text(text, window, cx);
                             this.old = Loadable::Loaded(value);
                         }
@@ -243,21 +249,25 @@ impl TextEditor {
             }
         };
         self.state = State::Saving;
+        let branch = self.session.read(cx).branch.clone();
         // Detached: closing the tab never cancels a write.
         cx.spawn_in(window, async move |this, cx| {
             let result = write.await;
             this.update(cx, |this, cx| {
                 this.state = match result {
                     SaveResult::Saved { .. } => {
+                        // Typing while it was written stays unsaved.
+                        this.unsaved = this.text(cx) != edit_text(&new);
                         this.old = Loadable::Loaded(new);
-                        // A draft kept for the property elsewhere is now saved too.
+                        // A draft kept for the property elsewhere on the branch written is now
+                        // saved too, though the window moved to another branch meanwhile.
                         let key = DraftKey {
                             type_name: this.type_name.clone(),
                             id: this.id.clone(),
                             property: this.property.clone(),
                         };
                         this.session
-                            .update(cx, |session, cx| session.remove_draft(&key, cx));
+                            .update(cx, |session, cx| session.remove_draft_on(&branch, &key, cx));
                         State::Saved
                     }
                     SaveResult::NoMatch => State::Conflict,
@@ -340,10 +350,7 @@ impl TextEditor {
             State::Failed(notice) => Some(
                 h_flex()
                     .gap(px(studio_ui::ds::space::SM))
-                    .child(Indicator::dot().color(match notice.tone {
-                        Tone::Conflict | Tone::Unknown => Color::Warning,
-                        Tone::Refused | Tone::Invalid => Color::Error,
-                    }))
+                    .child(Indicator::dot().color(notice.tone.color()))
                     .child(
                         Label::new(notice.message.clone())
                             .size(LabelSize::Small)
@@ -420,11 +427,8 @@ impl Item for TextEditor {
     }
 
     /// Unsaved: the text differs from the value saves are bound to.
-    fn is_dirty(&self, cx: &App) -> bool {
-        match &self.old {
-            Loadable::Loaded(old) => self.text(cx) != edit_text(old),
-            _ => false,
-        }
+    fn is_dirty(&self, _cx: &App) -> bool {
+        self.unsaved && matches!(self.old, Loadable::Loaded(_))
     }
 
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {

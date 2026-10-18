@@ -1,12 +1,12 @@
 //! PDF pages as images (spec 004, a Blob's own tab), drawn by the system's PDF renderer: on
-//! macOS CoreGraphics opens the document from memory and draws each page into a bitmap, which is
-//! encoded as PNG for an image element. Elsewhere there is no renderer and the tab offers the
+//! macOS CoreGraphics opens the document from memory and draws each page into a bitmap, whose
+//! pixels become an image element's. Elsewhere there is no renderer and the tab offers the
 //! system's viewer instead.
 
-/// One page, drawn: PNG bytes and the pixel size they hold.
+/// One page, drawn: its pixels, RGBA row by row from the top, and its pixel size.
 #[derive(Debug, Clone)]
 pub struct Page {
-    pub png: Vec<u8>,
+    pub rgba: Vec<u8>,
     pub width: u32,
     pub height: u32,
 }
@@ -78,7 +78,7 @@ pub fn render(bytes: &[u8], width: u32, max_pages: usize) -> Result<(Vec<Page>, 
         // The bitmap's first row is the page's top.
         let rgba = unsafe { std::slice::from_raw_parts(pixels as *const u8, w * h * 4) }.to_vec();
         pages.push(Page {
-            png: encode_png(rgba, width, height)?,
+            rgba,
             width,
             height,
         });
@@ -89,16 +89,6 @@ pub fn render(bytes: &[u8], width: u32, max_pages: usize) -> Result<(Vec<Page>, 
 #[cfg(not(target_os = "macos"))]
 pub fn render(_bytes: &[u8], _width: u32, _max_pages: usize) -> Result<(Vec<Page>, usize), String> {
     Err("Studio draws PDFs on macOS only; open it in the system's viewer.".into())
-}
-
-#[cfg(target_os = "macos")]
-fn encode_png(rgba: Vec<u8>, width: u32, height: u32) -> Result<Vec<u8>, String> {
-    use image::ImageEncoder as _;
-    let mut png = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(&rgba, width, height, image::ExtendedColorType::Rgba8)
-        .map_err(|error| error.to_string())?;
-    Ok(png)
 }
 
 /// Whether bytes are a PDF: its header within the first kilobyte, as readers accept.
@@ -164,7 +154,7 @@ pub(crate) mod tests {
         let page = &pages[0];
         // 200 × 100 points drawn 400 wide is 200 tall.
         assert_eq!((page.width, page.height), (400, 200));
-        let image = image::load_from_memory(&page.png).unwrap().to_rgba8();
+        let image = image::RgbaImage::from_raw(page.width, page.height, page.rgba.clone()).unwrap();
         // The top left is paper; the square sits near the bottom left (PDF's origin).
         assert_eq!(image.get_pixel(5, 5).0, [255, 255, 255, 255]);
         let mark = image.get_pixel(40, 200 - 40).0;

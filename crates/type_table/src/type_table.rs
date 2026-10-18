@@ -7,7 +7,7 @@ mod blob;
 mod blob_view;
 mod dialogs;
 mod grouping;
-pub mod model;
+mod model;
 mod node_page;
 mod nodes_panel;
 mod offers;
@@ -30,13 +30,12 @@ use studio_actions::graph::{
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
 
-pub use blob_view::BlobView;
-pub use dialogs::{DeleteRowModal, InsertRowModal};
-pub use node_page::NodePage;
-pub use peek::{NodePeek, PeekSubject};
-pub use table::{Cursor, TypeTable};
-pub use text_editor::TextEditor;
-pub use types_list::TypesList;
+use blob_view::BlobView;
+use node_page::NodePage;
+use peek::{NodePeek, PeekSubject};
+use table::TypeTable;
+use text_editor::TextEditor;
+use types_list::TypesList;
 
 /// Registers this surface with every new workspace: the left dock's Types panel, `OpenType`,
 /// and `OpenNode`. Its keys are in `assets/keymaps/` (`TypeTable`, `TypeTable && editing`).

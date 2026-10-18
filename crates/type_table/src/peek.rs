@@ -30,7 +30,7 @@ use crate::blob::{
 };
 use crate::model::{
     FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, display_value, field_rows, format_count,
-    node_rows, reads_as_markdown, same_value, save_result, short_commit,
+    node_rows, reads_as_markdown, same_value, save_result,
 };
 use graph_client::api::ReadOutput;
 use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError};
@@ -148,6 +148,8 @@ struct AddEdge {
     index: usize,
     editor: Entity<Editor>,
     found: Loadable<Vec<Neighbour>>,
+    /// The text `found` answers: what was typed when they were read.
+    answers: Option<String>,
     highlighted: usize,
     _search: Option<Task<()>>,
     _changed: Subscription,
@@ -171,6 +173,8 @@ enum SaveState {
 
 pub struct NodePeek {
     session: Entity<GraphSession>,
+    /// The branch the view reads: the session's, since the view last followed it there.
+    branch: String,
     blobs: Vec<BlobSlot>,
     schema: Option<Arc<SchemaModel>>,
     subject: PeekSubject,
@@ -304,6 +308,22 @@ impl NodePeek {
                 cx.notify();
                 return;
             }
+            // Another branch: the node is read there, as a table reads its rows again. What was
+            // being edited was the branch left's; its drafts wait for it in the session.
+            if let SessionEvent::BranchChanged = event
+                && !this.holds_commit
+                && session.read(cx).branch != this.branch
+            {
+                this.branch = session.read(cx).branch.clone();
+                this.edits.clear();
+                this.adding = None;
+                this.removing = None;
+                this.group_notices.clear();
+                this.drafts_notice = None;
+                this.confirm_discard = false;
+                this.refresh(cx);
+                return;
+            }
             // Another writer changed the schema: the view stays as read until Refresh.
             if let SessionEvent::SchemaMoved = event
                 && !this.holds_commit
@@ -328,12 +348,11 @@ impl NodePeek {
         });
         cx.on_release(|this: &mut Self, cx| this.release_images(cx))
             .detach();
-        let scope = session.update(cx, |session, _| {
-            let branch = session.branch.clone();
-            session.read_scope(&branch)
-        });
+        let branch = session.read(cx).branch.clone();
+        let scope = session.update(cx, |session, _| session.read_scope(&branch));
         let mut this = Self {
             session,
+            branch,
             blobs: Vec::new(),
             schema,
             subject,
@@ -387,10 +406,6 @@ impl NodePeek {
             None => this.load_node(cx),
         }
         this
-    }
-
-    pub fn subject(&self) -> &PeekSubject {
-        &self.subject
     }
 
     /// What names the node: its label, or its id until it is read or when it has none.
@@ -1301,9 +1316,14 @@ impl NodePeek {
     }
 
     fn drop_draft(&mut self, name: &str, cx: &mut Context<Self>) {
+        let branch = self.branch.clone();
+        self.drop_draft_on(&branch, name, cx);
+    }
+
+    fn drop_draft_on(&mut self, branch: &str, name: &str, cx: &mut Context<Self>) {
         if let Some(key) = self.draft_key(name) {
             self.session
-                .update(cx, |session, cx| session.remove_draft(&key, cx));
+                .update(cx, |session, cx| session.remove_draft_on(branch, &key, cx));
         }
     }
 
@@ -1500,11 +1520,21 @@ impl NodePeek {
             values.insert(name.clone(), new);
         }
         self.saving.insert(name);
+        let branch = self.branch.clone();
         // Detached: closing the page or moving the peek never cancels a write.
         cx.spawn_in(window, async move |this, cx| {
             let result = write.await;
             this.update_in(cx, |this, window, cx| {
-                this.finish_write(property, old, text, result, window, cx)
+                if this.branch == branch {
+                    this.finish_write(property, old, text, result, window, cx);
+                    return;
+                }
+                // The view reads another branch now; the property's draft was the branch left's.
+                this.saving.remove(&property.name);
+                if let SaveResult::Saved { .. } = result {
+                    this.drop_draft_on(&branch, &property.name, cx);
+                }
+                cx.notify();
             })
             .ok();
         })
@@ -1696,6 +1726,7 @@ impl NodePeek {
             index,
             editor,
             found: Loadable::NotLoaded,
+            answers: None,
             highlighted: 0,
             _search: None,
             _changed: changed,
@@ -1720,8 +1751,8 @@ impl NodePeek {
         let Some(group) = self.groups.get(adding.index) else {
             return;
         };
-        let text = adding.editor.read(cx).text(cx);
-        let query = match builder::node_search(&schema, &group.group.other_type, text.trim(), 8) {
+        let text = adding.editor.read(cx).text(cx).trim().to_owned();
+        let query = match builder::node_search(&schema, &group.group.other_type, &text, 8) {
             Ok(query) => query,
             Err(error) => {
                 adding.found = Loadable::Failed(error.to_string());
@@ -1741,6 +1772,7 @@ impl NodePeek {
                         Ok(output) => Loadable::Loaded(neighbours_from(&output.rows)),
                         Err(error) => Loadable::Failed(error.to_string()),
                     };
+                    adding.answers = Some(text);
                     adding.highlighted = 0;
                 }
                 cx.notify();
@@ -1768,6 +1800,18 @@ impl NodePeek {
     /// Adds the relationship to the highlighted node; on a group that holds one, it replaces
     /// the one there, which is removed first so the limit holds (rule D2 makes that two
     /// commits).
+    /// ↵ in the search: the highlighted node of the results for what is typed now. While those
+    /// are being read it does nothing, so a node found for earlier text is never written to.
+    fn confirm_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(adding) = self.adding.as_ref() else {
+            return;
+        };
+        let typed = adding.editor.read(cx).text(cx);
+        if adding.answers.as_deref() == Some(typed.trim()) {
+            self.add_highlighted(window, cx);
+        }
+    }
+
     fn add_highlighted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(adding) = self.adding.as_ref() else {
             return;
@@ -1866,7 +1910,7 @@ impl NodePeek {
                 }
             }
         }
-        let branch = self.session.read(cx).branch.clone();
+        let branch = self.branch.clone();
         let other = match &change {
             EdgeChange::Add(other) => other.clone(),
             EdgeChange::Remove(_) => group.other_type.clone(),
@@ -1875,44 +1919,75 @@ impl NodePeek {
         self.group_notices.remove(&index);
         let session = self.session.clone();
         let edge = group.edge;
+        let shown = self.snapshot.clone();
         // Detached: closing the page or moving the peek never cancels a write.
         cx.spawn_in(window, async move |this, cx| {
+            // A replace is two commits, the removal then the addition. The page follows its own
+            // commits from the one it shows while each is on top of the one before.
             let mut outcome = None;
+            let mut reached = shown.clone();
+            let mut followed = true;
+            let mut landed = 0;
             for (query, verb) in built {
                 let description = format!("{verb} {edge} of {id} · {other}");
                 let write = session.update(cx, |session, cx| {
-                    session.write(&query, None, description, cx)
+                    session.write_on(&branch, &query, None, description, None, cx)
                 });
                 let result = save_result(&write.await, &branch);
-                let landed = matches!(result, SaveResult::Saved { .. });
+                let saved = match &result {
+                    SaveResult::Saved { commit, parent } => {
+                        followed &= parent.is_some() && *parent == reached;
+                        reached = Some(commit.clone());
+                        landed += 1;
+                        true
+                    }
+                    _ => false,
+                };
                 outcome = Some(result);
-                if !landed {
+                if !saved {
                     break;
                 }
             }
             this.update(cx, |this, cx| {
                 this.edge_writes.remove(&index);
+                // The view reads another branch now: its toasts tell how the writes went.
+                if this.branch != branch {
+                    cx.notify();
+                    return;
+                }
+                if landed > 0 {
+                    if followed && this.snapshot == shown {
+                        this.snapshot = reached;
+                    } else {
+                        this.newer = true;
+                    }
+                }
+                // After the removal landed, a failed addition leaves the group without the
+                // relationship it replaced: said so, not "nothing was written".
+                let partly = |message: &str| {
+                    format!(
+                        "The relationship it replaces was removed, but the new one was not \
+                         added. {message}"
+                    )
+                };
                 match outcome {
-                    Some(SaveResult::Saved { commit, parent }) => {
-                        if parent.is_some() && parent == this.snapshot {
-                            this.snapshot = Some(commit);
-                        } else {
-                            this.newer = true;
-                        }
-                    }
+                    Some(SaveResult::Saved { .. }) | None => {}
                     Some(SaveResult::NoMatch) => {
-                        this.group_notices.insert(
-                            index,
-                            Notice::new(
-                                Tone::Conflict,
-                                "Nothing changed: it was already so, or changed elsewhere",
-                            ),
-                        );
+                        let message = "Nothing changed: it was already so, or changed elsewhere";
+                        let message = if landed > 0 {
+                            partly(message)
+                        } else {
+                            message.to_owned()
+                        };
+                        this.group_notices
+                            .insert(index, Notice::new(Tone::Conflict, message));
                     }
-                    Some(SaveResult::Refused(notice) | SaveResult::Unknown(notice)) => {
+                    Some(SaveResult::Refused(mut notice) | SaveResult::Unknown(mut notice)) => {
+                        if landed > 0 {
+                            notice.message = partly(&notice.message);
+                        }
                         this.group_notices.insert(index, notice);
                     }
-                    None => {}
                 }
                 this.reload_group(index, cx);
                 if this.saving.is_empty() && this.edge_writes.is_empty() {
@@ -1983,7 +2058,7 @@ impl NodePeek {
                 return;
             }
         };
-        let branch = self.session.read(cx).branch.clone();
+        let branch = self.branch.clone();
         let description = format!("Save {} changes of {id}", cells.len());
         let write = self.session.update(cx, |session, cx| {
             session.write(&query, None, description, cx)
@@ -1999,6 +2074,16 @@ impl NodePeek {
                 this.saving_drafts = false;
                 for (name, _, _) in &cells {
                     this.saving.remove(name);
+                }
+                // The view reads another branch now: the drafts saved were the branch left's.
+                if this.branch != branch {
+                    if let SaveResult::Saved { .. } = result {
+                        for (name, _, _) in &cells {
+                            this.drop_draft_on(&branch, name, cx);
+                        }
+                    }
+                    cx.notify();
+                    return;
                 }
                 match result {
                     SaveResult::Saved { commit, parent } => {
@@ -2071,7 +2156,7 @@ impl NodePeek {
                 .children(self.drafts_notice.as_ref().map(|notice| {
                     Label::new(notice.message.clone())
                         .size(LabelSize::XSmall)
-                        .color(notice_color(notice.tone))
+                        .color(notice.tone.color())
                 }))
                 .child(div().flex_1())
                 .child(
@@ -2117,7 +2202,7 @@ impl NodePeek {
     }
 
     fn copy(&mut self, name: String, value: &Value, cx: &mut Context<Self>) {
-        cx.write_to_clipboard(ClipboardItem::new_string(crate::model::copy_text(value)));
+        cx.write_to_clipboard(ClipboardItem::new_string(studio_ui::value_text(value)));
         self.copied = Some(name);
         cx.notify();
         self._tasks.push(cx.spawn(async move |this, cx| {
@@ -2137,31 +2222,10 @@ impl NodePeek {
         let Some(schema) = &self.schema else {
             return Vec::new();
         };
-        match &self.subject {
-            PeekSubject::Node { type_name, .. } => schema
-                .node(type_name)
-                .map(|node| {
-                    // Blob values are shown under Blobs, with their previews.
-                    node.properties
-                        .iter()
-                        .filter(|p| p.projectable())
-                        .map(|p| (p.name.clone(), Some(p.clone()), p.display_type()))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            PeekSubject::Edge { edge_type, .. } => {
-                let mut rows = Vec::new();
-                if let Some(edge) = schema.edge(edge_type) {
-                    rows.extend(
-                        edge.properties
-                            .iter()
-                            .filter(|p| p.projectable())
-                            .map(|p| (p.name.clone(), Some(p.clone()), p.display_type())),
-                    );
-                }
-                rows
-            }
-        }
+        listed_properties(schema, &self.subject)
+            .into_iter()
+            .map(|p| (p.name.clone(), Some(p.clone()), p.display_type()))
+            .collect()
     }
 
     /// Keeps one markdown view per text value with markup, made again only when its text
@@ -2174,12 +2238,16 @@ impl NodePeek {
         };
         // Runs every frame: a text is parsed only when it is new, so an unchanged view costs a
         // comparison per property.
-        let mut wanted: Vec<String> = Vec::new();
-        for (name, property, _) in self.property_rows() {
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        let mut wanted: HashSet<String> = HashSet::new();
+        for property in listed_properties(&schema, &self.subject) {
+            let name = property.name.clone();
             let Some(text) = values.get(&name).and_then(Value::as_str) else {
                 continue;
             };
-            if !property.as_ref().is_some_and(reads_as_markdown) {
+            if !reads_as_markdown(property) {
                 continue;
             }
             if self
@@ -2191,7 +2259,7 @@ impl NodePeek {
                     .get(&name)
                     .is_some_and(|plain| plain == text)
             {
-                wanted.push(name);
+                wanted.insert(name);
                 continue;
             }
             if studio_ui::text::is_plain(text) {
@@ -2203,7 +2271,7 @@ impl NodePeek {
                 let view = cx.new(|cx| Markdown::new(source, None, None, cx));
                 self.markdown.insert(name.clone(), (text.to_owned(), view));
             }
-            wanted.push(name);
+            wanted.insert(name);
         }
         self.markdown.retain(|name, _| wanted.contains(name));
         self.plain_text.retain(|name, _| wanted.contains(name));
@@ -2599,11 +2667,11 @@ impl NodePeek {
                 let unknown = notice.tone == Tone::Unknown;
                 h_flex()
                     .gap_1p5()
-                    .child(Indicator::dot().color(notice_color(notice.tone)))
+                    .child(Indicator::dot().color(notice.tone.color()))
                     .child(
                         Label::new(notice.message)
                             .size(LabelSize::XSmall)
-                            .color(notice_color(notice.tone)),
+                            .color(notice.tone.color()),
                     )
                     // Whether the save landed is in the branch's history.
                     .when(unknown, |row| {
@@ -2804,11 +2872,11 @@ impl NodePeek {
             h_flex()
                 .pl(px(22.))
                 .gap_1p5()
-                .child(Indicator::dot().color(notice_color(notice.tone)))
+                .child(Indicator::dot().color(notice.tone.color()))
                 .child(
                     Label::new(notice.message.clone())
                         .size(LabelSize::XSmall)
-                        .color(notice_color(notice.tone)),
+                        .color(notice.tone.color()),
                 )
         });
         let body = group
@@ -2940,7 +3008,7 @@ impl NodePeek {
                 cx.listener(|this, _: &SelectPreviousSuggestion, _, cx| this.move_match(-1, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &menu::Confirm, window, cx| this.add_highlighted(window, cx)),
+                cx.listener(|this, _: &menu::Confirm, window, cx| this.confirm_add(window, cx)),
             )
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel_add(cx)))
             .pl(px(22.))
@@ -3215,15 +3283,6 @@ fn lists_group(count: &Loadable<i64>, active: bool) -> bool {
     active || matches!(count, Loadable::Loaded(n) if *n > 0) || matches!(count, Loadable::Failed(_))
 }
 
-/// A notice's colour: red for what was refused or cannot be sent, amber for a conflict or an
-/// unknown outcome.
-fn notice_color(tone: Tone) -> Color {
-    match tone {
-        Tone::Refused | Tone::Invalid => Color::Error,
-        Tone::Conflict | Tone::Unknown => Color::Warning,
-    }
-}
-
 /// How far Zed's editor sets its text in from its left edge without a gutter: the font's
 /// descent, its gutter margin (`GutterDimensions::default_gutter_margin`).
 fn editor_inset(window: &Window, cx: &App) -> gpui::Pixels {
@@ -3424,7 +3483,10 @@ impl NodePeek {
         let page = self.page;
         // The peek opens the node's page; the page is it.
         let open_page = (!page).then(|| self.open_page_action()).flatten();
-        let has_properties = !self.property_rows().is_empty();
+        let has_properties = self
+            .schema
+            .as_ref()
+            .is_some_and(|schema| !listed_properties(schema, &self.subject).is_empty());
         let properties = self.render_properties(window, cx);
         let endpoints = self.render_endpoints(cx);
         let is_node = matches!(self.subject, PeekSubject::Node { .. });
@@ -3491,7 +3553,7 @@ impl NodePeek {
                             .tooltip(Tooltip::text(format!("Read at commit {commit}")))
                             .child(studio_ui::ds::meta_code(
                                 IconName::GitCommit,
-                                short_commit(&commit),
+                                studio_ui::short_commit_id(&commit),
                                 cx,
                             ))
                     }))
@@ -3521,13 +3583,6 @@ impl NodePeek {
     }
 }
 
-impl NodePeek {
-    /// Whether this peek shows `id` of `type_name`.
-    pub fn shows(&self, id: &str, _cx: &App) -> bool {
-        self.subject.id() == id
-    }
-}
-
 /// What a property the commit shown does not hold under its name was then, in a sentence's
 /// case (`capital`) or a header's.
 pub(crate) fn absence_text(then: &PropertyThen, capital: bool) -> String {
@@ -3545,6 +3600,23 @@ pub(crate) fn absence_text(then: &PropertyThen, capital: bool) -> String {
     } else {
         text
     }
+}
+
+/// The properties a view lists for its subject, in schema order. Blob values are shown under
+/// Blobs, with their previews.
+fn listed_properties<'a>(
+    schema: &'a SchemaModel,
+    subject: &PeekSubject,
+) -> Vec<&'a gq_language::Property> {
+    let properties = match subject {
+        PeekSubject::Node { type_name, .. } => schema.node(type_name).map(|node| &node.properties),
+        PeekSubject::Edge { edge_type, .. } => schema.edge(edge_type).map(|edge| &edge.properties),
+    };
+    properties
+        .into_iter()
+        .flatten()
+        .filter(|p| p.projectable())
+        .collect()
 }
 
 #[cfg(test)]
@@ -3598,6 +3670,55 @@ mod tests {
             assert_eq!(view.snapshot.as_deref(), Some("c2"), "its own commit");
             assert!(!view.newer, "its own write does not make it behind");
             assert!(view.saving.is_empty() && view.edits.is_empty());
+        });
+    }
+
+    /// A page at the branch head follows the window to another branch and reads its node there.
+    /// A write sent before the move lets go of the draft of the branch it was sent on, never
+    /// the one of the branch shown now, and leaves what the page shows alone.
+    #[gpui::test]
+    async fn a_page_follows_its_branch_and_a_write_from_the_one_left_stays_there(
+        cx: &mut TestAppContext,
+    ) {
+        let session = session(PEOPLE, cx);
+        let (view, cx) = page(session.clone(), cx);
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        session.update(cx, |session, cx| {
+            session.set_branch("fix".into(), cx);
+            let draft = DraftEntry {
+                old: json!("Ada"),
+                text: "Ada King".into(),
+            };
+            session.set_draft(key.clone(), draft, cx);
+            session.set_branch("main".into(), cx);
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            let person = view.schema.as_ref().unwrap().node("Person").unwrap();
+            let property = person.property("name").unwrap().clone();
+            view.start_edit(property, window, cx);
+            let editor = view.edits["name"].editor.clone();
+            editor.update(cx, |editor, cx| editor.set_text("Ada Lovelace", window, cx));
+            view.save_field("name", window, cx);
+        });
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        view.read_with(cx, |view, _| assert_eq!(view.branch, "fix"));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.value_of("name"), json!("Ada"), "read on fix");
+            assert!(view.saving.is_empty());
+        });
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.branch, "fix");
+            assert_eq!(
+                session.draft(&key).map(|draft| draft.text.as_str()),
+                Some("Ada King"),
+                "fix's draft stays"
+            );
         });
     }
 
@@ -4091,6 +4212,84 @@ mod tests {
             view.show_empty = false;
             view.start_add(1, window, cx);
             assert!(view.folded_shown(1), "being added to, with the row closed");
+        });
+    }
+
+    /// A replace is two commits: the page follows both, and when the addition fails after the
+    /// removal landed it says the old relationship is gone rather than that nothing was written.
+    #[gpui::test]
+    async fn a_replaced_relationship_follows_both_commits_and_reports_a_half(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::test_support::{committed, session_writing};
+        let refused = json!({ "error": "__dst 'p9' not found in Person", "code": "bad_request" });
+        for (second, both) in [
+            ((200, committed("c3", "c2")), true),
+            ((400, refused), false),
+        ] {
+            let session = session_writing(KNOWS, vec![(200, committed("c2", "c1")), second], cx);
+            let (view, cx) = page(session, cx);
+            view.update_in(cx, |view, window, cx| {
+                view.snapshot = Some("c1".into());
+                view.write_edge(
+                    0,
+                    EdgeChange::Add("p9".into()),
+                    Some("e1".into()),
+                    window,
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                if both {
+                    assert_eq!(
+                        view.snapshot.as_deref(),
+                        Some("c3"),
+                        "followed both commits"
+                    );
+                    assert!(!view.newer);
+                    assert!(!view.group_notices.contains_key(&0));
+                } else {
+                    assert_eq!(view.snapshot.as_deref(), Some("c2"), "the removal landed");
+                    let notice = view.group_notices.get(&0).expect("the half is reported");
+                    assert!(
+                        notice
+                            .message
+                            .starts_with("The relationship it replaces was removed"),
+                        "{}",
+                        notice.message
+                    );
+                }
+            });
+        }
+    }
+
+    /// ↵ picks from the results for what is typed now: results read for earlier text are not
+    /// written to while the search for the new text is out.
+    #[gpui::test]
+    async fn enter_waits_for_the_results_of_what_is_typed(cx: &mut TestAppContext) {
+        let refused = json!({ "error": "refused", "code": "bad_request" });
+        let (view, cx) = page(session_answering(KNOWS, 400, refused, cx), cx);
+        view.update_in(cx, |view, window, cx| {
+            view.start_add(0, window, cx);
+            let adding = view.adding.as_mut().unwrap();
+            adding
+                .editor
+                .update(cx, |editor, cx| editor.set_text("grace", window, cx));
+            adding.found = Loadable::Loaded(vec![Neighbour {
+                id: "p1".into(),
+                label: None,
+                edge_id: None,
+            }]);
+            adding.answers = Some("gr".into());
+            view.confirm_add(window, cx);
+            assert!(
+                view.adding.is_some(),
+                "the results answer earlier text: nothing written"
+            );
+            view.adding.as_mut().unwrap().answers = Some("grace".into());
+            view.confirm_add(window, cx);
+            assert!(view.adding.is_none(), "the results answer what is typed");
         });
     }
 
