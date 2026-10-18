@@ -9,16 +9,15 @@ use gpui::{
     ListAlignment, ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
 };
 use gq_language::SchemaModel;
-use graph_client::WriteOutcome;
 use graph_client::api::{
     BranchMergeOutcome, BranchMergeOutput, ChangeOutput, ChangeRequest, CommitOutput,
     MergeConflictOutput,
 };
+use graph_client::{ReadError, WriteOutcome};
 use graph_store::fixes::compose;
 use graph_store::{
     ChangeFold, FoldedChange, FoldedChanges, GraphSession, HeadWatch, NetChange, REVIEW_CHANGE_CAP,
-    SessionEvent, TypeCounts, commits_since, contains_merge_of, fork_point, revert_query,
-    summary_sentence,
+    SessionEvent, TypeCounts, commits_since, fork_point, revert_query, summary_sentence,
 };
 use serde_json::Value;
 use studio_actions::review::{
@@ -89,16 +88,36 @@ enum MergeState {
 }
 
 struct ReviewData {
-    fork: Option<CommitOutput>,
+    /// The merge base: the newest commit of the branch's history the target holds.
+    fork: Option<String>,
     /// The branch head the review read (the reviewed head).
-    head: Option<CommitOutput>,
+    head: Option<String>,
     /// The branch's commits since the fork, newest first.
-    commits: Vec<CommitOutput>,
+    commits: Vec<ReviewCommit>,
     folded: FoldedChanges,
     counts: Vec<TypeCounts>,
     partial: bool,
     /// The feed went past the reviewed head while reading: the branch moved.
     moved_while_reading: bool,
+}
+
+/// A commit under review: from the commit list, or the cause of its change-feed block.
+#[derive(Debug, Clone)]
+struct ReviewCommit {
+    id: String,
+    actor_id: Option<String>,
+    /// Unix microseconds.
+    created_at: i64,
+}
+
+impl From<&CommitOutput> for ReviewCommit {
+    fn from(commit: &CommitOutput) -> Self {
+        Self {
+            id: commit.graph_commit_id.clone(),
+            actor_id: commit.actor_id.clone(),
+            created_at: commit.created_at,
+        }
+    }
 }
 
 enum LoadState {
@@ -244,9 +263,7 @@ impl ReviewView {
     }
 
     fn reviewed_head(&self) -> Option<String> {
-        self.data
-            .as_ref()
-            .and_then(|d| d.head.as_ref().map(|h| h.graph_commit_id.clone()))
+        self.data.as_ref().and_then(|d| d.head.clone())
     }
 
     /// Reads the review again from the branch head. Reviewed marks are kept.
@@ -304,7 +321,7 @@ impl ReviewView {
                     Row::Card(ix) => Some(*ix),
                     Row::Group(_) => None,
                 });
-                self.bound_head = data.head.as_ref().map(|h| h.graph_commit_id.clone());
+                self.bound_head = data.head.clone();
                 self.newer = data.moved_while_reading;
                 self.data = Some(data);
                 self.load = LoadState::Ready;
@@ -662,9 +679,9 @@ impl ReviewView {
         let target = self.target.clone();
         let bound = self.bound_head.clone();
         self._merge_task = Some(cx.spawn(async move |this, cx| {
-            let read = session.update(cx, |session, cx| session.commits(&branch, true, cx));
+            let read = session.update(cx, |session, cx| session.merge_base(&branch, &target, cx));
             let head = match read.await {
-                Ok(list) => list.first().map(|c| c.graph_commit_id.clone()),
+                Ok(base) => Some(base.source_commit_id),
                 Err(error) => {
                     this.update(cx, |this, cx| {
                         this.merge = MergeState::Refused(format!(
@@ -709,9 +726,15 @@ impl ReviewView {
                         cx.notify();
                     })
                     .ok();
-                    let verified =
-                        verify_merge(&session, &target, commit.as_deref(), bound.as_deref(), cx)
-                            .await;
+                    let verified = verify_merge(
+                        &session,
+                        &branch,
+                        &target,
+                        commit.as_deref(),
+                        bound.as_deref(),
+                        cx,
+                    )
+                    .await;
                     MergeState::Merged {
                         outcome,
                         commit,
@@ -732,7 +755,8 @@ impl ReviewView {
                     })
                     .ok();
                     // Settle by reading history, never by merging again (constitution III).
-                    let landed = merge_landed(&session, &target, bound.as_deref(), cx).await;
+                    let landed =
+                        merge_landed(&session, &branch, &target, bound.as_deref(), cx).await;
                     MergeState::Unknown { reason, landed }
                 }
             };
@@ -816,14 +840,10 @@ impl ReviewView {
         let (sentence, detail) = match (&self.load, &self.data) {
             (LoadState::Ready, Some(data)) => {
                 // The commits in scope: all since the fork, or the one chosen.
-                let in_scope: Vec<&CommitOutput> = data
+                let in_scope: Vec<&ReviewCommit> = data
                     .commits
                     .iter()
-                    .filter(|c| {
-                        self.scope
-                            .as_ref()
-                            .is_none_or(|id| *id == c.graph_commit_id)
-                    })
+                    .filter(|c| self.scope.as_ref().is_none_or(|id| *id == c.id))
                     .collect();
                 let actors: Vec<String> = {
                     let mut actors: Vec<String> =
@@ -842,8 +862,8 @@ impl ReviewView {
                     (Some(fork), Some(head)) => format!(
                         "Forked from {} at {} · head {}",
                         self.target,
-                        short_commit_id(&fork.graph_commit_id),
-                        short_commit_id(&head.graph_commit_id)
+                        short_commit_id(fork),
+                        short_commit_id(head)
                     ),
                     (None, _) => format!("{} shares no history with {}", self.branch, self.target),
                     _ => String::new(),
@@ -952,7 +972,7 @@ impl ReviewView {
                 data.commits
                     .iter()
                     .map(|commit| {
-                        let mut label = short_commit_id(&commit.graph_commit_id);
+                        let mut label = short_commit_id(&commit.id);
                         if let Some(actor) = &commit.actor_id {
                             label.push_str(&format!(" · {actor}"));
                         }
@@ -960,7 +980,7 @@ impl ReviewView {
                             " · {}",
                             studio_ui::relative_time(commit.created_at, now)
                         ));
-                        (commit.graph_commit_id.clone(), label)
+                        (commit.id.clone(), label)
                     })
                     .collect()
             })
@@ -1457,9 +1477,196 @@ fn build_rows(data: &ReviewData, query: &str) -> Vec<Row> {
     rows
 }
 
-/// Reads both histories, finds the fork, and folds the branch's change feed from there, up to
-/// the reviewed head and the change cap.
+/// Reads what the branch changed since its merge base with the target: the base and the head
+/// from `branches/merge-base`, then the branch's change feed after the base, folded up to the
+/// head and the change cap. A review of one commit, and a base the feed refuses as a start
+/// (off the branch's first-parent history, after the target was merged in), read both
+/// histories instead.
 async fn read_review(
+    session: Entity<GraphSession>,
+    branch: String,
+    target: String,
+    scope: Option<String>,
+    this: WeakEntity<ReviewView>,
+    cx: &mut AsyncApp,
+) -> Result<ReviewData, String> {
+    if scope.is_none() {
+        let base = session
+            .update(cx, |session, cx| session.merge_base(&branch, &target, cx))
+            .await
+            .map_err(|e| e.to_string())?;
+        let fork = base.merge_base.graph_commit_id;
+        let head = base.source_commit_id;
+        if fork == head {
+            return Ok(ReviewData {
+                fork: Some(fork),
+                head: Some(head),
+                commits: Vec::new(),
+                folded: ChangeFold::new().finish(),
+                counts: Vec::new(),
+                partial: false,
+                moved_while_reading: false,
+            });
+        }
+        let start = format!("after:{fork}");
+        match fold_feed(&session, &branch, start, &head, None, &this, cx).await {
+            Ok(fed) => return Ok(fed.into_review(Some(fork), Some(head), cx).await),
+            Err(FeedError::Refused) => {}
+            Err(FeedError::Failed(error)) => return Err(error),
+        }
+    }
+    read_review_by_histories(session, branch, target, scope, this, cx).await
+}
+
+/// What folding a branch's change feed gave.
+struct Fed {
+    fold: ChangeFold,
+    /// The commits folded, oldest first.
+    commits: Vec<ReviewCommit>,
+    partial: bool,
+    moved_while_reading: bool,
+}
+
+impl Fed {
+    async fn into_review(
+        self,
+        fork: Option<String>,
+        head: Option<String>,
+        cx: &mut AsyncApp,
+    ) -> ReviewData {
+        let fold = self.fold;
+        let folded = cx
+            .background_executor()
+            .spawn(async move { fold.finish() })
+            .await;
+        let counts = folded.counts();
+        let mut commits = self.commits;
+        commits.reverse();
+        ReviewData {
+            fork,
+            head,
+            commits,
+            folded,
+            counts,
+            partial: self.partial,
+            moved_while_reading: self.moved_while_reading,
+        }
+    }
+}
+
+enum FeedError {
+    /// The feed refused the start commit.
+    Refused,
+    Failed(String),
+}
+
+/// Folds `branch`'s change feed from `start` (`after:<fork>`, or `beginning`) up to `head`, the
+/// change cap, or a block the review did not read the branch at: one outside `known`, when
+/// given, else one after `head`.
+async fn fold_feed(
+    session: &Entity<GraphSession>,
+    branch: &str,
+    start: String,
+    head: &str,
+    known: Option<&HashSet<String>>,
+    this: &WeakEntity<ReviewView>,
+    cx: &mut AsyncApp,
+) -> Result<Fed, FeedError> {
+    let mut fold = ChangeFold::new();
+    let mut commits = Vec::new();
+    let mut partial = false;
+    let mut moved_while_reading = false;
+    let mut reached_head = false;
+    let mut start = Some(start);
+    let mut token: Option<String> = None;
+    loop {
+        let limit = FEED_PAGE.min(REVIEW_CHANGE_CAP - fold.raw_changes()).max(1) as u32;
+        let first = commits.is_empty() && token.is_none();
+        let page = session
+            .update(cx, |session, cx| {
+                session.changes(branch, start.clone(), token.clone(), limit, cx)
+            })
+            .await
+            .map_err(|error| match error {
+                ReadError::Refused(refusal) if first && refusal.status == 400 => FeedError::Refused,
+                error => FeedError::Failed(error.to_string()),
+            })?;
+        let mut blocks = Vec::new();
+        let mut last_commit = None;
+        for block in page.blocks {
+            let id = &block.cause.graph_commit_id;
+            let outside = match known {
+                Some(known) => !known.contains(id),
+                None => reached_head && commits.last().map(|c: &ReviewCommit| &c.id) != Some(id),
+            };
+            if outside {
+                // Past the head the review read: the branch moved while reading.
+                moved_while_reading = true;
+                break;
+            }
+            if commits.last().map(|c: &ReviewCommit| &c.id) != Some(id) {
+                commits.push(ReviewCommit {
+                    id: id.clone(),
+                    actor_id: block.cause.actor_id.clone(),
+                    created_at: block.cause.authored_at,
+                });
+            }
+            last_commit = Some(id.clone());
+            reached_head |= id == head;
+            blocks.push(block);
+        }
+        // Fold off the main thread (constitution IX).
+        let (folded, complete) = cx
+            .background_executor()
+            .spawn(async move {
+                let mut complete = true;
+                for block in blocks {
+                    complete &= fold.add_block_capped(block, REVIEW_CHANGE_CAP);
+                }
+                (fold, complete)
+            })
+            .await;
+        fold = folded;
+        let raw = fold.raw_changes();
+        this.update(cx, |this, cx| {
+            this.load = LoadState::Loading { folded: raw };
+            cx.notify();
+        })
+        .ok();
+        let more =
+            page.next_page_token.is_some() || (!reached_head && page.caught_up == Some(false));
+        if !complete || (raw >= REVIEW_CHANGE_CAP && more) {
+            partial = true;
+            break;
+        }
+        if moved_while_reading {
+            break;
+        }
+        if let Some(next) = page.next_page_token {
+            token = Some(next);
+            start = None;
+            continue;
+        }
+        token = None;
+        if reached_head || page.caught_up != Some(false) {
+            break;
+        }
+        match last_commit {
+            Some(id) => start = Some(format!("after:{id}")),
+            None => break,
+        }
+    }
+    Ok(Fed {
+        fold,
+        commits,
+        partial,
+        moved_while_reading,
+    })
+}
+
+/// Reads both histories, finds the fork, and folds the branch's change feed from there, up to
+/// the reviewed head and the change cap; or one commit's own changes when `scope` names it.
+async fn read_review_by_histories(
     session: Entity<GraphSession>,
     branch: String,
     target: String,
@@ -1476,21 +1683,16 @@ async fn read_review(
         .update(cx, |session, cx| session.commits(&target, true, cx))
         .await
         .map_err(|e| e.to_string())?;
-    let fork = fork_point(&branch_commits, &target_commits).cloned();
-    let head = branch_commits.first().cloned();
-    let since: Vec<CommitOutput> = commits_since(
-        &branch_commits,
-        fork.as_ref().map(|f| f.graph_commit_id.as_str()),
-    )
-    .to_vec();
-    let in_review: HashSet<String> = since.iter().map(|c| c.graph_commit_id.clone()).collect();
-    let head_id = head.as_ref().map(|h| h.graph_commit_id.clone());
-
-    let mut fold = ChangeFold::new();
-    let mut partial = false;
-    let mut moved_while_reading = false;
+    let fork = fork_point(&branch_commits, &target_commits).map(|f| f.graph_commit_id.clone());
+    let head = branch_commits.first().map(|h| h.graph_commit_id.clone());
+    let since: Vec<ReviewCommit> = commits_since(&branch_commits, fork.as_deref())
+        .iter()
+        .map(ReviewCommit::from)
+        .collect();
     if let Some(commit) = &scope {
         // One commit: its own changes, page by page, up to the cap.
+        let mut fold = ChangeFold::new();
+        let mut partial = false;
         let mut token: Option<String> = None;
         loop {
             let limit = FEED_PAGE.min(REVIEW_CHANGE_CAP - fold.raw_changes()).max(1) as u32;
@@ -1527,118 +1729,71 @@ async fn read_review(
                 None => break,
             }
         }
-    } else if !since.is_empty() {
-        let mut start = Some(match &fork {
-            Some(fork) => format!("after:{}", fork.graph_commit_id),
-            None => "beginning".to_owned(),
-        });
-        let mut token: Option<String> = None;
-        loop {
-            let limit = FEED_PAGE.min(REVIEW_CHANGE_CAP - fold.raw_changes()).max(1) as u32;
-            let page = session
-                .update(cx, |session, cx| {
-                    session.changes(&branch, start.clone(), token.clone(), limit, cx)
-                })
-                .await
-                .map_err(|e| e.to_string())?;
-            let mut blocks = Vec::new();
-            let mut last_commit = None;
-            let mut reached_head = false;
-            for block in page.blocks {
-                if !in_review.contains(&block.cause.graph_commit_id) {
-                    // Past the head the review read: the branch moved while reading.
-                    moved_while_reading = true;
-                    break;
-                }
-                last_commit = Some(block.cause.graph_commit_id.clone());
-                reached_head |= Some(&block.cause.graph_commit_id) == head_id.as_ref();
-                blocks.push(block);
-            }
-            // Fold off the main thread (constitution IX).
-            let (folded, complete) = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut complete = true;
-                    for block in blocks {
-                        complete &= fold.add_block_capped(block, REVIEW_CHANGE_CAP);
-                    }
-                    (fold, complete)
-                })
-                .await;
-            fold = folded;
-            let raw = fold.raw_changes();
-            this.update(cx, |this, cx| {
-                this.load = LoadState::Loading { folded: raw };
-                cx.notify();
-            })
-            .ok();
-            let more =
-                page.next_page_token.is_some() || (!reached_head && page.caught_up == Some(false));
-            if !complete || (raw >= REVIEW_CHANGE_CAP && more) {
-                partial = true;
-                break;
-            }
-            if moved_while_reading {
-                break;
-            }
-            if let Some(next) = page.next_page_token {
-                token = Some(next);
-                start = None;
-                continue;
-            }
-            token = None;
-            if reached_head || page.caught_up != Some(false) {
-                break;
-            }
-            match last_commit {
-                Some(id) => start = Some(format!("after:{id}")),
-                None => break,
-            }
-        }
+        let mut commits = since;
+        commits.reverse();
+        let fed = Fed {
+            fold,
+            commits,
+            partial,
+            moved_while_reading: false,
+        };
+        return Ok(fed.into_review(fork, head, cx).await);
     }
-    let folded = cx
-        .background_executor()
-        .spawn(async move { fold.finish() })
-        .await;
-    let counts = folded.counts();
-    Ok(ReviewData {
-        fork,
-        head,
-        commits: since,
-        folded,
-        counts,
-        partial,
-        moved_while_reading,
-    })
+    let (Some(head_id), false) = (head.clone(), since.is_empty()) else {
+        let fed = Fed {
+            fold: ChangeFold::new(),
+            commits: Vec::new(),
+            partial: false,
+            moved_while_reading: false,
+        };
+        return Ok(fed.into_review(fork, head, cx).await);
+    };
+    let known: HashSet<String> = since.iter().map(|c| c.id.clone()).collect();
+    // A branch sharing no history with the target is read from its beginning.
+    let start = match &fork {
+        Some(fork) => format!("after:{fork}"),
+        None => "beginning".to_owned(),
+    };
+    let fed = fold_feed(&session, &branch, start, &head_id, Some(&known), &this, cx).await;
+    let mut fed = fed.map_err(|error| match error {
+        FeedError::Refused => "The change feed refused the fork as a start.".to_owned(),
+        FeedError::Failed(error) => error,
+    })?;
+    // The commit list names every commit since the fork, also those whose block the cap cut.
+    fed.commits = since.into_iter().rev().collect();
+    Ok(fed.into_review(fork, head, cx).await)
 }
 
-/// Whether the target's history holds the merge just reported: the merge commit, or for a
-/// fast-forward or an up-to-date target, a commit carrying the source head.
+/// Whether the target holds the merge just reported: the source head is the merge base of the
+/// two (merged, fast-forwarded, or already there), or the target's head is the merge commit.
 async fn verify_merge(
     session: &Entity<GraphSession>,
+    source: &str,
     target: &str,
     commit: Option<&str>,
     source_head: Option<&str>,
     cx: &mut AsyncApp,
 ) -> bool {
-    let read = session.update(cx, |session, cx| session.commits(target, true, cx));
-    let Ok(list) = read.await else {
+    let read = session.update(cx, |session, cx| session.merge_base(source, target, cx));
+    let Ok(base) = read.await else {
         return false;
     };
-    commit.is_some_and(|c| list.iter().any(|t| t.graph_commit_id == c))
-        || source_head.is_some_and(|head| contains_merge_of(&list, head))
+    source_head == Some(base.merge_base.graph_commit_id.as_str())
+        || commit == Some(base.target_commit_id.as_str())
 }
 
-/// After a lost merge response: whether the target's history shows the source head merged.
+/// After a lost merge response: whether the target holds the source head, which is then the
+/// merge base of the two.
 async fn merge_landed(
     session: &Entity<GraphSession>,
+    source: &str,
     target: &str,
     source_head: Option<&str>,
     cx: &mut AsyncApp,
 ) -> Option<bool> {
-    let read = session.update(cx, |session, cx| session.commits(target, true, cx));
-    let list = read.await.ok()?;
-    Some(contains_merge_of(&list, source_head?))
+    let read = session.update(cx, |session, cx| session.merge_base(source, target, cx));
+    let base = read.await.ok()?;
+    Some(base.merge_base.graph_commit_id == source_head?)
 }
 
 impl Render for ReviewView {
@@ -1764,5 +1919,138 @@ mod tests {
         assert!(change_matches(&c, "dijkstra"));
         assert!(change_matches(&c, "1985"));
         assert!(!change_matches(&c, "lovelace"));
+    }
+
+    /// A server for a review of `feature` against `main`: `feature` forked at m1 and committed
+    /// f1 (a person added) and f2 (one changed). Every request's path and query is recorded.
+    /// With `merged_in`, `main`'s m2 was merged into `feature`: the merge base is m2, off
+    /// `feature`'s first-parent history, and the feed refuses it as a start.
+    fn reviewed_server(
+        merged_in: bool,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use gpui::AppContext as _;
+        use graph_store::{Connection, ServerEntry, ServerSource};
+        use http_client::http::Response;
+        use http_client::{AsyncBody, FakeHttpClient};
+
+        let commit = |id: &str, parent: Option<&str>| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "created_at": 0, "parent_commit_id": parent, "actor_id": "act-dev" });
+        let person = |id: &str, op: &str| json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": id, "op": op, "before": { "properties": { "slug": id } }, "after": { "properties": { "slug": id, "name": "x" } } });
+        let block = |id: &str, parent: &str, change: Value| json!({ "cause": { "graph_commit_id": id, "parent_commit_id": parent, "authored_branch": "feature", "authored_at": 0, "actor_id": "act-dev" }, "changes": [change] });
+        let base_id = if merged_in { "m2" } else { "m1" };
+        let base = json!({ "merge_base": commit(base_id, Some("m1")), "source": "feature", "source_commit_id": "f2", "target": "main", "target_commit_id": "m2" });
+        let feed = json!({ "blocks": [block("f1", "m1", person("p1", "insert")), block("f2", "f1", person("p2", "update"))], "cursor": "c", "caught_up": true });
+        let feature = json!({ "commits": [commit("f2", Some("f1")), commit("f1", Some("m1")), commit("m1", None)] });
+        let main = json!({ "commits": [commit("m2", Some("m1")), commit("m1", None)] });
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let query = request.uri().query().unwrap_or_default().to_owned();
+            seen.lock().unwrap().push(format!("{path}?{query}"));
+            let (status, body) = if path.ends_with("/schema") {
+                (
+                    200,
+                    json!({ "schema_source": "node Person {\n  slug: String @key\n  name: String?\n}\n" }),
+                )
+            } else if path.ends_with("/branches/merge-base") {
+                (200, base.clone())
+            } else if path.ends_with("/changes") && query.contains("start=after%3Am2") {
+                (
+                    400,
+                    json!({ "error": "start commit is not on this branch's first-parent chain", "code": "bad_request" }),
+                )
+            } else if path.ends_with("/changes") {
+                (200, feed.clone())
+            } else if path.ends_with("/commits") && query.contains("branch=feature") {
+                (200, feature.clone())
+            } else if path.ends_with("/commits") {
+                (200, main.clone())
+            } else {
+                (200, json!({ "branches": ["main", "feature"] }))
+            };
+            async move {
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "feature".into(), cx));
+        cx.run_until_parked();
+        (session, asked)
+    }
+
+    /// A review reads the merge base and the branch's feed after it, never the two commit
+    /// lists; a feed that refuses the base as a start falls back to the lists.
+    #[gpui::test]
+    async fn a_review_reads_the_merge_base_and_the_feed_after_it(cx: &mut gpui::TestAppContext) {
+        let (session, asked) = reviewed_server(false, cx);
+        asked.lock().unwrap().clear();
+        let mut async_cx = cx.to_async();
+        let data = read_review(
+            session,
+            "feature".into(),
+            "main".into(),
+            None,
+            WeakEntity::new_invalid(),
+            &mut async_cx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(data.fork.as_deref(), Some("m1"));
+        assert_eq!(data.head.as_deref(), Some("f2"));
+        let commits: Vec<&str> = data.commits.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(commits, ["f2", "f1"], "newest first");
+        assert_eq!(data.folded.changes.len(), 2);
+        assert!(!data.partial && !data.moved_while_reading);
+        let asked = asked.lock().unwrap().clone();
+        assert!(
+            asked.iter().all(|request| !request.contains("/commits")),
+            "no commit list: {asked:?}"
+        );
+        assert!(
+            asked
+                .iter()
+                .any(|request| request.contains("start=after%3Am1"))
+        );
+
+        let (session, asked) = reviewed_server(true, cx);
+        asked.lock().unwrap().clear();
+        let mut async_cx = cx.to_async();
+        let data = read_review(
+            session,
+            "feature".into(),
+            "main".into(),
+            None,
+            WeakEntity::new_invalid(),
+            &mut async_cx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(data.fork.as_deref(), Some("m1"), "the first-parent fork");
+        assert_eq!(data.head.as_deref(), Some("f2"));
+        assert_eq!(data.folded.changes.len(), 2);
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(
+            asked
+                .iter()
+                .filter(|request| request.contains("/commits"))
+                .count(),
+            2,
+            "both lists: {asked:?}"
+        );
     }
 }

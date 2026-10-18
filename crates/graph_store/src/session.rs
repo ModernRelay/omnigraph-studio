@@ -15,8 +15,8 @@ use gq_language::{BuiltQuery, RelationshipGroup, SchemaModel, builder};
 use graph_client::api::{
     BranchCreateOutput, BranchCreateRequest, BranchMergeOutput, BranchMergeRequest,
     ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitOutput, GraphListResponse,
-    InvokeStoredQueryRequest, QueryCatalogEntry, QueryRequest, ReadOutput, ReadinessOutput,
-    SnapshotDatasetOutput, SnapshotOutput,
+    InvokeStoredQueryRequest, MergeBaseOutput, QueryCatalogEntry, QueryRequest, ReadOutput,
+    ReadinessOutput, SnapshotDatasetOutput, SnapshotOutput,
 };
 use graph_client::{
     ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CommitChanges, FeedAt, GraphClient, ReadError,
@@ -1219,6 +1219,21 @@ impl GraphSession {
                     .commit_changes(&graph, &commit, page_token.as_deref(), limit)
                     .await
             },
+            cx,
+        )
+    }
+
+    /// The commit a merge of `source` into `target` would classify against, and both heads.
+    pub fn merge_base(
+        &mut self,
+        source: &str,
+        target: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<MergeBaseOutput, ReadError>> {
+        let (client, graph) = (self.client(cx), self.graph_id.clone());
+        let (source, target) = (source.to_owned(), target.to_owned());
+        self.counted_read(
+            async move { client.merge_base(&graph, &source, &target).await },
             cx,
         )
     }

@@ -95,7 +95,9 @@ place), X (designed on 0.13; the better routes are deferred).
 - Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
   - E6 paged branch-to-branch diff: the change feed is folded from the fork, capped at 20,000
     changes, until then.
-  - E7 merge base: found by walking `GET /commits` parents until then.
+  - E7 merge base: `GET /branches/merge-base` since 0.14 (fork, head, and a merge's
+    confirmation); walking `GET /commits` parents remains for a review of one commit and for a
+    base off the branch's first-parent history, which the feed refuses as a start.
   - E8 merge preview with no effects: merge on request and show the 409 conflicts until then.
   - E9 branch details: derived from `GET /commits?branch=` until then.
   - E21 a branch from a commit: 0.13 forks only a branch's head (`from` names a branch).

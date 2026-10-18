@@ -276,7 +276,12 @@ A first cut of parts 1 and 4, ahead of the shared cache:
   changed in between, and kept at the new commit. So Refresh on a page reads again only the
   groups the commit touched, and a moved view's later reads mostly cost nothing. The memo
   holds 1,024 answers; the byte budget and release buffer are not built.
-- Not yet: review still offers Refresh on every move.
+- Review reads its fork and head from `branches/merge-base` and folds the feed after the base,
+  instead of reading both branches' whole commit lists (each about 1.6 s on the personal graph,
+  and 3m47s once right after a restart); its commits come from the feed blocks' causes. A
+  base off the branch's first-parent history is refused by the feed (`400`, checked on 0.14),
+  and review then reads both lists as before. A merge checks the head and confirms its landing
+  through the merge base too. Review still offers Refresh on every move.
 
 ### Expected effect, to be measured
 

@@ -304,6 +304,17 @@ pub struct BranchMergeRequest {
     pub delete_branch: bool,
 }
 
+/// `GET /graphs/{id}/branches/merge-base`: the commit a merge of `source` into `target` would
+/// classify against, and both branches' heads.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MergeBaseOutput {
+    pub merge_base: CommitOutput,
+    pub source: String,
+    pub source_commit_id: String,
+    pub target: String,
+    pub target_commit_id: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct BranchMergeOutput {
     pub source: String,
@@ -537,6 +548,16 @@ mod contract_tests {
             ],
         ),
         ("GraphListResponse", &["graphs"]),
+        (
+            "MergeBaseOutput",
+            &[
+                "merge_base",
+                "source",
+                "source_commit_id",
+                "target",
+                "target_commit_id",
+            ],
+        ),
         (
             "GraphInfo",
             &[

@@ -13,7 +13,6 @@ one is picked up it goes through OmniGraph's own RFC process.
 | E4 | Owner discovery for a graph root (discovery, not fencing) | E1 | — |
 | E5 | Writer-safety rules for local sessions | E1 | Enforced by the server Studio talks to |
 | E6 | Paged branch-to-branch diff with before and after images | 008 | Change feed folded from the fork, capped at 20,000, "Partial" when capped |
-| E7 | Merge base of two refs | 008 | Walk `GET /commits` parents |
 | E8 | Merge preview with no effects | 008 | Merge on request; a 409 lists conflicts and nothing moved |
 | E9 | Branch details (head, fork, creator, times) | 002, 008 | Derived from `GET /commits?branch=` |
 | E10 | Paged commit list | 009 | Full list, virtualized, warning above 5,000 commits |
@@ -35,15 +34,16 @@ one is picked up it goes through OmniGraph's own RFC process.
 | E27 | Annotation-only schema changes (a display hint on an existing property) | 014 | Every String reads as markdown; a hint can go only on a new property or type |
 
 In OmniGraph 0.14 (`edge-20261017-d883c49`, checked 2026-10-17; the HTTP contract header is
-still `0.13`), and so on every server Studio supports. Studio uses none of them yet. Paged commit
-lists (E10, #1013) landed on main after that build.
+still `0.13`), and so on every server Studio supports. Studio uses E7: a review reads its fork
+and head from the merge base, and a merge is confirmed by the source head becoming the merge
+base. Paged commit lists (E10, #1013) landed on main after that build.
 
 | ID | Feature | Operation | Spec |
 |---|---|---|---|
 | R1 | Blob writes | `cluster_putBlob`, `cluster_clearBlob` | 004 |
 | R2 | Unpublished commits: `as_commit` on writes and merges, publish, drop, `GET /commits?unpublished=` | `cluster_publishCommit`, `cluster_dropCommit` | 004, 008 |
 | E6 | Paged graph diff between two branches or commits, and a branch's diff since its merge base, with `before`/`after` images and `kind`/`type`/`op` filters | `cluster_getDiff`, `cluster_getBranchDiff` | 008 |
-| E7 | Merge base of two branches | `cluster_getMergeBase` | 008 |
+| E7 | Merge base of two branches (used by review and merge) | `cluster_getMergeBase` | 008 |
 | E8 | Merge preview: `dry_run` on `POST /branches/merge` ("nothing is written"; refused with `as_commit`) | `cluster_mergeBranches` with `dry_run` | 008 |
 | E23 | `omnigraph version --json` with the HTTP contract (#987) | CLI | 013 |
 | E24 | Unix-socket transport for `--server` (#988) | CLI | 013 |

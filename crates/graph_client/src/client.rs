@@ -18,8 +18,8 @@ use url::Url;
 use crate::api::{
     BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
     BranchMergeRequest, ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitListOutput,
-    ErrorOutput, GraphListResponse, HealthOutput, InvokeStoredQueryRequest, QueriesCatalogOutput,
-    QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotOutput,
+    ErrorOutput, GraphListResponse, HealthOutput, InvokeStoredQueryRequest, MergeBaseOutput,
+    QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput, SnapshotOutput,
 };
 use crate::{ApiError, CONTRACT_HEADER, IF_GRAPH_COMMIT_HEADER, SUPPORTED_CONTRACTS, WriteOutcome};
 
@@ -758,6 +758,23 @@ impl GraphClient {
 
     /// One page of a branch's change feed. `start` is `now`, `beginning` or
     /// `after:<commit_id>`; pass `page_token` from the previous page to continue.
+    /// `GET /graphs/{id}/branches/merge-base`: what a merge of `source` into `target` would
+    /// classify against, with both heads.
+    pub async fn merge_base(
+        &self,
+        graph: &str,
+        source: &str,
+        target: &str,
+    ) -> Result<MergeBaseOutput, ReadError> {
+        self.read(
+            Method::GET,
+            &["graphs", graph, "branches", "merge-base"],
+            &[("source", source), ("target", target)],
+            None,
+        )
+        .await
+    }
+
     pub async fn changes(
         &self,
         graph: &str,

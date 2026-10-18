@@ -2,8 +2,9 @@
 //! per-entity fold of change-feed entries (first before, last after), per-type counts and the
 //! summary sentence. Pure functions; no GPUI.
 //!
-//! OmniGraph 0.13 has no branch-to-branch diff (E6) or merge base (E7) route, so review folds
-//! the branch's change feed from the fork point found by walking `GET /commits`.
+//! Review folds the branch's change feed after the merge base (E7). When the feed refuses the
+//! base as a start, because the target was merged into the branch, review finds the fork by
+//! walking both branches' `GET /commits` instead.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -37,14 +38,6 @@ pub fn fork_point<'a>(
     branch
         .iter()
         .find(|commit| reachable.contains(commit.graph_commit_id.as_str()))
-}
-
-/// Whether `target`'s history shows `head` merged: listed itself, or the merged parent of one
-/// of its commits.
-pub fn contains_merge_of(target: &[CommitOutput], head: &str) -> bool {
-    target
-        .iter()
-        .any(|c| c.graph_commit_id == head || c.merged_parent_commit_id.as_deref() == Some(head))
 }
 
 /// The commits of `branch` newer than `fork`, newest first. Every commit when `fork` is `None`.
@@ -530,9 +523,6 @@ mod tests {
         ];
         assert_eq!(fork_point(&branch, &main).unwrap().graph_commit_id, "b2");
         assert_eq!(commits_since(&branch, Some("b2")).len(), 1);
-        assert!(contains_merge_of(&main, "b2"));
-        assert!(contains_merge_of(&main, "m2"));
-        assert!(!contains_merge_of(&main, "b3"));
     }
 
     #[test]

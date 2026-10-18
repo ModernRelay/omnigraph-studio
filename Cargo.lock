@@ -8536,6 +8536,7 @@ dependencies = [
  "gq_language",
  "graph_client",
  "graph_store",
+ "http_client",
  "menu",
  "serde_json",
  "studio_actions",
