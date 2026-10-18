@@ -59,7 +59,8 @@ Without the environment variables, Studio reads servers and tokens from the `omn
 | `OMNIGRAPH_STUDIO_DATA` | Directory of `settings.json`, `keymap.json` and the session (default `~/Library/Application Support/OmniGraph Studio`, `%APPDATA%\OmniGraph Studio` on Windows, or `$XDG_CONFIG_HOME/omnigraph-studio`) |
 
 Packaging: `script/bundle-mac` builds an app bundle and a DMG, ad hoc signed unless a signing
-identity is configured; `script/bundle-linux` builds a tarball with a `.desktop` entry.
+identity is configured (`--fast` bundles the optimized `release-fast` build, which rebuilds in
+seconds, to run day to day); `script/bundle-linux` builds a tarball with a `.desktop` entry.
 
 ## Features
 

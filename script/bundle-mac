@@ -2,6 +2,8 @@
 # Build "OmniGraph Studio.app" and a DMG in target/bundle (spec 001, "Shipping").
 #
 #   script/bundle-mac            # release build
+#   script/bundle-mac --fast     # optimized without LTO (`release-fast`), to run day to day:
+#                                # rebuilt in seconds, and as quick to draw as a release
 #   script/bundle-mac --debug    # the debug build, to check the bundle quickly
 #
 # Signing and notarization run when their variables are set:
@@ -19,8 +21,9 @@ cd "$ROOT"
 profile=release
 case "${1:-}" in
   --debug) profile=debug ;;
+  --fast) profile=release-fast ;;
   "") ;;
-  *) echo "usage: script/bundle-mac [--debug]" >&2; exit 2 ;;
+  *) echo "usage: script/bundle-mac [--fast|--debug]" >&2; exit 2 ;;
 esac
 
 if [[ "$(uname)" != "Darwin" ]]; then
@@ -48,6 +51,9 @@ if [[ "$profile" == release ]]; then
     echo "bundle-mac: no Metal compiler (it comes with Xcode); shaders will compile at launch" >&2
   fi
   cargo build --locked --release -p studio --bin omnigraph-studio $features
+elif [[ "$profile" == release-fast ]]; then
+  # Default features, as `script/measure-frames` builds them, so the two share one build.
+  cargo build --locked --profile release-fast -p studio --bin omnigraph-studio
 else
   cargo build --locked -p studio --bin omnigraph-studio
 fi
@@ -109,8 +115,8 @@ cat > "$app/Contents/Info.plist" <<PLIST
 PLIST
 plutil -lint "$app/Contents/Info.plist" >/dev/null
 cp LICENSE* "$app/Contents/Resources/" 2>/dev/null || true
-# Third-party notices (script/generate-licenses): a release needs them; a debug bundle, built to
-# run on this Mac, has them when cargo-about is installed.
+# Third-party notices (script/generate-licenses): a release needs them; a fast or debug bundle,
+# built to run on this Mac, has them when cargo-about is installed.
 if [[ "$profile" == release ]] || cargo about --version >/dev/null 2>&1; then
   script/generate-licenses "$app/Contents/Resources/THIRD-PARTY-NOTICES.md" >/dev/null
 fi
