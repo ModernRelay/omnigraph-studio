@@ -4,8 +4,8 @@
 //! an `explain` tree lights the text it came from.
 //!
 //! Lexical, like the outline: the compiler's AST carries no spans. Clauses follow `query.pest`
-//! at OmniGraph v0.13.0, where a `match` block's clauses have no separator, so each one is read
-//! to its end. An operator names what it reads (`binding`, `src` and `dst`, a filter's text,
+//! at the OmniGraph Studio builds on (the workspace's `omnigraph-compiler` pin), where a `match`
+//! block's clauses have no separator, so each one is read to its end. An operator names what it reads (`binding`, `src` and `dst`, a filter's text,
 //! an anti-join's outer variable), and those names are matched back to clauses.
 
 use std::ops::Range;

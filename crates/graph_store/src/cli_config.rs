@@ -27,8 +27,8 @@ pub struct CliServer {
 pub struct CliAlias {
     pub name: String,
     pub server: String,
-    /// The graph the alias names. Without one the CLI posts to the server root, a route 0.13
-    /// servers do not serve, so Studio shows such an alias under no graph.
+    /// The graph the alias names. Without one the CLI posts to the server root, a route the
+    /// server does not serve, so Studio shows such an alias under no graph.
     pub graph: Option<String>,
     /// The stored query's name.
     pub query: String,

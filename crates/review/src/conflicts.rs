@@ -1,4 +1,4 @@
-//! Merge conflicts in words (spec 008). OmniGraph 0.13 reports each conflict's kind; Studio
+//! Merge conflicts in words (spec 008). OmniGraph reports each conflict's kind; Studio
 //! says what happened, naming the side when the review knows it.
 
 use graph_client::api::MergeConflictKind;

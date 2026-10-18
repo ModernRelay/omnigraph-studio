@@ -212,7 +212,7 @@ pub struct ParamDescriptor {
     pub nullable: bool,
 }
 
-/// A stored-query parameter's kind, as the catalog names it (0.13). One Studio does not know
+/// A stored-query parameter's kind, as the catalog names it. One Studio does not know
 /// is `Other`: its value is sent as text, for the server to read or refuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]

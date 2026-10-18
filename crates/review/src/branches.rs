@@ -1,6 +1,6 @@
 //! Branches (spec 008): the sidebar list, switching, and the create and delete dialogs.
 //!
-//! OmniGraph 0.13's `GET /branches` returns names only (E9 waits on branch details), so each
+//! OmniGraph's `GET /branches` returns names only (E9 waits on branch details), so each
 //! branch's last commit comes from its own `GET /commits?branch=`, for up to
 //! [`DETAIL_LIMIT`] branches.
 
