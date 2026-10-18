@@ -3551,7 +3551,7 @@ impl NodePeek {
                     )
                     .child(div().flex_1())
                     .children(open_page.map(|open| {
-                        IconButton::new("peek-open-page", IconName::ArrowUpRight)
+                        studio_ui::ds::toolbar_icon_button("peek-open-page", IconName::ArrowUpRight)
                             .icon_size(IconSize::Small)
                             .icon_color(Color::Muted)
                             .tooltip(Tooltip::text("Open the node's page"))
@@ -3565,7 +3565,7 @@ impl NodePeek {
                             id: id.clone(),
                         };
                         header.child(
-                            studio_ui::ds::button("peek-explore", "Explore")
+                            studio_ui::ds::toolbar_button("peek-explore", "Explore")
                                 .style(ButtonStyle::Subtle)
                                 .start_icon(
                                     Icon::new(IconName::Crosshair)

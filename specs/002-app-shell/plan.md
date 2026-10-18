@@ -492,7 +492,13 @@ than styling one-off elements.
   scales with it. Its default is 15 px since 2026-10-18 (16 before): Tower's root size
   (93.75 %), at which Zed's `Default`, `Small` and `XSmall` labels are 13, 11 and 9 px, Tower's
   `text-sm` and `text-xs`. Body text is `Small`; labels, counts and metadata `XSmall`; buttons
-  `Default`.
+  `Default`. The interface font is Inter by default (Tower's face; Inter 4.1, OFL-1.1, the
+  regular, italic, medium, semibold and bold static files in `assets/fonts/inter/`, loaded
+  with Zed's fonts); IBM Plex Sans and every installed font stay selectable.
+- **Toolbars.** A document's toolbar (a table's, a query's, history's, the inspector's header,
+  the text editor's) holds `ds::toolbar_button`s and `ds::toolbar_icon_button`s: Zed's 22 px
+  size, Tower's `xs`, with small type and 12 px icons, set with no gap beyond their padding
+  (`ds::toolbar_actions`), so the chrome reads smaller than the document it serves.
 - **Shadows, Tower's values** (`ds::elevation`, light and dark): `raised` for a solid item on
   glass (4 %, 1/2 px; 30 % dark); `control` for outline buttons and fields; `sheet` for glass
   sheets and everything that floats (an inner white rim at 70 %, 6 % dark; 4 % at 1/2 px and

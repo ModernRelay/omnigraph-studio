@@ -64,6 +64,14 @@ mkdir -p "$(dirname "$out")"
   cat assets/themes/LICENSES
   echo '```'
   echo
+  echo "## Fonts Studio bundles"
+  echo
+  echo "Inter (assets/fonts/inter), Studio's default interface font:"
+  echo
+  echo '```'
+  cat assets/fonts/inter/OFL.txt
+  echo '```'
+  echo
   echo "## Icons Studio bundles"
   echo
   echo "Studio's icons (assets/icons/nucleo) are Nucleo's, under Nucleo's licence, not the GPL."

@@ -1497,7 +1497,7 @@ impl TypeTable {
             .anchor(gpui::Anchor::TopRight)
             .with_handle(self.toolbar_menus[1].clone())
             .trigger(
-                studio_ui::ds::button(
+                studio_ui::ds::toolbar_button(
                     "columns",
                     match hidden {
                         0 => "Columns".to_owned(),
@@ -1583,7 +1583,7 @@ impl TypeTable {
             .anchor(gpui::Anchor::TopRight)
             .with_handle(self.toolbar_menus[2].clone())
             .trigger(
-                studio_ui::ds::button(
+                studio_ui::ds::toolbar_button(
                     "group",
                     match &current_label {
                         Some(label) => format!("Group: {label}"),
@@ -1719,14 +1719,17 @@ impl TypeTable {
             .anchor(gpui::Anchor::TopRight)
             .with_handle(self.toolbar_menus[0].clone())
             .trigger(
-                studio_ui::ds::button("views", active.clone().unwrap_or_else(|| "Views".into()))
-                    .style(ButtonStyle::Subtle)
-                    .start_icon(Icon::new(IconName::Star).size(IconSize::Small))
-                    .when(!open, |button| {
-                        button.tooltip(Tooltip::text(
-                            "Saved filters, order, grouping and columns for this type",
-                        ))
-                    }),
+                studio_ui::ds::toolbar_button(
+                    "views",
+                    active.clone().unwrap_or_else(|| "Views".into()),
+                )
+                .style(ButtonStyle::Subtle)
+                .start_icon(Icon::new(IconName::Star).size(IconSize::Small))
+                .when(!open, |button| {
+                    button.tooltip(Tooltip::text(
+                        "Saved filters, order, grouping and columns for this type",
+                    ))
+                }),
             )
             .menu(move |window, cx| {
                 let views = views.clone();
@@ -4911,7 +4914,7 @@ impl TypeTable {
             })
             .when(self.newer, |d| {
                 d.child(
-                    studio_ui::ds::button("newer-data", "Newer data · Refresh")
+                    studio_ui::ds::toolbar_button("newer-data", "Newer data · Refresh")
                         .style(ButtonStyle::Tinted(TintColor::Accent))
                         .tooltip(|_, cx| {
                             Tooltip::for_action("Read the branch head again", &RefreshTable, cx)
@@ -4926,7 +4929,7 @@ impl TypeTable {
                     .child(self.render_columns_menu(cx))
                     .child(self.render_group_menu(cx))
                     .child(
-                        studio_ui::ds::button("add-filter", "Filter")
+                        studio_ui::ds::toolbar_button("add-filter", "Filter")
                             .style(ButtonStyle::Subtle)
                             .start_icon(Icon::new(IconName::Filter).size(IconSize::Small))
                             .tooltip(|_, cx| Tooltip::for_action("Add a filter", &AddFilter, cx))
@@ -4935,7 +4938,7 @@ impl TypeTable {
                             })),
                     )
                     .child(
-                        studio_ui::ds::button("insert-row", "Row")
+                        studio_ui::ds::toolbar_button("insert-row", "Row")
                             .style(ButtonStyle::Subtle)
                             .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
                             .disabled(pinned)
@@ -4951,7 +4954,7 @@ impl TypeTable {
                             })),
                     )
                     .child(
-                        studio_ui::ds::icon_button("refresh-table", IconName::RotateCw)
+                        studio_ui::ds::toolbar_icon_button("refresh-table", IconName::RotateCw)
                             .icon_size(IconSize::Small)
                             .tooltip(|_, cx| Tooltip::for_action("Refresh", &RefreshTable, cx))
                             .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),

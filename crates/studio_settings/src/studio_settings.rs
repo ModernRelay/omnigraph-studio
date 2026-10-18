@@ -113,6 +113,10 @@ pub struct PanelPlacement {
     pub dock: Option<DockSide>,
 }
 
+/// The interface font when the person has not chosen one: Inter, Tower's typeface, which
+/// `studio_theme` bundles and loads (`assets/fonts/inter/`).
+pub const DEFAULT_UI_FONT: &str = "Inter";
+
 /// Studio's own settings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
@@ -285,7 +289,8 @@ pub struct AgentSettings {
 pub struct StudioSettings {
     #[schemars(extend("x-section" = "Appearance"))]
     pub theme: ThemeChoice,
-    /// The font for menus, tables and panels. Default keeps Zed's.
+    /// The font for menus, tables and panels. Default is Inter, Tower's face, which Studio
+    /// bundles.
     #[schemars(
         title = "Interface font",
         extend("x-section" = "Appearance", "x-control" = "font")
@@ -570,9 +575,11 @@ impl StudioSettings {
             "buffer_font_size": self.buffer_font_size,
             "unstable.ui_density": density,
         });
-        if let Some(family) = &self.ui_font_family {
-            zed["ui_font_family"] = family.clone().into();
-        }
+        zed["ui_font_family"] = self
+            .ui_font_family
+            .as_deref()
+            .unwrap_or(DEFAULT_UI_FONT)
+            .into();
         if let Some(family) = &self.buffer_font_family {
             zed["buffer_font_family"] = family.clone().into();
         }
@@ -970,9 +977,9 @@ mod tests {
     fn fonts_and_density_reach_zed() {
         let mut settings = StudioSettings::default();
         let zed: serde_json::Value = serde_json::from_str(&settings.zed_user_settings()).unwrap();
-        assert!(
-            zed.get("ui_font_family").is_none(),
-            "unset keeps Zed's font"
+        assert_eq!(
+            zed["ui_font_family"], DEFAULT_UI_FONT,
+            "unset is Studio's bundled Inter"
         );
         assert_eq!(zed["unstable.ui_density"], "default");
         settings.ui_font_family = Some("IBM Plex Sans".into());
@@ -1067,6 +1074,7 @@ mod tests {
             vec![
                 "buffer_font_size",
                 "theme",
+                "ui_font_family",
                 "ui_font_size",
                 "unstable.ui_density"
             ]

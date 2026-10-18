@@ -21,6 +21,16 @@ const STUDIO_THEMES: &[(&str, &[u8])] = &[(
     include_bytes!("../../../assets/themes/vitesse-refined/vitesse-theme-refined.json"),
 )];
 
+/// Inter, Tower's typeface and Studio's default interface font (`assets/fonts/inter/`, with its
+/// OFL licence): the weights Studio draws, static files GPUI loads as they are.
+const STUDIO_FONTS: &[&[u8]] = &[
+    include_bytes!("../../../assets/fonts/inter/Inter-Regular.ttf"),
+    include_bytes!("../../../assets/fonts/inter/Inter-Italic.ttf"),
+    include_bytes!("../../../assets/fonts/inter/Inter-Medium.ttf"),
+    include_bytes!("../../../assets/fonts/inter/Inter-SemiBold.ttf"),
+    include_bytes!("../../../assets/fonts/inter/Inter-Bold.ttf"),
+];
+
 /// Zed's assets (fonts, icons, themes, keymaps), Studio's own themes, and Studio's icons in
 /// place of Zed's (`icons`).
 pub struct Assets;
@@ -49,9 +59,15 @@ impl AssetSource for Assets {
 }
 
 impl Assets {
-    /// Loads Zed's bundled fonts into the text system.
+    /// Loads Zed's bundled fonts and Studio's Inter into the text system.
     pub fn load_fonts(&self, cx: &App) -> gpui::Result<()> {
-        assets::Assets.load_fonts(cx)
+        assets::Assets.load_fonts(cx)?;
+        cx.text_system().add_fonts(
+            STUDIO_FONTS
+                .iter()
+                .map(|font| Cow::Borrowed(*font))
+                .collect(),
+        )
     }
 }
 

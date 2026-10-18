@@ -673,7 +673,7 @@ impl QueryEditor {
         };
         PopoverMenu::new("snapshot-picker")
             .trigger(
-                studio_ui::ds::button("snapshot-picker-button", label)
+                studio_ui::ds::toolbar_button("snapshot-picker-button", label)
                     .style(ButtonStyle::Subtle)
                     .start_icon(
                         Icon::new(if pinned.is_some() {
@@ -2052,7 +2052,7 @@ impl QueryEditor {
             // A stored query's plan needs its text, which the server does not send.
             .when(self.stored.is_none(), |toolbar| {
                 toolbar.child(
-                    studio_ui::ds::button("explain", "Explain")
+                    studio_ui::ds::toolbar_button("explain", "Explain")
                         .start_icon(Icon::new(IconName::ListTree).size(IconSize::XSmall))
                         .key_binding(KeyBinding::for_action_in(&Explain, &focus, cx))
                         .tooltip({
@@ -2072,7 +2072,7 @@ impl QueryEditor {
                 )
             })
             .child(
-                studio_ui::ds::button("run", "Run")
+                studio_ui::ds::toolbar_button("run", "Run")
                     .style(ButtonStyle::Filled)
                     .start_icon(Icon::new(IconName::PlayFilled).size(IconSize::XSmall))
                     .key_binding(KeyBinding::for_action_in(&Run, &focus, cx))

@@ -838,6 +838,17 @@ pub fn toolbar(cx: &App) -> Div {
         .border_color(surface::rule(cx))
 }
 
+/// A button in a document's toolbar: Zed's 22 px size (Tower's `xs`), small type and icons, so
+/// the toolbar reads as the document's chrome rather than as its content.
+pub fn toolbar_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    button(id, label).size(ButtonSize::Default)
+}
+
+/// An icon button in a document's toolbar, beside [`toolbar_button`]s.
+pub fn toolbar_icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
+    icon_button(id, icon).size(ButtonSize::Default)
+}
+
 /// A toolbar's buttons, set close: a ghost button's own padding is the space between them.
 pub fn toolbar_actions() -> Div {
     h_flex().flex_none().items_center()
