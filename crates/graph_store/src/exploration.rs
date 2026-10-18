@@ -1117,6 +1117,9 @@ pub struct Exploration {
     scope: ReadScope,
     /// The head moved and the session is reading what changed.
     awaiting_changes: bool,
+    /// A look for what is missing is due at the end of this turn: many answers come in one
+    /// turn (a node's counts), and each look walks the whole tree.
+    missing_due: bool,
     _subscription: Subscription,
 }
 
@@ -1182,6 +1185,7 @@ impl Exploration {
             tasks: HashMap::new(),
             scope,
             awaiting_changes: false,
+            missing_due: false,
             _subscription: subscription,
         }
     }
@@ -1683,7 +1687,16 @@ impl Exploration {
 
     /// After an answer: reads what it made visible, and redraws when it shows.
     fn loaded(&mut self, key: &LoadTarget, cx: &mut Context<Self>) {
-        self.request_missing(cx);
+        if !std::mem::replace(&mut self.missing_due, true) {
+            let this = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                this.update(cx, |this, cx| {
+                    this.missing_due = false;
+                    this.request_missing(cx);
+                })
+                .ok();
+            });
+        }
         // An answer read ahead for something closed shows nothing yet: nothing to draw.
         let shows = self
             .schema(cx)
