@@ -2,9 +2,10 @@
 //! settings prefix and the byte range of each declaration), so the editor can run the
 //! declaration under the cursor.
 //!
-//! Lexical only. It follows the terminals of `query.pest` at OmniGraph v0.13.0 (line and block
-//! comments, strings with escapes, `$variables`, `@meta` fields, identifiers, numbers) and never
-//! type-checks; `check` is the authority on what a source means.
+//! Lexical only. It follows the terminals of `query.pest` at OmniGraph `edge-20261017-d883c49`
+//! (line and block comments, strings with escapes, `$variables`, `@meta` fields, `@Catalogue`
+//! types, identifiers, numbers) and never type-checks; `check` is the authority on what a source
+//! means.
 
 use std::ops::Range;
 
@@ -101,11 +102,47 @@ const KEYWORDS: &[&str] = &[
     "starts_with",
 ];
 
-/// Words that are keywords only inside a `branch`, `show` or `reset` statement.
-const STATEMENT_KEYWORDS: &[&str] = &["create", "from", "into", "merge", "list", "all"];
+/// Words that are keywords only inside a statement: one whose first word is `branch`, `commit`,
+/// `load`, `show` or `reset`, or `explain load`.
+const STATEMENT_KEYWORDS: &[&str] = &[
+    "create",
+    "from",
+    "into",
+    "merge",
+    "merge-base",
+    "diff",
+    "to",
+    "after",
+    "page",
+    "dry",
+    "run",
+    "list",
+    "all",
+    "commit",
+    "publish",
+    "drop",
+    "load",
+    "csv",
+    "node",
+    "edge",
+    "mode",
+    "overwrite",
+    "append",
+    "delimiter",
+    "header",
+    "columns",
+];
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Whether the only token so far is `explain`, so a `load` after it starts a statement.
+fn after_explain(tokens: &[Token], source: &str) -> bool {
+    match tokens {
+        [only] => only.kind == TokenKind::Keyword && &source[only.range.clone()] == "explain",
+        _ => false,
+    }
 }
 
 /// Splits `.gq` source into tokens. Whitespace is skipped; anything the lexer does not know is
@@ -156,6 +193,8 @@ pub fn tokenize(source: &str) -> Vec<Token> {
             }
             match &source[start + 1..i] {
                 "description" | "instruction" => TokenKind::Annotation,
+                // `@Operator`: an engine catalogue type, where a meta field is lowercase.
+                name if name.starts_with(|c: char| c.is_ascii_uppercase()) => TokenKind::Type,
                 _ => TokenKind::Property,
             }
         } else if b.is_ascii_digit() {
@@ -172,6 +211,14 @@ pub fn tokenize(source: &str) -> Vec<Token> {
         } else if b.is_ascii_alphabetic() || b == b'_' {
             while i < len && is_ident_byte(bytes[i]) {
                 i += 1;
+            }
+            // `merge-base` is one word to the server.
+            if in_statement
+                && &source[start..i] == "merge"
+                && source[i..].starts_with("-base")
+                && !bytes.get(i + 5).copied().is_some_and(is_ident_byte)
+            {
+                i += 5;
             }
             let word = &source[start..i];
             let previous = tokens.last();
@@ -191,6 +238,11 @@ pub fn tokenize(source: &str) -> Vec<Token> {
                 if matches!(word, "branch" | "show" | "reset") && tokens.is_empty() {
                     in_statement = true;
                 }
+                TokenKind::Keyword
+            } else if (word == "commit" && tokens.is_empty())
+                || (word == "load" && (tokens.is_empty() || after_explain(&tokens, source)))
+            {
+                in_statement = true;
                 TokenKind::Keyword
             } else if in_statement && STATEMENT_KEYWORDS.contains(&word) {
                 TokenKind::Keyword
@@ -495,6 +547,60 @@ mod tests {
         assert!(tokens.contains(&(TokenKind::Keyword, "from")));
         let tokens = kinds("query q() { match { $p: Person } return { $p.list } }");
         assert!(tokens.contains(&(TokenKind::Property, "list")));
+        for (source, words) in [
+            (
+                "branch diff \"01J\" to main after page \"p\" limit 10",
+                &["branch", "diff", "to", "after", "page", "limit"][..],
+            ),
+            (
+                "branch merge-base feature into main",
+                &["branch", "merge-base", "into"],
+            ),
+            (
+                "branch merge feature dry run",
+                &["branch", "merge", "dry", "run"],
+            ),
+            (
+                "branch merge feature as commit",
+                &["branch", "merge", "as", "commit"],
+            ),
+            ("commit publish \"01J\"", &["commit", "publish"]),
+            ("commit drop \"01J\"", &["commit", "drop"]),
+            (
+                "load csv \"p.csv\" into node:Person mode overwrite delimiter \"|\" header columns (a)",
+                &[
+                    "load",
+                    "csv",
+                    "into",
+                    "node",
+                    "mode",
+                    "overwrite",
+                    "delimiter",
+                    "header",
+                    "columns",
+                ],
+            ),
+            (
+                "explain load csv \"k.csv\" into edge:Knows mode append",
+                &["explain", "load", "csv", "into", "edge", "mode", "append"],
+            ),
+        ] {
+            let keywords: Vec<&str> = kinds(source)
+                .into_iter()
+                .filter(|(kind, _)| *kind == TokenKind::Keyword)
+                .map(|(_, word)| word)
+                .collect();
+            assert_eq!(keywords, words, "{source}");
+        }
+        // Outside a statement they are names: a property `load`, an edge `commit`.
+        let tokens = kinds("query q() { match { $p commit $c } return { $p.load, $p.mode } }");
+        assert!(tokens.contains(&(TokenKind::Identifier, "commit")));
+        assert!(tokens.contains(&(TokenKind::Property, "load")));
+        assert!(tokens.contains(&(TokenKind::Property, "mode")));
+        // An engine catalogue type is a type; a meta field stays a property.
+        let tokens = kinds("query q() { match { $o: @Operator } return { $o.@id } }");
+        assert!(tokens.contains(&(TokenKind::Type, "@Operator")));
+        assert!(tokens.contains(&(TokenKind::Property, "@id")));
     }
 
     #[test]

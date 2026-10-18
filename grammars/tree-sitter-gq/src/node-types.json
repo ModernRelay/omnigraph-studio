@@ -20,6 +20,31 @@
     }
   },
   {
+    "type": "as_commit",
+    "named": true,
+    "fields": {}
+  },
+  {
+    "type": "as_unattached_branch",
+    "named": true,
+    "fields": {
+      "base": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "string",
+            "named": true
+          },
+          {
+            "type": "variable",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
     "type": "assignment",
     "named": true,
     "fields": {
@@ -319,13 +344,42 @@
   {
     "type": "branch_statement",
     "named": true,
-    "fields": {},
+    "fields": {
+      "limit": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "integer",
+            "named": true
+          }
+        ]
+      },
+      "page": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "string",
+            "named": true
+          }
+        ]
+      }
+    },
     "children": {
       "multiple": true,
       "required": false,
       "types": [
         {
+          "type": "as_commit",
+          "named": true
+        },
+        {
           "type": "branch_name",
+          "named": true
+        },
+        {
+          "type": "dry_run",
           "named": true
         }
       ]
@@ -415,6 +469,22 @@
           "named": true
         }
       ]
+    }
+  },
+  {
+    "type": "commit_statement",
+    "named": true,
+    "fields": {
+      "commit": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "string",
+            "named": true
+          }
+        ]
+      }
     }
   },
   {
@@ -588,6 +658,11 @@
     }
   },
   {
+    "type": "dry_run",
+    "named": true,
+    "fields": {}
+  },
+  {
     "type": "edge_alternation",
     "named": true,
     "fields": {},
@@ -659,6 +734,10 @@
       "multiple": false,
       "required": true,
       "types": [
+        {
+          "type": "load_statement",
+          "named": true
+        },
         {
           "type": "query_declaration",
           "named": true
@@ -815,6 +894,101 @@
           "named": true
         }
       ]
+    }
+  },
+  {
+    "type": "load_columns",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "load_delimiter",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "string",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "load_mode",
+    "named": true,
+    "fields": {}
+  },
+  {
+    "type": "load_statement",
+    "named": true,
+    "fields": {
+      "source": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "string",
+            "named": true
+          }
+        ]
+      },
+      "target": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "load_target",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "load_columns",
+          "named": true
+        },
+        {
+          "type": "load_delimiter",
+          "named": true
+        },
+        {
+          "type": "load_mode",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "load_target",
+    "named": true,
+    "fields": {
+      "type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "type_identifier",
+            "named": true
+          }
+        ]
+      }
     }
   },
   {
@@ -1557,6 +1731,20 @@
             "named": true
           }
         ]
+      },
+      "result": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "as_commit",
+            "named": true
+          },
+          {
+            "type": "as_unattached_branch",
+            "named": true
+          }
+        ]
       }
     },
     "children": {
@@ -1664,7 +1852,15 @@
           "named": true
         },
         {
+          "type": "commit_statement",
+          "named": true
+        },
+        {
           "type": "explain_statement",
+          "named": true
+        },
+        {
+          "type": "load_statement",
           "named": true
         },
         {
@@ -2116,11 +2312,19 @@
     "named": false
   },
   {
+    "type": "after",
+    "named": false
+  },
+  {
     "type": "all",
     "named": false
   },
   {
     "type": "and",
+    "named": false
+  },
+  {
+    "type": "append",
     "named": false
   },
   {
@@ -2144,9 +2348,17 @@
     "named": true
   },
   {
+    "type": "columns",
+    "named": false
+  },
+  {
     "type": "comment",
     "named": true,
     "extra": true
+  },
+  {
+    "type": "commit",
+    "named": false
   },
   {
     "type": "contains",
@@ -2161,11 +2373,39 @@
     "named": false
   },
   {
+    "type": "csv",
+    "named": false
+  },
+  {
     "type": "delete",
     "named": false
   },
   {
+    "type": "delimiter",
+    "named": false
+  },
+  {
     "type": "desc",
+    "named": false
+  },
+  {
+    "type": "diff",
+    "named": false
+  },
+  {
+    "type": "distinct",
+    "named": false
+  },
+  {
+    "type": "drop",
+    "named": false
+  },
+  {
+    "type": "dry",
+    "named": false
+  },
+  {
+    "type": "edge",
     "named": false
   },
   {
@@ -2190,6 +2430,10 @@
   },
   {
     "type": "from",
+    "named": false
+  },
+  {
+    "type": "header",
     "named": false
   },
   {
@@ -2221,6 +2465,10 @@
     "named": false
   },
   {
+    "type": "load",
+    "named": false
+  },
+  {
     "type": "match",
     "named": false
   },
@@ -2233,11 +2481,23 @@
     "named": false
   },
   {
+    "type": "merge-base",
+    "named": false
+  },
+  {
     "type": "meta_field",
     "named": true
   },
   {
     "type": "min",
+    "named": false
+  },
+  {
+    "type": "mode",
+    "named": false
+  },
+  {
+    "type": "node",
     "named": false
   },
   {
@@ -2249,11 +2509,27 @@
     "named": false
   },
   {
+    "type": "on",
+    "named": false
+  },
+  {
     "type": "or",
     "named": false
   },
   {
     "type": "order",
+    "named": false
+  },
+  {
+    "type": "overwrite",
+    "named": false
+  },
+  {
+    "type": "page",
+    "named": false
+  },
+  {
+    "type": "publish",
     "named": false
   },
   {
@@ -2266,6 +2542,10 @@
   },
   {
     "type": "return",
+    "named": false
+  },
+  {
+    "type": "run",
     "named": false
   },
   {
@@ -2289,12 +2569,20 @@
     "named": false
   },
   {
+    "type": "to",
+    "named": false
+  },
+  {
     "type": "true",
     "named": false
   },
   {
     "type": "type_identifier",
     "named": true
+  },
+  {
+    "type": "unattached",
+    "named": false
   },
   {
     "type": "update",

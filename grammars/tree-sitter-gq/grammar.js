@@ -1,5 +1,5 @@
 /**
- * Tree-sitter grammar for OmniGraph queries (`.gq`), GQ at OmniGraph v0.13.0.
+ * Tree-sitter grammar for OmniGraph queries (`.gq`), GQ at OmniGraph `edge-20261017-d883c49`.
  *
  * Written from `crates/omnigraph-compiler/src/query/query.pest` at that tag. It is for
  * highlighting, folding and outline in Studio's query editor: it accepts what the pest grammar
@@ -37,6 +37,8 @@ module.exports = grammar({
           $.setting_statement,
           $.show_statement,
           $.branch_statement,
+          $.commit_statement,
+          $.load_statement,
           $.explain_statement,
           $.query_declaration,
         ),
@@ -65,15 +67,58 @@ module.exports = grammar({
         choice(
           seq('create', $._branch_name, optional(seq('from', $._branch_name))),
           seq('delete', $._branch_name),
-          seq('merge', $._branch_name, optional(seq('into', $._branch_name))),
+          seq(
+            'merge',
+            $._branch_name,
+            optional(seq('into', $._branch_name)),
+            optional(choice($.as_commit, $.dry_run)),
+          ),
+          // One word to the server: the lexer takes `merge-base` whole, never `merge` and `-`.
+          seq('merge-base', $._branch_name, optional(seq('into', $._branch_name))),
+          seq(
+            'diff',
+            $._branch_name,
+            optional(seq(choice('into', 'to'), $._branch_name)),
+            optional(seq('after', 'page', field('page', $.string))),
+            optional(seq('limit', field('limit', $.integer))),
+          ),
           'list',
         ),
         optional(';'),
       ),
 
+    // A side is a branch or a quoted commit id. `dry` and `as` are names here: the clause
+    // words are keywords only where the clause may start.
     _branch_name: ($) => choice(alias($.identifier, $.branch_name), alias($.string, $.branch_name)),
 
-    explain_statement: ($) => seq('explain', $.query_declaration),
+    dry_run: (_) => seq('dry', 'run'),
+
+    commit_statement: ($) =>
+      seq('commit', choice('publish', 'drop'), field('commit', $.string), optional(';')),
+
+    load_statement: ($) => seq($._load, optional(';')),
+
+    // `load csv "<uri>" into node:Person mode overwrite [delimiter "|"] [header] [columns (a, b)]`.
+    _load: ($) =>
+      seq(
+        'load',
+        'csv',
+        field('source', $.string),
+        'into',
+        field('target', $.load_target),
+        repeat(choice($.load_mode, $.load_delimiter, 'header', $.load_columns)),
+      ),
+
+    load_target: ($) => seq(choice('node', 'edge'), ':', field('type', $.type_identifier)),
+
+    load_mode: (_) => seq('mode', choice('overwrite', 'append', 'merge')),
+
+    load_delimiter: ($) => seq('delimiter', $.string),
+
+    load_columns: ($) => seq('columns', '(', commaSep1($.identifier), ')'),
+
+    explain_statement: ($) =>
+      seq('explain', choice($.query_declaration, alias($._load, $.load_statement))),
 
     // ---- declarations ----
 
@@ -83,8 +128,16 @@ module.exports = grammar({
         field('name', $.identifier),
         field('parameters', $.parameters),
         repeat($.annotation),
+        optional(field('result', choice($.as_commit, $.as_unattached_branch))),
         field('body', $.query_body),
       ),
+
+    // The write's result is an unpublished commit.
+    as_commit: (_) => seq('as', 'commit'),
+
+    // The write's result is an unattached snapshot, a root or a child of the named one.
+    as_unattached_branch: ($) =>
+      seq('as', 'unattached', 'branch', optional(seq('on', field('base', choice($.string, $.variable))))),
 
     parameters: ($) => seq('(', commaSep($.parameter), ')'),
 
@@ -187,7 +240,7 @@ module.exports = grammar({
 
     aggregate_name: (_) => choice('count', 'sum', 'avg', 'min', 'max'),
 
-    return_clause: ($) => seq('return', '{', repeat1($.projection), '}'),
+    return_clause: ($) => seq('return', optional('distinct'), '{', repeat1($.projection), '}'),
 
     projection: ($) =>
       seq($._expression, optional(seq('as', field('alias', $.identifier))), optional(',')),
@@ -272,14 +325,20 @@ module.exports = grammar({
 
     parenthesized: ($) => seq('(', $._expression, ')'),
 
+    // `count(distinct $x)`: only an aggregate takes `distinct`, so another call's argument
+    // may still be a property named `distinct`.
     call: ($) =>
       prec(
         PREC.call,
-        seq(
-          field('function', choice($.identifier, alias($.aggregate_name, $.identifier))),
-          '(',
-          commaSep($._expression),
-          ')',
+        choice(
+          seq(field('function', $.identifier), '(', commaSep($._expression), ')'),
+          seq(
+            field('function', alias($.aggregate_name, $.identifier)),
+            '(',
+            optional('distinct'),
+            commaSep($._expression),
+            ')',
+          ),
         ),
       ),
 
@@ -294,7 +353,8 @@ module.exports = grammar({
 
     identifier: (_) => /[a-z_][A-Za-z0-9_]*/,
 
-    type_identifier: (_) => /[A-Z][A-Za-z0-9_]*/,
+    // A leading `@` names an engine catalogue type (`@Operator`).
+    type_identifier: (_) => token(seq(optional('@'), /[A-Z][A-Za-z0-9_]*/)),
 
     _literal: ($) => choice($.list, $.string, $.float, $.integer, $.boolean),
 

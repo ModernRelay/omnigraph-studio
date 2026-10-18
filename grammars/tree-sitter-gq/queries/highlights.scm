@@ -26,9 +26,12 @@
 (edge_name) @label
 
 [
-  "query" "match" "return" "order" "limit" "insert" "update" "delete" "set" "where"
-  "not" "exists" "and" "or" "in" "is" "null" "as" "asc" "desc" "reset" "show" "all"
-  "branch" "create" "from" "merge" "into" "list" "explain" "starts_with" "contains"
+  "query" "match" "return" "distinct" "order" "limit" "insert" "update" "delete" "set"
+  "where" "not" "exists" "and" "or" "in" "is" "null" "as" "asc" "desc" "reset" "show"
+  "all" "branch" "create" "from" "merge" "merge-base" "diff" "into" "to" "after" "page"
+  "dry" "run" "list" "commit" "publish" "drop" "unattached" "on" "explain" "load" "csv"
+  "node" "edge" "mode" "overwrite" "append" "delimiter" "header" "columns" "starts_with"
+  "contains"
 ] @keyword
 
 (comparison_operator) @operator
