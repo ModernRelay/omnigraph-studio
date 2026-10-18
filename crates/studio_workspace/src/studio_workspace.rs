@@ -896,10 +896,8 @@ impl Workspace {
             OutcomeKind::Committed {
                 commit: Some(commit),
             } => {
-                let action = Box::new(OpenCommit {
-                    commit_id: commit.clone(),
-                });
-                self.show_toast_with_action(ToastKind::Success, text, "View commit", action, cx);
+                let (label, action) = committed_follow_up(latest, commit);
+                self.show_toast_with_action(ToastKind::Success, text, label, action, cx);
             }
             // The write may or may not have landed: the branch's history says which.
             OutcomeKind::Unknown { .. } => {
@@ -3356,6 +3354,30 @@ fn same_graph(a: &Entity<GraphSession>, b: &Entity<GraphSession>, cx: &App) -> b
     a.graph_id == b.graph_id && a.connection == b.connection
 }
 
+/// The button on a committed write's toast: Undo for a delete Studio can put back (History
+/// still holds the commit), else the commit.
+fn committed_follow_up(
+    entry: &graph_store::OutcomeEntry,
+    commit: &str,
+) -> (&'static str, Box<dyn gpui::Action>) {
+    match entry.follow_up {
+        Some(graph_store::FollowUp::UndoDelete) => (
+            "Undo",
+            Box::new(studio_actions::graph::UndoDelete {
+                commit: commit.to_owned(),
+                branch: entry.branch.clone(),
+                what: entry.description.clone(),
+            }),
+        ),
+        None => (
+            "View commit",
+            Box::new(OpenCommit {
+                commit_id: commit.to_owned(),
+            }),
+        ),
+    }
+}
+
 fn toast_text(entry: &graph_store::OutcomeEntry) -> String {
     match &entry.outcome {
         // A mutation that matched nothing answers without a commit: nothing was published.
@@ -4705,6 +4727,34 @@ mod tests {
 
     /// The window leaving marks the last reading at once, so a return before the next tick
     /// does not measure across the time away.
+    /// A delete Studio can put back offers Undo on its toast, bound to its commit and branch;
+    /// any other commit offers itself.
+    #[test]
+    fn a_delete_that_can_be_put_back_offers_undo() {
+        let entry = |follow_up| graph_store::OutcomeEntry {
+            at: std::time::SystemTime::now(),
+            branch: "main".into(),
+            description: "Delete Company Acme".into(),
+            outcome: graph_store::OutcomeKind::Committed {
+                commit: Some("c2".into()),
+            },
+            follow_up,
+        };
+        let (label, action) =
+            committed_follow_up(&entry(Some(graph_store::FollowUp::UndoDelete)), "c2");
+        assert_eq!(label, "Undo");
+        assert!(action.partial_eq(&studio_actions::graph::UndoDelete {
+            commit: "c2".into(),
+            branch: "main".into(),
+            what: "Delete Company Acme".into(),
+        }));
+        let (label, action) = committed_follow_up(&entry(None), "c2");
+        assert_eq!(label, "View commit");
+        assert!(action.partial_eq(&OpenCommit {
+            commit_id: "c2".into()
+        }));
+    }
+
     #[gpui::test]
     fn leaving_the_window_pauses_the_cpu_reading(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {

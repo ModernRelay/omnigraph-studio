@@ -43,7 +43,9 @@ use ui::{
     ResizableColumnsState, Table, TableInteractionState, TableResizeBehavior, TintColor, Tooltip,
 };
 
-use crate::dialogs::{DeleteRowModal, InsertEdgeModal, InsertRowModal, SaveViewModal};
+use crate::dialogs::{
+    DeleteRowModal, DeleteTarget, InsertEdgeModal, InsertRowModal, SaveViewModal,
+};
 use crate::grouping::{GROUP_LIMIT, Grouping, Line, SECTION_FIRST_PAGE};
 use crate::model::{
     ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN, Row, SaveResult,
@@ -2582,9 +2584,11 @@ impl TypeTable {
         cx.notify();
     }
 
-    pub fn row_deleted(
+    /// Rows the table's own delete removed in `commit`: they leave the list, with their drafts
+    /// and the pick. The table follows the commit, which moves its pin once.
+    pub fn rows_deleted(
         &mut self,
-        id: &str,
+        ids: &[String],
         commit: &str,
         parent: Option<&str>,
         cx: &mut Context<Self>,
@@ -2593,6 +2597,14 @@ impl TypeTable {
             self.newer = true;
             cx.emit(ItemEvent::UpdateTab);
         }
+        for id in ids {
+            self.remove_row(id, cx);
+            self.selection.shift_remove(id);
+        }
+        cx.notify();
+    }
+
+    fn remove_row(&mut self, id: &str, cx: &mut Context<Self>) {
         if let Some(index) = self.rows.iter().position(|row| row.id == id) {
             let row = self.rows.remove(index);
             if let Some(grouping) = &mut self.grouping {
@@ -2626,7 +2638,6 @@ impl TypeTable {
                 self.close_peek(cx);
             }
         }
-        cx.notify();
     }
 
     // ---- cursor ----
@@ -3935,33 +3946,59 @@ impl TypeTable {
             self.toast(ToastKind::Info, &reason, cx);
             return;
         }
-        let Some(cursor) = self.cursor else { return };
-        let (Some(row), Some(schema), Some(workspace)) = (
-            self.rows.get(cursor.row),
-            self.schema.clone(),
-            self.workspace.upgrade(),
-        ) else {
+        let (Some(schema), Some(workspace)) = (self.schema.clone(), self.workspace.upgrade())
+        else {
             return;
         };
+        // The picked rows, in table order, or else the cursor's.
+        let picked: Vec<&Row> = if self.selection.is_empty() {
+            self.cursor
+                .and_then(|cursor| self.rows.get(cursor.row))
+                .into_iter()
+                .collect()
+        } else {
+            let mut seen = HashSet::new();
+            self.rows
+                .iter()
+                .filter(|row| self.selection.contains(&row.id) && seen.insert(row.id.clone()))
+                .collect()
+        };
+        if picked.is_empty() {
+            return;
+        }
+        let label = schema
+            .node(&self.type_name)
+            .and_then(|node| node.label_property().map(str::to_owned));
+        let edge = self.kind == TableKind::Edge;
+        let targets: Vec<DeleteTarget> = picked
+            .into_iter()
+            .map(|row| {
+                let text = |column: &str| {
+                    row.values
+                        .get(column)
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                };
+                DeleteTarget {
+                    id: row.id.clone(),
+                    label: label.as_deref().and_then(text),
+                    endpoints: edge.then(|| {
+                        (
+                            text(crate::model::FROM_COLUMN).unwrap_or_default(),
+                            text(crate::model::TO_COLUMN).unwrap_or_default(),
+                        )
+                    }),
+                }
+            })
+            .collect();
         let table = cx.entity().downgrade();
         let session = self.session.clone();
         let type_name = self.type_name.clone();
-        let id = row.id.clone();
-        let endpoints = (self.kind == TableKind::Edge).then(|| {
-            let end = |column: &str| {
-                row.values
-                    .get(column)
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned()
-            };
-            (end(crate::model::FROM_COLUMN), end(crate::model::TO_COLUMN))
-        });
         let if_commit = self.paging.pinned.clone();
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, |window, cx| {
                 DeleteRowModal::new(
-                    table, session, schema, type_name, id, endpoints, if_commit, window, cx,
+                    table, session, schema, type_name, targets, if_commit, window, cx,
                 )
             })
         });

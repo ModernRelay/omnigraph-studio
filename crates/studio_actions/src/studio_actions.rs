@@ -269,6 +269,17 @@ pub mod graph {
         pub text: Option<String>,
     }
 
+    /// Put back what a delete removed, its nodes and their relationships, in one commit, while
+    /// the branch is still at the delete's commit (spec 004). Offered by the toast a delete
+    /// leaves; `what` names the deleted rows in the outcome.
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct UndoDelete {
+        pub commit: String,
+        pub branch: String,
+        pub what: String,
+    }
+
     /// Open one node as a page in its own tab, read at the branch head or at a commit.
     #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
     #[action(namespace = studio_graph)]

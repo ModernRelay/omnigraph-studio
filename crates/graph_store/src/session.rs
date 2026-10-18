@@ -79,6 +79,15 @@ pub struct OutcomeEntry {
     pub branch: String,
     pub description: String,
     pub outcome: OutcomeKind,
+    /// What a committed write's toast offers instead of opening the commit.
+    pub follow_up: Option<FollowUp>,
+}
+
+/// A follow-up a write's outcome offers once it commits (spec 002, toasts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowUp {
+    /// The commit only removed rows, and Studio can put them back (spec 004).
+    UndoDelete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,7 +429,7 @@ impl GraphSession {
                 output.commit.as_ref().map(|c| c.graph_commit_id.clone())
             });
             this.update(cx, |this, cx| {
-                this.finish_write(branch, description, kind, cx);
+                this.finish_write(branch, description, kind, None, cx);
             })
             .ok();
             outcome
@@ -1171,13 +1180,25 @@ impl GraphSession {
         description: String,
         cx: &mut Context<Self>,
     ) -> Task<WriteOutcome<ChangeOutput>> {
+        self.write_with(query, if_commit, description, None, cx)
+    }
+
+    /// [`Self::write`], whose outcome offers `follow_up` once it commits.
+    pub fn write_with(
+        &mut self,
+        query: &BuiltQuery,
+        if_commit: Option<String>,
+        description: String,
+        follow_up: Option<FollowUp>,
+        cx: &mut Context<Self>,
+    ) -> Task<WriteOutcome<ChangeOutput>> {
         let request = ChangeRequest {
             query: query.text.clone(),
             name: Some(query.name.clone()),
             params: query.params_value(),
             branch: Some(self.branch.clone()),
         };
-        self.write_request(request, if_commit, description, cx)
+        self.send_write(request, if_commit, description, follow_up, cx)
     }
 
     pub fn write_request(
@@ -1185,6 +1206,17 @@ impl GraphSession {
         request: ChangeRequest,
         if_commit: Option<String>,
         description: String,
+        cx: &mut Context<Self>,
+    ) -> Task<WriteOutcome<ChangeOutput>> {
+        self.send_write(request, if_commit, description, None, cx)
+    }
+
+    fn send_write(
+        &mut self,
+        request: ChangeRequest,
+        if_commit: Option<String>,
+        description: String,
+        follow_up: Option<FollowUp>,
         cx: &mut Context<Self>,
     ) -> Task<WriteOutcome<ChangeOutput>> {
         let client = self.client(cx);
@@ -1209,7 +1241,7 @@ impl GraphSession {
                 },
             };
             this.update(cx, |this, cx| {
-                this.finish_write(branch, description, kind, cx);
+                this.finish_write(branch, description, kind, follow_up, cx);
             })
             .ok();
             outcome
@@ -1238,6 +1270,7 @@ impl GraphSession {
             branch: branch.clone(),
             description,
             outcome,
+            follow_up: None,
         });
         if let Some(commit) = commit {
             self.committed(branch, commit, cx);
@@ -1254,6 +1287,7 @@ impl GraphSession {
         branch: String,
         description: String,
         outcome: OutcomeKind,
+        follow_up: Option<FollowUp>,
         cx: &mut Context<Self>,
     ) {
         self.writes_in_flight = self.writes_in_flight.saturating_sub(1);
@@ -1266,6 +1300,7 @@ impl GraphSession {
             branch: branch.clone(),
             description,
             outcome,
+            follow_up,
         });
         if let Some(commit) = commit {
             self.committed(branch, commit, cx);
@@ -1302,7 +1337,7 @@ impl GraphSession {
                 .await;
             let kind = outcome_kind(&outcome, |_| None);
             this.update(cx, |this, cx| {
-                this.finish_write(branch, description, kind, cx);
+                this.finish_write(branch, description, kind, None, cx);
                 this.reload_branches(cx);
             })
             .ok();
@@ -1328,7 +1363,7 @@ impl GraphSession {
                 if this.branch == name {
                     this.set_branch("main".into(), cx);
                 }
-                this.finish_write(name, description, kind, cx);
+                this.finish_write(name, description, kind, None, cx);
                 this.reload_branches(cx);
             })
             .ok();
@@ -1359,7 +1394,7 @@ impl GraphSession {
                 output.commit.as_ref().map(|c| c.graph_commit_id.clone())
             });
             this.update(cx, |this, cx| {
-                this.finish_write(target, description, kind, cx);
+                this.finish_write(target, description, kind, None, cx);
             })
             .ok();
             outcome

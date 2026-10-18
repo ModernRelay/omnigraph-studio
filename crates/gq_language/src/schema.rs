@@ -105,6 +105,10 @@ pub struct EdgeType {
     pub to: String,
     /// The edge allows at most one target per source (`@card(..1)`).
     pub at_most_one: bool,
+    /// Each source needs at least this many of these edges (`@card(n..)`); 0 when optional.
+    /// Deleting the targets a source needs refuses the delete, or takes the source with it
+    /// (`builder::required_dependents`).
+    pub min: u32,
     pub properties: Vec<Property>,
 }
 
@@ -191,6 +195,7 @@ impl SchemaModel {
                     from: edge.from_type.clone(),
                     to: edge.to_type.clone(),
                     at_most_one: edge.cardinality.max == Some(1),
+                    min: edge.cardinality.min,
                     properties,
                 }
             })

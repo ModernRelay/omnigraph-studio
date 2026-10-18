@@ -7,6 +7,7 @@ pub mod changes;
 pub mod cli_config;
 mod connection;
 pub mod degrees;
+pub mod deletes;
 mod exploration;
 pub mod fixes;
 mod memo;
@@ -28,8 +29,8 @@ pub use exploration::*;
 pub use fixes::{RevertUnavailable, revert_query};
 pub use registry::{ConnectionRegistry, RegistryEvent, data_dir};
 pub use session::{
-    CommitList, DraftEntry, DraftKey, GraphSession, HEAD_POLL, HeadWatch, Loadable, OutcomeEntry,
-    OutcomeKind, ServerState, SessionEvent, open_session,
+    CommitList, DraftEntry, DraftKey, FollowUp, GraphSession, HEAD_POLL, HeadWatch, Loadable,
+    OutcomeEntry, OutcomeKind, ServerState, SessionEvent, open_session,
 };
 
 /// Sets up the HTTP client and loads every known server. Call once at startup.

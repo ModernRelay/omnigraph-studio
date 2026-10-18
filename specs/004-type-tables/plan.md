@@ -2,7 +2,7 @@
 
 Status: in progress · 2026-10-12. `crates/type_table` ships the Types sidebar, node and edge
 tables (keyset pages pinned to one commit, filtered counts, filters, a cell cursor, value-bound
-cell edits with all three outcomes, peek, insert and typed-key delete), sorting by a column,
+cell edits with all three outcomes, peek, insert, and delete with Undo), sorting by a column,
 Blob cells and previews, relative dates, relationship columns, saved views, bulk set,
 preview tabs (spec 002), and edge insert and delete. See Deferred for what is left.
 
@@ -14,7 +14,7 @@ real graphs; Studio rebuilds it natively, without a browser's limits.
 
 ## Principles
 
-II (one snapshot per table), III (write outcomes), IV (branch named, typed-key deletes), V (rows
+II (one snapshot per table), III (write outcomes), IV (branch named; a delete lists what it removes and offers Undo), V (rows
 stay put), IX (paged, virtualized).
 
 ## What exists today (checked)
@@ -241,7 +241,23 @@ its open section.
   clear, and the others stay with "Changed elsewhere to “X”". A refused or lost write puts
   every draft back with the reason. Discard asks for a second click.
 - Insert: a form generated from the node shape (required properties, key, enums, ranges).
-- Delete: type the row's key to confirm; uses `/mutate/if-graph-commit` with the pinned commit.
+- Delete (⌘⌫): the picked rows (⌘-click, ⇧-click), or else the cursor's, in one commit bound
+  to the table's pin (`/mutate/if-graph-commit`). Before it is offered, the dialog reads what
+  else goes (`graph_store::deletes`): a node's relationships go with it, and a node that needs a
+  relationship to a deleted node (`@card(n..)`) and would be left with fewer than `n` is a
+  dependent, deleted in the same commit, because the server refuses a delete that leaves it so.
+  Dependents of dependents follow, round by round (`builder::required_dependents`, one read per
+  required relationship into a type that grew, held at the pin), up to 1,000; more refuses and
+  points to the query editor. The dialog lists them by type and name with the relationship each
+  needs ("Also deletes 1 Person, 1 Badge that cannot exist without it"), and ↵ deletes. The
+  outcome's toast offers Undo (`studio_graph::UndoDelete`): it reads the delete commit's changes,
+  inserts every node and then every relationship again in one commit bound to the delete's
+  commit, so it applies only while the branch is still there; unkeyed relationships come back
+  under new ids. When Undo could not restore it (a node type without `@key`, or Blob or Vector
+  values on the nodes or their relationships, judged from the schema), the dialog says why and
+  asks for the key, or `delete N` for several rows, to be typed (constitution IV). An edge
+  delete takes no dependents; deleting a relationship its source needs is refused by the
+  server, which the dialog shows.
 - Every editing surface shows `write · <branch>`. A 403 shows "Your token cannot change
   <branch>" and keeps the draft.
 
@@ -267,6 +283,8 @@ kept answers.
 
 | Decision | Rejected alternatives | Why |
 |---|---|---|
+| ↵ and Undo for a delete Studio can put back; typing only when it cannot | Typing the key every time (constitution 1.0.0); no dialog, Undo only | Ragnor, 2026-10-17: typing was annoying. The dialog still lists everything a delete removes, and Undo puts it back from the change feed in one commit |
+| Dependents found by Studio and deleted in the same commit, listed | A checkbox per delete; only a schema-declared cascade (an engine change) | Ragnor, 2026-10-17. The server already refuses a delete that leaves a node below its `@card` minimum, so without them the delete cannot happen; the list says exactly what goes, and the delete is bound to the commit the list was read at |
 | Value-bound cell saves | `if-graph-commit` on every cell | Any unrelated commit would refuse the save |
 | Engine-side filter, sort and count | Filtering loaded rows | Correct at any size; grouping and filtering loaded rows is wrong once a type outgrows a page |
 | No row cap | A 1,000-row cap, as a web table needs | GPUI virtualizes; such a cap exists only because a browser renders every row |
@@ -329,6 +347,7 @@ kept answers.
 | 2026-10-14 | Typing in the filter field or a cell does not draw the grid | Main-thread CPU per frame from the snapshot tool, `release-fast`, Person (200 rows), 200 frames, before and after in the same sessions; `sample` of the filter loop; headless `typing_in_a_field_leaves_the_grid_as_it_was` and `studio_workspace` `a_tab_that_caches_its_parts_keeps_them_while_a_field_changes`, each failing with its fix undone | Before, a key in either field cost a full grid draw (10.5 ms filter, 10 ms scroll, under load); the profile put it in the grid's layout and paint, the editor's own work under 1 ms. After: filter 2.2 ms, cell 2.3 ms, query editor 3.5 ms, scroll 7.6 ms (load average 20). Undoing the per-key `notify` fails the filter assertion; drawing the editor inside the grid fails the cell assertion |
 | 2026-10-14 | A scroll frame's cost, and whether lighter cell text lowers it | `sample` of 1,500 scroll frames on Person, `release-fast`; then cell text drawn as one styled element instead of a `Label`, measured against the old build interleaved, three rounds each | A scroll costs 6 ms of main-thread CPU, inside a 120 Hz frame. The table's own code is 7% of it; GPUI's layout (40%), element layout requests (24%) and paint (25%) of the visible rows are the rest. Lighter cell text changed nothing measurable (5.9 to 6.6 ms before, 5.8 to 6.4 after), so it was not kept; a lower cost needs fewer elements per row, such as drawing a row's text without an element per cell |
 | 2026-10-14 | A row draws only the columns in view | Snapshot tool, `release-fast`, Person (10 columns, about 6.5 in view at 1440 px), 300 scroll frames at 1440×900 and 1440×1400, against the build before, interleaved, three rounds; renders after → nine times and six times; headless `rows_draw_only_the_columns_in_view` | Main-thread CPU a frame: 6.1 → 5.0 ms at 1440×900, 9.4–10.3 → 7.6 ms at 1440×1400. Every column that shows was drawn, including one half under the pinned column. The query result grid, which draws plain text cells without `ui::Table`, costs about the same per cell; what the table paid for was cells out of view |
+| 2026-10-17 | A delete takes its dependents, says so, and can be undone | `gq_language` `deletes_take_many_ids_and_find_the_sources_that_need_them`; `graph_store` `dependents_follow_the_chain_of_required_relationships` (company → person → badge, every read held at the pin, an optional relationship never read), `undo_is_known_before_the_delete`, `a_plan_deletes_every_type_in_one_mutation`; `studio_workspace` `a_delete_that_can_be_put_back_offers_undo`; on a scratch OmniGraph 0.13 graph (`WorksAt @card(1..)`, `Holds @card(1..1)`): `delete Company` alone, then the planned delete, then the undo as one insert mutation; offscreen snapshots: Company, ⌘⌫ on Acme, ↵, then Undo, with CLI reads after each | Alone: refused, "@card violation on edge WorksAt: source 'ada' has 0 edges (min 1)". The dialog listed Ada (needs WorksAt) and b-ada (needs Holds); ↵ deleted 3 nodes and 4 relationships in one commit, Bob kept his Beta job, and the one toast read "Delete Company Acme and 2 that needed them · committed to main" with Undo. Undo committed once more and the CLI read every node and all four `WorksAt` back; the table showed "Newer data · Refresh" |
 | 2026-10-14 | A wider grid draws the columns its new width shows in the frame that widens it | `type_table` `rows_draw_only_the_columns_in_view` extended: the window widened from about 1,730 px of scrolled columns to 5,810, then the columns the rows drew read in that frame, with the fix that asked for a second frame removed | Every column drawn in the frame of the resize: Zed's header row tracks the same scroll handle and is laid out before the list picks its rows' columns. A test with the extra frame disabled passed the same, so the extra frame was not kept |
 | 2026-10-14 | Grouping by a neighbour's property and by an end's property | `gq_language` `rows_group_by_a_neighbours_or_an_ends_property` (for every relationship of every dev node type and every groupable property of the other type: the counts, and pages and counts narrowed to a value and to "no value", compile; for both ends of every dev edge the same), `group_keys_name_one_kind_each`; `type_table` `a_neighbours_property_narrows_by_its_value_and_an_end_has_no_value_in_the_row`, `rows_group_by_a_neighbours_or_an_ends_property` (the menu's keys and labels on Person and WorksAt); offscreen snapshots on the dev server: Person, Group, the `worksAt Company` submenu, city; scrolled to the end; WorksAt, Group, `to Company`, city; and the same counts read with curl | Submenus for `contributes Project`, `knows Person`, `worksAt Company` and `← knows Person`, each with its arrow; Berlin 9, Lisbon 9, London 46, San Francisco 46, Tokyo 58, Toronto 35, "No city" 38 of 200 people, as curl counted; WorksAt by `to Company.city`: Berlin 9, Lisbon 9, London 49, and 7 edges to companies with no city |
 

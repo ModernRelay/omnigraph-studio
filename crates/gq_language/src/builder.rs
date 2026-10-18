@@ -1881,6 +1881,88 @@ pub fn delete_node(
     })
 }
 
+/// Deletes nodes of one type by key, in one statement; their relationships go with them.
+pub fn delete_nodes(
+    schema: &SchemaModel,
+    type_name: &str,
+    ids: &[String],
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, type_name)?;
+    let mut params = Params::new();
+    let ids = params.add("ids", "[String]", Value::from(ids.to_vec()));
+    let text = format!(
+        "query studio_delete({sig}) {{\n  delete {ty} where @id in {ids}\n}}\n",
+        sig = params.signature(),
+        ty = node.name,
+    );
+    Ok(BuiltQuery {
+        name: "studio_delete".into(),
+        text,
+        params: params.values,
+    })
+}
+
+/// Deletes edges of one type by id, in one statement; their nodes stay.
+pub fn delete_edges(
+    schema: &SchemaModel,
+    edge_name: &str,
+    ids: &[String],
+) -> Result<BuiltQuery, BuildError> {
+    let edge = edge(schema, edge_name)?;
+    let mut params = Params::new();
+    let ids = params.add("ids", "[String]", Value::from(ids.to_vec()));
+    let text = format!(
+        "query studio_delete_edges({sig}) {{\n  delete {ty} where @id in {ids}\n}}\n",
+        sig = params.signature(),
+        ty = edge.name,
+    );
+    Ok(BuiltQuery {
+        name: "studio_delete_edges".into(),
+        text,
+        params: params.values,
+    })
+}
+
+/// The sources that need `edge` and would be left with fewer than its minimum (`@card(n..)`)
+/// once the targets `gone` are deleted: a source with at least one such edge into `gone`
+/// whose edges to anything else number below the minimum. Sources in `done` (already to be
+/// deleted) are left out. Columns: `id`, then `label` when the source type has one; at most
+/// `limit` rows. An edge without a minimum has none.
+pub fn required_dependents(
+    schema: &SchemaModel,
+    edge_name: &str,
+    gone: &[String],
+    done: &[String],
+    limit: u32,
+) -> Result<BuiltQuery, BuildError> {
+    let edge = edge(schema, edge_name)?;
+    let source = node(schema, &edge.from)?;
+    let target = node(schema, &edge.to)?;
+    let mut params = Params::new();
+    let gone = params.add("gone", "[String]", Value::from(gone.to_vec()));
+    let done = params.add("done", "[String]", Value::from(done.to_vec()));
+    let least = params.add("least", "I64", Value::from(edge.min));
+    let mut columns = vec!["$m.@id as id".to_owned()];
+    if let Some(label) = source.label_property()
+        && Some(label) != source.key.as_deref()
+    {
+        columns.push(format!("$m.{label} as label"));
+    }
+    let hop = edge.traversal();
+    let text = format!(
+        "query studio_required_dependents({sig}) {{\n  match {{\n    $m: {from}\n    not ($m.@id in {done})\n    exists {{ $t: {to}  $m {hop} $t  $t.@id in {gone} }}\n    count {{ $o: {to}  $m {hop} $o  not ($o.@id in {gone}) }} < {least}\n  }}\n  return {{ {columns} }}\n  order {{ $m.@id asc }}\n  limit {limit}\n}}\n",
+        sig = params.signature(),
+        from = source.name,
+        to = target.name,
+        columns = columns.join(", "),
+    );
+    Ok(BuiltQuery {
+        name: "studio_required_dependents".into(),
+        text,
+        params: params.values,
+    })
+}
+
 /// Inserts one edge between two existing nodes with the given property values. An unkeyed edge
 /// gets a new id: a `.gq` insert cannot supply one.
 pub fn insert_edge(
@@ -2028,6 +2110,63 @@ mod tests {
             query.text,
             result.diagnostics
         );
+    }
+
+    /// A graph whose relationships need their targets: every person works somewhere, and a
+    /// badge belongs to exactly one person.
+    const REQUIRED: &str = "node Company {\n  slug: String @key\n  name: String\n}\n\
+        node Person {\n  slug: String @key\n  name: String\n}\n\
+        node Badge {\n  slug: String @key\n}\n\
+        edge WorksAt: Person -> Company @card(1..)\n\
+        edge Holds: Badge -> Person @card(1..1)\n\
+        edge Knows: Person -> Person @card(0..)\n";
+
+    fn assert_compiles_in(schema: &SchemaModel, query: &BuiltQuery) {
+        let result = check(schema, &query.text);
+        assert!(
+            result.diagnostics.is_empty(),
+            "generated query does not type-check:\n{}\n{:?}",
+            query.text,
+            result.diagnostics
+        );
+    }
+
+    /// Deletes by many ids, and the read of the sources a delete would leave below an edge's
+    /// minimum, type-check; the minimum comes from the schema.
+    #[test]
+    fn deletes_take_many_ids_and_find_the_sources_that_need_them() {
+        let schema = SchemaModel::parse(REQUIRED).unwrap();
+        assert_eq!(schema.edge("WorksAt").unwrap().min, 1);
+        assert_eq!(schema.edge("Knows").unwrap().min, 0);
+        let ids = ["acme".to_owned(), "beta".to_owned()];
+        let nodes = delete_nodes(&schema, "Company", &ids).unwrap();
+        assert_compiles_in(&schema, &nodes);
+        assert!(
+            nodes.text.contains("delete Company where @id in $ids"),
+            "{}",
+            nodes.text
+        );
+        assert_eq!(nodes.params["ids"], json!(["acme", "beta"]));
+        assert_compiles_in(&schema, &delete_edges(&schema, "Knows", &ids).unwrap());
+
+        let dependents =
+            required_dependents(&schema, "WorksAt", &ids, &["bob".to_owned()], 1001).unwrap();
+        assert_compiles_in(&schema, &dependents);
+        assert_eq!(dependents.params["least"], json!(1));
+        assert!(
+            dependents.text.contains("$m.name as label"),
+            "{}",
+            dependents.text
+        );
+        // A badge has no label but its key.
+        let badges = required_dependents(&schema, "Holds", &ids, &[], 1001).unwrap();
+        assert_compiles_in(&schema, &badges);
+        assert!(!badges.text.contains("as label"), "{}", badges.text);
+        assert_compiles_in(
+            &schema,
+            &required_dependents(&schema, "Knows", &ids, &[], 10).unwrap(),
+        );
+        assert!(delete_nodes(&schema, "Nope", &ids).is_err());
     }
 
     #[test]

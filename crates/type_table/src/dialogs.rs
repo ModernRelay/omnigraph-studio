@@ -1,7 +1,7 @@
 //! Insert-row and delete-row dialogs (spec 004), for nodes and edges. Each names the branch it
-//! writes to; a node delete is confirmed by typing the row's key, and every delete is bound to
-//! the commit the table was read at (constitution IV). None retries; a refused or unknown
-//! outcome keeps the form.
+//! writes to; a delete lists everything it removes, is confirmed with ↵ and offers Undo, and is
+//! bound to the commit the table was read at (constitution IV). None retries; a refused or
+//! unknown outcome keeps the form.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -13,7 +13,8 @@ use gpui::{
     Task, WeakEntity, Window,
 };
 use gq_language::{Property, ScalarKind, SchemaModel, builder};
-use graph_store::GraphSession;
+use graph_store::deletes::{self, DeletePlan};
+use graph_store::{DraftKey, FollowUp, GraphSession, Loadable};
 use serde_json::{Map, Value};
 use ui::prelude::*;
 
@@ -894,23 +895,52 @@ impl Render for InsertEdgeModal {
     }
 }
 
-/// Deleting one node, confirmed by typing its key, or one edge, confirmed with the button: an
-/// edge's id is generated and removing it leaves both nodes. Bound to the commit the table was
-/// read at, so a branch that moved meanwhile refuses the delete.
+/// A row the delete dialog removes: its id, its label when its type has one, and an edge's
+/// source and target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteTarget {
+    pub id: String,
+    pub label: Option<String>,
+    pub endpoints: Option<(String, String)>,
+}
+
+impl DeleteTarget {
+    fn name(&self) -> String {
+        match (&self.endpoints, &self.label) {
+            (Some((from, to)), _) => format!("{from} → {to}"),
+            (None, Some(label)) if !label.is_empty() => label.clone(),
+            _ => self.id.clone(),
+        }
+    }
+}
+
+/// How many dependents the dialog names before "and N more".
+const DEPENDENTS_NAMED: usize = 6;
+
+/// Deleting rows (spec 004, constitution IV): the picked rows, or the cursor's. Before it is
+/// sent the dialog reads what else the delete removes: a node's relationships go with it, and
+/// a node that needs one of them (`@card(n..)`) goes too, listed here, all in one commit bound
+/// to the commit the table was read at. ↵ deletes, and the toast offers Undo; typing the key
+/// is asked for only when Undo could not bring it all back.
 pub struct DeleteRowModal {
     table: WeakEntity<TypeTable>,
     session: Entity<GraphSession>,
     schema: Arc<SchemaModel>,
     type_name: String,
     branch: String,
-    id: String,
-    /// An edge's source and target ids; `None` for a node.
-    endpoints: Option<(String, String)>,
+    targets: Vec<DeleteTarget>,
+    /// Relationships rather than nodes: nothing depends on them.
+    edges: bool,
     if_commit: Option<String>,
+    /// What a node delete removes, read before it is offered.
+    plan: Loadable<DeletePlan>,
+    /// Why Undo could not restore this delete, once known; typing is then asked for.
+    undo_unavailable: Option<String>,
     confirm: Entity<Editor>,
     notice: Option<Notice>,
     saving: bool,
     focus_handle: FocusHandle,
+    _plan: Option<Task<()>>,
     _subscription: Subscription,
 }
 
@@ -925,9 +955,10 @@ impl ModalView for DeleteRowModal {
 
 impl Focusable for DeleteRowModal {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        match self.endpoints {
-            Some(_) => self.focus_handle.clone(),
-            None => self.confirm.focus_handle(cx),
+        if self.undo_unavailable.is_some() {
+            self.confirm.focus_handle(cx)
+        } else {
+            self.focus_handle.clone()
         }
     }
 }
@@ -939,16 +970,17 @@ impl DeleteRowModal {
         session: Entity<GraphSession>,
         schema: Arc<SchemaModel>,
         type_name: String,
-        id: String,
-        endpoints: Option<(String, String)>,
+        targets: Vec<DeleteTarget>,
         if_commit: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let branch = session.read(cx).branch.clone();
+        let edges = schema.edge(&type_name).is_some();
+        let phrase = Self::phrase_for(&targets);
         let confirm = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text(&id, window, cx);
+            editor.set_placeholder_text(&phrase, window, cx);
             editor
         });
         let subscription = cx.subscribe(&confirm, |this: &mut Self, _, event: &EditorEvent, cx| {
@@ -963,42 +995,116 @@ impl DeleteRowModal {
                 cx.notify();
             }
         });
-        Self {
+        let mut this = Self {
             table,
             session,
             schema,
             type_name,
             branch,
-            id,
-            endpoints,
+            targets,
+            edges,
             if_commit,
+            plan: Loadable::NotLoaded,
+            undo_unavailable: None,
             confirm,
             notice: None,
             saving: false,
             focus_handle: cx.focus_handle(),
+            _plan: None,
             _subscription: subscription,
+        };
+        if edges {
+            this.undo_unavailable = this.schema.edge(&this.type_name).and_then(|edge| {
+                edge.properties.iter().find(|p| !p.projectable()).map(|p| {
+                    format!(
+                        "{}.{} holds {} values, which Undo cannot restore.",
+                        edge.name, p.name, p.base_type
+                    )
+                })
+            });
+        } else {
+            this.start_plan(window, cx);
+        }
+        this
+    }
+
+    /// Reads what deleting the nodes takes with them.
+    fn start_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.plan = Loadable::Loading;
+        let ids = self.targets.iter().map(|t| t.id.clone()).collect();
+        let plan = deletes::plan_node_delete(
+            self.session.clone(),
+            self.schema.clone(),
+            self.type_name.clone(),
+            ids,
+            self.if_commit.clone(),
+            cx,
+        );
+        self._plan = Some(cx.spawn_in(window, async move |this, cx| {
+            let plan = plan.await;
+            this.update_in(cx, |this, window, cx| {
+                match plan {
+                    Ok(plan) => {
+                        this.undo_unavailable = plan.undo_unavailable.clone();
+                        this.plan = Loadable::Loaded(plan);
+                        if this.undo_unavailable.is_some() {
+                            window.focus(&this.confirm.focus_handle(cx), cx);
+                        }
+                    }
+                    Err(error) => this.plan = Loadable::Failed(error.to_string()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// What is typed to confirm a delete Undo could not restore: the key of one row, or
+    /// `delete N` for several.
+    fn phrase_for(targets: &[DeleteTarget]) -> String {
+        match targets {
+            [one] => one.id.clone(),
+            many => format!("delete {}", many.len()),
         }
     }
 
+    fn ready(&self) -> bool {
+        self.edges || matches!(self.plan, Loadable::Loaded(_))
+    }
+
     fn confirmed(&self, cx: &App) -> bool {
-        self.endpoints.is_some() || self.confirm.read(cx).text(cx).trim() == self.id
+        self.undo_unavailable.is_none()
+            || self.confirm.read(cx).text(cx).trim() == Self::phrase_for(&self.targets)
+    }
+
+    /// The deleted rows in a few words: "Acme", "3 Company rows".
+    fn what(&self) -> String {
+        match self.targets.as_slice() {
+            [one] => one.name(),
+            many if self.edges => format!("{} {} relationships", many.len(), self.type_name),
+            many => format!("{} {} rows", many.len(), self.type_name),
+        }
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving {
+        if self.saving || !self.ready() {
             return;
         }
         if !self.confirmed(cx) {
             self.notice = Some(Notice::new(
                 Tone::Invalid,
-                format!("Type {} to confirm.", self.id),
+                format!("Type {} to confirm.", Self::phrase_for(&self.targets)),
             ));
             cx.notify();
             return;
         }
-        let built = match self.endpoints {
-            Some(_) => builder::delete_edge(&self.schema, &self.type_name, &self.id),
-            None => builder::delete_node(&self.schema, &self.type_name, &self.id),
+        let ids: Vec<String> = self.targets.iter().map(|t| t.id.clone()).collect();
+        let (built, dependents) = match &self.plan {
+            Loadable::Loaded(plan) => (plan.query(&self.schema), plan.dependents.len()),
+            _ => (
+                builder::delete_edges(&self.schema, &self.type_name, &ids),
+                0,
+            ),
         };
         let query = match built {
             Ok(query) => query,
@@ -1008,30 +1114,68 @@ impl DeleteRowModal {
                 return;
             }
         };
+        // Every node the delete removes, for their drafts; the table's own rows leave it.
+        let removed: Vec<(String, String)> = match &self.plan {
+            Loadable::Loaded(plan) => plan
+                .nodes
+                .iter()
+                .flat_map(|(t, ids)| ids.iter().map(move |id| (t.clone(), id.clone())))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let own: Vec<String> = match &self.plan {
+            Loadable::Loaded(plan) => plan
+                .nodes
+                .iter()
+                .filter(|(t, _)| *t == self.type_name)
+                .flat_map(|(_, ids)| ids.clone())
+                .collect(),
+            _ => ids,
+        };
+        let what = match dependents {
+            0 => self.what(),
+            n => format!("{} and {n} that needed them", self.what()),
+        };
+        let description = format!("Delete {} {}", self.type_name, what);
         self.saving = true;
         self.notice = None;
         cx.notify();
-        let description = match &self.endpoints {
-            Some((from, to)) => format!("Delete {} {from} → {to}", self.type_name),
-            None => format!("Delete {} {}", self.type_name, self.id),
-        };
-        let if_commit = self.if_commit.clone();
+        // The outcome's toast offers Undo when Undo can put it all back.
+        let follow_up = self
+            .undo_unavailable
+            .is_none()
+            .then_some(FollowUp::UndoDelete);
         let write = self.session.update(cx, |session, cx| {
-            session.write(&query, if_commit, description, cx)
+            session.write_with(&query, self.if_commit.clone(), description, follow_up, cx)
         });
         let table = self.table.clone();
         table.update(cx, |table, _| table.save_started()).ok();
-        let branch = self.branch.clone();
-        let id = self.id.clone();
+        let (branch, session) = (self.branch.clone(), self.session.clone());
+        let several = self.targets.len() > 1 || dependents > 0;
         cx.spawn_in(window, async move |this, cx| {
             let outcome = write.await;
             let result = save_result(&outcome, &branch);
             let moved = matches!(&outcome, graph_client::WriteOutcome::Refused(error)
                 if error.status == 412 || error.body.precondition_failure.is_some());
+            if let SaveResult::Saved { .. } = &result {
+                session
+                    .update(cx, |session, cx| {
+                        let keys: Vec<DraftKey> = session
+                            .drafts()
+                            .filter(|(key, _)| {
+                                removed.iter().any(|(t, id)| key.type_name == *t && key.id == *id)
+                            })
+                            .map(|(key, _)| key.clone())
+                            .collect();
+                        for key in &keys {
+                            session.remove_draft(key, cx);
+                        }
+                    });
+            }
             table
                 .update(cx, |table, cx| {
                     if let SaveResult::Saved { commit, parent } = &result {
-                        table.row_deleted(&id, commit, parent.as_deref(), cx);
+                        table.rows_deleted(&own, commit, parent.as_deref(), cx);
                     } else if moved {
                         table.branch_moved(cx);
                     }
@@ -1045,7 +1189,11 @@ impl DeleteRowModal {
                     SaveResult::NoMatch => {
                         this.notice = Some(Notice::new(
                             Tone::Conflict,
-                            "Nothing was deleted: it no longer exists at the head of the branch.",
+                            if several {
+                                "Nothing was deleted: they no longer exist at the head of the branch."
+                            } else {
+                                "Nothing was deleted: it no longer exists at the head of the branch."
+                            },
                         ));
                     }
                     SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
@@ -1064,27 +1212,127 @@ impl DeleteRowModal {
             cx.emit(DismissEvent);
         }
     }
+
+    /// What else goes: "Also deletes 2 nodes that need it:", then their names and the
+    /// relationship each needs.
+    fn render_plan(&self, cx: &App) -> Option<AnyElement> {
+        match &self.plan {
+            Loadable::NotLoaded => None,
+            Loadable::Loading => Some(
+                h_flex()
+                    .gap_2()
+                    .child(studio_ui::ds::spinner())
+                    .child(
+                        Label::new("Finding what depends on it…")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .into_any_element(),
+            ),
+            Loadable::Failed(error) => Some(
+                Label::new(format!("Studio could not read what depends on it. {error}"))
+                    .size(LabelSize::Small)
+                    .color(Color::Error)
+                    .into_any_element(),
+            ),
+            Loadable::Loaded(plan) if plan.dependents.is_empty() => None,
+            Loadable::Loaded(plan) => {
+                let counts = plan
+                    .dependent_counts()
+                    .into_iter()
+                    .map(|(t, n)| format!("{n} {t}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let it = if self.targets.len() == 1 {
+                    "it"
+                } else {
+                    "them"
+                };
+                let hidden = plan.dependents.len().saturating_sub(DEPENDENTS_NAMED);
+                let list = studio_ui::ds::row_list()
+                    .bg(cx.theme().colors().editor_background)
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .children(plan.dependents.iter().take(DEPENDENTS_NAMED).map(|d| {
+                        h_flex()
+                            .h(px(studio_ui::ds::size::SIDEBAR_ROW))
+                            .px(px(studio_ui::ds::space::MD))
+                            .gap(px(studio_ui::ds::space::MD))
+                            .child(studio_ui::type_swatch(&d.type_name))
+                            .child(
+                                div().min_w_0().flex_1().child(
+                                    Label::new(d.label.clone().unwrap_or_else(|| d.id.clone()))
+                                        .size(LabelSize::Small)
+                                        .single_line()
+                                        .truncate(),
+                                ),
+                            )
+                            .child(
+                                Label::new(format!("needs {}", d.edge))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .single_line(),
+                            )
+                    }))
+                    .when(hidden > 0, |list| {
+                        list.child(
+                            div().px(px(studio_ui::ds::space::MD)).child(
+                                Label::new(format!("and {hidden} more"))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                    });
+                Some(
+                    v_flex()
+                        .gap_2()
+                        .child(
+                            Label::new(format!(
+                                "Also deletes {counts} that cannot exist without {it}:"
+                            ))
+                            .size(LabelSize::Small),
+                        )
+                        .child(list)
+                        .into_any_element(),
+                )
+            }
+        }
+    }
 }
 
 impl Render for DeleteRowModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let ready = self.ready();
         let confirmed = self.confirmed(cx);
         let saving = self.saving;
-        let (headline, explanation) = match &self.endpoints {
-            Some((from, to)) => (
-                format!("Delete {} {from} → {to}", self.type_name),
-                format!(
-                    "This removes this {} from {}. Both nodes stay.",
-                    self.type_name, self.branch
-                ),
+        let headline = format!("Delete {}", self.what());
+        let explanation = if self.edges {
+            format!("Removes it from {}. Its nodes stay.", self.branch)
+        } else {
+            format!("Removes it and its relationships from {}.", self.branch)
+        };
+        let explanation = if self.targets.len() > 1 {
+            explanation
+                .replace("Removes it", "Removes them")
+                .replace("Its nodes", "Their nodes")
+        } else {
+            explanation
+        };
+        let undo_note = match (&self.undo_unavailable, ready) {
+            (Some(reason), _) => Some(
+                Label::new(format!(
+                    "Undo cannot restore this: {reason} Type {} to confirm.",
+                    Self::phrase_for(&self.targets)
+                ))
+                .size(LabelSize::Small)
+                .color(Color::Warning),
             ),
-            None => (
-                format!("Delete {}", self.id),
-                format!(
-                    "This removes the {} and its relationships from {}. Type its key to confirm.",
-                    self.type_name, self.branch
-                ),
+            (None, true) => Some(
+                Label::new("You can undo this right after.")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
             ),
+            (None, false) => None,
         };
         frame(cx)
             .key_context("DeleteRowModal")
@@ -1094,8 +1342,13 @@ impl Render for DeleteRowModal {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(Headline::new(headline).size(HeadlineSize::Small))
-                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .overflow_hidden()
+                            .child(Headline::new(headline).size(HeadlineSize::Small)),
+                    )
                     .child(write_target(&self.branch, cx)),
             )
             .child(
@@ -1103,7 +1356,9 @@ impl Render for DeleteRowModal {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
-            .when(self.endpoints.is_none(), |d| {
+            .children(self.render_plan(cx))
+            .children(undo_note)
+            .when(self.undo_unavailable.is_some(), |d| {
                 d.child(field_box(&self.confirm, false, cx))
             })
             .children(self.notice.clone().map(|notice| {
@@ -1126,10 +1381,8 @@ impl Render for DeleteRowModal {
                             if saving { "Deleting…" } else { "Delete" },
                         )
                         .style(ButtonStyle::Tinted(ui::TintColor::Error))
-                        .disabled(saving || !confirmed)
-                        .when(self.endpoints.is_some(), |button| {
-                            button.key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
-                        })
+                        .disabled(saving || !ready || !confirmed)
+                        .key_binding(ui::KeyBinding::for_action(&menu::Confirm, cx))
                         .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
             )

@@ -25,7 +25,7 @@ use gpui::{App, AppContext as _, Context, Entity, Window};
 use gq_language::{Filter, FilterOp};
 use serde_json::Value;
 use studio_actions::graph::{
-    BrowseType, OpenBlob, OpenNode, OpenNodePage, OpenTextEditor, OpenType, PeekNode,
+    BrowseType, OpenBlob, OpenNode, OpenNodePage, OpenTextEditor, OpenType, PeekNode, UndoDelete,
 };
 use studio_workspace::{PanelPosition, ToastKind, Workspace};
 use ui::IconName;
@@ -149,6 +149,9 @@ pub fn init(cx: &mut App) {
             types.into(),
             cx,
         );
+        workspace.register_action(|workspace, action: &UndoDelete, _window, cx| {
+            undo_delete(workspace, action, cx);
+        });
         workspace.register_action(|workspace, action: &OpenBlob, window, cx| {
             open_blob(workspace, action, window, cx);
         });
@@ -363,4 +366,58 @@ pub fn open_blob(
     workspace.open_item(key, window, cx, move |window, cx| {
         BlobView::new(session, cell, snapshot, window, cx)
     })
+}
+
+/// Undo on a delete's toast (spec 004): reads what the delete commit removed and inserts it
+/// all again in one commit, bound to that commit, so it applies only while the branch still
+/// stands where the delete left it. Nothing is retried. The write's outcome toasts as every
+/// write's does; this says only why nothing was sent.
+fn undo_delete(workspace: &mut Workspace, action: &UndoDelete, cx: &mut Context<Workspace>) {
+    let Some(session) = workspace.session().cloned() else {
+        return;
+    };
+    let (branch, schema) = {
+        let session = session.read(cx);
+        (session.branch.clone(), session.schema_model())
+    };
+    if branch != action.branch {
+        workspace.show_toast(
+            ToastKind::Error,
+            format!(
+                "Nothing was restored: the delete was on {}. Switch to it to undo.",
+                action.branch
+            ),
+            cx,
+        );
+        return;
+    }
+    let Some(schema) = schema else {
+        return;
+    };
+    let query =
+        graph_store::deletes::undo_query(session.clone(), schema, action.commit.clone(), cx);
+    let (commit, what) = (action.commit.clone(), action.what.clone());
+    cx.spawn(async move |workspace, cx| {
+        let toast = |kind: ToastKind, message: String, cx: &mut gpui::AsyncApp| {
+            workspace
+                .update(cx, |workspace, cx| workspace.show_toast(kind, message, cx))
+                .ok();
+        };
+        let query = match query.await {
+            Ok(query) => query,
+            Err(reason) => {
+                toast(
+                    ToastKind::Error,
+                    format!("Nothing was restored. {reason}"),
+                    cx,
+                );
+                return;
+            }
+        };
+        let write = session.update(cx, |session, cx| {
+            session.write(&query, Some(commit), format!("Undo: {what}"), cx)
+        });
+        write.await;
+    })
+    .detach();
 }
