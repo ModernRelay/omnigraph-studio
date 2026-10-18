@@ -35,8 +35,8 @@ use ui::prelude::*;
 use ui::{HighlightedLabel, ListItem, ListItemSpacing};
 
 use found::{Answers, Found};
+use matching::humanize_action_name;
 use matching::{Candidate, Group, Ranked, rank};
-pub use matching::{humanize_action_name, normalize_query};
 use studio_workspace::ModalView;
 
 /// Registers the palette with every new workspace. Its keys (⌘K and ⌘⇧P, Ctrl elsewhere) come
@@ -495,6 +495,9 @@ impl CommandPalette {
     }
 
     fn set_nodes(&mut self, found: Vec<(String, Vec<Found>)>, cx: &mut Context<Self>) {
+        // The row the person moved to stays theirs when the nodes come in: ↵ runs it, not the
+        // first row of the new list.
+        let selected = self.selected_key();
         self.rows.truncate(self.fixed);
         self.candidates.truncate(self.fixed);
         let found = found.into_iter().flat_map(|(type_name, rows)| {
@@ -519,6 +522,19 @@ impl CommandPalette {
             });
         }
         self.update_matches(cx);
+        if let Some(index) = selected.and_then(|key| {
+            self.matches
+                .iter()
+                .position(|ranked| self.candidates[ranked.index].key == key)
+        }) {
+            self.select(index, cx);
+        }
+    }
+
+    /// The key of the highlighted row's candidate.
+    fn selected_key(&self) -> Option<String> {
+        let ranked = self.matches.get(self.selected)?;
+        Some(self.candidates.get(ranked.index)?.key.clone())
     }
 
     /// Shows another scope, keeping the text.
@@ -560,12 +576,9 @@ impl CommandPalette {
     fn update_matches(&mut self, cx: &mut Context<Self>) {
         let query = self.query.read(cx).text(cx);
         let scope = self.mode.scope();
-        self.matches = rank(&self.candidates, &query, &recent::keys(cx))
-            .into_iter()
-            .filter(|ranked| {
-                scope.is_none_or(|scope| scope.includes(self.candidates[ranked.index].group))
-            })
-            .collect();
+        self.matches = rank(&self.candidates, &query, &recent::keys(cx), |candidate| {
+            scope.is_none_or(|scope| scope.includes(candidate.group))
+        });
         // The branch picker starts on the branch the window is on.
         self.selected = self
             .matches
@@ -871,9 +884,14 @@ fn add_type_rows(
     let types = schema
         .nodes
         .iter()
-        .map(|n| (n.name.clone(), "node"))
-        .chain(schema.edges.iter().map(|e| (e.name.clone(), "edge")));
-    for (name, kind) in types {
+        .map(|n| (n.name.clone(), "node", graph_store::EntityKind::Node))
+        .chain(
+            schema
+                .edges
+                .iter()
+                .map(|e| (e.name.clone(), "edge", graph_store::EntityKind::Edge)),
+        );
+    for (name, kind, entity) in types {
         let action = OpenType {
             type_name: name.clone(),
             at_commit: None,
@@ -890,7 +908,7 @@ fn add_type_rows(
             group: Group::Type,
         });
         rows.push(Row::Type {
-            count: session.count_of(&name),
+            count: session.count_of(entity, &name),
             action: Box::new(action),
             kind,
         });
@@ -1150,6 +1168,30 @@ mod tests {
         });
         assert!(cx.debug_bounds("palette-searching").is_none());
         assert!(cx.debug_bounds("palette-count").is_some());
+
+        // Nodes that come in after the person moved keep the row they moved to.
+        palette.update(cx, |palette, cx| {
+            let found = |ids: &[&str]| {
+                vec![(
+                    "Person".to_owned(),
+                    ids.iter()
+                        .map(|id| Found {
+                            id: (*id).to_owned(),
+                            label: Some(format!("Ada {id}")),
+                        })
+                        .collect(),
+                )]
+            };
+            palette.set_nodes(found(&["p1", "p2"]), cx);
+            let p2 = palette
+                .matches
+                .iter()
+                .position(|ranked| palette.candidates[ranked.index].key == "node:Person:p2")
+                .unwrap();
+            palette.select(p2, cx);
+            palette.set_nodes(found(&["p0", "p1", "p2"]), cx);
+            assert_eq!(palette.selected_key().as_deref(), Some("node:Person:p2"));
+        });
     }
 
     #[test]

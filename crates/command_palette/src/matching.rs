@@ -96,92 +96,112 @@ const WORD_START: f32 = 6.0;
 const CONSECUTIVE: f32 = 4.0;
 const GAP: f32 = 0.2;
 
-/// Matches `query` as a case-insensitive subsequence of `label`, choosing the alignment with
-/// the best score. Spaces in the query are skipped, so `open type` matches `Graph: open type`.
-/// `None` when some query character does not appear in order.
-pub fn fuzzy_match(query: &str, label: &str) -> Option<FuzzyMatch> {
-    let query: Vec<char> = query
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .flat_map(char::to_lowercase)
-        .collect();
-    let label_chars: Vec<char> = label.chars().collect();
-    let lower: Vec<char> = label_chars
-        .iter()
-        .map(|c| c.to_lowercase().next().unwrap_or(*c))
-        .collect();
-    if query.is_empty() {
-        return Some(FuzzyMatch {
-            score: 0.0,
-            positions: Vec::new(),
-        });
+/// A query prepared once for matching many labels: lowercase, without spaces.
+pub struct Pattern(Vec<char>);
+
+impl Pattern {
+    pub fn new(query: &str) -> Self {
+        Self(
+            query
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .flat_map(char::to_lowercase)
+                .collect(),
+        )
     }
-    let n = lower.len();
-    let m = query.len();
-    if m > n {
-        return None;
-    }
-    let word_start = |j: usize| {
-        j == 0 || {
-            let p = label_chars[j - 1];
-            !p.is_alphanumeric() || (p.is_lowercase() && label_chars[j].is_uppercase())
+
+    /// Matches the query as a case-insensitive subsequence of `label`, choosing the alignment
+    /// with the best score. Spaces in the query are skipped, so `open type` matches
+    /// `Graph: open type`. `None` when some query character does not appear in order.
+    pub fn find(&self, label: &str) -> Option<FuzzyMatch> {
+        let query = &self.0;
+        if query.is_empty() {
+            return Some(FuzzyMatch {
+                score: 0.0,
+                positions: Vec::new(),
+            });
         }
-    };
-    const NONE: f32 = f32::NEG_INFINITY;
-    // score[i][j]: best score with query[i] matched at label[j]; back[i][j]: where query[i-1] is.
-    let mut score = vec![vec![NONE; n]; m];
-    let mut back = vec![vec![usize::MAX; n]; m];
-    for j in 0..n {
-        if lower[j] == query[0] {
-            score[0][j] =
-                MATCH + if word_start(j) { WORD_START } else { 0.0 } - GAP * j as f32 * 0.1;
+        let fold = |c: char| c.to_lowercase().next().unwrap_or(c);
+        // Most labels do not hold the query in order at all: that is found without allocating.
+        let mut rest = query.iter().peekable();
+        for c in label.chars() {
+            if rest.next_if(|q| **q == fold(c)).is_some() && rest.peek().is_none() {
+                break;
+            }
         }
-    }
-    for i in 1..m {
-        // Best of score[i-1][k] + GAP * k over k <= j - 2, for non-adjacent predecessors.
-        let mut best: (f32, usize) = (NONE, usize::MAX);
-        for j in 1..n {
-            if j >= 2 {
-                let k = j - 2;
-                let candidate = score[i - 1][k] + GAP * k as f32;
-                if candidate > best.0 {
-                    best = (candidate, k);
+        if rest.peek().is_some() {
+            return None;
+        }
+        let label_chars: Vec<char> = label.chars().collect();
+        let lower: Vec<char> = label_chars.iter().copied().map(fold).collect();
+        let n = lower.len();
+        let m = query.len();
+        let word_start = |j: usize| {
+            j == 0 || {
+                let p = label_chars[j - 1];
+                !p.is_alphanumeric() || (p.is_lowercase() && label_chars[j].is_uppercase())
+            }
+        };
+        const NONE: f32 = f32::NEG_INFINITY;
+        // score[i * n + j]: best score with query[i] matched at label[j]; back[i * n + j]: where
+        // query[i - 1] is.
+        let mut score = vec![NONE; m * n];
+        let mut back = vec![usize::MAX; m * n];
+        for j in 0..n {
+            if lower[j] == query[0] {
+                score[j] =
+                    MATCH + if word_start(j) { WORD_START } else { 0.0 } - GAP * j as f32 * 0.1;
+            }
+        }
+        for i in 1..m {
+            let (above, row) = score.split_at_mut(i * n);
+            let above = &above[(i - 1) * n..];
+            let row = &mut row[..n];
+            // Best of above[k] + GAP * k over k <= j - 2, for non-adjacent predecessors.
+            let mut best: (f32, usize) = (NONE, usize::MAX);
+            for j in 1..n {
+                if j >= 2 {
+                    let k = j - 2;
+                    let candidate = above[k] + GAP * k as f32;
+                    if candidate > best.0 {
+                        best = (candidate, k);
+                    }
+                }
+                if lower[j] != query[i] {
+                    continue;
+                }
+                let bonus = MATCH + if word_start(j) { WORD_START } else { 0.0 };
+                let adjacent = above[j - 1] + CONSECUTIVE;
+                let apart = best.0 - GAP * (j - 1) as f32;
+                if adjacent >= apart && adjacent > NONE {
+                    row[j] = adjacent + bonus;
+                    back[i * n + j] = j - 1;
+                } else if apart > NONE {
+                    row[j] = apart + bonus;
+                    back[i * n + j] = best.1;
                 }
             }
-            if lower[j] != query[i] {
-                continue;
-            }
-            let bonus = MATCH + if word_start(j) { WORD_START } else { 0.0 };
-            let adjacent = score[i - 1][j - 1] + CONSECUTIVE;
-            let apart = best.0 - GAP * (j - 1) as f32;
-            if adjacent >= apart && adjacent > NONE {
-                score[i][j] = adjacent + bonus;
-                back[i][j] = j - 1;
-            } else if apart > NONE {
-                score[i][j] = apart + bonus;
-                back[i][j] = best.1;
+        }
+        let (mut j, best) = score[(m - 1) * n..]
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s > NONE)
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(j, s)| (j, *s))?;
+        let bytes: Vec<usize> = label.char_indices().map(|(at, _)| at).collect();
+        let mut positions = vec![0; m];
+        for i in (0..m).rev() {
+            positions[i] = bytes[j];
+            if i > 0 {
+                j = back[i * n + j];
             }
         }
+        // Among equal matches, prefer the shorter label.
+        Some(FuzzyMatch {
+            score: best - n as f32 * 0.01,
+            positions,
+        })
     }
-    let (mut j, best) = score[m - 1]
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| **s > NONE)
-        .max_by(|a, b| a.1.total_cmp(b.1))
-        .map(|(j, s)| (j, *s))?;
-    let bytes: Vec<usize> = label.char_indices().map(|(at, _)| at).collect();
-    let mut positions = vec![0; m];
-    for i in (0..m).rev() {
-        positions[i] = bytes[j];
-        if i > 0 {
-            j = back[i][j];
-        }
-    }
-    // Among equal matches, prefer the shorter label.
-    Some(FuzzyMatch {
-        score: best - n as f32 * 0.01,
-        positions,
-    })
 }
 
 /// Which group a row belongs to; earlier groups come first when scores tie.
@@ -217,17 +237,24 @@ pub struct Ranked {
     pub positions: Vec<usize>,
 }
 
-/// Orders candidates for a query. With no query: recently run first (most recent first), then
-/// Studio's actions, types and the rest, each alphabetically. With a query: matches only, by
-/// score plus a bonus for recent use, then the same tie-breaks.
-pub fn rank(candidates: &[Candidate], query: &str, recent: &[String]) -> Vec<Ranked> {
+/// Orders the candidates `include` keeps for a query. With no query: recently run first (most
+/// recent first), then Studio's actions, types and the rest, each alphabetically. With a query:
+/// matches only, by score plus a bonus for recent use, then the same tie-breaks.
+pub fn rank(
+    candidates: &[Candidate],
+    query: &str,
+    recent: &[String],
+    include: impl Fn(&Candidate) -> bool,
+) -> Vec<Ranked> {
     let query = normalize_query(query);
+    let pattern = Pattern::new(&query);
     let recency = |key: &str| recent.iter().position(|r| r == key);
     let mut rows: Vec<(f32, Option<usize>, usize, Vec<usize>)> = candidates
         .iter()
         .enumerate()
+        .filter(|(_, candidate)| include(candidate))
         .filter_map(|(index, candidate)| {
-            let found = fuzzy_match(&query, &candidate.label)?;
+            let found = pattern.find(&candidate.label)?;
             let recent_at = recency(&candidate.key);
             let bonus = recent_at.map_or(0.0, |at| 4.0 * (1.0 - (at.min(20) as f32) / 20.0));
             Some((found.score + bonus, recent_at, index, found.positions))
@@ -265,6 +292,10 @@ pub fn remember(recent: &mut Vec<String>, key: &str, cap: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fuzzy_match(query: &str, label: &str) -> Option<FuzzyMatch> {
+        Pattern::new(query).find(label)
+    }
 
     #[test]
     fn action_names_are_humanized() {
@@ -356,7 +387,7 @@ mod tests {
         let candidates = candidates();
         let recent = vec!["studio::ToggleSidebar".to_owned()];
         assert_eq!(
-            labels(&rank(&candidates, "", &recent), &candidates),
+            labels(&rank(&candidates, "", &recent, |_| true), &candidates),
             [
                 "Studio: toggle sidebar",
                 "Graph: new query",
@@ -370,14 +401,20 @@ mod tests {
     fn a_query_ranks_by_score_with_a_bonus_for_recent_use() {
         let candidates = candidates();
         assert_eq!(
-            labels(&rank(&candidates, "se", &[]), &candidates)[0],
+            labels(&rank(&candidates, "se", &[], |_| true), &candidates)[0],
             "Editor: select all"
         );
         let recent = vec!["studio::ToggleSidebar".to_owned()];
-        let ranked = labels(&rank(&candidates, "s", &recent), &candidates);
+        let ranked = labels(&rank(&candidates, "s", &recent, |_| true), &candidates);
         assert_eq!(ranked[0], "Studio: toggle sidebar");
+        // A scope ranks only what it includes.
+        let types = |c: &Candidate| c.group == Group::Type;
         assert_eq!(
-            labels(&rank(&candidates, "pers", &[]), &candidates),
+            labels(&rank(&candidates, "", &recent, types), &candidates),
+            ["Person"]
+        );
+        assert_eq!(
+            labels(&rank(&candidates, "pers", &[], |_| true), &candidates),
             ["Person"]
         );
     }
