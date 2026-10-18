@@ -25,5 +25,5 @@ pub use params::param_value;
 pub use parts::{PartKind, QueryPart, operator_parts, query_parts};
 pub use schema::{
     Direction, EdgeType, NodeType, Property, RelationshipGroup, ScalarKind, SchemaModel,
-    traversal_name,
+    traversal_name, traversal_token,
 };

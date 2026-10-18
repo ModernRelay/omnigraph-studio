@@ -114,9 +114,9 @@ pub struct EdgeType {
 }
 
 impl EdgeType {
-    /// The traversal spelling: the edge name with a lowercase first letter (`worksAt`).
+    /// How a query names the edge in a traversal ([`traversal_token`]).
     pub fn traversal(&self) -> String {
-        traversal_name(&self.name)
+        traversal_token(&self.name)
     }
 }
 
@@ -305,12 +305,26 @@ fn in_declared_order(file: &SchemaFile, type_name: &str, properties: &mut [Prope
     });
 }
 
-/// `WorksAt` → `worksAt`.
+/// `WorksAt` → `worksAt`: the edge as a relationship reads.
 pub fn traversal_name(edge: &str) -> String {
     let mut chars = edge.chars();
     match chars.next() {
         Some(first) => first.to_lowercase().chain(chars).collect(),
         None => String::new(),
+    }
+}
+
+/// The words a query reserves, which a bare traversal may not be.
+const RESERVED: [&str; 6] = ["and", "or", "not", "is", "null", "in"];
+
+/// How a query names the edge in a traversal: its [`traversal_name`], quoted when that is a
+/// reserved word (`In` → `"in"`), as GQ spells such an edge.
+pub fn traversal_token(edge: &str) -> String {
+    let name = traversal_name(edge);
+    if RESERVED.contains(&name.as_str()) {
+        format!("\"{name}\"")
+    } else {
+        name
     }
 }
 
@@ -411,5 +425,8 @@ pub(crate) mod tests {
             other_type: "Person".into(),
         }));
         assert_eq!(traversal_name("WorksAt"), "worksAt");
+        assert_eq!(traversal_token("WorksAt"), "worksAt");
+        assert_eq!(traversal_token("In"), "\"in\"");
+        assert_eq!(traversal_name("In"), "in");
     }
 }

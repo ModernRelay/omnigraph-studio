@@ -1,11 +1,11 @@
 //! Diagnostics and result types for `.gq` source, from `omnigraph-compiler` (spec 007).
 
-use omnigraph_compiler::describe_query_operation;
 use omnigraph_compiler::query::ast::Expr;
 use omnigraph_compiler::query::ast::FileBody;
 use omnigraph_compiler::query::diagnostic::QueryDiagnostic;
 use omnigraph_compiler::query::parser::parse_query_diagnostic;
 use omnigraph_compiler::query::typecheck::{BoundVariable, CheckedQuery, typecheck_query_decl};
+use omnigraph_compiler::{QueryResultFieldDescriptor, QueryValueKind, describe_query_operation};
 
 use crate::schema::SchemaModel;
 
@@ -56,12 +56,37 @@ impl Diagnostic {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultColumn {
     pub name: String,
-    /// The compiler's value kind, for example `String`, `I64`, `Date`, `Node`.
+    /// The value's kind as a type reads: `String`, `Int`, `[Date]`, `Vector(3)`, or the node
+    /// type of a whole node.
     pub kind: String,
     pub nullable: bool,
     /// The node type of a column that returns a whole node (`return { $p }`), from the
     /// variable's binding.
     pub node_type: Option<String>,
+}
+
+/// A result column's kind as a type reads: `String`, `[Date]`, `Vector(3)`, a whole node's
+/// type.
+fn kind_label(field: &QueryResultFieldDescriptor, node_type: Option<&str>) -> String {
+    let name = |kind: QueryValueKind| match kind {
+        QueryValueKind::String => "String",
+        QueryValueKind::Bool => "Bool",
+        QueryValueKind::Int => "Int",
+        QueryValueKind::BigInt => "BigInt",
+        QueryValueKind::Float => "Float",
+        QueryValueKind::Date => "Date",
+        QueryValueKind::DateTime => "DateTime",
+        QueryValueKind::Blob => "Blob",
+        QueryValueKind::Vector => "Vector",
+        QueryValueKind::List => "List",
+        QueryValueKind::Object => "Object",
+    };
+    match (field.kind, field.item_kind, field.vector_dim) {
+        (QueryValueKind::List, Some(item), _) => format!("[{}]", name(item)),
+        (QueryValueKind::Vector, _, Some(dim)) => format!("Vector({dim})"),
+        (QueryValueKind::Object, ..) if let Some(node_type) = node_type => node_type.to_owned(),
+        (kind, ..) => name(kind).to_owned(),
+    }
 }
 
 /// One declaration in the source.
@@ -78,10 +103,9 @@ pub struct QueryInfo {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueryCheck {
     pub diagnostics: Vec<Diagnostic>,
+    /// One per declaration; none for a statement (`branch …`, `show …`, `commit …`, `load …`,
+    /// `explain load …`), which declares no query.
     pub queries: Vec<QueryInfo>,
-    /// The source is a single statement (`branch …`, `show …`, `commit …`, `load …`, `explain load …`) rather than
-    /// query declarations.
-    pub statement: bool,
 }
 
 /// Parses and type-checks `.gq` source against a schema.
@@ -103,10 +127,7 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
         | FileBody::Show(_)
         | FileBody::Commit(_)
         | FileBody::Load(_)
-        | FileBody::ExplainLoad(_) => {
-            result.statement = true;
-            return result;
-        }
+        | FileBody::ExplainLoad(_) => return result,
     };
     for decl in &decls {
         let info = QueryInfo {
@@ -148,14 +169,17 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
                     info.columns = operation
                         .result
                         .iter()
-                        .map(|field| ResultColumn {
-                            name: field.name.clone(),
-                            kind: format!("{:?}", field.kind),
-                            nullable: field.nullable,
-                            node_type: node_types
+                        .map(|field| {
+                            let node_type = node_types
                                 .iter()
                                 .find(|(name, _)| *name == field.name)
-                                .map(|(_, ty)| ty.clone()),
+                                .map(|(_, ty)| ty.clone());
+                            ResultColumn {
+                                name: field.name.clone(),
+                                kind: kind_label(field, node_type.as_deref()),
+                                nullable: field.nullable,
+                                node_type,
+                            }
                         })
                         .collect();
                 }
@@ -192,12 +216,15 @@ mod tests {
     fn a_valid_read_reports_its_columns() {
         let result = check(
             &dev(),
-            "query q() { match { $p: Person } return { $p.name, $p.born } limit 5 }",
+            "query q() { match { $p: Person } return { $p.name, $p.born, $p.tags, $p } limit 5 }",
         );
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         let columns = &result.queries[0].columns;
-        assert_eq!(columns.len(), 2);
+        assert_eq!(columns.len(), 4);
         assert!(columns[1].nullable);
+        // Each kind reads as a type: a list by its items, a whole node by its type.
+        let kinds: Vec<&str> = columns.iter().map(|c| c.kind.as_str()).collect();
+        assert_eq!(kinds, ["String", "Date", "[String]", "Person"]);
     }
 
     #[test]
@@ -236,7 +263,7 @@ mod tests {
     #[test]
     fn statements_are_recognised() {
         let result = check(&dev(), "branch list");
-        assert!(result.statement);
+        assert!(result.diagnostics.is_empty() && result.queries.is_empty());
     }
 
     #[test]

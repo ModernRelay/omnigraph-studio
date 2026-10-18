@@ -49,7 +49,11 @@ pub fn parse_scalar(property: &Property, text: &str) -> Result<Value, String> {
             }
         }
         ScalarKind::DateTime => {
-            if trimmed.len() >= 16 && is_date(&trimmed[..10]) && trimmed.as_bytes()[10] == b'T' {
+            // `get`, not slicing: a wide character may straddle the tenth byte.
+            if trimmed.len() >= 16
+                && trimmed.get(..10).is_some_and(is_date)
+                && trimmed.as_bytes().get(10) == Some(&b'T')
+            {
                 Ok(Value::String(trimmed.to_owned()))
             } else {
                 Err("Enter a date and time as YYYY-MM-DDTHH:MM:SSZ".into())
@@ -99,4 +103,33 @@ pub fn parse_input(property: &Property, text: &str) -> Result<Value, String> {
             .map(Value::Array);
     }
     parse_scalar(property, text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn property(kind: ScalarKind, base_type: &str) -> Property {
+        Property {
+            name: "at".into(),
+            kind,
+            base_type: base_type.into(),
+            nullable: true,
+            list: false,
+            enum_values: None,
+            is_key: false,
+        }
+    }
+
+    #[test]
+    fn a_date_time_with_a_wide_character_is_refused_not_a_panic() {
+        let at = property(ScalarKind::DateTime, "DateTime");
+        assert_eq!(
+            parse_scalar(&at, "2024-01-02T10:00:00Z"),
+            Ok(Value::String("2024-01-02T10:00:00Z".into()))
+        );
+        // A full-width digit, as an input method types it, puts the tenth byte inside it.
+        assert!(parse_scalar(&at, "2024-01-0１T10:00:00Z").is_err());
+        assert!(parse_scalar(&at, "日付日付日付日付").is_err());
+    }
 }

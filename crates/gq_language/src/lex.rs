@@ -56,11 +56,12 @@ pub struct Token {
     pub range: Range<usize>,
 }
 
-/// Words that are keywords wherever they stand.
-const KEYWORDS: &[&str] = &[
+/// Words that are keywords wherever they stand: drawn as keywords, and offered by completion.
+pub(crate) const KEYWORDS: &[&str] = &[
     "query",
     "match",
     "return",
+    "distinct",
     "order",
     "limit",
     "insert",
@@ -286,13 +287,28 @@ pub struct Outline {
 /// A statement that is not a query declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Statement {
-    /// `show …`, `branch list` and `explain load …`: answered as rows.
+    /// `show …`, `branch list`, `branch diff`, `branch merge-base` and `branch merge … dry
+    /// run`: answered as rows, each naming its own branches.
     Read,
     /// `branch create`, `branch delete`, `branch merge`, `commit publish`, `commit drop`:
     /// changes branches or commits, each naming its own target.
     Write,
     /// `load csv … into …`: loads into the request's branch, as a mutation does.
     Load,
+    /// `explain load …`: the plan of a load into the request's branch head, answered as rows.
+    ExplainLoad,
+}
+
+impl Statement {
+    /// Whether running it changes the graph.
+    pub fn writes(self) -> bool {
+        matches!(self, Statement::Write | Statement::Load)
+    }
+
+    /// Whether it is sent to the request's branch rather than naming its own.
+    pub fn targets_branch(self) -> bool {
+        matches!(self, Statement::Load | Statement::ExplainLoad)
+    }
 }
 
 /// The declarations of a source and its settings prefix.
@@ -339,8 +355,16 @@ pub fn outline(source: &str) -> Outline {
             return outline;
         }
         "branch" => {
-            let verb = tokens.get(first + 1).map(text).unwrap_or_default();
-            outline.statement = Some(if verb == "list" {
+            let verb = tokens.get(first + 1);
+            let rest = verb.map_or("", |verb| &source[verb.range.start..]);
+            // `merge-base` is one word to the server; `dry run` ends a merge that writes nothing.
+            let dry_run = tokens[first..]
+                .windows(2)
+                .any(|pair| text(&pair[0]) == "dry" && text(&pair[1]) == "run");
+            let reads = rest.starts_with("merge-base")
+                || matches!(verb.map(text), Some("list" | "diff"))
+                || (verb.map(text) == Some("merge") && dry_run);
+            outline.statement = Some(if reads {
                 Statement::Read
             } else {
                 Statement::Write
@@ -356,7 +380,7 @@ pub fn outline(source: &str) -> Outline {
             return outline;
         }
         "explain" if tokens.get(first + 1).map(text) == Some("load") => {
-            outline.statement = Some(Statement::Read);
+            outline.statement = Some(Statement::ExplainLoad);
             return outline;
         }
         _ => {}
@@ -663,7 +687,20 @@ mod tests {
         );
         assert_eq!(
             outline("explain load csv \"s3://b/p.csv\" into node:Person mode append").statement,
-            Some(Statement::Read)
+            Some(Statement::ExplainLoad)
+        );
+        // The branch reads a server answers as rows, and the merge that only decides.
+        for read in [
+            "branch diff feature into main",
+            "branch merge-base feature into main",
+            "branch merge feature into main dry run",
+        ] {
+            assert_eq!(outline(read).statement, Some(Statement::Read), "{read}");
+        }
+        assert_eq!(
+            outline("branch merge \"dry\" into main").statement,
+            Some(Statement::Write),
+            "a branch named dry"
         );
         assert_eq!(
             outline("branch create x from main").statement,

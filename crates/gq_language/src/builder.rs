@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 
 use crate::schema::{
     Direction, EdgeType, NodeType, Property, RelationshipGroup, ScalarKind, SchemaModel,
-    traversal_name,
+    traversal_name, traversal_token,
 };
 
 /// A generated query: GQ source and the parameters to send with it.
@@ -1391,8 +1391,8 @@ pub fn endpoint_value_counts(
 
 fn traversal_clause(group: &RelationshipGroup, edge_var: Option<&str>) -> String {
     let edge = match edge_var {
-        Some(var) => format!("${var}:{}", traversal_name(&group.edge)),
-        None => traversal_name(&group.edge),
+        Some(var) => format!("${var}:{}", traversal_token(&group.edge)),
+        None => traversal_token(&group.edge),
     };
     match group.direction {
         Direction::Outgoing => format!("$n {edge} $m"),
@@ -2496,6 +2496,44 @@ mod tests {
             query.text,
             result.diagnostics
         );
+    }
+
+    /// An edge whose traversal is a reserved word is named in quotes in every query that
+    /// follows it, and each type-checks.
+    #[test]
+    fn an_edge_named_by_a_reserved_word_is_quoted() {
+        let schema = SchemaModel::parse(
+            "node Team {\n  slug: String @key\n  name: String\n}\n\
+             node Person {\n  slug: String @key\n  name: String\n}\n\
+             edge In: Person -> Team\n\
+             edge Is: Person -> Person\n",
+        )
+        .unwrap();
+        let has_any = |key: &str| Filter {
+            property: key.to_owned(),
+            op: FilterOp::HasAny,
+            value: Value::Null,
+        };
+        let start = PageStart::First;
+        for edge in ["In", "Is"] {
+            let out = RelationshipGroup {
+                edge: edge.into(),
+                direction: Direction::Outgoing,
+                other_type: if edge == "In" { "Team" } else { "Person" }.into(),
+            };
+            let key = relationship_key(&out);
+            let queries = [
+                node_page(&schema, "Person", &[has_any(&key)], None, &start, 10).unwrap(),
+                neighbour_counts(&schema, "Person", &[], &key, 10).unwrap(),
+                degree(&schema, "Person", &out, "p1").unwrap(),
+                edge_page(&schema, edge, &[], None, &start, 10).unwrap(),
+            ];
+            for query in &queries {
+                assert_compiles_in(&schema, query);
+                let quoted = format!("\"{}\"", traversal_name(edge));
+                assert!(query.text.contains(&quoted), "{}", query.text);
+            }
+        }
     }
 
     /// Deletes by many ids, and the read of the sources a delete would leave below an edge's

@@ -7,7 +7,7 @@
 
 use std::ops::Range;
 
-use crate::lex::{TokenKind, outline, tokenize};
+use crate::lex::{KEYWORDS, TokenKind, outline, tokenize};
 use crate::schema::{SchemaModel, traversal_name};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,12 +26,6 @@ pub struct Completion {
     pub kind: CompletionKind,
     pub detail: Option<String>,
 }
-
-const KEYWORDS: &[&str] = &[
-    "query", "match", "return", "order", "limit", "insert", "update", "set", "where", "delete",
-    "not", "exists", "count", "sum", "min", "max", "avg", "and", "or", "in", "is", "null", "asc",
-    "desc", "nearest", "search", "fuzzy", "bm25", "rrf", "now", "explain", "branch", "show",
-];
 
 /// The types a parameter can be declared with.
 const PARAMETER_TYPES: &[&str] = &[
@@ -157,8 +151,9 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
     for edge in &schema.edges {
         let name = traversal_name(&edge.name);
         if matches(&name) {
+            // What is inserted: a reserved word is quoted, as a traversal spells it.
             items.push(Completion {
-                label: name,
+                label: edge.traversal(),
                 kind: CompletionKind::Relationship,
                 detail: Some(format!("{} → {}", edge.from, edge.to)),
             });
@@ -280,6 +275,46 @@ fn bindings(
         };
         if !name.is_empty() && !found.iter().any(|(n, _)| n == name) {
             found.push((name.to_owned(), type_name));
+        }
+    }
+    // `$a worksAt $b`, `$a $e:worksAt {1,2} $b`, `$a "in" $b`: a traversal binds its ends to the
+    // edge's, where nothing else bound them.
+    let variable = |i: usize| {
+        tokens
+            .get(i)
+            .filter(|t| t.kind == TokenKind::Variable)
+            .map(|t| &text[t.range.start + 1..t.range.end])
+    };
+    for i in 0..tokens.len() {
+        let Some(from) = variable(i) else {
+            continue;
+        };
+        let mut at = i + 1;
+        if variable(at).is_some() && word(at + 1) == Some(":") {
+            at += 2;
+        }
+        let Some(edge) = word(at).map(|w| w.trim_matches('"')).and_then(|name| {
+            schema
+                .edges
+                .iter()
+                .find(|e| traversal_name(&e.name) == name)
+        }) else {
+            continue;
+        };
+        at += 1;
+        if word(at) == Some("{") {
+            while word(at).is_some_and(|w| w != "}") {
+                at += 1;
+            }
+            at += 1;
+        }
+        let Some(to) = variable(at) else {
+            continue;
+        };
+        for (name, type_name) in [(from, &edge.from), (to, &edge.to)] {
+            if !name.is_empty() && !found.iter().any(|(n, _)| n == name) {
+                found.push((name.to_owned(), type_name.clone()));
+            }
         }
     }
     found
@@ -411,8 +446,13 @@ mod tests {
                 ("ids", "[String]?"),
                 ("p", "Person"),
                 ("e", "WorksAt"),
+                ("c", "Company"),
             ]
         );
+        // A traversal's end has the edge's type, so its properties complete.
+        let ends = "query q() { match { $p: Person  $p worksAt $c } return { $c.na";
+        let (_, properties) = completions(&schema, ends, ends.len());
+        assert_eq!(properties[0].label, "name");
         assert!(items.iter().all(|i| i.kind == CompletionKind::Variable));
         let typed = format!("{source}i");
         let (_, items) = completions(&schema, &typed, typed.len());

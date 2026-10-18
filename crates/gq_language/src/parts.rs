@@ -76,13 +76,20 @@ pub fn query_parts(source: &str, declaration: Range<usize>) -> Vec<QueryPart> {
             let end = reader.closing(i + 1, close);
             reader.clauses(i + 2, end);
             i = end + 1;
-        } else if (keyword("return") || keyword("order")) && reader.is(i + 1, "{") {
+        } else if let Some(open) = (keyword("return") || keyword("order"))
+            .then(|| {
+                // `return distinct { … }` keeps one row per distinct tuple.
+                let at = i + usize::from(keyword("return") && reader.keyword(i + 1, "distinct"));
+                reader.is(at + 1, "{").then_some(at + 1)
+            })
+            .flatten()
+        {
             let kind = if keyword("return") {
                 PartKind::Return
             } else {
                 PartKind::Order
             };
-            let end = reader.closing(i + 1, close);
+            let end = reader.closing(open, close);
             reader.push(kind, i, end.min(close - 1));
             i = end + 1;
         } else if keyword("limit") {
@@ -750,6 +757,18 @@ mod tests {
                 (&PartKind::Limit, "limit 5"),
             ]
         );
+        // A return of distinct rows is the return clause too.
+        let distinct = "query q() { match { $p: Person } return distinct { $p.name } }";
+        assert_eq!(
+            crate::check(&crate::schema::tests::dev(), distinct).diagnostics,
+            []
+        );
+        let returns: Vec<&str> = query_parts(distinct, 0..distinct.len())
+            .iter()
+            .filter(|part| part.kind == PartKind::Return)
+            .map(|part| &distinct[part.range.clone()])
+            .collect();
+        assert_eq!(returns, ["return distinct { $p.name }"]);
     }
 
     #[test]
