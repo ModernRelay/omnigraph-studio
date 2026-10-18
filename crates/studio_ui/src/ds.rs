@@ -957,10 +957,9 @@ pub fn tag(label: impl Into<SharedString>, cx: &App) -> Div {
         .rounded(px(radius::XS))
         .bg(surface::tag(cx))
         .child(
-            Label::new(label.into())
-                .size(LabelSize::XSmall)
-                .single_line()
-                .truncate(),
+            crate::cell_text(label, cx)
+                .size(ui::TextSize::XSmall, cx)
+                .hug(),
         )
 }
 

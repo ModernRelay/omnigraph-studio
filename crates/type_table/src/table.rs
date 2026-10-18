@@ -5680,9 +5680,8 @@ impl TypeTable {
         cx: &App,
     ) -> AnyElement {
         let Some(relation) = self.relations.get(&(row.id.clone(), key.to_owned())) else {
-            return Label::new("…")
-                .size(LabelSize::Small)
-                .color(Color::Disabled)
+            return studio_ui::cell_text("…", cx)
+                .color(Color::Disabled.color(cx))
                 .into_any_element();
         };
         let count = match &relation.count {
@@ -5696,9 +5695,8 @@ impl TypeTable {
             }
         };
         if count == 0 {
-            return Label::new("—")
-                .size(LabelSize::Small)
-                .color(Color::Disabled)
+            return studio_ui::cell_text("—", cx)
+                .color(Color::Disabled.color(cx))
                 .into_any_element();
         }
         let labels: Vec<&str> = relation
@@ -5730,14 +5728,16 @@ impl TypeTable {
             .when(more > 0, |cell| {
                 cell.child(
                     div().flex_none().child(
-                        Label::new(if fit == 0 {
-                            format_count(count)
-                        } else {
-                            format!("+{}", format_count(more))
-                        })
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .single_line(),
+                        studio_ui::cell_text(
+                            if fit == 0 {
+                                format_count(count)
+                            } else {
+                                format!("+{}", format_count(more))
+                            },
+                            cx,
+                        )
+                        .color(Color::Muted.color(cx))
+                        .hug(),
                     ),
                 )
             })

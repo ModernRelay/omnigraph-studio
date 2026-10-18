@@ -1,10 +1,11 @@
-//! One line of text that fills the room its parent gives it, cut with "…" when it does not
-//! fit: what a grid cell shows. A text element measures its text for the layout, and a
-//! truncated one measures it on every pass of every frame (GPUI's `TextLayout::layout` keeps no
-//! size for it), taking a line wrapper from the shared pool each time. A cell's box is fixed by
-//! its column, so this element asks for no measurement: it takes the room, shapes its line
-//! once a frame (GPUI keeps shaped lines from the frame before), and cuts it only when it is
-//! wider than that room.
+//! One line of text, cut with "…" when it does not fit: what a grid cell, a tag or a count
+//! beside them shows. A text element measures its text for the layout, and a truncated one
+//! measures it on every pass of every frame (GPUI's `TextLayout::layout` keeps no size for
+//! it), taking a line wrapper from the shared pool each time. This element is never measured:
+//! it fills the room its parent gives it (a cell's box, fixed by its column), or asks for the
+//! width of its line and gives way when there is less ([`CellText::hug`]). It shapes its line
+//! once a frame (GPUI keeps shaped lines from the frame before) and cuts it only when it is
+//! wider than its room.
 //!
 //! It looks as a small `Label` does: the UI font at the small size and weight, in the colour
 //! given, or the buffer font.
@@ -20,6 +21,7 @@ use ui::TextSize;
 pub struct CellText {
     text: SharedString,
     align: TextAlign,
+    hug: bool,
     style: TextStyleRefinement,
 }
 
@@ -28,7 +30,9 @@ pub fn cell_text(text: impl Into<SharedString>, cx: &App) -> CellText {
     CellText {
         text: text.into(),
         align: TextAlign::Left,
+        hug: false,
         style: TextStyleRefinement {
+            color: Some(ui::Color::Default.color(cx)),
             font_size: Some(TextSize::Small.rems(cx).into()),
             font_weight: Some(theme::theme_settings(cx).ui_font(cx).weight),
             ..TextStyleRefinement::default()
@@ -39,6 +43,11 @@ pub fn cell_text(text: impl Into<SharedString>, cx: &App) -> CellText {
 impl CellText {
     pub fn color(mut self, color: Hsla) -> Self {
         self.style.color = Some(color);
+        self
+    }
+
+    pub fn size(mut self, size: TextSize, cx: &App) -> Self {
+        self.style.font_size = Some(size.rems(cx).into());
         self
     }
 
@@ -63,6 +72,12 @@ impl CellText {
         self.align = TextAlign::Right;
         self
     }
+
+    /// As wide as its line, narrower (and cut) when its parent has less room, as a tag is.
+    pub fn hug(mut self) -> Self {
+        self.hug = true;
+        self
+    }
 }
 
 impl IntoElement for CellText {
@@ -80,7 +95,8 @@ pub struct Fitted {
 }
 
 impl Element for CellText {
-    type RequestLayoutState = ();
+    /// A hugging line, shaped to ask for its width.
+    type RequestLayoutState = Option<ShapedLine>;
     type PrepaintState = Option<Fitted>;
 
     fn id(&self) -> Option<ElementId> {
@@ -91,27 +107,39 @@ impl Element for CellText {
         None
     }
 
-    /// The rest of the parent's row, one line high, and no narrower than nothing: never
-    /// measured.
+    /// One line high; the rest of the parent's row, or the line's width, and no narrower than
+    /// nothing. Never measured.
     fn request_layout(
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         window: &mut Window,
         cx: &mut App,
-    ) -> (LayoutId, ()) {
-        let line_height =
-            window.with_text_style(Some(self.style.clone()), |window| line_height(window));
+    ) -> (LayoutId, Option<ShapedLine>) {
+        let (line_height, whole) = window.with_text_style(Some(self.style.clone()), |window| {
+            let whole = self.hug.then(|| self.shape(window));
+            (line_height(window), whole)
+        });
         let none = Length::Definite(DefiniteLength::Absolute(px(0.).into()));
-        let mut style = Style {
-            flex_grow: 1.,
-            flex_shrink: 1.,
-            flex_basis: none,
-            ..Style::default()
+        let mut style = match &whole {
+            Some(whole) => {
+                let mut style = Style {
+                    flex_shrink: 1.,
+                    ..Style::default()
+                };
+                style.size.width = Length::Definite(DefiniteLength::Absolute(whole.width.into()));
+                style
+            }
+            None => Style {
+                flex_grow: 1.,
+                flex_shrink: 1.,
+                flex_basis: none,
+                ..Style::default()
+            },
         };
         style.min_size.width = none;
         style.size.height = Length::Definite(DefiniteLength::Absolute(line_height.into()));
-        (window.request_layout(style, [], cx), ())
+        (window.request_layout(style, [], cx), whole)
     }
 
     fn prepaint(
@@ -119,7 +147,7 @@ impl Element for CellText {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _request_layout: &mut (),
+        whole: &mut Option<ShapedLine>,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Fitted> {
@@ -127,7 +155,8 @@ impl Element for CellText {
             return None;
         }
         window.with_text_style(Some(self.style.clone()), |window| {
-            self.fit(bounds.size.width, window, cx)
+            let whole = whole.take().unwrap_or_else(|| self.shape(window));
+            self.fit(whole, bounds.size.width, window, cx)
         })
     }
 
@@ -136,7 +165,7 @@ impl Element for CellText {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _request_layout: &mut (),
+        _whole: &mut Option<ShapedLine>,
         fitted: &mut Option<Fitted>,
         window: &mut Window,
         cx: &mut App,
@@ -158,19 +187,34 @@ impl Element for CellText {
 }
 
 impl CellText {
-    /// The line shaped in the text style in effect, cut to `width` when it is wider.
-    fn fit(&self, width: Pixels, window: &mut Window, cx: &mut App) -> Option<Fitted> {
+    /// The whole line, shaped in the text style in effect.
+    fn shape(&self, window: &mut Window) -> ShapedLine {
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
-        let runs = [text_style.to_run(self.text.len())];
-        let whole = window
-            .text_system()
-            .shape_line(self.text.clone(), font_size, &runs, None);
+        window.text_system().shape_line(
+            self.text.clone(),
+            font_size,
+            &[text_style.to_run(self.text.len())],
+            None,
+        )
+    }
+
+    /// `whole`, or cut to `width` when it is wider.
+    fn fit(
+        &self,
+        whole: ShapedLine,
+        width: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Fitted> {
         let line = if whole.width <= width {
             whole
         } else {
-            // Wider than its room, as few cells are: cut at the end, "…" taking the place of
-            // what does not show.
+            // Wider than its room, as few are: cut at the end, "…" taking the place of what
+            // does not show.
+            let text_style = window.text_style();
+            let font_size = text_style.font_size.to_pixels(window.rem_size());
+            let runs = [text_style.to_run(self.text.len())];
             let (text, runs) = cx
                 .text_system()
                 .line_wrapper(text_style.font(), font_size)
