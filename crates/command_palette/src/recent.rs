@@ -67,10 +67,13 @@ pub fn record(key: &str, cx: &mut App) {
     let saved = Saved {
         recent: recent.keys.clone(),
     };
-    // Written on the main thread: the list is small, and two runs started close together must
-    // land in order, the later list last.
+    // Written on the write thread in the order asked: two runs started close together land
+    // in order, the later list last.
     if let Ok(text) = serde_json::to_string_pretty(&saved) {
-        studio_settings::write_atomic(&path(), text.as_bytes(), studio_settings::Access::Private)
-            .ok();
+        studio_settings::write_atomic_in_turn(
+            path(),
+            text.into_bytes(),
+            studio_settings::Access::Private,
+        );
     }
 }

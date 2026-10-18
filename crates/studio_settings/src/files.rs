@@ -19,6 +19,53 @@ pub enum Access {
     Keep,
 }
 
+/// One write waiting its turn, or a mark that everything asked for before it is done.
+enum Job {
+    Write(PathBuf, Vec<u8>, Access),
+    Done(std::sync::mpsc::Sender<()>),
+}
+
+/// The thread Studio's own state files are written on, one at a time in the order asked: a
+/// sync to disk can take tens of milliseconds, too long for the main thread, and a later save of
+/// a file must never land before an earlier one.
+fn writer() -> &'static std::sync::mpsc::Sender<Job> {
+    static WRITER: std::sync::OnceLock<std::sync::mpsc::Sender<Job>> = std::sync::OnceLock::new();
+    WRITER.get_or_init(|| {
+        let (jobs, queue) = std::sync::mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("studio-writes".into())
+            .spawn(move || {
+                for job in queue {
+                    match job {
+                        Job::Write(path, contents, access) => {
+                            write_atomic(&path, &contents, access).ok();
+                        }
+                        Job::Done(done) => {
+                            done.send(()).ok();
+                        }
+                    }
+                }
+            })
+            .expect("the write thread starts");
+        jobs
+    })
+}
+
+/// [`write_atomic`] on the write thread, after every write asked for before it. What fails is
+/// left as it was, as a failed [`write_atomic`] leaves it.
+pub fn write_atomic_in_turn(path: PathBuf, contents: Vec<u8>, access: Access) {
+    writer().send(Job::Write(path, contents, access)).ok();
+}
+
+/// Waits, a few seconds at most, until every write asked for so far is done: at quit, so the
+/// last state is on disk.
+pub fn writes_done() {
+    let (done, wait) = std::sync::mpsc::channel();
+    if writer().send(Job::Done(done)).is_ok() {
+        wait.recv_timeout(std::time::Duration::from_secs(5)).ok();
+    }
+}
+
 /// Replaces `path` with `contents` in one step. A link is written through to its target, so the
 /// link stays. A failed write leaves the old file as it was and no temporary file behind.
 pub fn write_atomic(path: &Path, contents: &[u8], access: Access) -> std::io::Result<()> {
@@ -175,6 +222,18 @@ mod tests {
                 .starts_with("session.json.unreadable-")
         );
         assert_eq!(std::fs::read_to_string(&aside).unwrap(), "{ not json");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn writes_in_turn_land_in_the_order_asked() {
+        let dir = scratch("in-turn");
+        let path = dir.join("state.json");
+        for n in 0..50 {
+            write_atomic_in_turn(path.clone(), format!("{n}").into_bytes(), Access::Private);
+        }
+        writes_done();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "49", "the last asked, last");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

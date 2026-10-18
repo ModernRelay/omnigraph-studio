@@ -115,14 +115,19 @@ pub(crate) fn save(server_url: &str, graph: &str, saved: &SavedWorkspace) {
         return;
     }
     if let Ok(text) = serde_json::to_string_pretty(saved) {
-        write_private(&workspaces_dir().join(key(server_url, graph)), &text).ok();
+        write_private(&workspaces_dir().join(key(server_url, graph)), &text);
     }
 }
 
 /// Replaces a file in one step (a crash leaves the old file or the new one, never an empty
-/// one), readable only by its owner, including a file an older build created.
-fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
-    studio_settings::write_atomic(path, text.as_bytes(), studio_settings::Access::Private)
+/// one), readable only by its owner, including a file an older build created. Written on the
+/// write thread, in the order asked, so a save never holds up a frame.
+fn write_private(path: &Path, text: &str) {
+    studio_settings::write_atomic_in_turn(
+        path.to_path_buf(),
+        text.as_bytes().to_vec(),
+        studio_settings::Access::Private,
+    );
 }
 
 /// The graphs a window had open, in the order they were opened, and which one it showed.
@@ -301,6 +306,8 @@ impl WindowSession {
         .detach();
         cx.on_app_quit(|cx| {
             cx.global_mut::<WindowSession>().quitting = true;
+            // The last state written before the app goes.
+            studio_settings::writes_done();
             async {}
         })
         .detach();
@@ -345,7 +352,7 @@ fn write_session(windows: &[SavedWindow]) {
         ..SessionFile::default()
     };
     if let Ok(text) = serde_json::to_string_pretty(&file) {
-        write_private(&session_path(), &text).ok();
+        write_private(&session_path(), &text);
     }
 }
 
@@ -404,7 +411,7 @@ pub(crate) fn save_window_bounds(bounds: Bounds<Pixels>) {
     }
     let saved = SavedBounds::from(bounds);
     if let Ok(text) = serde_json::to_string(&saved) {
-        write_private(&bounds_path(), &text).ok();
+        write_private(&bounds_path(), &text);
     }
 }
 
@@ -421,7 +428,9 @@ mod tests {
         let path = dir.join("workspace.json");
         std::fs::write(&path, "{}").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_private(&path, r#"{"active": 1}"#).unwrap();
+        write_private(&path, r#"{"active": 1}"#);
+        // On the write thread: done once every write asked before this mark is.
+        studio_settings::writes_done();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"active": 1}"#);

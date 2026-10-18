@@ -23,7 +23,7 @@ mod files;
 
 pub use document::Reading;
 
-pub use files::{Access, set_aside, write_atomic};
+pub use files::{Access, set_aside, write_atomic, write_atomic_in_turn, writes_done};
 
 pub use fields::{Choice, FieldKind, Scope, SettingField, fields, sections};
 
