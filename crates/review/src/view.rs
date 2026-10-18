@@ -60,6 +60,17 @@ enum FixState {
     Unknown,
 }
 
+impl FixState {
+    /// A fix is out or has landed: the card shows the review as read, so the next fix waits for
+    /// Refresh, from the buttons and the keys alike.
+    fn done(&self) -> bool {
+        matches!(
+            self,
+            Self::Running | Self::Saving | Self::Reverted { .. } | Self::Edited { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CardState {
     reviewed: bool,
@@ -129,6 +140,9 @@ struct ReviewData {
     /// these, not through every value of every change on each key.
     search: Vec<String>,
     counts: Vec<TypeCounts>,
+    /// Why each change cannot be reverted, when it cannot: worked out with the fold, off the
+    /// main thread, since a review holds up to 20,000 changes.
+    revert_blocked: Vec<Option<String>>,
     partial: bool,
     /// The feed went past the reviewed head while reading: the branch moved.
     moved_while_reading: bool,
@@ -365,18 +379,15 @@ impl ReviewView {
     fn finish_load(&mut self, result: Result<ReviewData, String>, cx: &mut Context<Self>) {
         match result {
             Ok(data) => {
-                let schema = self.session.read(cx).schema_model();
                 self.cards = data
                     .folded
                     .changes
                     .iter()
-                    .map(|change| CardState {
+                    .zip(&data.revert_blocked)
+                    .map(|(change, blocked)| CardState {
                         reviewed: self.reviewed_keys.contains(&mark_key(change)),
                         fix: FixState::Idle,
-                        revert_blocked: match &schema {
-                            Some(schema) => revert_query(schema, change).err().map(|e| e.0),
-                            None => None,
-                        },
+                        revert_blocked: blocked.clone(),
                     })
                     .collect();
                 self.rows = build_rows(&data, &self.search_text(cx));
@@ -512,7 +523,7 @@ impl ReviewView {
         let Some(card) = self.cards.get(ix) else {
             return;
         };
-        if card.fix == FixState::Running || matches!(card.fix, FixState::Reverted { .. }) {
+        if card.fix.done() {
             return;
         }
         let Some(schema) = self.session.read(cx).schema_model() else {
@@ -795,6 +806,16 @@ impl ReviewView {
         }
     }
 
+    /// Whether Merge may run: a review of the whole branch on screen, with no fix out. A review
+    /// being read shows a head nobody has seen, a fix still out would land on either side of the
+    /// merge, and a review of one commit has not shown what else the merge takes.
+    fn mergeable(&self) -> bool {
+        matches!(self.load, LoadState::Ready)
+            && !self.merging()
+            && self.fixes_running == 0
+            && self.scope.is_none()
+    }
+
     /// Whether the merge deletes the branch: as the checkbox says, and never `main`.
     fn delete_after_merge(&self) -> bool {
         self.delete_branch && self.branch != "main"
@@ -803,9 +824,7 @@ impl ReviewView {
     /// Merges the branch into the target after checking the branch still sits at the head this
     /// review holds. The outcome is shown, then confirmed against the target's history.
     pub fn merge(&mut self, cx: &mut Context<Self>) {
-        // Only a review on screen merges, with no fix out: a review being read shows a head
-        // nobody has seen, and a fix still out would land on either side of the merge.
-        if !matches!(self.load, LoadState::Ready) || self.merging() || self.fixes_running > 0 {
+        if !self.mergeable() {
             return;
         }
         self.merge = MergeState::Checking;
@@ -978,8 +997,7 @@ impl ReviewView {
         let colors = cx.theme().colors();
         let border = colors.border_variant;
         let focus = self.focus_handle.clone();
-        let mergeable =
-            matches!(self.load, LoadState::Ready) && !self.merging() && self.fixes_running == 0;
+        let mergeable = self.mergeable();
         let merge_button = studio_ui::ds::button(
             "merge",
             format!("Merge {} into {}", self.branch, self.target),
@@ -1000,14 +1018,13 @@ impl ReviewView {
                     ""
                 }
             );
-            move |_, cx| {
-                Tooltip::with_meta(
-                    "Merge after checking the branch has not moved",
-                    None,
-                    cli.clone(),
-                    cx,
-                )
-            }
+            // A disabled Merge says why (constitution VI).
+            let title = if self.scope.is_some() {
+                format!("Review all of {}'s commits to merge it", self.branch)
+            } else {
+                "Merge after checking the branch has not moved".to_owned()
+            };
+            move |_, cx| Tooltip::with_meta(title.clone(), None, cli.clone(), cx)
         })
         .on_click(cx.listener(|this, _, _, cx| this.merge(cx)));
         let refresh = studio_ui::ds::button("refresh", "Refresh")
@@ -1581,14 +1598,7 @@ impl ReviewView {
                     })
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_reviewed(ix, cx)));
                 let blocked = state.revert_blocked.clone();
-                // After a fix the card shows the review as read; the next one waits for Refresh.
-                let done = matches!(
-                    state.fix,
-                    FixState::Running
-                        | FixState::Saving
-                        | FixState::Reverted { .. }
-                        | FixState::Edited { .. }
-                );
+                let done = state.fix.done();
                 let editable = self.editable(ix, cx);
                 let edit_button = editable.then(|| {
                     Button::new(("edit", ix), "Edit")
@@ -1739,6 +1749,7 @@ async fn read_review(
                 folded: ChangeFold::new().finish(),
                 search: Vec::new(),
                 counts: Vec::new(),
+                revert_blocked: Vec::new(),
                 partial: false,
                 moved_while_reading: false,
                 merged_in: false,
@@ -1746,7 +1757,7 @@ async fn read_review(
         }
         let start = format!("after:{fork}");
         return match fold_feed(&session, &branch, start, &head, &this, cx).await {
-            Ok(fed) => Ok(fed.into_review(Some(fork), Some(head), cx).await),
+            Ok(fed) => Ok(fed.into_review(&session, Some(fork), Some(head), cx).await),
             Err(FeedError::Refused) => {
                 read_review_since_merge(session, branch, target, fork, head, this, cx).await
             }
@@ -1768,17 +1779,27 @@ struct Fed {
 impl Fed {
     async fn into_review(
         self,
+        session: &Entity<GraphSession>,
         fork: Option<String>,
         head: Option<String>,
         cx: &mut AsyncApp,
     ) -> ReviewData {
         let fold = self.fold;
-        let (folded, search) = cx
+        let schema = session.read_with(cx, |session, _| session.schema_model());
+        let (folded, search, revert_blocked) = cx
             .background_executor()
             .spawn(async move {
                 let folded = fold.finish();
                 let search = folded.changes.iter().map(search_text_of).collect();
-                (folded, search)
+                let revert_blocked = folded
+                    .changes
+                    .iter()
+                    .map(|change| {
+                        let schema = schema.as_ref()?;
+                        revert_query(schema, change).err().map(|e| e.0)
+                    })
+                    .collect();
+                (folded, search, revert_blocked)
             })
             .await;
         let counts = folded.counts();
@@ -1791,6 +1812,7 @@ impl Fed {
             folded,
             search,
             counts,
+            revert_blocked,
             partial: self.partial,
             moved_while_reading: self.moved_while_reading,
             merged_in: false,
@@ -2005,7 +2027,7 @@ async fn read_review_since_merge(
         partial,
         moved_while_reading: false,
     };
-    let mut data = fed.into_review(Some(base), Some(head), cx).await;
+    let mut data = fed.into_review(&session, Some(base), Some(head), cx).await;
     data.merged_in = true;
     Ok(data)
 }
@@ -2068,7 +2090,7 @@ async fn read_commit_review(
         partial,
         moved_while_reading: false,
     };
-    Ok(fed.into_review(fork, head, cx).await)
+    Ok(fed.into_review(&session, fork, head, cx).await)
 }
 
 /// After a lost merge response: whether the target holds the source head.
