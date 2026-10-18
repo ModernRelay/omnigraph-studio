@@ -182,8 +182,13 @@ fn property_row(row: &PropertyRow, kind: ChangeKind) -> Div {
         .color(Color::Muted)
         .single_line()
         .truncate();
-    let body = match kind {
-        ChangeKind::Changed => h_flex()
+    let inner = match (kind, &row.before, &row.after) {
+        (ChangeKind::Changed, Some(before), Some(after)) => inner_diff(before, after),
+        _ => None,
+    };
+    let body = match (kind, inner) {
+        (_, Some(pieces)) => pieces_row(pieces),
+        (ChangeKind::Changed, None) => h_flex()
             .flex_1()
             .min_w_0()
             .gap(px(space::MD))
@@ -199,11 +204,11 @@ fn property_row(row: &PropertyRow, kind: ChangeKind) -> Div {
                     .min_w_0()
                     .child(value_label(&row.after, Color::Created, false)),
             ),
-        ChangeKind::Added | ChangeKind::Unchanged => h_flex()
+        (ChangeKind::Added | ChangeKind::Unchanged, None) => h_flex()
             .flex_1()
             .min_w_0()
             .child(value_label(&row.after, Color::Default, false)),
-        ChangeKind::Removed => {
+        (ChangeKind::Removed, None) => {
             h_flex()
                 .flex_1()
                 .min_w_0()
@@ -220,6 +225,253 @@ fn property_row(row: &PropertyRow, kind: ChangeKind) -> Div {
                 .child(name),
         )
         .child(body)
+}
+
+/// What changed inside a value, drawn in one wrapping row: kept text muted, removals struck,
+/// additions in the created colour.
+fn pieces_row(pieces: Vec<Piece>) -> Div {
+    h_flex()
+        .flex_1()
+        .min_w_0()
+        .flex_wrap()
+        .children(pieces.into_iter().flat_map(|piece| {
+            let (color, strike) = match piece.kind {
+                PieceKind::Same | PieceKind::Gap => (Color::Muted, false),
+                PieceKind::Removed => (Color::Deleted, true),
+                PieceKind::Added => (Color::Created, false),
+            };
+            let label = Label::new(piece.text).size(LabelSize::Small).color(color);
+            // Its own space, so a struck removal does not strike it.
+            let space = piece.spaced.then(|| Label::new(" ").size(LabelSize::Small));
+            space
+                .into_iter()
+                .chain([if strike { label.strikethrough() } else { label }])
+        }))
+}
+
+/// One piece of what changed inside a value, with whether a space comes before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Piece {
+    kind: PieceKind,
+    text: String,
+    spaced: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PieceKind {
+    Same,
+    Removed,
+    Added,
+    /// Unchanged text left out, drawn as "…".
+    Gap,
+}
+
+impl Piece {
+    fn new(kind: PieceKind, text: impl Into<String>, spaced: bool) -> Self {
+        Self {
+            kind,
+            text: text.into(),
+            spaced,
+        }
+    }
+}
+
+/// Text at least this long, in words and marks ([`Token`]), shows its changed words rather than
+/// before → after.
+const LONG_TEXT_WORDS: usize = 8;
+/// Words and marks a difference compares at most on each side, past which before → after shows:
+/// the comparison runs as the row draws, in time that grows with the product of the lengths.
+const DIFF_WORDS: usize = 200;
+/// Unchanged words and marks kept on each side of a change.
+const CONTEXT_WORDS: usize = 3;
+
+/// What changed inside a value, where that says more than before → after: the elements a list
+/// gained and lost with how many it kept, or the words a longer text changed with a few words
+/// around each change. `None` for any other value.
+fn inner_diff(before: &Value, after: &Value) -> Option<Vec<Piece>> {
+    match (before, after) {
+        (Value::Array(before), Value::Array(after)) => {
+            let mut left: Vec<&Value> = before.iter().collect();
+            let mut added = Vec::new();
+            for item in after {
+                match left.iter().position(|kept| *kept == item) {
+                    Some(at) => {
+                        left.remove(at);
+                    }
+                    None => added.push(item),
+                }
+            }
+            let kept = after.len() - added.len();
+            let mut pieces: Vec<Piece> = added
+                .into_iter()
+                .map(|item| (PieceKind::Added, format!("+ {}", crate::format_value(item))))
+                .chain(left.into_iter().map(|item| {
+                    (
+                        PieceKind::Removed,
+                        format!("− {}", crate::format_value(item)),
+                    )
+                }))
+                .enumerate()
+                .map(|(at, (kind, text))| Piece::new(kind, text, at > 0))
+                .collect();
+            if pieces.is_empty() {
+                // Only the order changed.
+                return None;
+            }
+            if kept > 0 {
+                pieces.push(Piece::new(
+                    PieceKind::Same,
+                    format!("· {kept} unchanged"),
+                    true,
+                ));
+            }
+            Some(pieces)
+        }
+        (Value::String(before), Value::String(after)) => {
+            let old = tokens(before);
+            let new = tokens(after);
+            let long = old.len().max(new.len()) >= LONG_TEXT_WORDS;
+            if !long || old.len() > DIFF_WORDS || new.len() > DIFF_WORDS {
+                return None;
+            }
+            let pieces = word_pieces(&old, &new);
+            // The same words with other spacing: before → after shows what differs.
+            pieces
+                .iter()
+                .any(|piece| matches!(piece.kind, PieceKind::Removed | PieceKind::Added))
+                .then_some(pieces)
+        }
+        _ => None,
+    }
+}
+
+/// The words of `old` and `new` as kept, removed and added runs (a longest common
+/// subsequence), unchanged runs cut to [`CONTEXT_WORDS`] beside each change.
+/// One word, or one mark of punctuation, of a text, and whether space came before it: a
+/// difference compares the words and marks alone, and joins them back as the text spaced them.
+#[derive(Debug, Clone, Copy)]
+struct Token<'a> {
+    text: &'a str,
+    spaced: bool,
+}
+
+fn tokens(text: &str) -> Vec<Token<'_>> {
+    let mut tokens = Vec::new();
+    let mut spaced = false;
+    let mut word: Option<usize> = None;
+    for (at, c) in text.char_indices() {
+        let in_word = c.is_alphanumeric() || c == '_' || c == '\'' || c == '-';
+        if let Some(start) = word
+            && !in_word
+        {
+            tokens.push(Token {
+                text: &text[start..at],
+                spaced,
+            });
+            spaced = false;
+            word = None;
+        }
+        if c.is_whitespace() {
+            spaced = true;
+        } else if in_word {
+            word.get_or_insert(at);
+        } else {
+            tokens.push(Token {
+                text: &text[at..at + c.len_utf8()],
+                spaced,
+            });
+            spaced = false;
+        }
+    }
+    if let Some(start) = word {
+        tokens.push(Token {
+            text: &text[start..],
+            spaced,
+        });
+    }
+    tokens
+}
+
+/// Tokens back into text, spaced as their text spaced them; a run begins without its space.
+fn join(tokens: &[Token]) -> String {
+    let mut text = String::new();
+    for (ix, token) in tokens.iter().enumerate() {
+        if ix > 0 && token.spaced {
+            text.push(' ');
+        }
+        text.push_str(token.text);
+    }
+    text
+}
+
+fn word_pieces(old: &[Token], new: &[Token]) -> Vec<Piece> {
+    // lcs[i][j]: the longest common subsequence of old[i..] and new[j..].
+    let mut lcs = vec![vec![0u16; new.len() + 1]; old.len() + 1];
+    for i in (0..old.len()).rev() {
+        for j in (0..new.len()).rev() {
+            lcs[i][j] = if old[i].text == new[j].text {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    // Tokens in order, each kept (0), removed (1) or added (2).
+    let mut words: Vec<(u8, Token)> = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() || j < new.len() {
+        if i < old.len() && j < new.len() && old[i].text == new[j].text {
+            words.push((0, old[i]));
+            i += 1;
+            j += 1;
+        } else if i < old.len() && (j == new.len() || lcs[i + 1][j] >= lcs[i][j + 1]) {
+            // A removal before the addition that takes its place: "move → hold".
+            words.push((1, old[i]));
+            i += 1;
+        } else {
+            words.push((2, new[j]));
+            j += 1;
+        }
+    }
+    let mut pieces: Vec<Piece> = Vec::new();
+    // A run's piece, spaced as its first token was, but never at the start of the row.
+    let push = |pieces: &mut Vec<Piece>, kind: PieceKind, run: &[Token]| {
+        let spaced = !pieces.is_empty() && run[0].spaced;
+        pieces.push(Piece::new(kind, join(run), spaced));
+    };
+    let mut at = 0;
+    while at < words.len() {
+        let kind = words[at].0;
+        let end = words[at..]
+            .iter()
+            .position(|(k, _)| *k != kind)
+            .map_or(words.len(), |n| at + n);
+        let run: Vec<Token> = words[at..end].iter().map(|(_, token)| *token).collect();
+        match kind {
+            0 => {
+                let first = at == 0;
+                let last = end == words.len();
+                let keep_head = if first { 0 } else { CONTEXT_WORDS };
+                let keep_tail = if last { 0 } else { CONTEXT_WORDS };
+                if run.len() > keep_head + keep_tail {
+                    if keep_head > 0 {
+                        push(&mut pieces, PieceKind::Same, &run[..keep_head]);
+                    }
+                    let spaced = !pieces.is_empty();
+                    pieces.push(Piece::new(PieceKind::Gap, "…", spaced));
+                    if keep_tail > 0 {
+                        push(&mut pieces, PieceKind::Same, &run[run.len() - keep_tail..]);
+                    }
+                } else {
+                    push(&mut pieces, PieceKind::Same, &run);
+                }
+            }
+            1 => push(&mut pieces, PieceKind::Removed, &run),
+            _ => push(&mut pieces, PieceKind::Added, &run),
+        }
+        at = end;
+    }
+    pieces
 }
 
 fn value_label(value: &Option<Value>, color: Color, strike: bool) -> Label {
@@ -599,4 +851,75 @@ pub fn change_group_header(
                 .color(Color::Muted),
         )
         .child(change_counts(added, changed, removed))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// The row as it reads, removals as `[-…]` and additions as `[+…]`.
+    fn text(pieces: &[Piece]) -> String {
+        let mut text = String::new();
+        for piece in pieces {
+            if piece.spaced {
+                text.push(' ');
+            }
+            match piece.kind {
+                PieceKind::Same | PieceKind::Gap => text.push_str(&piece.text),
+                PieceKind::Removed => text.push_str(&format!("[-{}]", piece.text)),
+                PieceKind::Added => text.push_str(&format!("[+{}]", piece.text)),
+            }
+        }
+        text
+    }
+
+    /// A list shows what it gained and lost and how much it kept; a reordered list, a short
+    /// text and a number keep before → after.
+    #[test]
+    fn a_list_shows_its_gains_and_losses() {
+        let pieces = inner_diff(
+            &json!(["graphs", "hiring", "rust"]),
+            &json!(["rust", "graphs", "design"]),
+        )
+        .unwrap();
+        assert_eq!(text(&pieces), "[++ design] [-− hiring] · 2 unchanged");
+        assert_eq!(inner_diff(&json!(["a", "b"]), &json!(["b", "a"])), None);
+        assert_eq!(inner_diff(&json!("Engineer"), &json!("Lead")), None);
+        assert_eq!(inner_diff(&json!(12), &json!(15)), None);
+    }
+
+    /// A longer text shows its changed words with a few words around each change, and the
+    /// unchanged rest as a gap.
+    #[test]
+    fn a_longer_text_shows_its_changed_words_in_context() {
+        let before = "We agreed to move the offsite to the coast after the hiring plan is \
+                      done and the budget is in";
+        let after = "We agreed to hold the offsite to the coast after the hiring plan is done \
+                     and the budget is in November";
+        let pieces = inner_diff(&json!(before), &json!(after)).unwrap();
+        assert_eq!(
+            text(&pieces),
+            "We agreed to [-move] [+hold] the offsite to … budget is in [+November]"
+        );
+        // Other spacing alone is not a change of words.
+        assert_eq!(
+            inner_diff(&json!(before), &json!(before.replace(' ', "  "))),
+            None
+        );
+        // Punctuation is its own mark: a word that gained a comma is the same word.
+        let pieces = inner_diff(
+            &json!("A split is a tree of panes with shares. Each pane keeps its own tabs."),
+            &json!(
+                "A split is a tree of panes, each with its share of the space. Each pane keeps \
+                 its own tabs."
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            text(&pieces),
+            "… tree of panes[+, each] with [-shares] [+its share of the space]. Each pane …"
+        );
+    }
 }

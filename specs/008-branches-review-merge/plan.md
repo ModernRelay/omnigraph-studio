@@ -58,7 +58,10 @@ place), X (designed on 0.13; the better routes are deferred).
   what the target has (changed, removed, or unchanged with relationships that changed), then
   what the branch added. Inside a section, cards run by type under one header counting what the
   run shows. A card is one node: its changed properties, before and after (a removed one stays
-  as a real, searchable row), then the relationship changes that came with it.
+  as a real, searchable row), then the relationship changes that came with it. A changed list
+  shows the elements it gained and lost and how many it kept; a changed text of eight words or
+  more shows its changed words with three words of context on each side, the rest as "…",
+  punctuation compared as its own mark (texts over 200 words show before → after).
 - A relationship change is on one card, its home: the end the branch added, else an end it
   changed or removed, else its source, which then stands unchanged for its relationships.
   There it is counted, reviewed and reverted. When the other end has a card too, the
