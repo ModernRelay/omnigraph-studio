@@ -1150,6 +1150,11 @@ impl Exploration {
     fn new(session: Entity<GraphSession>, cx: &mut Context<Self>) -> Self {
         let subscription = cx.subscribe(&session, |this, session, event, cx| match event {
             SessionEvent::SchemaChanged => this.request_missing(cx),
+            // Another writer changed the schema: what is shown stays until Refresh.
+            SessionEvent::SchemaMoved if this.pin.is_some() && !this.newer_available => {
+                this.newer_available = true;
+                this.changed(cx);
+            }
             SessionEvent::BranchChanged => {
                 if let Some(root) = this.state.root.clone() {
                     this.root_at(root, cx);

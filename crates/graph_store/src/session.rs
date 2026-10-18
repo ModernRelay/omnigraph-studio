@@ -121,6 +121,10 @@ pub enum SessionEvent {
     ChangesRead {
         branch: String,
     },
+    /// Another writer changed the schema, seen at a head move. The session reads under the new
+    /// one now; a view still showing what it read under the old one offers Refresh, which takes
+    /// it. Unlike [`SessionEvent::SchemaChanged`], nothing on screen changes by itself.
+    SchemaMoved,
 }
 
 /// How many answers to reads pinned to a commit, and Blob cells at a commit, a session keeps. A
@@ -538,27 +542,34 @@ impl GraphSession {
         }));
     }
 
-    /// Takes a schema read from the server. A text other than the one held starts a new schema
-    /// epoch: what was kept under the old one, answers and change logs, is let go.
+    /// Takes a schema read from the server at the person's asking, or the first: views take it
+    /// at once ([`SessionEvent::SchemaChanged`]).
     fn install_schema(&mut self, schema: Loadable<Arc<SchemaModel>>, cx: &mut Context<Self>) {
-        if let Loadable::Loaded(model) = &schema
-            && self.schema_text.as_deref() != Some(&*model.source)
-        {
-            self.schema_epoch += 1;
-            self.schema_text = Some(model.source.clone());
-            self.pinned_reads.clear();
-            self.pinned_blobs.clear();
-            // Each log starts again at its branch's head, so the next move is read.
-            self.change_logs = self
-                .heads
-                .iter()
-                .map(|(branch, head)| (branch.clone(), ChangeLog::starting_at(head.clone())))
-                .collect();
+        if let Loadable::Loaded(model) = &schema {
+            self.start_schema_epoch(model);
         }
         self.schema = schema;
         cx.emit(SessionEvent::SchemaChanged);
         cx.notify();
         self.check_heads(cx);
+    }
+
+    /// A text other than the one held starts a new schema epoch: what was kept under the old
+    /// one, answers and change logs, is let go.
+    fn start_schema_epoch(&mut self, model: &SchemaModel) {
+        if self.schema_text.as_deref() == Some(&*model.source) {
+            return;
+        }
+        self.schema_epoch += 1;
+        self.schema_text = Some(model.source.clone());
+        self.pinned_reads.clear();
+        self.pinned_blobs.clear();
+        // Each log starts again at its branch's head, so the next move is read.
+        self.change_logs = self
+            .heads
+            .iter()
+            .map(|(branch, head)| (branch.clone(), ChangeLog::starting_at(head.clone())))
+            .collect();
     }
 
     /// Reads the schema again while keeping the one held, and takes it if its text changed: a
@@ -572,8 +583,13 @@ impl GraphSession {
                 this.note_read(&read, cx);
                 if let Ok(output) = read
                     && this.schema_text.as_deref() != Some(output.schema_source.as_str())
+                    && let Loadable::Loaded(model) = parse_schema(&output.schema_source)
                 {
-                    this.install_schema(parse_schema(&output.schema_source), cx);
+                    // The session reads under it from now; views take it on Refresh.
+                    this.start_schema_epoch(&model);
+                    this.schema = Loadable::Loaded(model);
+                    cx.emit(SessionEvent::SchemaMoved);
+                    cx.notify();
                 }
             })
             .ok();
@@ -2919,9 +2935,19 @@ mod tests {
         assert_eq!(reads(), 2, "read again under the new schema");
 
         // Another writer changes the schema; the head move's feed read finds it and the session
-        // takes it.
+        // takes it, telling views it moved rather than changing them.
         let _watch = session.update(cx, |session, _| {
             session.watch_reads("main", node_reads(&schema, "Person"))
+        });
+        let events = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let heard = events.clone();
+        cx.update(|cx| {
+            cx.subscribe(&session, move |_, event: &SessionEvent, _| match event {
+                SessionEvent::SchemaChanged => heard.lock().unwrap().push("changed"),
+                SessionEvent::SchemaMoved => heard.lock().unwrap().push("moved"),
+                _ => {}
+            })
+            .detach()
         });
         let renamed = "node Person {\n  slug: String @key\n  full_name: String @rename_from(\"name\")\n}\nnode Note {\n  slug: String @key\n}\n";
         served.lock().unwrap().schema = renamed.into();
@@ -2935,6 +2961,7 @@ mod tests {
             session.schema_model().unwrap().source.clone()
         });
         assert_eq!(&*held, renamed, "the new schema is taken");
+        assert_eq!(*events.lock().unwrap(), ["moved"], "views are not changed");
         assert!(
             matches!(
                 session.read_with(cx, |session, _| session.changes_since("main", "c1", "c2")),

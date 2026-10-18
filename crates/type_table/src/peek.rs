@@ -284,6 +284,14 @@ impl NodePeek {
                 cx.notify();
                 return;
             }
+            // Another writer changed the schema: the view stays as read until Refresh.
+            if let SessionEvent::SchemaMoved = event
+                && !this.holds_commit
+            {
+                this.newer = true;
+                cx.notify();
+                return;
+            }
             // While its own writes are out the view compares when they end: the head may be its
             // own commit.
             let moved = match event {
@@ -413,8 +421,10 @@ impl NodePeek {
         self.awaiting_changes = false;
     }
 
-    /// Reads a node again at the branch head, with its relationships and Blobs.
+    /// Reads a node again at the branch head, with its relationships and Blobs, under the
+    /// session's schema.
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.schema = self.session.read(cx).schema_model().or(self.schema.take());
         self.newer = false;
         self.snapshot = None;
         // What the table read belongs to the old commit.

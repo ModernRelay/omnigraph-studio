@@ -50,6 +50,7 @@ impl TypesList {
         self._session_subscription = session.as_ref().map(|session| {
             cx.subscribe(session, |_, _, event: &SessionEvent, cx| match event {
                 SessionEvent::SchemaChanged
+                | SessionEvent::SchemaMoved
                 | SessionEvent::CountsChanged
                 | SessionEvent::BranchChanged => cx.notify(),
                 _ => {}

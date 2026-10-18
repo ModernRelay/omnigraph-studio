@@ -82,9 +82,16 @@ pub(crate) fn session_routing(
 #[derive(Default)]
 pub(crate) struct Writer {
     commits: Mutex<Vec<(String, String, Vec<Value>)>>,
+    /// The schema the server answers with once the writer changed it.
+    schema: Mutex<Option<String>>,
 }
 
 impl Writer {
+    /// Changes the schema the server answers with.
+    pub(crate) fn set_schema(&self, schema: &str) {
+        *self.schema.lock().unwrap() = Some(schema.to_owned());
+    }
+
     /// Commits `commit` on the newest one (or `c1`) with `changes`.
     pub(crate) fn commit(&self, commit: &str, changes: Vec<Value>) {
         let mut commits = self.commits.lock().unwrap();
@@ -210,7 +217,13 @@ fn serve_with(
             let path = request.uri().path().to_owned();
             let query = request.uri().query().unwrap_or_default().to_owned();
             let (status, body) = if path.ends_with("/schema") {
-                (200, json!({ "schema_source": &*schema }))
+                let changed = writer
+                    .as_ref()
+                    .and_then(|writer| writer.schema.lock().unwrap().clone());
+                (
+                    200,
+                    json!({ "schema_source": changed.unwrap_or_else(|| schema.to_string()) }),
+                )
             } else if path.ends_with("/query") {
                 let mut bytes = Vec::new();
                 request.into_body().read_to_end(&mut bytes).await.ok();

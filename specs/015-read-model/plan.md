@@ -275,7 +275,8 @@ A first cut of parts 1 and 4, ahead of the shared cache:
   parameters at an earlier commit of the branch when the log shows nothing it depends on
   changed in between, and kept at the new commit. So Refresh on a page reads again only the
   groups the commit touched, and a moved view's later reads mostly cost nothing. The memo
-  holds 1,024 answers; the byte budget and release buffer are not built.
+  keeps its answers within 64 MB (each weighed by its rows), least recently used first out, up
+  to 4,096; the release buffer is not built.
 - Review reads its fork and head from `branches/merge-base` and folds the feed after the base,
   instead of reading both branches' whole commit lists (each about 1.6 s on the personal graph,
   and 3m47s once right after a restart); its commits come from the feed blocks' causes. A
@@ -288,8 +289,10 @@ A first cut of parts 1 and 4, ahead of the shared cache:
   uses the current schema, so a rename, a drop or an addition can change the same query's
   answer at the same commit; nothing kept or carried crosses an epoch, and a new epoch starts
   every change log again at its branch's head. A head move whose feed read meets
-  `409 schema_boundary`, or whose `/schema` read after it differs, reads the schema again and
-  takes it. Left open: a schema changed and changed back between two head checks is not seen
+  `409 schema_boundary`, or whose `/schema` read after it differs, reads the schema again: the
+  session reads under it from then on, and views showing what they read under the old one offer
+  Refresh (`SchemaMoved`), which takes it. Nothing on screen changes by itself, an open cell
+  edit included; a reload the person starts still changes views at once (`SchemaChanged`). Left open: a schema changed and changed back between two head checks is not seen
   (the server gives no schema identity with a read; omnigraph#1054).
 - A node page or peek at a commit made before one of its type's properties was added (or
   renamed) was refused whole (`return { $n }` reads every current property). It now reads the

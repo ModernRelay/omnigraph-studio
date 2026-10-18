@@ -574,6 +574,13 @@ impl TypeTable {
     ) {
         match event {
             SessionEvent::SchemaChanged => self.load_schema(cx),
+            // Another writer changed the schema: what the table shows was read under the old
+            // one, and stays until Refresh takes the new one.
+            SessionEvent::SchemaMoved if !self.newer => {
+                self.newer = true;
+                cx.emit(ItemEvent::UpdateTab);
+                cx.notify();
+            }
             // A table pinned to a commit reads that commit whatever the branch does.
             SessionEvent::BranchChanged | SessionEvent::HeadMoved { .. }
                 if self.at_commit.is_some() => {}
@@ -2656,7 +2663,16 @@ impl TypeTable {
     }
 
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.reload(false, cx);
+        let schema_moved = match (&self.schema, self.session.read(cx).schema_model()) {
+            (Some(shown), Some(held)) => shown.source != held.source,
+            _ => false,
+        };
+        if schema_moved {
+            // Its columns and rows come from the new schema.
+            self.load_schema(cx);
+        } else {
+            self.reload(false, cx);
+        }
         if self.peek.is_some() {
             self.close_peek(cx);
         }
@@ -6399,6 +6415,63 @@ mod tests {
         table.read_with(cx, |table, _| {
             assert_eq!(table.paging.pinned.as_deref(), Some("c2"));
             assert!(table.newer, "a person changed");
+        });
+    }
+
+    /// Another writer's schema change, seen at a head move, leaves the table as it was read and
+    /// offers Refresh; Refresh reads it under the new schema (constitution II).
+    #[gpui::test]
+    async fn a_schema_changed_elsewhere_waits_for_refresh(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, writer) = session_followed(
+            PEOPLE,
+            |request| {
+                if request["name"] == "studio_head" {
+                    return serde_json::json!([]);
+                }
+                serde_json::json!([
+                    {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
+                    {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
+                ])
+            },
+            cx,
+        );
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session.clone(),
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let grown = format!("{PEOPLE}node Note {{\n  slug: String @key\n}}\n");
+        writer.set_schema(&grown);
+        writer.commit("c2", vec![changed("node", "Note", "n1", None)]);
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert!(table.newer, "Refresh is offered");
+            assert_eq!(table.rows.len(), 2, "the rows stay");
+            assert_eq!(
+                table.paging.pinned.as_deref(),
+                Some("c1"),
+                "and their commit"
+            );
+            assert_eq!(&*table.schema.as_ref().unwrap().source, PEOPLE);
+        });
+
+        table.update_in(cx, |table, window, cx| table.refresh(window, cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert!(!table.newer);
+            assert_eq!(&*table.schema.as_ref().unwrap().source, grown.as_str());
+            assert_eq!(table.rows.len(), 2);
         });
     }
 
