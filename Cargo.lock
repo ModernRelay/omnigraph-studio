@@ -9843,6 +9843,7 @@ dependencies = [
 name = "studio_settings"
 version = "0.2.1"
 dependencies = [
+ "futures",
  "gpui",
  "log",
  "schemars 1.0.4",

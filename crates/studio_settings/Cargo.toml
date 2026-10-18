@@ -9,6 +9,7 @@ publish.workspace = true
 path = "src/studio_settings.rs"
 
 [dependencies]
+futures = { workspace = true }
 gpui = { workspace = true }
 log = { workspace = true }
 settings = { workspace = true }
@@ -17,6 +18,9 @@ serde_json = { workspace = true }
 serde_ignored = { workspace = true }
 serde_path_to_error = { workspace = true }
 schemars = { workspace = true }
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
 
 [features]
 test-support = []

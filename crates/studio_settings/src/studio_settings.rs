@@ -9,7 +9,7 @@
 //! Layer 1 (`docs/architecture.md`).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use gpui::{App, BorrowAppContext, Global};
@@ -346,6 +346,9 @@ struct SettingsFileState {
     keymap: Vec<String>,
     /// False for settings held in memory by a test: every change is refused.
     writable: bool,
+    /// Changes made so far: a write that comes back for an older one does not apply its
+    /// reading over a newer change.
+    edits: u64,
 }
 
 impl Global for SettingsFileState {}
@@ -579,6 +582,7 @@ pub fn init(cx: &mut App) {
         problems,
         keymap: Vec::new(),
         writable: true,
+        edits: 0,
     });
     apply(settings, cx);
     watch(cx);
@@ -594,6 +598,7 @@ pub fn init_test(cx: &mut App) {
         problems: Vec::new(),
         keymap: Vec::new(),
         writable: false,
+        edits: 0,
     });
     cx.set_global(StudioSettings::default());
 }
@@ -692,13 +697,14 @@ fn apply(settings: StudioSettings, cx: &mut App) {
     cx.refresh_windows();
 }
 
-/// Applies a change and writes it into the settings file. The file is read again first, so an
-/// edit another program made since Studio last read it stays, and only the settings the change
-/// touches are rewritten ([`document::edit`]); comments, order and every other key are kept.
-/// A file whose syntax is broken is not written: the person's text may hold what they meant, so
-/// the change is refused until the file reads again.
+/// Applies a change, and writes it into the settings file on the write thread, in turn with
+/// every other write: reading, editing and syncing the file can take tens of milliseconds, too
+/// long for a click. The file is read again first, so an edit another program made since
+/// Studio last read it stays, and only the settings the change touches are rewritten
+/// ([`document::edit`]); comments, order and every other key are kept. A file whose syntax is
+/// broken is not written: the person's text may hold what they meant, so the change holds only
+/// until Studio quits, and the settings page says why.
 pub fn update(cx: &mut App, f: impl FnOnce(&mut StudioSettings)) {
-    let path = settings_path();
     let old = StudioSettings::get(cx).clone();
     let mut new = old.clone();
     f(&mut new);
@@ -706,54 +712,111 @@ pub fn update(cx: &mut App, f: impl FnOnce(&mut StudioSettings)) {
         notify(cx);
         return;
     }
-    let text = match std::fs::read_to_string(&path) {
+    let state = cx.global_mut::<SettingsFileState>();
+    state.edits += 1;
+    let edit = state.edits;
+    apply(new.clone(), cx);
+    let path = settings_path();
+    let (done, written) = futures::channel::oneshot::channel();
+    files::run_in_turn(move || {
+        done.send(write_change(&path, &old, &new)).ok();
+    });
+    cx.spawn(async move |cx| {
+        if let Ok(written) = written.await {
+            cx.update(|cx| saved(edit, written, cx));
+        }
+    })
+    .detach();
+}
+
+/// How writing one change into the settings file went.
+enum Written {
+    /// The file could not be read, or its syntax is broken: nothing was written.
+    Unread(String),
+    Saved {
+        /// The file as it reads now, edits from elsewhere included; `None` when the write
+        /// failed.
+        reading: Option<Box<Reading>>,
+        modified: Option<SystemTime>,
+        error: Option<String>,
+    },
+}
+
+/// Reads the settings file, edits the change from `old` to `new` into it, and writes it.
+fn write_change(path: &Path, old: &StudioSettings, new: &StudioSettings) -> Written {
+    let text = match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(error) => Err(error.to_string()),
     };
     let edited = text.and_then(|text| {
-        let edited = document::edit(&text, &old, &new)?;
+        let edited = document::edit(&text, old, new)?;
         Ok((edited != text, edited))
     });
     let (changed, edited) = match edited {
         Ok(edited) => edited,
-        Err(error) => {
-            let state = cx.global_mut::<SettingsFileState>();
+        Err(error) => return Written::Unread(error),
+    };
+    // Private: `agent.env` may hold a model provider's key.
+    let written = if changed {
+        write_atomic(path, edited.as_bytes(), Access::Private)
+            .map_err(|error| format!("{} could not be saved: {error}", path.display()))
+    } else {
+        Ok(())
+    };
+    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let reading = written
+        .is_ok()
+        .then(|| StudioSettings::read(&edited).ok().map(Box::new))
+        .flatten();
+    Written::Saved {
+        reading,
+        modified,
+        error: written.err(),
+    }
+}
+
+/// Takes in how change `edit` was written. The file's time is taken as read, so the watch does
+/// not read it again. Only the newest change's reading applies, and only when it differs from
+/// what applies already (an edit made elsewhere): an older one would undo a newer change. A
+/// change that could not be written applies until Studio quits, and the error says so.
+fn saved(edit: u64, written: Written, cx: &mut App) {
+    let path = settings_path();
+    let latest = cx.global::<SettingsFileState>().edits == edit;
+    let state = cx.global_mut::<SettingsFileState>();
+    match written {
+        Written::Unread(error) => {
             state.error = Some(format!(
-                "{} could not be read, so the change was not saved: {error}. Fix the file and \
-                 try again.",
+                "{} could not be read, so the change was not saved and holds only until Studio \
+                 quits: {error}. Fix the file and try again.",
                 path.display()
             ));
             // They were found in an earlier version of the file.
             state.problems.clear();
             notify(cx);
-            return;
         }
-    };
-    // Private: `agent.env` may hold a model provider's key.
-    let written = if changed {
-        write_atomic(&path, edited.as_bytes(), Access::Private)
-            .map_err(|error| format!("{} could not be saved: {error}", path.display()))
-    } else {
-        Ok(())
-    };
-    let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-    // What the file says now, written or already so, edits from elsewhere included: the watch
-    // takes this time as read. When the write failed, the change applies until Studio quits
-    // and the error says so.
-    let reading = written
-        .is_ok()
-        .then(|| StudioSettings::read(&edited).ok())
-        .flatten();
-    let state = cx.global_mut::<SettingsFileState>();
-    state.modified = modified;
-    state.error = written.err();
-    match reading {
-        Some(reading) => {
-            state.problems = reading.problems;
-            apply(reading.settings, cx);
+        Written::Saved {
+            reading,
+            modified,
+            error,
+        } => {
+            state.modified = modified;
+            let failed = error.is_some();
+            state.error = error;
+            match reading {
+                Some(reading) if latest => {
+                    let reading = *reading;
+                    state.problems = reading.problems;
+                    if reading.settings != *StudioSettings::get(cx) {
+                        apply(reading.settings, cx);
+                    } else {
+                        notify(cx);
+                    }
+                }
+                _ if failed => notify(cx),
+                _ => {}
+            }
         }
-        None => apply(new, cx),
     }
 }
 
@@ -793,6 +856,70 @@ fn watch(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A change is edited into the file as it is now, an edit made elsewhere kept.
+    #[test]
+    fn a_change_is_written_into_the_file_as_it_is_now() {
+        let dir =
+            std::env::temp_dir().join(format!("studio-settings-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        // Someone else set the buffer font size meanwhile.
+        std::fs::write(&path, "{\n  // mine\n  \"buffer_font_size\": 15\n}\n").unwrap();
+        let old = StudioSettings::default();
+        let new = StudioSettings {
+            ui_font_size: old.ui_font_size + 2.,
+            ..old.clone()
+        };
+        let Written::Saved { reading, error, .. } = write_change(&path, &old, &new) else {
+            panic!("unread");
+        };
+        assert_eq!(error, None);
+        let reading = reading.unwrap();
+        assert_eq!(reading.settings.ui_font_size, new.ui_font_size);
+        assert_eq!(reading.settings.buffer_font_size, 15.);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("// mine"), "{text}");
+        // A file whose syntax is broken is not written.
+        std::fs::write(&path, "{ \"ui_font_size\": ").unwrap();
+        assert!(matches!(
+            write_change(&path, &old, &new),
+            Written::Unread(_)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ \"ui_font_size\": "
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A write that comes back for an older change does not apply its reading over a newer
+    /// change, while the file's time is still taken as read.
+    #[gpui::test]
+    fn an_older_changes_reading_does_not_apply(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            init_test(cx);
+            cx.global_mut::<SettingsFileState>().edits = 2;
+            let older = StudioSettings {
+                ui_font_size: 20.,
+                ..StudioSettings::default()
+            };
+            let modified = Some(SystemTime::UNIX_EPOCH);
+            let written = Written::Saved {
+                reading: Some(Box::new(Reading {
+                    settings: older,
+                    problems: vec!["from the older write".into()],
+                })),
+                modified,
+                error: None,
+            };
+            saved(1, written, cx);
+            assert_eq!(*StudioSettings::get(cx), StudioSettings::default());
+            let state = cx.global::<SettingsFileState>();
+            assert!(state.problems.is_empty());
+            assert_eq!(state.modified, modified);
+        });
+    }
 
     #[test]
     fn a_build_directory_binary_is_a_development_run_and_a_bundle_is_not() {

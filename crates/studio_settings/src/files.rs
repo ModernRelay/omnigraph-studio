@@ -19,9 +19,11 @@ pub enum Access {
     Keep,
 }
 
-/// One write waiting its turn, or a mark that everything asked for before it is done.
+/// One write waiting its turn, a read, edit and write of one file ([`run_in_turn`]), or a mark
+/// that everything asked for before it is done.
 enum Job {
     Write(PathBuf, Vec<u8>, Access),
+    Run(Box<dyn FnOnce() + Send>),
     Done(std::sync::mpsc::Sender<()>),
 }
 
@@ -44,6 +46,7 @@ fn writer() -> &'static std::sync::mpsc::Sender<Job> {
                                 log::warn!("Studio could not write {}: {error}", path.display());
                             }
                         }
+                        Job::Run(run) => run(),
                         Job::Done(done) => {
                             done.send(()).ok();
                         }
@@ -59,6 +62,12 @@ fn writer() -> &'static std::sync::mpsc::Sender<Job> {
 /// left as it was, as a failed [`write_atomic`] leaves it.
 pub fn write_atomic_in_turn(path: PathBuf, contents: Vec<u8>, access: Access) {
     writer().send(Job::Write(path, contents, access)).ok();
+}
+
+/// Runs `job` on the write thread, after every write asked for before it: a read, edit and
+/// write of a file that must not interleave with another's.
+pub(crate) fn run_in_turn(job: impl FnOnce() + Send + 'static) {
+    writer().send(Job::Run(Box::new(job))).ok();
 }
 
 /// Waits, a few seconds at most, until every write asked for so far is done: at quit, so the
