@@ -498,7 +498,8 @@ than styling one-off elements.
   (`size::ROW_BUTTON`, a tag's height: a tree row's toggle, an inline Fix, Show more, a
   setting's reset, a value's copy); and a tab's pin and close, `ds::inline_icon_button`, no
   square beyond its icon. An icon button's icon follows its size: 14 px at 28 and 22 px,
-  12 px in a row and a tab. A plain `IconButton::new` is the 22 px one, as Zed's, so its
+  12 px in a row and a tab; a sheet's close, `ds::sheet_close_button`, is the one role that
+  sets its own, an outlined 22 px square with the 12 px icon. A plain `IconButton::new` is the 22 px one, as Zed's, so its
   hover fill keeps 4 px clear in the 30 px status bar and 5 px in a 32 px strip (until
   2026-10-18 every icon button defaulted to 28 px, which nearly filled the strips it sat
   in). A label is the body size at 28 px and up (13 px at the default 15 px

@@ -1387,6 +1387,15 @@ pub fn inline_icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButto
     IconButton::new(id, icon).size(ButtonSize::None)
 }
 
+/// A sheet's close (a dialog's ×): an outlined square at a strip's size with a row's icon, so
+/// it holds its place beside the title without weighing as much as it.
+pub fn sheet_close_button(id: impl Into<ElementId>) -> IconButton {
+    IconButton::new(id, IconName::Close)
+        .variant(Variant::Outline)
+        .size(ButtonSize::Default)
+        .icon_size(IconSize::XSmall)
+}
+
 /// A text field's frame: a hairline box at a control's height, so a field lines up with the
 /// buttons beside it, around an editor and an icon or a counter. `invalid` draws the error
 /// border. Every single-line field in Studio is one, but for a filter among a sidebar's rows

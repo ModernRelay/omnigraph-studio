@@ -10,7 +10,7 @@ use gpui::{AnyElement, App, ClickEvent, Div, ElementId, SharedString, Window};
 use ui::Tooltip;
 use ui::prelude::*;
 
-use crate::button::{Button, IconButton, Variant};
+use crate::button::{Button, Variant};
 use crate::ds::{elevation, radii, radius, size, space, surface};
 
 /// A modal's card: the floating fill, its hairline, the floating shadow and the modal radius,
@@ -102,10 +102,7 @@ impl RenderOnce for ModalHeader {
                     )
                     .children(self.meta)
                     .children(self.on_close.map(|on_close| {
-                        IconButton::new("modal-close", IconName::Close)
-                            .variant(crate::button::Variant::Outline)
-                            .size(ButtonSize::Default)
-                            .icon_size(IconSize::XSmall)
+                        crate::ds::sheet_close_button("modal-close")
                             .tooltip(Tooltip::text("Close"))
                             .disabled(self.close_disabled)
                             .on_click(on_close)

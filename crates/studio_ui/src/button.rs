@@ -556,9 +556,9 @@ impl IconButton {
         self
     }
 
-    /// An icon size other than the one the button's size gives it: the design system's own
-    /// choice for one control (a sheet's outlined close), never a view's.
-    pub fn icon_size(mut self, size: IconSize) -> Self {
+    /// An icon size other than the one the button's size gives it, for the one role that has
+    /// one (`ds::sheet_close_button`); no view sets it.
+    pub(crate) fn icon_size(mut self, size: IconSize) -> Self {
         self.icon_size = Some(size);
         self
     }
