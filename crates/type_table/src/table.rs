@@ -352,6 +352,8 @@ pub struct TypeTable {
     focus_handle: FocusHandle,
     table_state: Entity<TableInteractionState>,
     page_task: Option<Task<()>>,
+    /// Each grouped section's read under way, by the section's index: a reload drops them.
+    section_tasks: HashMap<usize, Task<()>>,
     count_task: Option<Task<()>>,
     total_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -561,6 +563,7 @@ impl TypeTable {
             focus_handle: cx.focus_handle(),
             table_state,
             page_task: None,
+            section_tasks: HashMap::new(),
             count_task: None,
             total_task: None,
             _subscriptions: subscriptions,
@@ -1843,6 +1846,10 @@ impl TypeTable {
         } else {
             Loadable::Loading
         };
+        // A page or section read for what the table showed before must not land: the grouped
+        // path and a query that cannot be built start none of their own.
+        self.page_task = None;
+        self.section_tasks.clear();
         self.count_task = None;
         self.total_task = None;
         self.table_state
@@ -2234,14 +2241,15 @@ impl TypeTable {
         section.error = None;
         let snapshot = self.paging.pinned.clone();
         let read = self.read_shown(&query, snapshot, cx);
-        cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let result = read.await;
             this.update(cx, |this, cx| {
+                this.section_tasks.remove(&index);
                 this.apply_section_page(generation, index, result, size, cx)
             })
             .ok();
-        })
-        .detach();
+        });
+        self.section_tasks.insert(index, task);
         cx.notify();
     }
 
