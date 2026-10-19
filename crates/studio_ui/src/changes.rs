@@ -279,6 +279,7 @@ impl Piece {
 const LONG_TEXT_WORDS: usize = 8;
 /// Words and marks a difference compares at most on each side, past which before → after shows:
 /// the comparison runs as the row draws, in time that grows with the product of the lengths.
+/// The same holds a list's elements.
 const DIFF_WORDS: usize = 200;
 /// Unchanged words and marks kept on each side of a change.
 const CONTEXT_WORDS: usize = 3;
@@ -289,6 +290,9 @@ const CONTEXT_WORDS: usize = 3;
 fn inner_diff(before: &Value, after: &Value) -> Option<Vec<Piece>> {
     match (before, after) {
         (Value::Array(before), Value::Array(after)) => {
+            if before.len() > DIFF_WORDS || after.len() > DIFF_WORDS {
+                return None;
+            }
             let mut left: Vec<&Value> = before.iter().collect();
             let mut added = Vec::new();
             for item in after {
@@ -326,8 +330,9 @@ fn inner_diff(before: &Value, after: &Value) -> Option<Vec<Piece>> {
             Some(pieces)
         }
         (Value::String(before), Value::String(after)) => {
-            let old = tokens(before);
-            let new = tokens(after);
+            // Cut past the limit: a long text is not split whole at each draw to be refused.
+            let old = tokens(before, DIFF_WORDS + 1);
+            let new = tokens(after, DIFF_WORDS + 1);
             let long = old.len().max(new.len()) >= LONG_TEXT_WORDS;
             if !long || old.len() > DIFF_WORDS || new.len() > DIFF_WORDS {
                 return None;
@@ -343,8 +348,6 @@ fn inner_diff(before: &Value, after: &Value) -> Option<Vec<Piece>> {
     }
 }
 
-/// The words of `old` and `new` as kept, removed and added runs (a longest common
-/// subsequence), unchanged runs cut to [`CONTEXT_WORDS`] beside each change.
 /// One word, or one mark of punctuation, of a text, and whether space came before it: a
 /// difference compares the words and marks alone, and joins them back as the text spaced them.
 #[derive(Debug, Clone, Copy)]
@@ -353,11 +356,15 @@ struct Token<'a> {
     spaced: bool,
 }
 
-fn tokens(text: &str) -> Vec<Token<'_>> {
+/// The first `limit` tokens of `text`, at most.
+fn tokens(text: &str, limit: usize) -> Vec<Token<'_>> {
     let mut tokens = Vec::new();
     let mut spaced = false;
     let mut word: Option<usize> = None;
     for (at, c) in text.char_indices() {
+        if tokens.len() >= limit {
+            return tokens;
+        }
         let in_word = c.is_alphanumeric() || c == '_' || c == '\'' || c == '-';
         if let Some(start) = word
             && !in_word
@@ -402,6 +409,8 @@ fn join(tokens: &[Token]) -> String {
     text
 }
 
+/// The words of `old` and `new` as kept, removed and added runs (a longest common
+/// subsequence), unchanged runs cut to [`CONTEXT_WORDS`] beside each change.
 fn word_pieces(old: &[Token], new: &[Token]) -> Vec<Piece> {
     // lcs[i][j]: the longest common subsequence of old[i..] and new[j..].
     let mut lcs = vec![vec![0u16; new.len() + 1]; old.len() + 1];
