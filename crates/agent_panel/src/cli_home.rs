@@ -301,8 +301,8 @@ pub fn candidates(configured: Option<&str>) -> Vec<PathBuf> {
 pub struct CliFacts {
     /// Its release, as it reports it ("0.14.0").
     pub version: Option<String>,
-    /// `None` for a CLI older than Studio's minimum, 0.14, which has no `version --json`, or
-    /// one that did not answer.
+    /// `None` for a CLI that did not answer `version --json`: one older than Studio's minimum,
+    /// 0.14, or not OmniGraph's.
     pub contract: Option<String>,
 }
 
@@ -314,38 +314,22 @@ const VERSION_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_secs(5)
 };
 
-/// Reads a CLI's release and contract by running it, never a server. `version --json` reports
-/// both (`http_contract`, in every OmniGraph Studio supports). An older CLI answers only
-/// `--version`: its release names it in the message that says why it was not chosen, and it
-/// has no contract here.
+/// Reads a CLI's release and contract by running it, never a server: `version --json` reports
+/// both (`http_contract`, in every OmniGraph Studio supports).
 pub async fn cli_facts(cli: &Path) -> CliFacts {
-    if let Some(json) = output(cli, &["version", "--json"]).await
-        && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&json)
-        && let Some(contract) = json.get("http_contract").and_then(|c| c.as_str())
-    {
-        return CliFacts {
-            version: json
-                .get("version")
-                .and_then(|v| v.as_str())
-                .map(str::to_owned),
-            contract: Some(contract.to_owned()),
-        };
-    }
+    let json = output(cli, &["version", "--json"])
+        .await
+        .and_then(|json| serde_json::from_slice::<serde_json::Value>(&json).ok());
+    let field = |name: &str| {
+        json.as_ref()?
+            .get(name)
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+    };
     CliFacts {
-        version: output(cli, &["--version"])
-            .await
-            .and_then(|text| release(&String::from_utf8_lossy(&text))),
-        contract: None,
+        version: field("version"),
+        contract: field("http_contract"),
     }
-}
-
-/// The release in a `--version` line: `omnigraph 0.13.0` is `0.13.0`.
-fn release(text: &str) -> Option<String> {
-    let word = text.lines().next()?.split_whitespace().nth(1)?;
-    word.chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_digit())
-        .then(|| word.to_owned())
 }
 
 /// A CLI's standard output when it exits with success within [`VERSION_TIMEOUT`].
@@ -381,18 +365,26 @@ pub enum CliChoice {
 /// With no match the wrapper runs nothing and says why, rather than pointing at a CLI the server
 /// would refuse.
 pub async fn choose_cli(home: &CliHome, candidates: Vec<PathBuf>, contract: &str) -> CliChoice {
-    // Each probe waits on a process; together they take as long as the slowest, not the sum.
-    let facts = futures::future::join_all(candidates.iter().map(|cli| cli_facts(cli))).await;
-    let found: Vec<(PathBuf, CliFacts)> = candidates.into_iter().zip(facts).collect();
-    if let Some((cli, facts)) = found
+    // Every candidate is asked at once and heard in order: the first that speaks the contract
+    // is chosen as soon as those before it have answered, and the probes after it are dropped,
+    // which stops their processes. A hung wrapper later on the path delays nothing.
+    let mut probes: futures::stream::FuturesOrdered<_> = candidates
         .iter()
-        .find(|(_, facts)| facts.contract.as_deref() == Some(contract))
-        && home.use_cli(cli).is_ok()
-    {
-        return CliChoice::Chosen {
-            cli: cli.clone(),
-            version: facts.version.clone(),
+        .cloned()
+        .map(|cli| async move { cli_facts(&cli).await })
+        .collect();
+    let mut found = Vec::new();
+    for cli in candidates {
+        let Some(facts) = futures::StreamExt::next(&mut probes).await else {
+            break;
         };
+        if facts.contract.as_deref() == Some(contract) && home.use_cli(&cli).is_ok() {
+            return CliChoice::Chosen {
+                cli,
+                version: facts.version,
+            };
+        }
+        found.push((cli, facts));
     }
     home.refuse(&no_cli_text(contract, &found)).ok();
     CliChoice::NoMatch { found }
@@ -409,8 +401,10 @@ pub fn no_cli_text(contract: &str, found: &[(PathBuf, CliFacts)]) -> String {
             .map(|(cli, facts)| {
                 let what = match (&facts.version, &facts.contract) {
                     (Some(version), Some(speaks)) => format!("{version}, which speaks {speaks}"),
-                    (Some(version), None) => format!("{version}, older than 0.14"),
-                    (None, _) => "did not say its version".to_owned(),
+                    (None, Some(speaks)) => format!("a CLI that speaks {speaks}"),
+                    (_, None) => "older than 0.14, or not OmniGraph's: it did not answer \
+                                  `version --json`"
+                        .to_owned(),
                 };
                 format!("{} is {what}", cli.display())
             })
@@ -938,8 +932,6 @@ mod tests {
     /// found.
     #[test]
     fn the_cli_that_speaks_the_contract_is_chosen_without_a_server() {
-        assert_eq!(release("omnigraph 0.13.0\n").as_deref(), Some("0.13.0"));
-        assert_eq!(release("usage: …"), None);
         let dir = std::env::temp_dir().join(format!("studio-cli-choice-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
@@ -959,6 +951,8 @@ mod tests {
             "omnigraph-0.14",
             r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.14.0","http_contract":"0.13"}'; exit 0; }; exit 2"#,
         );
+        // A wrapper that hangs: a match before it is chosen without waiting for it.
+        let hung = fake("omnigraph-hung", "sleep 30");
         let other = fake(
             "omnigraph-0.15",
             r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.15.0","http_contract":"0.15"}'; exit 0; }; exit 2"#,
@@ -991,10 +985,21 @@ mod tests {
             other => panic!("{other:?}"),
         }
 
+        let started = std::time::Instant::now();
+        match choose(vec![current.clone(), hung.clone()]) {
+            CliChoice::Chosen { cli, .. } => assert_eq!(cli, current),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "waited for the hung CLI after the match: {:?}",
+            started.elapsed()
+        );
+
         match choose(vec![old.clone(), other.clone()]) {
             CliChoice::NoMatch { found } => {
                 let text = no_cli_text("0.13", &found);
-                assert!(text.contains("0.13.0, older than 0.14"), "{text}");
+                assert!(text.contains("older than 0.14"), "{text}");
                 assert!(text.contains("0.15.0, which speaks 0.15"), "{text}");
             }
             other => panic!("{other:?}"),
