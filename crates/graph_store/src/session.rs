@@ -1975,16 +1975,22 @@ impl GraphSession {
     }
 
     /// `branch`'s newest commit, as a list of branches shows it: from its commit list when one
-    /// is held, else read alone and kept until a commit lands on the branch. A branch with no
-    /// commit has none.
+    /// is held or being read, else read alone and kept until a commit lands on the branch. A
+    /// branch with no commit has none.
     pub fn head_commit(
         &mut self,
         branch: &str,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<CommitOutput>, ReadError>> {
         let key = branch.to_owned();
-        if let Some(list) = self.commit_lists.peek(&key) {
-            return Task::ready(Ok(list.first().cloned()));
+        match self.commit_lists.held(&key) {
+            Some(Held::Done(list)) => return Task::ready(Ok(list.first().cloned())),
+            // The whole list is on its way (History asked): its first commit, not a second read.
+            Some(Held::Pending(pending)) if pending.read.upgrade().is_some() => {
+                let list = self.commits(branch, false, cx);
+                return cx.spawn(async move |_, _| Ok(list.await?.first().cloned()));
+            }
+            _ => {}
         }
         let branch = key.clone();
         self.share(
@@ -1993,7 +1999,28 @@ impl GraphSession {
             move |session, cx| {
                 let client = session.client(cx);
                 let graph = session.graph_id.clone();
-                session.counted_read(async move { client.head_commit(&graph, &branch).await }, cx)
+                let read = session.counted_read(
+                    {
+                        let branch = branch.clone();
+                        async move { client.newest_commits(&graph, &branch, 1).await }
+                    },
+                    cx,
+                );
+                cx.spawn(async move |this, cx| {
+                    let list = read.await?;
+                    // More than asked for: a server that pages no history answered it whole,
+                    // which is the branch's commit list too.
+                    let head = list.commits.first().cloned();
+                    if list.commits.len() > 1 {
+                        this.update(cx, |this, _| {
+                            if !this.commit_lists.holds(&branch) {
+                                this.commit_lists.insert(branch, Arc::new(list.commits));
+                            }
+                        })
+                        .ok();
+                    }
+                    Ok(head)
+                })
             },
             |_, _| {},
             cx,
@@ -3777,12 +3804,20 @@ mod tests {
         assert_eq!(asked(), vec!["branch=main&limit=1"], "the head alone");
         assert_eq!(head(&session, "main", cx).as_deref(), Some("c2"));
         assert!(asked().is_empty(), "kept");
-
-        // A branch whose whole list is held: its first commit, nothing read.
-        let list = session.update(cx, |session, cx| session.commits("feature", false, cx));
+        // This server pages no history and answered the whole list: it is main's list too.
+        let list = session.update(cx, |session, cx| session.commits("main", false, cx));
         cx.run_until_parked();
+        assert_eq!(futures::executor::block_on(list).unwrap().len(), 2);
+        assert!(
+            asked().is_empty(),
+            "main's list was kept from the head's read"
+        );
+
+        // A branch whose whole list is being read, then held: its first commit, from that read.
+        let list = session.update(cx, |session, cx| session.commits("feature", false, cx));
+        assert_eq!(head(&session, "feature", cx).as_deref(), Some("c2"));
         futures::executor::block_on(list).unwrap();
-        asked();
+        assert_eq!(asked(), vec!["branch=feature"], "the list's read alone");
         assert_eq!(head(&session, "feature", cx).as_deref(), Some("c2"));
         assert!(asked().is_empty(), "from the list");
 

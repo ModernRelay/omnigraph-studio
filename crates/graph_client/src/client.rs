@@ -17,9 +17,9 @@ use url::Url;
 use crate::api::{
     BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
     BranchMergeRequest, ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitListOutput,
-    CommitOutput, DiffOutput, ErrorOutput, GraphListResponse, HealthOutput,
-    InvokeStoredQueryRequest, MergeBaseOutput, QueriesCatalogOutput, QueryRequest, ReadOutput,
-    ReadinessOutput, SchemaOutput, SnapshotOutput,
+    DiffOutput, ErrorOutput, GraphListResponse, HealthOutput, InvokeStoredQueryRequest,
+    MergeBaseOutput, QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput,
+    SnapshotOutput,
 };
 use crate::{ApiError, CONTRACT_HEADER, IF_GRAPH_COMMIT_HEADER, SUPPORTED_CONTRACTS, WriteOutcome};
 
@@ -863,22 +863,22 @@ impl GraphClient {
         .await
     }
 
-    /// `branch`'s newest commit: a page of one, where the server pages a history; one that
-    /// does not (an older 0.14) ignores `limit` and answers the whole list, newest first.
-    pub async fn head_commit(
+    /// `branch`'s newest `limit` commits, newest first: a page, where the server pages a
+    /// history; one that does not (an older 0.14) ignores `limit` and answers the whole list.
+    pub async fn newest_commits(
         &self,
         graph: &str,
         branch: &str,
-    ) -> Result<Option<CommitOutput>, ReadError> {
-        let list: CommitListOutput = self
-            .read(
-                Method::GET,
-                &["graphs", graph, "commits"],
-                &[("branch", branch), ("limit", "1")],
-                None,
-            )
-            .await?;
-        Ok(list.commits.into_iter().next())
+        limit: u32,
+    ) -> Result<CommitListOutput, ReadError> {
+        let limit = limit.to_string();
+        self.read(
+            Method::GET,
+            &["graphs", graph, "commits"],
+            &[("branch", branch), ("limit", limit.as_str())],
+            None,
+        )
+        .await
     }
 
     /// One page of a commit's changes against its first parent.
