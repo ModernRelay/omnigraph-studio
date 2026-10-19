@@ -182,11 +182,19 @@ impl Drag {
         if Arc::ptr_eq(&self.scene, scene) {
             return;
         }
+        // Found by id once for every chip, not by a walk of the scene for each: ⌘A can mark
+        // thousands.
+        let at: HashMap<&SceneId, usize> = scene
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (&node.id, index))
+            .collect();
         let moved = |index: usize| {
             self.scene
                 .nodes
                 .get(index)
-                .and_then(|node| scene.index_of(&node.id))
+                .and_then(|node| at.get(&node.id).copied())
         };
         self.node = self
             .node
@@ -368,6 +376,16 @@ impl GraphCanvas {
 
 impl GraphCanvas {
     pub fn new(session: Entity<GraphSession>, cx: &mut Context<Self>) -> Self {
+        Self::build(session, None, cx)
+    }
+
+    /// The canvas, of `results` when given: built with them, so it lays out only them, not
+    /// the ontology first.
+    fn build(
+        session: Entity<GraphSession>,
+        results: Option<(usize, Arc<ResultsData>)>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let exploration = Exploration::for_session(&session, cx);
         let subscriptions = vec![
             cx.subscribe(&exploration, |this, _, event, cx| match event {
@@ -412,7 +430,7 @@ impl GraphCanvas {
         let mut canvas = Self {
             session,
             exploration,
-            results: None,
+            results,
             focus_handle: cx.focus_handle(),
             show_schema: true,
             mode: Mode::Schema,
@@ -450,7 +468,10 @@ impl GraphCanvas {
             _subscriptions: subscriptions,
         };
         canvas.rebuild(cx);
-        canvas.follow_selection(cx);
+        // A results canvas selects nothing of the exploration.
+        if canvas.results.is_none() {
+            canvas.follow_selection(cx);
+        }
         canvas
     }
 
@@ -460,7 +481,6 @@ impl GraphCanvas {
         action: &ShowResultsOnCanvas,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut canvas = Self::new(session, cx);
         let nodes = action
             .nodes
             .iter()
@@ -472,17 +492,12 @@ impl GraphCanvas {
             })
             .collect();
         let seq = NEXT_RESULTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        canvas.results = Some((
-            seq,
-            Arc::new(ResultsData {
-                title: action.title.clone(),
-                nodes,
-                links: action.links.clone(),
-            }),
-        ));
-        canvas.selected = None;
-        canvas.rebuild(cx);
-        canvas
+        let results = Arc::new(ResultsData {
+            title: action.title.clone(),
+            nodes,
+            links: action.links.clone(),
+        });
+        Self::build(session, Some((seq, results)), cx)
     }
 
     /// Shows the ontology (the schema's types and relationships), or the exploration when
@@ -510,6 +525,7 @@ impl GraphCanvas {
         let Some(schema) = self.session.read(cx).schema_model() else {
             self.scene = Arc::default();
             self.positions = Arc::default();
+            self.chips.borrow_mut().clear();
             cx.notify();
             return;
         };
@@ -756,6 +772,9 @@ impl GraphCanvas {
         self.hovered = None;
         self.scene = Arc::new(scene);
         self.positions = Arc::new(positions);
+        // The chips painted were the old scene's, by its indices: a click before the next
+        // paint hits nothing rather than another node.
+        self.chips.borrow_mut().clear();
         if let Some(target) = self.center_on.clone()
             && let Some(index) = self.scene.index_of(&target)
         {

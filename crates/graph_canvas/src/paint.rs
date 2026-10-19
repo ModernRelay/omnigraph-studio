@@ -103,25 +103,30 @@ struct Route {
 }
 
 fn routes(scene: &Scene, screen: &[Point<Pixels>], scale: f32, schema: bool) -> Vec<Route> {
+    // Painted every frame: only the ontology bows the lines two types share, so only it counts
+    // them, and a rank is kept only where one is drawn.
     let mut pair_count: HashMap<(usize, usize), usize> = HashMap::new();
-    for edge in &scene.edges {
-        *pair_count
-            .entry((edge.from.min(edge.to), edge.from.max(edge.to)))
-            .or_default() += 1;
+    if schema {
+        for edge in &scene.edges {
+            *pair_count
+                .entry((edge.from.min(edge.to), edge.from.max(edge.to)))
+                .or_default() += 1;
+        }
     }
     let mut seen: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut rank_of = |key: (usize, usize)| {
+        let seen = seen.entry(key).or_default();
+        *seen += 1;
+        *seen - 1
+    };
     scene
         .edges
         .iter()
         .map(|edge| {
             let key = (edge.from.min(edge.to), edge.from.max(edge.to));
-            let rank = {
-                let seen = seen.entry(key).or_default();
-                *seen += 1;
-                *seen - 1
-            };
             let (a, b) = (screen[key.0], screen[key.1]);
             if edge.from == edge.to {
+                let rank = rank_of(key);
                 let height = (60. + LOOP_STEP * rank as f32) * scale;
                 return Route {
                     curve: Curve::Straight,
@@ -141,6 +146,7 @@ fn routes(scene: &Scene, screen: &[Point<Pixels>], scale: f32, schema: bool) -> 
                     loop_rank: 0,
                 };
             }
+            let rank = rank_of(key);
             let count = pair_count[&key];
             if count < 2 {
                 return Route {
