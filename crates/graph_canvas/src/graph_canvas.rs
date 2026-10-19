@@ -998,16 +998,11 @@ impl GraphCanvas {
                     .iter()
                     .filter_map(|ix| Some((*ix, *self.positions.get(*ix)?)))
                     .collect();
-                for ix in std::iter::once(index).chain(moving) {
-                    for follower in self.followers(ix) {
-                        if !followers.iter().any(|(f, _)| *f == follower.0) {
-                            followers.push(follower);
-                        }
-                    }
-                }
+                moving.push(index);
+                followers.extend(self.followers(&moving));
                 followers
             }
-            Some((index, _)) => self.followers(index),
+            Some((index, _)) => self.followers(&[index]),
             None => Vec::new(),
         };
         self.drag = Some(Drag {
@@ -1056,16 +1051,22 @@ impl GraphCanvas {
             .collect()
     }
 
-    /// The chips that move with a dragged one, from where they are: a node's relationship
-    /// pills, unless placed by hand, and each pill's "+K more".
-    fn followers(&self, index: usize) -> Vec<(usize, Vec2)> {
+    /// The chips that move with the dragged ones (`owners`), from where they are, each once: a
+    /// node's relationship pills, unless placed by hand, and each pill's "+K more".
+    fn followers(&self, owners: &[usize]) -> Vec<(usize, Vec2)> {
+        // Each chip's children, found once: with every chip marked, a drag starts at once.
+        let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (child, node) in self.scene.nodes.iter().enumerate() {
+            if let Some(parent) = node.parent {
+                children.entry(parent).or_default().push(child);
+            }
+        }
+        let mut taken: HashSet<usize> = owners.iter().copied().collect();
         let mut out = Vec::new();
-        let mut stack = vec![index];
+        let mut stack = owners.to_vec();
         while let Some(owner) = stack.pop() {
-            for (child, node) in self.scene.nodes.iter().enumerate() {
-                if node.parent != Some(owner) {
-                    continue;
-                }
+            for &child in children.get(&owner).into_iter().flatten() {
+                let node = &self.scene.nodes[child];
                 let follows = match node.kind {
                     SceneKind::Hub { .. } => {
                         pin_key(&node.id).is_none_or(|key| !self.pinned.contains_key(&key))
@@ -1073,7 +1074,10 @@ impl GraphCanvas {
                     SceneKind::More { .. } => true,
                     _ => false,
                 };
-                if follows && let Some(at) = self.positions.get(child) {
+                if follows
+                    && taken.insert(child)
+                    && let Some(at) = self.positions.get(child)
+                {
                     out.push((child, *at));
                     stack.push(child);
                 }
