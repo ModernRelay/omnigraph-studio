@@ -2272,7 +2272,7 @@ fn content_text(content: &ContentBlock) -> String {
 // Explanations go in tooltips.
 
 /// Width of the thread's gutter, where each entry's icon sits.
-const GUTTER: f32 = 24.;
+const GUTTER: f32 = ds::size::GUTTER;
 
 /// A thread row: an icon in the gutter, the content beside it.
 fn gutter_row(icon: Option<Icon>, content: impl IntoElement) -> Div {

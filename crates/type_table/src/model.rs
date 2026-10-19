@@ -925,7 +925,7 @@ pub fn chips_that_fit(labels: &[&str], count: i64, available: f32) -> usize {
     let labels = &labels[..labels.len().min(RELATION_CHIPS_SHOWN)];
     const CHAR: f32 = 6.8;
     const CHROME: f32 = 2. * studio_ui::ds::space::SM;
-    const GAP: f32 = 4.;
+    const GAP: f32 = studio_ui::ds::space::XS;
     let more_width = |left: i64| format!("+{left}").len() as f32 * CHAR + GAP;
     let mut used = 0.;
     for (shown, label) in labels.iter().enumerate() {

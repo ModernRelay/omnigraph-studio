@@ -52,7 +52,7 @@ use crate::results::{
 const CHECK_DELAY: Duration = Duration::from_millis(150);
 /// The width of the row-number column in the result grid.
 const ROW_NUMBER_WIDTH: f32 = 48.;
-const PLAN_ROW_HEIGHT: f32 = 24.;
+const PLAN_ROW_HEIGHT: f32 = studio_ui::ds::size::SIDEBAR_ROW;
 
 /// Highlight keys: Zed's editor has a closed set; `ConsoleAnsiHighlight(n)` is the one keyed by
 /// a number. Studio's syntax classes and diagnostics take numbers no Zed console uses.

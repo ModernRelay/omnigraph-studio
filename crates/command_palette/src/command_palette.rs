@@ -261,10 +261,10 @@ impl Row {
     }
 }
 
-const ROW_HEIGHT: f32 = 32.;
+const ROW_HEIGHT: f32 = studio_ui::ds::size::PALETTE_ROW;
 /// Space above the first row and below the last. The list's height includes it, so the rows
 /// fit without scrolling and a selected row is never clipped by the edge.
-const LIST_PAD: f32 = 4.;
+const LIST_PAD: f32 = studio_ui::ds::space::XS;
 const VISIBLE_ROWS: usize = 11;
 
 pub struct CommandPalette {

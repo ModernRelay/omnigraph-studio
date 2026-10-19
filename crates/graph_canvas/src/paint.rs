@@ -31,15 +31,18 @@ pub(crate) struct Palette {
 /// The dot grid's dots, across.
 const GRID_DOT: f32 = 1.2;
 
-/// A chip's text size at zoom 1, and a hub's or "+K more"'s.
+/// A chip's text size at zoom 1, and a hub's or "+K more"'s. The canvas's text is world
+/// geometry, not interface text: chips are measured and laid out at these sizes and the view's
+/// zoom scales them, so they stay fixed rather than following the interface font size. At zoom
+/// 1 they are the design system's body (13 px) and small (11 px) sizes at its default.
 const CHIP_TEXT: f32 = 13.;
 const HUB_TEXT: f32 = 12.5;
 /// A relationship label's text size at zoom 1.
 const LABEL_TEXT: f32 = 11.;
 /// A pill's inner spacing at zoom 1: between pieces, at each end, and its mark's size.
-const PILL_GAP: f32 = 6.;
-const PILL_PAD_X: f32 = 10.;
-const PILL_MARK: f32 = 16.;
+const PILL_GAP: f32 = studio_ui::ds::space::SM;
+const PILL_PAD_X: f32 = studio_ui::ds::space::CONTROL_INSET;
+const PILL_MARK: f32 = studio_ui::ds::size::ROW_ICON;
 /// Below this text size a node is drawn as its mark alone, unless it is selected or pointed at.
 const MARK_ONLY_BELOW: f32 = 8.5;
 const TYPE_MARK_ONLY_BELOW: f32 = 6.;

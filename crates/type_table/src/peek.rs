@@ -48,8 +48,8 @@ pub const NEIGHBOUR_LIMIT: u32 = 8;
 const CHILD_INDENT: f32 = space::XS + studio_ui::ds::size::DISCLOSURE + space::SM;
 const PAGE_NEIGHBOURS: u32 = 50;
 
-/// The widest a page's text runs, as a document's measure.
-const PAGE_WIDTH: f32 = 760.;
+/// The widest a page's text runs: the design system's reading width, as settings' is.
+const PAGE_WIDTH: f32 = studio_ui::ds::size::READING_WIDTH;
 
 /// Debounce before relationship counts are read, so moving the cursor quickly through rows
 /// does not send a burst of reads.

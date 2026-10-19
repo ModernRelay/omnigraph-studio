@@ -120,8 +120,9 @@ impl ResultTable {
     pub fn column_width(&self, column: usize) -> f32 {
         const CHAR: f32 = 7.5;
         const TYPE_CHAR: f32 = 6.6;
-        const GAP: f32 = 6.;
-        const PADDING: f32 = 24.;
+        // The header's gap between name and type, and a cell's inset on both sides.
+        const GAP: f32 = studio_ui::ds::space::SM;
+        const PADDING: f32 = 2. * studio_ui::ds::space::LG;
         let title = self.columns[column].chars().count() as f32 * CHAR;
         let header = match self.types.get(column) {
             Some(Some(ty)) => title + GAP + ty.chars().count() as f32 * TYPE_CHAR,

@@ -45,7 +45,7 @@ const ZOOM_STEP: f32 = 1.25;
 const ZOOM_MIN: f32 = 0.05;
 const ZOOM_MAX: f32 = 20.;
 /// Room kept around a fitted image.
-const FIT_MARGIN: f32 = 24.;
+const FIT_MARGIN: f32 = studio_ui::ds::space::XXL;
 
 /// What the value turned out to be, ready to show.
 enum Content {

@@ -46,9 +46,9 @@ use rows::{RowId, RowTag};
 /// The tree's panel id in the left dock.
 const EXPLORE_PANEL: &str = "explore";
 const ROW_HEIGHT: f32 = studio_ui::ds::size::SIDEBAR_ROW;
-const INDENT: f32 = 12.;
-const LEFT_PAD: f32 = 8.;
-const DISCLOSURE: f32 = 12.;
+const INDENT: f32 = studio_ui::ds::space::LG;
+const LEFT_PAD: f32 = studio_ui::ds::space::MD;
+const DISCLOSURE: f32 = studio_ui::ds::size::DISCLOSURE;
 
 /// Registers the tree's keys and adds the "Explore" panel to every workspace.
 pub fn init(cx: &mut App) {

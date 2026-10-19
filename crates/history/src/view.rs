@@ -40,7 +40,7 @@ const WHEN_WIDTH: f32 = 64.;
 /// The change counts' column, so `+3 ~2 −1` line up down the list whatever tags follow.
 const CHANGES_WIDTH: f32 = 112.;
 const LANE_WIDTH: f32 = 14.;
-const GRAPH_PADDING: f32 = 8.;
+const GRAPH_PADDING: f32 = studio_ui::ds::space::MD;
 
 /// Changes read per commit for a row's counts.
 const ROW_COUNT_PAGE: u32 = 500;

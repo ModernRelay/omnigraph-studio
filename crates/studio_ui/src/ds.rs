@@ -191,6 +191,8 @@ pub mod size {
     pub const PILL: f32 = 26.;
     /// A thread's or feed's gutter, where each entry's icon sits.
     pub const GUTTER: f32 = 24.;
+    /// A row of the command palette: a pick list is read once, so a little taller than a menu's.
+    pub const PALETTE_ROW: f32 = 32.;
     /// A row of an activity feed: taller than a data row, as a feed is read, not scanned.
     pub const FEED_ROW: f32 = 36.;
     pub const SIDEBAR_WIDTH: f32 = 264.;
