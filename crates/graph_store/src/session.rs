@@ -353,6 +353,9 @@ pub struct GraphSession {
     schema_text: Option<Arc<str>>,
     /// Each branch's commit list, read once and shared until a commit lands on that branch.
     commit_lists: ReadMemo<String, CommitList>,
+    /// Branches' newest commits, read alone for a list of branches: forgotten with their
+    /// commit lists.
+    head_commits: ReadMemo<String, Option<CommitOutput>>,
     /// The branch list has been read once; reading it again forgets the commit lists.
     branches_read: bool,
     /// How many times the session has moved to another branch: a branch list asked for before
@@ -425,6 +428,7 @@ impl GraphSession {
             schema_epoch: 0,
             schema_text: None,
             commit_lists: Memo::new(COMMIT_LISTS),
+            head_commits: Memo::new(COMMIT_LISTS),
             branches_read: false,
             branch_moves: 0,
             degrees: DegreeBatches::default(),
@@ -759,6 +763,7 @@ impl GraphSession {
                 // window opens) stay, rather than being read twice.
                 if this.branches_read {
                     this.commit_lists.clear();
+                    this.head_commits.clear();
                 }
                 this.branches_read |= matches!(result, Loadable::Loaded(_));
                 this.branches = result;
@@ -1328,6 +1333,7 @@ impl GraphSession {
                     // As after any branch list read: a branch deleted and made again under its
                     // name has another history.
                     this.commit_lists.clear();
+                    this.head_commits.clear();
                     this.branches = Loadable::Loaded(branches);
                     cx.emit(SessionEvent::BranchesChanged);
                     cx.notify();
@@ -1371,6 +1377,7 @@ impl GraphSession {
         self.read_changes(&branch, cx);
         if previous.is_some() && !own {
             self.commit_lists.forget(&branch);
+            self.head_commits.forget(&branch);
             if branch == self.branch {
                 self.refresh_counts(cx);
             }
@@ -1933,6 +1940,7 @@ impl GraphSession {
         let key = branch.to_owned();
         if fresh {
             self.commit_lists.forget(&key);
+            self.head_commits.forget(&key);
         }
         let branch = key.clone();
         self.share(
@@ -1950,6 +1958,32 @@ impl GraphSession {
                     },
                     cx,
                 )
+            },
+            |_, _| {},
+            cx,
+        )
+    }
+
+    /// `branch`'s newest commit, as a list of branches shows it: from its commit list when one
+    /// is held, else read alone and kept until a commit lands on the branch. A branch with no
+    /// commit has none.
+    pub fn head_commit(
+        &mut self,
+        branch: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<CommitOutput>, ReadError>> {
+        let key = branch.to_owned();
+        if let Some(list) = self.commit_lists.peek(&key) {
+            return Task::ready(Ok(list.first().cloned()));
+        }
+        let branch = key.clone();
+        self.share(
+            |session| &mut session.head_commits,
+            key,
+            move |session, cx| {
+                let client = session.client(cx);
+                let graph = session.graph_id.clone();
+                session.counted_read(async move { client.head_commit(&graph, &branch).await }, cx)
             },
             |_, _| {},
             cx,
@@ -2407,6 +2441,7 @@ impl GraphSession {
             self.refresh_counts(cx);
         }
         self.commit_lists.forget(&branch);
+        self.head_commits.forget(&branch);
         cx.emit(SessionEvent::Committed {
             branch: branch.clone(),
         });
@@ -3665,6 +3700,77 @@ mod tests {
         session.read_with(cx, |session, _| {
             assert!(matches!(session.stored_queries, Loadable::Failed(_)))
         });
+    }
+
+    /// A list of branches reads each branch's newest commit alone, once, and again after a
+    /// commit lands on it; a branch whose commit list is held reads nothing.
+    #[gpui::test]
+    async fn a_branch_head_is_read_alone_and_from_a_held_list(cx: &mut TestAppContext) {
+        let lists: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let seen = lists.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let query = request.uri().query().unwrap_or_default().to_owned();
+            let seen = seen.clone();
+            async move {
+                let body = if path.ends_with("/commits") {
+                    seen.lock().unwrap().push(query);
+                    r#"{"commits":[{"graph_commit_id":"c2","created_at":2,"graph_manifest_version":2,"published":true},{"graph_commit_id":"c1","created_at":1,"graph_manifest_version":1,"published":true}]}"#
+                } else {
+                    r#"{"branches":["main","feature"]}"#
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        let asked = || std::mem::take(&mut *lists.lock().unwrap());
+        asked();
+        let head = |session: &Entity<GraphSession>, branch: &str, cx: &mut TestAppContext| {
+            let read = session.update(cx, |session, cx| session.head_commit(branch, cx));
+            cx.run_until_parked();
+            futures::executor::block_on(read)
+                .unwrap()
+                .map(|commit| commit.graph_commit_id)
+        };
+
+        assert_eq!(head(&session, "main", cx).as_deref(), Some("c2"));
+        assert_eq!(asked(), vec!["branch=main&limit=1"], "the head alone");
+        assert_eq!(head(&session, "main", cx).as_deref(), Some("c2"));
+        assert!(asked().is_empty(), "kept");
+
+        // A branch whose whole list is held: its first commit, nothing read.
+        let list = session.update(cx, |session, cx| session.commits("feature", false, cx));
+        cx.run_until_parked();
+        futures::executor::block_on(list).unwrap();
+        asked();
+        assert_eq!(head(&session, "feature", cx).as_deref(), Some("c2"));
+        assert!(asked().is_empty(), "from the list");
+
+        // A commit on main: its head is read again.
+        session.update(cx, |session, cx| {
+            session
+                .external_write("main".into(), "w".into(), false, cx)
+                .finish(OutcomeKind::Committed {
+                    commit: Some("c3".into()),
+                });
+        });
+        cx.run_until_parked();
+        asked();
+        head(&session, "main", cx);
+        assert_eq!(asked(), vec!["branch=main&limit=1"]);
     }
 
     /// A branch's commit list is read once for every view that shows it, and again only after

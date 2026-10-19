@@ -94,8 +94,8 @@ impl BranchList {
         cx.notify();
     }
 
-    /// Each branch's head commit, from the session's commit lists: after a commit, only the
-    /// branch it landed on is read again.
+    /// Each branch's head commit, read alone (or from a commit list the session holds): after
+    /// a commit, only the branch it landed on is read again.
     fn load_details(&mut self, cx: &mut Context<Self>) {
         let Some(session) = self.session.clone() else {
             return;
@@ -107,22 +107,20 @@ impl BranchList {
             .into_iter()
             .take(DETAIL_LIMIT)
             .map(|branch| {
-                let read = session.update(cx, |session, cx| session.commits(&branch, false, cx));
+                let read = session.update(cx, |session, cx| session.head_commit(&branch, cx));
                 (branch, read)
             })
             .collect();
         self._details_task = Some(cx.spawn(async move |this, cx| {
             let mut details = HashMap::new();
             for (branch, read) in reads {
-                if let Ok(list) = read.await
-                    && let Some(head) = list.first()
-                {
+                if let Ok(Some(head)) = read.await {
                     details.insert(
                         branch,
                         BranchDetail {
-                            head: head.graph_commit_id.clone(),
+                            head: head.graph_commit_id,
                             created_at: head.created_at,
-                            actor: head.actor_id.clone(),
+                            actor: head.actor_id,
                         },
                     );
                 }
