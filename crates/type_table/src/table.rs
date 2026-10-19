@@ -337,6 +337,12 @@ pub struct TypeTable {
     /// The rows the last frame drew, first to last: a relationship column reads the rows near
     /// them, not every row read so far.
     rows_drawn: Range<usize>,
+    /// The rows, and the rows with Blob cells, the frame being drawn asked for last: the list
+    /// also lays one line out twice a frame to measure it, so they are acted on once the
+    /// frame is out ([`Self::drawn`]).
+    frame_rows: Option<Range<usize>>,
+    frame_blob_rows: Option<Range<usize>>,
+    frame_due: bool,
     /// Properties the commit shown does not hold under their current name, and what they were
     /// then. Rows are read without them.
     absent: HashMap<String, PropertyThen>,
@@ -560,6 +566,9 @@ impl TypeTable {
             relations_drawn: HashSet::new(),
             relations_asked: HashSet::new(),
             rows_drawn: 0..0,
+            frame_rows: None,
+            frame_blob_rows: None,
+            frame_due: false,
             absent: HashMap::new(),
             grouping_choices: Default::default(),
             cell_text: RefCell::new(HashMap::new()),
@@ -2534,6 +2543,24 @@ impl TypeTable {
 
     /// Notes the rows this frame draws; rows scrolled into view whose drawn relationships were
     /// never asked for read them once the frame is out.
+    /// Once the frame being drawn is out, asks for what its last rows drawn need: their
+    /// relationships and their Blob cells. Else the row the list measures, asked for in
+    /// between, would make every frame ask again.
+    fn drawn(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.frame_due, true) {
+            return;
+        }
+        cx.defer_in(window, |this, window, cx| {
+            this.frame_due = false;
+            if let Some(rows) = this.frame_rows.take() {
+                this.want_row_relations(rows, window, cx);
+            }
+            if let Some(rows) = this.frame_blob_rows.take() {
+                this.want_blob_metas(rows, cx);
+            }
+        });
+    }
+
     fn want_row_relations(
         &mut self,
         rows: Range<usize>,
@@ -3197,12 +3224,16 @@ impl TypeTable {
         let session = self.session.clone();
         let snapshot = self.paging.pinned.clone();
         // The row's relationships as this table read them at the same commit.
+        // Looked up by the row's own keys, not found among every row's: a peek follows each
+        // arrow press.
         let known: HashMap<String, KnownRelation> = match snapshot {
             Some(_) => self
-                .relations
+                .columns
                 .iter()
-                .filter(|((row_id, _), _)| *row_id == id)
-                .filter_map(|((_, key), relation)| {
+                .filter_map(ColumnSpec::relationship)
+                .filter_map(|group| {
+                    let key = builder::relationship_key(group);
+                    let relation = self.relations.get(&(id.clone(), key.clone()))?;
                     let count = *relation.count.as_ref().ok()?;
                     let first = relation.whole.then(|| {
                         relation
@@ -5556,7 +5587,8 @@ impl TypeTable {
                             }
                         }
                     };
-                    this.want_row_relations(rows, window, cx);
+                    this.frame_rows = Some(rows);
+                    this.drawn(window, cx);
                     #[cfg(test)]
                     {
                         this.frame_drawn = drawn.to_vec();
@@ -5569,7 +5601,7 @@ impl TypeTable {
                         {
                             cx.defer_in(window, |this, _, cx| this.load_more(cx));
                         }
-                        this.want_blob_metas(range.clone(), cx);
+                        this.frame_blob_rows = Some(range.clone());
                         return range.map(|ix| this.render_row(ix, window, cx)).collect();
                     };
                     let shown: Vec<Line> = lines.slice(range).collect();
@@ -5598,9 +5630,11 @@ impl TypeTable {
                             _ => None,
                         })
                         .collect();
-                    if let (Some(first), Some(last)) = (rows.iter().min(), rows.iter().max()) {
-                        this.want_blob_metas(*first..*last + 1, cx);
-                    }
+                    this.frame_blob_rows = rows
+                        .iter()
+                        .min()
+                        .zip(rows.iter().max())
+                        .map(|(first, last)| *first..*last + 1);
                     shown
                         .iter()
                         .map(|line| match *line {
