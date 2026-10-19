@@ -2117,30 +2117,32 @@ impl NodePeek {
             cx.notify();
             return;
         }
-        let row = builder::RowEdit {
-            id: id.clone(),
-            cells: cells.clone(),
-        };
-        let query = match builder::update_rows(&schema, &type_name, &[row]) {
-            Ok(query) => query,
+        let branch = self.branch.clone();
+        // A list among them, which a write's `where` cannot compare, is compared at the head
+        // first (`write_properties`).
+        let write = match crate::write::write_properties(
+            &self.session,
+            &branch,
+            &schema,
+            &type_name,
+            &id,
+            &cells,
+            cx,
+        ) {
+            Ok(write) => write,
             Err(error) => {
-                self.drafts_notice = Some(Notice::new(Tone::Invalid, error.to_string()));
+                self.drafts_notice = Some(Notice::new(Tone::Invalid, error));
                 cx.notify();
                 return;
             }
         };
-        let branch = self.branch.clone();
-        let description = format!("Save {} changes of {id}", cells.len());
-        let write = self.session.update(cx, |session, cx| {
-            session.write(&query, None, description, cx)
-        });
         self.saving_drafts = true;
         self.drafts_notice = None;
         for (name, _, _) in &cells {
             self.saving.insert(name.clone());
         }
         cx.spawn_in(window, async move |this, cx| {
-            let result = save_result(&write.await, &branch);
+            let result = write.await;
             this.update(cx, |this, cx| {
                 this.saving_drafts = false;
                 for (name, _, _) in &cells {

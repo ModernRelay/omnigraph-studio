@@ -1,6 +1,6 @@
-//! One node property written from its page, its peek or its text editor (spec 014): bound to
-//! the value it was read at, as a table cell saves (spec 004), so it changes nothing if the
-//! value changed elsewhere meanwhile.
+//! A node's properties written from its page, its peek or its text editor (spec 014): bound to
+//! the values they were read at, as a table cell saves (spec 004), so a write changes nothing
+//! if a value changed elsewhere meanwhile.
 
 use gpui::{App, Entity, Task};
 use gq_language::{SchemaModel, builder};
@@ -26,23 +26,92 @@ pub(crate) fn write_property(
     let query = builder::update_cell(schema, type_name, property, id, old, new)
         .map_err(|error| error.to_string())?;
     let description = format!("Set {property} of {id}");
+    let read = (property.to_owned(), old.clone());
+    send_bound(
+        session,
+        branch,
+        schema,
+        type_name,
+        id,
+        &[read],
+        query,
+        description,
+        cx,
+    )
+}
+
+/// Writes several properties of node `id` in one commit, each `(property, the value it was
+/// read at, the new value)`, as [`write_property`] writes one.
+pub(crate) fn write_properties(
+    session: &Entity<GraphSession>,
+    branch: &str,
+    schema: &SchemaModel,
+    type_name: &str,
+    id: &str,
+    cells: &[(String, Value, Value)],
+    cx: &mut App,
+) -> Result<Task<SaveResult>, String> {
+    let row = builder::RowEdit {
+        id: id.to_owned(),
+        cells: cells.to_vec(),
+    };
+    let query =
+        builder::update_rows(schema, type_name, &[row]).map_err(|error| error.to_string())?;
+    let description = format!("Save {} changes of {id}", cells.len());
+    let read: Vec<(String, Value)> = cells
+        .iter()
+        .map(|(property, old, _)| (property.clone(), old.clone()))
+        .collect();
+    send_bound(
+        session,
+        branch,
+        schema,
+        type_name,
+        id,
+        &read,
+        query,
+        description,
+        cx,
+    )
+}
+
+/// Sends `query`, which writes node `id`'s properties `read` (each with the value it was read
+/// at), to `branch`. Its `where` binds the scalars; a `where` cannot compare a list, so with a
+/// list among them the node is read at the branch's head first and the write is bound to that
+/// head: a change made elsewhere since the values were read is found by the comparison, and one
+/// made after the read by the head having moved.
+#[allow(clippy::too_many_arguments)]
+fn send_bound(
+    session: &Entity<GraphSession>,
+    branch: &str,
+    schema: &SchemaModel,
+    type_name: &str,
+    id: &str,
+    read: &[(String, Value)],
+    query: builder::BuiltQuery,
+    description: String,
+    cx: &mut App,
+) -> Result<Task<SaveResult>, String> {
     let branch = branch.to_owned();
-    let list = schema
-        .node(type_name)
-        .and_then(|node| node.property(property))
-        .is_some_and(|property| property.list);
-    if !list {
+    let lists: Vec<(String, Value)> = read
+        .iter()
+        .filter(|(property, _)| {
+            schema
+                .node(type_name)
+                .and_then(|node| node.property(property))
+                .is_some_and(|property| property.list)
+        })
+        .cloned()
+        .collect();
+    if lists.is_empty() {
         let write = session.update(cx, |session, cx| {
             session.write_on(&branch, &query, None, description, None, cx)
         });
         return Ok(cx.spawn(async move |_| save_result(&write.await, &branch)));
     }
-    // A write's `where` cannot compare a list, so the value is read at the branch's head
-    // first and the write is bound to that head: a change made elsewhere since the value was
-    // read is found by the comparison, and one made after the read by the head having moved.
-    let read = builder::node_by_id(schema, type_name, id).map_err(|error| error.to_string())?;
-    let read = session.update(cx, |session, cx| session.read_on(&branch, &read, cx));
-    let (session, property, old) = (session.clone(), property.to_owned(), old.clone());
+    let node = builder::node_by_id(schema, type_name, id).map_err(|error| error.to_string())?;
+    let read = session.update(cx, |session, cx| session.read_on(&branch, &node, cx));
+    let session = session.clone();
     Ok(cx.spawn(async move |cx| {
         let output = match read.await {
             Ok(output) => output,
@@ -53,14 +122,14 @@ pub(crate) fn write_property(
                 ));
             }
         };
-        let now = node_rows(&output.rows)
-            .into_iter()
-            .next()
-            .map(|row| row.values.get(&property).cloned().unwrap_or(Value::Null));
-        let (Some(head), Some(now)) = (output.graph_commit_id, now) else {
+        let (Some(head), Some(row)) = (output.graph_commit_id, node_rows(&output.rows).pop())
+        else {
             return SaveResult::NoMatch;
         };
-        if !same_value(&now, &old) {
+        let unchanged = lists.iter().all(|(property, old)| {
+            same_value(row.values.get(property).unwrap_or(&Value::Null), old)
+        });
+        if !unchanged {
             return SaveResult::NoMatch;
         }
         let write = session.update(cx, |session, cx| {

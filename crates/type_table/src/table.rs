@@ -132,6 +132,15 @@ struct RowLook {
 /// How long scrolling must pause before the drawn rows' Blob cells are read.
 const BLOB_READ_AFTER: Duration = Duration::from_millis(120);
 
+/// A cell's save as sent: the value it was bound to, the one written and the text typed.
+struct SavedCell {
+    row_id: String,
+    column: String,
+    old: Value,
+    new: Value,
+    text: String,
+}
+
 /// One draft being saved: the cell, the value it showed (the save is bound to it), the new
 /// value, and the text to put back if the save does not land.
 #[derive(Debug, Clone)]
@@ -1067,6 +1076,26 @@ impl TypeTable {
             .iter()
             .filter(|row| self.selection.contains(&row.id) && seen.insert(row.id.as_str()))
             .map(|row| (row.id.clone(), row.value(&property.name).clone()))
+            .collect();
+        // Each row is bound to the value it shows: a selected row the table no longer shows (a
+        // filter or a read since hid it) has none, and is not set behind the count's back.
+        let hidden = self.selection.len().saturating_sub(rows.len());
+        if hidden > 0 {
+            self.bulk.notice = Some(Notice::new(
+                Tone::Invalid,
+                format!(
+                    "{} in the selection {} not shown here, so nothing was set. Show {}, or \
+                     select again.",
+                    plural(hidden, "row", "rows"),
+                    if hidden == 1 { "is" } else { "are" },
+                    if hidden == 1 { "it" } else { "them" },
+                ),
+            ));
+            cx.notify();
+            return;
+        }
+        let rows: Vec<(String, Value)> = rows
+            .into_iter()
             .filter(|(_, old)| !same_value(old, &new))
             .collect();
         if rows.is_empty() {
@@ -3420,6 +3449,13 @@ impl TypeTable {
             self.finish_editing(window, cx);
             return;
         }
+        // A list is bound to the commit shown, not compared in the write: one the row no longer
+        // holds as the edit found it is read again as a conflict, unwritten.
+        if property.list && !same_value(&old, self.rows[row_ix].value(&column)) {
+            self.finish_editing(window, cx);
+            self.reread_conflict(row_id, column, old, text, window, cx);
+            return;
+        }
         let query = match builder::update_cell(
             &schema,
             &self.type_name,
@@ -3454,28 +3490,36 @@ impl TypeTable {
             let outcome = write.await;
             let result = save_result(&outcome, &branch);
             this.update_in(cx, |this, window, cx| {
-                this.finish_save(
-                    row_id, column, old, text, &session, &branch, result, window, cx,
-                )
+                let cell = SavedCell {
+                    row_id,
+                    column,
+                    old,
+                    new,
+                    text,
+                };
+                this.finish_save(cell, &session, &branch, result, window, cx)
             })
             .ok();
         })
         .detach();
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn finish_save(
         &mut self,
-        row_id: String,
-        column: String,
-        old: Value,
-        text: String,
+        cell: SavedCell,
         session: &Entity<GraphSession>,
         branch: &str,
         result: SaveResult,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let SavedCell {
+            row_id,
+            column,
+            old,
+            new,
+            text,
+        } = cell;
         self.saves_in_flight = self.saves_in_flight.saturating_sub(1);
         // The table moved to another branch or graph meanwhile and shows what it read there;
         // the write's outcome is told by its toast. A saved cell's draft was the branch left's,
@@ -3504,7 +3548,10 @@ impl TypeTable {
                 {
                     self.newer = true;
                 }
+                // Shown again: the rows may have been read again, at the commit before, while
+                // the write was out.
                 if let Some(ix) = self.row_index(&row_id) {
+                    self.set_cell(ix, &column, new);
                     self.set_dimmed(ix, !self.row_fits(ix));
                 }
             }
@@ -3716,6 +3763,14 @@ impl TypeTable {
             let old = self
                 .draft_old(&key.0, &key.1, cx)
                 .unwrap_or_else(|| self.rows[row].value(&key.1).clone());
+            // A list is bound to the commit shown, not compared in the write: one the row no
+            // longer holds as the draft found it changed since, and is a conflict unwritten.
+            let shown = self.rows[row].value(&key.1);
+            if property.list && !same_value(&old, shown) {
+                let notice = changed_elsewhere(Some(&property), Some(shown));
+                self.put_draft(&key.0, &key.1, old, text, Some(notice), cx);
+                continue;
+            }
             match parse_input(&property, &text) {
                 Err(message) => {
                     let notice = Notice::new(Tone::Invalid, message);
@@ -3850,7 +3905,12 @@ impl TypeTable {
                 }
                 let changed = output.affected_nodes as usize;
                 if output.commit.is_some() && changed == row_count {
+                    // Shown again, as one saved cell is: the rows may have been read again.
+                    let places = self.row_places();
                     for edit in &edits {
+                        if let Some(at) = places.get(&edit.row_id) {
+                            self.set_cell_at(at, &edit.column, edit.new.clone());
+                        }
                         self.cells
                             .remove(&(edit.row_id.clone(), edit.column.clone()));
                         self.drop_draft(&edit.row_id, &edit.column, cx);
@@ -6996,10 +7056,25 @@ mod tests {
         };
         draft("tags", Value::Null, "math, poetry", cx);
         draft("name", "Ada".into(), "Ada King", cx);
+        // Typed over a list the row no longer holds: a conflict, not a write.
+        draft("tags", serde_json::json!(["math"]), "math, art", cx);
         let sent = sent.lock().unwrap();
         assert_eq!(sent.len(), 2, "{sent:?}");
         assert_eq!(sent[0]["if_graph_commit"], "c1", "{}", sent[0]);
         assert!(sent[1].get("if_graph_commit").is_none(), "{}", sent[1]);
+        table.read_with(cx, |table, _| {
+            let cell = table.cells.get(&("p1".to_owned(), "tags".to_owned()));
+            assert!(
+                matches!(
+                    cell,
+                    Some(CellState::Draft {
+                        notice: Some(_),
+                        ..
+                    })
+                ),
+                "{cell:?}"
+            );
+        });
     }
 
     /// A cell saved on one branch lands after the window moved to another: it lets go of the
