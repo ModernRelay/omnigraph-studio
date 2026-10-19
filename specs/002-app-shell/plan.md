@@ -488,6 +488,21 @@ than styling one-off elements.
   licensed bundle, and a test keeps the count under the limit and every file to a row.
 - **Spacing.** Every gap and inset is a `ds::space` step (2, 4, 6, 8, 12, 16, 24, 32), never
   GPUI's rem utilities (`gap_2()`): since 2026-10-18 no view uses them.
+- **Everything from the design system, checked** (since 2026-10-18). A view takes every size,
+  space, corner, offset, colour, shadow and weight from `studio_ui::ds`: `ds::size`,
+  `ds::space` and `ds::radii` by role, `ds::surface` colour roles (document, chrome,
+  status bar, tabs, header strip, solid, paper, floating, highlight, pressed, rule, focus,
+  accent, warning, drop target, on tint, control border, error border) or a `ui` `Color`,
+  `ds::elevation`, and `ds::text::weight::{BODY, HEADING}`. Only `ds` reads the theme's
+  palette. `script/check-design-tokens.py`, run in CI beside the layer check, refuses
+  anything else outside the design system; an exception carries a `// ds-exempt: <reason>`.
+  Data column widths and algorithm constants (zoom steps, layout forces, text-width
+  estimates) are named once where they are used; the canvas's chip text is world geometry
+  the zoom scales.
+- **Weights.** Two: the body's (regular) for everything read, buttons, segments and a key
+  column included, and the heading's (medium) for what names a surface: a toolbar's, a
+  page's or a dialog's title, a tree's root, a card's subject. Inter's heavier cuts read
+  heavy at these sizes; semibold is not used.
 - **Text sizes.** The window's rem size is `ui_font_size`, as in Zed, so every `ui` size
   scales with it. Its default is 15 px since 2026-10-18 (16 before): Tower's root size
   (93.75 %), at which Zed's `Default`, `Small` and `XSmall` labels are 13, 11 and 9 px, Tower's
@@ -495,8 +510,11 @@ than styling one-off elements.
   `Default`. The interface font is Inter by default (Tower's face; Inter 4.1, OFL-1.1, the
   regular, italic, medium, semibold and bold static files in `assets/fonts/inter/`, loaded
   with Zed's fonts); IBM Plex Sans and every installed font stay selectable.
-- **Toolbars.** A document's toolbar (a table's, a query's, history's, the inspector's header,
-  the text editor's) holds `ds::toolbar_button`s and `ds::toolbar_icon_button`s: Zed's 22 px
+- **Toolbars.** A document's toolbar and every header or notice strip (a table's, a query's,
+  history's and its commit pane's, the review's, storage's, the inspector's header, the text
+  editor's, a newer-data notice) holds `ds::toolbar_button`s and `ds::toolbar_icon_button`s;
+  a button inside a dense row (an inline Fix or Run, Show more, a crumb) is
+  `ButtonSize::Compact`. Toolbar buttons are Zed's 22 px
   size, Tower's `xs`, with small type and 12 px icons, set with no gap beyond their padding
   (`ds::toolbar_actions`), so the chrome reads smaller than the document it serves.
 - **Shadows, Tower's values** (`ds::elevation`, light and dark): `raised` for a solid item on
