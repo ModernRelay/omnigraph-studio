@@ -598,14 +598,7 @@ impl RelationshipTree {
             },
             Some(EntryKind::Group { key, .. } | EntryKind::Bucket { key, .. }) => {
                 // Seen from the other type, the relationship runs the other way.
-                let back = gq_language::RelationshipGroup {
-                    edge: key.group.edge.clone(),
-                    direction: match key.group.direction {
-                        gq_language::Direction::Outgoing => gq_language::Direction::Incoming,
-                        gq_language::Direction::Incoming => gq_language::Direction::Outgoing,
-                    },
-                    other_type: key.node.type_name.clone(),
-                };
+                let back = gq_language::builder::reversed(&key.group, &key.node.type_name);
                 OpenType {
                     type_name: key.group.other_type.clone(),
                     at_commit: None,
@@ -813,10 +806,7 @@ impl RelationshipTree {
                     Color::Default
                 };
                 let muted = if empty { Color::Disabled } else { Color::Muted };
-                let arrow = match key.group.direction {
-                    gq_language::Direction::Outgoing => "→",
-                    gq_language::Direction::Incoming => "←",
-                };
+                let arrow = key.group.direction.arrow();
                 let count_label = match count {
                     Loadable::Loaded(n) => n.to_string(),
                     Loadable::Failed(_) => "!".to_owned(),
@@ -1002,10 +992,7 @@ impl RelationshipTree {
                         .and_then(|parent| match &self.entries.get(parent)?.kind {
                             // As the group row reads it: `→ WorksAt`.
                             EntryKind::Group { key, .. } | EntryKind::Bucket { key, .. } => {
-                                let arrow = match key.group.direction {
-                                    gq_language::Direction::Outgoing => "→",
-                                    gq_language::Direction::Incoming => "←",
-                                };
+                                let arrow = key.group.direction.arrow();
                                 Some(format!("{arrow} {}", key.group.edge))
                             }
                             _ => None,

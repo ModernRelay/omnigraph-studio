@@ -127,6 +127,24 @@ pub enum Direction {
     Incoming,
 }
 
+impl Direction {
+    /// The same edges seen from their other end.
+    pub fn reversed(self) -> Self {
+        match self {
+            Self::Outgoing => Self::Incoming,
+            Self::Incoming => Self::Outgoing,
+        }
+    }
+
+    /// The arrow a group is drawn with, pointing the way its edges run from this end.
+    pub fn arrow(self) -> &'static str {
+        match self {
+            Self::Outgoing => "→",
+            Self::Incoming => "←",
+        }
+    }
+}
+
 /// One edge type, seen from one node type: the rows under a node in the relationship tree and
 /// the hubs on the canvas.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

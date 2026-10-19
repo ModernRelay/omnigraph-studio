@@ -324,10 +324,7 @@ impl EntityGroups {
                         other,
                         GroupRelationship {
                             change: relationship.change,
-                            direction: match relationship.direction {
-                                Direction::Outgoing => Direction::Incoming,
-                                Direction::Incoming => Direction::Outgoing,
-                            },
+                            direction: relationship.direction.reversed(),
                             other_type: group.type_name.clone(),
                             other_id: group.id.clone(),
                             other_group: Some(ix),

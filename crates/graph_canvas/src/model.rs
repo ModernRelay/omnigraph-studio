@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use gq_language::{Direction, SchemaModel};
+use gq_language::SchemaModel;
 use graph_store::{Entry, EntryKind, ExplorePath, ExploreState, GroupKey, Loadable, NodeRef};
 
 /// Neighbours a hub shows before "+K more", and how many each click on it adds.
@@ -290,10 +290,7 @@ pub fn explore_scene(
                     skipped[index] = true;
                     continue;
                 }
-                let arrow = match key.group.direction {
-                    Direction::Outgoing => "→",
-                    Direction::Incoming => "←",
-                };
+                let arrow = key.group.direction.arrow();
                 let count_value = count.loaded().copied();
                 let label = match count_value {
                     Some(count) => format!("{arrow} {} · {count}", key.group.edge),
@@ -334,10 +331,7 @@ pub fn explore_scene(
                 let hub = match by_id.get(&hub_id).copied() {
                     Some(existing) => existing,
                     None if scene.nodes.len() < cap => {
-                        let arrow = match key.group.direction {
-                            Direction::Outgoing => "→",
-                            Direction::Incoming => "←",
-                        };
+                        let arrow = key.group.direction.arrow();
                         let hub = add(
                             &mut scene,
                             &mut by_id,
@@ -474,6 +468,7 @@ fn push_edge(scene: &mut Scene, lines: &mut HashSet<(usize, usize)>, from: usize
 
 #[cfg(test)]
 mod tests {
+    use gq_language::Direction;
     use graph_store::{Neighbour, NeighbourList};
 
     use super::*;

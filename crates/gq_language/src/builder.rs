@@ -1551,10 +1551,7 @@ pub fn page_neighbours(
 pub fn reversed(group: &RelationshipGroup, node_type: &str) -> RelationshipGroup {
     RelationshipGroup {
         edge: group.edge.clone(),
-        direction: match group.direction {
-            Direction::Outgoing => Direction::Incoming,
-            Direction::Incoming => Direction::Outgoing,
-        },
+        direction: group.direction.reversed(),
         other_type: node_type.to_owned(),
     }
 }
