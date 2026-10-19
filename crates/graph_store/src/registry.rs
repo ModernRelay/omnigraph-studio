@@ -126,15 +126,12 @@ impl ConnectionRegistry {
         );
         this.watch_operator_files(cx);
 
-        let mut any_moved = false;
+        // Each address was saved as `add_server` checked it, scheme included.
         for saved in saved.servers.into_iter().filter(|s| s.source == "studio") {
-            // An address saved without a scheme (`localhost:8080`) is read with the one it
-            // needs; its token, kept under the old address, moves with it.
-            let url = graph_client::server_root(&saved.url).unwrap_or_else(|_| saved.url.clone());
-            let moved = url != saved.url;
+            let read = cx.read_credentials(&saved.url);
             let entry = ServerEntry {
                 name: saved.name,
-                url: url.clone(),
+                url: saved.url,
                 source: ServerSource::Studio,
                 known_graphs: saved.graphs,
             };
@@ -144,25 +141,15 @@ impl ConnectionRegistry {
                 continue;
             };
             connection.update(cx, |connection, _| connection.await_token());
-            any_moved |= moved;
-            let read = cx.read_credentials(&saved.url);
             cx.spawn(async move |_, cx| {
                 let token = read
                     .await
                     .ok()
                     .flatten()
                     .and_then(|(_, bytes)| String::from_utf8(bytes).ok());
-                if moved && let Some(token) = &token {
-                    cx.update(|cx| cx.write_credentials(&url, KEYCHAIN_USER, token.as_bytes()))
-                        .detach();
-                }
                 connection.update(cx, |connection, cx| connection.set_token(token, cx));
             })
             .detach();
-        }
-        // Once, with every address read again: the file then names each with its scheme.
-        if any_moved {
-            this.save(cx);
         }
         this
     }
