@@ -20,7 +20,7 @@ use gpui::{
     ScrollHandle, ScrollStrategy, SharedString, StyleRefinement, Subscription, Task,
     UnderlineStyle, UniformListScrollHandle, WeakEntity, Window, uniform_list,
 };
-use gq_language::{QueryInfo, ResultColumn, SchemaModel, TokenKind};
+use gq_language::{QueryInfo, ResultColumn, SchemaModel};
 use graph_client::api::ErrorCode;
 use graph_client::api::{
     ChangeRequest, ParamDescriptor, ParamKind, QueryCatalogEntry, QueryRequest, ReadOutput,
@@ -55,23 +55,10 @@ const ROW_NUMBER_WIDTH: f32 = 48.;
 const PLAN_ROW_HEIGHT: f32 = studio_ui::ds::size::SIDEBAR_ROW;
 
 /// Highlight keys: Zed's editor has a closed set; `ConsoleAnsiHighlight(n)` is the one keyed by
-/// a number. Studio's syntax classes and diagnostics take numbers no Zed console uses.
-const SYNTAX_KEY: usize = 0x6751_0000;
+/// a number. Studio's diagnostics take numbers no Zed console uses.
 const DIAGNOSTIC_KEY: usize = 0x6751_0100;
 /// The parts of the query the hovered plan operator stands for.
 const PLAN_KEY: usize = 0x6751_0200;
-/// The token kinds that take a syntax colour (`TokenKind::syntax_name`), one highlight key each.
-const SYNTAX: [TokenKind; 9] = [
-    TokenKind::Keyword,
-    TokenKind::Variable,
-    TokenKind::Type,
-    TokenKind::Property,
-    TokenKind::Annotation,
-    TokenKind::QueryName,
-    TokenKind::String,
-    TokenKind::Number,
-    TokenKind::Comment,
-];
 
 /// A run that is ready to send.
 #[derive(Clone)]
@@ -928,7 +915,6 @@ impl QueryEditor {
             self.sync_unsaved(cx);
             cx.emit(ItemEvent::UpdateTab);
         }
-        self.highlight_syntax(cx);
         self.schedule_check(window, cx);
         self.cursor_moved(window, cx);
     }
@@ -952,40 +938,6 @@ impl QueryEditor {
             cx.emit(ItemEvent::UpdateTab);
             cx.notify();
         }
-    }
-
-    fn highlight_syntax(&mut self, cx: &mut Context<Self>) {
-        if self.parsed {
-            return;
-        }
-        let theme = cx.theme().clone();
-        self.editor.update(cx, |editor, cx| {
-            let text = editor.text(cx);
-            let tokens = gq_language::tokenize(&text);
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            for (index, kind) in SYNTAX.iter().enumerate() {
-                let key = HighlightKey::ConsoleAnsiHighlight(SYNTAX_KEY + index);
-                let Some(style) = kind
-                    .syntax_name()
-                    .and_then(|name| theme.syntax().style_for_name(name))
-                else {
-                    continue;
-                };
-                let ranges: Vec<_> = tokens
-                    .iter()
-                    .filter(|token| token.kind == *kind)
-                    .map(|token| {
-                        snapshot.anchor_after(MultiBufferOffset(token.range.start))
-                            ..snapshot.anchor_before(MultiBufferOffset(token.range.end))
-                    })
-                    .collect();
-                if ranges.is_empty() {
-                    editor.clear_highlights(key, cx);
-                } else {
-                    editor.highlight_text(key, ranges, style, cx);
-                }
-            }
-        });
     }
 
     /// Checks the text after typing pauses, off the main thread.
