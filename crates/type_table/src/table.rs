@@ -1768,15 +1768,16 @@ impl TypeTable {
             .collect()
     }
 
-    fn count_query(&self, filters: &[Filter]) -> Result<BuiltQuery, BuildError> {
+    /// The count of the table's rows, through its filters (`filtered`) or of every row.
+    fn count_query(&self, filtered: bool) -> Result<BuiltQuery, BuildError> {
         let schema = self
             .schema
             .as_ref()
             .ok_or_else(|| BuildError::UnknownType(self.type_name.clone()))?;
-        let filters = if filters.is_empty() {
-            Vec::new()
-        } else {
+        let filters = if filtered {
             self.resolved_filters()
+        } else {
+            Vec::new()
         };
         let filters = filters.as_slice();
         match self.kind {
@@ -2657,10 +2658,10 @@ impl TypeTable {
 
     fn load_counts(&mut self, cx: &mut Context<Self>) {
         let snapshot = self.paging.pinned.clone();
-        let filtered = self.count_query(&self.filters);
+        let filtered = self.count_query(!self.filters.is_empty());
         self.count_task = self.spawn_count(filtered, snapshot.clone(), true, cx);
         if !self.filters.is_empty() {
-            let total = self.count_query(&[]);
+            let total = self.count_query(false);
             self.total_task = self.spawn_count(total, snapshot, false, cx);
         }
     }
