@@ -7,7 +7,7 @@
 //! relationship is mirrored there, so either entity tells its whole story while each change is
 //! counted, reviewed and reverted once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use gq_language::{Direction, SchemaModel};
 
@@ -128,6 +128,18 @@ pub struct EntityGroups {
     pub groups: Vec<EntityGroup>,
     /// Each change's group, by its index in [`FoldedChanges::changes`].
     pub home: Vec<usize>,
+    /// What each group's card lines count, found once here: a card is drawn at every frame,
+    /// and a hub's can hold thousands of lines.
+    counts: Vec<LineCounts>,
+}
+
+/// How many lines a card has, and the added, changed and removed among them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LineCounts {
+    total: usize,
+    added: usize,
+    changed: usize,
+    removed: usize,
 }
 
 impl EntityGroups {
@@ -352,7 +364,38 @@ impl EntityGroups {
             group.relationships.sort_by_key(key);
             group.mirrors.sort_by_key(key);
         }
-        EntityGroups { groups, home }
+        let mut grouped = EntityGroups {
+            groups,
+            home,
+            counts: Vec::new(),
+        };
+        grouped.counts = (0..grouped.groups.len())
+            .map(|ix| grouped.count_lines(folded, ix))
+            .collect();
+        grouped
+    }
+
+    /// Counts group `ix`'s card lines; mirrors count on their own card.
+    fn count_lines(&self, folded: &FoldedChanges, ix: usize) -> LineCounts {
+        let group = &self.groups[ix];
+        let moved: HashSet<usize> = group.repoints.iter().map(|&(_, added)| added).collect();
+        let mut counts = LineCounts::default();
+        for (relationship, mirror) in self.line_changes(ix) {
+            counts.total += 1;
+            if mirror {
+                continue;
+            }
+            match (
+                moved.contains(&relationship.change),
+                folded.changes[relationship.change].net(),
+            ) {
+                (true, _) | (false, Some(NetChange::Changed)) => counts.changed += 1,
+                (false, Some(NetChange::Added)) => counts.added += 1,
+                (false, Some(NetChange::Removed)) => counts.removed += 1,
+                (false, None) => {}
+            }
+        }
+        counts
     }
 
     /// The groups `keep` leaves, in runs of one type, each counting what it holds.
@@ -455,7 +498,7 @@ impl EntityGroups {
 
     /// How many lines group `ix`'s card has.
     pub fn line_count(&self, ix: usize) -> usize {
-        self.line_changes(ix).count()
+        self.counts.get(ix).map_or(0, |counts| counts.total)
     }
 
     /// Where the line of `change` is on group `ix`'s card.
@@ -465,8 +508,8 @@ impl EntityGroups {
     }
 
     /// Group `ix`'s card's first `take` lines ([`Self::entries`]) and what all its lines count,
-    /// without making the lines it leaves out: a node with thousands of relationship changes
-    /// draws its first few at the cost of a few.
+    /// counted when the groups were made: a node with thousands of relationship changes draws
+    /// its first few at the cost of a few.
     pub fn lines(
         &self,
         folded: &FoldedChanges,
@@ -476,23 +519,14 @@ impl EntityGroups {
         take: usize,
     ) -> CardLines {
         let group = &self.groups[ix];
-        let mut lines = CardLines::default();
-        for (relationship, mirror) in self.line_changes(ix) {
-            lines.total += 1;
-            if mirror {
-                continue;
-            }
-            let moved = group
-                .repoints
-                .iter()
-                .any(|(_, added)| *added == relationship.change);
-            match (moved, folded.changes[relationship.change].net()) {
-                (true, _) | (false, Some(NetChange::Changed)) => lines.changed += 1,
-                (false, Some(NetChange::Added)) => lines.added += 1,
-                (false, Some(NetChange::Removed)) => lines.removed += 1,
-                (false, None) => {}
-            }
-        }
+        let counts = self.counts.get(ix).copied().unwrap_or_default();
+        let mut lines = CardLines {
+            total: counts.total,
+            added: counts.added,
+            changed: counts.changed,
+            removed: counts.removed,
+            ..CardLines::default()
+        };
         let other_name = |relationship: &GroupRelationship| {
             relationship
                 .other_group
