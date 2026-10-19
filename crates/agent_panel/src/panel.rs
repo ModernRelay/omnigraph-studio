@@ -2,7 +2,7 @@
 //! run on the person's session.
 
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::schema::v1::{
@@ -23,7 +23,7 @@ use graph_store::{GraphSession, OutcomeKind};
 use serde_json::{Map, Value};
 use studio_actions::agent::{Allow, AllowAlways, ClearQueue, Reject, Restart, Send, SendNow, Stop};
 use studio_actions::graph::ReviewBranch;
-use studio_settings::StudioSettings;
+use studio_settings::{AgentSettings, StudioSettings};
 use studio_ui::ds;
 use studio_ui::ds::{Dotted as _, Prose as _};
 use studio_ui::menu::ContextMenu;
@@ -477,6 +477,53 @@ struct Host {
     _tasks: Vec<Task<()>>,
 }
 
+/// What a conversation's agent needs before it is launched, made off the main thread: its
+/// working directory, the tool socket, and the omnigraph CLI's gateway and home with the shared
+/// rules and skill, which it can start without.
+struct Prepared {
+    socket: ToolSocket,
+    /// Studio's own executable, which the agent runs as its tool proxy.
+    executable: PathBuf,
+    gateway: std::io::Result<(Gateway, CliHome)>,
+    /// Why the shared rules and the skill could not be written.
+    rules: Option<std::io::Error>,
+}
+
+impl Prepared {
+    /// Makes them for a conversation in `cwd` on `graph`, writing to `branch` off `base`; a
+    /// start fails, with its message, when the directory, the socket or the executable cannot
+    /// be had.
+    fn make(cwd: &Path, graph: &str, branch: &str, base: &str) -> Result<Self, String> {
+        std::fs::create_dir_all(cwd)
+            .map_err(|error| format!("Studio could not create {}: {error}", cwd.display()))?;
+        let socket = ToolSocket::bind(&crate::socket::socket_dir())
+            .map_err(|error| format!("Studio could not open the tool socket: {error}"))?;
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("Studio could not find its own executable: {error}"))?;
+        let gateway = Gateway::bind().and_then(|gateway| {
+            let home = CliHome::write(
+                cwd,
+                &crate::sessions::private_homes(),
+                gateway.port,
+                &gateway.token,
+                graph,
+                branch,
+                base,
+            )?;
+            Ok((gateway, home))
+        });
+        let rules = cli_home::write_agents_md(cwd, graph)
+            .and_then(|()| crate::skill::write(cwd))
+            .err();
+        Ok(Self {
+            socket,
+            executable,
+            gateway,
+            rules,
+        })
+    }
+}
+
 pub struct AgentPanel {
     session: Entity<GraphSession>,
     workspace: WeakEntity<Workspace>,
@@ -504,6 +551,8 @@ pub struct AgentPanel {
     /// The adapter the agent runs as, which says which of its tool calls are Studio's.
     adapter: Adapter,
     host: Option<Host>,
+    /// Making what a start needs on disk, off the main thread; dropped, the start is not made.
+    preparing: Option<Task<()>>,
     /// The agent comes back after it stopped, with the conversation on screen: when it replays
     /// the conversation (`session/load`), the replay replaces what is shown instead of adding
     /// to it.
@@ -661,6 +710,7 @@ impl AgentPanel {
             always_allow: false,
             adapter: Adapter::Other,
             host: None,
+            preparing: None,
             replace_on_replay: false,
             session_id,
             failed: false,
@@ -747,38 +797,10 @@ impl AgentPanel {
             .as_ref()
             .and_then(|saved| saved.cwd.clone())
             .unwrap_or_else(|| crate::sessions::graph_cwd(&self.session.read(cx).settings_key(cx)));
-        if let Err(error) = std::fs::create_dir_all(&cwd) {
-            self.fail_start(
-                format!("Studio could not create {}: {error}", cwd.display()),
-                cx,
-            );
-            return;
-        }
-        let mut socket = match ToolSocket::bind(&crate::socket::socket_dir()) {
-            Ok(socket) => socket,
-            Err(error) => {
-                self.fail_start(
-                    format!("Studio could not open the tool socket: {error}"),
-                    cx,
-                );
-                return;
-            }
-        };
-        let executable = match std::env::current_exe() {
-            Ok(path) => path,
-            Err(error) => {
-                self.fail_start(
-                    format!("Studio could not find its own executable: {error}"),
-                    cx,
-                );
-                return;
-            }
-        };
         let base = self.session.read(cx).branch.clone();
         let graph_key = self.session.read(cx).settings_key(cx);
         // A resumed conversation keeps writing to its branch.
-        self.failed = false;
-        self.branch = Some(match &saved {
+        let branch = match &saved {
             Some(saved) => AgentBranch {
                 name: saved.branch.clone(),
                 base,
@@ -794,46 +816,69 @@ impl AgentPanel {
                 created: false,
                 changes: 0,
             },
-        });
+        };
+        let graph = self.session.read(cx).graph_id.clone();
+        // The directory, the sockets and the files the agent needs are made off the main thread
+        // (constitution IX); the agent is launched once they are there.
+        let prepare = {
+            let (cwd, graph) = (cwd.clone(), graph.clone());
+            let (name, base) = (branch.name.clone(), branch.base.clone());
+            cx.background_spawn(async move { Prepared::make(&cwd, &graph, &name, &base) })
+        };
+        self.state = State::Starting;
+        self.preparing = Some(cx.spawn(async move |this, cx| {
+            let prepared = prepare.await;
+            this.update(cx, |this, cx| match prepared {
+                Ok(prepared) => this.launch(prepared, settings, cwd, branch, graph, cx),
+                Err(message) => this.fail_start(message, cx),
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Launches the agent on what [`Prepared::make`] made for it.
+    fn launch(
+        &mut self,
+        prepared: Prepared,
+        settings: AgentSettings,
+        cwd: PathBuf,
+        branch: AgentBranch,
+        graph: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Prepared {
+            mut socket,
+            executable,
+            gateway,
+            rules,
+        } = prepared;
+        self.failed = false;
+        let (agent_branch, agent_base) = (branch.name.clone(), branch.base.clone());
+        self.branch = Some(branch);
         self.always_allow = false;
 
         // The agent's omnigraph CLI (spec 013): a gateway for this conversation, and a home that
         // points the CLI at it. Without them the agent still has the tools.
-        let (agent_branch, agent_base) = self
-            .branch
-            .as_ref()
-            .map(|branch| (branch.name.clone(), branch.base.clone()))
-            .unwrap_or_default();
-        let graph = self.session.read(cx).graph_id.clone();
         let (gateway_tx, mut gateway_rx) = mpsc::unbounded::<GatewayEvent>();
         self.cli_ready = None;
         self.cli_waiting.clear();
         self.stop_runs();
         self.runs.clear();
         self.gateway_cards.clear();
-        let gateway = Gateway::bind().and_then(|mut gateway| {
-            let home = CliHome::write(
-                &cwd,
-                &crate::sessions::private_homes(),
-                gateway.port,
-                &gateway.token,
-                &graph,
-                &agent_branch,
-                &agent_base,
-            )?;
-            let serve = gateway.serve(
-                self.session.read(cx).gateway_client(cx),
-                Sandbox {
-                    graph: graph.clone(),
-                    branch: agent_branch.clone(),
-                    base: agent_base.clone(),
-                },
-                gateway_tx,
-            );
-            Ok((std::sync::Arc::new(home), serve))
-        });
         let (cli_home, gateway_serve) = match gateway {
-            Ok((home, serve)) => (Some(home), Some(serve)),
+            Ok((mut gateway, home)) => {
+                let serve = gateway.serve(
+                    self.session.read(cx).gateway_client(cx),
+                    Sandbox {
+                        graph: graph.clone(),
+                        branch: agent_branch,
+                        base: agent_base,
+                    },
+                    gateway_tx,
+                );
+                (Some(std::sync::Arc::new(home)), Some(serve))
+            }
             Err(error) => {
                 self.cli_ready = Some(false);
                 self.entries.push(Entry::Notice {
@@ -847,9 +892,7 @@ impl AgentPanel {
             }
         };
         // The shared rules and the skill help the agent; without them it still has the CLI.
-        if let Err(error) =
-            cli_home::write_agents_md(&cwd, &graph).and_then(|()| crate::skill::write(&cwd))
-        {
+        if let Some(error) = rules {
             self.entries.push(Entry::Notice {
                 text: format!(
                     "Studio could not write AGENTS.md and the omnigraph-studio skill for the \
@@ -962,6 +1005,7 @@ impl AgentPanel {
 
     fn stop_host(&mut self) {
         self.host = None;
+        self.preparing = None;
         // No agent is left to take a run's outcome.
         self.stop_runs();
         // Options can only be set on a running session.
