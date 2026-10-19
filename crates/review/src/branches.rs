@@ -201,17 +201,8 @@ impl BranchList {
                                 .ok();
                         }
                     };
-                    let merge = {
-                        let workspace = workspace.clone();
-                        let name = name.clone();
-                        move |window: &mut Window, cx: &mut App| {
-                            workspace
-                                .update(cx, |w, cx| {
-                                    open_review(w, name.clone(), TARGET.into(), window, cx)
-                                })
-                                .ok();
-                        }
-                    };
+                    // A merge is made from the review, which holds it.
+                    let merge = review.clone();
                     let delete = {
                         let workspace = workspace.clone();
                         let session = session.clone();
@@ -705,19 +696,19 @@ impl Render for DeleteBranchModal {
 
 /// Registers the branch actions on a workspace.
 pub fn register(workspace: &mut Workspace) {
-    workspace.register_action(|workspace, _: &ReviewBranch, window, cx| {
+    // A merge is made from the review, which holds it: both open the review of the branch.
+    fn review_current(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
         let Some(session) = workspace.session() else {
             return;
         };
         let branch = session.read(cx).branch.clone();
         open_review(workspace, branch, TARGET.into(), window, cx);
+    }
+    workspace.register_action(|workspace, _: &ReviewBranch, window, cx| {
+        review_current(workspace, window, cx)
     });
     workspace.register_action(|workspace, _: &MergeBranch, window, cx| {
-        let Some(session) = workspace.session() else {
-            return;
-        };
-        let branch = session.read(cx).branch.clone();
-        open_review(workspace, branch, TARGET.into(), window, cx);
+        review_current(workspace, window, cx)
     });
     workspace.register_action(|workspace, _: &CreateBranch, window, cx| {
         let Some(session) = workspace.session().cloned() else {
