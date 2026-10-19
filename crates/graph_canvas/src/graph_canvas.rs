@@ -358,10 +358,25 @@ impl Item for GraphCanvas {
 }
 
 impl GraphCanvas {
+    /// Whether the canvas draws the exploration: not a results canvas, nor the ontology.
+    fn draws_exploration(&self) -> bool {
+        self.results.is_none() && !self.show_schema
+    }
+}
+
+impl GraphCanvas {
     pub fn new(session: Entity<GraphSession>, cx: &mut Context<Self>) -> Self {
         let exploration = Exploration::for_session(&session, cx);
         let subscriptions = vec![
             cx.subscribe(&exploration, |this, _, event, cx| match event {
+                // The ontology and a results canvas draw none of the exploration: only the
+                // tab's mark for newer data and the caption follow it, and nothing is laid out.
+                ExplorationEvent::Changed | ExplorationEvent::Loaded
+                    if !this.draws_exploration() =>
+                {
+                    cx.emit(ItemEvent::UpdateTab);
+                    cx.notify();
+                }
                 ExplorationEvent::Changed => {
                     this._loaded = None;
                     cx.emit(ItemEvent::UpdateTab);
@@ -383,13 +398,13 @@ impl GraphCanvas {
                 }
                 ExplorationEvent::SelectionChanged => this.follow_selection(cx),
             }),
-            cx.subscribe(&session, |this, _, event: &SessionEvent, cx| {
-                if matches!(
-                    event,
-                    SessionEvent::SchemaChanged | SessionEvent::CountsChanged
-                ) {
-                    this.rebuild(cx);
+            cx.subscribe(&session, |this, _, event: &SessionEvent, cx| match event {
+                SessionEvent::SchemaChanged => this.rebuild(cx),
+                // Counts are drawn on the ontology's types only.
+                SessionEvent::CountsChanged if this.results.is_none() && this.show_schema => {
+                    this.rebuild(cx)
                 }
+                _ => {}
             }),
         ];
         let mut canvas = Self {
