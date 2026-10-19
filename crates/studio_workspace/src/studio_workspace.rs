@@ -19,8 +19,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    Action, AnyView, App, ClickEvent, Context, DismissEvent, Div, DragMoveEvent, ElementId, Entity,
-    EntityId, EventEmitter, FocusHandle, Focusable, MouseButton, Pixels, Point, Render,
+    Action, AnyView, App, Bounds, ClickEvent, Context, DismissEvent, Div, DragMoveEvent, ElementId,
+    Entity, EntityId, EventEmitter, FocusHandle, Focusable, MouseButton, Pixels, Point, Render,
     ScrollHandle, SharedString, Stateful, Subscription, Task, WeakEntity, Window,
     WindowControlArea, deferred, div, point,
 };
@@ -43,8 +43,8 @@ pub use item::{Item, ItemEvent, ItemFooter, ItemHandle, KeyHint};
 pub use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};
 pub use panels::{Dock, PanelEntry, PanelPosition};
 pub use persistence::{
-    SavedGraph, SavedItem, SavedPane, SavedSession, SavedWindow, SavedWorkspace, load_windows,
-    register_item_kind, restore_enabled, saved_window_bounds,
+    SavedGraph, SavedItem, SavedPane, SavedSession, SavedWindow, SavedWorkspace,
+    keep_saved_windows, load_windows, register_item_kind, restore_enabled, saved_window_bounds,
 };
 
 /// A modal: dismissing it emits [`DismissEvent`]. Following Zed's modal layer, the workspace
@@ -184,7 +184,7 @@ pub struct Workspace {
     lights_shown: bool,
     /// The settings file problem last shown, so a toast appears once per problem.
     settings_error: Option<String>,
-    /// What the CLI's files could not give, as last shown.
+    /// What the CLI's files could not give, and the servers not added at start, as last shown.
     cli_errors: Vec<String>,
     _settings_subscription: Subscription,
     /// Studio's memory and CPU for the footer while `studio.show_performance` is on (the
@@ -200,6 +200,8 @@ pub struct Workspace {
     /// The next comparison of the state with what was last written.
     _save_check: Option<Task<()>>,
     _save_bounds: Option<Task<()>>,
+    /// The window's place and size the debounced save above has still to write.
+    pending_bounds: Option<Bounds<Pixels>>,
     _bounds_subscription: Subscription,
     _quit_subscription: Subscription,
     _activation_subscription: Subscription,
@@ -322,10 +324,10 @@ impl Workspace {
         });
         let bounds_subscription = cx.observe_window_bounds(window, move |this, window, cx| {
             let bounds = window.bounds();
-            this._save_bounds = Some(cx.spawn(async move |_, cx| {
+            this.pending_bounds = Some(bounds);
+            this._save_bounds = Some(cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(SAVE_DELAY).await;
-                persistence::save_window_bounds(bounds);
-                cx.update(|cx| persistence::window_moved(window_slot, bounds, cx));
+                this.update(cx, |this, cx| this.save_bounds(cx)).ok();
             }));
         });
         // So are the CLI's files when they cannot be read (servers read before stand meanwhile).
@@ -392,6 +394,7 @@ impl Workspace {
             _save: None,
             _save_check: None,
             _save_bounds: None,
+            pending_bounds: None,
             _bounds_subscription: bounds_subscription,
             // GPUI drops every window once the quit handlers ran: a save still waiting for its
             // delay would go with them.
@@ -823,7 +826,18 @@ impl Workspace {
             }
         }
         self.save_now(cx);
+        // A move or resize just before the window closes or Studio quits is kept too.
+        self._save_bounds = None;
+        self.save_bounds(cx);
         studio_settings::writes_done();
+    }
+
+    /// Writes the window's place and size, when they changed since last written.
+    fn save_bounds(&mut self, cx: &mut Context<Self>) {
+        if let Some(bounds) = self.pending_bounds.take() {
+            persistence::save_window_bounds(bounds);
+            persistence::window_moved(self.window_slot, bounds, cx);
+        }
     }
 
     /// Writes the shown graph's state now, rather than after the save delay, when a save is
@@ -1851,16 +1865,24 @@ impl Workspace {
         }
     }
 
-    /// Names each new error from the CLI's files in a toast that stays until dismissed.
+    /// Names each new error from the CLI's files, and each server that could not be added at
+    /// start, in a toast that stays until dismissed.
     fn show_cli_errors(&mut self, registry: &Entity<ConnectionRegistry>, cx: &mut Context<Self>) {
-        let errors = registry.read(cx).cli_errors().to_vec();
+        let registry = registry.read(cx);
+        let errors: Vec<String> = registry
+            .cli_errors()
+            .iter()
+            .map(|error| format!("OmniGraph CLI config: {error}"))
+            .chain(
+                registry
+                    .start_errors()
+                    .iter()
+                    .map(|error| format!("A server could not be added: {error}")),
+            )
+            .collect();
         for error in &errors {
             if !self.cli_errors.contains(error) {
-                self.show_toast(
-                    ToastKind::Error,
-                    format!("OmniGraph CLI config: {error}"),
-                    cx,
-                );
+                self.show_toast(ToastKind::Error, error.clone(), cx);
             }
         }
         self.cli_errors = errors;
@@ -4237,6 +4259,11 @@ impl ConfirmClose {
         self.workspace
             .update(cx, |workspace, cx| {
                 if let Some((pane, index)) = workspace.find_item(item_id) {
+                    // The focus had been the closed tab's: the tab shown next takes it, not a
+                    // handle of the closed one the modal would hand it back to.
+                    if let Some(modal) = &mut workspace.modal {
+                        modal.previous_focus = None;
+                    }
                     workspace.force_close(pane, index, window, cx);
                 }
             })

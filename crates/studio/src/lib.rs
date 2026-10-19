@@ -51,31 +51,9 @@ pub fn init(cx: &mut App) {
         open_settings(workspace, window, cx);
     });
     // A write still running keeps Studio open: quitting would lose its outcome (spec 002). The
-    // window that holds it comes forward with a toast saying so.
-    cx.on_action(|_: &Quit, cx| {
-        for handle in cx.windows() {
-            let Some(handle) = handle.downcast::<Workspace>() else {
-                continue;
-            };
-            let running = handle
-                .update(cx, |workspace, window, cx| {
-                    let graph = workspace.running_write(cx)?;
-                    workspace.show_toast(
-                        ToastKind::Error,
-                        format!("A write to {graph} is still running. Quit when it finishes."),
-                        cx,
-                    );
-                    window.activate_window();
-                    Some(())
-                })
-                .ok()
-                .flatten();
-            if running.is_some() {
-                return;
-            }
-        }
-        cx.quit();
-    });
+    // window that holds it comes forward with a toast saying so. Deferred, as `OpenLink` is
+    // below: the window the action came from is held for dispatch, and could not be asked.
+    cx.on_action(|_: &Quit, cx| cx.defer(quit_unless_writing));
     // The file when it exists; a run from a terminal logs to its output, so then the folder.
     cx.on_action(|_: &RevealLog, cx| {
         let file = logging::log_file();
@@ -205,6 +183,9 @@ pub fn window_options(bounds: Option<gpui::Bounds<gpui::Pixels>>, cx: &App) -> W
 /// window asking for a graph.
 pub fn open_windows(cx: &mut App) {
     let saved = if environment_graph(cx).is_some() {
+        // A run for the environment's graph opens that alone, and keeps the windows the last
+        // ordinary run saved for the next one.
+        studio_workspace::keep_saved_windows(cx);
         Vec::new()
     } else {
         reopenable_windows(cx)
@@ -231,6 +212,32 @@ pub fn build_workspace(window: &mut Window, cx: &mut App) -> Entity<Workspace> {
     let workspace = new_workspace(window, cx);
     open_initial_graph(&workspace, window, cx);
     workspace
+}
+
+/// Quits, unless a window holds a write still running: that window comes forward with a toast.
+fn quit_unless_writing(cx: &mut App) {
+    for handle in cx.windows() {
+        let Some(handle) = handle.downcast::<Workspace>() else {
+            continue;
+        };
+        let running = handle
+            .update(cx, |workspace, window, cx| {
+                let graph = workspace.running_write(cx)?;
+                workspace.show_toast(
+                    ToastKind::Error,
+                    format!("A write to {graph} is still running. Quit when it finishes."),
+                    cx,
+                );
+                window.activate_window();
+                Some(())
+            })
+            .ok()
+            .flatten();
+        if running.is_some() {
+            return;
+        }
+    }
+    cx.quit();
 }
 
 fn new_workspace(window: &mut Window, cx: &mut App) -> Entity<Workspace> {

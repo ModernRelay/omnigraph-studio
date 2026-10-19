@@ -259,9 +259,18 @@ struct WindowSession {
     slots: HashMap<WindowId, u64>,
     written: Option<Vec<SavedWindow>>,
     quitting: bool,
+    /// The windows the last run saved stay for the next start ([`keep_saved_windows`]).
+    kept: bool,
 }
 
 impl Global for WindowSession {}
+
+/// Leaves the windows the last run saved for the next start: this run opened one graph of its
+/// own (the environment's), and writing its window over them would lose them.
+pub fn keep_saved_windows(cx: &mut App) {
+    WindowSession::install(cx);
+    cx.global_mut::<WindowSession>().kept = true;
+}
 
 impl WindowSession {
     fn update(cx: &mut App, change: impl FnOnce(&mut SessionWindows)) {
@@ -279,6 +288,7 @@ impl WindowSession {
             slots: HashMap::new(),
             written: None,
             quitting: false,
+            kept: false,
         });
         cx.on_window_closed(|cx, id| {
             let session = cx.global_mut::<WindowSession>();
@@ -305,6 +315,9 @@ impl WindowSession {
             return;
         }
         let session = cx.global_mut::<WindowSession>();
+        if session.kept {
+            return;
+        }
         let saved = session.windows.saved();
         // A window reports its graphs after its first draw: until one does, the windows the last
         // run left are what to reopen, and an empty list written over them would lose them to

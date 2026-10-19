@@ -41,7 +41,8 @@ pub enum RegistryEvent {
 
 pub struct ConnectionRegistry {
     pub connections: Vec<Entity<Connection>>,
-    pub load_errors: Vec<String>,
+    /// Servers named in the environment or saved by Studio that could not be added at start.
+    start_errors: Vec<String>,
     http: Arc<dyn HttpClient>,
     /// Where the CLI's files are (`$OMNIGRAPH_HOME`, else `~/.omnigraph`), and their stamp
     /// when last read.
@@ -106,16 +107,16 @@ impl ConnectionRegistry {
                 .ok()
                 .into_iter()
                 .collect();
-            this.add_connection(
-                ServerEntry {
-                    name: "environment".into(),
-                    url,
-                    source: ServerSource::Environment,
-                    known_graphs: graphs,
-                },
-                token,
-                cx,
-            );
+            let entry = ServerEntry {
+                name: "environment".into(),
+                url,
+                source: ServerSource::Environment,
+                known_graphs: graphs,
+            };
+            if let Err(error) = this.add_connection(entry, token, cx) {
+                this.start_errors
+                    .push(format!("OMNIGRAPH_STUDIO_SERVER: {error}"));
+            }
         }
 
         this.operator_stamp = cli_config::stamp(operator_dir.as_deref());
@@ -137,8 +138,13 @@ impl ConnectionRegistry {
             };
             // Listed at once, so the windows a start reopens find it and a save made while the
             // keychain is read keeps it; it connects once its token is in.
-            let Some(connection) = this.add_connection(entry, None, cx) else {
-                continue;
+            let name = entry.name.clone();
+            let connection = match this.add_connection(entry, None, cx) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    this.start_errors.push(format!("{name}: {error}"));
+                    continue;
+                }
             };
             connection.update(cx, |connection, _| connection.await_token());
             cx.spawn(async move |_, cx| {
@@ -157,7 +163,7 @@ impl ConnectionRegistry {
     fn empty(http: Arc<dyn HttpClient>, operator_dir: Option<PathBuf>) -> Self {
         Self {
             connections: Vec::new(),
-            load_errors: Vec::new(),
+            start_errors: Vec::new(),
             http,
             operator_dir,
             operator_stamp: Vec::new(),
@@ -172,6 +178,12 @@ impl ConnectionRegistry {
     /// credentials other users can read.
     pub fn cli_errors(&self) -> &[String] {
         &self.cli_errors
+    }
+
+    /// The servers named in the environment or saved by Studio that could not be added at
+    /// start, each by its name and why.
+    pub fn start_errors(&self) -> &[String] {
+        &self.start_errors
     }
 
     /// The CLI config's aliases bound to `graph` on the CLI server named `server`, by name.
@@ -324,18 +336,12 @@ impl ConnectionRegistry {
         entry: ServerEntry,
         token: Option<String>,
         cx: &mut Context<Self>,
-    ) -> Option<Entity<Connection>> {
-        match Connection::new(entry, token, self.http.clone()) {
-            Ok(connection) => {
-                let connection = cx.new(|_| connection);
-                self.connections.push(connection.clone());
-                Some(connection)
-            }
-            Err(error) => {
-                self.load_errors.push(error.to_string());
-                None
-            }
-        }
+    ) -> Result<Entity<Connection>, String> {
+        let connection =
+            Connection::new(entry, token, self.http.clone()).map_err(|error| error.to_string())?;
+        let connection = cx.new(|_| connection);
+        self.connections.push(connection.clone());
+        Ok(connection)
     }
 
     /// Adds a server by URL. The token goes to the OS keychain; the list to Studio's data
@@ -361,7 +367,7 @@ impl ConnectionRegistry {
         };
         let connection = self
             .add_connection(entry, token, cx)
-            .ok_or_else(|| anyhow::anyhow!("invalid server address"))?;
+            .map_err(anyhow::Error::msg)?;
         self.save(cx);
         cx.emit(RegistryEvent::ServersChanged);
         cx.notify();
