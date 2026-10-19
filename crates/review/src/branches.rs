@@ -582,9 +582,42 @@ impl DeleteBranchModal {
         }
         self.running = true;
         let branch = self.branch.clone();
-        let task = self.session.update(cx, |s, cx| s.delete_branch(branch, cx));
+        // Merged when the dialog opened, and asked again now: a commit landed on the branch
+        // meanwhile is the branch's alone, and then the branch waits for its name.
+        let recheck = matches!(self.holds, Holds::Merged).then(|| {
+            self.session
+                .update(cx, |session, cx| session.merge_base(&branch, TARGET, cx))
+        });
         self._task =
             Some(cx.spawn(async move |this, cx| {
+                if let Some(read) = recheck {
+                    let merged = matches!(
+                        read.await,
+                        Ok(base) if base.merge_base.graph_commit_id == base.source_commit_id
+                    );
+                    if !merged {
+                        this.update(cx, |this, cx| {
+                            this.running = false;
+                            this.holds = Holds::Unmerged;
+                            this.error = Some(
+                                format!(
+                                    "{} has a commit {TARGET} does not since this opened; type \
+                                     its name to delete it.",
+                                    this.branch
+                                )
+                                .into(),
+                            );
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                }
+                let Ok(task) = this.update(cx, |this, cx| {
+                    this.session.update(cx, |s, cx| s.delete_branch(branch, cx))
+                }) else {
+                    return;
+                };
                 let outcome = task.await;
                 this.update(cx, |this, cx| {
                     this.running = false;
@@ -747,11 +780,16 @@ mod tests {
             editor::init(cx);
         });
         let commit = |id: &str| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "created_at": 0 });
+        let late_reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let late = late_reads.clone();
         let (session, asked) = fake_server(
             move |path, query, _| {
                 if path.ends_with("/branches/merge-base") {
-                    // `feature`'s head is in main; `spike` has a commit of its own.
-                    let (base, head) = if query.contains("source=feature") {
+                    // `feature`'s head is in main; `spike` has a commit of its own; `late` is
+                    // merged when its dialog opens and has a commit of its own at the delete.
+                    let late_merged = query.contains("source=late")
+                        && late.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                    let (base, head) = if query.contains("source=feature") || late_merged {
                         ("f1", "f1")
                     } else {
                         ("m1", "s1")
@@ -774,7 +812,9 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter(|request| {
-                    request.contains("/branches/feature?") || request.contains("/branches/spike?")
+                    request.contains("/branches/feature?")
+                        || request.contains("/branches/spike?")
+                        || request.contains("/branches/late?")
                 })
                 .count()
         };
@@ -807,5 +847,24 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(deletes(), 2);
+
+        let (late, cx) = cx.add_window_view(|window, cx| {
+            DeleteBranchModal::new(session.clone(), "late".into(), window, cx)
+        });
+        cx.run_until_parked();
+        late.update(cx, |modal, cx| {
+            assert_eq!(modal.holds, Holds::Merged);
+            modal.delete(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            deletes(),
+            2,
+            "a commit landed meanwhile: not without its name"
+        );
+        late.read_with(cx, |modal, _| {
+            assert_eq!(modal.holds, Holds::Unmerged);
+            assert!(modal.error.is_some());
+        });
     }
 }
