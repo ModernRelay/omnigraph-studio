@@ -2146,7 +2146,6 @@ impl GraphSession {
     /// the storage inspector shows, read together.
     pub fn server_state(&mut self, branch: &str, cx: &mut Context<Self>) -> Task<ServerState> {
         let client = self.client(cx);
-        let (graph, branch) = (self.graph_id.clone(), branch.to_owned());
         // Each is a read of its own, counted and noted as one.
         let health = {
             let client = client.clone();
@@ -2156,11 +2155,8 @@ impl GraphSession {
             let client = client.clone();
             self.counted_read(async move { client.readiness().await }, cx)
         };
-        let graphs = {
-            let client = client.clone();
-            self.counted_read(async move { client.graphs().await }, cx)
-        };
-        let snapshot = self.counted_read(async move { client.snapshot(&graph, &branch).await }, cx);
+        let graphs = self.counted_read(async move { client.graphs().await }, cx);
+        let snapshot = self.branch_snapshot(branch, cx);
         cx.background_spawn(async move {
             ServerState {
                 health: health.await,
@@ -2169,6 +2165,16 @@ impl GraphSession {
                 snapshot: snapshot.await,
             }
         })
+    }
+
+    /// `branch`'s storage snapshot: its tables, versions and row counts.
+    pub fn branch_snapshot(
+        &mut self,
+        branch: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<SnapshotOutput, ReadError>> {
+        let (client, graph, branch) = (self.client(cx), self.graph_id.clone(), branch.to_owned());
+        self.counted_read(async move { client.snapshot(&graph, &branch).await }, cx)
     }
 
     /// How many neighbours `id` has through `group`, at `snapshot` (the branch head when

@@ -42,6 +42,7 @@ pub struct StorageInspector {
     /// Its datasets nodes first, each kind by type name, as the table lists them.
     snapshot: Loadable<SnapshotOutput>,
     _task: Option<Task<()>>,
+    _snapshot_task: Option<Task<()>>,
     _subscription: Subscription,
 }
 
@@ -74,13 +75,23 @@ impl Item for StorageInspector {
     }
 }
 
+/// A snapshot's datasets, nodes first, each kind by type name, as the table lists them.
+fn tables_in_order(mut snapshot: SnapshotOutput) -> SnapshotOutput {
+    snapshot.datasets.sort_by(|a, b| {
+        (matches!(a.entity_kind, EntityKind::Edge), &a.type_name)
+            .cmp(&(matches!(b.entity_kind, EntityKind::Edge), &b.type_name))
+    });
+    snapshot
+}
+
 impl StorageInspector {
     pub fn new(session: Entity<GraphSession>, cx: &mut Context<Self>) -> Self {
         let branch = session.read(cx).branch.clone();
-        // What it shows is the session branch's: another branch is read at once.
+        // Its storage is the session branch's: another branch's is read at once. The server's
+        // health, readiness and graphs are the same on every branch, and stay.
         let subscription = cx.subscribe(&session, |this: &mut Self, _, event, cx| {
             if let SessionEvent::BranchChanged = event {
-                this.reload(cx);
+                this.reload_snapshot(cx);
             }
         });
         let mut view = Self {
@@ -92,6 +103,7 @@ impl StorageInspector {
             graphs: Loadable::NotLoaded,
             snapshot: Loadable::NotLoaded,
             _task: None,
+            _snapshot_task: None,
             _subscription: subscription,
         };
         view.reload(cx);
@@ -109,20 +121,39 @@ impl StorageInspector {
         let read = self
             .session
             .update(cx, |session, cx| session.server_state(&branch, cx));
+        self._snapshot_task = None;
         self._task = Some(cx.spawn(async move |this, cx| {
             let state = read.await;
             this.update(cx, |this, cx| {
                 this.health = loadable(state.health);
                 this.readiness = loadable(state.readiness);
                 this.graphs = loadable(state.graphs);
-                this.snapshot = loadable(state.snapshot.map(|mut snapshot| {
-                    snapshot.datasets.sort_by(|a, b| {
-                        (matches!(a.entity_kind, EntityKind::Edge), &a.type_name)
-                            .cmp(&(matches!(b.entity_kind, EntityKind::Edge), &b.type_name))
-                    });
-                    snapshot
-                }));
+                // A branch moved to meanwhile is read on its own.
+                if this.branch == branch {
+                    this.snapshot = loadable(state.snapshot.map(tables_in_order));
+                }
                 cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Reads the storage of the session's branch again, the server's facts kept.
+    fn reload_snapshot(&mut self, cx: &mut Context<Self>) {
+        self.branch = self.session.read(cx).branch.clone();
+        let branch = self.branch.clone();
+        self.snapshot = Loadable::Loading;
+        let read = self
+            .session
+            .update(cx, |session, cx| session.branch_snapshot(&branch, cx));
+        self._snapshot_task = Some(cx.spawn(async move |this, cx| {
+            let snapshot = read.await;
+            this.update(cx, |this, cx| {
+                if this.branch == branch {
+                    this.snapshot = loadable(snapshot.map(tables_in_order));
+                    cx.notify();
+                }
             })
             .ok();
         }));
