@@ -77,6 +77,9 @@ pub struct HistoryView {
     count_tasks: HashMap<String, Task<()>>,
     count_rows: Option<Range<usize>>,
     _count_wait: Option<Task<()>>,
+    /// The rows the frame being drawn asked for last, taken once it is out ([`Self::drawn`]).
+    drawn_rows: Option<Range<usize>>,
+    drawn_due: bool,
     /// Branch names by the commit they point at.
     heads: HashMap<String, Vec<String>>,
     /// Commits in the branch's own list; the rest came in through merges.
@@ -128,7 +131,16 @@ impl HistoryView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(session, branch, false, window, cx)
+        let mut view = Self::build(session.clone(), branch, false, window, cx);
+        // Its own branch's commits, and the other branches whose heads and merges it shows: a
+        // tab restored before the branch list was read draws them once it is.
+        view._session_subscription =
+            Some(cx.subscribe(&session, |this, _, event, cx| match event {
+                SessionEvent::Committed { branch } if *branch == this.branch => this.reload(cx),
+                SessionEvent::BranchesChanged => this.reload(cx),
+                _ => {}
+            }));
+        view
     }
 
     /// The bottom-dock panel: the window's branch, rows only.
@@ -195,6 +207,8 @@ impl HistoryView {
             count_tasks: HashMap::new(),
             count_rows: None,
             _count_wait: None,
+            drawn_rows: None,
+            drawn_due: false,
             heads: HashMap::new(),
             own_count: 0,
             scroll: UniformListScrollHandle::new(),
@@ -412,6 +426,18 @@ impl HistoryView {
             .as_ref()
             .is_some_and(|d| d.read(cx).commit_id() == commit.graph_commit_id);
         if !same {
+            // The detail counts its commit's changes whole: the row does not read them too. A
+            // commit left before its detail counted it is asked for again.
+            if let Some(left) = self
+                .detail
+                .as_ref()
+                .map(|d| d.read(cx).commit_id().to_owned())
+                && !self.counts.contains_key(&left)
+            {
+                self.asked_counts.remove(&left);
+                self.count_rows = None;
+            }
+            self.asked_counts.insert(commit.graph_commit_id.clone());
             let session = self.session.clone();
             let id = commit.graph_commit_id.clone();
             let detail = cx.new(|cx| match pause {
@@ -467,6 +493,21 @@ impl HistoryView {
 
     fn graph_width(&self) -> f32 {
         ((self.graph.lane_count.max(1) as f32) * LANE_WIDTH + GRAPH_PADDING * 2.).max(52.)
+    }
+
+    /// Notes the rows a frame draws. The list also lays one row out twice a frame to measure
+    /// it, so the rows are taken once the frame is out, as the last range it asked for: else
+    /// every redraw would restart the pause before the counts are read.
+    fn drawn(&mut self, rows: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        self.drawn_rows = Some(rows);
+        if !std::mem::replace(&mut self.drawn_due, true) {
+            cx.defer_in(window, |this, _, cx| {
+                this.drawn_due = false;
+                if let Some(rows) = this.drawn_rows.clone() {
+                    this.want_row_counts(rows, cx);
+                }
+            });
+        }
     }
 
     /// Asks for the drawn rows' change counts once scrolling has paused: a fast scroll reads
@@ -753,7 +794,7 @@ impl HistoryView {
                     "history-rows",
                     self.commits.len(),
                     cx.processor(|this, range: Range<usize>, window, cx| {
-                        this.want_row_counts(range.clone(), cx);
+                        this.drawn(range.clone(), window, cx);
                         this.render_rows(range, window, cx)
                     }),
                 )
@@ -967,7 +1008,64 @@ impl Render for HistoryView {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use gpui::TestAppContext;
+    use graph_store::{Connection, ServerEntry, ServerSource};
+    use http_client::{AsyncBody, FakeHttpClient, Response};
+    use serde_json::json;
+
     use super::*;
+
+    /// A History tab opened before the branch list was read reads the other branches, whose
+    /// heads and merges it shows, once the list is in.
+    #[gpui::test]
+    async fn a_tab_opened_before_the_branch_list_reads_the_other_branches(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let lists = Arc::new(Mutex::new(Vec::<String>::new()));
+        let asked = lists.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let query = request.uri().query().unwrap_or_default().to_owned();
+            let asked = asked.clone();
+            async move {
+                let body = if path.ends_with("/branches") {
+                    json!({ "branches": ["main", "fix"] })
+                } else if path.ends_with("/commits") {
+                    asked.lock().unwrap().push(query);
+                    json!({ "commits": [] })
+                } else {
+                    json!({})
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        let (_view, cx) = cx.add_window_view(move |window, cx| {
+            HistoryView::new(session, "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let lists = lists.lock().unwrap();
+        assert!(
+            lists.iter().any(|query| query.contains("branch=fix")),
+            "{lists:?}"
+        );
+    }
 
     #[test]
     fn search_finds_commits_by_the_start_of_their_id_or_their_actor() {

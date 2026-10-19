@@ -191,7 +191,9 @@ impl CommitView {
         self.more_error = None;
         let session = self.session.clone();
         let commit_id = self.commit_id.clone();
-        let mut token = self.next_page_token.take();
+        // Kept while it is read: the list's read-more line stays, so the list is not laid out
+        // again from its top under the person's place.
+        let mut token = self.next_page_token.clone();
         // Moved, not copied, on the main thread: it comes back with the pages read.
         let mut fold = std::mem::take(&mut self.fold);
         let start = fold.raw_changes();
@@ -591,13 +593,16 @@ impl CommitView {
                 .child(
                     studio_ui::ds::button(
                         "load-more",
-                        if self.more_error.is_some() {
+                        if matches!(self.state, State::Loading) {
+                            "Reading changes…"
+                        } else if self.more_error.is_some() {
                             "Try again"
                         } else {
                             "Load more changes"
                         },
                     )
                     .style(ButtonStyle::Subtle)
+                    .disabled(matches!(self.state, State::Loading))
                     .on_click(cx.listener(|this, _, _, cx| this.load_more(cx))),
                 )
                 .children(self.more_error.clone().map(|error| {
