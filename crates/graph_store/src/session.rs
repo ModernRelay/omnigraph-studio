@@ -1942,6 +1942,22 @@ impl GraphSession {
         )
     }
 
+    /// What merging `source` into `target` would do now, or its conflicts: a dry run, which
+    /// writes nothing and takes no write gate, so it is a read here, not an outcome.
+    pub fn merge_preview(
+        &mut self,
+        source: &str,
+        target: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<graph_client::MergePreview, ReadError>> {
+        let (client, graph) = (self.client(cx), self.graph_id.clone());
+        let (source, target) = (source.to_owned(), target.to_owned());
+        self.counted_read(
+            async move { client.merge_preview(&graph, &source, &target).await },
+            cx,
+        )
+    }
+
     /// One page of `branch`'s change feed: from `start` (`now`, `beginning` or
     /// `after:<commit_id>`), or from `page_token` to continue.
     pub fn changes(
@@ -2416,6 +2432,7 @@ impl GraphSession {
             source: source.clone(),
             target: Some(target.clone()),
             delete_branch,
+            dry_run: false,
         };
         self.writes_in_flight += 1;
         cx.emit(SessionEvent::ActivityChanged);

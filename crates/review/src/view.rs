@@ -203,6 +203,17 @@ impl From<&CommitOutput> for ReviewCommit {
     }
 }
 
+/// What a merge of the branch into its target would do now: a dry run read with the review,
+/// which writes nothing.
+#[derive(Debug, Clone)]
+enum Preview {
+    /// Not asked: a review of one commit, or the dry run could not be read.
+    Unread,
+    Reading,
+    Merges(BranchMergeOutcome),
+    Conflicts(Vec<MergeConflictOutput>),
+}
+
 enum LoadState {
     Loading { folded: usize },
     Failed(SharedString),
@@ -241,6 +252,8 @@ pub struct ReviewView {
     /// change made again since is reviewed again.
     reviewed_keys: HashSet<String>,
     merge: MergeState,
+    /// What a merge would do now, read with the review by a dry run.
+    preview: Preview,
     /// Whether the merge deletes the branch once it lands; on unless the person turns it off.
     delete_branch: bool,
     show_conflicts: bool,
@@ -258,6 +271,7 @@ pub struct ReviewView {
     _head_watch: HeadWatch,
     _load_task: Option<Task<()>>,
     _names_task: Option<Task<()>>,
+    _preview_task: Option<Task<()>>,
     _merge_task: Option<Task<()>>,
     _search_task: Option<Task<()>>,
     _fix_tasks: Vec<Task<()>>,
@@ -352,6 +366,7 @@ impl ReviewView {
             bound_head: None,
             reviewed_keys: HashSet::new(),
             merge: MergeState::Idle,
+            preview: Preview::Unread,
             delete_branch: true,
             show_conflicts: false,
             newer: false,
@@ -362,6 +377,7 @@ impl ReviewView {
             _head_watch: head_watch,
             _load_task: None,
             _names_task: None,
+            _preview_task: None,
             _merge_task: None,
             _search_task: None,
             _fix_tasks: Vec::new(),
@@ -431,9 +447,16 @@ impl ReviewView {
                 self.newer = data.moved_while_reading;
                 let ends = data.groups.unnamed_ends();
                 let head = data.head.clone();
+                let changed = !data.folded.changes.is_empty();
                 self.data = Some(data);
                 self.load = LoadState::Ready;
                 self.read_names(ends, head, cx);
+                if self.scope.is_none() && changed {
+                    self.read_preview(cx);
+                } else {
+                    self.preview = Preview::Unread;
+                    self._preview_task = None;
+                }
             }
             Err(error) => self.load = LoadState::Failed(error.into()),
         }
@@ -469,6 +492,38 @@ impl ReviewView {
             })
             .ok();
         }));
+    }
+
+    /// Asks what a merge would do now, by a dry run: the branch reads as merging cleanly, or
+    /// its conflicts show before anyone merges. A dry run that cannot be read says nothing.
+    fn read_preview(&mut self, cx: &mut Context<Self>) {
+        self.preview = Preview::Reading;
+        let read = self.session.update(cx, |session, cx| {
+            session.merge_preview(&self.branch, &self.target, cx)
+        });
+        self._preview_task = Some(cx.spawn(async move |this, cx| {
+            let preview = match read.await {
+                Ok(graph_client::MergePreview::Merges(outcome)) => Preview::Merges(outcome),
+                Ok(graph_client::MergePreview::Conflicts(conflicts)) => {
+                    Preview::Conflicts(conflicts)
+                }
+                Err(_) => Preview::Unread,
+            };
+            this.update(cx, |this, cx| {
+                this.preview = preview;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The conflicts the conflicts view lists: a merge's, else a dry run's.
+    fn conflicts(&self) -> Option<&[MergeConflictOutput]> {
+        match (&self.merge, &self.preview) {
+            (MergeState::Conflicts(conflicts), _) => Some(conflicts),
+            (MergeState::Idle, Preview::Conflicts(conflicts)) => Some(conflicts),
+            _ => None,
+        }
     }
 
     fn change_count(&self) -> usize {
@@ -1116,8 +1171,7 @@ impl ReviewView {
     // ---- rendering ----
 
     fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors();
-        let border = colors.border_variant;
+        let border = studio_ui::ds::surface::rule(cx);
         let focus = self.focus_handle.clone();
         let mergeable = self.mergeable();
         let merge_button = studio_ui::ds::button(
@@ -1189,6 +1243,24 @@ impl ReviewView {
                     ),
                     (None, _) => format!("{} shares no history with {}", self.branch, self.target),
                     _ => String::new(),
+                };
+                // What a merge would do now, by the dry run read with the review; conflicts
+                // show in the banner instead.
+                let preview = match &self.preview {
+                    Preview::Reading => " · checking the merge…".to_owned(),
+                    Preview::Merges(BranchMergeOutcome::FastForward) => {
+                        " · merges cleanly as a fast-forward".to_owned()
+                    }
+                    Preview::Merges(BranchMergeOutcome::AlreadyUpToDate) => {
+                        format!(" · {} already has every change", self.target)
+                    }
+                    Preview::Merges(_) => " · merges cleanly".to_owned(),
+                    Preview::Unread | Preview::Conflicts(_) => String::new(),
+                };
+                let detail = if detail.is_empty() {
+                    detail
+                } else {
+                    format!("{detail}{preview}")
                 };
                 (sentence, detail)
             }
@@ -1395,7 +1467,34 @@ impl ReviewView {
 
     fn render_merge_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (severity, text, action): (Severity, String, Option<AnyElement>) = match &self.merge {
-            MergeState::Idle => return None,
+            MergeState::Idle => match &self.preview {
+                Preview::Conflicts(conflicts) => (
+                    Severity::Warning,
+                    format!(
+                        "{} conflict{} would stop a merge into {} now. {}",
+                        conflicts.len(),
+                        if conflicts.len() == 1 { "" } else { "s" },
+                        self.target,
+                        resolution_hint(&self.branch, &self.target)
+                    ),
+                    Some(
+                        studio_ui::ds::button(
+                            "toggle-preview-conflicts",
+                            if self.show_conflicts {
+                                "Show changes"
+                            } else {
+                                "Show conflicts"
+                            },
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_conflicts = !this.show_conflicts;
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                    ),
+                ),
+                _ => return None,
+            },
             MergeState::Checking => (
                 Severity::Info,
                 format!("Checking that {} has not moved…", self.branch),
@@ -1491,7 +1590,7 @@ impl ReviewView {
             MergeState::Conflicts(conflicts) => (
                 Severity::Error,
                 format!(
-                    "{} conflict{} stopped the merge. {}",
+                    "{} conflict{} stopped the merge, and nothing was merged. {}",
                     conflicts.len(),
                     if conflicts.len() == 1 { "" } else { "s" },
                     resolution_hint(&self.branch, &self.target)
@@ -1551,12 +1650,11 @@ impl ReviewView {
     }
 
     fn render_conflicts(&self, cx: &mut Context<Self>) -> AnyElement {
-        let MergeState::Conflicts(conflicts) = &self.merge else {
+        let Some(conflicts) = self.conflicts() else {
             return div().into_any_element();
         };
-        let colors = cx.theme().colors();
-        let surface = colors.surface_background;
-        let border = colors.border_variant;
+        let surface = cx.theme().colors().surface_background;
+        let border = studio_ui::ds::surface::rule(cx);
         v_flex()
             .id("conflicts")
             .flex_1()
@@ -1565,10 +1663,14 @@ impl ReviewView {
             .p(px(space::XL))
             .gap(px(space::MD))
             .child(
-                Label::new(format!(
-                    "Conflicts merging {} into {}",
-                    self.branch, self.target
-                ))
+                Label::new(if matches!(self.merge, MergeState::Conflicts(_)) {
+                    format!("Conflicts merging {} into {}", self.branch, self.target)
+                } else {
+                    format!(
+                        "Conflicts a merge of {} into {} would stop on",
+                        self.branch, self.target
+                    )
+                })
                 .size(LabelSize::Small)
                 .color(Color::Muted),
             )
@@ -2809,13 +2911,15 @@ pub(crate) mod tests {
                 view.merge(cx);
             });
             cx.run_until_parked();
-            let merges: Vec<String> = asked
+            let (previews, merges): (Vec<String>, Vec<String>) = asked
                 .lock()
                 .unwrap()
                 .iter()
                 .filter(|request| request.contains("/branches/merge?"))
                 .cloned()
-                .collect();
+                .partition(|request| request.contains("\"dry_run\":true"));
+            // The review asked what a merge would do once, writing nothing, before the merge.
+            assert_eq!(previews.len(), 1, "{previews:?}");
             assert_eq!(merges.len(), 1, "{merges:?}");
             assert_eq!(merges[0].contains("\"delete_branch\":true"), delete);
             view.read_with(cx, |view, cx| {

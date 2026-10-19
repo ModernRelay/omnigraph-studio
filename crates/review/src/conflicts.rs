@@ -32,8 +32,7 @@ pub fn conflict_wording(kind: MergeConflictKind, here: Option<NetChange>, target
 /// What to do about conflicts, after the list.
 pub fn resolution_hint(source: &str, target: &str) -> String {
     format!(
-        "Nothing was merged. Fix each entity on {source} with ordinary edits so it agrees with \
-         {target}, then merge again."
+        "Fix each entity on {source} with ordinary edits so it agrees with {target}, then merge."
     )
 }
 

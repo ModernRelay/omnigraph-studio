@@ -111,6 +111,12 @@ place), X (designed on 0.13; the better routes are deferred).
   lands (`delete_branch`): the server reports the deletion on the answer and never undoes the
   merge for it, and the outcome says "Deleted <branch>." or why it was not. A session on the
   deleted branch moves to the target. Not offered for `main`.
+- Before anyone merges, a review of the whole branch asks what a merge would do now with a
+  dry run (`dry_run` on `POST /branches/merge`, E8): the server reads both branches, takes no
+  write gate and writes nothing. A clean merge reads beside the fork, "merges cleanly as a
+  fast-forward"; conflicts show in a banner with Show conflicts, the same list a merge's 409
+  gives. A dry run that cannot be read says nothing; Merge stays available either way, since
+  the merge itself decides.
 - Outcome shown plainly: fast-forwarded, merged (with commit), already up to date.
 - A 409 opens a conflicts view: one row per conflict with its kind in words ("Changed on both
   branches", "Deleted on main, changed here", "Relationship points to a deleted node"), the

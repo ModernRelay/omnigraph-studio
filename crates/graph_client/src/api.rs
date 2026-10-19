@@ -314,6 +314,10 @@ pub struct BranchMergeRequest {
     pub target: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub delete_branch: bool,
+    /// Classify and validate only: the outcome the merge would have now, or its conflicts, with
+    /// nothing written. The server reads both branches without the merge's write gate.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
 }
 
 /// `GET /graphs/{id}/branches/merge-base`: the commit a merge of `source` into `target` would

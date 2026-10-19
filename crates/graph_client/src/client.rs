@@ -899,6 +899,41 @@ impl GraphClient {
         .await
     }
 
+    /// `POST /graphs/{id}/branches/merge` with `dry_run`: what merging `source` into `target`
+    /// would do now, or the conflicts that would stop it. Nothing is written; the server reads
+    /// both branches, without the merge's write gate or its grant.
+    pub async fn merge_preview(
+        &self,
+        graph: &str,
+        source: &str,
+        target: &str,
+    ) -> Result<MergePreview, ReadError> {
+        let url = self.url(&["graphs", graph, "branches", "merge"], &[]);
+        let request = BranchMergeRequest {
+            source: source.to_owned(),
+            target: Some(target.to_owned()),
+            delete_branch: false,
+            dry_run: true,
+        };
+        let raw = self
+            .fetch(Method::POST, url, Some(json(&request)), &[])
+            .await?;
+        if raw.status.is_success() {
+            check_contract(&raw)?;
+            let output: BranchMergeOutput = serde_json::from_slice(&raw.body)
+                .map_err(|error| ReadError::Decode(error.to_string()))?;
+            return Ok(MergePreview::Merges(output.outcome));
+        }
+        if raw.status == StatusCode::CONFLICT
+            && let Ok(error) = serde_json::from_slice::<ErrorOutput>(&raw.body)
+            && let Some(conflicts) = error.merge_conflicts.filter(|c| !c.is_empty())
+        {
+            check_contract(&raw)?;
+            return Ok(MergePreview::Conflicts(conflicts));
+        }
+        Err(ReadError::Refused(summary(raw.status, &raw.body)))
+    }
+
     /// One page of a branch's change feed, from `at`.
     pub async fn changes(
         &self,
@@ -1004,6 +1039,14 @@ impl GraphClient {
         )
         .await
     }
+}
+
+/// What a merge would do now ([`GraphClient::merge_preview`]).
+#[derive(Debug, Clone)]
+pub enum MergePreview {
+    Merges(crate::api::BranchMergeOutcome),
+    /// The conflicts that would stop it, as a merge would report them.
+    Conflicts(Vec<crate::api::MergeConflictOutput>),
 }
 
 /// `GET /commits/{id}/changes`: one page of a commit's entity changes.
@@ -1450,6 +1493,37 @@ mod tests {
             matches!(outcome, WriteOutcome::Unknown { .. }),
             "{outcome:?}"
         );
+    }
+
+    /// A merge preview reads what a merge would do, or the conflicts that would stop it; any
+    /// other answer is a refused read, never a merge outcome.
+    #[test]
+    fn a_merge_preview_reads_the_outcome_or_the_conflicts() {
+        let merges = r#"{"source":"feature","target":"main","outcome":"fast_forward","commit":null,"dry_run":true}"#;
+        let preview = block_on(
+            client(respond(200, Some("0.13"), merges)).merge_preview("g", "feature", "main"),
+        );
+        assert!(matches!(
+            preview,
+            Ok(MergePreview::Merges(
+                crate::api::BranchMergeOutcome::FastForward
+            ))
+        ));
+        let conflicts = r#"{"error":"merge conflicts","code":"conflict","merge_conflicts":[{"entity_kind":"node","type_name":"Person","kind":"divergent_update","message":"changed on both","entity_id":"p1"}]}"#;
+        let preview = block_on(
+            client(respond(409, Some("0.13"), conflicts)).merge_preview("g", "feature", "main"),
+        );
+        match preview {
+            Ok(MergePreview::Conflicts(conflicts)) => {
+                assert_eq!(conflicts[0].entity_id.as_deref(), Some("p1"));
+            }
+            other => panic!("{other:?}"),
+        }
+        let refused = block_on(
+            client(respond(403, Some("0.13"), r#"{"error":"denied"}"#))
+                .merge_preview("g", "feature", "main"),
+        );
+        assert!(matches!(refused, Err(ReadError::Refused(summary)) if summary.status == 403));
     }
 
     #[test]
