@@ -27,9 +27,10 @@ pub struct Completion {
     pub detail: Option<String>,
 }
 
-/// The types a parameter can be declared with.
+/// The types a parameter can be declared with; `Vector` takes its dimension, `Vector(3)`.
 const PARAMETER_TYPES: &[&str] = &[
-    "String", "Bool", "I32", "I64", "U32", "U64", "F32", "F64", "Date", "DateTime",
+    "String", "Bool", "I32", "I64", "U32", "U64", "F32", "F64", "Date", "DateTime", "Blob",
+    "Vector",
 ];
 
 /// Completions for the word ending at `offset` (a byte offset into `source`). Returns the byte
@@ -109,6 +110,9 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
                 .into_iter()
                 .find(|(name, _)| name == var)
                 .map(|(_, type_name)| type_name);
+            let is_edge = bound
+                .as_ref()
+                .is_some_and(|type_name| schema.edge(type_name).is_some());
             if let Some(type_name) = bound {
                 let properties = schema
                     .node(&type_name)
@@ -125,10 +129,16 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
                     }
                 }
             }
-            for meta in ["@id"] {
+            // A relationship also names its ends and its type.
+            let metas: &[&str] = if is_edge {
+                &["@id", "@src", "@dst", "@type"]
+            } else {
+                &["@id"]
+            };
+            for meta in metas {
                 if prefix.is_empty() {
                     items.push(Completion {
-                        label: meta.into(),
+                        label: (*meta).into(),
                         kind: CompletionKind::Property,
                         detail: Some("String".into()),
                     });
@@ -416,6 +426,18 @@ mod tests {
         let source = "query q() { match { $a $e:worksAt $b } return { $e.ro";
         let (_, items) = completions(&dev(), source, source.len());
         assert_eq!(items[0].label, "role");
+        // A relationship names its ends and its type too; a node does not.
+        let labels = |source: &str| -> Vec<String> {
+            let (_, items) = completions(&dev(), source, source.len());
+            items.into_iter().map(|item| item.label).collect()
+        };
+        let edge = labels("query q() { match { $a $e:worksAt $b } return { $e.");
+        for meta in ["@id", "@src", "@dst", "@type"] {
+            assert!(edge.iter().any(|label| label == meta), "{meta}: {edge:?}");
+        }
+        let node = labels("query q() { match { $p: Person } return { $p.");
+        assert!(node.iter().any(|label| label == "@id"));
+        assert!(!node.iter().any(|label| label == "@src"), "{node:?}");
     }
 
     #[test]
