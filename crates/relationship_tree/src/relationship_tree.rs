@@ -143,8 +143,9 @@ pub struct RelationshipTree {
     scroll_handle: UniformListScrollHandle,
     exploration_subscriptions: Vec<Subscription>,
     _workspace_subscription: Subscription,
-    /// The read ahead for the row the pointer rests on, once it has rested.
-    _prefetch: Option<gpui::Task<()>>,
+    /// The read ahead for the row the pointer rests on, once it has rested, with that row's
+    /// path.
+    prefetch: Option<(graph_store::ExplorePath, gpui::Task<()>)>,
     /// A rebuild waiting for reads that finish together.
     _loaded: Option<gpui::Task<()>>,
 }
@@ -188,7 +189,7 @@ impl RelationshipTree {
             scroll_handle: UniformListScrollHandle::new(),
             exploration_subscriptions: Vec::new(),
             _workspace_subscription: workspace_subscription,
-            _prefetch: None,
+            prefetch: None,
             _loaded: None,
         };
         if session.is_some() && window.focused(cx).is_none() {
@@ -1071,7 +1072,7 @@ impl RelationshipTree {
             .hover(|style| style.bg(hover_bg))
             .when_some(prefetch_path, |row, path| {
                 row.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                    this.prefetch(hovered.then(|| path.clone()), cx)
+                    this.prefetch(&path, *hovered, cx)
                 }))
             })
             .when_some(card, |d, card| {
@@ -1292,18 +1293,30 @@ impl RelationshipTree {
     }
 
     /// Reads ahead what opening `path` will show once the pointer has rested on its row;
-    /// leaving the row first reads nothing.
-    fn prefetch(&mut self, path: Option<graph_store::ExplorePath>, cx: &mut Context<Self>) {
-        let (Some(path), Some(exploration)) = (path, self.exploration.clone()) else {
-            self._prefetch = None;
+    /// leaving the row first reads nothing. A row the pointer left cancels only its own read:
+    /// moving down, the row entered hears the move before the row left does.
+    fn prefetch(&mut self, path: &graph_store::ExplorePath, hovered: bool, cx: &mut Context<Self>) {
+        if !hovered {
+            if self
+                .prefetch
+                .as_ref()
+                .is_some_and(|(pending, _)| pending == path)
+            {
+                self.prefetch = None;
+            }
+            return;
+        }
+        let Some(exploration) = self.exploration.clone() else {
             return;
         };
-        self._prefetch = Some(cx.spawn(async move |_, cx| {
+        let read = path.clone();
+        let task = cx.spawn(async move |_, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(120))
                 .await;
-            exploration.update(cx, |e, cx| e.prefetch(&path, cx));
-        }));
+            exploration.update(cx, |e, cx| e.prefetch(&read, cx));
+        });
+        self.prefetch = Some((path.clone(), task));
     }
 
     /// Whether some relationship group shown has no relationships.
