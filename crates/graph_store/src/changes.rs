@@ -372,7 +372,7 @@ fn plural(count: usize, one: &str, many: &str) -> String {
 }
 
 /// `20000` → `20,000`.
-fn grouped(n: usize) -> String {
+pub(crate) fn grouped(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {

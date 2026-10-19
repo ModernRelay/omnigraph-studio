@@ -17,7 +17,7 @@ use gq_language::{BuiltQuery, SchemaModel};
 use graph_client::ReadError;
 use serde_json::Value;
 
-use crate::changes::{ChangeFold, NetChange};
+use crate::changes::{ChangeFold, NetChange, REVIEW_CHANGE_CAP, grouped};
 use crate::fixes::{compose, revert_query};
 use crate::session::GraphSession;
 
@@ -26,8 +26,11 @@ use crate::session::GraphSession;
 pub const MAX_DEPENDENTS: usize = 1000;
 /// Rounds of dependents of dependents before the chain is called too long.
 const MAX_ROUNDS: usize = 32;
-/// Changes read per page when undoing.
-const UNDO_PAGE: u32 = 500;
+/// Changes read per page when undoing: the most a page holds.
+const UNDO_PAGE: u32 = 8_192;
+/// The most changes Undo reads and puts back in one commit, as many as a review folds
+/// (constitution IX): a delete that removed more is refused before it is all held.
+const UNDO_CAP: usize = REVIEW_CHANGE_CAP;
 
 /// A node deleted because it needs one that is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +239,7 @@ pub fn undo_query(
     cx.spawn(async move |cx| {
         let mut fold = ChangeFold::new();
         let mut page_token: Option<String> = None;
+        let mut read = 0;
         loop {
             let page = session
                 .update(cx, |session, cx| {
@@ -243,6 +247,14 @@ pub fn undo_query(
                 })
                 .await
                 .map_err(|error| error.to_string())?;
+            read += page.changes.len();
+            if read > UNDO_CAP {
+                return Err(format!(
+                    "The commit removed more than {} nodes and relationships, more than Undo puts \
+                     back in one commit.",
+                    grouped(UNDO_CAP)
+                ));
+            }
             for change in page.changes {
                 fold.add(&page.cause, change);
             }
@@ -292,6 +304,72 @@ mod tests {
         edge WorksAt: Person -> Company @card(1..)\n\
         edge Holds: Badge -> Person @card(1..1)\n\
         edge Knows: Person -> Person @card(0..)\n";
+
+    /// Undo of a delete that removed more than it puts back in one commit is refused once the
+    /// pages read pass the cap, without reading the rest or holding them.
+    #[gpui::test]
+    async fn undo_refuses_a_delete_larger_than_one_commit_puts_back(cx: &mut TestAppContext) {
+        let pages = Arc::new(Mutex::new(0usize));
+        let counted = pages.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let counted = counted.clone();
+            async move {
+                let path = request.uri().path().to_owned();
+                let body = if path.ends_with("/changes") {
+                    let page = {
+                        let mut pages = counted.lock().unwrap();
+                        *pages += 1;
+                        *pages
+                    };
+                    let changes: Vec<Value> = (0..UNDO_PAGE)
+                        .map(|n| {
+                            serde_json::json!({
+                                "kind": "node",
+                                "type": {"id": "t1", "name": "Company"},
+                                "id": format!("c{page}-{n}"),
+                                "op": "delete",
+                                "before": {"properties": {"slug": format!("c{page}-{n}"), "name": "x"}},
+                            })
+                        })
+                        .collect();
+                    serde_json::json!({
+                        "cause": {"graph_commit_id": "c9", "authored_branch": "main", "authored_at": 9},
+                        "changes": changes,
+                        "next_page_token": format!("p{page}"),
+                    })
+                } else if path.ends_with("/schema") {
+                    serde_json::json!({ "schema_source": REQUIRED })
+                } else {
+                    serde_json::json!({ "branches": ["main"] })
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        let schema = Arc::new(SchemaModel::parse(REQUIRED).unwrap());
+        let undo = cx.update(|cx| undo_query(session.clone(), schema, "c9".into(), cx));
+        cx.run_until_parked();
+        let refused = futures::executor::block_on(undo).unwrap_err();
+        assert!(refused.contains("more than 20,000"), "{refused}");
+        assert_eq!(
+            *pages.lock().unwrap(),
+            UNDO_CAP.div_ceil(UNDO_PAGE as usize),
+            "no page past the cap"
+        );
+    }
 
     /// Deleting a company finds the person who works only there, then the badge only that
     /// person holds; each read is held at the commit the rows were shown at, and a round that
