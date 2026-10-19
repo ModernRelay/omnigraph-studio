@@ -206,8 +206,8 @@ pub fn open_windows(cx: &mut App) {
     }
 }
 
-/// Builds the root view of a window and opens its first graph: the environment's, else the
-/// first window the last run had open, else none, asking for one.
+/// Builds the root view of a window and opens its first graph: the environment's, else none,
+/// asking for one. The windows the last run left open are reopened by [`open_windows`].
 pub fn build_workspace(window: &mut Window, cx: &mut App) -> Entity<Workspace> {
     let workspace = new_workspace(window, cx);
     open_initial_graph(&workspace, window, cx);
@@ -362,8 +362,6 @@ fn open_initial_graph(workspace: &Entity<Workspace>, window: &mut Window, cx: &m
         workspace.update(cx, |workspace, cx| {
             workspace.set_session(session, window, cx)
         });
-    } else if let Some(saved) = reopenable_windows(cx).first() {
-        reopen_window(workspace, saved, window, cx);
     } else {
         ask_for_graph(workspace, window, cx);
     }

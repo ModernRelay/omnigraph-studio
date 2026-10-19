@@ -168,7 +168,8 @@ fn watch(cx: &mut App) {
     cx.spawn(async move |cx| {
         loop {
             cx.background_executor().timer(Duration::from_secs(2)).await;
-            let modified = modified();
+            // Off the main thread: a slow or network home would hold up frames.
+            let modified = cx.background_executor().spawn(async { modified() }).await;
             let changed = cx.update(|cx| cx.global::<UserKeymap>().modified != modified);
             if changed {
                 cx.update(|cx| {
