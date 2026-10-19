@@ -8,7 +8,7 @@ mod conflicts;
 mod edit;
 mod view;
 
-use gpui::{App, AppContext as _, Focusable as _};
+use gpui::{App, AppContext as _};
 use studio_workspace::{PanelPosition, Workspace};
 use ui::IconName;
 
@@ -25,12 +25,6 @@ pub fn init(cx: &mut App) {
     });
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };
-        // Window-level actions reach the workspace only through a focused element, and a fresh
-        // window focuses nothing. Until studio_workspace focuses itself, focus it here.
-        if window.focused(cx).is_none() {
-            let focus = workspace.focus_handle(cx);
-            window.focus(&focus, cx);
-        }
         let handle = cx.entity().downgrade();
         let session = workspace.session().cloned();
         let list = cx.new(|cx| BranchList::new(handle, session, window, cx));
