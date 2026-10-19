@@ -760,9 +760,12 @@ pub fn update(cx: &mut App, f: impl FnOnce(&mut StudioSettings)) {
         done.send(write_change(&path, &old, &new)).ok();
     });
     cx.spawn(async move |cx| {
-        if let Ok(written) = written.await {
-            cx.update(|cx| saved(edit, written, cx));
-        }
+        // A write that stopped without an answer still ends, or the file would never be
+        // watched again.
+        let written = written
+            .await
+            .unwrap_or_else(|_| Written::Unread("the write stopped before it finished".into()));
+        cx.update(|cx| saved(edit, written, cx));
     })
     .detach();
 }
@@ -781,38 +784,66 @@ enum Written {
     },
 }
 
-/// Reads the settings file, edits the change from `old` to `new` into it, and writes it.
-fn write_change(path: &Path, old: &StudioSettings, new: &StudioSettings) -> Written {
-    let text = match std::fs::read_to_string(path) {
+/// How many times a change is edited into the file again when the file was saved elsewhere
+/// while the change was being written.
+const SAVE_ATTEMPTS: usize = 3;
+
+/// The settings file's text, empty when there is none yet.
+fn settings_text(path: &Path) -> Result<String, String> {
+    match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(error) => Err(format!("it could not be read ({error})")),
-    };
-    let edited = text.and_then(|text| {
-        let edited = document::edit(&text, old, new)?;
-        Ok((edited != text, edited))
-    });
-    let (changed, edited) = match edited {
-        Ok(edited) => edited,
-        Err(error) => return Written::Unread(error),
-    };
-    // Private: `agent.env` may hold a model provider's key.
-    let written = if changed {
-        write_atomic(path, edited.as_bytes(), Access::Private)
-            .map_err(|error| format!("{} could not be saved: {error}", path.display()))
-    } else {
-        Ok(())
-    };
-    let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
-    let reading = written
-        .is_ok()
-        .then(|| StudioSettings::read(&edited).ok().map(Box::new))
-        .flatten();
-    Written::Saved {
-        reading,
-        modified,
-        error: written.err(),
     }
+}
+
+/// Reads the settings file, edits the change from `old` to `new` into it, and writes it. A
+/// save made elsewhere while it is written is not replaced: the change is edited into that
+/// text instead.
+fn write_change(path: &Path, old: &StudioSettings, new: &StudioSettings) -> Written {
+    let reading = |text: &str| StudioSettings::read(text).ok().map(Box::new);
+    for _ in 0..SAVE_ATTEMPTS {
+        let text = match settings_text(path) {
+            Ok(text) => text,
+            Err(error) => return Written::Unread(error),
+        };
+        let edited = match document::edit(&text, old, new) {
+            Ok(edited) => edited,
+            Err(error) => return Written::Unread(error),
+        };
+        if edited == text {
+            return Written::Saved {
+                reading: reading(&edited),
+                modified: std::fs::metadata(path).and_then(|m| m.modified()).ok(),
+                error: None,
+            };
+        }
+        let unchanged = || settings_text(path).is_ok_and(|now| now == text);
+        // Private: `agent.env` may hold a model provider's key.
+        match files::write_atomic_unless_changed(
+            path,
+            edited.as_bytes(),
+            Access::Private,
+            unchanged,
+        ) {
+            Ok(files::Replaced::Written(modified)) => {
+                return Written::Saved {
+                    reading: reading(&edited),
+                    modified,
+                    error: None,
+                };
+            }
+            Ok(files::Replaced::Changed) => continue,
+            Err(error) => {
+                return Written::Saved {
+                    reading: None,
+                    modified: std::fs::metadata(path).and_then(|m| m.modified()).ok(),
+                    error: Some(format!("{} could not be saved: {error}", path.display())),
+                };
+            }
+        }
+    }
+    Written::Unread("it was saved elsewhere each time Studio wrote it".into())
 }
 
 /// Takes in how change `edit` was written. The file's time is taken as read, so the watch does
@@ -866,15 +897,25 @@ fn watch(cx: &mut App) {
         loop {
             cx.background_executor().timer(Duration::from_secs(2)).await;
             let path = settings_path();
-            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            // Off the main thread, as the read below: a slow disk would hold up frames.
+            let modified = cx
+                .background_executor()
+                .spawn(async move { std::fs::metadata(&path).and_then(|m| m.modified()).ok() })
+                .await;
             let changed = cx.update(|cx| {
                 let state = cx.global::<SettingsFileState>();
                 state.writing == 0 && state.modified != modified
             });
             if changed {
-                let (reading, modified, error) = read_file();
+                let (reading, modified, error) =
+                    cx.background_executor().spawn(async { read_file() }).await;
                 cx.update(|cx| {
                     let state = cx.global_mut::<SettingsFileState>();
+                    // A change Studio began writing meanwhile takes in the file when it is
+                    // saved; this reading may be older than that change.
+                    if state.writing > 0 {
+                        return;
+                    }
                     state.modified = modified;
                     state.error = error;
                     match reading {

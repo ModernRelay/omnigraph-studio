@@ -38,18 +38,27 @@ fn writer() -> &'static std::sync::mpsc::Sender<Job> {
             .name("studio-writes".into())
             .spawn(move || {
                 for job in queue {
-                    match job {
-                        // Said in the log, by its path only: a full disk would otherwise stop
-                        // every save without a word.
-                        Job::Write(path, contents, access) => {
-                            if let Err(error) = write_atomic(&path, &contents, access) {
-                                log::warn!("Studio could not write {}: {error}", path.display());
+                    // One job that panics is said in the log and the next runs: it must not
+                    // stop every later save.
+                    let ran =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match job {
+                            // Said in the log, by its path only: a full disk would otherwise stop
+                            // every save without a word.
+                            Job::Write(path, contents, access) => {
+                                if let Err(error) = write_atomic(&path, &contents, access) {
+                                    log::warn!(
+                                        "Studio could not write {}: {error}",
+                                        path.display()
+                                    );
+                                }
                             }
-                        }
-                        Job::Run(run) => run(),
-                        Job::Done(done) => {
-                            done.send(()).ok();
-                        }
+                            Job::Run(run) => run(),
+                            Job::Done(done) => {
+                                done.send(()).ok();
+                            }
+                        }));
+                    if ran.is_err() {
+                        log::error!("A write of Studio's files stopped with a panic");
                     }
                 }
             })
@@ -82,6 +91,48 @@ pub fn writes_done() {
 /// Replaces `path` with `contents` in one step. A link is written through to its target, so the
 /// link stays. A failed write leaves the old file as it was and no temporary file behind.
 pub fn write_atomic(path: &Path, contents: &[u8], access: Access) -> std::io::Result<()> {
+    replace(path, contents, access, |_| Ok(true)).map(|_| ())
+}
+
+/// What [`write_atomic_unless_changed`] did.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Replaced {
+    /// The file holds the contents, modified at this time as written.
+    Written(Option<SystemTime>),
+    /// The file changed elsewhere while the contents were synced: it was left as it is.
+    Changed,
+}
+
+/// [`write_atomic`] only while `unchanged` still holds once the contents are written and
+/// synced, just before they replace the file: the sync is the slow part, and a save made
+/// elsewhere during it is not replaced. The time given is the new contents' own, read before
+/// the rename, so a save made elsewhere right after it is not taken for this one.
+pub(crate) fn write_atomic_unless_changed(
+    path: &Path,
+    contents: &[u8],
+    access: Access,
+    unchanged: impl FnOnce() -> bool,
+) -> std::io::Result<Replaced> {
+    let mut modified = None;
+    let replaced = replace(path, contents, access, |file| {
+        modified = file.metadata()?.modified().ok();
+        Ok(unchanged())
+    })?;
+    Ok(if replaced {
+        Replaced::Written(modified)
+    } else {
+        Replaced::Changed
+    })
+}
+
+/// Writes and syncs `contents` beside `path`, then renames them over it if `ready` says so:
+/// whether it was replaced. Anything but a replacement leaves no temporary file behind.
+fn replace(
+    path: &Path,
+    contents: &[u8],
+    access: Access,
+    ready: impl FnOnce(&std::fs::File) -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
     let target = match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path)?,
         _ => path.to_path_buf(),
@@ -116,9 +167,13 @@ pub fn write_atomic(path: &Path, contents: &[u8], access: Access) -> std::io::Re
         }
         file.write_all(contents)?;
         file.sync_all()?;
-        std::fs::rename(&temp, &target)
+        if !ready(&file)? {
+            return Ok(false);
+        }
+        std::fs::rename(&temp, &target)?;
+        Ok(true)
     })();
-    if written.is_err() {
+    if !matches!(written, Ok(true)) {
         std::fs::remove_file(&temp).ok();
     }
     written
@@ -204,6 +259,29 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A save made elsewhere while the new contents were synced stays, and nothing is left
+    /// behind; otherwise the file is replaced and its time is the new contents'.
+    #[test]
+    fn a_file_changed_while_its_save_was_synced_is_kept() {
+        let dir = scratch("unless");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "old").unwrap();
+        let replaced = write_atomic_unless_changed(&path, b"ours", Access::Private, || {
+            std::fs::write(&path, "theirs").unwrap();
+            false
+        })
+        .unwrap();
+        assert_eq!(replaced, Replaced::Changed);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "theirs");
+        assert!(leftovers(&dir).is_empty());
+        let replaced =
+            write_atomic_unless_changed(&path, b"ours", Access::Private, || true).unwrap();
+        let on_disk = std::fs::metadata(&path).unwrap().modified().ok();
+        assert_eq!(replaced, Replaced::Written(on_disk));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ours");
         std::fs::remove_dir_all(&dir).ok();
     }
 
