@@ -442,7 +442,7 @@ const CALLS: &[&str] = &[
 /// Words that join two operands.
 const JOINERS: &[&str] = &["and", "or", "in", "contains", "starts_with"];
 /// Words an edge may not be named.
-const RESERVED: &[&str] = &["and", "or", "not", "is", "null", "in"];
+use crate::schema::RESERVED;
 
 impl Reader<'_> {
     fn text(&self, i: usize) -> &str {

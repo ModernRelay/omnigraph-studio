@@ -537,9 +537,14 @@ pub struct Filter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildError {
     UnknownType(String),
-    UnknownProperty { type_name: String, property: String },
+    UnknownProperty {
+        type_name: String,
+        property: String,
+    },
     UnknownEdge(String),
     NotEditable(String),
+    /// The property is named by a reserved word, so a write cannot be bound to its value.
+    Unbindable(String),
 }
 
 impl std::fmt::Display for BuildError {
@@ -552,6 +557,11 @@ impl std::fmt::Display for BuildError {
             } => write!(f, "{type_name} has no property {property}"),
             BuildError::UnknownEdge(name) => write!(f, "The schema has no relationship {name}"),
             BuildError::NotEditable(name) => write!(f, "{name} cannot be edited in a cell"),
+            BuildError::Unbindable(name) => write!(
+                f,
+                "`{name}` is a GQ reserved word, so a change to it cannot be bound to the value \
+                 shown; rename the property in the schema (`@rename_from`) to edit it"
+            ),
         }
     }
 }
@@ -2087,15 +2097,7 @@ pub fn update_cell(
     let mut params = Params::new();
     let id = params.add("id", "String", Value::String(id.to_owned()));
     let new = params.add("new", &property.param_type(true), new.clone());
-    let mut predicate = format!("@id = {id}");
-    if !property.list {
-        if old.is_null() {
-            predicate.push_str(&format!(" and {} is null", property.name));
-        } else {
-            let old = params.add("old", &property.param_type(false), old.clone());
-            predicate.push_str(&format!(" and {} = {old}", property.name));
-        }
-    }
+    let predicate = format!("@id = {id}{}", bound_to(property, old, "old", &mut params)?);
     let text = format!(
         "query studio_set({sig}) {{\n  update {ty} set {{ {prop}: {new} }} where {predicate}\n}}\n",
         sig = params.signature(),
@@ -2109,6 +2111,29 @@ pub fn update_cell(
         depends: Depends::Unknown,
         seeds: None,
     })
+}
+
+/// The condition that binds a statement to the value its row showed for `property` (`old`, as
+/// parameter `param`), so a row changed elsewhere matches nothing; a list is not bound. A
+/// property named by a reserved word cannot be named in a mutation's `where`, so no write to it
+/// can be bound, and none is built.
+fn bound_to(
+    property: &Property,
+    old: &Value,
+    param: &str,
+    params: &mut Params,
+) -> Result<String, BuildError> {
+    if property.list {
+        return Ok(String::new());
+    }
+    if !crate::schema::nameable_in_where(&property.name) {
+        return Err(BuildError::Unbindable(property.name.clone()));
+    }
+    if old.is_null() {
+        return Ok(format!(" and {} is null", property.name));
+    }
+    let old = params.add(param, &property.param_type(false), old.clone());
+    Ok(format!(" and {} = {old}", property.name))
 }
 
 /// One row's edits in a batch: its id, and per property the value the row showed and the new
@@ -2146,19 +2171,12 @@ pub fn update_rows(
                 new.clone(),
             );
             sets.push(format!("{}: {new}", property.name));
-            if property.list {
-                continue;
-            }
-            if old.is_null() {
-                predicate.push_str(&format!(" and {} is null", property.name));
-            } else {
-                let old = params.add(
-                    &format!("old{r}_{c}"),
-                    &property.param_type(false),
-                    old.clone(),
-                );
-                predicate.push_str(&format!(" and {} = {old}", property.name));
-            }
+            predicate.push_str(&bound_to(
+                property,
+                old,
+                &format!("old{r}_{c}"),
+                &mut params,
+            )?);
         }
         statements.push(format!(
             "update {ty} set {{ {sets} }} where {predicate}",
@@ -2197,31 +2215,19 @@ pub fn update_cells(
     }
     let mut params = Params::new();
     let new = params.add("new", &property.param_type(true), new.clone());
-    let statements: Vec<String> = rows
+    let statements = rows
         .iter()
         .enumerate()
         .map(|(index, (id, old))| {
             let id = params.add(&format!("id{index}"), "String", Value::String(id.clone()));
-            let mut predicate = format!("@id = {id}");
-            if !property.list {
-                if old.is_null() {
-                    predicate.push_str(&format!(" and {} is null", property.name));
-                } else {
-                    let old = params.add(
-                        &format!("old{index}"),
-                        &property.param_type(false),
-                        old.clone(),
-                    );
-                    predicate.push_str(&format!(" and {} = {old}", property.name));
-                }
-            }
-            format!(
-                "update {ty} set {{ {prop}: {new} }} where {predicate}",
+            let bound = bound_to(property, old, &format!("old{index}"), &mut params)?;
+            Ok(format!(
+                "update {ty} set {{ {prop}: {new} }} where @id = {id}{bound}",
                 ty = node.name,
                 prop = property.name,
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<Vec<String>, BuildError>>()?;
     let text = format!(
         "query studio_set_rows({sig}) {{\n  {statements}\n}}\n",
         sig = params.signature(),
@@ -2550,6 +2556,27 @@ mod tests {
             query.text,
             result.diagnostics
         );
+    }
+
+    /// A property named by a reserved word cannot be named in a mutation's `where`, so no edit
+    /// of it is built, by any of the update builders; another property beside it is.
+    #[test]
+    fn an_edit_of_a_reserved_word_property_is_refused_with_its_reason() {
+        let schema = SchemaModel::parse(
+            "node Box {\n  slug: String @key\n  in: String?\n  label: String?\n}\n",
+        )
+        .unwrap();
+        let refused = update_cell(&schema, "Box", "in", "b1", &json!("x"), &json!("y"));
+        assert!(matches!(refused, Err(BuildError::Unbindable(ref name)) if name == "in"));
+        let rows = [("b1".to_owned(), json!("x"))];
+        assert!(update_cells(&schema, "Box", "in", &rows, &json!("y")).is_err());
+        let edit = RowEdit {
+            id: "b1".into(),
+            cells: vec![("in".into(), json!("x"), json!("y"))],
+        };
+        assert!(update_rows(&schema, "Box", &[edit]).is_err());
+        let label = update_cell(&schema, "Box", "label", "b1", &json!("x"), &json!("y")).unwrap();
+        assert_compiles_in(&schema, &label);
     }
 
     /// An edge whose traversal is a reserved word is named in quotes in every query that

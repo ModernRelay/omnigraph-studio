@@ -314,7 +314,14 @@ pub fn traversal_name(edge: &str) -> String {
 }
 
 /// The words a query reserves, which a bare traversal may not be.
-const RESERVED: [&str; 6] = ["and", "or", "not", "is", "null", "in"];
+/// GQ's reserved words, which cannot name a property or an edge bare.
+pub(crate) const RESERVED: [&str; 6] = ["and", "or", "not", "is", "null", "in"];
+
+/// Whether a property can be named bare in a mutation's `where`: not a reserved word, nor a
+/// Boolean literal (the compiler reads `true` there as the value).
+pub(crate) fn nameable_in_where(name: &str) -> bool {
+    !RESERVED.contains(&name) && name != "true" && name != "false"
+}
 
 /// How a query names the edge in a traversal: its [`traversal_name`], quoted when that is a
 /// reserved word (`In` → `"in"`), as GQ spells such an edge.
