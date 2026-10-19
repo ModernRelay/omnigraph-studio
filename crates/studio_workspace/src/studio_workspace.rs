@@ -304,7 +304,8 @@ impl Workspace {
         let this = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_, cx| {
             this.update(cx, |workspace, cx| match workspace.running_write(cx) {
-                // Closing drops the save waiting for its delay: written now.
+                // Closing drops the save waiting for its delay: written now, in turn on the
+                // write thread; only a quit waits for the disk.
                 None => {
                     workspace.flush_saves(cx);
                     true
@@ -400,6 +401,7 @@ impl Workspace {
             // delay would go with them.
             _quit_subscription: cx.on_app_quit(|this, cx| {
                 this.flush_saves(cx);
+                studio_settings::writes_done();
                 async {}
             }),
             _activation_subscription: activation_subscription,
@@ -829,7 +831,6 @@ impl Workspace {
         // A move or resize just before the window closes or Studio quits is kept too.
         self._save_bounds = None;
         self.save_bounds(cx);
-        studio_settings::writes_done();
     }
 
     /// Writes the window's place and size, when they changed since last written.
