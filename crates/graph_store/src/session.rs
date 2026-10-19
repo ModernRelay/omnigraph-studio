@@ -156,6 +156,9 @@ const PINNED_BLOBS: usize = 2_048;
 
 /// How many branches' commit lists a session keeps.
 const COMMIT_LISTS: usize = 64;
+/// The most the commit lists kept may weigh together: a list holds a branch's whole history,
+/// main's commits before its fork included, so a few long ones would otherwise take the 64.
+const COMMIT_LIST_BYTES: usize = 32 * 1024 * 1024;
 
 /// Ids per read of [`GraphSession::node_names`], and the most nodes one call names: a review
 /// of 20,000 changes asks a bounded number of small reads, and an end past the limit keeps its
@@ -272,6 +275,21 @@ fn read_bytes(output: &ReadOutput) -> usize {
         }
     }
     256 + weight(&output.rows) + output.columns.iter().map(|c| 24 + c.len()).sum::<usize>()
+}
+
+/// What a kept commit list weighs, about: each commit's strings and fixed fields.
+fn commit_list_bytes(list: &CommitList) -> usize {
+    let text = |value: &Option<String>| value.as_ref().map_or(0, |text| 24 + text.len());
+    64 + list
+        .iter()
+        .map(|commit| {
+            64 + commit.graph_commit_id.len()
+                + text(&commit.graph_branch)
+                + text(&commit.parent_commit_id)
+                + text(&commit.merged_parent_commit_id)
+                + text(&commit.actor_id)
+        })
+        .sum::<usize>()
 }
 
 fn parse_schema(source: &str) -> Loadable<Arc<SchemaModel>> {
@@ -427,7 +445,7 @@ impl GraphSession {
             degree_commits: HashMap::new(),
             schema_epoch: 0,
             schema_text: None,
-            commit_lists: Memo::new(COMMIT_LISTS),
+            commit_lists: Memo::weighed(COMMIT_LISTS, COMMIT_LIST_BYTES, commit_list_bytes),
             head_commits: Memo::new(COMMIT_LISTS),
             branches_read: false,
             branch_moves: 0,
