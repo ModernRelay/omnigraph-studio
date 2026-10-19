@@ -849,6 +849,47 @@ pub fn node_page(
     node_page_reading(schema, type_name, filters, sort, start, limit, None)
 }
 
+/// The filters a read at a commit without the properties in `without` sends. No row there has
+/// a value for them, so a filter for no value holds for every row and is left out, and any
+/// other test of one holds for none: `None` says the read matches no row.
+pub fn filters_without(filters: &[Filter], without: &[String]) -> Option<Vec<Filter>> {
+    let mut kept = Vec::with_capacity(filters.len());
+    for filter in filters {
+        if filter.op.is_relationship() || !without.contains(&filter.property) {
+            kept.push(filter.clone());
+        } else if filter.op != FilterOp::IsEmpty {
+            return None;
+        }
+    }
+    Some(kept)
+}
+
+/// A page's filters and sort at a commit without the properties in `without`, and whether the
+/// page holds no rows. A sort on one of them finds no row with a value, so the run of rows
+/// with one is empty and the run without one is every row, by `@id`: the table pages the
+/// two runs as it does at the head, and neither read names the property.
+fn page_without<'a>(
+    filters: &[Filter],
+    sort: Option<&'a Sort>,
+    start: &PageStart,
+    without: &[String],
+) -> (Vec<Filter>, Option<&'a Sort>, bool) {
+    let Some(filters) = filters_without(filters, without) else {
+        return (Vec::new(), None, true);
+    };
+    match sort {
+        Some(sort) if without.contains(&sort.property) => {
+            let valued = match start {
+                PageStart::First => true,
+                PageStart::After { value, .. } => !value.is_null(),
+                PageStart::Nulls { .. } => false,
+            };
+            (filters, None, valued)
+        }
+        sort => (filters, sort, false),
+    }
+}
+
 /// [`node_page`] with each row as columns, as [`node_fields_by_id`] reads one node: for a
 /// commit made before the properties in `without` were added or renamed.
 pub fn node_page_fields(
@@ -881,6 +922,9 @@ fn node_page_reading(
     fields_without: Option<&[String]>,
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
+    let (sent, sort, empty) =
+        page_without(filters, sort, start, fields_without.unwrap_or_default());
+    let limit = if empty { 0 } else { limit };
     let mut params = Params::new();
     let (keyset, order) = keyset("n", &node.name, &node.properties, sort, start, &mut params)?;
     let mut clauses = vec![format!("$n: {}", node.name)];
@@ -890,7 +934,7 @@ fn node_page_reading(
         &node.name,
         &node.properties,
         "n",
-        filters,
+        &sent,
         &mut params,
     )?);
     let (name, returned, seeds) = match fields_without {
@@ -1079,6 +1123,8 @@ pub fn edge_page_without(
     without: &[String],
 ) -> Result<BuiltQuery, BuildError> {
     let edge = edge(schema, edge_name)?;
+    let (sent, sort, empty) = page_without(filters, sort, start, without);
+    let limit = if empty { 0 } else { limit };
     let mut params = Params::new();
     let (keyset, order) = keyset("e", &edge.name, &edge.properties, sort, start, &mut params)?;
     let mut clauses = vec![
@@ -1091,7 +1137,7 @@ pub fn edge_page_without(
         &edge.name,
         &edge.properties,
         "e",
-        filters,
+        &sent,
         &mut params,
     )?);
     let mut columns = vec![
@@ -3239,6 +3285,78 @@ mod tests {
         .unwrap();
         assert_compiles(&edges);
         assert!(!edges.text.contains("role"), "{}", edges.text);
+    }
+
+    /// At a commit without a property no row has a value for it: a sort on it pages an empty
+    /// run of values, then every row by `@id`; a filter for no value is left out, and any
+    /// other filter on it reads no rows. No read names the property.
+    #[test]
+    fn a_page_without_a_property_sorts_and_filters_as_if_no_row_held_it() {
+        let schema = dev();
+        let without = ["born".to_owned()];
+        let born = Sort {
+            property: "born".into(),
+            descending: false,
+        };
+        let page = |filters: &[Filter], sort: Option<&Sort>, start: &PageStart| {
+            let query =
+                node_page_fields(&schema, "Person", filters, sort, start, 50, &without).unwrap();
+            assert_compiles(&query);
+            assert!(!query.text.contains("born"), "{}", query.text);
+            query.text
+        };
+        assert!(page(&[], Some(&born), &PageStart::First).contains("limit 0"));
+        let nulls = page(
+            &[],
+            Some(&born),
+            &PageStart::Nulls {
+                after: "person-000003".into(),
+            },
+        );
+        assert!(
+            nulls.contains("limit 50") && nulls.contains("$n.@id > $after"),
+            "{nulls}"
+        );
+        let filter = |op| Filter {
+            property: "born".into(),
+            op,
+            value: json!("1815-12-10"),
+        };
+        assert!(page(&[filter(FilterOp::IsEmpty)], None, &PageStart::First).contains("limit 50"));
+        for op in [
+            FilterOp::Eq,
+            FilterOp::Ne,
+            FilterOp::Gt,
+            FilterOp::IsNotEmpty,
+        ] {
+            assert!(page(&[filter(op)], None, &PageStart::First).contains("limit 0"));
+            assert_eq!(filters_without(&[filter(op)], &without), None);
+        }
+        assert_eq!(
+            filters_without(&[filter(FilterOp::IsEmpty)], &without),
+            Some(Vec::new())
+        );
+
+        let role = Sort {
+            property: "role".into(),
+            descending: true,
+        };
+        let edges = edge_page_without(
+            &schema,
+            "WorksAt",
+            &[],
+            Some(&role),
+            &PageStart::First,
+            50,
+            &["role".to_owned()],
+        )
+        .unwrap();
+        assert_compiles(&edges);
+        assert!(
+            !edges.text.contains("role") && edges.text.contains("limit 0"),
+            "{}",
+            edges.text
+        );
     }
 
     #[test]
