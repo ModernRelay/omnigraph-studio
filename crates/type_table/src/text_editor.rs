@@ -122,6 +122,7 @@ impl TextEditor {
                 && !matches!(this.state, State::Saving)
             {
                 this.state = State::Idle;
+                this.branch = this.session.read(cx).branch.clone();
                 this.read(window, cx);
             } else if let SessionEvent::BranchChanged = event {
                 cx.notify();
@@ -178,11 +179,17 @@ impl TextEditor {
             }
         };
         self.old = Loadable::Loading;
-        self.branch = self.session.read(cx).branch.clone();
-        let at = self.read_at.clone();
-        let read = self
-            .session
-            .update(cx, |session, cx| session.read(&query, at, cx));
+        // The branch the editor saves to, which it keeps while the window moves elsewhere.
+        let read = match self.read_at.clone() {
+            Some(at) => self
+                .session
+                .update(cx, |session, cx| session.read(&query, Some(at), cx)),
+            None => {
+                let branch = self.branch.clone();
+                self.session
+                    .update(cx, |session, cx| session.read_on(&branch, &query, cx))
+            }
+        };
         let property = self.property.clone();
         self._read = Some(cx.spawn_in(window, async move |this, cx| {
             let result = read.await;
@@ -536,7 +543,7 @@ mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
 
-    use crate::test_support::{PEOPLE, committed, session_answering};
+    use crate::test_support::{PEOPLE, committed, session_answering, session_routing};
 
     fn editor_answering(
         status: u16,
@@ -635,6 +642,65 @@ mod tests {
         session.read_with(cx, |session, _| {
             assert_eq!(session.outcomes.last().unwrap().branch, "fix");
         });
+    }
+
+    /// After a conflict on a branch the window has left, the person's text stays bound to that
+    /// branch: Keep mine reads the value there again, not on the window's branch.
+    #[gpui::test]
+    async fn keep_mine_reads_again_on_the_branch_the_text_saves_to(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let branches = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = branches.clone();
+        let (session, _) = session_routing(
+            PEOPLE,
+            move |request| {
+                if let Some(branch) = request["branch"].as_str() {
+                    seen.lock().unwrap().push(branch.to_owned());
+                }
+                json!([{"n": {"@id": "p1", "slug": "p1", "name": "Ada"}}])
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        let (view, cx) = cx.add_window_view({
+            let session = session.clone();
+            move |window, cx| {
+                TextEditor::new(
+                    session,
+                    "Person".into(),
+                    "p1".into(),
+                    "name".into(),
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            }
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            view.set_text("Ada Lovelace".into(), window, cx);
+        });
+        cx.run_until_parked();
+        session.update(cx, |session, cx| session.set_branch("main".into(), cx));
+        cx.run_until_parked();
+        let before = branches.lock().unwrap().len();
+        view.update_in(cx, |view, window, cx| view.keep_mine(window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.branch, "fix", "still saves to fix");
+            assert_eq!(view.text(cx), "Ada Lovelace", "the text stays");
+        });
+        assert_eq!(
+            branches.lock().unwrap()[before..].to_vec(),
+            ["fix"],
+            "read again on fix"
+        );
     }
 
     /// A value changed elsewhere meanwhile is not overwritten: the save matches nothing, the

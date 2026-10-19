@@ -1576,6 +1576,27 @@ impl GraphSession {
         })
     }
 
+    /// [`GraphSession::read`] of `branch`'s head, though the session moved to another branch
+    /// meanwhile: a view bound to the branch it read on reads it again there.
+    pub fn read_on(
+        &mut self,
+        branch: &str,
+        query: &BuiltQuery,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ReadOutput, ReadError>> {
+        if branch == self.branch {
+            return self.read(query, None, cx);
+        }
+        let request = QueryRequest {
+            query: query.text.clone(),
+            name: Some(query.name.clone()),
+            params: query.params_value(),
+            branch: Some(branch.to_owned()),
+            snapshot: None,
+        };
+        self.read_request(request, cx)
+    }
+
     /// Names of the nodes `ends` lists, `(type, id)`, by their type's label property, read at
     /// `snapshot` (the session's branch when `None`): one read per type of at most
     /// [`NAME_BATCH`] ids, the first [`NAME_LIMIT`] ends only. A node whose label is its key, or
