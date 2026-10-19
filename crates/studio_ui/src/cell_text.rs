@@ -34,7 +34,7 @@ pub fn cell_text(text: impl Into<SharedString>, cx: &App) -> CellText {
         hug: false,
         style: TextStyleRefinement {
             color: Some(ui::Color::Default.color(cx)),
-            font_size: Some(TextSize::Small.rems(cx).into()),
+            font_size: Some(crate::ds::text::body_size(cx).into()),
             font_weight: Some(theme::theme_settings(cx).ui_font(cx).weight),
             ..TextStyleRefinement::default()
         },
@@ -49,6 +49,12 @@ impl CellText {
 
     pub fn size(mut self, size: TextSize, cx: &App) -> Self {
         self.style.font_size = Some(size.rems(cx).into());
+        self
+    }
+
+    /// At the metadata size, as a `meta` label beside it.
+    pub fn meta(mut self, cx: &App) -> Self {
+        self.style.font_size = Some(crate::ds::text::meta_size(cx).into());
         self
     }
 

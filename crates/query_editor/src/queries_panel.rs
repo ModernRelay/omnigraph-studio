@@ -11,7 +11,6 @@ use gpui::{
 use graph_store::cli_config::CliAlias;
 use graph_store::{ConnectionRegistry, GraphSession, Loadable, SessionEvent};
 use studio_actions::graph::{NewQuery, OpenQueryFile, OpenStoredQuery};
-use studio_ui::ds::IconButton;
 use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::Tooltip;
 use ui::prelude::*;
@@ -219,8 +218,7 @@ impl QueriesPanel {
             }
             PanelRow::StoredHeader => {
                 let session = self.session.clone();
-                let refresh = IconButton::new("stored-refresh", IconName::RotateCw)
-                    .icon_size(IconSize::XSmall)
+                let refresh = studio_ui::ds::row_icon_button("stored-refresh", IconName::RotateCw)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Read the stored queries again"))
                     .on_click(move |_, _, cx| {
@@ -350,9 +348,7 @@ impl Render for QueriesActions {
             .and_then(|panel| panel.read(cx).graph_key(cx))
             .map(|graph| studio_settings::queries_dir(&graph));
         let button = |id: &'static str, icon: IconName| {
-            IconButton::new(id, icon)
-                .icon_size(IconSize::XSmall)
-                .icon_color(Color::Muted)
+            studio_ui::ds::row_icon_button(id, icon).icon_color(Color::Muted)
         };
         h_flex()
             .gap(px(studio_ui::ds::space::XXS))

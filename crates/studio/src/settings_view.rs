@@ -285,7 +285,6 @@ fn stepper(
         .gap(px(space::XS))
         .child(
             studio_ui::ds::icon_button(target.id("down"), IconName::Dash)
-                .icon_size(IconSize::Small)
                 .disabled(value <= min)
                 .on_click(move |_, _, cx| {
                     down.set(to_value((value - step).max(min)), cx);
@@ -300,7 +299,6 @@ fn stepper(
         )
         .child(
             studio_ui::ds::icon_button(target.id("up"), IconName::Plus)
-                .icon_size(IconSize::Small)
                 .disabled(value >= max)
                 .on_click(move |_, _, cx| {
                     up.set(to_value((value + step).min(max)), cx);
@@ -695,7 +693,6 @@ impl Render for SettingsView {
                             .child(ds::search_field(self.search.clone(), cx).w(px(ds::size::FIELD)))
                             .child(
                                 studio_ui::ds::icon_button("reveal-settings", IconName::Folder)
-                                    .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text(format!(
                                         "Show settings.json · {}",
                                         path.display()
@@ -704,7 +701,6 @@ impl Render for SettingsView {
                             )
                             .child(
                                 studio_ui::ds::icon_button("reveal-keymap", IconName::Keyboard)
-                                    .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text(format!(
                                         "Show keymap.json, your shortcuts · {}",
                                         studio_settings::keymap_path().display()
@@ -791,7 +787,7 @@ fn problem_text(problem: &str, cx: &App) -> impl IntoElement {
         ..HighlightStyle::default()
     };
     div()
-        .text_ui_sm(cx)
+        .text_size(ds::text::body_size(cx))
         .text_color(Color::Muted.color(cx))
         .child(StyledText::new(text).with_highlights(spans.into_iter().map(|span| (span, code))))
 }

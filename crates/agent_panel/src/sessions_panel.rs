@@ -21,7 +21,7 @@ use gpui::{
 use studio_actions::agent::{NewConversation, OpenConversation};
 use studio_settings::StudioSettings;
 use studio_ui::ds;
-use studio_ui::ds::{IconButton, Prose as _};
+use studio_ui::ds::Prose as _;
 use studio_ui::menu::ContextMenu;
 use studio_workspace::{ToastKind, Workspace};
 use ui::prelude::*;
@@ -458,7 +458,7 @@ fn conversation_row(
     }
     let pin = {
         let (id, pinned, store) = (id.clone(), record.pinned, store.clone());
-        IconButton::new(
+        ds::row_icon_button(
             SharedString::from(format!("pin-{id}")),
             if pinned {
                 IconName::Unpin
@@ -466,7 +466,6 @@ fn conversation_row(
                 IconName::Pin
             },
         )
-        .icon_size(IconSize::XSmall)
         .icon_color(Color::Muted)
         .tooltip(Tooltip::text(if pinned { "Unpin" } else { "Pin" }))
         .on_click(move |_, _, cx| {
@@ -475,7 +474,7 @@ fn conversation_row(
     };
     let archive = {
         let (id, archived, store) = (id.clone(), record.archived, store.clone());
-        IconButton::new(
+        ds::row_icon_button(
             SharedString::from(format!("archive-{id}")),
             if archived {
                 IconName::Undo
@@ -483,7 +482,6 @@ fn conversation_row(
                 IconName::Archive
             },
         )
-        .icon_size(IconSize::XSmall)
         .icon_color(Color::Muted)
         .tooltip(Tooltip::text(if archived {
             "Restore to the list"
@@ -704,8 +702,7 @@ impl Render for SessionsActions {
             .child({
                 let panel = panel.clone();
                 // A filter, not a search: the sidebar's title line ends with the global one.
-                IconButton::new("search-conversations", IconName::Filter)
-                    .icon_size(IconSize::XSmall)
+                ds::row_icon_button("search-conversations", IconName::Filter)
                     .icon_color(Color::Muted)
                     .toggle_state(searching)
                     .tooltip(Tooltip::text("Filter conversations"))
@@ -720,8 +717,7 @@ impl Render for SessionsActions {
                 row.child(
                     PopoverMenu::new("conversations-more")
                         .trigger(
-                            IconButton::new("conversations-more-button", IconName::Ellipsis)
-                                .icon_size(IconSize::XSmall)
+                            ds::row_icon_button("conversations-more-button", IconName::Ellipsis)
                                 .icon_color(Color::Muted)
                                 .tooltip(Tooltip::text("More")),
                         )
@@ -737,8 +733,7 @@ impl Render for SessionsActions {
                 )
             })
             .child(
-                IconButton::new("new-conversation", IconName::Plus)
-                    .icon_size(IconSize::XSmall)
+                ds::row_icon_button("new-conversation", IconName::Plus)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("New conversation"))
                     .on_click(|_, window, cx| {

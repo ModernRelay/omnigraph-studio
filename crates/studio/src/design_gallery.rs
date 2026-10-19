@@ -196,7 +196,6 @@ impl Render for DesignGallery {
                         .enumerate()
                         .map(|(index, (icon, title))| {
                             studio_ui::ds::icon_button(("g-dock-tab", index), icon)
-                                .icon_size(IconSize::Small)
                                 .toggle_state(index == 0)
                                 .tooltip(ui::Tooltip::text(title))
                         }),
@@ -268,10 +267,10 @@ impl Render for DesignGallery {
                 cx,
             ))
             .child(div().flex_1())
-            .child(
-                studio_ui::ds::icon_button("g-close-dock", IconName::Close)
-                    .icon_size(IconSize::XSmall),
-            );
+            .child(studio_ui::ds::row_icon_button(
+                "g-close-dock",
+                IconName::Close,
+            ));
         // The document footer, after Delta: graph / branch, the tab's facts, its controls.
         let footer_context = || {
             h_flex()
@@ -610,10 +609,7 @@ impl Render for DesignGallery {
                     .gap(px(space::SM))
                     .child(footer_context())
                     .child(div().flex_1())
-                    .child(
-                        studio_ui::ds::icon_button("g-restart", IconName::RotateCw)
-                            .icon_size(IconSize::Small),
-                    )
+                    .child(studio_ui::ds::icon_button("g-restart", IconName::RotateCw))
                     .child(
                         ds::pill("g-agent", cx)
                             .child(ui::Indicator::dot().color(Color::Success))
@@ -649,7 +645,8 @@ impl Render for DesignGallery {
             ));
 
         // Buttons, after Tower's (spec 002, "Buttons"): every variant at a control's height,
-        // the sizes, icon buttons, and the toggled and disabled states.
+        // each size by its role (a control, a toolbar, a row, a tab), icon buttons, and the
+        // toggled and disabled states.
         let variants = [
             ("Primary", ds::Variant::Primary),
             ("Secondary", ds::Variant::Secondary),
@@ -657,12 +654,6 @@ impl Render for DesignGallery {
             ("Ghost", ds::Variant::Ghost),
             ("Destructive", ds::Variant::Destructive),
             ("Glass", ds::Variant::Glass),
-        ];
-        let sizes = [
-            ("Large", ButtonSize::Large),
-            ("Medium", ButtonSize::Medium),
-            ("Default", ButtonSize::Default),
-            ("Compact", ButtonSize::Compact),
         ];
         let buttons = v_flex()
             .gap(px(space::LG))
@@ -682,17 +673,28 @@ impl Render for DesignGallery {
                 h_flex()
                     .gap(px(space::MD))
                     .items_center()
-                    .children(sizes.into_iter().enumerate().map(|(index, (label, size))| {
-                        ds::Button::new(("g-size", index), label)
-                            .variant(ds::Variant::Outline)
-                            .size(size)
-                    }))
-                    .children(sizes.into_iter().enumerate().map(|(index, (_, size))| {
-                        ds::IconButton::new(("g-icon-size", index), IconName::Plus)
-                            .variant(ds::Variant::Outline)
-                            .size(size)
-                            .icon_size(IconSize::Small)
-                    })),
+                    .child(ds::button("g-size-control", "Control").variant(ds::Variant::Outline))
+                    .child(
+                        ds::toolbar_button("g-size-toolbar", "Toolbar")
+                            .variant(ds::Variant::Outline),
+                    )
+                    .child(ds::row_button("g-size-row", "Row").variant(ds::Variant::Outline))
+                    .child(
+                        ds::icon_button("g-icon-control", IconName::Plus)
+                            .variant(ds::Variant::Outline),
+                    )
+                    .child(
+                        ds::toolbar_icon_button("g-icon-toolbar", IconName::Plus)
+                            .variant(ds::Variant::Outline),
+                    )
+                    .child(
+                        ds::row_icon_button("g-icon-row", IconName::Plus)
+                            .variant(ds::Variant::Outline),
+                    )
+                    .child(
+                        ds::inline_icon_button("g-icon-inline", IconName::Plus)
+                            .variant(ds::Variant::Outline),
+                    ),
             )
             .child(
                 h_flex()

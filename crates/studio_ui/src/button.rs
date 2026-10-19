@@ -54,10 +54,10 @@ impl From<ButtonStyle> for Variant {
 /// A button's height for each of Zed's sizes: the medium one is a control's.
 pub fn height(size: ButtonSize) -> Option<f32> {
     match size {
-        ButtonSize::Large => Some(32.),
+        ButtonSize::Large => Some(ds::size::LARGE_BUTTON),
         ButtonSize::Medium => Some(ds::size::CONTROL),
         ButtonSize::Default => Some(ds::size::BAR_BUTTON),
-        ButtonSize::Compact => Some(18.),
+        ButtonSize::Compact => Some(ds::size::ROW_BUTTON),
         ButtonSize::None => None,
     }
 }
@@ -66,7 +66,7 @@ pub fn height(size: ButtonSize) -> Option<f32> {
 fn inset(size: ButtonSize) -> f32 {
     match size {
         ButtonSize::Large => ds::space::LG,
-        ButtonSize::Medium => 10.,
+        ButtonSize::Medium => ds::space::CONTROL_INSET,
         ButtonSize::Default => ds::space::MD,
         ButtonSize::Compact => ds::space::SM,
         ButtonSize::None => 0.,
@@ -207,6 +207,17 @@ fn label_icon_size(size: ButtonSize) -> IconSize {
     match size {
         ButtonSize::Large | ButtonSize::Medium => IconSize::Medium,
         _ => IconSize::XSmall,
+    }
+}
+
+/// An icon button's icon, which has no label beside it: 14 px in a control's square and a
+/// strip's, 12 px in a row's, 16 px in the large square. The button's size decides it, so
+/// every icon button of one size draws its icon alike.
+fn icon_button_icon_size(size: ButtonSize) -> IconSize {
+    match size {
+        ButtonSize::Large => IconSize::Medium,
+        ButtonSize::Medium | ButtonSize::Default => IconSize::Small,
+        ButtonSize::Compact | ButtonSize::None => IconSize::XSmall,
     }
 }
 
@@ -511,7 +522,7 @@ impl RenderOnce for Button {
 pub struct IconButton {
     base: Base,
     icon: IconName,
-    icon_size: IconSize,
+    icon_size: Option<IconSize>,
     icon_color: Option<Color>,
     selected_icon: Option<IconName>,
     selected_icon_color: Option<Color>,
@@ -527,7 +538,7 @@ impl IconButton {
                 Shape::Rounded,
             ),
             icon,
-            icon_size: IconSize::Small,
+            icon_size: None,
             icon_color: None,
             selected_icon: None,
             selected_icon_color: None,
@@ -545,8 +556,10 @@ impl IconButton {
         self
     }
 
+    /// An icon size other than the one the button's size gives it: the design system's own
+    /// choice for one control (a sheet's outlined close), never a view's.
     pub fn icon_size(mut self, size: IconSize) -> Self {
-        self.icon_size = size;
+        self.icon_size = Some(size);
         self
     }
 
@@ -658,10 +671,13 @@ impl RenderOnce for IconButton {
             _ => self.icon,
         };
         let side = height(self.base.size);
+        let icon_size = self
+            .icon_size
+            .unwrap_or_else(|| icon_button_icon_size(self.base.size));
         self.base
             .frame(cx)
             .when_some(side, |this, side| this.w(px(side)))
-            .child(Icon::new(icon).size(self.icon_size).color(color))
+            .child(Icon::new(icon).size(icon_size).color(color))
     }
 }
 

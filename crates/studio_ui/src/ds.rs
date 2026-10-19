@@ -193,6 +193,11 @@ pub mod size {
     /// A button inside a floating bar ([`super::bar_button`]): Zed's default size, 3 px inside
     /// the bar's edge.
     pub const BAR_BUTTON: f32 = 22.;
+    /// A button inside a row, a card or beside a value: a tag's height, so a row action sits
+    /// in the row as its chips do.
+    pub const ROW_BUTTON: f32 = TAG;
+    /// The large button, one step above a control.
+    pub const LARGE_BUTTON: f32 = 32.;
     /// A pill: a filter, a composer's picker, a dock's title tab.
     pub const PILL: f32 = 26.;
     /// A thread's or feed's gutter, where each entry's icon sits.
@@ -884,6 +889,23 @@ pub mod text {
             .weight(weight::HEADING)
     }
 
+    /// The default size, for text that is not a `Label` (a summary set in a `div`): what
+    /// [`plain`], [`title`] and [`state`] draw at.
+    pub fn plain_size(cx: &App) -> Rems {
+        ui::TextSize::Default.rems(cx)
+    }
+
+    /// The body size, for text that is not a `Label` (a markdown value, a grid cell, an
+    /// editor's font): what [`body`], [`muted`] and [`error`] draw at.
+    pub fn body_size(cx: &App) -> Rems {
+        ui::TextSize::Small.rems(cx)
+    }
+
+    /// The metadata size, for text that is not a `Label`: what [`meta`] and [`code`] draw at.
+    pub fn meta_size(cx: &App) -> Rems {
+        ui::TextSize::XSmall.rems(cx)
+    }
+
     /// A labelled control's icon beside its label: 80 % of the label's ink, as a button's.
     pub fn icon_ink(cx: &App) -> Color {
         Color::Custom(cx.theme().colors().text.opacity(0.8))
@@ -1316,8 +1338,7 @@ pub fn meta_code(icon: IconName, value: impl Into<SharedString>, cx: &App) -> Di
 
 /// A button in a toolbar, strip, panel or dialog: 28 px tall with a 6 px inset and a small
 /// label, so its hover and pressed fills have room around the label without padding it out
-/// (`crate::button`). A button inside a dense row (a pill segment, a tree row, a tab) takes
-/// Zed's compact sizes through `.size`.
+/// (`crate::button`). A button inside a row or a card is a [`row_button`].
 pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
     Button::new(id, label)
 }
@@ -1345,9 +1366,25 @@ pub fn bar_icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
 
 /// [`button`] for an icon alone: a 28 px square.
 pub fn icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
-    IconButton::new(id, icon)
-        .size(ButtonSize::Medium)
-        .icon_size(IconSize::Small)
+    IconButton::new(id, icon).size(ButtonSize::Medium)
+}
+
+/// A labelled action inside a row or a card ("Show all", "Load more", "Discard"):
+/// `size::ROW_BUTTON` tall, so it sits in the row as a tag does.
+pub fn row_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    button(id, label).size(ButtonSize::Compact)
+}
+
+/// An icon action inside a row, a card's line or beside a value (pin, copy, reset, refresh,
+/// remove, open): a `size::ROW_BUTTON` square with the small icon, muted until hovered.
+pub fn row_icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
+    IconButton::new(id, icon).size(ButtonSize::Compact)
+}
+
+/// An icon inside a tab beside its title (pin, close): no square of its own beyond the icon,
+/// so the tab keeps its height and the title its room.
+pub fn inline_icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
+    IconButton::new(id, icon).size(ButtonSize::None)
 }
 
 /// A text field's frame: a hairline box at a control's height, so a field lines up with the
@@ -1406,7 +1443,7 @@ pub fn sidebar_search(editor: impl IntoElement, cx: &App) -> Div {
 /// box): an editor's text at the label's size rather than the body size.
 pub fn field_text(cx: &App) -> gpui::TextStyleRefinement {
     gpui::TextStyleRefinement {
-        font_size: Some(ui::TextSize::Small.rems(cx).into()),
+        font_size: Some(text::body_size(cx).into()),
         ..Default::default()
     }
 }
@@ -1874,10 +1911,7 @@ pub fn setting_row(
                         .child(Label::new(title.into()))
                         .when_some(reset, |title, reset| {
                             title.child(
-                                IconButton::new("reset", IconName::Undo)
-                                    .size(ButtonSize::Compact)
-                                    .icon_size(IconSize::XSmall)
-                                    .icon_color(Color::Muted)
+                                row_icon_button("reset", IconName::Undo)
                                     .tooltip(Tooltip::text("Reset to default"))
                                     .on_click(reset),
                             )
