@@ -28,9 +28,10 @@ use crate::merged::{branch_heads, with_merged_commits};
 /// Above this many commits the list warns that it loads in full (E10).
 pub const LONG_HISTORY: usize = 5_000;
 
-/// Other branches whose lists History reads for heads and merged-in commits.
-/// How long scrolling must pause before the drawn rows' change counts are read.
+/// How long scrolling must pause before the drawn rows' change counts are read, and stepping
+/// through commits before the selected one's changes are.
 const COUNTS_AFTER: Duration = Duration::from_millis(120);
+/// Other branches whose lists History reads for heads and merged-in commits.
 const OTHER_BRANCHES: usize = 20;
 
 const ROW_HEIGHT: f32 = studio_ui::ds::size::ROW;
@@ -347,7 +348,7 @@ impl HistoryView {
         self.match_commits(cx);
         self.match_at = (!self.matches.is_empty()).then_some(0);
         if let Some(&ix) = self.matches.first() {
-            self.select(ix, cx);
+            self.step_to(ix, cx);
         }
         cx.notify();
     }
@@ -382,11 +383,21 @@ impl HistoryView {
             (at + count - 1) % count
         };
         self.match_at = Some(at);
-        self.select(self.matches[at], cx);
+        self.step_to(self.matches[at], cx);
     }
 
     /// Selects a commit and, in the tab, shows its changes in the detail split.
     pub fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.show(ix, None, cx);
+    }
+
+    /// Selects a commit reached by a key: its changes are read once the steps pause, so a
+    /// held arrow or a search being typed reads only where it stops.
+    fn step_to(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.show(ix, Some(COUNTS_AFTER), cx);
+    }
+
+    fn show(&mut self, ix: usize, pause: Option<Duration>, cx: &mut Context<Self>) {
         let Some(commit) = self.commits.get(ix).cloned() else {
             return;
         };
@@ -403,7 +414,10 @@ impl HistoryView {
         if !same {
             let session = self.session.clone();
             let id = commit.graph_commit_id.clone();
-            let detail = cx.new(|cx| CommitView::new(session, id, Some(commit), cx));
+            let detail = cx.new(|cx| match pause {
+                Some(pause) => CommitView::after_pause(session, id, Some(commit), pause, cx),
+                None => CommitView::new(session, id, Some(commit), cx),
+            });
             self._detail_subscription =
                 Some(cx.subscribe(&detail, |this, _, counts: &CommitCounts, cx| {
                     if counts.partial {
@@ -425,7 +439,7 @@ impl HistoryView {
     fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
         let next = self.selected.map_or(0, |s| s + 1);
         if next < self.commits.len() {
-            self.select(next, cx);
+            self.step_to(next, cx);
         }
     }
 
@@ -436,7 +450,7 @@ impl HistoryView {
         cx: &mut Context<Self>,
     ) {
         if let Some(previous) = self.selected.and_then(|s| s.checked_sub(1)) {
-            self.select(previous, cx);
+            self.step_to(previous, cx);
         }
     }
 

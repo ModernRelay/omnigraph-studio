@@ -2,6 +2,7 @@
 //! review. Shown in History's detail split, or as its own tab through `OpenCommit`.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
@@ -78,6 +79,8 @@ pub struct CommitView {
     list_state: ListState,
     focus_handle: FocusHandle,
     _task: Option<Task<()>>,
+    /// The wait before a stepped-to commit's first read; dropped with the view.
+    _pause: Option<Task<()>>,
 }
 
 impl EventEmitter<ItemEvent> for CommitView {}
@@ -121,7 +124,36 @@ impl CommitView {
         commit: Option<CommitOutput>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut view = Self {
+        let mut view = Self::unread(session, commit_id, commit, cx);
+        view.load_more(cx);
+        view
+    }
+
+    /// A commit stepped to, which reads its changes only once the stepping has paused for
+    /// `pause`: a held arrow key passes commits whose reads the server would otherwise start
+    /// and the view drop. The header shows at once.
+    pub fn after_pause(
+        session: Entity<GraphSession>,
+        commit_id: String,
+        commit: Option<CommitOutput>,
+        pause: Duration,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::unread(session, commit_id, commit, cx);
+        view._pause = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(pause).await;
+            this.update(cx, |this, cx| this.load_more(cx)).ok();
+        }));
+        view
+    }
+
+    fn unread(
+        session: Entity<GraphSession>,
+        commit_id: String,
+        commit: Option<CommitOutput>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
             session,
             commit_id,
             commit,
@@ -141,9 +173,8 @@ impl CommitView {
             list_state: ListState::new(0, ListAlignment::Top, px(600.)),
             focus_handle: cx.focus_handle(),
             _task: None,
-        };
-        view.load_more(cx);
-        view
+            _pause: None,
+        }
     }
 
     pub fn commit_id(&self) -> &str {
@@ -717,5 +748,57 @@ mod tests {
             assert!(view.more_error.is_none());
         });
         assert_eq!(*partial.lock().unwrap(), [true, false]);
+    }
+
+    /// A commit stepped past reads nothing; the one the steps stop on reads once they pause.
+    #[gpui::test]
+    async fn a_stepped_commit_reads_only_once_the_steps_pause(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = reads.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let changes = request.uri().path().ends_with("/changes");
+            if changes {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+            async move {
+                let cause = json!({ "graph_commit_id": "c9", "parent_commit_id": "c8", "authored_branch": "main", "authored_at": 0 });
+                let body = json!({ "cause": cause, "changes": [] });
+                Ok(Response::builder()
+                    .status(if changes { 200 } else { 404 })
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        let pause = Duration::from_millis(120);
+        let passed =
+            cx.new(|cx| CommitView::after_pause(session.clone(), "c8".into(), None, pause, cx));
+        cx.run_until_parked();
+        drop(passed);
+        let stopped = cx.new(|cx| CommitView::after_pause(session, "c9".into(), None, pause, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "nothing reads before the pause"
+        );
+        cx.executor().advance_clock(pause);
+        cx.run_until_parked();
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "only the commit stopped on reads"
+        );
+        stopped.read_with(cx, |view, _| assert!(matches!(view.state, State::Ready)));
     }
 }
