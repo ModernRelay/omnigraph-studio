@@ -244,6 +244,8 @@ pub struct ReviewView {
     list_state: ListState,
     /// The head fixes and the merge bind to: the reviewed head, then each fix's own commit.
     bound_head: Option<String>,
+    /// What the review holds, in a sentence, made when it loads: the header draws at every frame.
+    summary: String,
     /// Reviewed marks, by entity and the last commit that changed it, kept across Refresh: a
     /// change made again since is reviewed again.
     reviewed_keys: HashSet<String>,
@@ -377,6 +379,7 @@ impl ReviewView {
             open_cards: HashSet::new(),
             list_state: ListState::new(0, ListAlignment::Top, px(800.)),
             bound_head: None,
+            summary: String::new(),
             reviewed_keys: HashSet::new(),
             merge: MergeState::Idle,
             preview: Preview::Unread,
@@ -466,6 +469,7 @@ impl ReviewView {
                     .and_then(|&group| data.groups.groups[group].primary());
                 self.bound_head = data.head.clone();
                 self.newer = data.moved_while_reading;
+                self.summary = self.summary_of(&data);
                 let ends = data.groups.unnamed_ends();
                 let head = data.head.clone();
                 let changed = !data.folded.changes.is_empty();
@@ -478,6 +482,9 @@ impl ReviewView {
                     self.preview = Preview::Unread;
                     self._preview_task = None;
                 }
+                // A head that moved while this was read, a fix of this review's included, is
+                // offered as newer: the cards show the head read.
+                self.compare_head(cx);
             }
             Err(error) => self.load = LoadState::Failed(error.into()),
         }
@@ -1049,6 +1056,25 @@ impl ReviewView {
     /// Offers Refresh when the session saw the branch's head at another commit than the one
     /// fixes and the merge bind to. Studio's own fixes move that head themselves, so a head seen
     /// while a fix or the merge is out is compared once they are back.
+    /// The review in a sentence: what changed, in how many commits, by whom.
+    fn summary_of(&self, data: &ReviewData) -> String {
+        // The commits in scope: all since the fork, or the one chosen.
+        let in_scope: Vec<&ReviewCommit> = data
+            .commits
+            .iter()
+            .filter(|c| self.scope.as_ref().is_none_or(|id| *id == c.id))
+            .collect();
+        let mut actors: Vec<String> = in_scope.iter().filter_map(|c| c.actor_id.clone()).collect();
+        actors.sort();
+        actors.dedup();
+        summary_sentence(
+            data.folded.entity_count(),
+            data.folded.relationship_count(),
+            in_scope.len().max(usize::from(self.scope.is_some())),
+            &actors,
+        )
+    }
+
     fn compare_head(&mut self, cx: &mut Context<Self>) {
         if self.fixes_running > 0 || matches!(self.merge, MergeState::Merging) {
             self.head_moved_while_writing = true;
@@ -1315,25 +1341,7 @@ impl ReviewView {
 
         let (sentence, detail) = match (&self.load, &self.data) {
             (LoadState::Ready, Some(data)) => {
-                // The commits in scope: all since the fork, or the one chosen.
-                let in_scope: Vec<&ReviewCommit> = data
-                    .commits
-                    .iter()
-                    .filter(|c| self.scope.as_ref().is_none_or(|id| *id == c.id))
-                    .collect();
-                let actors: Vec<String> = {
-                    let mut actors: Vec<String> =
-                        in_scope.iter().filter_map(|c| c.actor_id.clone()).collect();
-                    actors.sort();
-                    actors.dedup();
-                    actors
-                };
-                let sentence = summary_sentence(
-                    data.folded.entity_count(),
-                    data.folded.relationship_count(),
-                    in_scope.len().max(usize::from(self.scope.is_some())),
-                    &actors,
-                );
+                let sentence = self.summary.clone();
                 let detail = match (&data.fork, &data.head) {
                     (Some(fork), Some(head)) if data.merged_in => format!(
                         "Since {} was last merged in at {} · head {}",
