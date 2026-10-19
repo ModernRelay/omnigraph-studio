@@ -537,7 +537,8 @@ than styling one-off elements.
   It also refuses any label or icon given a size (its builder chain is read whole), a label
   given only the muted colour, a button given a sized or tinted icon, a button's size or an icon
   button's icon size named directly (`ButtonSize::…`, `.icon_size`), any icon, label or type
-  size named in a view (`IconSize`, `LabelSize`, `TextSize`), GPUI's text sizes, an opacity written as a number, and Zed's `Divider`, `Banner`,
+  size named in a view (`IconSize`, `LabelSize`, `TextSize`), GPUI's text sizes, a border wider than a hairline written as a GPUI utility
+  (`.border_l_2()`), an opacity written as a number, and Zed's `Divider`, `Banner`,
   `Callout`, `Chip` and `Checkbox`; the forked Zed menu keeps upstream's calls.
   Data column widths and algorithm constants (zoom steps, layout forces, text-width
   estimates) are named once where they are used; the canvas's chip text is world geometry

@@ -228,7 +228,7 @@ pub mod size {
     pub const TAG: f32 = 18.;
     /// A line being dragged (a column's or a dock's new edge).
     pub const DRAG_LINE: f32 = 2.;
-    /// A coloured line down an item's leading edge: a change card's kind.
+    /// A coloured line down an item's leading edge: a change card's kind, a focused tree row.
     pub const ACCENT_LINE: f32 = 2.;
     /// The tallest a preview (an image, a document's first page) shows before it opens.
     pub const PREVIEW_MAX_HEIGHT: f32 = 240.;

@@ -995,7 +995,7 @@ impl RelationshipTree {
             .gap(px(space::XS))
             .items_center()
             .bg(panel_bg)
-            .border_l_2()
+            .border_l(px(studio_ui::ds::size::ACCENT_LINE))
             .border_color(gpui::transparent_black())
             .when(selected, |d| d.bg(selected_bg))
             .when(selected && focused, |d| d.border_color(focus_border))

@@ -34,6 +34,8 @@ every surface and nothing drifts. This refuses, outside the design system and te
   `.icon_size(IconSize::XSmall)`): views take the role for where the button sits
   (`ds::button`, `toolbar_button`, `bar_button`, `row_button` and their icon forms,
   `ds::inline_icon_button`), whose size gives the icon its size;
+- a border wider than a hairline written as a GPUI utility (`.border_l_2()`): views take
+  `ds::size::ACCENT_LINE` or `DRAG_LINE`;
 - any icon or type size named in a view (`IconSize::XSmall`, `LabelSize::Small`,
   `ui::TextSize::Small.rems(cx)`, `.text_ui_sm(cx)`): icons take `ds::icon::lead` or `meta`,
   labels a `ds::text` role, and other text `ds::text::plain_size`, `body_size` or
@@ -86,6 +88,7 @@ RULES = [
     ("opacity as a number", re.compile(r"\.opacity\(\s*0?\.\d")),
     ("button size outside a ds role", re.compile(r"\bButtonSize::[A-Z]|\.icon_size\(")),
     ("icon size outside ds::icon", re.compile(r"\bIconSize::[A-Z]")),
+    ("border wider than a hairline", re.compile(r"\.border_([tblrxy]_)?([2-9]|[1-9][0-9])\(\)")),
     ("type size outside ds::text",
      re.compile(r"\b(TextSize|LabelSize)::[A-Z]|\.text_ui(_xs|_sm|_lg)?\(")),
 ]
