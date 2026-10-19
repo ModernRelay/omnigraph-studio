@@ -5,6 +5,8 @@
 
 use serde_json::{Number, Value};
 
+use crate::input::IntegerError;
+
 /// Reads `text` as a value of the parameter type `type_name`. An empty text is `None` (the
 /// parameter is sent as null) when the parameter is nullable, and an error otherwise.
 pub fn param_value(
@@ -56,6 +58,7 @@ fn list(name: &str, item_type: &str, text: &str) -> Result<Value, String> {
             .into_iter()
             .map(|item| match item {
                 Value::String(s) => scalar(name, item_type, &s),
+                Value::Null => Err(format!("${name} cannot hold a null item")),
                 other => scalar(name, item_type, &other.to_string()),
             })
             .collect::<Result<Vec<_>, _>>()
@@ -75,28 +78,15 @@ fn scalar(name: &str, type_name: &str, text: &str) -> Result<Value, String> {
     match type_name {
         "String" | "Blob" => Ok(Value::String(text.to_owned())),
         "Date" | "DateTime" => Ok(Value::String(trimmed.to_owned())),
-        "Bool" => match trimmed.to_ascii_lowercase().as_str() {
-            "true" | "yes" | "1" => Ok(Value::Bool(true)),
-            "false" | "no" | "0" => Ok(Value::Bool(false)),
-            _ => Err(format!("${name} must be true or false")),
-        },
-        "I32" | "I64" => {
-            let value: i64 = trimmed
-                .parse()
-                .map_err(|_| format!("${name} must be a whole number"))?;
-            if type_name == "I32" && i32::try_from(value).is_err() {
-                return Err(format!("${name} does not fit in an I32"));
-            }
-            Ok(Value::Number(value.into()))
+        "Bool" => {
+            crate::input::boolean(trimmed).ok_or_else(|| format!("${name} must be true or false"))
         }
-        "U32" | "U64" => {
-            let value: u64 = trimmed
-                .parse()
-                .map_err(|_| format!("${name} must be a whole number of at least 0"))?;
-            if type_name == "U32" && u32::try_from(value).is_err() {
-                return Err(format!("${name} does not fit in a U32"));
-            }
-            Ok(Value::Number(value.into()))
+        "I32" | "I64" | "U32" | "U64" => {
+            crate::input::integer(type_name, trimmed).map_err(|error| match error {
+                IntegerError::NotWhole => format!("${name} must be a whole number"),
+                IntegerError::Negative => format!("${name} must be a whole number of at least 0"),
+                IntegerError::OutOfRange => format!("${name} does not fit in {type_name}"),
+            })
         }
         "F32" | "F64" => {
             let value: f64 = trimmed
@@ -170,5 +160,7 @@ mod tests {
             Ok(Some(json!([0.5, 1.0, 2.0])))
         );
         assert!(param_value("t", "[I32]", false, "[1, \"x\"]").is_err());
+        // A list parameter holds no null: the item is refused, not sent as the text "null".
+        assert!(param_value("t", "[String]", false, "[\"a\", null]").is_err());
     }
 }
