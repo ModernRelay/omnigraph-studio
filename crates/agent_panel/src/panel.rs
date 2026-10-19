@@ -725,6 +725,23 @@ impl AgentPanel {
             .session_id
             .as_ref()
             .and_then(|id| self.sessions.read(cx).get(id).cloned());
+        // One held with another agent is not this one's to load: a new conversation starts,
+        // on a branch of its own, and the old one stays in the list for that agent.
+        let agent = settings.command.join(" ");
+        let saved = match saved {
+            Some(saved) if saved.agent != agent => {
+                self.entries.push(Entry::Notice {
+                    text: format!(
+                        "This conversation was with {}; a new one starts with {agent}.",
+                        saved.agent
+                    ),
+                    error: false,
+                });
+                self.session_id = None;
+                None
+            }
+            saved => saved,
+        };
         // A conversation runs where it ran before; any other in the graph's own directory.
         let cwd = saved
             .as_ref()
@@ -1049,6 +1066,16 @@ impl AgentPanel {
                 session,
                 opened,
             } => {
+                // The agent could not load the conversation asked for and opened a new one on
+                // its branch: the record follows the new one, rather than two conversations
+                // sharing a branch.
+                if opened == Opened::New
+                    && let Some(asked) = self.session_id.take().filter(|asked| *asked != session)
+                {
+                    let new = session.clone();
+                    self.sessions
+                        .update(cx, |sessions, cx| sessions.rebind(&asked, new, cx));
+                }
                 self.session_id = Some(session);
                 self.remember_session(cx);
                 cx.emit(ItemEvent::UpdateTab);

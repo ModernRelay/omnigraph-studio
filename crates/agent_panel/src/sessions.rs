@@ -152,6 +152,18 @@ impl AgentSessions {
             .find(|record| record.agent == agent)
     }
 
+    /// Gives the conversation recorded as `old` the agent's new session id: the agent could not
+    /// load it, and a new conversation took its place on its branch.
+    pub fn rebind(&mut self, old: &str, new: String, cx: &mut Context<Self>) {
+        if let Some(record) = self.records.iter_mut().find(|record| record.session == old) {
+            record.session = new;
+            self.live.remove(old);
+            self.unread.remove(old);
+            self.save();
+            cx.notify();
+        }
+    }
+
     /// Records a conversation, or updates its branch, keeping its title, times and marks.
     pub fn upsert(&mut self, record: SessionRecord, cx: &mut Context<Self>) {
         match self
@@ -565,6 +577,33 @@ mod tests {
 
     /// One record Studio cannot read leaves the others, and the file is set aside before the
     /// next save writes only those.
+    /// A conversation the agent could not load, replaced by a new one on its branch, is one
+    /// record under the new session, not two on one branch.
+    #[gpui::test]
+    fn a_conversation_the_agent_could_not_load_follows_the_new_one(cx: &mut gpui::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("studio-agent-rebind-{}", std::process::id()));
+        let store = cx.new(|_| AgentSessions::load(dir.join("sessions.json")));
+        store.update(cx, |store, cx| {
+            store.upsert(record("old", "server/crm", "claude", 5), cx);
+            store.rebind("old", "new".into(), cx);
+            // As the panel records it: the new session, on the branch it resumed.
+            store.upsert(
+                SessionRecord {
+                    branch: "agent/old".into(),
+                    ..record("new", "server/crm", "claude", 0)
+                },
+                cx,
+            );
+        });
+        store.read_with(cx, |store, _| {
+            assert!(store.get("old").is_none());
+            let records = store.for_graph("server/crm");
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].branch, "agent/old", "the branch it had");
+        });
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn a_record_that_cannot_be_read_leaves_the_others() {
         let dir = std::env::temp_dir().join(format!("studio-agent-records-{}", std::process::id()));
