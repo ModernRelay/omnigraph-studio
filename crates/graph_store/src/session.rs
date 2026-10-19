@@ -1777,11 +1777,21 @@ impl GraphSession {
         let Some(commit) = request.snapshot.clone() else {
             return self.read_request(request, cx);
         };
-        if self.heads.get(&self.branch) != Some(&commit) {
+        // A branch whose head is the commit answers the read faster than the commit does: the
+        // session's own branch, else another watched one at it (a review's, an agent's).
+        let at_head = if self.heads.get(&self.branch) == Some(&commit) {
+            Some(self.branch.clone())
+        } else {
+            self.heads
+                .iter()
+                .find(|(_, head)| **head == commit)
+                .map(|(branch, _)| branch.clone())
+        };
+        let Some(branch) = at_head else {
             return self.read_request(request, cx);
-        }
+        };
         let at_branch = QueryRequest {
-            branch: Some(self.branch.clone()),
+            branch: Some(branch),
             snapshot: None,
             ..request.clone()
         };
@@ -3147,9 +3157,10 @@ mod tests {
                     sent.lock()
                         .unwrap()
                         .push((branch.clone(), snapshot.clone()));
-                    let at = snapshot
-                        .clone()
-                        .unwrap_or_else(|| head.lock().unwrap().to_string());
+                    let at = snapshot.clone().unwrap_or_else(|| match branch.as_deref() {
+                        Some("review") => "r1".to_owned(),
+                        _ => head.lock().unwrap().to_string(),
+                    });
                     serde_json::json!({
                         "query_name": "q",
                         "target": { "branch": branch, "snapshot": snapshot },
@@ -3233,6 +3244,22 @@ mod tests {
                 "a read does not move the head"
             );
         });
+
+        // At the head of another watched branch (a review's): read through that branch.
+        session.update(cx, |session, _| {
+            session.heads.insert("review".into(), "r1".into());
+        });
+        sent.lock().unwrap().clear();
+        let read = session.update(cx, |session, cx| {
+            session.read(&query(3), Some("r1".into()), cx)
+        });
+        let output = read.await.unwrap();
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![(Some("review".to_owned()), None)],
+            "sent as a read of the review's branch"
+        );
+        assert_eq!(output.target.snapshot.as_deref(), Some("r1"));
     }
 
     /// Counts asked for one at a time in the same turn go out as one read per node type and
