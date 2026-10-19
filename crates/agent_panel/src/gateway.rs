@@ -43,11 +43,12 @@ const FORWARDED_HEADERS: &[&str] = &[
 /// What the gateway tells the conversation.
 #[derive(Debug)]
 pub enum GatewayEvent {
-    /// A write for the agent's branch waits for `decide` (true sends it).
+    /// A write for the agent's branch waits for `decide`: `Some` sends it, with what records
+    /// its outcome.
     Write {
         id: u64,
         write: WriteSummary,
-        decide: oneshot::Sender<bool>,
+        decide: oneshot::Sender<Option<OnOutcome>>,
     },
     /// How a forwarded write ended (constitution III).
     Finished { id: u64, outcome: Seen },
@@ -55,6 +56,14 @@ pub enum GatewayEvent {
     /// stopped): nothing was sent, and nothing will be.
     Abandoned { id: u64 },
 }
+
+/// What records an approved write's outcome. It is called once, with the outcome, however the
+/// write ends, though the conversation that sent it stops meanwhile; dropped uncalled (Studio
+/// quit while it was sent), it says nothing more.
+pub type OnOutcome = Box<dyn FnOnce(&Seen) + Send>;
+
+/// How long the gateway waits after a connection it could not take, before taking the next.
+const ACCEPT_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// A forwarded write's outcome, as the gateway saw the server's answer.
 #[derive(Debug, Clone, PartialEq)]
@@ -106,8 +115,11 @@ impl Gateway {
             let Some(listener) = listener else { return };
             let mut connections = Vec::new();
             loop {
+                // A connection it could not take (out of descriptors, reset before it was
+                // taken) ends that connection, not the gateway.
                 let Ok((stream, _)) = listener.accept().await else {
-                    break;
+                    smol::Timer::after(ACCEPT_RETRY).await;
+                    continue;
                 };
                 connections.retain(|task: &smol::Task<()>| !task.is_finished());
                 connections.push(smol::spawn(serve_connection(stream, shared.clone())));
@@ -314,7 +326,7 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
                     .ok();
                 return;
             };
-            if decided != Ok(true) {
+            let Ok(Some(on_outcome)) = decided else {
                 answer(
                     &mut stream,
                     403,
@@ -323,16 +335,26 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
                 )
                 .await;
                 return;
-            }
-            let response = shared.client.forward(forward_request(&request, None)).await;
-            let (outcome, reply) = read_write_answer(response).await;
-            shared
-                .events
-                .unbounded_send(GatewayEvent::Finished { id, outcome })
-                .ok();
+            };
+            // Once sent, a write runs to its end in a task of its own, and its outcome is
+            // recorded: the conversation stopping, or the CLI going, would otherwise drop it
+            // halfway with the server perhaps committing it unseen.
+            let (client, events) = (shared.client.clone(), shared.events.clone());
+            let forward = forward_request(&request, None);
+            let (reply_tx, reply_rx) = oneshot::channel();
+            smol::spawn(async move {
+                let response = client.forward(forward).await;
+                let (outcome, reply) = read_write_answer(response).await;
+                on_outcome(&outcome);
+                events
+                    .unbounded_send(GatewayEvent::Finished { id, outcome })
+                    .ok();
+                reply_tx.send(reply).ok();
+            })
+            .detach();
             // When the server's answer was lost, the CLI's connection closes without one, and
             // the CLI reports the outcome as unknown, as it is.
-            if let Some((status, headers, body)) = reply {
+            if let Ok(Some((status, headers, body))) = reply_rx.await {
                 write_buffered(&mut stream, status, &headers, &body).await;
             }
         }
@@ -743,8 +765,11 @@ async fn stream_back(
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let read = match response.body.read(&mut buffer).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(read) => read,
+            // The answer broke off: the connection closes without the chunked stream's end
+            // (or short of its length), so the CLI sees a cut answer, never a complete one.
+            Err(_) => return,
         };
         let written = if length.is_some() {
             stream.write_all(&buffer[..read]).await
@@ -874,6 +899,117 @@ mod tests {
         )
     }
 
+    /// An approved write on its way when the gateway stops (the conversation restarted) runs to
+    /// its end, and its outcome reaches what records it.
+    #[test]
+    fn an_approved_write_ends_and_reports_though_the_gateway_stops() {
+        smol::block_on(async {
+            let (arrived_tx, arrived) = oneshot::channel::<()>();
+            let (release, released) = oneshot::channel::<()>();
+            let gates = Arc::new(Mutex::new((Some(arrived_tx), Some(released))));
+            let held = gates.clone();
+            let http = FakeHttpClient::create(move |_request| {
+                let held = held.clone();
+                async move {
+                    let (arrived, released) = {
+                        let mut gates = held.lock().unwrap();
+                        (gates.0.take(), gates.1.take())
+                    };
+                    if let Some(arrived) = arrived {
+                        arrived.send(()).ok();
+                    }
+                    if let Some(released) = released {
+                        released.await.ok();
+                    }
+                    Ok(Response::builder()
+                        .status(200)
+                        .header(CONTRACT_HEADER, "0.13")
+                        .header("content-type", "application/json")
+                        .body(AsyncBody::from(
+                            r#"{"branch":"agent/20261013-101500","query_name":"m","affected_nodes":1,"affected_edges":0,"commit":{"graph_commit_id":"c9"}}"#,
+                        ))
+                        .unwrap())
+                }
+            });
+            let client =
+                GraphClient::new("http://127.0.0.1:8787", Some("person-token".into()), http)
+                    .unwrap();
+            let mut gateway = Gateway::bind().unwrap();
+            let (port, token) = (gateway.port, gateway.token.clone());
+            let (events_tx, mut events) = mpsc::unbounded();
+            let serve = smol::spawn(gateway.serve(client, sandbox(), events_tx));
+            let write =
+                r#"{"query":"query m() { … }","name":"m","branch":"agent/20261013-101500"}"#;
+            let _cli = smol::spawn(call(
+                port,
+                post("/graphs/knowledge/mutate", &token, Some("0.13"), write),
+            ));
+            let Some(GatewayEvent::Write { decide, .. }) = events.next().await else {
+                panic!("no write event")
+            };
+            let (recorded, outcome) = oneshot::channel::<super::Seen>();
+            decide
+                .send(Some(Box::new(move |seen: &super::Seen| {
+                    recorded.send(seen.clone()).ok();
+                })))
+                .ok()
+                .unwrap();
+            arrived.await.unwrap();
+            drop(serve);
+            release.send(()).unwrap();
+            assert_eq!(
+                outcome.await.unwrap(),
+                super::Seen::Committed {
+                    commit: Some("c9".into()),
+                    nodes: 1,
+                    edges: 0
+                }
+            );
+        });
+    }
+
+    /// A read whose answer breaks off partway closes without the chunked stream's end: the CLI
+    /// sees a cut answer, not a complete short one.
+    #[test]
+    fn a_read_cut_off_partway_does_not_end_as_complete() {
+        struct Broken;
+        impl futures::AsyncRead for Broken {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut [u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()))
+            }
+        }
+        smol::block_on(async {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let reader = smol::spawn(async move {
+                let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+                let mut raw = Vec::new();
+                stream.read_to_end(&mut raw).await.unwrap();
+                String::from_utf8(raw).unwrap()
+            });
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let body = futures::io::Cursor::new(br#"{"rows":["#.to_vec()).chain(Broken);
+            let response = graph_client::ForwardResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: AsyncBody::from_reader(body),
+            };
+            stream_back(&mut stream, "POST", Ok(response)).await;
+            drop(stream);
+            let raw = reader.await;
+            assert!(raw.contains("transfer-encoding: chunked"), "{raw}");
+            assert!(
+                raw.contains(r#"{"rows":["#),
+                "what arrived is passed on: {raw}"
+            );
+            assert!(!raw.ends_with("0\r\n\r\n"), "no end of the stream: {raw}");
+        });
+    }
+
     #[test]
     fn the_gateway_checks_the_session_then_forwards_reads_and_approved_writes() {
         smol::block_on(async {
@@ -994,7 +1130,7 @@ mod tests {
                 panic!("no write event")
             };
             assert_eq!(summary.kind, gateway_rules::WriteKind::Mutate);
-            decide.send(false).unwrap();
+            decide.send(None).ok().unwrap();
             let (status, _, body) = rejected.await;
             assert_eq!(status, 403);
             assert!(body.contains("rejected"), "{body}");
@@ -1008,7 +1144,14 @@ mod tests {
             let Some(GatewayEvent::Write { decide, id, .. }) = events.next().await else {
                 panic!("no write event")
             };
-            decide.send(true).unwrap();
+            let recorded: Arc<Mutex<Option<super::Seen>>> = Arc::default();
+            let record = recorded.clone();
+            decide
+                .send(Some(Box::new(move |seen: &super::Seen| {
+                    *record.lock().unwrap() = Some(seen.clone());
+                })))
+                .ok()
+                .unwrap();
             let (status, head, body) = allowed.await;
             assert_eq!(status, 200);
             assert!(head.contains("omnigraph-http-api: 0.13"));
@@ -1029,6 +1172,7 @@ mod tests {
                     edges: 1
                 }
             );
+            assert_eq!(recorded.lock().unwrap().as_ref(), Some(&outcome));
             assert_eq!(seen.lock().unwrap().len(), 2);
 
             // The CLI gives up before the person decides (its command timed out): the write is
@@ -1048,7 +1192,10 @@ mod tests {
                 panic!("the gateway did not see the CLI go")
             };
             assert_eq!(abandoned, id);
-            assert!(decide.send(true).is_err(), "nobody waits for the decision");
+            assert!(
+                decide.send(Some(Box::new(|_: &super::Seen| {}))).is_err(),
+                "nobody waits for the decision"
+            );
             assert_eq!(seen.lock().unwrap().len(), 2, "nothing was sent");
 
             // A chunked body is read whole before the rules see it.
@@ -1155,7 +1302,7 @@ mod end_to_end {
                 match event {
                     GatewayEvent::Write { id, write, decide } => {
                         summaries.insert(id, write.summary);
-                        decide.send(true).ok();
+                        decide.send(Some(Box::new(|_: &super::Seen| {}))).ok();
                     }
                     GatewayEvent::Finished { id, outcome } => {
                         let summary = summaries.remove(&id).unwrap_or_default();

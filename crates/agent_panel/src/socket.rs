@@ -212,7 +212,14 @@ impl ToolSocket {
         async move {
             let Some(listener) = listener else { return };
             let mut connections = Vec::new();
-            while let Ok((reader, writer)) = sys::accept(&listener).await {
+            loop {
+                // A connection it could not take (out of descriptors, reset before it was
+                // taken) ends that connection, not the socket.
+                let Ok((reader, writer)) = sys::accept(&listener).await else {
+                    smol::Timer::after(std::time::Duration::from_millis(100)).await;
+                    continue;
+                };
+                connections.retain(|task: &smol::Task<()>| !task.is_finished());
                 connections.push(smol::spawn(serve_connection(
                     reader,
                     writer,

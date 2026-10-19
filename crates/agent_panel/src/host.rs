@@ -367,8 +367,8 @@ async fn connect(
                         .copied()
                 });
                 if studio.is_some() {
-                    // Studio's reads are read-only and its writes wait for Studio's own
-                    // approval, so the agent's prompt for them is answered at once.
+                    // Studio's reads are read-only and its writes go through Studio's own
+                    // approval setting, so the agent's prompt for them is answered at once.
                     let allow = request
                         .options
                         .iter()

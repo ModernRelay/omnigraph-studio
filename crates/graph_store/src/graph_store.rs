@@ -39,8 +39,8 @@ pub use fixes::{RevertUnavailable, revert_query};
 pub use graph_client::api::EntityKind;
 pub use registry::{ConnectionRegistry, RegistryEvent, data_dir};
 pub use session::{
-    CommitList, DraftEntry, DraftKey, FollowUp, GraphSession, HeadWatch, Loadable, OutcomeEntry,
-    OutcomeKind, ServerState, SessionEvent, open_session,
+    CommitList, DraftEntry, DraftKey, ExternalWrite, FollowUp, GraphSession, HeadWatch, Loadable,
+    OutcomeEntry, OutcomeKind, ServerState, SessionEvent, open_session,
 };
 
 /// Sets up the HTTP client and loads every known server. Call once at startup.

@@ -35,7 +35,7 @@ use ui::{
 };
 
 use crate::cli_home::{self, CliHome};
-use crate::gateway::{Gateway, GatewayEvent, Seen};
+use crate::gateway::{Gateway, GatewayEvent, OnOutcome, Seen};
 use crate::gateway_rules::{Sandbox, WriteSummary};
 use crate::host::{AgentLaunch, HostCommand, HostEvent, Opened, SessionLaunch};
 use crate::sessions::{AgentSessions, Live, SessionRecord};
@@ -56,6 +56,21 @@ pub const PRESETS: &[(&str, &[&str])] = &[
 
 const UNKNOWN_OUTCOME: &str = "The server did not confirm this change. It was not retried; \
 check the branch history before the agent tries it again.";
+
+/// A gateway write's outcome, as Studio's activity records it.
+fn outcome_kind(seen: &Seen) -> OutcomeKind {
+    match seen {
+        Seen::Committed { commit, .. } => OutcomeKind::Committed {
+            commit: commit.clone(),
+        },
+        Seen::Refused(message) => OutcomeKind::Refused {
+            message: message.clone(),
+        },
+        Seen::Unknown(reason) => OutcomeKind::Unknown {
+            reason: reason.clone(),
+        },
+    }
+}
 
 /// Opens the agent for the workspace's graph: an agent tab already open (the shown one first),
 /// else the graph's last conversation with the agent, else a new one.
@@ -496,9 +511,9 @@ pub struct AgentPanel {
     /// command killed) when its call is cancelled, at Stop and with a new session.
     runs: std::collections::HashMap<u64, CliRun>,
     next_run: u64,
-    /// The card of each write the gateway forwards, by the gateway's id: the entry, whether
-    /// the write creates the agent's branch, and its summary.
-    gateway_cards: std::collections::HashMap<u64, (usize, bool, String)>,
+    /// The card of each write the gateway forwards, by the gateway's id: the entry, and
+    /// whether the write creates the agent's branch.
+    gateway_cards: std::collections::HashMap<u64, (usize, bool)>,
 }
 
 impl EventEmitter<ItemEvent> for AgentPanel {}
@@ -919,9 +934,15 @@ impl AgentPanel {
                 {
                     proposal.state = ProposalState::Rejected;
                 }
+                // A write on its way runs to its end, but its card no longer hears how: the
+                // session's activity records it.
+                Entry::Proposal(proposal) if matches!(proposal.state, ProposalState::Running) => {
+                    proposal.state = ProposalState::Unknown;
+                }
                 _ => {}
             }
         }
+        self.gateway_cards.clear();
     }
 
     /// Starts the agent again on this conversation, after it stopped: it replays the
@@ -1561,11 +1582,11 @@ impl AgentPanel {
         &mut self,
         id: u64,
         write: WriteSummary,
-        decide: oneshot::Sender<bool>,
+        decide: oneshot::Sender<Option<OnOutcome>>,
         cx: &mut Context<Self>,
     ) {
         let Some(branch) = &self.branch else {
-            decide.send(false).ok();
+            decide.send(None).ok();
             return;
         };
         let ask = StudioSettings::get(cx).agent.ask_before_writes && !self.always_allow;
@@ -1584,11 +1605,16 @@ impl AgentPanel {
             creates_from: write.creates_branch.then(|| branch.base.clone()),
             state,
         }));
-        self.gateway_cards
-            .insert(id, (index, write.creates_branch, write.summary));
+        self.gateway_cards.insert(id, (index, write.creates_branch));
+        let (branch, description, creates_branch) = (
+            branch.name.clone(),
+            format!("Agent CLI: {}", write.summary),
+            write.creates_branch,
+        );
         match waiting {
             None => {
-                decide.send(true).ok();
+                let approval = self.record_outcome(branch, description, creates_branch, cx);
+                decide.send(Some(approval)).ok();
             }
             Some(decision) => {
                 cx.spawn(async move |this, cx| {
@@ -1596,18 +1622,23 @@ impl AgentPanel {
                     // write is not sent, and the card keeps what it says.
                     let decision = decision.await.ok();
                     let allow = matches!(decision, Some(Decision::Allow | Decision::AllowAlways));
-                    this.update(cx, |this, cx| {
-                        if let Some(Decision::AllowAlways) = decision {
-                            this.always_allow = true;
-                        }
-                        if let Some(Decision::Reject) = decision {
-                            // Nothing is sent, so no outcome comes for the card.
-                            this.gateway_cards.remove(&id);
-                            this.set_proposal_state(index, ProposalState::Rejected, cx);
-                        }
-                    })
-                    .ok();
-                    decide.send(allow).ok();
+                    let approval = this
+                        .update(cx, |this, cx| {
+                            if let Some(Decision::AllowAlways) = decision {
+                                this.always_allow = true;
+                            }
+                            if let Some(Decision::Reject) = decision {
+                                // Nothing is sent, so no outcome comes for the card.
+                                this.gateway_cards.remove(&id);
+                                this.set_proposal_state(index, ProposalState::Rejected, cx);
+                            }
+                            allow.then(|| {
+                                this.record_outcome(branch, description, creates_branch, cx)
+                            })
+                        })
+                        .ok()
+                        .flatten();
+                    decide.send(approval).ok();
                 })
                 .detach();
             }
@@ -1616,51 +1647,47 @@ impl AgentPanel {
         cx.notify();
     }
 
+    /// What records a write the person let the agent's CLI send, from the moment it is sent:
+    /// the session counts it among the writes in flight and logs its outcome with Studio's own,
+    /// though this conversation stops before it ends.
+    fn record_outcome(
+        &self,
+        branch: String,
+        description: String,
+        creates_branch: bool,
+        cx: &mut Context<Self>,
+    ) -> OnOutcome {
+        let write = self.session.update(cx, |session, cx| {
+            session.external_write(branch, description, creates_branch, cx)
+        });
+        Box::new(move |seen: &Seen| write.finish(outcome_kind(seen)))
+    }
+
     fn gateway_finished(&mut self, id: u64, outcome: Seen, cx: &mut Context<Self>) {
-        let Some((index, creates_branch, summary)) = self.gateway_cards.remove(&id) else {
+        let Some((index, creates_branch)) = self.gateway_cards.remove(&id) else {
             return;
         };
-        let (state, kind) = match &outcome {
+        let state = match &outcome {
             Seen::Committed {
                 commit: Some(commit),
                 nodes,
                 edges,
-            } => (
-                ProposalState::Committed {
-                    commit: commit.clone(),
-                    nodes: *nodes,
-                    edges: *edges,
-                },
-                OutcomeKind::Committed {
-                    commit: Some(commit.clone()),
-                },
-            ),
-            Seen::Committed { commit: None, .. } => (
-                ProposalState::Done(if creates_branch {
-                    "Branch created".into()
-                } else {
-                    "Done".into()
-                }),
-                OutcomeKind::Committed { commit: None },
-            ),
-            Seen::Refused(message) => (
-                ProposalState::Refused(message.clone()),
-                OutcomeKind::Refused {
-                    message: message.clone(),
-                },
-            ),
-            Seen::Unknown(reason) => (
-                ProposalState::Unknown,
-                OutcomeKind::Unknown {
-                    reason: reason.clone(),
-                },
-            ),
+            } => ProposalState::Committed {
+                commit: commit.clone(),
+                nodes: *nodes,
+                edges: *edges,
+            },
+            Seen::Committed { commit: None, .. } => ProposalState::Done(if creates_branch {
+                "Branch created".into()
+            } else {
+                "Done".into()
+            }),
+            Seen::Refused(message) => ProposalState::Refused(message.clone()),
+            Seen::Unknown(_) => ProposalState::Unknown,
         };
         let went_through = matches!(outcome, Seen::Committed { .. });
         let mut created = false;
-        let mut branch_name = String::new();
         if let Some(branch) = &mut self.branch {
-            branch_name = branch.name.clone();
             if went_through && creates_branch && !branch.created {
                 branch.created = true;
                 created = true;
@@ -1678,15 +1705,6 @@ impl AgentPanel {
         if created {
             self.remember_session(cx);
         }
-        self.session.update(cx, |session, cx| {
-            session.note_write(
-                branch_name,
-                format!("Agent CLI: {summary}"),
-                kind,
-                created,
-                cx,
-            )
-        });
         self.set_proposal_state(index, state, cx);
     }
 

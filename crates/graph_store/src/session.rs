@@ -60,6 +60,20 @@ pub enum OutcomeKind {
     Unknown { reason: String },
 }
 
+/// A write [`GraphSession::external_write`] counts while it runs. It can travel to the task that
+/// sends it, off the main thread.
+#[must_use = "a write dropped without its outcome is recorded as unknown"]
+pub struct ExternalWrite {
+    done: oneshot::Sender<OutcomeKind>,
+}
+
+impl ExternalWrite {
+    /// Records how the write ended.
+    pub fn finish(self, outcome: OutcomeKind) {
+        self.done.send(outcome).ok();
+    }
+}
+
 /// Which property a draft is for: the node's type, its id and the property's name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DraftKey {
@@ -373,6 +387,9 @@ pub struct GraphSession {
     _schema_task: Option<Task<()>>,
     _branches_task: Option<Task<()>>,
     _datasets_task: Option<Task<()>>,
+    /// A counts read is under way, and commits seen meanwhile want one more after it.
+    counts_reading: bool,
+    counts_again: bool,
     _stored_queries_task: Option<Task<()>>,
 }
 
@@ -427,6 +444,8 @@ impl GraphSession {
             _schema_task: None,
             _branches_task: None,
             _datasets_task: None,
+            counts_reading: false,
+            counts_again: false,
             _stored_queries_task: None,
         };
         session._head_poll = Some(cx.spawn(async move |this, cx| {
@@ -774,8 +793,12 @@ impl GraphSession {
 
     /// Reads the counts again after a commit on the session's branch: the ones shown stay until
     /// the new ones are in, rather than blanking every count at each commit.
+    /// A burst of commits (an agent's writes) reads them once more after the read under way,
+    /// rather than dropping it and sending another at each.
     fn refresh_counts(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.datasets, Loadable::Loaded(_)) {
+        if self.counts_reading {
+            self.counts_again = true;
+        } else if matches!(self.datasets, Loadable::Loaded(_)) {
             self.read_counts(cx);
         } else {
             self.reload_counts(cx);
@@ -783,6 +806,8 @@ impl GraphSession {
     }
 
     fn read_counts(&mut self, cx: &mut Context<Self>) {
+        self.counts_reading = true;
+        self.counts_again = false;
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let branch = self.branch.clone();
@@ -806,8 +831,12 @@ impl GraphSession {
                     _ => HashMap::new(),
                 };
                 this.datasets = result;
+                this.counts_reading = false;
                 cx.emit(SessionEvent::CountsChanged);
                 cx.notify();
+                if this.counts_again {
+                    this.refresh_counts(cx);
+                }
             })
             .ok();
         }));
@@ -2287,31 +2316,38 @@ impl GraphSession {
         Self::to_outcome(work, cx)
     }
 
-    /// Records a write sent on the person's behalf outside this session's own calls, as the
-    /// agent's CLI writes through Studio's gateway (spec 013): logged with Studio's own
-    /// writes, and views of the branch learn of the commit. `branch_created` reads the branch
-    /// list again.
-    pub fn note_write(
+    /// A write sent on the person's behalf outside this session's own calls, as the agent's
+    /// CLI writes through Studio's gateway (spec 013), from the moment it is sent: it counts
+    /// among the writes in flight until [`ExternalWrite::finish`] records its outcome with
+    /// Studio's own writes, and views of the branch learn of its commit. Dropped without an
+    /// outcome, as when Studio stops the write's task, it is recorded as unknown.
+    /// `creates_branch` reads the branch list again once it went through.
+    pub fn external_write(
         &mut self,
         branch: String,
         description: String,
-        outcome: OutcomeKind,
-        branch_created: bool,
+        creates_branch: bool,
         cx: &mut Context<Self>,
-    ) {
-        let commit = match &outcome {
-            OutcomeKind::Committed { commit } => commit.clone(),
-            _ => None,
-        };
-        self.log_outcome(branch.clone(), description, outcome, None);
-        if let Some(commit) = commit {
-            self.committed(branch, commit, None, cx);
-        }
-        if branch_created {
-            self.reload_branches(cx);
-        }
+    ) -> ExternalWrite {
+        let (done, outcome) = oneshot::channel();
+        self.writes_in_flight += 1;
         cx.emit(SessionEvent::ActivityChanged);
         cx.notify();
+        cx.spawn(async move |this, cx| {
+            let outcome = outcome.await.unwrap_or_else(|_| OutcomeKind::Unknown {
+                reason: "Studio stopped before the server answered.".into(),
+            });
+            this.update(cx, |this, cx| {
+                let went_through = matches!(outcome, OutcomeKind::Committed { .. });
+                this.finish_write(branch, description, outcome, None, None, cx);
+                if creates_branch && went_through {
+                    this.reload_branches(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+        ExternalWrite { done }
     }
 
     /// Adds a write's outcome to the log, which keeps the newest [`OUTCOMES`].
@@ -2730,11 +2766,19 @@ mod tests {
         use std::sync::atomic::AtomicUsize;
         let snapshots = Arc::new(AtomicUsize::new(0));
         let counted = snapshots.clone();
+        // A gate the next snapshot read waits at, once one is set.
+        let gate: Arc<std::sync::Mutex<Option<oneshot::Receiver<()>>>> = Arc::default();
+        let held = gate.clone();
         let http = FakeHttpClient::create(move |request| {
+            let mut wait = None;
             if request.uri().path().ends_with("/snapshot") {
                 counted.fetch_add(1, Ordering::SeqCst);
+                wait = held.lock().unwrap().take();
             }
             async move {
+                if let Some(wait) = wait {
+                    wait.await.ok();
+                }
                 let body = serde_json::json!({
                     "branches": ["main"],
                     "graph_branch": "main",
@@ -2764,7 +2808,9 @@ mod tests {
             commit: Some(commit.into()),
         };
         session.update(cx, |session, cx| {
-            session.note_write("agent/x".into(), "w".into(), committed("c2"), false, cx);
+            session
+                .external_write("agent/x".into(), "w".into(), false, cx)
+                .finish(committed("c2"));
         });
         cx.run_until_parked();
         assert_eq!(
@@ -2773,27 +2819,98 @@ mod tests {
             "another branch's commit"
         );
         session.update(cx, |session, cx| {
-            session.note_write("main".into(), "w".into(), committed("c3"), false, cx);
+            session
+                .external_write("main".into(), "w".into(), false, cx)
+                .finish(committed("c3"));
+        });
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
             assert!(
                 matches!(session.datasets, Loadable::Loaded(_)),
                 "still shown"
             );
         });
-        cx.run_until_parked();
         assert_eq!(snapshots.load(Ordering::SeqCst), read + 1);
+
+        // A burst of commits while the counts are read: the read under way is kept, and one
+        // more follows it.
+        let (open, wait) = oneshot::channel::<()>();
+        *gate.lock().unwrap() = Some(wait);
+        let before = snapshots.load(Ordering::SeqCst);
+        for commit in ["c4", "c5", "c6"] {
+            session.update(cx, |session, cx| {
+                session
+                    .external_write("main".into(), "w".into(), false, cx)
+                    .finish(committed(commit));
+            });
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            snapshots.load(Ordering::SeqCst),
+            before + 1,
+            "one read under way"
+        );
+        open.send(()).ok();
+        cx.run_until_parked();
+        assert_eq!(
+            snapshots.load(Ordering::SeqCst),
+            before + 2,
+            "then one more"
+        );
+    }
+
+    /// A write sent outside the session's own calls counts as running until its outcome is
+    /// recorded; dropped without one, as when Studio stops its task, it is recorded as unknown.
+    #[gpui::test]
+    async fn an_external_write_counts_until_its_outcome_and_is_unknown_when_dropped(
+        cx: &mut TestAppContext,
+    ) {
+        let session = listing_session(r#"{"branches":["main"]}"#, "main", cx);
+        let first = session.update(cx, |session, cx| {
+            session.external_write("main".into(), "sent".into(), false, cx)
+        });
+        let second = session.update(cx, |session, cx| {
+            session.external_write("main".into(), "stopped".into(), false, cx)
+        });
+        session.read_with(cx, |session, _| assert_eq!(session.writes_in_flight, 2));
+        first.finish(OutcomeKind::Refused {
+            message: "no".into(),
+        });
+        drop(second);
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.writes_in_flight, 0);
+            let outcomes: Vec<_> = session
+                .outcomes
+                .iter()
+                .map(|entry| (entry.description.as_str(), &entry.outcome))
+                .collect();
+            assert!(matches!(
+                outcomes.as_slice(),
+                [
+                    ("sent", OutcomeKind::Refused { .. }),
+                    ("stopped", OutcomeKind::Unknown { .. })
+                ]
+            ));
+        });
     }
 
     /// The activity log keeps the newest writes.
     #[gpui::test]
     async fn the_activity_log_keeps_the_newest_writes(cx: &mut TestAppContext) {
         let session = listing_session(r#"{"branches":["main"]}"#, "main", cx);
-        session.update(cx, |session, cx| {
-            for n in 0..=OUTCOMES {
-                let refused = OutcomeKind::Refused {
-                    message: "no".into(),
-                };
-                session.note_write("main".into(), format!("write {n}"), refused, false, cx);
-            }
+        for n in 0..=OUTCOMES {
+            let refused = OutcomeKind::Refused {
+                message: "no".into(),
+            };
+            session.update(cx, |session, cx| {
+                session
+                    .external_write("main".into(), format!("write {n}"), false, cx)
+                    .finish(refused);
+            });
+            cx.run_until_parked();
+        }
+        session.read_with(cx, |session, _| {
             assert_eq!(session.outcomes.len(), OUTCOMES);
             assert_eq!(session.outcomes[0].description, "write 1");
             assert_eq!(

@@ -1,6 +1,7 @@
 //! The agent panel (spec 011): an external agent over the Agent Client Protocol, with graph
 //! tools Studio serves and runs itself. The agent never holds the person's token, and its
-//! changes land only on a branch of its own after the person approves each one.
+//! changes land only on a branch of its own, each shown as a card; with "Ask before writes"
+//! on, each waits until the person allows it.
 //!
 //! Layer 5 (`docs/architecture.md`). Plan: `specs/011-agent-panel/plan.md`.
 
