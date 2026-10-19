@@ -271,6 +271,10 @@ impl Connection {
         }
         let next = match served(health) {
             Ok(_) if self.state == ConnectionState::Ready => ConnectionState::Ready,
+            // `/healthz` asks for no token, so it passes for a refused one too: probing again
+            // would be refused alike, and would take the token field away while it is typed
+            // in. A new token connects again.
+            Ok(_) if self.state == ConnectionState::Unauthorized => ConnectionState::Unauthorized,
             // Recovered: probe the graphs again, which schedules the next check.
             Ok(_) => {
                 self.connect(cx);
@@ -446,6 +450,53 @@ mod tests {
             assert!(connection._health_check.is_none());
             assert_eq!(connection.state, ConnectionState::Idle);
         });
+    }
+
+    /// A refused token stays refused through health checks, which pass without one: the
+    /// graphs are not asked again with it.
+    #[gpui::test]
+    async fn a_refused_token_is_not_sent_again_by_a_health_check(cx: &mut TestAppContext) {
+        let listed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lists = listed.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let health = request.uri().path().ends_with("/healthz");
+            if !health {
+                lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            async move {
+                let (status, body) = if health {
+                    (
+                        200,
+                        r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#,
+                    )
+                } else {
+                    (401, r#"{"error":"unauthorized","code":"unauthorized"}"#)
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Studio,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        connection.update(cx, |connection, cx| connection.connect(cx));
+        cx.run_until_parked();
+        let asked = listed.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..3 {
+            cx.executor().advance_clock(FAILED_CHECK_INTERVAL);
+            cx.run_until_parked();
+            connection.read_with(cx, |connection, _| {
+                assert_eq!(connection.state, ConnectionState::Unauthorized)
+            });
+        }
+        assert_eq!(listed.load(std::sync::atomic::Ordering::SeqCst), asked);
     }
 
     /// A 0.13 server speaks the same contract header as 0.14, so its version is what refuses
