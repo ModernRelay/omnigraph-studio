@@ -355,6 +355,19 @@ impl ConnectionRegistry {
         cx: &mut Context<Self>,
     ) -> anyhow::Result<Entity<Connection>> {
         let url = graph_client::server_root(&url).map_err(anyhow::Error::msg)?;
+        // An address listed already is that server: a second connection to it would open its
+        // graphs twice, each window writing the same saved tabs over the other's.
+        if let Some(existing) = self
+            .connections
+            .iter()
+            .find(|connection| connection.read(cx).server.url == url)
+            .cloned()
+        {
+            if let Some(token) = token {
+                self.update_token(&existing, token, cx);
+            }
+            return Ok(existing);
+        }
         if let Some(token) = &token {
             cx.write_credentials(&url, KEYCHAIN_USER, token.as_bytes())
                 .detach();
@@ -542,6 +555,19 @@ mod tests {
         });
         apply(cx, files(&[("a", "http://a.test", Some("two"))]));
         assert_eq!(token_sent(cx, &a).as_deref(), Some("Bearer typed"));
+
+        // Adding an address listed already is that server again, not a second connection.
+        let count = registry.read_with(cx, |registry, _| registry.connections.len());
+        let again = registry.update(cx, |registry, cx| {
+            registry
+                .add_server("mine".into(), "http://a.test".into(), None, Vec::new(), cx)
+                .unwrap()
+        });
+        assert_eq!(again, a);
+        assert_eq!(
+            registry.read_with(cx, |registry, _| registry.connections.len()),
+            count
+        );
 
         // A new address is a new connection; a server no longer named leaves; a new one joins.
         assert!(apply(
