@@ -105,10 +105,9 @@ fn property_column(property: &Property, key: String) -> ColumnSpec {
     }
 }
 
-/// A node table's columns: the pinned key (or `@id`), then properties in schema order. Vector
-/// properties are hidden; Blob properties show as "Blob".
-/// A node table's columns: the key, the properties in schema order, then one column per
-/// relationship group in `groups`.
+/// A node table's columns: the pinned key (or `@id`), the properties in schema order, then one
+/// column per relationship group in `groups`. Vector properties are hidden; Blob properties
+/// show as "Blob".
 pub fn node_columns(node: &NodeType, groups: &[RelationshipGroup]) -> Vec<ColumnSpec> {
     let mut columns = Vec::new();
     match node.key.as_deref().and_then(|key| node.property(key)) {
@@ -776,8 +775,8 @@ pub fn row_matches(filters: &[Filter], values: &Map<String, Value>) -> bool {
     })
 }
 
-/// A filter as a chip reads: `title is Engineer`, `email is empty`, `has worksAt →`.
-/// A filter as its pill's parts: the field, the test and the value it compares with, if any.
+/// A filter as its pill's parts: the field, the test and the value it compares with, if any,
+/// as it reads: `title is Engineer`, `email is empty`, `has worksAt →`.
 pub fn filter_parts(filter: &Filter) -> (String, String, Option<String>) {
     // A relationship is named by its traversal; the pill's icon shows its direction.
     if let Some((_, edge)) = gq_language::builder::parse_relationship_key(&filter.property) {

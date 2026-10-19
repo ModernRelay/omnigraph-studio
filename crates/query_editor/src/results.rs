@@ -237,9 +237,6 @@ fn tree_title(tree: &str) -> String {
     }
 }
 
-/// `{"binding":"p","table":"node:Person","filter":null,"id":0,"properties":{…}}` →
-/// `binding=p, table=node:Person`. Nulls, ids and the planner's property bag are left out;
-/// text that is not a JSON object is kept as it is.
 /// Details that say how the engine keeps its books, not what the operator does: identities,
 /// table versions, statistics, tie-breaks.
 const BOOKKEEPING: &[&str] = &[
@@ -307,6 +304,9 @@ fn readable(value: &Value) -> Option<String> {
     }
 }
 
+/// `{"binding":"p","table":"node:Person","filter":null,"id":0,"properties":{…}}` →
+/// `binding=p, table=node:Person`. Nulls, ids and the planner's property bag are left out;
+/// text that is not a JSON object is kept as it is.
 pub fn summarize_detail(detail: &str) -> String {
     let Ok(Value::Object(map)) = serde_json::from_str::<Value>(detail) else {
         return detail.to_owned();

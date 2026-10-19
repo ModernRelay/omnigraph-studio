@@ -254,7 +254,7 @@ impl SettingsValues {
     }
 
     /// Whether the setting at `path` has its default value.
-    pub fn is_default_at(&self, path: &[String]) -> bool {
+    fn is_default_at(&self, path: &[String]) -> bool {
         self.at(path) == at(defaults(), path)
     }
 
@@ -313,7 +313,7 @@ impl StudioSettings {
     }
 
     /// The document with the setting at `path` back at its default.
-    pub fn reset_at(&self, path: &[String]) -> Self {
+    fn reset_at(&self, path: &[String]) -> Self {
         self.with_value(path, at(defaults(), path).clone())
             .unwrap_or_else(|_| self.clone())
     }

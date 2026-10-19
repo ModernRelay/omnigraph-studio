@@ -233,7 +233,7 @@ impl TypesList {
                     Loadable::Failed(error) => format!("Counts could not be read: {error}"),
                     _ => format!("Rows at the head of {}", s.branch),
                 };
-                let selected = active.as_deref() == Some(format!("type:{name}").as_str());
+                let selected = active.as_deref() == Some(crate::table_key(name, None).as_str());
                 // A click previews the type in the pane's preview tab; a double click keeps it.
                 let action = OpenType {
                     type_name: name.clone(),
