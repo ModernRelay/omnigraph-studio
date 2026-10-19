@@ -1356,7 +1356,7 @@ impl ReviewView {
         let mut banners: Vec<AnyElement> = Vec::new();
         if self.data.as_ref().is_some_and(|data| data.partial) {
             let text = format!(
-                "Partial: showing the first {} changes. The full branch diff needs a server route (E6).",
+                "Partial: showing the first {} changes, the most a review holds.",
                 group_digits(REVIEW_CHANGE_CAP)
             );
             banners.push(
@@ -2541,10 +2541,7 @@ impl Render for ReviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let header = self.render_header(cx);
         let body = match (&self.load, &self.data) {
-            (LoadState::Ready, Some(data)) if self.show_conflicts => {
-                let _ = data;
-                self.render_conflicts(cx)
-            }
+            (LoadState::Ready, Some(_)) if self.show_conflicts => self.render_conflicts(cx),
             (LoadState::Ready, Some(data)) if data.folded.changes.is_empty() => {
                 studio_ui::ds::empty_state(IconName::Check, "Nothing to review")
                     .child(studio_ui::ds::state_detail(if data.commits.is_empty() {
@@ -2596,8 +2593,6 @@ impl Render for ReviewView {
     }
 }
 
-/// Opens (or activates) the review of `branch` against `target`. `merge` starts the merge as
-/// soon as the review has read the branch head.
 /// Opens the review of `branch` against `target`. A merge starts there, from a head the person
 /// has seen: opening never merges.
 pub fn open_review(
