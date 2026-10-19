@@ -157,12 +157,7 @@ pub fn results_scene(
         for (node, _) in nodes.iter().skip(cap) {
             *counts.entry(node.type_name.as_str()).or_default() += 1;
         }
-        let most = counts
-            .into_iter()
-            .max_by_key(|(_, n)| *n)
-            .map(|(t, _)| t.to_owned())
-            .unwrap_or_default();
-        (capped, most)
+        (capped, most_left_out(counts).unwrap_or_default())
     });
     Scene {
         nodes: scene_nodes,
@@ -432,13 +427,18 @@ pub fn explore_scene(
 
     if !hidden.is_empty() {
         let total = hidden.values().sum();
-        let (type_name, _) = hidden
-            .into_iter()
-            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
-            .expect("not empty");
-        scene.capped = Some((total, type_name));
+        scene.capped = most_left_out(hidden).map(|type_name| (total, type_name));
     }
     scene
+}
+
+/// The type most of the nodes left out belong to; of types as many, the first by name, so the
+/// banner names the same one each time the scene is made.
+fn most_left_out<S: AsRef<str>>(counts: impl IntoIterator<Item = (S, usize)>) -> Option<String> {
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.as_ref().cmp(a.0.as_ref())))
+        .map(|(type_name, _)| type_name.as_ref().to_owned())
 }
 
 fn hub_limit(hub: &SceneNode, limits: &HashMap<GroupKey, usize>) -> usize {
@@ -469,6 +469,19 @@ fn push_edge(scene: &mut Scene, lines: &mut HashSet<(usize, usize)>, from: usize
 #[cfg(test)]
 mod tests {
     use gq_language::Direction;
+
+    /// Of types with as many nodes left out, the banner names the first by name, whatever
+    /// order they were counted in.
+    #[test]
+    fn the_banner_names_one_type_however_ties_are_counted() {
+        for counts in [
+            vec![("Person", 250), ("Company", 250), ("Note", 3)],
+            vec![("Company", 250), ("Note", 3), ("Person", 250)],
+        ] {
+            assert_eq!(super::most_left_out(counts).as_deref(), Some("Company"));
+        }
+        assert_eq!(super::most_left_out(Vec::<(&str, usize)>::new()), None);
+    }
     use graph_store::{Neighbour, NeighbourList};
 
     use super::*;
