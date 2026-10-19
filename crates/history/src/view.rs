@@ -556,7 +556,9 @@ impl HistoryView {
         // One accent for the branch's own lane; merged branches' lanes in a quiet grey, so the
         // graph reads as structure, not a palette.
         let accent = studio_ui::ds::surface::accent(cx);
-        let quiet = Color::Muted.color(cx).opacity(0.55);
+        let quiet = Color::Muted
+            .color(cx)
+            .opacity(studio_ui::ds::opacity::DIMMED);
         let graph_width = self.graph_width();
         let now = now_micros();
         range
@@ -661,11 +663,7 @@ impl HistoryView {
                                     div()
                                         .id(("merge", ix))
                                         .tooltip(Tooltip::text(format!("Merged into {branch}")))
-                                        .child(
-                                            Icon::new(IconName::PullRequest)
-                                                .size(IconSize::XSmall)
-                                                .color(Color::Muted),
-                                        ),
+                                        .child(studio_ui::ds::icon::meta(IconName::PullRequest)),
                                 )
                             }),
                     )
@@ -821,7 +819,7 @@ impl RowPaint {
                 point(x(lane), mid),
                 end,
                 Some(point(end.x, mid)),
-                color.opacity(0.5),
+                color.opacity(studio_ui::ds::opacity::DIMMED),
                 window,
             );
         }
@@ -873,11 +871,7 @@ impl Render for HistoryView {
         let header = studio_ui::ds::toolbar(cx)
             .when(!self.compact, |header| {
                 header
-                    .child(
-                        Icon::new(IconName::HistoryRerun)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
+                    .child(studio_ui::ds::icon::lead(IconName::HistoryRerun))
                     .child(studio_ui::ds::text::title("History"))
             })
             .child(studio_ui::ds::meta_row([
@@ -898,10 +892,9 @@ impl Render for HistoryView {
                 Banner::new()
                     .severity(Severity::Warning)
                     .child(
-                        Label::new(format!(
+                        studio_ui::ds::text::body(format!(
                             "{count} commits. The list loads in full until the server pages history (E10)."
-                        ))
-                        .size(LabelSize::Small),
+                        )),
                     ),
             )
         });

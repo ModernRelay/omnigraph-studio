@@ -237,11 +237,7 @@ impl Render for DesignGallery {
                     .child(text::body("environment"))
                     .child(text::muted("Ready"))
                     .child(div().flex_1())
-                    .child(
-                        Icon::new(IconName::ChevronUpDown)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    ),
+                    .child(studio_ui::ds::icon::meta(IconName::ChevronUpDown)),
             );
         // The right and bottom docks' tabs: title tabs, the active one on a pill.
         let dock_tabs = h_flex()
@@ -279,28 +275,16 @@ impl Render for DesignGallery {
                 .gap(px(space::SM))
                 .items_center()
                 .flex_none()
-                .child(
-                    Icon::new(IconName::DatabaseZap)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                )
+                .child(studio_ui::ds::icon::meta(IconName::DatabaseZap))
                 .child(text::body("knowledge"))
                 .child(
                     Label::new("/")
                         .size(LabelSize::Small)
                         .color(Color::Disabled),
                 )
-                .child(
-                    Icon::new(IconName::GitBranch)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                )
+                .child(studio_ui::ds::icon::meta(IconName::GitBranch))
                 .child(text::body("main"))
-                .child(
-                    Icon::new(IconName::ChevronUpDown)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                )
+                .child(studio_ui::ds::icon::meta(IconName::ChevronUpDown))
         };
 
         let columns = [
@@ -360,7 +344,7 @@ impl Render for DesignGallery {
         let card = ds::card(cx)
             .child(
                 ds::card_header(cx)
-                    .child(Icon::new(IconName::Pencil).size(IconSize::XSmall).color(Color::Muted))
+                    .child(studio_ui::ds::icon::meta(IconName::Pencil))
                     .child(text::body("Retitle person-000000"))
                     .child(div().flex_1())
                     .child(ds::meta(IconName::GitBranch, "agent/20261012-095049"))
@@ -453,11 +437,7 @@ impl Render for DesignGallery {
                         studio_ui::ds::button("g-search", "Search")
                             .full_width()
                             .style(ButtonStyle::Outlined)
-                            .start_icon(
-                                Icon::new(IconName::MagnifyingGlass)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            ),
+                            .start_icon(studio_ui::ds::icon::lead(IconName::MagnifyingGlass)),
                     ),
                 ),
             );
@@ -524,11 +504,7 @@ impl Render for DesignGallery {
                 h_flex()
                     .gap(px(space::XS))
                     .child(text::meta("By"))
-                    .child(
-                        Icon::new(IconName::Person)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
+                    .child(studio_ui::ds::icon::meta(IconName::Person))
                     .child(text::meta("act-dev"))
                     .into_any_element(),
             ]));
@@ -592,11 +568,7 @@ impl Render for DesignGallery {
                     .border_1()
                     .border_color(surface::raised_border(cx))
                     .bg(surface::document(cx))
-                    .child(
-                        Icon::new(IconName::Plus)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
+                    .child(studio_ui::ds::icon::meta(IconName::Plus))
                     .child(text::muted("Add note")),
             )
             .child(
@@ -614,11 +586,7 @@ impl Render for DesignGallery {
                     )
                     .child(
                         ds::TimelineEntry::new("t3", "review", "merged into main", "24 May")
-                            .lead(
-                                Icon::new(IconName::GitBranch)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            )
+                            .lead(studio_ui::ds::icon::lead(IconName::GitBranch))
                             .source(IconName::GitCommit, "4S3Y6CKK")
                             .last(true),
                     ),
@@ -640,11 +608,7 @@ impl Render for DesignGallery {
                             .flex()
                             .justify_center()
                             .pt(px(space::XS))
-                            .child(
-                                Icon::new(IconName::Person)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            ),
+                            .child(studio_ui::ds::icon::lead(IconName::Person)),
                     )
                     .child(text::muted("Ask about the graph, or ask for a change…")),
             )
@@ -661,11 +625,7 @@ impl Render for DesignGallery {
                         ds::pill("g-agent", cx)
                             .child(ui::Indicator::dot().color(Color::Success))
                             .child(text::body("Claude Agent"))
-                            .child(
-                                Icon::new(IconName::ChevronDown)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
+                            .child(studio_ui::ds::icon::meta(IconName::ChevronDown)),
                     )
                     .child(ds::composer_button("g-send", IconName::ArrowUp, true, cx)),
             );
@@ -772,23 +732,16 @@ impl Render for DesignGallery {
             )
             .child(
                 ds::modal_body().child(
-                    ds::row_list(cx)
-                        .bg(surface::document(cx))
-                        .border_color(surface::floating_border(cx))
-                        .child(
-                            h_flex()
-                                .h(px(size::SIDEBAR_ROW))
-                                .px(px(space::MD))
-                                .gap(px(space::MD))
-                                .child(studio_ui::type_swatch("Person", cx))
-                                .child(Label::new("Ada Lovelace").size(LabelSize::Small))
-                                .child(div().flex_1())
-                                .child(
-                                    Label::new("needs WorksAt")
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                ),
-                        ),
+                    ds::row_list(cx).child(
+                        h_flex()
+                            .h(px(size::SIDEBAR_ROW))
+                            .px(px(space::MD))
+                            .gap(px(space::MD))
+                            .child(studio_ui::type_swatch("Person", cx))
+                            .child(studio_ui::ds::text::body("Ada Lovelace"))
+                            .child(div().flex_1())
+                            .child(studio_ui::ds::text::meta("needs WorksAt")),
+                    ),
                 ),
             )
             .child(

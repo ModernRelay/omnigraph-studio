@@ -293,13 +293,9 @@ impl Render for BranchList {
                 }
             }
             Err(Some(error)) => {
-                list = list.child(
-                    div().px(px(ds::space::MD)).child(
-                        Label::new(format!("Branches could not be read: {error}"))
-                            .size(LabelSize::XSmall)
-                            .color(Color::Error),
-                    ),
-                )
+                list = list.child(div().px(px(ds::space::MD)).child(
+                    studio_ui::ds::text::error_note(format!("Branches could not be read: {error}")),
+                ))
             }
             Err(None) => list = list.child(studio_ui::ds::sidebar_note("Reading branches…")),
         }
@@ -436,17 +432,8 @@ impl Render for CreateBranchModal {
             .child(
                 ds::modal_body()
                     .child(field(&self.name, cx))
-                    .child(
-                        Label::new(cli)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .buffer_font(cx),
-                    )
-                    .children(
-                        self.error
-                            .clone()
-                            .map(|e| Label::new(e).size(LabelSize::Small).color(Color::Error)),
-                    ),
+                    .child(studio_ui::ds::text::meta(cli).buffer_font(cx))
+                    .children(self.error.clone().map(studio_ui::ds::text::error)),
             )
             .child(
                 ds::modal_footer(cx)
@@ -686,11 +673,7 @@ impl Render for DeleteBranchModal {
                 dialog.child(
                     ds::modal_body()
                         .when(typing, |body| body.child(field(&self.confirm, cx)))
-                        .children(
-                            self.error
-                                .clone()
-                                .map(|e| Label::new(e).size(LabelSize::Small).color(Color::Error)),
-                        ),
+                        .children(self.error.clone().map(studio_ui::ds::text::error)),
                 )
             })
             .child(

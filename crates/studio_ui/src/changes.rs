@@ -177,9 +177,7 @@ impl ChangeCard {
 /// One property's row: its name, then before → after for a change, the value of an addition,
 /// or the last value of a removal, struck through.
 fn property_row(row: &PropertyRow, kind: ChangeKind) -> Div {
-    let name = Label::new(row.name.clone())
-        .size(LabelSize::Small)
-        .color(Color::Muted)
+    let name = crate::ds::text::muted(row.name.clone())
         .single_line()
         .truncate();
     let inner = match (kind, &row.before, &row.after) {
@@ -197,7 +195,7 @@ fn property_row(row: &PropertyRow, kind: ChangeKind) -> Div {
                 Color::Deleted,
                 true,
             )))
-            .child(Label::new("→").size(LabelSize::Small).color(Color::Muted))
+            .child(crate::ds::text::muted("→"))
             .child(
                 div()
                     .flex_1()
@@ -242,7 +240,7 @@ fn pieces_row(pieces: Vec<Piece>) -> Div {
             };
             let label = Label::new(piece.text).size(LabelSize::Small).color(color);
             // Its own space, so a struck removal does not strike it.
-            let space = piece.spaced.then(|| Label::new(" ").size(LabelSize::Small));
+            let space = piece.spaced.then(|| crate::ds::text::body(" "));
             space
                 .into_iter()
                 .chain([if strike { label.strikethrough() } else { label }])
@@ -511,31 +509,22 @@ impl RenderOnce for ChangeCard {
             )
             .map(|header| match &self.endpoints {
                 Some((from, to)) => header.child(
-                    Label::new(format!("{from} → {to}"))
-                        .size(LabelSize::Small)
+                    crate::ds::text::body(format!("{from} → {to}"))
                         .buffer_font(cx)
                         .single_line()
                         .truncate(),
                 ),
                 None => match &self.name {
                     Some(name) => header
+                        .child(crate::ds::text::body(name.clone()).single_line().truncate())
                         .child(
-                            Label::new(name.clone())
-                                .size(LabelSize::Small)
-                                .single_line()
-                                .truncate(),
-                        )
-                        .child(
-                            Label::new(self.entity_id.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
+                            crate::ds::text::meta(self.entity_id.clone())
                                 .buffer_font(cx)
                                 .single_line()
                                 .truncate(),
                         ),
                     None => header.child(
-                        Label::new(self.entity_id.clone())
-                            .size(LabelSize::Small)
+                        crate::ds::text::body(self.entity_id.clone())
                             .buffer_font(cx)
                             .single_line()
                             .truncate(),
@@ -559,11 +548,7 @@ impl RenderOnce for ChangeCard {
                 .child(
                     h_flex()
                         .gap(px(space::MD))
-                        .child(
-                            Label::new("Relationships")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
+                        .child(crate::ds::text::meta("Relationships"))
                         .child(change_counts(added, changed, removed)),
                 )
                 .children(self.relationships)
@@ -595,7 +580,7 @@ impl RenderOnce for ChangeCard {
                     .px(px(space::LG))
                     .py(px(space::MD))
                     .gap(px(space::XS))
-                    .when(self.hollow, |d| d.opacity(0.6))
+                    .when(self.hollow, |d| d.opacity(crate::ds::opacity::DIMMED))
                     .child(header)
                     .children(rows)
                     .children(relationships),
@@ -719,7 +704,7 @@ impl RenderOnce for RelationshipLine {
             Some(kind) => Label::new(kind.symbol())
                 .size(LabelSize::Small)
                 .color(kind.color()),
-            None => Label::new("·").size(LabelSize::Small).color(Color::Muted),
+            None => crate::ds::text::muted("·"),
         };
         let tooltip = match self.kind {
             Some(kind) => kind.label(),
@@ -740,19 +725,13 @@ impl RenderOnce for RelationshipLine {
                 div()
                     .w(px(crate::ds::size::FIELD_LABEL - space::MD - space::INLINE))
                     .flex_none()
-                    .child(
-                        Label::new(self.label)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .single_line()
-                            .truncate(),
-                    ),
+                    .child(crate::ds::text::muted(self.label).single_line().truncate()),
             )
-            .child(
-                Label::new(if self.outgoing { "→" } else { "←" })
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
+            .child(crate::ds::text::muted(if self.outgoing {
+                "→"
+            } else {
+                "←"
+            }))
             .child(
                 h_flex()
                     .flex_1()
@@ -765,17 +744,12 @@ impl RenderOnce for RelationshipLine {
                             .single_line()
                             .truncate(),
                     )
-                    .children(self.other_detail.map(|detail| {
-                        Label::new(detail)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .single_line()
-                    })),
+                    .children(
+                        self.other_detail
+                            .map(|detail| crate::ds::text::meta(detail).single_line()),
+                    ),
             )
-            .children(
-                self.note
-                    .map(|note| Label::new(note).size(LabelSize::XSmall).color(Color::Muted)),
-            )
+            .children(self.note.map(crate::ds::text::meta))
             .children(
                 self.status
                     .map(|(text, color)| Label::new(text).size(LabelSize::XSmall).color(color)),
@@ -798,7 +772,7 @@ impl RenderOnce for RelationshipLine {
                 let hover = crate::ds::surface::highlight(cx);
                 d.hover(move |d| d.bg(hover))
             })
-            .when(self.hollow, |d| d.opacity(0.6))
+            .when(self.hollow, |d| d.opacity(crate::ds::opacity::DIMMED))
             .child(line)
             .children(rows);
         match self.on_click {
@@ -844,12 +818,12 @@ pub fn change_group_header(
         .pt(px(space::LG))
         .pb(px(space::XS))
         .child(crate::kind_swatch(type_name, is_edge, cx))
-        .child(Label::new(type_name.to_owned()).size(LabelSize::Small))
-        .child(
-            Label::new(if is_edge { "relationship" } else { "node" })
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
-        )
+        .child(crate::ds::text::body(type_name.to_owned()))
+        .child(crate::ds::text::meta(if is_edge {
+            "relationship"
+        } else {
+            "node"
+        }))
         .child(change_counts(added, changed, removed))
 }
 

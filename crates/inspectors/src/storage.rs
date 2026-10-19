@@ -12,7 +12,7 @@ use graph_client::api::{
 };
 use graph_store::{GraphSession, Loadable, SessionEvent};
 use studio_ui::CopyableValue;
-use studio_ui::ds::space;
+use studio_ui::ds::{Dotted as _, space};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 
@@ -285,16 +285,12 @@ impl StorageInspector {
                     h_flex()
                         .gap(px(space::MD))
                         .min_h(px(studio_ui::ds::size::SIDEBAR_ROW))
-                        .child(
-                            div().w(px(col::KIND)).flex_none().child(
-                                Label::new(match dataset.entity_kind {
-                                    EntityKind::Node => "node",
-                                    EntityKind::Edge => "edge",
-                                })
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                            ),
-                        )
+                        .child(div().w(px(col::KIND)).flex_none().child(
+                            studio_ui::ds::text::muted(match dataset.entity_kind {
+                                EntityKind::Node => "node",
+                                EntityKind::Edge => "edge",
+                            }),
+                        ))
                         .child(
                             h_flex()
                                 .w(px(col::TYPE))
@@ -383,7 +379,7 @@ fn error_of(errors: &[&Option<String>]) -> Option<String> {
 }
 
 fn heading(text: &'static str) -> Label {
-    Label::new(text).size(LabelSize::XSmall).color(Color::Muted)
+    studio_ui::ds::text::meta(text)
 }
 
 fn column(text: &'static str, width: f32) -> Div {
@@ -398,7 +394,7 @@ fn kv(label: &'static str, value: CopyableValue) -> AnyElement {
             div()
                 .w(px(studio_ui::ds::size::FIELD_LABEL))
                 .flex_none()
-                .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
+                .child(studio_ui::ds::text::muted(label)),
         )
         .child(div().flex_1().min_w_0().child(value))
         .into_any_element()
@@ -439,13 +435,13 @@ fn graph_row(ix: usize, graph: &GraphInfo, current: bool) -> AnyElement {
             div()
                 .w(px(col::FLAG))
                 .flex_none()
-                .child(Label::new(yes_no(graph.read_available)).size(LabelSize::Small)),
+                .child(studio_ui::ds::text::body(yes_no(graph.read_available))),
         )
         .child(
             div()
                 .w(px(col::FLAG))
                 .flex_none()
-                .child(Label::new(yes_no(graph.write_available)).size(LabelSize::Small)),
+                .child(studio_ui::ds::text::body(yes_no(graph.write_available))),
         )
         .child(
             div()
@@ -454,11 +450,12 @@ fn graph_row(ix: usize, graph: &GraphInfo, current: bool) -> AnyElement {
                 .child(CopyableValue::new(("graph-action", ix), Some(action)).plain()),
         )
         .child(
-            div().w(px(col::FAILURE)).flex_none().child(
-                Label::new(failure.unwrap_or_else(|| "none".into()))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            ),
+            div()
+                .w(px(col::FAILURE))
+                .flex_none()
+                .child(studio_ui::ds::text::muted(
+                    failure.unwrap_or_else(|| "none".into()),
+                )),
         )
         .child(div().flex_1().min_w_0().child(CopyableValue::new(
             ("graph-uri", ix),
@@ -485,24 +482,15 @@ fn section(title: &str, error: Option<String>, rows: Vec<AnyElement>, cx: &App) 
         .gap(px(space::XS))
         .py(px(space::LG))
         .border_b_1()
-        .border_color(studio_ui::ds::surface::rule(cx))
-        .child(
-            Label::new(title.to_owned())
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-        )
-        .children(error.map(|e| {
-            Label::new(format!("Could not read: {e}"))
-                .size(LabelSize::Small)
-                .color(Color::Error)
-        }))
+        .dotted(cx)
+        .child(studio_ui::ds::text::muted(title.to_owned()))
+        .children(error.map(|e| studio_ui::ds::text::error(format!("Could not read: {e}"))))
         .children(rows)
         .into_any_element()
 }
 
 impl Render for StorageInspector {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = studio_ui::ds::surface::rule(cx);
         let graph_id = self.session.read(cx).graph_id.clone();
         let loading = self.snapshot.is_loading();
         let server = self.render_server(cx);
@@ -513,30 +501,19 @@ impl Render for StorageInspector {
             .track_focus(&self.focus_handle)
             .size_full()
             .child(
-                h_flex()
-                    .flex_none()
-                    .px(px(space::XL))
-                    .py(px(space::MD))
-                    .gap(px(space::MD))
-                    .border_b_1()
-                    .border_color(border)
+                studio_ui::ds::toolbar(cx)
                     .child(
-                        Icon::new(IconName::Server)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
+                        studio_ui::ds::icon::lead(IconName::Server),
                     )
                     .child(studio_ui::ds::text::title(format!(
                         "Storage · {graph_id} @ {}",
                         self.branch
                     )))
-                    .when(loading, |d| {
-                        d.child(Label::new("Reading…").size(LabelSize::Small).color(Color::Muted))
-                    })
+                    .when(loading, |d| d.child(studio_ui::ds::text::meta("Reading…")))
                     .child(div().flex_1())
                     .child(
-                        studio_ui::ds::toolbar_button("refresh-storage", "Refresh")
-                            .style(ButtonStyle::Subtle)
-                            .start_icon(Icon::new(IconName::RotateCw).size(IconSize::Small))
+                        studio_ui::ds::toolbar_icon_button("refresh-storage", IconName::RotateCw)
+                            .tooltip(ui::Tooltip::text("Read the server's state again"))
                             .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
                     ),
             )

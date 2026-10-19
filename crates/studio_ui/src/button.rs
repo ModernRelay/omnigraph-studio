@@ -503,7 +503,10 @@ impl RenderOnce for Button {
     }
 }
 
-/// An icon button: a circle around one icon. What `ds::icon_button` makes.
+/// An icon button: one icon in a square of the radius scale's small corner. By default Zed's
+/// 22 px size (`size::BAR_BUTTON`), which every strip, toolbar and floating bar holds with
+/// room around its fill; `ds::icon_button` is the 28 px one, beside a field or a medium
+/// button.
 #[derive(IntoElement)]
 pub struct IconButton {
     base: Base,
@@ -520,7 +523,7 @@ impl IconButton {
             base: Base::new(
                 id.into(),
                 Variant::Ghost,
-                ButtonSize::Medium,
+                ButtonSize::Default,
                 Shape::Rounded,
             ),
             icon,

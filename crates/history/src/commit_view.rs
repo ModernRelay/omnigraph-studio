@@ -390,11 +390,7 @@ impl CommitView {
             .child(
                 h_flex()
                     .gap(px(studio_ui::ds::space::INLINE))
-                    .child(
-                        Icon::new(IconName::GitCommit)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
+                    .child(studio_ui::ds::icon::meta(IconName::GitCommit))
                     .child(studio_ui::ds::text::meta("Commit"))
                     .child(div().flex_1())
                     .child(self.render_open_at(cx)),

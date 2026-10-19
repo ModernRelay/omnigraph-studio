@@ -702,15 +702,11 @@ impl RelationshipTree {
             .w(px(DISCLOSURE))
             .flex_none()
             .when(disclosure, |d| {
-                d.child(
-                    Icon::new(if expanded {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-                )
+                d.child(studio_ui::ds::icon::meta(if expanded {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                }))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     cx.stop_propagation();
                     let path = toggle_path.clone();
@@ -739,8 +735,7 @@ impl RelationshipTree {
                     })
                     .child(
                         div().min_w_0().flex_shrink(1.).child(
-                            Label::new(label.unwrap_or_else(|| node.id.clone()))
-                                .size(LabelSize::Small)
+                            studio_ui::ds::text::body(label.unwrap_or_else(|| node.id.clone()))
                                 .when(root, |label| {
                                     label.weight(studio_ui::ds::text::weight::HEADING)
                                 })
@@ -751,35 +746,23 @@ impl RelationshipTree {
                         div()
                             .min_w(px(studio_ui::ds::size::SHORT_LABEL))
                             .flex_shrink(1.)
-                            .child(
-                                Label::new(key)
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .truncate_start(),
-                            )
+                            .child(studio_ui::ds::text::meta(key).truncate_start())
                     }))
                     .child(div().flex_1())
-                    .children(hint.map(|hint| {
-                        Label::new(hint)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .single_line()
-                    }))
+                    .children(hint.map(|hint| studio_ui::ds::text::meta(hint).single_line()))
                     .into_any_element()
             }
             EntryKind::Cycle { node, .. } => h_flex()
                 .min_w_0()
                 .flex_1()
                 .gap(px(space::SM))
-                .child(Label::new("↺").size(LabelSize::Small).color(Color::Muted))
+                .child(studio_ui::ds::text::muted("↺"))
                 .child(type_swatch(&node.type_name, cx))
                 .child(
-                    div().min_w_0().flex_shrink(1.).child(
-                        Label::new(rows::node_text(state, node))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .truncate(),
-                    ),
+                    div()
+                        .min_w_0()
+                        .flex_shrink(1.)
+                        .child(studio_ui::ds::text::muted(rows::node_text(state, node)).truncate()),
                 )
                 .child(
                     Label::new("already above")
@@ -803,12 +786,10 @@ impl RelationshipTree {
                     .flex_1()
                     .gap(px(space::SM))
                     .child(
-                        Label::new(format!(
+                        studio_ui::ds::text::meta(format!(
                             "{} →",
                             gq_language::traversal_name(&key.group.edge)
                         ))
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
                         .single_line(),
                     )
                     // The target's dot, as on a neighbour row; none when there is no target.
@@ -817,8 +798,7 @@ impl RelationshipTree {
                     })
                     .child(
                         div().min_w_0().flex_shrink(1.).child(
-                            Label::new(value)
-                                .size(LabelSize::Small)
+                            studio_ui::ds::text::body(value)
                                 .when(target.is_none(), |label| label.color(Color::Muted))
                                 .truncate(),
                         ),
@@ -937,18 +917,11 @@ impl RelationshipTree {
                         ),
                     )
                     .child(div().flex_1())
-                    .child(
-                        Label::new(count.to_string())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .single_line(),
-                    )
+                    .child(studio_ui::ds::text::meta(count.to_string()).single_line())
                     .into_any_element()
             }
             EntryKind::OtherValues { shown, rest } => {
-                Label::new(rows::other_values_label(*shown, *rest))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
+                studio_ui::ds::text::meta(rows::other_values_label(*shown, *rest))
                     .single_line()
                     .into_any_element()
             }
@@ -971,9 +944,7 @@ impl RelationshipTree {
                     .single_line()
                     .into_any_element()
             }
-            EntryKind::Loading { .. } => Label::new("Loading…")
-                .size(LabelSize::XSmall)
-                .color(Color::Muted)
+            EntryKind::Loading { .. } => studio_ui::ds::text::meta("Loading…")
                 .single_line()
                 .into_any_element(),
             EntryKind::Error { target, message } => {
@@ -994,12 +965,7 @@ impl RelationshipTree {
                             .min_w_0()
                             .flex_shrink(1.)
                             .tooltip(Tooltip::text(tooltip))
-                            .child(
-                                Label::new(message.clone())
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Error)
-                                    .truncate(),
-                            ),
+                            .child(studio_ui::ds::text::error_note(message.clone()).truncate()),
                     )
                     .child(
                         Button::new(("retry", row), "Retry")
@@ -1271,15 +1237,13 @@ impl RelationshipTree {
                             .rounded(px(studio_ui::ds::radii(cx).sm))
                             .bg(field)
                             .child(
-                                Icon::new(IconName::MagnifyingGlass)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
+                                studio_ui::ds::icon::meta(IconName::MagnifyingGlass),
                             )
                             .child(
                                 div()
                                     .min_w_0()
                                     .flex_1()
-                                    .child(Label::new(filter).size(LabelSize::Small).truncate()),
+                                    .child(studio_ui::ds::text::body(filter).truncate()),
                             )
                             .child(
                                 Label::new("esc")
@@ -1580,24 +1544,18 @@ impl HoverCard {
                     .child(studio_ui::ds::type_dot(&self.type_name))
                     .child(
                         div().min_w_0().flex_shrink(1.).child(
-                            Label::new(self.label.clone().unwrap_or_else(|| self.id.clone()))
-                                .size(LabelSize::Small)
-                                .weight(studio_ui::ds::text::weight::HEADING)
-                                .truncate(),
+                            studio_ui::ds::text::body(
+                                self.label.clone().unwrap_or_else(|| self.id.clone()),
+                            )
+                            .weight(studio_ui::ds::text::weight::HEADING)
+                            .truncate(),
                         ),
                     )
-                    .child(
-                        Label::new(self.type_name.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .single_line(),
-                    ),
+                    .child(studio_ui::ds::text::meta(self.type_name.clone()).single_line()),
             )
             .when(self.label.is_some(), |card| {
                 card.child(
-                    Label::new(self.id.clone())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
+                    studio_ui::ds::text::meta(self.id.clone())
                         .buffer_font(cx)
                         .truncate(),
                 )
@@ -1610,22 +1568,16 @@ impl HoverCard {
                         .gap(px(space::XXS))
                         .border_t_1()
                         .border_color(studio_ui::ds::surface::rule(cx))
-                        .children(self.relationship.clone().map(|relationship| {
-                            Label::new(relationship)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                        }))
+                        .children(self.relationship.clone().map(studio_ui::ds::text::meta))
                         .children(self.edge.iter().map(|(name, value)| {
                             let value = rows::edge_value(value);
                             h_flex()
                                 .gap(px(space::MD))
                                 .child(
-                                    div().w(px(name_width)).flex_none().child(
-                                        Label::new(name.clone())
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted)
-                                            .truncate(),
-                                    ),
+                                    div()
+                                        .w(px(name_width))
+                                        .flex_none()
+                                        .child(studio_ui::ds::text::meta(name.clone()).truncate()),
                                 )
                                 .child(
                                     div().min_w_0().flex_1().child(

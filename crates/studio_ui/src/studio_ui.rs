@@ -121,12 +121,7 @@ pub fn resizable_grid_header(
                 .gap(px(crate::ds::space::SM))
                 .overflow_hidden()
                 .when(column.align_right, |d| d.justify_end())
-                .child(
-                    Label::new(column.title.clone())
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .single_line(),
-                )
+                .child(crate::ds::text::muted(column.title.clone()).single_line())
                 .children(column.detail.clone().map(|detail| {
                     Label::new(detail)
                         .size(LabelSize::XSmall)
@@ -192,11 +187,7 @@ pub fn kind_swatch(type_name: &str, is_edge: bool, cx: &App) -> Div {
             .flex()
             .items_center()
             .justify_center()
-            .child(
-                Icon::new(IconName::ArrowRight)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-            )
+            .child(crate::ds::icon::meta(IconName::ArrowRight))
     } else {
         type_swatch(type_name, cx)
     }

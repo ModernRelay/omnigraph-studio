@@ -25,7 +25,7 @@ use studio_actions::agent::{Allow, AllowAlways, ClearQueue, Reject, Restart, Sen
 use studio_actions::graph::ReviewBranch;
 use studio_settings::StudioSettings;
 use studio_ui::ds;
-use studio_ui::ds::IconButton;
+use studio_ui::ds::{Dotted as _, IconButton};
 use studio_ui::menu::ContextMenu;
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
@@ -2456,7 +2456,6 @@ impl Render for AgentPanel {
             .pb(px(ds::space::LG))
             .border_t_1()
             .border_color(ds::surface::rule(cx))
-            .when(ds::is_glass(cx), |row| row.border_dashed())
             .tooltip(Tooltip::text(format!(
                 "The agent reads {graph} at {branch}; its changes go to a branch of its own"
             )))
@@ -3659,7 +3658,7 @@ impl AgentPanel {
                     .gap(px(ds::space::SM))
                     .items_center()
                     .border_t_1()
-                    .border_color(border)
+                    .dotted(cx)
                     .tooltip(Tooltip::text(entry.text.clone()))
                     .child(Indicator::dot().color(if next { Color::Accent } else { Color::Muted }))
                     .child(

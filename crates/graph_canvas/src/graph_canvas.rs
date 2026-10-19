@@ -1874,6 +1874,10 @@ impl GraphCanvas {
                 .filter(|shadow| !shadow.inset)
                 .collect(),
             on_tint: studio_ui::ds::surface::on_tint(cx),
+            here: studio_ui::ds::surface::here(cx),
+            here_halo: studio_ui::ds::surface::here_halo(cx),
+            pointed: studio_ui::ds::surface::pointed_border(cx),
+            grid_dot: studio_ui::ds::surface::grid_dot(cx),
             font: theme::theme_settings(cx).ui_font(cx).clone(),
         };
         let scene = self.scene.clone();
@@ -2414,7 +2418,6 @@ impl Render for GraphCanvas {
             .area
             .zip(self.bounds.get())
             .map(|((from, to), bounds)| {
-                let accent = studio_ui::ds::surface::accent(cx);
                 div()
                     .absolute()
                     .left(from.x.min(to.x) - bounds.origin.x)
@@ -2423,8 +2426,8 @@ impl Render for GraphCanvas {
                     .h((to.y - from.y).abs())
                     .rounded(px(studio_ui::ds::radii(cx).xs))
                     .border_1()
-                    .border_color(accent.opacity(0.6))
-                    .bg(accent.opacity(0.08))
+                    .border_color(studio_ui::ds::surface::marquee_border(cx))
+                    .bg(studio_ui::ds::surface::marquee(cx))
             });
         div()
             .id("graph-canvas")

@@ -2276,24 +2276,15 @@ impl Workspace {
                     .gap(px(studio_ui::ds::space::SM))
                     .items_center()
                     .child(Indicator::dot().color(color))
-                    .child(Label::new(server).size(LabelSize::Small).single_line())
-                    .child(
-                        Label::new(state)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .single_line(),
-                    )
+                    .child(studio_ui::ds::text::body(server).single_line())
+                    .child(studio_ui::ds::text::muted(state).single_line())
                     .when(others > 0, |row| {
                         row.child(studio_ui::ds::sidebar_count(format!(
                             "+{others} graph{}",
                             if others == 1 { "" } else { "s" }
                         )))
                     })
-                    .child(
-                        Icon::new(IconName::ChevronUpDown)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    ),
+                    .child(studio_ui::ds::icon::meta(IconName::ChevronUpDown)),
             );
         PopoverMenu::new("graph-switcher-menu")
             .anchor(gpui::Anchor::BottomLeft)
@@ -2439,7 +2430,7 @@ impl Workspace {
                     .border_r_1()
                     .border_color(hairline)
                     .when(in_corner && index == 0, |tab| {
-                        tab.rounded_tl(px(studio_ui::ds::radii(cx).lg))
+                        tab.rounded_tl(px(studio_ui::ds::radii(cx).sheet()))
                     })
                     .when(selected, |tab| tab.bg(editor_bg))
                     .when(!selected, |tab| {
@@ -2468,9 +2459,7 @@ impl Workspace {
                         h_flex()
                             .gap(px(studio_ui::ds::space::XS))
                             .items_center()
-                            .children(item.tab_icon(cx).map(|icon| {
-                                Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)
-                            }))
+                            .children(item.tab_icon(cx).map(studio_ui::ds::icon::meta))
                             .child(
                                 Label::new(item.tab_title(cx))
                                     .size(LabelSize::Small)
@@ -2708,7 +2697,16 @@ impl Workspace {
 
     /// One pane: its header and its active tab. Pressing anywhere in it makes it the active
     /// pane.
-    fn render_pane(&self, pane_id: PaneId, cx: &mut Context<Self>) -> AnyElement {
+    fn render_pane(
+        &self,
+        pane_id: PaneId,
+        floor: SheetFloor,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let has_item = self
+            .pane(pane_id)
+            .and_then(|pane| pane.active_item())
+            .is_some();
         let body = match self.pane(pane_id).and_then(|pane| pane.active_item()) {
             // Cached, as Zed caches each pane: the tab's view is drawn again only when it
             // notifies, so a hover or a toast elsewhere replays it from the last frame. A tab
@@ -2743,6 +2741,8 @@ impl Workspace {
                     Some(SplitDirection::Down) => area.left_0().right_0().bottom_0().h_1_2(),
                 }
             });
+        // Every tab is a document on the document's fill, which the pane paints, not the view.
+        let corner = px(studio_ui::ds::radii(cx).sheet());
         let body = div()
             .id(SharedString::from(format!("pane-body-{pane_id}")))
             .flex_1()
@@ -2750,6 +2750,12 @@ impl Workspace {
             .flex()
             .flex_col()
             .relative()
+            .when(has_item, |body| {
+                body.bg(studio_ui::ds::surface::document(cx))
+                    .when(floor.bottom, |body| body.pb(corner))
+                    .when(floor.bottom && floor.left, |body| body.rounded_bl(corner))
+                    .when(floor.bottom && floor.right, |body| body.rounded_br(corner))
+            })
             .child(body)
             .children(overlay)
             .on_drag_move(
@@ -2800,6 +2806,7 @@ impl Workspace {
         &self,
         member: &Member,
         path: Vec<usize>,
+        floor: SheetFloor,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Member::Split {
@@ -2815,7 +2822,7 @@ impl Workspace {
             if self.zoomed == Some(Zoomed::Pane(*id)) {
                 return div().size_full().into_any_element();
             }
-            return self.render_pane(*id, cx);
+            return self.render_pane(*id, floor, cx);
         };
         let axis = *axis;
         let hairline = studio_ui::ds::surface::rule(cx);
@@ -2836,9 +2843,11 @@ impl Workspace {
             .size_full()
             .min_w_0()
             .min_h_0();
+        let count = members.len();
         for (index, (child, flex)) in members.iter().zip(flexes).enumerate() {
             let mut child_path = path.clone();
             child_path.push(index);
+            let child_floor = floor.member(axis, index, count);
             let mut cell = div()
                 .relative()
                 .flex()
@@ -2848,7 +2857,7 @@ impl Workspace {
                 .flex_basis(px(0.))
                 .flex_grow(*flex)
                 .flex_shrink(1.)
-                .child(self.render_member(child, child_path, cx));
+                .child(self.render_member(child, child_path, child_floor, cx));
             if index > 0 {
                 cell = if horizontal {
                     cell.border_l_1()
@@ -3055,7 +3064,7 @@ impl Workspace {
                         .when(unavailable.is_some(), |button| {
                             button.child(Indicator::dot().color(Color::Warning))
                         })
-                        .child(Label::new(graph).size(LabelSize::Small).single_line())
+                        .child(studio_ui::ds::text::body(graph).single_line())
                         .on_click(|_, window, cx| {
                             window
                                 .dispatch_action(Box::new(studio_actions::workspace::OpenGraph), cx)
@@ -3075,16 +3084,8 @@ impl Workspace {
                                 .tooltip(Tooltip::text(format!(
                                     "Reads and edits in this window use {branch}. Switch branch."
                                 )))
-                                .start_icon(
-                                    Icon::new(IconName::GitBranch)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Muted),
-                                )
-                                .end_icon(
-                                    Icon::new(IconName::ChevronUpDown)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Muted),
-                                ),
+                                .start_icon(studio_ui::ds::icon::meta(IconName::GitBranch))
+                                .end_icon(studio_ui::ds::icon::meta(IconName::ChevronUpDown)),
                         )
                         .menu(move |window, cx| {
                             let session = session_for_menu.clone();
@@ -3114,13 +3115,21 @@ impl Workspace {
     ) -> impl IntoElement {
         let editor_background = studio_ui::ds::surface::document(cx);
         let center = self.center.clone();
-        let body =
-            div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .child(self.render_member(&center, Vec::new(), cx));
-        let column = if studio_ui::ds::is_glass(cx) {
+        let glass = studio_ui::ds::is_glass(cx);
+        // On glass the panes along the sheet's bottom meet its rounded corners, unless the
+        // bottom dock sits under them inside the sheet.
+        let floor = SheetFloor {
+            bottom: glass && bottom.is_none(),
+            left: true,
+            right: true,
+        };
+        let body = div().flex_1().min_h_0().flex().child(self.render_member(
+            &center,
+            Vec::new(),
+            floor,
+            cx,
+        ));
+        let column = if glass {
             studio_ui::ds::sheet(cx)
         } else {
             div().bg(editor_background)
@@ -3262,7 +3271,8 @@ impl Workspace {
     /// dock's panel with its header.
     fn render_zoomed(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let content = match self.zoomed? {
-            Zoomed::Pane(id) => self.render_pane(id, cx),
+            // The zoomed card is the document's fill itself, so nothing shows at its corners.
+            Zoomed::Pane(id) => self.render_pane(id, SheetFloor::default(), cx),
             Zoomed::Dock(position) => {
                 let dock = match position {
                     PanelPosition::Left => &self.left,
@@ -3286,7 +3296,7 @@ impl Workspace {
                 .bg(studio_ui::ds::surface::document(cx))
                 .border_1()
                 .border_color(studio_ui::ds::surface::floating_border(cx))
-                .rounded(px(studio_ui::ds::radii(cx).lg))
+                .rounded(px(studio_ui::ds::radii(cx).sheet()))
                 .shadow(studio_ui::ds::elevation::float(cx))
                 .overflow_hidden()
                 .occlude()
@@ -3307,7 +3317,7 @@ impl Workspace {
             studio_ui::ds::button(id, label)
                 .full_width()
                 .style(ButtonStyle::Outlined)
-                .start_icon(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                .start_icon(studio_ui::ds::icon::lead(icon))
                 .key_binding(binding)
                 .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
         };
@@ -3454,7 +3464,7 @@ impl Workspace {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(Label::new(toast.message.clone()).size(LabelSize::Small)),
+                            .child(studio_ui::ds::text::body(toast.message.clone())),
                     )
                     .children(toast.action.as_ref().map(|(label, action)| {
                         let action = action.boxed_clone();
@@ -3828,8 +3838,7 @@ fn dock_title(panel: &PanelEntry) -> impl IntoElement {
         .gap(px(studio_ui::ds::space::SM))
         .items_center()
         .child(
-            Label::new(panel.title.clone())
-                .size(LabelSize::Small)
+            studio_ui::ds::text::body(panel.title.clone())
                 .single_line()
                 .truncate(),
         )
@@ -3876,6 +3885,35 @@ fn toggle_action(position: PanelPosition) -> Box<dyn Action> {
 /// the top-left pane, unless the traffic lights' space comes first (`render_pane_header`: the
 /// sidebar hidden, or no graph open). GPUI clips a sheet's children to its rectangle, not its
 /// corners, so that tab takes the sheet's radius or its shade shows outside the curve.
+/// Where a pane meets the bottom of the document sheet on glass. GPUI clips a child to the
+/// sheet's rectangle, not its rounded corners, so the pane rounds its document fill into the
+/// corners it reaches and keeps its tab's content a corner's radius above the sheet's edge,
+/// where a view's own fill (an editor's, a table's) cannot square the corner.
+#[derive(Clone, Copy, Default)]
+struct SheetFloor {
+    bottom: bool,
+    left: bool,
+    right: bool,
+}
+
+impl SheetFloor {
+    /// The floor of the `index`th of `count` members split along `axis`.
+    fn member(self, axis: SplitAxis, index: usize, count: usize) -> Self {
+        let last = index + 1 == count;
+        match axis {
+            SplitAxis::Horizontal => Self {
+                bottom: self.bottom,
+                left: self.left && index == 0,
+                right: self.right && last,
+            },
+            SplitAxis::Vertical => Self {
+                bottom: self.bottom && last,
+                ..self
+            },
+        }
+    }
+}
+
 fn first_tab_in_sheet_corner(
     glass: bool,
     top_left_pane: bool,
@@ -3925,11 +3963,8 @@ struct DraggedTab {
 impl Render for DraggedTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         studio_ui::ds::drag_preview(cx)
-            .children(
-                self.icon
-                    .map(|icon| Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)),
-            )
-            .child(Label::new(self.title.clone()).size(LabelSize::Small))
+            .children(self.icon.map(studio_ui::ds::icon::meta))
+            .child(studio_ui::ds::text::body(self.title.clone()))
     }
 }
 

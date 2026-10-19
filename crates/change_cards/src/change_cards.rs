@@ -138,11 +138,9 @@ pub fn run_header(
 ) -> Div {
     v_flex()
         .children(run.section.map(|section| {
-            div().pt(px(space::XL)).child(
-                Label::new(section_title(section))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
+            div()
+                .pt(px(space::XL))
+                .child(studio_ui::ds::text::muted(section_title(section)))
         }))
         .child(
             change_group_header(
@@ -154,14 +152,10 @@ pub fn run_header(
                 cx,
             )
             .when(run.relationships > 0, |d| {
-                d.child(
-                    Label::new(match run.relationships {
-                        1 => "· 1 relationship".to_owned(),
-                        n => format!("· {} relationships", group_digits(n)),
-                    })
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-                )
+                d.child(studio_ui::ds::text::meta(match run.relationships {
+                    1 => "· 1 relationship".to_owned(),
+                    n => format!("· {} relationships", group_digits(n)),
+                }))
             }),
         )
 }

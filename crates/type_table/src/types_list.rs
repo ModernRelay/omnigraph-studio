@@ -112,16 +112,10 @@ impl Render for TypesList {
                     .px(px(studio_ui::ds::space::LG))
                     .py(px(studio_ui::ds::space::XS))
                     .gap(px(studio_ui::ds::space::XS))
-                    .child(
-                        Label::new("Studio could not read the schema.")
-                            .size(LabelSize::Small)
-                            .color(Color::Error),
-                    )
-                    .child(
-                        Label::new(error)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
+                    .child(studio_ui::ds::text::error(
+                        "Studio could not read the schema.",
+                    ))
+                    .child(studio_ui::ds::text::meta(error))
                     .child(
                         studio_ui::ds::button("reload-schema", "Try again")
                             .style(ButtonStyle::Subtle)

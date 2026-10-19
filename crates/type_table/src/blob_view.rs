@@ -847,12 +847,9 @@ impl Item for BlobView {
                         .into_any_element(),
                 );
             }
-            Some(Export::Failed(error)) => end.push(
-                Label::new(error.clone())
-                    .size(LabelSize::XSmall)
-                    .color(Color::Error)
-                    .into_any_element(),
-            ),
+            Some(Export::Failed(error)) => {
+                end.push(studio_ui::ds::text::error_note(error.clone()).into_any_element())
+            }
             None => {}
         }
         if self.size.is_some() {

@@ -279,12 +279,8 @@ fn render_field(field: &Field, cx: &App) -> AnyElement {
         .child(
             h_flex()
                 .gap(px(studio_ui::ds::space::MD))
-                .child(Label::new(p.name.clone()).size(LabelSize::Small))
-                .child(
-                    Label::new(p.display_type())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
+                .child(studio_ui::ds::text::body(p.name.clone()))
+                .child(studio_ui::ds::text::meta(p.display_type()))
                 .when(p.is_key, |d| {
                     d.child(
                         Label::new("key")
@@ -293,19 +289,11 @@ fn render_field(field: &Field, cx: &App) -> AnyElement {
                     )
                 })
                 .when(required && !p.is_key, |d| {
-                    d.child(
-                        Label::new("required")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
+                    d.child(studio_ui::ds::text::meta("required"))
                 }),
         )
         .child(field_box(&field.editor, field.error.is_some(), cx))
-        .children(field.error.clone().map(|error| {
-            Label::new(error)
-                .size(LabelSize::XSmall)
-                .color(Color::Error)
-        }))
+        .children(field.error.clone().map(studio_ui::ds::text::error_note))
         .into_any_element()
 }
 
@@ -339,9 +327,7 @@ impl Render for InsertRowModal {
             .child(
                 modal_body()
                     .children(fields)
-                    .children(
-                        blocked.map(|b| Label::new(b).size(LabelSize::Small).color(Color::Error)),
-                    )
+                    .children(blocked.map(studio_ui::ds::text::error))
                     .children(self.notice.clone().map(|notice| {
                         Label::new(notice.message)
                             .size(LabelSize::Small)
@@ -778,7 +764,6 @@ impl InsertEdgeModal {
                 .id(("endpoint-suggestions", end as usize))
                 .max_h(px(studio_ui::ds::size::LIST_MAX_HEIGHT))
                 .overflow_y_scroll()
-                .border_color(studio_ui::ds::surface::rule(cx))
                 .children(endpoint.offers.rows(
                     "endpoint-suggestion",
                     Rc::new(move |index, window, cx| pick(&index, window, cx)),
@@ -790,17 +775,9 @@ impl InsertEdgeModal {
             .child(
                 h_flex()
                     .gap(px(studio_ui::ds::space::MD))
-                    .child(Label::new(label.to_owned()).size(LabelSize::Small))
-                    .child(
-                        Label::new(endpoint.type_name.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new("required")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
+                    .child(studio_ui::ds::text::body(label.to_owned()))
+                    .child(studio_ui::ds::text::meta(endpoint.type_name.clone()))
+                    .child(studio_ui::ds::text::meta("required")),
             )
             .child(
                 div()
@@ -816,11 +793,7 @@ impl InsertEdgeModal {
                     .child(field_box(&endpoint.editor, endpoint.error.is_some(), cx)),
             )
             .children(offers)
-            .children(endpoint.error.clone().map(|error| {
-                Label::new(error)
-                    .size(LabelSize::XSmall)
-                    .color(Color::Error)
-            }))
+            .children(endpoint.error.clone().map(studio_ui::ds::text::error_note))
             .into_any_element()
     }
 }
@@ -859,9 +832,7 @@ impl Render for InsertEdgeModal {
                     .child(from)
                     .child(to)
                     .children(fields)
-                    .children(
-                        blocked.map(|b| Label::new(b).size(LabelSize::Small).color(Color::Error)),
-                    )
+                    .children(blocked.map(studio_ui::ds::text::error))
                     .children(self.notice.clone().map(|notice| {
                         Label::new(notice.message)
                             .size(LabelSize::Small)
@@ -1215,25 +1186,19 @@ impl DeleteRowModal {
                 h_flex()
                     .gap(px(studio_ui::ds::space::MD))
                     .child(studio_ui::ds::spinner())
-                    .child(
-                        Label::new("Finding what depends on it…")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
+                    .child(studio_ui::ds::text::muted("Finding what depends on it…"))
                     .into_any_element(),
             ),
             Loadable::Failed(error) => Some(
-                Label::new(format!("Studio could not read what depends on it. {error}"))
-                    .size(LabelSize::Small)
-                    .color(Color::Error)
-                    .into_any_element(),
+                studio_ui::ds::text::error(format!(
+                    "Studio could not read what depends on it. {error}"
+                ))
+                .into_any_element(),
             ),
             Loadable::Loaded(plan) if plan.dependents.is_empty() => None,
             Loadable::Loaded(plan) => {
                 let hidden = plan.dependents.len().saturating_sub(DEPENDENTS_NAMED);
                 let list = studio_ui::ds::row_list(cx)
-                    .bg(studio_ui::ds::surface::document(cx))
-                    .border_color(studio_ui::ds::surface::floating_border(cx))
                     .children(plan.dependents.iter().take(DEPENDENTS_NAMED).map(|d| {
                         h_flex()
                             .h(px(studio_ui::ds::size::SIDEBAR_ROW))
@@ -1242,26 +1207,23 @@ impl DeleteRowModal {
                             .child(studio_ui::type_swatch(&d.type_name, cx))
                             .child(
                                 div().min_w_0().flex_1().child(
-                                    Label::new(d.label.clone().unwrap_or_else(|| d.id.clone()))
-                                        .size(LabelSize::Small)
-                                        .single_line()
-                                        .truncate(),
+                                    studio_ui::ds::text::body(
+                                        d.label.clone().unwrap_or_else(|| d.id.clone()),
+                                    )
+                                    .single_line()
+                                    .truncate(),
                                 ),
                             )
                             .child(
-                                Label::new(format!("needs {}", d.edge))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
+                                studio_ui::ds::text::meta(format!("needs {}", d.edge))
                                     .single_line(),
                             )
                     }))
                     .when(hidden > 0, |list| {
                         list.child(
-                            div().px(px(studio_ui::ds::space::MD)).child(
-                                Label::new(format!("and {hidden} more"))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
+                            div()
+                                .px(px(studio_ui::ds::space::MD))
+                                .child(studio_ui::ds::text::meta(format!("and {hidden} more"))),
                         )
                     });
                 Some(list.into_any_element())

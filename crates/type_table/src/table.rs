@@ -4055,30 +4055,17 @@ impl TypeTable {
         if count == 0 && !self.drafts.saving {
             return None;
         }
-        let (border, fill) = (
-            studio_ui::ds::surface::floating_border(cx),
-            studio_ui::ds::surface::solid(cx),
-        );
         let saving = self.drafts.saving;
         let focus = self.focus_handle.clone();
         let save_tooltip = format!(
             "One commit to {}; each row is bound to the values it shows",
             self.branch
         );
-        let pill = h_flex()
-            .id("drafts-bar")
-            .occlude()
+        // The canvas's floating bar: its text at a control's inset, its buttons the bar's.
+        let pill = studio_ui::ds::float_bar("drafts-bar", cx)
             .max_w(px(studio_ui::ds::size::READING_WIDTH))
-            .pl(px(space::LG))
-            .pr(px(space::SM))
-            .py(px(space::XS))
+            .pl(px(space::CONTROL_INSET))
             .gap(px(space::MD))
-            .items_center()
-            .rounded(px(studio_ui::ds::radii(cx).lg))
-            .bg(fill)
-            .border_1()
-            .border_color(border)
-            .shadow(studio_ui::ds::elevation::float(cx))
             .child(Indicator::dot().color(Color::Accent))
             .child(
                 Label::new(if saving {
@@ -4099,7 +4086,7 @@ impl TypeTable {
             }))
             .when(count > 0 && !saving, |bar| {
                 bar.child(
-                    studio_ui::ds::button(
+                    studio_ui::ds::bar_button(
                         "drafts-discard",
                         if self.drafts.confirm_discard {
                             format!("Discard {}", plural(count, "draft", "drafts"))
@@ -4115,7 +4102,7 @@ impl TypeTable {
                     .on_click(cx.listener(|this, _, _, cx| this.discard_drafts(cx))),
                 )
                 .child(
-                    studio_ui::ds::button("drafts-save", "Save as one commit")
+                    studio_ui::ds::bar_button("drafts-save", "Save as one commit")
                         .style(ButtonStyle::Tinted(TintColor::Accent))
                         .tooltip(move |_, cx| {
                             Tooltip::for_action_in(save_tooltip.clone(), &SaveDrafts, &focus, cx)
@@ -4884,7 +4871,7 @@ impl TypeTable {
                 div()
                     .id("row-count")
                     .when_some(count_error, |d, error| d.tooltip(Tooltip::text(error)))
-                    .child(Label::new(count).size(LabelSize::Small).color(Color::Muted)),
+                    .child(studio_ui::ds::text::muted(count)),
             )
             // Where edits go is the branch the status bar names; the table says only when it
             // cannot edit.
@@ -4900,10 +4887,9 @@ impl TypeTable {
                                 cx,
                             )
                             .into_any_element(),
-                            None => Label::new(self.read_only_label())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .into_any_element(),
+                            None => {
+                                studio_ui::ds::text::meta(self.read_only_label()).into_any_element()
+                            }
                         }),
                 )
             })
@@ -5189,10 +5175,6 @@ impl TypeTable {
 
     /// The values the filter's value field offers, under it: ↑/↓ highlight, ↵ or a click picks.
     fn render_suggestions(&self, draft: &FilterDraft, cx: &mut Context<Self>) -> AnyElement {
-        let (bg, border) = (
-            studio_ui::ds::surface::floating(cx),
-            studio_ui::ds::surface::floating_border(cx),
-        );
         let pick =
             cx.listener(|this, index: &usize, window, cx| this.pick_suggestion(*index, window, cx));
         let items = draft.offers.rows(
@@ -5212,16 +5194,13 @@ impl TypeTable {
                         .offset(point(px(-space::XS), px(studio_ui::ds::size::CONTROL)))
                         .snap_to_window_with_margin(px(space::MD))
                         .child(
-                            studio_ui::ds::row_list(cx)
+                            studio_ui::ds::popover_list(cx)
                                 .id("filter-suggestions")
                                 .occlude()
                                 .min_w(px(studio_ui::ds::size::POPOVER_MIN))
                                 .max_w(px(studio_ui::ds::size::POPOVER_MAX))
                                 .max_h(px(studio_ui::ds::size::LIST_MAX_HEIGHT))
                                 .overflow_y_scroll()
-                                .border_color(border)
-                                .bg(bg)
-                                .shadow(studio_ui::ds::elevation::floating(cx))
                                 .children(items),
                         ),
                 )
@@ -5461,11 +5440,9 @@ impl TypeTable {
         // out by the row callback for the lines it draws, not for every loaded row.
         let looks: Rc<RefCell<HashMap<usize, RowLook>>> = Rc::default();
         self.frame_looks = looks.clone();
-        let picked_bg = studio_ui::ds::surface::selected_document(cx).opacity(0.6);
+        let picked_bg = studio_ui::ds::surface::picked(cx);
         let header_bg = studio_ui::ds::surface::well(cx);
         let line_count = lines.as_ref().map_or(self.rows.len(), |lines| lines.len());
-        let hairline = studio_ui::ds::surface::rule(cx);
-        let glass = studio_ui::ds::is_glass(cx);
         // Widths fitted to each column's type unless dragged. Not Zed's resizable columns: they
         // draw a full-height rule between every column, which the visual language leaves out
         // (spec 002); the header's edges resize instead.
@@ -5483,15 +5460,15 @@ impl TypeTable {
             .disable_base_style()
             .hide_row_borders()
             .pin_cols(1)
-            .map_row(move |(ix, row), _window, _cx| {
+            .map_row(move |(ix, row), _window, cx| {
                 let look = looks.borrow().get(&ix).copied().unwrap_or_default();
-                row.border_b_1()
-                    .border_color(hairline)
-                    .when(glass, |row| row.border_dashed())
+                studio_ui::ds::dotted(row.border_b_1(), cx)
                     .when(look.header, |row| row.bg(header_bg))
                     .when(look.picked, |row| row.bg(picked_bg))
                     .when(look.cursor, |row| row.bg(selected_bg))
-                    .when(look.dimmed, |row| row.opacity(0.45))
+                    .when(look.dimmed, |row| {
+                        row.opacity(studio_ui::ds::opacity::DIMMED)
+                    })
                     .into_any_element()
             })
             .uniform_list(
@@ -5657,20 +5634,13 @@ impl TypeTable {
             // one type differ.
             .when_some(id.clone().filter(|_| repeated), |header, id| {
                 header.child(
-                    div().min_w_0().flex_shrink(1000.).child(
-                        Label::new(id)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .truncate_start(),
-                    ),
+                    div()
+                        .min_w_0()
+                        .flex_shrink(1000.)
+                        .child(studio_ui::ds::text::meta(id).truncate_start()),
                 )
             })
-            .child(
-                Label::new(format_count(section.count as i64))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
-                    .single_line(),
-            )
+            .child(studio_ui::ds::text::meta(format_count(section.count as i64)).single_line())
             .when_some(id, |header, id| header.tooltip(Tooltip::text(id)))
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_section(index, cx)))
             .into_any_element();
@@ -5684,10 +5654,7 @@ impl TypeTable {
         };
         let page = self.page_size(cx);
         let content: AnyElement = if section.loading {
-            Label::new("Loading…")
-                .size(LabelSize::XSmall)
-                .color(Color::Muted)
-                .into_any_element()
+            studio_ui::ds::text::meta("Loading…").into_any_element()
         } else if let Some(error) = &section.error {
             h_flex()
                 .gap(px(space::XS))
@@ -5759,11 +5726,9 @@ impl TypeTable {
                 .px(px(space::LG))
                 .items_center()
                 .child(
-                    Label::new(format!(
+                    studio_ui::ds::text::meta(format!(
                         "The first {GROUP_LIMIT} values are shown; filter to see the others"
                     ))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted)
                     .single_line(),
                 )
                 .into_any_element(),
@@ -6168,9 +6133,7 @@ impl TypeTable {
             .items_center()
             .gap(px(space::XS))
             .overflow_hidden()
-            .when(col == 0, |d| {
-                d.border_r_1().border_color(divider.opacity(0.6))
-            })
+            .when(col == 0, |d| d.border_r_1().border_color(divider))
             .when(column.align_right, |d| d.justify_end());
         // The cursor and the editor are drawn as a ring over the cell, so no cell changes size.
         let ring = || {
@@ -6370,17 +6333,11 @@ impl TypeTable {
                                             )
                                         })
                                 }))
-                                .children(hint.map(|hint| {
-                                    Label::new(hint).size(LabelSize::XSmall).color(Color::Muted)
-                                }))
-                                .child(
-                                    Label::new(format!(
-                                        "↵ save · esc cancel · write · {}",
-                                        self.branch
-                                    ))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                                ),
+                                .children(hint.map(studio_ui::ds::text::meta))
+                                .child(studio_ui::ds::text::meta(format!(
+                                    "↵ save · esc cancel · write · {}",
+                                    self.branch
+                                ))),
                         ),
                 )
                 .with_priority(2),

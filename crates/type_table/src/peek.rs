@@ -822,12 +822,9 @@ impl NodePeek {
                     _ => "reading…".into(),
                 };
                 let body: Option<AnyElement> = match (&slot.meta, &slot.preview) {
-                    (Loadable::Failed(error), _) | (_, Loadable::Failed(error)) => Some(
-                        Label::new(error.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Error)
-                            .into_any_element(),
-                    ),
+                    (Loadable::Failed(error), _) | (_, Loadable::Failed(error)) => {
+                        Some(studio_ui::ds::text::error(error.clone()).into_any_element())
+                    }
                     (Loadable::Loaded(BlobMeta::External { uri }), _) => Some(
                         v_flex()
                             .gap(px(space::XS))
@@ -907,12 +904,9 @@ impl NodePeek {
                                     .into_any_element(),
                             )
                         }
-                        Some(SaveState::Failed(error)) => Some(
-                            Label::new(error.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Error)
-                                .into_any_element(),
-                        ),
+                        Some(SaveState::Failed(error)) => {
+                            Some(studio_ui::ds::text::error_note(error.clone()).into_any_element())
+                        }
                         None if managed => Some(
                             h_flex()
                                 .gap(px(space::XXS))
@@ -951,12 +945,8 @@ impl NodePeek {
                         h_flex()
                             .gap(px(space::MD))
                             .items_center()
-                            .child(
-                                Icon::new(IconName::File)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .child(Label::new(slot.property.clone()).size(LabelSize::Small))
+                            .child(studio_ui::ds::icon::meta(IconName::File))
+                            .child(studio_ui::ds::text::body(slot.property.clone()))
                             .child(studio_ui::ds::text::meta(facts))
                             .child(div().flex_1())
                             .children(save),
@@ -2228,7 +2218,7 @@ impl NodePeek {
                 .gap(px(space::SM))
                 .items_center()
                 .child(Indicator::dot().color(Color::Accent))
-                .child(Label::new(label).size(LabelSize::Small))
+                .child(studio_ui::ds::text::body(label))
                 .children(self.drafts_notice.as_ref().map(|notice| {
                     Label::new(notice.message.clone())
                         .size(LabelSize::XSmall)
@@ -2355,16 +2345,10 @@ impl NodePeek {
         let values = match &self.values {
             Loadable::Loaded(values) => values,
             Loadable::Failed(error) => {
-                return Label::new(error.clone())
-                    .size(LabelSize::Small)
-                    .color(Color::Error)
-                    .into_any_element();
+                return studio_ui::ds::text::error(error.clone()).into_any_element();
             }
             _ => {
-                return Label::new("Reading…")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .into_any_element();
+                return studio_ui::ds::text::muted("Reading…").into_any_element();
             }
         };
         let hover = studio_ui::ds::surface::highlight(cx);
@@ -2404,11 +2388,9 @@ impl NodePeek {
                             .and_then(|p| self.render_picker(index, p, &value, cx));
                         let opens_editor = editable && picker.is_none() && !editing && !saving;
                         let body = match (self.edits.get(&name), picker) {
-                            _ if let Some(then) = self.absent.get(&name) => Label::new(
+                            _ if let Some(then) = self.absent.get(&name) => studio_ui::ds::text::muted(
                                 absence_text(then, true),
                             )
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
                             .into_any_element(),
                             (Some(edit), _) => self.render_field_edit(edit, window, cx),
                             (None, _) if draft.is_some() => {
@@ -2416,8 +2398,7 @@ impl NodePeek {
                                 h_flex()
                                     .gap(px(space::SM))
                                     .child(
-                                        Label::new(if text.trim().is_empty() { "—".to_owned() } else { studio_ui::text::first_line(&text) })
-                                            .size(LabelSize::Small),
+                                        studio_ui::ds::text::body(if text.trim().is_empty() { "—".to_owned() } else { studio_ui::text::first_line(&text) }),
                                     )
                                     .child(Indicator::dot().color(Color::Accent))
                                     .into_any_element()
@@ -2478,9 +2459,7 @@ impl NodePeek {
                                         0.
                                     }))
                                     .child(
-                                        Label::new(title)
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted)
+                                        studio_ui::ds::text::muted(title)
                                             .truncate(),
                                     ),
                             )
@@ -2582,11 +2561,7 @@ impl NodePeek {
                                 )
                                 .style(ButtonStyle::Subtle)
                                 .size(ButtonSize::Compact)
-                                .end_icon(
-                                    Icon::new(IconName::ChevronDown)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Muted),
-                                ),
+                                .end_icon(studio_ui::ds::icon::meta(IconName::ChevronDown)),
                             )
                             .anchor(gpui::Anchor::TopLeft)
                             .menu(move |window, cx| {
@@ -2767,8 +2742,8 @@ impl NodePeek {
                         )
                     })
             }))
-            .children(hint.map(|hint| Label::new(hint).size(LabelSize::XSmall).color(Color::Muted)))
-            .child(Label::new(keys).size(LabelSize::XSmall).color(Color::Muted))
+            .children(hint.map(studio_ui::ds::text::meta))
+            .child(studio_ui::ds::text::meta(keys))
             .into_any_element()
     }
 
@@ -2818,27 +2793,14 @@ impl NodePeek {
                 this.show_empty = !this.show_empty;
                 cx.notify();
             }))
-            .child(
-                Icon::new(if open {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                })
-                .size(IconSize::XSmall)
-                .color(Color::Muted),
-            )
-            .child(
-                Label::new("Empty")
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
+            .child(studio_ui::ds::icon::meta(if open {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            }))
+            .child(studio_ui::ds::text::muted("Empty"))
             .child(div().flex_1())
-            .child(
-                Label::new(format_count(folded as i64))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .buffer_font(cx),
-            )
+            .child(studio_ui::ds::text::muted(format_count(folded as i64)).buffer_font(cx))
             .into_any_element()
     }
 
@@ -2876,35 +2838,22 @@ impl NodePeek {
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_group(index, cx)))
             .when_some(failed, |d, error| d.tooltip(Tooltip::text(error)))
-            .child(
-                Icon::new(if group.expanded {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                })
-                .size(IconSize::XSmall)
-                .color(Color::Muted),
-            )
-            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
-            .child(
-                Label::new(gq_language::traversal_name(&group.group.edge)).size(LabelSize::Small),
-            )
-            .child(
-                Label::new(group.group.other_type.clone())
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
+            .child(studio_ui::ds::icon::meta(if group.expanded {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            }))
+            .child(studio_ui::ds::icon::meta(icon))
+            .child(studio_ui::ds::text::body(gq_language::traversal_name(
+                &group.group.edge,
+            )))
+            .child(studio_ui::ds::text::muted(group.group.other_type.clone()))
             .child(div().flex_1())
             .when(self.edge_writes.contains(&index), |header| {
                 header.child(Indicator::dot().color(Color::Warning))
             })
             .children(add)
-            .child(
-                Label::new(count)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .buffer_font(cx),
-            );
+            .child(studio_ui::ds::text::muted(count).buffer_font(cx));
         let adding = self
             .adding
             .as_ref()
@@ -2991,10 +2940,9 @@ impl NodePeek {
         let replaces = self.holds_one(index)
             && matches!(self.groups[index].count, Loadable::Loaded(n) if n > 0);
         let found = match &adding.found {
-            Loadable::Loaded(found) if found.is_empty() => Label::new("No match")
-                .size(LabelSize::XSmall)
-                .color(Color::Muted)
-                .into_any_element(),
+            Loadable::Loaded(found) if found.is_empty() => {
+                studio_ui::ds::text::meta("No match").into_any_element()
+            }
             Loadable::Loaded(found) => v_flex()
                 .children(found.iter().enumerate().map(|(n, node)| {
                     let highlighted = n == adding.highlighted;
@@ -3015,28 +2963,20 @@ impl NodePeek {
                         }))
                         .child(studio_ui::type_swatch(&other, cx))
                         .child(
-                            Label::new(node.label.clone().unwrap_or_else(|| node.id.clone()))
-                                .size(LabelSize::Small)
-                                .truncate(),
+                            studio_ui::ds::text::body(
+                                node.label.clone().unwrap_or_else(|| node.id.clone()),
+                            )
+                            .truncate(),
                         )
                         .when(node.label.is_some(), |row| {
-                            row.child(
-                                Label::new(node.id.clone())
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .truncate(),
-                            )
+                            row.child(studio_ui::ds::text::meta(node.id.clone()).truncate())
                         })
                 }))
                 .into_any_element(),
-            Loadable::Failed(error) => Label::new(error.clone())
-                .size(LabelSize::XSmall)
-                .color(Color::Error)
-                .into_any_element(),
-            _ => Label::new("Searching…")
-                .size(LabelSize::XSmall)
-                .color(Color::Muted)
-                .into_any_element(),
+            Loadable::Failed(error) => {
+                studio_ui::ds::text::error_note(error.clone()).into_any_element()
+            }
+            _ => studio_ui::ds::text::meta("Searching…").into_any_element(),
         };
         let keys = if replaces {
             format!("↑↓ choose · ↵ replace · esc cancel · write · {branch}")
@@ -3058,15 +2998,11 @@ impl NodePeek {
             .gap(px(space::XS))
             .child(
                 studio_ui::ds::field_frame(false, cx)
-                    .child(
-                        Icon::new(IconName::MagnifyingGlass)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
+                    .child(studio_ui::ds::icon::meta(IconName::MagnifyingGlass))
                     .child(studio_ui::ds::field_input(adding.editor.clone())),
             )
             .child(found)
-            .child(Label::new(keys).size(LabelSize::XSmall).color(Color::Muted))
+            .child(studio_ui::ds::text::meta(keys))
             .into_any_element()
     }
 
@@ -3118,11 +3054,7 @@ impl NodePeek {
         match &group.neighbours {
             Loadable::Loaded(neighbours) if neighbours.is_empty() => div()
                 .pl(px(CHILD_INDENT))
-                .child(
-                    Label::new("None at this commit")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
+                .child(studio_ui::ds::text::meta("None at this commit"))
                 .into_any_element(),
             Loadable::Loaded(neighbours) => {
                 let more = match &group.count {
@@ -3163,11 +3095,7 @@ impl NodePeek {
                                     window.dispatch_action(Box::new(open), cx)
                                 }
                             })
-                            .child(
-                                Label::new(format!("{label} · Open page"))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            )
+                            .child(studio_ui::ds::text::meta(format!("{label} · Open page")))
                             .into_any_element()
                     }
                 });
@@ -3206,22 +3134,16 @@ impl NodePeek {
                             })
                             .child(studio_ui::type_swatch(&other, cx))
                             .child(
-                                Label::new(
+                                studio_ui::ds::text::body(
                                     neighbour
                                         .label
                                         .clone()
                                         .unwrap_or_else(|| neighbour.id.clone()),
                                 )
-                                .size(LabelSize::Small)
                                 .truncate(),
                             )
                             .when(neighbour.label.is_some(), |d| {
-                                d.child(
-                                    Label::new(neighbour.id.clone())
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted)
-                                        .truncate(),
-                                )
+                                d.child(studio_ui::ds::text::meta(neighbour.id.clone()).truncate())
                             })
                             .child(div().flex_1())
                             .children(remove)
@@ -3231,19 +3153,11 @@ impl NodePeek {
             }
             Loadable::Failed(error) => div()
                 .pl(px(CHILD_INDENT))
-                .child(
-                    Label::new(error.clone())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Error),
-                )
+                .child(studio_ui::ds::text::error_note(error.clone()))
                 .into_any_element(),
             _ => div()
                 .pl(px(CHILD_INDENT))
-                .child(
-                    Label::new("Reading…")
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
+                .child(studio_ui::ds::text::meta("Reading…"))
                 .into_any_element(),
         }
     }
@@ -3281,15 +3195,11 @@ impl NodePeek {
                     .child(
                         div()
                             .w(px(studio_ui::ds::size::SHORT_LABEL))
-                            .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
+                            .child(studio_ui::ds::text::muted(label)),
                     )
                     .child(studio_ui::type_swatch(ty, cx))
-                    .child(Label::new(id).size(LabelSize::Small))
-                    .child(
-                        Label::new(ty.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
+                    .child(studio_ui::ds::text::body(id))
+                    .child(studio_ui::ds::text::meta(ty.clone())),
             )
         };
         Some(
@@ -3371,11 +3281,10 @@ fn neighbours_from(rows: &Value) -> Vec<Neighbour> {
 }
 
 fn section(title: &'static str) -> impl IntoElement {
-    div().pt(px(space::MD)).pb(px(space::XS)).child(
-        Label::new(title)
-            .size(LabelSize::XSmall)
-            .color(Color::Muted),
-    )
+    div()
+        .pt(px(space::MD))
+        .pb(px(space::XS))
+        .child(studio_ui::ds::text::meta(title))
 }
 
 impl Render for NodePeek {
@@ -3491,10 +3400,7 @@ impl NodePeek {
                 })
                 .into_any_element()
             }
-            Some(Item::Note(text)) => Label::new(text)
-                .size(LabelSize::Small)
-                .color(Color::Muted)
-                .into_any_element(),
+            Some(Item::Note(text)) => studio_ui::ds::text::muted(text).into_any_element(),
             Some(Item::Group(index)) if index < self.groups.len() => {
                 self.drawn(index, window, cx);
                 self.render_group(index, cx).into_any_element()
@@ -3548,9 +3454,7 @@ impl NodePeek {
                     .gap(px(space::SM))
                     .child(studio_ui::type_swatch(&type_name, cx))
                     .child(
-                        Label::new(type_name.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
+                        studio_ui::ds::text::muted(type_name.clone()),
                     )
                     .child(div().flex_1())
                     .children(open_page.map(|open| {
@@ -3571,9 +3475,7 @@ impl NodePeek {
                             studio_ui::ds::toolbar_button("peek-explore", "Explore")
                                 .style(ButtonStyle::Subtle)
                                 .start_icon(
-                                    Icon::new(IconName::Crosshair)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Muted),
+                                    studio_ui::ds::icon::meta(IconName::Crosshair),
                                 )
                                 .tooltip(Tooltip::text("Walk the graph from this node"))
                                 .on_click(move |_, window, cx| {

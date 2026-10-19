@@ -86,21 +86,16 @@ impl Offers {
                     .when(self.highlighted == Some(index), |row| row.bg(highlight))
                     .hover(|row| row.bg(highlight))
                     .child(
-                        div().min_w_0().flex_shrink(1.).child(
-                            Label::new(primary)
-                                .size(LabelSize::Small)
-                                .single_line()
-                                .truncate(),
-                        ),
+                        div()
+                            .min_w_0()
+                            .flex_shrink(1.)
+                            .child(studio_ui::ds::text::body(primary).single_line().truncate()),
                     )
                     .children(secondary.map(|id| {
-                        div().min_w_0().flex_shrink(1.).child(
-                            Label::new(id)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .single_line()
-                                .truncate_start(),
-                        )
+                        div()
+                            .min_w_0()
+                            .flex_shrink(1.)
+                            .child(studio_ui::ds::text::meta(id).single_line().truncate_start())
                     }))
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                         cx.stop_propagation();

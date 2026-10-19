@@ -30,7 +30,7 @@ use graph_store::{GraphSession, SessionEvent};
 use serde_json::{Map, Value};
 use studio_actions::query::{CopyCell, CopyRow, Explain, Run, Save, SaveAs};
 use studio_ui::ds::Button;
-use studio_ui::ds::space;
+use studio_ui::ds::{Dotted as _, space};
 use studio_ui::menu::ContextMenu;
 use studio_ui::{
     ColumnDrag, ColumnResize, GridColumn, GridPlace, ROW_HEIGHT, columns_in_view, format_value,
@@ -2092,17 +2092,13 @@ impl QueryEditor {
                                         .size(IconSize::XSmall)
                                         .color(Color::Error),
                                 )
-                                .child(
-                                    Label::new(problem.code.clone())
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                )
+                                .child(studio_ui::ds::text::meta(problem.code.clone()))
                                 .child(Label::new(problem.message.clone()).size(LabelSize::Small))
-                                .children(problem.fix.clone().map(|fix| {
-                                    Label::new(format!("Fix: {fix}"))
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted)
-                                }))
+                                .children(
+                                    problem.fix.clone().map(|fix| {
+                                        studio_ui::ds::text::muted(format!("Fix: {fix}"))
+                                    }),
+                                )
                                 .when(!problem.edits.is_empty(), |row| {
                                     // The analysis is shared, not copied: the problems are
                                     // drawn every frame, the text and edits only applied on
@@ -2128,11 +2124,7 @@ impl QueryEditor {
                                     )
                                 })
                                 .child(div().flex_1())
-                                .child(
-                                    Label::new(position)
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                )
+                                .child(studio_ui::ds::text::meta(position))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     if let Some(at) = &at {
                                         let offset = this.offset_of(at, cx);
@@ -2517,7 +2509,6 @@ impl QueryEditor {
             return Vec::new();
         };
         let places = self.result_places(rows, window);
-        let border = studio_ui::ds::surface::rule(cx);
         let (selected_bg, row_selected_bg) = (
             studio_ui::ds::surface::selected_document(cx),
             studio_ui::ds::surface::hover(cx),
@@ -2542,7 +2533,7 @@ impl QueryEditor {
                     h_flex()
                         .h(px(ROW_HEIGHT))
                         .border_b_1()
-                        .border_color(border)
+                        .dotted(cx)
                         .when(row_selected, |d| d.bg(row_selected_bg))
                         .child(
                             h_flex()
@@ -2629,6 +2620,7 @@ impl QueryEditor {
             },
             _ => Vec::new(),
         };
+        let fill = studio_ui::ds::surface::text_highlight(cx);
         self.editor.update(cx, |editor, cx| {
             if ranges.is_empty() {
                 editor.clear_background_highlights(key, cx);
@@ -2642,12 +2634,7 @@ impl QueryEditor {
                         ..snapshot.anchor_before(MultiBufferOffset(range.end))
                 })
                 .collect();
-            editor.highlight_background(
-                key,
-                &anchors,
-                |_, theme| theme.colors().text_accent.opacity(0.16),
-                cx,
-            );
+            editor.highlight_background(key, &anchors, move |_, _| fill, cx);
         });
         cx.notify();
     }
@@ -2669,11 +2656,7 @@ impl QueryEditor {
                     PlanItem::Header(title) => h_flex()
                         .h(px(PLAN_ROW_HEIGHT))
                         .px(px(space::MD))
-                        .child(
-                            Label::new(title.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
+                        .child(studio_ui::ds::text::meta(title.clone()))
                         .into_any_element(),
                     PlanItem::Operator {
                         depth,
@@ -2717,11 +2700,7 @@ impl QueryEditor {
                         .pl(px(space::LG))
                         .pr(px(space::MD))
                         .gap(px(space::MD))
-                        .child(
-                            Label::new(name.clone())
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
+                        .child(studio_ui::ds::text::meta(name.clone()))
                         .child(
                             Label::new(value.clone())
                                 .size(LabelSize::XSmall)
@@ -3078,11 +3057,7 @@ fn render_facts(facts: &[(String, String)]) -> impl IntoElement {
                 .flex_none()
                 .gap(px(space::XS))
                 .when(!name.is_empty(), |fact| {
-                    fact.child(
-                        Label::new(name.clone())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    )
+                    fact.child(studio_ui::ds::text::meta(name.clone()))
                 })
                 .child(Label::new(value).size(LabelSize::XSmall).single_line())
         }))

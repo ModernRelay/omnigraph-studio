@@ -111,11 +111,7 @@ impl RenderOnce for ModalHeader {
                             .on_click(on_close)
                     })),
             )
-            .children(self.description.map(|description| {
-                Label::new(description)
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
-            }))
+            .children(self.description.map(crate::ds::text::muted))
     }
 }
 
@@ -164,15 +160,6 @@ pub fn write_target(branch: impl Into<SharedString>, cx: &App) -> Div {
         .items_center()
         .rounded(px(radii(cx).xs))
         .bg(surface::pressed(cx))
-        .child(
-            Icon::new(IconName::GitBranch)
-                .size(IconSize::XSmall)
-                .color(Color::Muted),
-        )
-        .child(
-            Label::new(branch)
-                .size(LabelSize::XSmall)
-                .color(Color::Muted)
-                .single_line(),
-        )
+        .child(crate::ds::icon::meta(IconName::GitBranch))
+        .child(crate::ds::text::meta(branch).single_line())
 }

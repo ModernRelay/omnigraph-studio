@@ -387,27 +387,17 @@ impl TextEditor {
                 h_flex()
                     .gap(px(studio_ui::ds::space::SM))
                     .child(Indicator::dot().color(notice.tone.color()))
-                    .child(
-                        Label::new(notice.message.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
+                    .child(studio_ui::ds::text::muted(notice.message.clone()))
                     .into_any_element(),
             ),
         };
         studio_ui::ds::toolbar(cx)
             .child(studio_ui::type_swatch(&self.type_name, cx))
             .child(
-                Label::new(self.label.clone().unwrap_or_else(|| self.id.clone()))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
+                studio_ui::ds::text::muted(self.label.clone().unwrap_or_else(|| self.id.clone()))
                     .single_line(),
             )
-            .child(
-                Label::new(self.property.clone())
-                    .size(LabelSize::Small)
-                    .single_line(),
-            )
+            .child(studio_ui::ds::text::body(self.property.clone()).single_line())
             .child(div().flex_1())
             .children(elsewhere)
             .children(status)

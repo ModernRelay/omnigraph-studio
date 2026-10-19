@@ -146,8 +146,7 @@ impl RenderOnce for CopyableValue {
                 )
                 .into_any_element();
         };
-        let mut label = Label::new(value.clone())
-            .size(LabelSize::Small)
+        let mut label = crate::ds::text::body(value.clone())
             .single_line()
             .truncate();
         if self.mono {

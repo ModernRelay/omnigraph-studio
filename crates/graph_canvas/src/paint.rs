@@ -25,6 +25,13 @@ pub(crate) struct Palette {
     pub shadow: Vec<BoxShadow>,
     /// A type mark's letter on its tint.
     pub on_tint: Hsla,
+    /// Where you are: the selected or marked chip's ring, and its halo.
+    pub here: Hsla,
+    pub here_halo: Hsla,
+    /// A pointed chip's hairline.
+    pub pointed: Hsla,
+    /// The dot grid's dots.
+    pub grid_dot: Hsla,
     pub font: Font,
 }
 
@@ -50,8 +57,6 @@ const TYPE_MARK_ONLY_BELOW: f32 = 6.;
 const DOT_STEP: f32 = 22.;
 /// Up to this many relationships, the schema labels every line.
 pub(crate) const ALWAYS_LABEL: usize = 16;
-/// The warm ring that marks where you are.
-const WARM: u32 = 0xf2b48f;
 /// Segments per path: GPUI caps one path near 65k vertices. A batch that still needs more is
 /// painted in halves (`stroke_lines`), never dropped.
 const SEGMENTS_PER_PATH: usize = 2_000;
@@ -541,9 +546,9 @@ pub(crate) fn paint(
             .collect();
         let size = text.size * scale;
         let border = if focus {
-            gpui::rgb(WARM).into()
+            palette.here
         } else if pointed {
-            palette.text.opacity(0.2)
+            palette.pointed
         } else {
             palette.border
         };
@@ -556,7 +561,7 @@ pub(crate) fn paint(
                 fill: palette.card.opacity(alpha),
                 border: border.opacity(alpha),
                 shadow: true,
-                ring: focus.then(|| Hsla::from(gpui::rgb(WARM)).opacity(0.2)),
+                ring: focus.then_some(palette.here_halo),
             },
             palette,
             window,
@@ -682,7 +687,7 @@ fn dashes(points: &[Point<Pixels>], out: &mut Vec<Segment>) {
 }
 
 fn paint_dots(bounds: Bounds<Pixels>, palette: &Palette, window: &mut Window) {
-    let color = palette.text.opacity(0.07);
+    let color = palette.grid_dot;
     let left = f32::from(bounds.left());
     let top = f32::from(bounds.top());
     let mut y = (top / DOT_STEP).ceil() * DOT_STEP;

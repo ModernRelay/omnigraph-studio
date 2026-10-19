@@ -696,12 +696,7 @@ impl CommandPalette {
                 let label =
                     HighlightedLabel::new(candidate.label.clone(), ranked.positions.clone())
                         .truncate();
-                let muted = |text: String| {
-                    Label::new(text)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
-                        .into_any_element()
-                };
+                let muted = |text: String| studio_ui::ds::text::muted(text).into_any_element();
                 let end: AnyElement = match row {
                     Row::Action { action, .. } => match &self.previous_focus {
                         Some(focus) => ui::KeyBinding::for_action_in(action.as_ref(), focus, cx)
@@ -728,24 +723,16 @@ impl CommandPalette {
                         cx,
                     )),
                     Row::Node { type_name, .. } => Some(studio_ui::type_swatch(type_name, cx)),
-                    Row::Branch { current, .. } => Some(
-                        div().child(
-                            Icon::new(if *current {
-                                IconName::Check
-                            } else {
-                                IconName::GitBranch
-                            })
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                        ),
-                    ),
-                    Row::Tab { .. } | Row::Saved { .. } => Some(
-                        div().child(
-                            Icon::new(IconName::Code)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        ),
-                    ),
+                    Row::Branch { current, .. } => {
+                        Some(div().child(studio_ui::ds::icon::lead(if *current {
+                            IconName::Check
+                        } else {
+                            IconName::GitBranch
+                        })))
+                    }
+                    Row::Tab { .. } | Row::Saved { .. } => {
+                        Some(div().child(studio_ui::ds::icon::lead(IconName::Code)))
+                    }
                     Row::Action { .. } => None,
                 };
                 Some(
@@ -933,14 +920,10 @@ impl Render for CommandPalette {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(
-                    Label::new(
-                        self.mode
-                            .empty(!self.query.read(cx).is_empty(cx), searching),
-                    )
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-                )
+                .child(studio_ui::ds::text::muted(
+                    self.mode
+                        .empty(!self.query.read(cx).is_empty(cx), searching),
+                ))
                 .into_any_element()
         } else {
             uniform_list(
@@ -1007,11 +990,7 @@ impl Render for CommandPalette {
                     .px(px(space::CONTROL_INSET))
                     .py(px(space::SM))
                     .gap(px(space::MD))
-                    .child(
-                        Icon::new(IconName::MagnifyingGlass)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
+                    .child(studio_ui::ds::icon::lead(IconName::MagnifyingGlass))
                     .child(div().flex_1().child(self.query.clone()))
                     .when(searching, |row| {
                         row.child(
@@ -1039,21 +1018,17 @@ impl Render for CommandPalette {
                     .px(px(space::CONTROL_INSET))
                     .py(px(space::SM))
                     .gap(px(space::LG))
-                    .child(div().flex_1().min_w_0().children(description.map(|d| {
-                        Label::new(d)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted)
-                            .truncate()
-                    })))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .children(description.map(|d| studio_ui::ds::text::meta(d).truncate())),
+                    )
                     // No "0 nodes" while the nodes are still to come.
                     .when(!(searching && count == 0), |footer| {
-                        footer.child(
-                            div().debug_selector(|| "palette-count".into()).child(
-                                Label::new(format!("{count} {}", self.mode.noun(count)))
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
-                        )
+                        footer.child(div().debug_selector(|| "palette-count".into()).child(
+                            studio_ui::ds::text::meta(format!("{count} {}", self.mode.noun(count))),
+                        ))
                     })
                     .when(typed && self.mode != Mode::Keys, |footer| {
                         footer.child(studio_ui::ds::key_hint(&AskAgent, "Ask", &focus, cx))

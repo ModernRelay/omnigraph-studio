@@ -1264,9 +1264,8 @@ impl ReviewView {
             move |_, cx| Tooltip::with_meta(title.clone(), None, cli.clone(), cx)
         })
         .on_click(cx.listener(|this, _, _, cx| this.merge(cx)));
-        let refresh = studio_ui::ds::toolbar_button("refresh", "Refresh")
-            .style(ButtonStyle::Subtle)
-            .start_icon(Icon::new(IconName::RotateCw).size(IconSize::Small))
+        let refresh = studio_ui::ds::toolbar_icon_button("refresh", IconName::RotateCw)
+            .tooltip(Tooltip::text("Read the branch and its target again"))
             .on_click(cx.listener(|this, _, _, cx| this.reload(cx)));
 
         let (sentence, detail) = match (&self.load, &self.data) {
@@ -1353,7 +1352,7 @@ impl ReviewView {
                     h_flex()
                         .gap(px(space::SM))
                         .child(studio_ui::kind_swatch(&count.type_name, count.is_edge, cx))
-                        .child(Label::new(count.type_name.clone()).size(LabelSize::Small))
+                        .child(studio_ui::ds::text::body(count.type_name.clone()))
                         .child(change_counts(count.added, count.changed, count.removed))
                 }))
         });
@@ -1367,7 +1366,7 @@ impl ReviewView {
             banners.push(
                 Banner::new()
                     .severity(Severity::Warning)
-                    .child(Label::new(text).size(LabelSize::Small))
+                    .child(studio_ui::ds::text::body(text))
                     .into_any_element(),
             );
         }
@@ -1380,12 +1379,11 @@ impl ReviewView {
                 Banner::new()
                     .severity(Severity::Info)
                     .child(
-                        Label::new(format!(
+                        studio_ui::ds::text::body(format!(
                             "Your fixes moved {} to {}. Cards show the review as read; merging uses the new head.",
                             self.branch,
                             short_commit_id(head)
-                        ))
-                        .size(LabelSize::Small),
+                        )),
                     )
                     .action_slot(
                         studio_ui::ds::button("refresh-own", "Refresh")
@@ -1398,13 +1396,10 @@ impl ReviewView {
             banners.push(
                 Banner::new()
                     .severity(Severity::Info)
-                    .child(
-                        Label::new(format!(
-                            "Newer data: {} changed after this review was read.",
-                            self.branch
-                        ))
-                        .size(LabelSize::Small),
-                    )
+                    .child(studio_ui::ds::text::body(format!(
+                        "Newer data: {} changed after this review was read.",
+                        self.branch
+                    )))
                     .action_slot(
                         studio_ui::ds::button("refresh-newer", "Refresh")
                             .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
@@ -1427,11 +1422,7 @@ impl ReviewView {
             .trigger(
                 studio_ui::ds::toolbar_button("review-scope-button", scope_label)
                     .style(ButtonStyle::Outlined)
-                    .end_icon(
-                        Icon::new(IconName::ChevronDown)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    ),
+                    .end_icon(studio_ui::ds::icon::meta(IconName::ChevronDown)),
             )
             .menu(move |window, cx| {
                 let view = view.clone();
@@ -1492,11 +1483,7 @@ impl ReviewView {
             .child(
                 h_flex()
                     .gap(px(space::MD))
-                    .child(
-                        Icon::new(IconName::GitBranch)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    )
+                    .child(studio_ui::ds::icon::lead(IconName::GitBranch))
                     .child(studio_ui::ds::text::title(format!(
                         "{} → {}",
                         self.branch, self.target
@@ -1524,11 +1511,7 @@ impl ReviewView {
             .child(h_flex().gap(px(space::MD)).child(scope_menu).child(search))
             .child(Label::new(sentence))
             .when(!detail.is_empty(), |d| {
-                d.child(
-                    Label::new(detail)
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
+                d.child(studio_ui::ds::text::muted(detail))
             })
             .children(counts)
             .children(banners)
@@ -1712,7 +1695,7 @@ impl ReviewView {
         let mut banner = Banner::new()
             .severity(severity)
             .wrap_content(true)
-            .child(Label::new(text).size(LabelSize::Small));
+            .child(studio_ui::ds::text::body(text));
         if let Some(action) = action {
             banner = banner.action_slot(action);
         }
@@ -1733,18 +1716,16 @@ impl ReviewView {
             .overflow_y_scroll()
             .p(px(space::XL))
             .gap(px(space::MD))
-            .child(
-                Label::new(if matches!(self.merge, MergeState::Conflicts(_)) {
+            .child(studio_ui::ds::text::muted(
+                if matches!(self.merge, MergeState::Conflicts(_)) {
                     format!("Conflicts merging {} into {}", self.branch, self.target)
                 } else {
                     format!(
                         "Conflicts a merge of {} into {} would stop on",
                         self.branch, self.target
                     )
-                })
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-            )
+                },
+            ))
             .children(conflicts.iter().enumerate().map(|(ix, conflict)| {
                 let here = conflict
                     .entity_id
@@ -1774,20 +1755,10 @@ impl ReviewView {
                                 h_flex()
                                     .gap(px(space::MD))
                                     .child(type_swatch(&conflict.type_name, cx))
-                                    .child(
-                                        Label::new(conflict.type_name.clone())
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted),
-                                    )
-                                    .child(
-                                        Label::new(entity).size(LabelSize::Small).buffer_font(cx),
-                                    ),
+                                    .child(studio_ui::ds::text::muted(conflict.type_name.clone()))
+                                    .child(studio_ui::ds::text::body(entity).buffer_font(cx)),
                             )
-                            .child(
-                                Label::new(conflict.message.clone())
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            ),
+                            .child(studio_ui::ds::text::meta(conflict.message.clone())),
                     )
                     .when(reviewable, |d| {
                         d.cursor_pointer()

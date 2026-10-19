@@ -14,7 +14,7 @@ use gpui::{
 };
 use serde_json::Value;
 use studio_settings::{FieldKind, Scope, SettingField, SettingsValues, StudioSettings};
-use studio_ui::ds::{self, space};
+use studio_ui::ds::{self, Dotted as _, space};
 use studio_ui::menu::ContextMenu;
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use theme::ThemeRegistry;
@@ -650,7 +650,7 @@ impl Render for SettingsView {
                                 reset,
                             );
                             if index + 1 < count {
-                                row.border_b_1().border_color(rule)
+                                row.border_b_1().dotted(cx)
                             } else {
                                 row
                             }

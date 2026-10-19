@@ -137,11 +137,7 @@ impl Render for EditModal {
                             ds::field_frame(field.error.is_some(), cx)
                                 .child(ds::field_input(field.editor.clone())),
                         )
-                        .children(field.error.clone().map(|error| {
-                            Label::new(error)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Error)
-                        })),
+                        .children(field.error.clone().map(studio_ui::ds::text::error_note)),
                 )
             })))
             .child(

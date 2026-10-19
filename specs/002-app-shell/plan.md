@@ -410,10 +410,28 @@ than styling one-off elements.
   floats the three columns as sheets over a soft wash, with one gap around and between them,
   and moves the traffic lights into the sidebar sheet. They sit centered in the first header
   strip (`studio_workspace::traffic_light_position`), where a window also opens with them.
-- **Hairlines.** `ds::surface::rule`, never a solid border; dashed between rows on glass.
+- **Hairlines.** `ds::surface::rule`. A rule between the rows or the sections of a document
+  (a table's rows, query results, settings rows, a queue, storage's sections, a feed's date
+  rule) is `ds::dotted`: dotted on glass, as Tower's feeds, solid when flat. A region's edge
+  (a toolbar's, a strip's, a pane's, the composer's) is solid in both styles.
+- **One document fill** (since 2026-10-18). Every tab sits on `surface::document`, which the
+  pane paints, not the view: before, the table, schema, agent and canvas were white while a
+  query, History, Storage and Settings showed the glass sheet through.
 - **Sheet corners.** GPUI clips a glass sheet's children to its rectangle, not its rounded
-  corners, so a child with a fill flush in a corner takes the sheet's radius (`radius::LG`):
-  the first tab of the top-left pane, when the sidebar is shown.
+  corners, so a child with a fill flush in a corner takes the sheet's radius
+  (`Radii::sheet`): the first tab of the top-left pane, when the sidebar is shown, and the
+  document fill of every pane along the sheet's bottom. Such a pane also keeps its tab a
+  corner's radius above the edge (`SheetFloor`), since a view's own fill (an editor's) would
+  square the corner again.
+- **Quiet things.** A row a filter dims, a card for a side not written yet and a merged
+  branch's lane recede by one opacity, `ds::opacity::DIMMED`. Colours a view used to derive
+  itself are surface roles: the canvas's here-ring and its halo, a pointed chip's hairline,
+  the dot grid, the marquee, a highlighted span of query text, rows picked beside the cursor's,
+  a card's hairline (also its footer's rule).
+- **Floating bars and lists.** Everything floating over a document is a `ds::float_bar` (the
+  canvas's controls, the table's drafts bar) with bar buttons; a list of rows in a form is a
+  `ds::row_list` with its own fill and hairline, and one floating under a field a
+  `ds::popover_list`.
 - **Corners: one setting, one scale** (since 2026-10-18). `studio.corner_radius` (Appearance,
   0–20 px, 10 by default) is the base every corner derives from, through `ds::radii(cx)`; no
   view picks its own (`rounded_sm()`-style utilities and literal radii are gone). The scale is
@@ -464,7 +482,10 @@ than styling one-off elements.
   primary, Outlined outline, Subtle ghost, Tinted(Error) destructive. Sizes keep Zed's
   heights: medium 28 px (`size::CONTROL`, 10 px in), default 22 px (the header strips and the
   status bar), compact 18 px (inside dense rows: a tab's close, a tree toggle, an inline Fix,
-  a setting's reset). A label is the body size at 28 px and up (13 px at the default 15 px
+  a setting's reset). An icon button is 22 px unless asked otherwise, as Zed's, so its hover
+  fill keeps 4 px clear in the 30 px status bar and 5 px in a 32 px strip; `ds::icon_button`
+  is the 28 px one, beside a field or a medium button (until 2026-10-18 every icon button
+  defaulted to 28 px, which nearly filled the strips it sat in). A label is the body size at 28 px and up (13 px at the default 15 px
   interface size, Tower's `text-sm`) and the small size below; a leading icon is 16 px at
   28 px and 12 px below, a trailing one (a chevron) 12 px, both at 80 % of the label's ink.
   A toggled button sits on the pressed fill; a disabled one fades to 64 %; a key hint on a
@@ -507,7 +528,9 @@ than styling one-off elements.
   scales with it. Its default is 15 px since 2026-10-18 (16 before): Tower's root size
   (93.75 %), at which Zed's `Default`, `Small` and `XSmall` labels are 13, 11 and 9 px, Tower's
   `text-sm` and `text-xs`. Body text is `Small`; labels, counts and metadata `XSmall`; buttons
-  `Default`. The interface font is Inter by default (Tower's face; Inter 4.1, OFL-1.1, the
+  `Default`. Views take text and quiet icons by role (`ds::text::body`, `muted`, `meta`,
+  `error`, `error_note`; `ds::icon::lead`, `meta`) rather than setting a label's or an
+  icon's size and colour themselves. The interface font is Inter by default (Tower's face; Inter 4.1, OFL-1.1, the
   regular, italic, medium, semibold and bold static files in `assets/fonts/inter/`, loaded
   with Zed's fonts); IBM Plex Sans and every installed font stay selectable.
 - **Toolbars.** A document's toolbar and every header or notice strip (a table's, a query's,
@@ -589,6 +612,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-18 | One document fill with the sheet's corners; rules, dimming and floating bars by role | `script/check-design-tokens.py`; `cargo clippy` `-D warnings` on the ten touched crates; the `studio_ui`, `studio_workspace`, `type_table`, `graph_canvas`, `query_editor`, `history`, `review` and `inspectors` suites; offscreen glass snapshots of a query with results, Person's table, History, Storage, the schema, Settings and the ontology, their bottom corners cropped at 2×, sampled by pixel | Before: the table, schema, agent and ontology were white (255) with square bottom corners on the rounded sheet; a query, History and Storage were the glass sheet (245) with round ones. After: all seven are white with round corners. Settings rows, query results, storage sections and the agent's queue drew solid rules where the table's rows were dotted; the agent's composer edge was dotted beside a solid banner edge. Storage built its own 36 px header with a labelled Refresh; it takes the 48 px toolbar and the icon refresh History and the table use, as the review's header now does. The drafts bar was a solid card with `lg` corners beside the canvas's glass bars. Dimmed things used 0.45, 0.5, 0.55 and 0.6 |
 | 2026-10-18 | One corner setting; round ends only for labelled buttons; Tower's type scale, shadows and button type; spacing and alignment by token | `ds` `nested_radii_are_concentric` (the default scale, every pair at bases 1–20, 0 square); `studio_settings` row order with `studio.corner_radius`; `button` tests; workspace clippy `-D warnings`; offscreen snapshots in glass: a table, its peek, the canvas, settings, history, a query, the delete dialog, ⌘K | The canvas's mode switch was a bare 22 px segmented control beside two 28 px glass bars (the segmented track had been removed); it is a bar now, and all three share height, corner and shadow. The table's header text started 4 px right of its cells' (Zed pads a header cell); the inspector's rows 4 px right of their section labels (their hover inset); a peek group's children at 26 and 28 px under an arrow at 22. The branch picker was a 28 px pill with 13 px text beside a 22 px graph picker with 12 px text. Buttons were 12 px text with 14 px icons, 24–32 px apart in the table toolbar; they are 13 px with 16 px icons at 80 %, with their padding as their gap. Fourteen hover fills used Zed's theme hover; they use `surface::highlight` |
 | 2026-10-18 | Nested radii count the hairline; flush fills follow their container's corners; no raw radius utilities | `ds` test `nested_radii_are_concentric` (menu row, palette list and row, a row list, `radius::flush` for a card header and a modal footer); offscreen snapshots cropped at 2×: the gallery's card header, the delete dialog's footer, ⌘K's highlighted row, a tab's menu | Before, the card header's fill showed a square corner outside the card's curve; the menu row, palette card and palette row were 1 px rounder than their insets allowed, since the hairline was not counted. Fourteen `rounded_sm`/`rounded_md` calls became tokens by role: the inspector's rows SM, its image frame MD, a table cell's edit notice a menu surface, a dragged column, the agent picker and the tree's filter row pills |
 | 2026-10-18 | Tower's buttons, menus, modals and icons; spacing on the ds scale | `studio_ui` `button` tests (`controls_draw_at_their_sizes`: 28 px pills 10 px in, circles, pill fields; `zed_styles_pick_the_variants`), `menu` tests (Zed's six, on the fork), `studio_theme` `icons` tests (≤ 100 Nucleo drawings, each file named once, each replacing a Zed icon); the workspace suite; `cargo clippy --workspace --all-targets -D warnings`; offscreen snapshots in glass on a scratch cluster: the delete dialog with two dependents, ⌘K, a tab's context menu, the design gallery, a table with the new icons | The dialog read one muted paragraph under "Delete Acme", the dependents list, then Cancel and a red Delete with a light ↵; the palette a frame with the results card inside; the menu 26 px rows and edge-to-edge rules. A 97 % modal fill let the rows behind show through above the title; the fill is opaque now. The settings reset, a 28 px circle, made its row taller than the others; it is compact. A spacing conversion made both arms of one `if` equal (clippy); collapsed |

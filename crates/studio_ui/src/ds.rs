@@ -119,6 +119,12 @@ impl Radii {
         }
     }
 
+    /// A glass sheet (a dock, the document column): the largest radius but a modal's. A
+    /// document's fill that reaches the sheet's bottom takes it too ([`sheet`]).
+    pub fn sheet(&self) -> f32 {
+        self.lg
+    }
+
     /// A context menu or popover: a card's radius.
     pub fn menu(&self) -> f32 {
         self.md
@@ -266,6 +272,17 @@ pub mod size {
     pub const MENU_ROW: f32 = 26.;
     /// The narrowest a context menu draws.
     pub const MENU_MIN_WIDTH: f32 = 200.;
+    /// A short vertical rule between groups in a strip: an icon's height.
+    pub const SHORT_RULE: f32 = ROW_ICON;
+    /// A label-and-value field's row in a property grid.
+    pub const FIELD_ROW: f32 = GUTTER;
+}
+
+/// How far something recedes when it is present but not in play.
+pub mod opacity {
+    /// A row a filter dims, a card for a side not written yet, a merged branch's lane: one
+    /// value, so every quiet thing is equally quiet.
+    pub const DIMMED: f32 = 0.5;
 }
 
 /// Whether the window is drawn in the glass style (setting `studio.window_style`).
@@ -292,8 +309,9 @@ pub mod surface {
         }
     }
 
-    /// The rule between regions and rows: a hairline when flat; on glass a dotted rule,
-    /// 14% ink, which lands at about half a solid line's weight.
+    /// The rule between regions and rows: a hairline when flat; on glass 14% ink, which a
+    /// row's or a section's dotted rule (`super::dotted`) lands at about half a solid line's
+    /// weight. A region's edge (a toolbar's, a strip's, a pane's) stays solid in both styles.
     pub fn rule(cx: &App) -> Hsla {
         if is_glass(cx) {
             gpui::black().opacity(0.14)
@@ -306,6 +324,16 @@ pub mod surface {
     /// rather than a fill, so the glass still shows through.
     pub fn well(_cx: &App) -> Hsla {
         gpui::black().opacity(0.015)
+    }
+
+    /// A card's hairline, and the rule inside it over its footer: raised on glass, the
+    /// theme's border softened when flat.
+    pub fn card_border(cx: &App) -> Hsla {
+        if is_glass(cx) {
+            raised_border(cx)
+        } else {
+            cx.theme().colors().border.opacity(0.7)
+        }
     }
 
     /// The hairline of a solid item that sits on glass.
@@ -479,6 +507,48 @@ pub mod surface {
         cx.theme().colors().text_accent
     }
 
+    /// The canvas's marquee while it is dragged: the accent, faint inside, firmer at its edge.
+    pub fn marquee(cx: &App) -> Hsla {
+        accent(cx).opacity(0.08)
+    }
+
+    pub fn marquee_border(cx: &App) -> Hsla {
+        accent(cx).opacity(0.6)
+    }
+
+    /// A span marked in an editor's text (the query an explain step came from): the accent,
+    /// faint enough to read the text through it.
+    pub fn text_highlight(cx: &App) -> Hsla {
+        accent(cx).opacity(0.16)
+    }
+
+    /// Rows picked beside the cursor's row: the selected row's fill, lighter, so the cursor
+    /// still stands out among them.
+    pub fn picked(cx: &App) -> Hsla {
+        selected_document(cx).opacity(0.6)
+    }
+
+    /// Where you are on the canvas (the selected or marked chip): a warm ring, apart from the
+    /// accent a selection's marquee takes.
+    pub fn here(_cx: &App) -> Hsla {
+        gpui::rgb(0xf2b48f).into()
+    }
+
+    /// The halo around [`here`]'s ring.
+    pub fn here_halo(cx: &App) -> Hsla {
+        here(cx).opacity(0.2)
+    }
+
+    /// A pointed item's hairline on the canvas: the ink at 20 %, twice a control's.
+    pub fn pointed_border(cx: &App) -> Hsla {
+        cx.theme().colors().text.opacity(0.2)
+    }
+
+    /// The canvas's dot grid: the ink, barely there.
+    pub fn grid_dot(cx: &App) -> Hsla {
+        cx.theme().colors().text.opacity(0.07)
+    }
+
     /// A bar that asks before something irreversible (a write the agent prepared): the theme's
     /// warning fill and hairline.
     pub fn warning(cx: &App) -> Hsla {
@@ -535,7 +605,7 @@ pub mod elevation {
             color: gpui::white().opacity(alpha),
             offset: point(px(0.), px(0.)),
             blur_radius: px(0.),
-            spread_radius: px(1.),
+            spread_radius: px(size::HAIRLINE),
             inset: true,
         }
     }
@@ -675,6 +745,23 @@ pub fn wash() -> Div {
         .child(field(315., gpui::rgba(0x78a5f01f).into()))
 }
 
+/// Icon roles, as the text roles: a quiet icon beside a title or a label, and a smaller one
+/// among metadata or inside a dense row. An icon in a button takes the button's own size.
+pub mod icon {
+    use super::*;
+
+    /// An icon that leads a toolbar's title, a section or a menu row: small and muted.
+    pub fn lead(name: IconName) -> Icon {
+        Icon::new(name).size(IconSize::Small).color(Color::Muted)
+    }
+
+    /// An icon among metadata or inside a dense row (a relationship's arrow, a hint's mark):
+    /// extra small and muted.
+    pub fn meta(name: IconName) -> Icon {
+        Icon::new(name).size(IconSize::XSmall).color(Color::Muted)
+    }
+}
+
 /// Text roles. Body text is `Small`; metadata and labels `XSmall`; one weight change per row.
 pub mod text {
     use super::*;
@@ -690,7 +777,8 @@ pub mod text {
         pub const HEADING: FontWeight = FontWeight::MEDIUM;
     }
 
-    /// A toolbar's or a card's title: the body size, the heading weight.
+    /// A toolbar's or a card's title: the default size, a step above body text, and the
+    /// heading weight.
     pub fn title(text: impl Into<SharedString>) -> Label {
         Label::new(text.into()).weight(weight::HEADING)
     }
@@ -718,9 +806,28 @@ pub mod text {
             .color(Color::Muted)
     }
 
-    /// A page's title size: the one large heading a node's page carries.
+    /// A refusal or a failure in a sentence: the body size in the error colour.
+    pub fn error(text: impl Into<SharedString>) -> Label {
+        Label::new(text.into())
+            .size(LabelSize::Small)
+            .color(Color::Error)
+    }
+
+    /// A refusal noted under a field or beside a row: the metadata size in the error colour.
+    pub fn error_note(text: impl Into<SharedString>) -> Label {
+        Label::new(text.into())
+            .size(LabelSize::XSmall)
+            .color(Color::Error)
+    }
+
+    /// A page's title, in px at Zed's 16 px rem: the one large heading a node's page carries.
+    pub const PAGE_TITLE: f32 = 22.;
+    /// A key binding's glyphs in a hint, in px at Zed's 16 px rem: the meta size.
+    pub const KEY_HINT: f32 = 11.;
+
+    /// A page's title size.
     pub fn page_title_size() -> LabelSize {
-        LabelSize::Custom(rems_from_px(22_f32))
+        LabelSize::Custom(rems_from_px(PAGE_TITLE))
     }
 
     /// A labelled control's icon beside its label: 80 % of the label's ink, as a button's.
@@ -845,7 +952,7 @@ impl SidebarRow {
 
     /// A muted icon leading the label, at the size every sidebar list uses.
     pub fn icon(self, icon: IconName) -> Self {
-        self.start(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+        self.start(icon::lead(icon))
     }
 
     pub fn end(mut self, end: impl IntoElement) -> Self {
@@ -1072,15 +1179,19 @@ pub fn toolbar_actions() -> Div {
 
 /// A short vertical hairline between groups in a strip (Delta's footer: context | facts).
 pub fn rule_v(cx: &App) -> Div {
-    div().w(px(1.)).h(px(16.)).flex_none().bg(surface::rule(cx))
+    div()
+        .w(px(size::HAIRLINE))
+        .h(px(size::SHORT_RULE))
+        .flex_none()
+        .bg(surface::rule(cx))
 }
 
 /// The divider between groups of the status bar, as Zed's: a short vertical line in the border
 /// colour, which a hairline's lighter colour would lose against the bar.
 pub fn divider_v(cx: &App) -> Div {
     div()
-        .w(px(1.))
-        .h(px(16.))
+        .w(px(size::HAIRLINE))
+        .h(px(size::SHORT_RULE))
         .flex_none()
         .bg(cx.theme().colors().border)
 }
@@ -1104,7 +1215,7 @@ pub fn title_tab(
         .rounded(px(radii(cx).sm))
         .when(selected && pill, |tab| tab.bg(surface::selected_chrome(cx)))
         .cursor_pointer()
-        .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+        .child(icon::meta(icon))
         .child(Label::new(title).size(LabelSize::Small).color(if selected {
             Color::Default
         } else {
@@ -1130,7 +1241,7 @@ pub fn meta(icon: IconName, value: impl Into<SharedString>) -> Div {
         .gap(px(space::XS))
         .items_center()
         .flex_none()
-        .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+        .child(icon::meta(icon))
         .child(text::meta(value).single_line())
 }
 
@@ -1140,7 +1251,7 @@ pub fn meta_code(icon: IconName, value: impl Into<SharedString>, cx: &App) -> Di
         .gap(px(space::XS))
         .items_center()
         .flex_none()
-        .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+        .child(icon::meta(icon))
         .child(text::code(value, cx).color(Color::Muted).single_line())
 }
 
@@ -1185,7 +1296,6 @@ pub fn icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
 /// border. Every single-line field in Studio is one, but for a filter among a sidebar's rows
 /// ([`sidebar_search`]).
 pub fn field_frame(invalid: bool, cx: &App) -> Div {
-    let colors = cx.theme().colors();
     h_flex()
         .h(px(size::CONTROL))
         // The border is part of the inset.
@@ -1195,11 +1305,11 @@ pub fn field_frame(invalid: bool, cx: &App) -> Div {
         .rounded(px(radii(cx).sm))
         .border_1()
         .border_color(if invalid {
-            cx.theme().status().error_border
+            surface::error_border(cx)
         } else {
-            colors.text.opacity(0.1)
+            surface::control_border(cx)
         })
-        .bg(colors.editor_background)
+        .bg(surface::document(cx))
         .shadow(elevation::control(cx))
 }
 
@@ -1255,7 +1365,7 @@ pub fn filter_pill(
 ) -> Stateful<Div> {
     let id: ElementId = id.into();
     let rule = surface::rule(cx);
-    let divider = move || div().w(px(1.)).h_full().flex_none().bg(rule);
+    let divider = move || div().w(px(size::HAIRLINE)).h_full().flex_none().bg(rule);
     let segment = || {
         h_flex()
             .h_full()
@@ -1271,19 +1381,19 @@ pub fn filter_pill(
         .rounded_full()
         .border_1()
         .border_color(surface::raised_border(cx))
-        .bg(cx.theme().colors().editor_background)
+        .bg(surface::document(cx))
         .shadow(elevation::raised(cx))
         .overflow_hidden()
         .child(
             segment()
-                .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+                .child(icon::meta(icon))
                 .child(Label::new(field.into()).size(LabelSize::Small)),
         )
         .child(divider())
         .child(segment().child(text::muted(test).size(LabelSize::Small)))
         .when_some(value, |pill, value| {
             pill.child(divider()).child(
-                segment().max_w(px(220.)).child(
+                segment().max_w(px(size::FIELD)).child(
                     Label::new(value)
                         .size(LabelSize::Small)
                         .single_line()
@@ -1341,14 +1451,24 @@ pub fn pill_button(
         .child(Icon::new(icon).size(IconSize::XSmall).color(color))
 }
 
-/// A padded list of rounded rows, as a field's offers: rows of radius `Radii::xs` inside a
-/// hairline, the list concentric around them. The caller colours the hairline and adds the
-/// fill and shadow.
+/// A padded list of rounded rows in a form or a dialog (a field's offers, what a delete takes
+/// with it): rows of radius `Radii::xs` on the document's fill inside a floating surface's
+/// hairline, the list concentric around them.
 pub fn row_list(cx: &App) -> Div {
     v_flex()
         .p(px(space::XS))
         .border_1()
         .rounded(px(radii(cx).row_list()))
+        .bg(surface::document(cx))
+        .border_color(surface::floating_border(cx))
+}
+
+/// A [`row_list`] floating over the page under a field (a filter's values): a menu's fill
+/// and shadow.
+pub fn popover_list(cx: &App) -> Div {
+    row_list(cx)
+        .bg(surface::floating(cx))
+        .shadow(elevation::floating(cx))
 }
 
 /// A floating group of controls over a canvas: a glass bar 28 px tall holding
@@ -1486,7 +1606,7 @@ pub fn key_hint(
         .gap(px(space::XS))
         .items_center()
         .flex_none()
-        .child(ui::KeyBinding::for_action_in(action, focus, cx).size(rems_from_px(11_f32)))
+        .child(ui::KeyBinding::for_action_in(action, focus, cx).size(rems_from_px(text::KEY_HINT)))
         .child(text::meta(label))
 }
 
@@ -1517,16 +1637,11 @@ fn code_frame(cx: &App) -> Div {
         .py(px(space::MD))
         .rounded(px(radii(cx).sm))
         .border_1();
-    let block = if is_glass(cx) {
-        block
-            .border_dashed()
-            .border_color(surface::rule(cx))
-            .bg(surface::well(cx))
+    let block = dotted(block, cx).bg(if is_glass(cx) {
+        surface::well(cx)
     } else {
-        block
-            .border_color(cx.theme().colors().border_variant)
-            .bg(surface::sunken(cx))
-    };
+        surface::sunken(cx)
+    });
     block
         .font_buffer(cx)
         .text_xs()
@@ -1542,7 +1657,7 @@ pub fn fields() -> Div {
 pub fn field(label: impl Into<SharedString>, value: impl IntoElement) -> Div {
     h_flex()
         .w_full()
-        .min_h(px(24.))
+        .min_h(px(size::FIELD_ROW))
         .gap(px(space::LG))
         .items_center()
         .child(
@@ -1561,15 +1676,11 @@ pub fn card(cx: &App) -> Div {
         .w_full()
         .rounded(px(radii(cx).md))
         .border_1()
-        .bg(cx.theme().colors().editor_background)
+        .border_color(surface::card_border(cx))
+        .bg(surface::document(cx))
         .overflow_hidden();
-    if is_glass(cx) {
-        // A solid item on glass: raised.
-        card.border_color(surface::raised_border(cx))
-            .shadow(elevation::raised(cx))
-    } else {
-        card.border_color(cx.theme().colors().border.opacity(0.7))
-    }
+    // A solid item on glass: raised.
+    card.when(is_glass(cx), |card| card.shadow(elevation::raised(cx)))
 }
 
 pub fn card_header(cx: &App) -> Div {
@@ -1596,7 +1707,7 @@ pub fn card_footer(cx: &App) -> Div {
         .gap(px(space::XS))
         .items_center()
         .border_t_1()
-        .border_color(cx.theme().colors().border.opacity(0.7))
+        .border_color(surface::card_border(cx))
 }
 
 /// An empty state, as Zed's panels draw one: an icon, a title of two or three words, then the
@@ -1668,18 +1779,18 @@ pub fn state_action(
     focus: &gpui::FocusHandle,
     cx: &App,
 ) -> Button {
-    button(id, label)
-        .style(ButtonStyle::Outlined)
-        .key_binding(ui::KeyBinding::for_action_in(action, focus, cx).size(rems_from_px(11_f32)))
+    button(id, label).style(ButtonStyle::Outlined).key_binding(
+        ui::KeyBinding::for_action_in(action, focus, cx).size(rems_from_px(text::KEY_HINT)),
+    )
 }
 
 /// A raised glass sheet: a translucent fill over the wash, a light outline, and layered soft
 /// shadows instead of a border. GPUI clips its children to the sheet's rectangle, not its
 /// rounded corners, so a child with a background flush in a corner takes the sheet's radius
-/// there (`Radii::lg`).
+/// there (`Radii::sheet`).
 pub fn sheet(cx: &App) -> Div {
     div()
-        .rounded(px(radii(cx).lg))
+        .rounded(px(radii(cx).sheet()))
         .overflow_hidden()
         .bg(surface::glass(
             cx.theme().colors().panel_background,
@@ -1689,14 +1800,30 @@ pub fn sheet(cx: &App) -> Div {
         .shadow(elevation::sheet(cx))
 }
 
-/// The rule under a list row: a hairline, dotted on glass.
-pub fn row_rule(row: Div, cx: &App) -> Div {
-    let row = row.border_b_1().border_color(surface::rule(cx));
+/// A rule between the rows or the sections of a document: the rule's hairline, dotted on
+/// glass as Tower's feeds are. A region's edge (a toolbar's, a strip's) stays solid. Give the
+/// element its border sides; this sets their colour and style.
+pub fn dotted<E: Styled>(element: E, cx: &App) -> E {
+    let element = element.border_color(surface::rule(cx));
     if is_glass(cx) {
-        row.border_dashed()
+        element.border_dashed()
     } else {
-        row
+        element
     }
+}
+
+/// [`dotted`] as a method, for a chain: `.border_b_1().dotted(cx)`.
+pub trait Dotted: Styled + Sized {
+    fn dotted(self, cx: &App) -> Self {
+        dotted(self, cx)
+    }
+}
+
+impl<E: Styled> Dotted for E {}
+
+/// The rule under a list row: [`dotted`] below it.
+pub fn row_rule(row: Div, cx: &App) -> Div {
+    dotted(row.border_b_1(), cx)
 }
 
 /// One entry of an activity feed, written as structure rather than a sentence: a status dot,
@@ -1793,10 +1920,7 @@ impl RenderOnce for ActivityRow {
                     .child(text::body(object).single_line())
             }))
             .children(self.preposition.map(|p| text::muted(p).single_line()))
-            .children(
-                self.place_icon
-                    .map(|icon| Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)),
-            )
+            .children(self.place_icon.map(icon::meta))
             .children(
                 self.place
                     .map(|place| text::body(place).single_line().truncate()),
@@ -1823,7 +1947,7 @@ pub fn tile(icon: IconName, cx: &App) -> Div {
         .justify_center()
         .rounded(px(radii(cx).sm))
         .bg(surface::highlight(cx))
-        .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+        .child(icon::lead(icon))
 }
 
 /// Metadata items joined by a middle dot: "123 runs · last run 2m ago · by act-dev".
@@ -1849,14 +1973,10 @@ pub fn section_rule(title: impl Into<SharedString>, cx: &App) -> Div {
         .gap(px(space::LG))
         .items_center()
         .child(text::meta(title))
-        .child(
-            div()
-                .flex_1()
-                .h(px(1.))
-                .border_t_1()
-                .border_dashed()
-                .border_color(surface::rule(cx)),
-        )
+        .child(dotted(
+            div().flex_1().h(px(size::HAIRLINE)).border_t_1(),
+            cx,
+        ))
 }
 
 /// A count in a soft tinted pill: pale status tints, keyed by a hue so the same type
@@ -1889,7 +2009,7 @@ pub fn pill(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
         .items_center()
         .rounded_full()
         .border_1()
-        .border_color(cx.theme().colors().border_variant)
+        .border_color(surface::control_border(cx))
         .cursor_pointer()
         .hover(move |style| style.bg(hover))
 }
@@ -1918,14 +2038,14 @@ pub fn composer_button(
                 button.bg(colors.text).child(
                     Icon::new(icon)
                         .size(IconSize::Small)
-                        .color(Color::Custom(colors.editor_background)),
+                        .color(Color::Custom(surface::document(cx))),
                 )
             } else {
                 button
                     .border_1()
-                    .border_color(colors.border_variant)
+                    .border_color(surface::control_border(cx))
                     .hover(move |style| style.bg(hover))
-                    .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                    .child(icon::lead(icon))
             }
         })
 }
@@ -2000,6 +2120,8 @@ impl TimelineEntry {
 impl RenderOnce for TimelineEntry {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let rule = surface::rule(cx);
+        // The dot sits centred on the header's line; the rail runs from under it.
+        let dot_top = (size::HEADER - size::DOT) / 2.;
         let rail = div()
             .w(px(size::GUTTER))
             .flex_none()
@@ -2011,9 +2133,9 @@ impl RenderOnce for TimelineEntry {
                 rail.child(
                     div()
                         .absolute()
-                        .top(px(18.))
+                        .top(px(dot_top + size::DOT))
                         .bottom_0()
-                        .w(px(1.))
+                        .w(px(size::HAIRLINE))
                         .border_l_1()
                         .border_dashed()
                         .border_color(rule),
@@ -2021,15 +2143,15 @@ impl RenderOnce for TimelineEntry {
             })
             .child(
                 div()
-                    .mt(px(11.))
-                    .size(px(7.))
+                    .mt(px(dot_top))
+                    .size(px(size::DOT))
                     .rounded_full()
                     .border_1()
                     .border_color(rule)
-                    .bg(cx.theme().colors().editor_background),
+                    .bg(surface::document(cx)),
             );
         let header = h_flex()
-            .h(px(30.))
+            .h(px(size::HEADER))
             .gap(px(space::SM))
             .items_center()
             .children(self.expanded.map(|expanded| {
@@ -2055,9 +2177,7 @@ impl RenderOnce for TimelineEntry {
                         h_flex()
                             .gap(px(space::XS))
                             .child(text::meta("From"))
-                            .children(self.source_icon.map(|icon| {
-                                Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)
-                            }))
+                            .children(self.source_icon.map(icon::meta))
                             .child(text::meta(source).single_line())
                             .into_any_element()
                     })
