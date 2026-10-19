@@ -250,16 +250,12 @@ impl OpenGraphModal {
             return;
         }
         let registry = ConnectionRegistry::global(cx);
-        match registry.update(cx, |registry, cx| {
+        registry.update(cx, |registry, cx| {
             registry.update_token(&connection, token, cx)
-        }) {
-            Ok(()) => {
-                self.error = None;
-                self.replacement_token
-                    .update(cx, |editor, cx| editor.set_text("", window, cx));
-            }
-            Err(error) => self.error = Some(error.to_string().into()),
-        }
+        });
+        self.error = None;
+        self.replacement_token
+            .update(cx, |editor, cx| editor.set_text("", window, cx));
         cx.notify();
     }
 

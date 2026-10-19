@@ -89,7 +89,6 @@ pub enum ConnectionEvent {
 pub struct Connection {
     pub server: ServerEntry,
     client: GraphClient,
-    http: Arc<dyn HttpClient>,
     pub state: ConnectionState,
     pub health: Option<HealthOutput>,
     /// How long the last health check took to answer: the server's round trip, shown beside
@@ -117,11 +116,10 @@ impl Connection {
         token: Option<String>,
         http: Arc<dyn HttpClient>,
     ) -> anyhow::Result<Self> {
-        let client = GraphClient::new(&server.url, token, http.clone())?;
+        let client = GraphClient::new(&server.url, token, http)?;
         Ok(Self {
             server,
             client,
-            http,
             state: ConnectionState::Idle,
             health: None,
             latency: None,
@@ -172,17 +170,12 @@ impl Connection {
     /// Replaces the token: typed in after the server refused the old one, or changed in the
     /// CLI's files (spec 003). Requests made after this use it, and a connection in use checks
     /// again; one not yet used connects when it is.
-    pub fn set_token(
-        &mut self,
-        token: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> anyhow::Result<()> {
+    pub fn set_token(&mut self, token: Option<String>, cx: &mut Context<Self>) {
         self.token_pending = false;
-        self.client = GraphClient::new(&self.server.url, token, self.http.clone())?;
+        self.client.set_token(token);
         if self.state != ConnectionState::Idle {
             self.connect(cx);
         }
-        Ok(())
     }
 
     /// Stops a connection attempt that is taking too long.
@@ -433,7 +426,7 @@ mod tests {
             "nothing sent without the token"
         );
         connection.update(cx, |connection, cx| {
-            connection.set_token(Some("t".into()), cx).unwrap()
+            connection.set_token(Some("t".into()), cx)
         });
         cx.run_until_parked();
         connection.read_with(cx, |connection, _| {

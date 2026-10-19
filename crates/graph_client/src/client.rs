@@ -297,7 +297,9 @@ pub enum FeedAt<'a> {
 #[derive(Clone)]
 pub struct GraphClient {
     base: Url,
-    token: Option<Arc<str>>,
+    /// Shared by every clone, as the connection's one token: a token replaced after the server
+    /// refused the old one reaches every holder, a running agent's gateway among them.
+    token: Arc<std::sync::RwLock<Option<Arc<str>>>>,
     http: Arc<dyn HttpClient>,
     /// Shared by every clone, so the bound holds for the whole connection.
     read_slots: Arc<smol::lock::Semaphore>,
@@ -343,10 +345,26 @@ impl GraphClient {
         }
         Ok(Self {
             base,
-            token: token.map(Into::into),
+            token: Arc::new(std::sync::RwLock::new(token.map(Into::into))),
             http,
             read_slots: Arc::new(smol::lock::Semaphore::new(READ_CONCURRENCY)),
         })
+    }
+
+    /// Replaces the token for this client and every clone of it; requests sent after this use
+    /// it.
+    pub fn set_token(&self, token: Option<String>) {
+        *self
+            .token
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = token.map(Into::into);
+    }
+
+    fn token(&self) -> Option<Arc<str>> {
+        self.token
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn base_url(&self) -> &str {
@@ -408,7 +426,7 @@ impl GraphClient {
             .header(CONTRACT_HEADER, SUPPORTED_CONTRACTS[0])
             .follow_redirects(RedirectPolicy::NoFollow)
             .timeout(timeout);
-        if let Some(token) = &self.token {
+        if let Some(token) = self.token() {
             builder = builder.header("authorization", format!("Bearer {token}"));
         }
         if body.is_some() {
@@ -691,7 +709,7 @@ impl GraphClient {
             .uri(url.as_str())
             .header(CONTRACT_HEADER, SUPPORTED_CONTRACTS[0])
             .follow_redirects(RedirectPolicy::NoFollow);
-        if let Some(token) = &self.token {
+        if let Some(token) = self.token() {
             builder = builder.header("authorization", format!("Bearer {token}"));
         }
         for (name, value) in &request.headers {
@@ -1274,6 +1292,43 @@ mod tests {
 
     const CHANGE: &str =
         r#"{"branch":"main","query_name":"u","affected_nodes":1,"affected_edges":0,"commit":null}"#;
+
+    /// A token replaced on the client reaches every clone, as the one a running agent's gateway
+    /// holds: its next forwarded request and its next read send the new token.
+    #[test]
+    fn a_replaced_token_reaches_every_clone() {
+        let sent: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let log = sent.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let log = log.clone();
+            async move {
+                let token = request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                log.lock().unwrap().push(token);
+                Ok(Response::builder()
+                    .status(200)
+                    .header(CONTRACT_HEADER, SUPPORTED_CONTRACTS[0])
+                    .body(AsyncBody::from("{}"))
+                    .unwrap())
+            }
+        });
+        let held = client(http);
+        let gateway = held.clone();
+        held.set_token(Some("new".into()));
+        block_on(gateway.forward(ForwardRequest {
+            method: Method::GET,
+            path_and_query: "graphs".into(),
+            headers: Vec::new(),
+            body: AsyncBody::empty(),
+        }))
+        .unwrap();
+        block_on(gateway.schema("g")).ok();
+        assert_eq!(*sent.lock().unwrap(), ["Bearer new", "Bearer new"]);
+    }
 
     /// Stored queries: the catalog decodes (a kind Studio does not know is `Other`), a read
     /// says it expects a read, and a write says it expects a write, drops any snapshot and, bound

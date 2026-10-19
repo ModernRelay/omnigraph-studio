@@ -156,9 +156,7 @@ impl ConnectionRegistry {
                     cx.update(|cx| cx.write_credentials(&url, KEYCHAIN_USER, token.as_bytes()))
                         .detach();
                 }
-                connection
-                    .update(cx, |connection, cx| connection.set_token(token, cx))
-                    .ok();
+                connection.update(cx, |connection, cx| connection.set_token(token, cx));
             })
             .detach();
         }
@@ -290,11 +288,7 @@ impl ConnectionRegistry {
                 });
                 if self.cli_tokens.get(&server.name) != Some(&token) {
                     self.cli_tokens.insert(server.name.clone(), token.clone());
-                    if let Err(error) =
-                        connection.update(cx, |connection, cx| connection.set_token(token, cx))
-                    {
-                        self.cli_errors.push(error.to_string());
-                    }
+                    connection.update(cx, |connection, cx| connection.set_token(token, cx));
                     changed = true;
                 }
                 continue;
@@ -394,7 +388,7 @@ impl ConnectionRegistry {
         connection: &Entity<Connection>,
         token: String,
         cx: &mut Context<Self>,
-    ) -> anyhow::Result<()> {
+    ) {
         let token = token.trim().to_owned();
         let (url, source) = {
             let server = &connection.read(cx).server;
@@ -402,12 +396,11 @@ impl ConnectionRegistry {
         };
         connection.update(cx, |connection, cx| {
             connection.set_token(Some(token.clone()), cx)
-        })?;
+        });
         if source == ServerSource::Studio {
             cx.write_credentials(&url, KEYCHAIN_USER, token.as_bytes())
                 .detach();
         }
-        Ok(())
     }
 
     /// Writes Studio-added servers and remembered graph ids to the data directory.
@@ -551,11 +544,9 @@ mod tests {
         assert_eq!(token_sent(cx, &a).as_deref(), Some("Bearer two"));
 
         // A token typed into Studio stays while the files keep theirs.
-        registry
-            .update(cx, |registry, cx| {
-                registry.update_token(&a, "typed".into(), cx)
-            })
-            .unwrap();
+        registry.update(cx, |registry, cx| {
+            registry.update_token(&a, "typed".into(), cx)
+        });
         apply(cx, files(&[("a", "http://a.test", Some("two"))]));
         assert_eq!(token_sent(cx, &a).as_deref(), Some("Bearer typed"));
 
