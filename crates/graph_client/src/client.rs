@@ -701,7 +701,11 @@ impl GraphClient {
             .base
             .join(&request.path_and_query)
             .map_err(|error| error.to_string())?;
-        if !url.as_str().starts_with(self.base.as_str()) {
+        // The server receives exactly the path judged here: a join that resolves `%2e%2e`,
+        // drops a tab or encodes a byte would send another.
+        if !url.as_str().starts_with(self.base.as_str())
+            || url.path() != format!("{}{path}", self.base.path())
+        {
             return Err(format!("refused path {:?}", request.path_and_query));
         }
         let mut builder = Request::builder()
@@ -1489,6 +1493,9 @@ mod tests {
             "/graphs/g/query",
             "../graphs/g/query",
             "graphs/../../etc",
+            "graphs/%2e%2e/query",
+            "graphs/g/%2E./query",
+            "graphs/g\t/query",
             "http://elsewhere/graphs",
             "graphs\\g",
         ] {
