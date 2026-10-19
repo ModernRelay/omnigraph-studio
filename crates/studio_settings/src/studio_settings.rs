@@ -377,8 +377,9 @@ impl Global for SettingsFileState {}
 /// Windows, `$XDG_CONFIG_HOME/omnigraph-studio` elsewhere. A binary run from a Cargo build
 /// directory (`cargo run`, an example) uses a sibling directory ending in "Dev" instead, so a
 /// development run never rewrites the tabs, drafts and conversations of the app the person
-/// uses. A bundled app is not a development run, whichever profile built it. Found once, at the
-/// first call: a run keeps one directory.
+/// uses. A bundled app is not a development run, whichever profile built it. A test binary
+/// (Cargo's `deps`) has a directory of its own, so no crate's test reads or rewrites a
+/// development run's. Found once, at the first call: a run keeps one directory.
 pub fn data_dir() -> PathBuf {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(find_data_dir).clone()
@@ -390,7 +391,11 @@ fn find_data_dir() -> PathBuf {
     {
         return PathBuf::from(dir);
     }
-    let dev = std::env::current_exe().is_ok_and(|exe| is_build_output(&exe));
+    let exe = std::env::current_exe().ok();
+    if exe.as_deref().is_some_and(is_test_binary) {
+        return std::env::temp_dir().join(format!("omnigraph-studio-test-{}", std::process::id()));
+    }
+    let dev = exe.as_deref().is_some_and(is_build_output);
     let home = std::env::home_dir().unwrap_or_default();
     if cfg!(windows) {
         return std::env::var_os("APPDATA")
@@ -422,6 +427,15 @@ fn find_data_dir() -> PathBuf {
 
 /// Whether an executable is Cargo's build output rather than an installed app: it sits in a
 /// profile directory (or its `examples`) under a `target` directory, and not in a macOS bundle.
+/// A test binary Cargo built: in a build directory's `deps`.
+fn is_test_binary(exe: &std::path::Path) -> bool {
+    is_build_output(exe)
+        && exe
+            .parent()
+            .and_then(|dir| dir.file_name())
+            .is_some_and(|name| name == "deps")
+}
+
 fn is_build_output(exe: &std::path::Path) -> bool {
     let parts: Vec<&std::ffi::OsStr> = exe.iter().collect();
     if parts
@@ -967,6 +981,20 @@ mod tests {
         ));
         assert!(!dev("/opt/omnigraph-studio/bin/omnigraph-studio"));
         assert!(!dev("/usr/local/bin/omnigraph-studio"));
+        // A test binary keeps a directory of its own.
+        let test = |path: &str| is_test_binary(std::path::Path::new(path));
+        assert!(test(
+            "/w/omnigraph-studio/target/debug/deps/studio-0123abcd"
+        ));
+        assert!(!test("/w/omnigraph-studio/target/debug/omnigraph-studio"));
+        assert!(!test("/w/omnigraph-studio/target/debug/examples/snapshot"));
+        if std::env::var_os("OMNIGRAPH_STUDIO_DATA").is_none() {
+            assert!(
+                data_dir().starts_with(std::env::temp_dir()),
+                "{:?}",
+                data_dir()
+            );
+        }
     }
 
     /// `assets/settings/default.json` documents the defaults (spec 002); it must say what the
