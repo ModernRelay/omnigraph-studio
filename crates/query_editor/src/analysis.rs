@@ -20,7 +20,8 @@ impl Analysis {
     /// Checks `text` against `schema`. Runs off the main thread.
     pub fn new(schema: &SchemaModel, text: String) -> Self {
         let outline = gq_language::outline(&text);
-        let problems = gq_language::check(schema, &text)
+        let checked = gq_language::check(schema, &text);
+        let problems = checked
             .diagnostics
             .into_iter()
             .map(|diagnostic| {
@@ -39,15 +40,25 @@ impl Analysis {
                 (diagnostic, range)
             })
             .collect();
+        // The whole text's check describes each declaration it parsed; only text that does not
+        // parse is checked again a declaration at a time, so one broken query leaves the others
+        // runnable.
         let queries = outline
             .declarations
             .iter()
             .map(|declaration| {
-                let own = outline.runnable_text(&text, declaration);
-                gq_language::check(schema, &own)
+                checked
                     .queries
-                    .into_iter()
+                    .iter()
                     .find(|query| query.name == declaration.name)
+                    .cloned()
+                    .or_else(|| {
+                        let own = outline.runnable_text(&text, declaration);
+                        gq_language::check(schema, &own)
+                            .queries
+                            .into_iter()
+                            .find(|query| query.name == declaration.name)
+                    })
             })
             .collect();
         Self {
