@@ -283,6 +283,9 @@ pub mod opacity {
     /// A row a filter dims, a card for a side not written yet, a merged branch's lane: one
     /// value, so every quiet thing is equally quiet.
     pub const DIMMED: f32 = 0.5;
+    /// What lies away from the canvas's focus (its chips and their lines' labels): fainter than
+    /// a dimmed row, since a crowded canvas has to let the near part stand out.
+    pub const FAR: f32 = 0.3;
 }
 
 /// Whether the window is drawn in the glass style (setting `studio.window_style`).

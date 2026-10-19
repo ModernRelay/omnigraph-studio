@@ -444,7 +444,7 @@ pub(crate) fn paint(
             let dim = near
                 .as_ref()
                 .is_some_and(|n| !(n.contains(&edge.from) && n.contains(&edge.to)));
-            let alpha = if dim { 0.25 } else { 1. };
+            let alpha = if dim { studio_ui::ds::opacity::FAR } else { 1. };
             let pieces = [Piece {
                 text: label.clone(),
                 color: palette.muted.opacity(alpha),
@@ -487,7 +487,7 @@ pub(crate) fn paint(
         let focus = selected == Some(index) || marked.contains(&index);
         let pointed = hovered == Some(index);
         let dim = !marked.contains(&index) && near.as_ref().is_some_and(|n| !n.contains(&index));
-        let alpha = if dim { 0.3 } else { 1. };
+        let alpha = if dim { studio_ui::ds::opacity::FAR } else { 1. };
         let root = matches!(node.kind, SceneKind::Node { root: true, .. });
         // From afar a node is its mark alone, and a closed hub a dot on its line. A type keeps
         // its name further out: an ontology has few, and their names are the point.

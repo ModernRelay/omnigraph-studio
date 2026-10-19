@@ -424,7 +424,9 @@ than styling one-off elements.
   corner's radius above the edge (`SheetFloor`), since a view's own fill (an editor's) would
   square the corner again.
 - **Quiet things.** A row a filter dims, a card for a side not written yet and a merged
-  branch's lane recede by one opacity, `ds::opacity::DIMMED`. Colours a view used to derive
+  branch's lane recede by one opacity, `ds::opacity::DIMMED`; what lies away from the
+  canvas's focus, its chips and their lines' labels alike, by `ds::opacity::FAR` (they were
+  0.3 and 0.25). Colours a view used to derive
   itself are surface roles: the canvas's here-ring and its halo, a pointed chip's hairline,
   the dot grid, the marquee, a highlighted span of query text, rows picked beside the cursor's,
   a card's hairline (also its footer's rule).
