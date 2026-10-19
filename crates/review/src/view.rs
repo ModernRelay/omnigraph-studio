@@ -17,9 +17,8 @@ use graph_client::{ReadError, WriteOutcome};
 use graph_store::fixes::compose;
 use graph_store::{
     ChangeFold, EntityGroup, EntityGroups, FoldedChange, FoldedChanges, GraphSession, GroupRun,
-    GroupSection, HeadWatch, NetChange, NodeNames, REVIEW_CHANGE_CAP, RelationshipEntry,
-    SessionEvent, TypeCounts, commits_since, contains_merge_of, entity_name, fork_point,
-    revert_query, summary_sentence,
+    GroupSection, HeadWatch, NetChange, NodeNames, REVIEW_CHANGE_CAP, SessionEvent, TypeCounts,
+    commits_since, contains_merge_of, fork_point, revert_query, summary_sentence,
 };
 use serde_json::Value;
 use studio_actions::review::{
@@ -28,10 +27,7 @@ use studio_actions::review::{
 use studio_ui::ds::Button;
 use studio_ui::ds::{radii, space};
 use studio_ui::menu::ContextMenu;
-use studio_ui::{
-    ChangeCard, ChangeKind, PropertyRow, RelationshipLine, change_counts, change_group_header,
-    group_digits, short_commit_id, type_swatch,
-};
+use studio_ui::{ChangeCard, change_counts, group_digits, short_commit_id, type_swatch};
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace, workspace_for};
 use ui::prelude::*;
 use ui::{Banner, Checkbox, KeyBinding, PopoverMenu, Severity, ToggleState, Tooltip};
@@ -46,10 +42,6 @@ const SEARCH_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
 /// after the last change returned, so fewer, larger pages cost fewer reads; the server's byte
 /// budget still bounds what one page holds.
 const FEED_PAGE: usize = 8_192;
-
-/// Relationship lines a card shows until it is opened: a node that gained hundreds of
-/// relationships stays one readable card, and one row the list lays out quickly.
-const CARD_LINES: usize = 20;
 
 /// One row of the review's list.
 #[derive(Debug, Clone, Copy)]
@@ -243,7 +235,7 @@ pub struct ReviewView {
     /// loads; until then, and for a node without a name, its id shows.
     names: NodeNames,
     /// Cards showing every relationship line, by entity `(type, id)`; the others show
-    /// [`CARD_LINES`].
+    /// [`change_cards::CARD_LINES`].
     open_cards: HashSet<(String, String)>,
     list_state: ListState,
     /// The head fixes and the merge bind to: the reviewed head, then each fix's own commit.
@@ -1741,41 +1733,17 @@ impl ReviewView {
             return div().into_any_element();
         };
         match self.rows.get(row).copied() {
-            Some(Row::Header(ix)) => {
-                let header = &self.headers[ix];
-                let title = header.section.map(|section| match section {
-                    GroupSection::Existing => format!("Changes to what {} has", self.target),
-                    GroupSection::Added => format!("Added on {}", self.branch),
-                });
-                v_flex()
-                    .px(px(space::XL))
-                    .children(title.map(|title| {
-                        div()
-                            .pt(px(space::XL))
-                            .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
-                    }))
-                    .child(
-                        change_group_header(
-                            &header.type_name,
-                            header.is_edge,
-                            header.added,
-                            header.changed,
-                            header.removed,
-                            cx,
-                        )
-                        .when(header.relationships > 0, |d| {
-                            d.child(
-                                Label::new(match header.relationships {
-                                    1 => "· 1 relationship".to_owned(),
-                                    n => format!("· {} relationships", group_digits(n)),
-                                })
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                            )
-                        }),
-                    )
-                    .into_any_element()
-            }
+            Some(Row::Header(ix)) => div()
+                .px(px(space::XL))
+                .child(change_cards::run_header(
+                    &self.headers[ix],
+                    |section| match section {
+                        GroupSection::Existing => format!("Changes to what {} has", self.target),
+                        GroupSection::Added => format!("Added on {}", self.branch),
+                    },
+                    cx,
+                ))
+                .into_any_element(),
             Some(Row::Entity(group)) => {
                 let schema = self.session.read(cx).schema_model();
                 let card = self.entity_card(data, group, schema.as_deref(), cx);
@@ -1807,15 +1775,14 @@ impl ReviewView {
         let total = group.changes().count();
         let reviewed = unreviewed == 0;
 
-        let mut card = match group.change {
-            Some(own) => change_card(&changes[own], schema, ("change", ix))
-                .name(entity_name(&changes[own], schema)),
-            None => ChangeCard::new(("change", ix), ChangeKind::Unchanged, group.id.clone()).name(
-                self.names
-                    .get(&(group.type_name.clone(), group.id.clone()))
-                    .cloned(),
-            ),
-        }
+        let mut card = change_cards::entity_card(
+            &data.groups,
+            &data.folded,
+            ix,
+            schema,
+            &self.names,
+            ("change", ix),
+        )
         .selected(selected_group == Some(ix))
         .hollow(reviewed);
         if let Some((text, color)) = group
@@ -1905,14 +1872,14 @@ impl ReviewView {
         }
 
         let entries = data.groups.entries(&data.folded, ix, schema, &self.names);
-        let counts = relationship_counts(&entries);
+        let counts = change_cards::relationship_counts(&entries);
         // A card of many relationships shows its first few until opened, and opens by itself
         // for a relationship selected below them (from a mirror, or a change of a fix).
         let card_key = (group.type_name.clone(), group.id.clone());
         let selected_at = self
             .selected
             .and_then(|s| entries.iter().position(|entry| entry.change == s));
-        let shown = lines_shown(
+        let shown = change_cards::lines_shown(
             entries.len(),
             self.open_cards.contains(&card_key),
             selected_at,
@@ -1926,8 +1893,15 @@ impl ReviewView {
                 let mirror = entry.net.is_none();
                 let moved_from = entry.replaces.as_ref().map(|(removed, _)| *removed);
                 let was_edge = moved_from.map(|removed| &changes[removed]);
-                let mut line = relationship_line(entry, &changes[change], was_edge, schema)
-                    .on_click(cx.listener(move |this, _, _, cx| this.select(change, cx)));
+                // A mirror's other end is the card it is reviewed on.
+                let mut line = change_cards::relationship_line(
+                    entry,
+                    &changes[change],
+                    was_edge,
+                    schema,
+                    "reviewed there",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| this.select(change, cx)));
                 if mirror {
                     return line;
                 }
@@ -1986,10 +1960,7 @@ impl ReviewView {
             card = card.relationships_footer(
                 studio_ui::ds::button(
                     ("more-relationships", ix),
-                    match left_out {
-                        1 => "Show 1 more relationship".to_owned(),
-                        n => format!("Show {} more relationships", group_digits(n)),
-                    },
+                    change_cards::more_lines_label(left_out),
                 )
                 .style(ButtonStyle::Subtle)
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -2007,90 +1978,6 @@ impl ReviewView {
                 this.select(change, cx);
             }
         }))
-    }
-}
-
-/// How many of a card's `total` relationship lines show: all once the card is opened or when
-/// the selected one is past the first [`CARD_LINES`], else at most those.
-fn lines_shown(total: usize, open: bool, selected_at: Option<usize>) -> usize {
-    if open || selected_at.is_some_and(|at| at >= CARD_LINES) {
-        total
-    } else {
-        total.min(CARD_LINES)
-    }
-}
-
-/// Added, changed and removed relationships among a card's entries; mirrors are counted on
-/// their own card.
-pub(crate) fn relationship_counts(entries: &[RelationshipEntry]) -> (usize, usize, usize) {
-    entries
-        .iter()
-        .fold((0, 0, 0), |(added, changed, removed), entry| {
-            match entry.net {
-                Some(NetChange::Added) => (added + 1, changed, removed),
-                Some(NetChange::Changed) => (added, changed + 1, removed),
-                Some(NetChange::Removed) => (added, changed, removed + 1),
-                None => (added, changed, removed),
-            }
-        })
-}
-
-/// A card's line for one relationship entry: what changed, which way it points, the other
-/// end, and a changed relationship's property rows. A mirror says where it is reviewed.
-pub(crate) fn relationship_line(
-    entry: RelationshipEntry,
-    edge: &FoldedChange,
-    was: Option<&FoldedChange>,
-    schema: Option<&SchemaModel>,
-) -> RelationshipLine {
-    let kind = entry.net.map(|net| match net {
-        NetChange::Added => ChangeKind::Added,
-        NetChange::Changed => ChangeKind::Changed,
-        NetChange::Removed => ChangeKind::Removed,
-    });
-    let id = if kind.is_some() {
-        ("relationship", entry.change)
-    } else {
-        ("mirror", entry.change)
-    };
-    // A moved relationship's rows compare the old edge's values with the new one's.
-    let compared = was.map(|was| FoldedChange {
-        before: was.before.clone(),
-        ..edge.clone()
-    });
-    let rows = if kind.is_some() {
-        compared
-            .as_ref()
-            .unwrap_or(edge)
-            .card_diffs(schema)
-            .into_iter()
-            .map(|diff| PropertyRow {
-                name: diff.name.into(),
-                before: diff.before,
-                after: diff.after,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let note = match (kind, &entry.replaces) {
-        // The other end is the card it is reviewed on.
-        (None, _) => Some("reviewed there"),
-        (Some(_), Some(_)) if entry.other_is_new => Some("moved, new"),
-        (Some(_), Some(_)) => Some("moved"),
-        (Some(_), None) if entry.other_is_new => Some("new"),
-        (Some(_), None) => None,
-    };
-    let other = match &entry.replaces {
-        Some((_, was)) => format!("{was} → {}", entry.other),
-        None => entry.other,
-    };
-    let line = RelationshipLine::new(id, kind, entry.words, entry.outgoing, other)
-        .other_detail(entry.other_type)
-        .rows(rows);
-    match note {
-        Some(note) => line.note(note),
-        None => line,
     }
 }
 
@@ -2122,33 +2009,6 @@ fn fix_status(fix: &FixState) -> Option<(String, Color)> {
             Color::Warning,
         ),
     })
-}
-
-/// The card for one folded change.
-pub(crate) fn change_card(
-    change: &FoldedChange,
-    schema: Option<&SchemaModel>,
-    id: impl Into<gpui::ElementId>,
-) -> ChangeCard {
-    let kind = match change.net() {
-        Some(NetChange::Added) => ChangeKind::Added,
-        Some(NetChange::Removed) => ChangeKind::Removed,
-        _ => ChangeKind::Changed,
-    };
-    let rows = change
-        .card_diffs(schema)
-        .into_iter()
-        .map(|diff| PropertyRow {
-            name: diff.name.into(),
-            before: diff.before,
-            after: diff.after,
-        })
-        .collect();
-    let mut card = ChangeCard::new(id, kind, change.id.clone()).rows(rows);
-    if let Some((from, to)) = change.endpoints() {
-        card = card.endpoints(from, to);
-    }
-    card
 }
 
 /// What a search finds a change by, lowercase: its id, its type, a relationship's two ends and
@@ -2728,17 +2588,6 @@ pub(crate) mod tests {
             assert!(text.contains(found), "{found}");
         }
         assert!(!text.contains("lovelace"));
-    }
-
-    /// A card of many relationships shows its first few until opened, or until the one selected
-    /// is past them.
-    #[test]
-    fn a_card_shows_its_first_relationships_until_opened() {
-        assert_eq!(lines_shown(5, false, None), 5);
-        assert_eq!(lines_shown(400, false, None), CARD_LINES);
-        assert_eq!(lines_shown(400, false, Some(3)), CARD_LINES);
-        assert_eq!(lines_shown(400, false, Some(CARD_LINES)), 400);
-        assert_eq!(lines_shown(400, true, None), 400);
     }
 
     /// A card shows when its own change or a relationship on it matches the search, the first

@@ -1401,6 +1401,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "change_cards"
+version = "0.2.1"
+dependencies = [
+ "gpui",
+ "gq_language",
+ "graph_store",
+ "studio_ui",
+ "ui",
+]
+
+[[package]]
 name = "chardetng"
 version = "0.1.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4344,9 +4355,9 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 name = "history"
 version = "0.2.1"
 dependencies = [
+ "change_cards",
  "editor",
  "gpui",
- "gq_language",
  "graph_client",
  "graph_store",
  "http_client",
@@ -8535,6 +8546,7 @@ dependencies = [
 name = "review"
 version = "0.2.1"
 dependencies = [
+ "change_cards",
  "editor",
  "futures",
  "gpui",

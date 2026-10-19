@@ -7,6 +7,7 @@ members = [
     "crates/studio_theme",
     "crates/studio_ui",
     "crates/studio_workspace",
+    "crates/change_cards",
     "crates/graph_client",
     "crates/graph_store",
     "crates/gq_language",
@@ -45,6 +46,7 @@ studio_settings = { path = "crates/studio_settings" }
 studio_theme = { path = "crates/studio_theme" }
 studio_ui = { path = "crates/studio_ui" }
 studio_workspace = { path = "crates/studio_workspace" }
+change_cards = { path = "crates/change_cards" }
 graph_client = { path = "crates/graph_client" }
 graph_store = { path = "crates/graph_store" }
 gq_language = { path = "crates/gq_language" }

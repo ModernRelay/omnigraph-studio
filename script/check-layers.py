@@ -16,6 +16,7 @@ LAYERS = {
     "studio_ui": 2,
     "graph_store": 3,
     "studio_workspace": 4,
+    "change_cards": 4,
     "command_palette": 5,
     "type_table": 5,
     "relationship_tree": 5,

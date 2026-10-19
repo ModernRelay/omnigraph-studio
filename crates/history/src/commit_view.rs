@@ -1,23 +1,21 @@
 //! One commit's changes against its first parent (spec 009), with the same entity cards as the
 //! review. Shown in History's detail split, or as its own tab through `OpenCommit`.
 
+use std::collections::HashSet;
+
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
     ListState, Render, SharedString, Task, Window, list,
 };
-use gq_language::SchemaModel;
 use graph_client::ReadError;
 use graph_client::api::{ChangeCauseOutput, CommitOutput};
 use graph_store::{
-    ChangeFold, EntityGroups, FoldedChange, FoldedChanges, GraphSession, GroupRun, GroupSection,
-    NetChange, NodeNames, RelationshipEntry, TypeCounts, entity_name,
+    ChangeFold, EntityGroups, FoldedChanges, GraphSession, GroupRun, GroupSection, NodeNames,
+    TypeCounts,
 };
 use studio_actions::graph::{OpenCommit, OpenQueryAt, OpenType};
 use studio_ui::menu::ContextMenu;
-use studio_ui::{
-    ChangeCard, ChangeKind, PropertyRow, RelationshipLine, change_group_header, group_digits,
-    now_micros, relative_time, short_commit_id, utc_date_time,
-};
+use studio_ui::{now_micros, relative_time, short_commit_id, utc_date_time};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 use ui::{PopoverMenu, Tooltip};
@@ -67,6 +65,9 @@ pub struct CommitView {
     runs: Vec<GroupRun>,
     /// Names of the nodes known here only by id, read at the commit.
     names: NodeNames,
+    /// Cards showing every relationship line, by entity `(type, id)`; the others show
+    /// [`change_cards::CARD_LINES`].
+    open_cards: HashSet<(String, String)>,
     _names_task: Option<Task<()>>,
     counts: Vec<TypeCounts>,
     rows: Vec<Row>,
@@ -131,6 +132,7 @@ impl CommitView {
             groups: EntityGroups::default(),
             runs: Vec::new(),
             names: NodeNames::default(),
+            open_cards: HashSet::new(),
             _names_task: None,
             counts: Vec::new(),
             rows: Vec::new(),
@@ -491,78 +493,69 @@ impl CommitView {
     ) -> AnyElement {
         let more = self.next_page_token.is_some();
         match self.rows.get(row).copied() {
-            Some(Row::Header(ix)) => {
-                let run = &self.runs[ix];
-                let title = run.section.map(|section| match section {
-                    GroupSection::Existing => "Changes to existing entities",
-                    GroupSection::Added => "Added",
-                });
-                v_flex()
-                    .px(px(studio_ui::ds::space::EDGE))
-                    .children(title.map(|title| {
-                        div()
-                            .pt(px(studio_ui::ds::space::XL))
-                            .child(Label::new(title).size(LabelSize::Small).color(Color::Muted))
-                    }))
-                    .child(
-                        change_group_header(
-                            &run.type_name,
-                            run.is_edge,
-                            run.added,
-                            run.changed,
-                            run.removed,
-                            cx,
-                        )
-                        .when(run.relationships > 0, |d| {
-                            d.child(
-                                Label::new(match run.relationships {
-                                    1 => "· 1 relationship".to_owned(),
-                                    n => format!("· {} relationships", group_digits(n)),
-                                })
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                            )
-                        }),
-                    )
-                    .into_any_element()
-            }
+            Some(Row::Header(ix)) => div()
+                .px(px(studio_ui::ds::space::EDGE))
+                .child(change_cards::run_header(
+                    &self.runs[ix],
+                    |section| match section {
+                        GroupSection::Existing => "Changes to existing entities".to_owned(),
+                        GroupSection::Added => "Added".to_owned(),
+                    },
+                    cx,
+                ))
+                .into_any_element(),
             Some(Row::Entity(ix)) => {
                 let schema = self.session.read(cx).schema_model();
                 let schema = schema.as_deref();
-                let group = &self.groups.groups[ix];
-                let card = match group.change {
-                    Some(own) => {
-                        change_card(&self.folded.changes[own], schema, ("commit-change", ix))
-                            .name(entity_name(&self.folded.changes[own], schema))
-                    }
-                    None => ChangeCard::new(
-                        ("commit-change", ix),
-                        ChangeKind::Unchanged,
-                        group.id.clone(),
-                    )
-                    .name(
-                        self.names
-                            .get(&(group.type_name.clone(), group.id.clone()))
-                            .cloned(),
-                    ),
-                };
+                let card = change_cards::entity_card(
+                    &self.groups,
+                    &self.folded,
+                    ix,
+                    schema,
+                    &self.names,
+                    ("commit-change", ix),
+                );
                 let entries = self.groups.entries(&self.folded, ix, schema, &self.names);
-                let counts = relationship_counts(&entries);
+                let counts = change_cards::relationship_counts(&entries);
+                let group = &self.groups.groups[ix];
+                let card_key = (group.type_name.clone(), group.id.clone());
+                let shown = change_cards::lines_shown(
+                    entries.len(),
+                    self.open_cards.contains(&card_key),
+                    None,
+                );
+                let left_out = entries.len() - shown;
                 let lines = entries
                     .into_iter()
+                    .take(shown)
                     .map(|entry| {
                         let edge = &self.folded.changes[entry.change];
                         let was = entry
                             .replaces
                             .as_ref()
                             .map(|(removed, _)| &self.folded.changes[*removed]);
-                        relationship_line(entry, edge, was, schema)
+                        // A mirror's other end is the card it is shown on in full.
+                        change_cards::relationship_line(entry, edge, was, schema, "shown there")
                     })
                     .collect();
+                let mut card = card.relationships(counts, lines);
+                if left_out > 0 {
+                    card = card.relationships_footer(
+                        studio_ui::ds::button(
+                            ("more-relationships", ix),
+                            change_cards::more_lines_label(left_out),
+                        )
+                        .style(ButtonStyle::Subtle)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_cards.insert(card_key.clone());
+                            cx.notify();
+                        })),
+                    );
+                }
                 div()
                     .px(px(studio_ui::ds::space::EDGE))
                     .py(px(studio_ui::ds::space::XS))
-                    .child(card.relationships(counts, lines))
+                    .child(card)
                     .into_any_element()
             }
             None if more => h_flex()
@@ -600,99 +593,6 @@ fn describe(error: &ReadError) -> String {
             "The history behind this commit was cleaned up, so its changes cannot be read.".into()
         }
         other => other.to_string(),
-    }
-}
-
-/// The card for one folded change.
-pub(crate) fn change_card(
-    change: &FoldedChange,
-    schema: Option<&SchemaModel>,
-    id: impl Into<gpui::ElementId>,
-) -> ChangeCard {
-    let kind = match change.net() {
-        Some(NetChange::Added) => ChangeKind::Added,
-        Some(NetChange::Removed) => ChangeKind::Removed,
-        _ => ChangeKind::Changed,
-    };
-    let rows = change
-        .card_diffs(schema)
-        .into_iter()
-        .map(|diff| PropertyRow {
-            name: diff.name.into(),
-            before: diff.before,
-            after: diff.after,
-        })
-        .collect();
-    let mut card = ChangeCard::new(id, kind, change.id.clone()).rows(rows);
-    if let Some((from, to)) = change.endpoints() {
-        card = card.endpoints(from, to);
-    }
-    card
-}
-
-/// Added, changed and removed relationships among a card's entries; mirrors are counted on
-/// their own card.
-fn relationship_counts(entries: &[RelationshipEntry]) -> (usize, usize, usize) {
-    entries
-        .iter()
-        .fold((0, 0, 0), |(added, changed, removed), entry| {
-            match entry.net {
-                Some(NetChange::Added) => (added + 1, changed, removed),
-                Some(NetChange::Changed) => (added, changed + 1, removed),
-                Some(NetChange::Removed) => (added, changed, removed + 1),
-                None => (added, changed, removed),
-            }
-        })
-}
-
-/// A card's line for one relationship entry, as the review draws it, without its actions.
-fn relationship_line(
-    entry: RelationshipEntry,
-    edge: &FoldedChange,
-    was: Option<&FoldedChange>,
-    schema: Option<&SchemaModel>,
-) -> RelationshipLine {
-    let kind = entry.net.map(|net| match net {
-        NetChange::Added => ChangeKind::Added,
-        NetChange::Changed => ChangeKind::Changed,
-        NetChange::Removed => ChangeKind::Removed,
-    });
-    // A moved relationship's rows compare the old edge's values with the new one's.
-    let compared = was.map(|was| FoldedChange {
-        before: was.before.clone(),
-        ..edge.clone()
-    });
-    let (id, rows) = match kind {
-        Some(_) => (
-            ("relationship", entry.change),
-            compared
-                .as_ref()
-                .unwrap_or(edge)
-                .card_diffs(schema)
-                .into_iter()
-                .map(|diff| PropertyRow {
-                    name: diff.name.into(),
-                    before: diff.before,
-                    after: diff.after,
-                })
-                .collect(),
-        ),
-        None => (("mirror", entry.change), Vec::new()),
-    };
-    let other = match &entry.replaces {
-        Some((_, was)) => format!("{was} → {}", entry.other),
-        None => entry.other,
-    };
-    let line = RelationshipLine::new(id, kind, entry.words, entry.outgoing, other)
-        .other_detail(entry.other_type)
-        .rows(rows);
-    match (kind, entry.replaces.is_some()) {
-        // The other end is the card it is shown on.
-        (None, _) => line.note("shown there"),
-        (Some(_), true) if entry.other_is_new => line.note("moved, new"),
-        (Some(_), true) => line.note("moved"),
-        (Some(_), false) if entry.other_is_new => line.note("new"),
-        (Some(_), false) => line,
     }
 }
 
