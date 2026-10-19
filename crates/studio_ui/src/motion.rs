@@ -1,8 +1,8 @@
 //! Motion for things Studio paints itself (the canvas's nodes and camera): easing curves,
 //! values that blend, and a [`Tween`] that glides a value to its target. After the design of
 //! `gpui-animation` (MIT OR Apache-2.0): easing as a curve over linear progress, interpolation as
-//! a trait, and a target that can change mid-flight, the glide then starting from wherever the
-//! value is. Unlike that crate there is no registry or tick thread: a view asks for the next
+//! a trait, and a glide a new one can replace mid-flight, starting from wherever the value is.
+//! Unlike that crate there is no registry or tick thread: a view asks for the next
 //! frame while one of its tweens runs ([`keep_animating`]), so nothing runs while nothing moves.
 //!
 //! Motion is for changes the person should follow (a node grows out of the one it came from; the
@@ -11,7 +11,7 @@
 
 use std::time::{Duration, Instant};
 
-use gpui::{App, Hsla, Pixels, Point, Window, point, px};
+use gpui::{App, Window};
 
 /// How long a change of place takes: long enough to follow, short enough not to wait for.
 pub const GLIDE: Duration = Duration::from_millis(220);
@@ -54,43 +54,13 @@ impl Lerp for f32 {
     }
 }
 
-impl Lerp for Pixels {
-    fn lerp(&self, to: &Self, t: f32) -> Self {
-        px(f32::from(*self).lerp(&f32::from(*to), t))
-    }
-}
-
-impl Lerp for Point<Pixels> {
-    fn lerp(&self, to: &Self, t: f32) -> Self {
-        point(self.x.lerp(&to.x, t), self.y.lerp(&to.y, t))
-    }
-}
-
-impl Lerp for Hsla {
-    /// Around the hue circle the short way, so a blend never passes through unrelated hues.
-    fn lerp(&self, to: &Self, t: f32) -> Self {
-        let mut dh = to.h - self.h;
-        if dh > 0.5 {
-            dh -= 1.;
-        } else if dh < -0.5 {
-            dh += 1.;
-        }
-        Hsla {
-            h: (self.h + dh * t).rem_euclid(1.),
-            s: self.s.lerp(&to.s, t),
-            l: self.l.lerp(&to.l, t),
-            a: self.a.lerp(&to.a, t),
-        }
-    }
-}
-
-/// A value gliding to its target. Setting a new target mid-glide starts from where the value
-/// is then, so a glide can always be interrupted without a jump.
+/// A value gliding to its target. A new target mid-glide is a new glide from the value then
+/// ([`Tween::value`]), so a glide can always be interrupted without a jump.
 #[derive(Debug, Clone)]
 pub struct Tween<T: Lerp> {
     from: T,
     to: T,
-    started: Option<Instant>,
+    started: Instant,
     duration: Duration,
     ease: Ease,
 }
@@ -101,7 +71,7 @@ impl<T: Lerp> Tween<T> {
         Self {
             from,
             to,
-            started: Some(now),
+            started: now,
             duration,
             ease,
         }
@@ -121,8 +91,7 @@ impl<T: Lerp> Tween<T> {
     }
 
     fn progress(&self, now: Instant) -> Option<f32> {
-        let started = self.started?;
-        let elapsed = now.saturating_duration_since(started);
+        let elapsed = now.saturating_duration_since(self.started);
         (elapsed < self.duration).then(|| elapsed.as_secs_f32() / self.duration.as_secs_f32())
     }
 }
@@ -169,23 +138,5 @@ mod tests {
         let end = start + Duration::from_millis(100);
         assert_eq!(x.value(end), 100.);
         assert!(!x.is_running(end));
-    }
-
-    #[test]
-    fn colours_blend_the_short_way_round() {
-        let red = Hsla {
-            h: 0.95,
-            s: 1.,
-            l: 0.5,
-            a: 1.,
-        };
-        let orange = Hsla {
-            h: 0.05,
-            s: 1.,
-            l: 0.5,
-            a: 1.,
-        };
-        let mid = red.lerp(&orange, 0.5);
-        assert!(mid.h < 0.01 || mid.h > 0.99, "{mid:?} went through green");
     }
 }

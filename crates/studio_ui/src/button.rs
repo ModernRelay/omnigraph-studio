@@ -263,8 +263,8 @@ impl Base {
     }
 
     /// The pill (or circle) with its paint, states and handlers; the caller adds the content.
-    fn frame(self, cx: &App) -> Stateful<Div> {
-        let paint = paint(self.variant, self.selected, cx);
+    /// `paint` is the variant's, which the caller read its ink from.
+    fn frame(self, paint: Paint, cx: &App) -> Stateful<Div> {
         let focused_border = cx.theme().colors().border_focused;
         let disabled = self.disabled;
         div()
@@ -465,7 +465,8 @@ impl VisibleOnHover for Button {
 impl RenderOnce for Button {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let size = self.base.size;
-        let painted = paint(self.base.variant, self.base.selected, cx).ink;
+        let paint = paint(self.base.variant, self.base.selected, cx);
+        let painted = paint.ink;
         let ink = self.label_color.unwrap_or(painted);
         // Ink on solid fills always; a caller's colour only on the quiet variants.
         let ink = match self.base.variant {
@@ -485,7 +486,7 @@ impl RenderOnce for Button {
             _ => None,
         };
         let pad = inset(size);
-        self.base.frame(cx).child(
+        self.base.frame(paint, cx).child(
             h_flex()
                 .px(px(pad - 1.))
                 .gap(px(match size {
@@ -657,7 +658,8 @@ impl VisibleOnHover for IconButton {
 impl RenderOnce for IconButton {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let selected = self.base.selected;
-        let painted = paint(self.base.variant, selected, cx).ink;
+        let paint = paint(self.base.variant, selected, cx);
+        let painted = paint.ink;
         let color = match self.base.variant {
             Variant::Primary | Variant::Destructive => painted,
             _ if selected => self
@@ -675,7 +677,7 @@ impl RenderOnce for IconButton {
             .icon_size
             .unwrap_or_else(|| icon_button_icon_size(self.base.size));
         self.base
-            .frame(cx)
+            .frame(paint, cx)
             .when_some(side, |this, side| this.w(px(side)))
             .child(Icon::new(icon).size(icon_size).color(color))
     }

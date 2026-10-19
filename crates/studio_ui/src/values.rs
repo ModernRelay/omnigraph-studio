@@ -69,7 +69,8 @@ pub fn relative_time(micros: i64, now_micros: i64) -> String {
     let seconds = (now_micros - micros) / 1_000_000;
     match seconds {
         s if s < 45 => "just now".into(),
-        s if s < 60 * 60 => format!("{} min ago", (s + 30) / 60),
+        // Whole minutes, as hours and days count, so the last minute of an hour is not "60".
+        s if s < 60 * 60 => format!("{} min ago", (s / 60).max(1)),
         s if s < 60 * 60 * 24 => format!("{} h ago", s / 3600),
         s if s < 60 * 60 * 24 * 14 => {
             let days = s / 86_400;
@@ -196,6 +197,9 @@ mod tests {
         let now = 1_791_817_685_000_000;
         assert_eq!(relative_time(now - 10_000_000, now), "just now");
         assert_eq!(relative_time(now - 300_000_000, now), "5 min ago");
+        assert_eq!(relative_time(now - 50_000_000, now), "1 min ago");
+        assert_eq!(relative_time(now - 3_590_000_000, now), "59 min ago");
+        assert_eq!(relative_time(now - 3_600_000_000, now), "1 h ago");
         assert_eq!(relative_time(now - 3 * 3_600_000_000, now), "3 h ago");
         assert_eq!(relative_time(now - 86_400_000_000, now), "1 day ago");
         assert_eq!(relative_time(now - 30 * 86_400_000_000, now), "2026-09-12");
