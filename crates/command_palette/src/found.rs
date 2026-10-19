@@ -20,8 +20,9 @@ pub(crate) struct Answers {
     /// Every answer while the palette is open, by type and text: text typed back to shows
     /// again without a read.
     exact: HashMap<(String, String), Vec<Found>>,
-    /// Each type's latest answer that held every match (fewer rows than were asked for), with
-    /// its text; narrower text filters it.
+    /// Each type's widest answer that held every match (fewer rows than were asked for), with
+    /// its text; narrower text filters it. Kept while the text narrows and widens again, so a
+    /// typo corrected answers from it.
     complete: HashMap<String, (String, Vec<Found>)>,
 }
 
@@ -41,15 +42,18 @@ impl Answers {
             .filter(|found| search_matches(&found.id, found.label.as_deref(), text))
             .cloned()
             .collect();
-        self.complete
-            .insert(type_name.to_owned(), (text.to_owned(), rows.clone()));
         self.exact.insert(key, rows.clone());
         Some(rows)
     }
 
     /// Keeps what a read for `type_name` at `text` answered, asked with `limit`.
     pub(crate) fn keep(&mut self, type_name: String, text: String, rows: Vec<Found>, limit: usize) {
-        if rows.len() < limit {
+        // An answer the held one covers is narrower: the held one stays.
+        let covered = self
+            .complete
+            .get(&type_name)
+            .is_some_and(|(held, _)| search_narrows(held, &text));
+        if rows.len() < limit && !covered {
             self.complete
                 .insert(type_name.clone(), (text.clone(), rows.clone()));
         }
@@ -88,6 +92,11 @@ mod tests {
             "text typed back to shows its answer again"
         );
         assert_eq!(answers.known("Person", "a"), None, "shorter text asks");
+        // A typo corrected: what "ad" held answers "adam" though "ada lx" found nothing.
+        assert_eq!(
+            answers.known("Person", "adam"),
+            Some(vec![found("p-2", "Adam Smith")])
+        );
         assert_eq!(answers.known("Company", "ada"), None, "no answer yet");
 
         // As many rows as the limit: there may be more, so a narrower search still asks.
