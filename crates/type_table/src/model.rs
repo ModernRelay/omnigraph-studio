@@ -700,7 +700,12 @@ pub fn preset_range(
 
 fn compare(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
-        (Value::Number(a), Value::Number(b)) => a.as_f64()?.partial_cmp(&b.as_f64()?),
+        // Whole numbers exactly: an I64 or U64 past 2^53 has no exact f64, so two that differ
+        // would compare equal and an edit between them would read as no change.
+        (Value::Number(a), Value::Number(b)) => match (whole(a), whole(b)) {
+            (Some(a), Some(b)) => Some(a.cmp(&b)),
+            _ => a.as_f64()?.partial_cmp(&b.as_f64()?),
+        },
         (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
         (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
         _ => None,
@@ -708,6 +713,13 @@ fn compare(a: &Value, b: &Value) -> Option<Ordering> {
 }
 
 /// Whether two cell values are the same value (`1` and `1.0` are).
+fn whole(number: &serde_json::Number) -> Option<i128> {
+    number
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| number.as_u64().map(i128::from))
+}
+
 pub fn same_value(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Array(a), Value::Array(b)) => {
@@ -1474,6 +1486,12 @@ mod tests {
         assert_eq!(format_count(1_000_000), "1\u{a0}000\u{a0}000");
         assert!(same_value(&json!(1), &json!(1.0)));
         assert!(!same_value(&json!(["a"]), &json!(["b"])));
+        // Whole numbers past 2^53 compare exactly: an edit between two of them is a change.
+        assert!(!same_value(
+            &json!(9_007_199_254_740_993_i64),
+            &json!(9_007_199_254_740_992_i64)
+        ));
+        assert!(!same_value(&json!(u64::MAX), &json!(u64::MAX - 1)));
         assert_eq!(display_value(None, &Value::Null), "—");
     }
 
