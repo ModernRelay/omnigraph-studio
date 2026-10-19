@@ -38,9 +38,7 @@ use studio_ui::ds::Button;
 use studio_ui::ds::space;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::{ColumnDrag, ColumnResize, GridPlace, ROW_HEIGHT, columns_in_view, grid_places};
-use studio_workspace::{
-    Item, ItemEvent, ItemFooter, KeyHint, SavedItem, ToastKind, Workspace, WorkspaceEvent,
-};
+use studio_workspace::{Item, ItemEvent, ItemFooter, KeyHint, SavedItem, ToastKind, Workspace};
 use ui::prelude::*;
 use ui::{
     ColumnWidthConfig, Indicator, PopoverMenu, PopoverMenuHandle, Table, TableInteractionState,
@@ -451,7 +449,7 @@ impl TypeTable {
             editor
         });
         let grid = TableGrid::new(cx);
-        let mut subscriptions = vec![
+        let subscriptions = vec![
             cx.subscribe_in(&session, window, Self::on_session_event),
             cx.subscribe_in(
                 &cell_editor,
@@ -491,22 +489,6 @@ impl TypeTable {
                 },
             ),
         ];
-        if let Some(workspace) = workspace.upgrade() {
-            subscriptions.push(cx.subscribe_in(
-                &workspace,
-                window,
-                |this, workspace, event: &WorkspaceEvent, window, cx| match event {
-                    WorkspaceEvent::SessionChanged => {
-                        let Some(session) = workspace.read(cx).session().cloned() else {
-                            return;
-                        };
-                        if session != this.session {
-                            this.switch_session(session, window, cx);
-                        }
-                    }
-                },
-            ));
-        }
         let branch = session.read(cx).branch.clone();
         let table_state = cx.new(|cx| TableInteractionState::new(cx));
         let scope = at_commit.is_none().then(|| new_scope(&session, cx));
@@ -638,54 +620,6 @@ impl TypeTable {
             }
             _ => {}
         }
-    }
-
-    fn switch_session(
-        &mut self,
-        session: Entity<GraphSession>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self._subscriptions[0] = cx.subscribe_in(&session, window, Self::on_session_event);
-        self.branch = session.read(cx).branch.clone();
-        // The new session reads for the table under a scope of its own.
-        if self.at_commit.is_none() {
-            self.scope = Some(new_scope(&session, cx));
-        }
-        self.session = session;
-        self.schema = None;
-        self.forget_reads();
-        self.cells.clear();
-        self.draft_notices.clear();
-        self.editing = None;
-        self.sync_drafts(cx);
-        self.load_schema(cx);
-    }
-
-    /// Drops every read under way and what the reads brought: another session's answers are
-    /// not this one's, and its schema may still be loading when they land.
-    fn forget_reads(&mut self) {
-        self.page_task = None;
-        self.count_task = None;
-        self.total_task = None;
-        self.relation_tasks.clear();
-        self.blob_tasks.clear();
-        self._blob_wait = None;
-        if let Some(grouping) = &mut self.grouping {
-            // Section reads under way are told apart by the generation.
-            grouping.restart();
-        }
-        self.rows.clear();
-        self.cell_text.borrow_mut().clear();
-        self.relations.clear();
-        self.relations_asked.clear();
-        self.blobs.clear();
-        self.blob_rows = None;
-        self.cursor = None;
-        self.loading_more = false;
-        self.paging.reset();
-        self.first_page = Loadable::Loading;
-        self.count = Loadable::Loading;
     }
 
     fn load_schema(&mut self, cx: &mut Context<Self>) {
