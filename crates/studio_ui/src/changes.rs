@@ -50,12 +50,47 @@ impl ChangeKind {
     }
 }
 
-/// One property row of a card. `None` means the side has no value.
+/// One property row of a card: its name, each side's value as shown (`None` when the side has
+/// none), and what changed inside the value when that says more than before → after. Made once
+/// for a change and shared by every frame that draws it ([`PropertyRow::new`]): a card is drawn
+/// at every frame, and the comparison takes time that grows with the text.
 #[derive(Debug, Clone)]
 pub struct PropertyRow {
-    pub name: SharedString,
-    pub before: Option<Value>,
-    pub after: Option<Value>,
+    name: SharedString,
+    before: Option<SharedString>,
+    after: Option<SharedString>,
+    inner: Option<Rc<[Piece]>>,
+}
+
+/// Characters of a value a row keeps: it shows one line, cut to the card's width.
+const SHOWN_CHARS: usize = 400;
+
+impl PropertyRow {
+    pub fn new(
+        name: impl Into<SharedString>,
+        before: Option<&Value>,
+        after: Option<&Value>,
+    ) -> Self {
+        let inner = match (before, after) {
+            (Some(before), Some(after)) => inner_diff(before, after).map(Into::into),
+            _ => None,
+        };
+        Self {
+            name: name.into(),
+            before: before.map(shown),
+            after: after.map(shown),
+            inner,
+        }
+    }
+}
+
+/// A value as a row shows it: its text, cut to [`SHOWN_CHARS`], so a long text is neither
+/// copied whole nor measured whole at each frame.
+fn shown(value: &Value) -> SharedString {
+    match value {
+        Value::String(text) => crate::text::cut(text, SHOWN_CHARS).into(),
+        other => crate::text::cut(&format_value(other), SHOWN_CHARS).into(),
+    }
 }
 
 type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
@@ -72,7 +107,7 @@ pub struct ChangeCard {
     entity_id: SharedString,
     name: Option<SharedString>,
     endpoints: Option<(SharedString, SharedString)>,
-    rows: Vec<PropertyRow>,
+    rows: Rc<[PropertyRow]>,
     relationships: Vec<RelationshipLine>,
     relationship_counts: (usize, usize, usize),
     /// Below the relationship lines: for example a control that shows the ones left out.
@@ -96,7 +131,7 @@ impl ChangeCard {
             entity_id: entity_id.into(),
             name: None,
             endpoints: None,
-            rows: Vec::new(),
+            rows: Rc::from([]),
             relationships: Vec::new(),
             relationship_counts: (0, 0, 0),
             relationships_footer: None,
@@ -114,7 +149,7 @@ impl ChangeCard {
         self
     }
 
-    pub fn rows(mut self, rows: Vec<PropertyRow>) -> Self {
+    pub fn rows(mut self, rows: Rc<[PropertyRow]>) -> Self {
         self.rows = rows;
         self
     }
@@ -180,8 +215,8 @@ fn property_row(row: &PropertyRow, kind: ChangeKind) -> Div {
     let name = crate::ds::text::muted(row.name.clone())
         .single_line()
         .truncate();
-    let inner = match (kind, &row.before, &row.after) {
-        (ChangeKind::Changed, Some(before), Some(after)) => inner_diff(before, after),
+    let inner = match kind {
+        ChangeKind::Changed => row.inner.as_deref(),
         _ => None,
     };
     let body = match (kind, inner) {
@@ -227,18 +262,18 @@ fn property_row(row: &PropertyRow, kind: ChangeKind) -> Div {
 
 /// What changed inside a value, drawn in one wrapping row: kept text muted, removals struck,
 /// additions in the created colour.
-fn pieces_row(pieces: Vec<Piece>) -> Div {
+fn pieces_row(pieces: &[Piece]) -> Div {
     h_flex()
         .flex_1()
         .min_w_0()
         .flex_wrap()
-        .children(pieces.into_iter().flat_map(|piece| {
+        .children(pieces.iter().flat_map(|piece| {
             let (color, strike) = match piece.kind {
                 PieceKind::Same | PieceKind::Gap => (Color::Muted, false),
                 PieceKind::Removed => (Color::Deleted, true),
                 PieceKind::Added => (Color::Created, false),
             };
-            let label = crate::ds::text::body(piece.text).color(color);
+            let label = crate::ds::text::body(piece.text.clone()).color(color);
             // Its own space, so a struck removal does not strike it.
             let space = piece.spaced.then(|| crate::ds::text::body(" "));
             space
@@ -251,7 +286,7 @@ fn pieces_row(pieces: Vec<Piece>) -> Div {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Piece {
     kind: PieceKind,
-    text: String,
+    text: SharedString,
     spaced: bool,
 }
 
@@ -265,7 +300,7 @@ enum PieceKind {
 }
 
 impl Piece {
-    fn new(kind: PieceKind, text: impl Into<String>, spaced: bool) -> Self {
+    fn new(kind: PieceKind, text: impl Into<SharedString>, spaced: bool) -> Self {
         Self {
             kind,
             text: text.into(),
@@ -278,8 +313,8 @@ impl Piece {
 /// before → after.
 const LONG_TEXT_WORDS: usize = 8;
 /// Words and marks a difference compares at most on each side, past which before → after shows:
-/// the comparison runs as the row draws, in time that grows with the product of the lengths.
-/// The same holds a list's elements.
+/// the comparison takes time that grows with the product of the lengths. The same holds a
+/// list's elements.
 const DIFF_WORDS: usize = 200;
 /// Unchanged words and marks kept on each side of a change.
 const CONTEXT_WORDS: usize = 3;
@@ -481,11 +516,8 @@ fn word_pieces(old: &[Token], new: &[Token]) -> Vec<Piece> {
     pieces
 }
 
-fn value_label(value: &Option<Value>, color: Color, strike: bool) -> Label {
-    let text = match value {
-        Some(value) => format_value(value),
-        None => "—".into(),
-    };
+fn value_label(value: &Option<SharedString>, color: Color, strike: bool) -> Label {
+    let text = value.clone().unwrap_or_else(|| "—".into());
     let mut label = crate::ds::text::body(text)
         .color(color)
         .single_line()
@@ -612,7 +644,7 @@ pub struct RelationshipLine {
     other: SharedString,
     other_detail: Option<SharedString>,
     note: Option<SharedString>,
-    rows: Vec<PropertyRow>,
+    rows: Rc<[PropertyRow]>,
     status: Option<(SharedString, Color)>,
     selected: bool,
     hollow: bool,
@@ -637,7 +669,7 @@ impl RelationshipLine {
             other: other.into(),
             other_detail: None,
             note: None,
-            rows: Vec::new(),
+            rows: Rc::from([]),
             status: None,
             selected: false,
             hollow: false,
@@ -659,7 +691,7 @@ impl RelationshipLine {
         self
     }
 
-    pub fn rows(mut self, rows: Vec<PropertyRow>) -> Self {
+    pub fn rows(mut self, rows: Rc<[PropertyRow]>) -> Self {
         self.rows = rows;
         self
     }
@@ -862,6 +894,18 @@ mod tests {
         assert_eq!(inner_diff(&json!(["a", "b"]), &json!(["b", "a"])), None);
         assert_eq!(inner_diff(&json!("Engineer"), &json!("Lead")), None);
         assert_eq!(inner_diff(&json!(12), &json!(15)), None);
+    }
+
+    /// A row keeps the first characters of a long value, not its whole text.
+    #[test]
+    fn a_long_value_is_cut_where_a_row_shows_it() {
+        let long = "word ".repeat(1_000);
+        let row = PropertyRow::new("note", None, Some(&json!(long)));
+        let shown = row.after.unwrap();
+        assert!(shown.chars().count() <= SHOWN_CHARS);
+        assert!(shown.ends_with('…'));
+        let short = PropertyRow::new("note", Some(&json!(12)), None);
+        assert_eq!(short.before.as_deref(), Some("12"));
     }
 
     /// A longer text shows its changed words with a few words around each change, and the

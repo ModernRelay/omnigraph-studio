@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use change_cards::CardRows;
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
     ListState, Render, SharedString, Task, Window, list,
@@ -63,6 +64,8 @@ pub struct CommitView {
     /// The changes by entity, each node with its relationship changes, as the review shows
     /// them.
     groups: EntityGroups,
+    /// The cards' property rows, made as they are first drawn; new with each fold.
+    card_rows: CardRows,
     runs: Vec<GroupRun>,
     /// Names of the nodes known here only by id, read at the commit.
     names: NodeNames,
@@ -162,6 +165,7 @@ impl CommitView {
             fold: ChangeFold::new(),
             folded: FoldedChanges::default(),
             groups: EntityGroups::default(),
+            card_rows: CardRows::default(),
             runs: Vec::new(),
             names: NodeNames::default(),
             open_cards: HashSet::new(),
@@ -262,6 +266,7 @@ impl CommitView {
                             .collect();
                         this.groups = groups;
                         this.folded = folded;
+                        this.card_rows = CardRows::default();
                         if !ends.is_empty() {
                             let commit = Some(this.commit_id.clone());
                             let names = this
@@ -540,6 +545,7 @@ impl CommitView {
                     ix,
                     schema,
                     &self.names,
+                    &self.card_rows,
                     ("commit-change", ix),
                 );
                 let group = &self.groups.groups[ix];
@@ -557,13 +563,14 @@ impl CommitView {
                     .entries
                     .into_iter()
                     .map(|entry| {
-                        let edge = &self.folded.changes[entry.change];
-                        let was = entry
-                            .replaces
-                            .as_ref()
-                            .map(|(removed, _)| &self.folded.changes[*removed]);
                         // A mirror's other end is the card it is shown on in full.
-                        change_cards::relationship_line(entry, edge, was, schema, "shown there")
+                        change_cards::relationship_line(
+                            entry,
+                            &self.folded,
+                            schema,
+                            &self.card_rows,
+                            "shown there",
+                        )
                     })
                     .collect();
                 let mut card = card.relationships(counts, lines);

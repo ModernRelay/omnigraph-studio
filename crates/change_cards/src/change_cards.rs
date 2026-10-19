@@ -6,6 +6,10 @@
 //! neither of those layers can do alone, so the two views draw the same cards from one place.
 //! What a card can do (review, revert, edit) stays with the view that offers it.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use gpui::{App, Div, ElementId};
 use gq_language::SchemaModel;
 use graph_store::{
@@ -32,6 +36,24 @@ pub fn lines_shown(total: usize, open: bool, selected_at: Option<usize>) -> usiz
     }
 }
 
+/// Each change's property rows, made the first time its card or line is drawn and kept with
+/// the changes they were made from: a view draws its cards at every frame, and a row's word
+/// difference takes time that grows with its text. A view makes a new one with new changes.
+#[derive(Default)]
+pub struct CardRows(RefCell<HashMap<usize, Rc<[PropertyRow]>>>);
+
+impl CardRows {
+    /// Change `change`'s rows, made by `make` the first time they are asked for.
+    fn get(&self, change: usize, make: impl FnOnce() -> Vec<PropertyRow>) -> Rc<[PropertyRow]> {
+        if let Some(rows) = self.0.borrow().get(&change) {
+            return rows.clone();
+        }
+        let rows: Rc<[PropertyRow]> = make().into();
+        self.0.borrow_mut().insert(change, rows.clone());
+        rows
+    }
+}
+
 /// What the button below a card's first lines says.
 pub fn more_lines_label(left_out: usize) -> String {
     match left_out {
@@ -40,15 +62,18 @@ pub fn more_lines_label(left_out: usize) -> String {
     }
 }
 
-/// The card for one folded change: its kind, id and changed property rows, and a lone
+/// The card for change `ix` of `folded`: its kind, id and changed property rows, and a lone
 /// relationship's ends.
 pub fn change_card(
-    change: &FoldedChange,
+    folded: &FoldedChanges,
+    ix: usize,
     schema: Option<&SchemaModel>,
+    rows: &CardRows,
     id: impl Into<ElementId>,
 ) -> ChangeCard {
+    let change = &folded.changes[ix];
     let mut card = ChangeCard::new(id, kind_of(change.net()), change.id.clone())
-        .rows(property_rows(change, schema));
+        .rows(rows.get(ix, || property_rows(change, schema)));
     if let Some((from, to)) = change.endpoints() {
         card = card.endpoints(from, to);
     }
@@ -63,11 +88,12 @@ pub fn entity_card(
     ix: usize,
     schema: Option<&SchemaModel>,
     names: &NodeNames,
+    rows: &CardRows,
     id: impl Into<ElementId>,
 ) -> ChangeCard {
     let group = &groups.groups[ix];
     match group.change {
-        Some(own) => change_card(&folded.changes[own], schema, id)
+        Some(own) => change_card(folded, own, schema, rows, id)
             .name(entity_name(&folded.changes[own], schema)),
         None => ChangeCard::new(id, ChangeKind::Unchanged, group.id.clone()).name(
             names
@@ -77,16 +103,15 @@ pub fn entity_card(
     }
 }
 
-/// A card's line for one relationship entry: what changed, which way it points, the other
-/// end, and a changed relationship's property rows; for one moved to another end
-/// ([`RelationshipEntry::replaces`], `was` its removed edge), both ends and the old edge's
-/// values against the new one's. A mirror's line carries `mirror_note`, which says where it
-/// is shown in full.
+/// A card's line for one relationship entry of `folded`: what changed, which way it points,
+/// the other end, and a changed relationship's property rows; for one moved to another end
+/// ([`RelationshipEntry::replaces`]), both ends and the removed edge's values against the new
+/// one's. A mirror's line carries `mirror_note`, which says where it is shown in full.
 pub fn relationship_line(
     entry: RelationshipEntry,
-    edge: &FoldedChange,
-    was: Option<&FoldedChange>,
+    folded: &FoldedChanges,
     schema: Option<&SchemaModel>,
+    rows: &CardRows,
     mirror_note: &'static str,
 ) -> RelationshipLine {
     let kind = entry.net.map(|net| kind_of(Some(net)));
@@ -95,8 +120,14 @@ pub fn relationship_line(
     } else {
         ("mirror", entry.change)
     };
+    let edge = &folded.changes[entry.change];
+    let was = entry
+        .replaces
+        .as_ref()
+        .map(|(removed, _)| &folded.changes[*removed]);
     let rows = match kind {
-        Some(_) => match was {
+        // A line's rows are its edge's, compared with the removed edge's when it moved.
+        Some(_) => rows.get(entry.change, || match was {
             Some(was) => property_rows(
                 &FoldedChange {
                     before: was.before.clone(),
@@ -105,8 +136,8 @@ pub fn relationship_line(
                 schema,
             ),
             None => property_rows(edge, schema),
-        },
-        None => Vec::new(),
+        }),
+        None => Rc::from([]),
     };
     let note = match (kind, &entry.replaces) {
         (None, _) => Some(mirror_note),
@@ -172,11 +203,7 @@ fn property_rows(change: &FoldedChange, schema: Option<&SchemaModel>) -> Vec<Pro
     change
         .card_diffs(schema)
         .into_iter()
-        .map(|diff| PropertyRow {
-            name: diff.name.into(),
-            before: diff.before,
-            after: diff.after,
-        })
+        .map(|diff| PropertyRow::new(diff.name, diff.before.as_ref(), diff.after.as_ref()))
         .collect()
 }
 
@@ -195,5 +222,22 @@ mod tests {
         assert_eq!(lines_shown(400, true, None), 400);
         assert_eq!(more_lines_label(1), "Show 1 more relationship");
         assert_eq!(more_lines_label(1_380), "Show 1,380 more relationships");
+    }
+
+    /// A change's rows are made the first time they are asked for and shared after.
+    #[test]
+    fn a_changes_rows_are_made_once() {
+        let rows = CardRows::default();
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            vec![PropertyRow::new("name", None, None)]
+        };
+        let first = rows.get(3, make);
+        let again = rows.get(3, make);
+        assert!(Rc::ptr_eq(&first, &again));
+        assert_eq!(made.get(), 1);
+        rows.get(4, make);
+        assert_eq!(made.get(), 2, "another change makes its own");
     }
 }

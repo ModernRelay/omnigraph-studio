@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use change_cards::CardRows;
 use editor::{Editor, EditorEvent};
 use gpui::{
     AnyElement, App, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
@@ -175,6 +176,8 @@ struct ReviewData {
     /// The changes' indexes in order of type and id, sorted with the fold: a conflict finds its
     /// entity's change by a search, not a walk of every change at each frame.
     by_entity: Vec<usize>,
+    /// The cards' property rows, made as they are first drawn.
+    card_rows: CardRows,
     partial: bool,
     /// The feed went past the reviewed head while reading: the branch moved.
     moved_while_reading: bool,
@@ -1876,7 +1879,6 @@ impl ReviewView {
         cx: &mut Context<Self>,
     ) -> ChangeCard {
         let group = &data.groups.groups[ix];
-        let changes = &data.folded.changes;
         let focus = self.focus_handle.clone();
         let selected_group = self.selected.and_then(|s| data.groups.home.get(s).copied());
         let unreviewed = self.group_unreviewed(group);
@@ -1889,6 +1891,7 @@ impl ReviewView {
             ix,
             schema,
             &self.names,
+            &data.card_rows,
             ("change", ix),
         )
         .selected(selected_group == Some(ix))
@@ -1994,13 +1997,12 @@ impl ReviewView {
                 let change = entry.change;
                 let mirror = entry.net.is_none();
                 let moved_from = entry.replaces.as_ref().map(|(removed, _)| *removed);
-                let was_edge = moved_from.map(|removed| &changes[removed]);
                 // A mirror's other end is the card it is reviewed on.
                 let mut line = change_cards::relationship_line(
                     entry,
-                    &changes[change],
-                    was_edge,
+                    &data.folded,
                     schema,
+                    &data.card_rows,
                     "reviewed there",
                 )
                 .on_click(cx.listener(move |this, _, _, cx| this.select(change, cx)));
@@ -2186,6 +2188,7 @@ async fn read_review(
                 counts: Vec::new(),
                 revert_blocked: Vec::new(),
                 by_entity: Vec::new(),
+                card_rows: CardRows::default(),
                 partial: false,
                 moved_while_reading: false,
                 merged_in: false,
@@ -2253,6 +2256,7 @@ impl Fed {
             counts,
             revert_blocked,
             by_entity,
+            card_rows: CardRows::default(),
             partial: self.partial,
             moved_while_reading: self.moved_while_reading,
             merged_in: false,
@@ -2732,6 +2736,7 @@ pub(crate) mod tests {
             counts: folded.counts(),
             revert_blocked: vec![None; 3],
             by_entity: entity_order(&folded.changes),
+            card_rows: CardRows::default(),
             folded,
             groups,
             partial: false,
