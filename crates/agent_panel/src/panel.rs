@@ -557,7 +557,7 @@ impl Item for AgentPanel {
             .as_ref()
             .and_then(|id| self.sessions.read(cx).get(id))
             .and_then(|record| record.title.clone())
-            .map(|title| cut(&title, TAB_TITLE_CHARS).into())
+            .map(|title| studio_ui::text::cut(&title, TAB_TITLE_CHARS).into())
             .unwrap_or_else(|| "New conversation".into())
     }
 
@@ -849,7 +849,8 @@ impl AgentPanel {
         self.cwd = Some(cwd.clone());
         let launch = SessionLaunch {
             cwd,
-            mcp_command: proxy_executable(executable),
+            // The proxy is Studio's own executable.
+            mcp_command: executable,
             mcp_args: vec![
                 crate::PROXY_COMMAND.to_owned(),
                 socket.path.to_string_lossy().into_owned(),
@@ -2005,17 +2006,6 @@ impl AgentPanel {
     }
 }
 
-/// The proxy runs Studio's own executable. Test binaries and examples are not Studio, so they
-/// name the built `omnigraph-studio` next to them when it exists.
-fn proxy_executable(current: PathBuf) -> PathBuf {
-    if let Ok(path) = std::env::var("OMNIGRAPH_STUDIO_PROXY")
-        && !path.is_empty()
-    {
-        return PathBuf::from(path);
-    }
-    current
-}
-
 /// One of the agent's session options as the composer shows it, with a value chosen but not yet
 /// confirmed standing in for the agent's.
 #[derive(Clone)]
@@ -2212,7 +2202,7 @@ fn option_picker(
         .trigger(
             ds::button(
                 SharedString::from(format!("option-{id}-button")),
-                cut(&option.current_name(), OPTION_NAME_CHARS),
+                studio_ui::text::cut(&option.current_name(), OPTION_NAME_CHARS),
             )
             .style(ButtonStyle::Subtle)
             .color(Color::Muted)
@@ -2292,15 +2282,6 @@ fn select_values(
 const OPTION_NAME_CHARS: usize = 32;
 /// The longest conversation title a tab shows.
 const TAB_TITLE_CHARS: usize = 28;
-
-fn cut(name: &str, chars: usize) -> String {
-    if name.chars().count() <= chars {
-        name.to_owned()
-    } else {
-        let kept: String = name.chars().take(chars.saturating_sub(1)).collect();
-        format!("{}…", kept.trim_end())
-    }
-}
 
 /// Token counts as people read them: 999, 1.2k, 84k, 1.2M.
 fn humanize_tokens(count: u64) -> String {
@@ -3879,17 +3860,5 @@ mod tests {
         );
         assert_eq!(activity_summary(2, &[]), "Thought 2 times");
         assert_eq!(ToolKind::of(Some(StudioTool::Run)), Run);
-    }
-
-    #[test]
-    fn long_option_names_are_cut_on_a_character() {
-        assert_eq!(cut("Claude Sonnet", OPTION_NAME_CHARS), "Claude Sonnet");
-        let long = "Claude Sonnet with an extended thinking budget";
-        // No space is left before the ellipsis.
-        assert_eq!(
-            cut(long, OPTION_NAME_CHARS),
-            "Claude Sonnet with an extended…"
-        );
-        assert_eq!(cut("模型模型模型", 4), "模型模…");
     }
 }

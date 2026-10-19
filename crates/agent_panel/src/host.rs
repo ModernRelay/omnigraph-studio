@@ -889,18 +889,21 @@ fn credential_variables(
     };
     let mut found: Vec<String> = names
         .filter_map(|name| name.into_string().ok())
-        .filter(|name| {
-            let name = if fold_case {
-                name.to_ascii_uppercase()
-            } else {
-                name.clone()
-            };
-            name.starts_with("OMNIGRAPH_")
-        })
+        .filter(|name| is_omnigraph_variable(name, fold_case))
         .filter(|name| !configured.keys().any(|key| same(key, name)))
         .collect();
     found.sort();
     found
+}
+
+/// Whether a variable is one of OmniGraph's (`OMNIGRAPH_…`), its name in any ASCII case when
+/// `fold_case`, as Windows reads names.
+pub(crate) fn is_omnigraph_variable(name: &str, fold_case: bool) -> bool {
+    if fold_case {
+        name.to_ascii_uppercase().starts_with("OMNIGRAPH_")
+    } else {
+        name.starts_with("OMNIGRAPH_")
+    }
 }
 
 #[cfg(test)]

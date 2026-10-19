@@ -133,13 +133,7 @@ impl CliHome {
         let mut command = std::process::Command::new(cli);
         for (name, _) in std::env::vars_os() {
             // Windows reads a variable by its name in any case.
-            let name_text = name.to_string_lossy();
-            let ours = if cfg!(windows) {
-                name_text.to_ascii_uppercase().starts_with("OMNIGRAPH_")
-            } else {
-                name_text.starts_with("OMNIGRAPH_")
-            };
-            if ours {
+            if crate::host::is_omnigraph_variable(&name.to_string_lossy(), cfg!(windows)) {
                 command.env_remove(name);
             }
         }

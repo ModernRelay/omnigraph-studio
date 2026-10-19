@@ -344,12 +344,7 @@ fn provisional_title(message: &str) -> Option<String> {
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())?;
-    Some(if line.chars().count() > TITLE_CHARS {
-        let kept: String = line.chars().take(TITLE_CHARS - 1).collect();
-        format!("{}…", kept.trim_end())
-    } else {
-        line.to_owned()
-    })
+    Some(studio_ui::text::cut(line, TITLE_CHARS))
 }
 
 /// The records on disk, each read on its own: one Studio cannot read (damaged, or written by a

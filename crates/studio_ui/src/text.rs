@@ -28,6 +28,17 @@ pub fn is_plain(text: &str) -> bool {
     }
 }
 
+/// `text` cut to at most `chars` characters, the last of them "…" when it was cut, with no space
+/// left before it: a title or a name where room is short.
+pub fn cut(text: &str, chars: usize) -> String {
+    if text.chars().count() <= chars {
+        text.to_owned()
+    } else {
+        let kept: String = text.chars().take(chars.saturating_sub(1)).collect();
+        format!("{}…", kept.trim_end())
+    }
+}
+
 /// The value's first line as plain text, its markup removed, with "…" when more follows: what
 /// a table cell shows of it.
 pub fn first_line(text: &str) -> String {
@@ -89,6 +100,15 @@ pub fn pieces_are<'a>(len: usize, pieces: impl IntoIterator<Item = &'a str>, tex
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_text_is_cut_on_a_character() {
+        assert_eq!(cut("Claude Sonnet", 32), "Claude Sonnet");
+        let long = "Claude Sonnet with an extended thinking budget";
+        // No space is left before the ellipsis.
+        assert_eq!(cut(long, 32), "Claude Sonnet with an extended…");
+        assert_eq!(cut("模型模型模型", 4), "模型模…");
+    }
 
     #[test]
     fn pieces_are_compared_with_a_text_in_place() {
