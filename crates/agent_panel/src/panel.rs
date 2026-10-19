@@ -25,7 +25,7 @@ use studio_actions::agent::{Allow, AllowAlways, ClearQueue, Reject, Restart, Sen
 use studio_actions::graph::ReviewBranch;
 use studio_settings::StudioSettings;
 use studio_ui::ds;
-use studio_ui::ds::{Dotted as _, IconButton, Prose as _};
+use studio_ui::ds::{Dotted as _, Prose as _};
 use studio_ui::menu::ContextMenu;
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
@@ -2661,7 +2661,6 @@ impl AgentPanel {
                             )
                             .child(
                                 studio_ui::ds::icon_button("use-custom", IconName::ArrowRight)
-                                    .icon_size(IconSize::Small)
                                     .tooltip(Tooltip::text("Use this command"))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         let text = this.custom_command.read(cx).text(cx);
@@ -2935,16 +2934,16 @@ impl AgentPanel {
                     .children(items.iter().map(|(content, status)| {
                         let icon = match status {
                             PlanEntryStatus::Completed => {
-                                Icon::new(IconName::Check).color(Color::Success)
+                                ds::icon::meta(IconName::Check).color(Color::Success)
                             }
                             PlanEntryStatus::InProgress => {
-                                Icon::new(IconName::ArrowRight).color(Color::Accent)
+                                ds::icon::meta(IconName::ArrowRight).color(Color::Accent)
                             }
-                            _ => Icon::new(IconName::Circle).color(Color::Disabled),
+                            _ => ds::icon::meta(IconName::Circle).color(Color::Disabled),
                         };
                         h_flex()
                             .gap(px(ds::space::MD))
-                            .child(icon.size(IconSize::XSmall))
+                            .child(icon)
                             .child(studio_ui::ds::text::body(content.clone()))
                     })),
             )
@@ -3608,8 +3607,7 @@ impl AgentPanel {
                             .items_center()
                             .visible_on_hover("queued")
                             .child(
-                                IconButton::new(("remove-queued", id), IconName::Trash)
-                                    .icon_size(IconSize::XSmall)
+                                ds::row_icon_button(("remove-queued", id), IconName::Trash)
                                     .icon_color(Color::Muted)
                                     .tooltip(Tooltip::text("Remove from the queue"))
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -3618,8 +3616,7 @@ impl AgentPanel {
                                     })),
                             )
                             .child(
-                                IconButton::new(("edit-queued", id), IconName::Pencil)
-                                    .icon_size(IconSize::XSmall)
+                                ds::row_icon_button(("edit-queued", id), IconName::Pencil)
                                     .icon_color(Color::Muted)
                                     .tooltip(Tooltip::text("Edit in the composer"))
                                     .on_click(cx.listener(move |this, _, window, cx| {

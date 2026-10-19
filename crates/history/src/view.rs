@@ -937,7 +937,6 @@ impl Render for HistoryView {
             .child(search)
             .child(
                 studio_ui::ds::toolbar_icon_button("refresh-history", IconName::RotateCw)
-                    .icon_size(IconSize::Small)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Read the history again"))
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),

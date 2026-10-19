@@ -22,7 +22,6 @@ use serde_json::{Map, Value};
 use studio_actions::graph::{OpenBlob, OpenNodePage, PeekNode};
 use studio_actions::node::{CancelField, ExpandField, SaveField, SaveNodeDrafts};
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
-use studio_ui::ds::IconButton;
 use studio_ui::ds::space;
 use studio_ui::menu::ContextMenu;
 use ui::prelude::*;
@@ -2231,7 +2230,7 @@ impl NodePeek {
                 }))
                 .child(div().flex_1())
                 .child(
-                    studio_ui::ds::button(
+                    studio_ui::ds::row_button(
                         "peek-discard-drafts",
                         if self.confirm_discard {
                             "Discard them"
@@ -2244,11 +2243,10 @@ impl NodePeek {
                     } else {
                         ButtonStyle::Subtle
                     })
-                    .size(ButtonSize::Compact)
                     .on_click(cx.listener(|this, _, _, cx| this.discard_drafts(cx))),
                 )
                 .child(
-                    studio_ui::ds::button(
+                    studio_ui::ds::row_button(
                         "peek-save-drafts",
                         if self.saving_drafts {
                             "Saving…"
@@ -2257,7 +2255,6 @@ impl NodePeek {
                         },
                     )
                     .style(ButtonStyle::Filled)
-                    .size(ButtonSize::Compact)
                     .disabled(self.saving_drafts)
                     .tooltip(move |_, cx| {
                         Tooltip::for_action(format!("One commit to {branch}"), &SaveNodeDrafts, cx)
@@ -2466,11 +2463,10 @@ impl NodePeek {
                             .child(div().flex_1().min_w_0().child(body))
                             .when(expands, |row| {
                                 row.child(
-                                    IconButton::new(
+                                    studio_ui::ds::row_icon_button(
                                         ("peek-open-editor", index),
                                         IconName::Maximize,
                                     )
-                                    .icon_size(IconSize::XSmall)
                                     .icon_color(Color::Muted)
                                     .visible_on_hover(group.clone())
                                     .tooltip(Tooltip::text("Open in the editor"))
@@ -2515,7 +2511,7 @@ impl NodePeek {
             // GPUI's text takes its size from the element around it, so the labels' size is
             // set there too.
             Some((_, view)) => div()
-                .text_size(ui::TextSize::Small.rems(cx))
+                .text_size(studio_ui::ds::text::body_size(cx))
                 .child(MarkdownElement::new(view.clone(), value_style(window, cx)))
                 .into_any_element(),
             None => studio_ui::ds::text::body(display_value(property, value))
@@ -2553,12 +2549,11 @@ impl NodePeek {
                     .child(
                         PopoverMenu::new(SharedString::from(format!("peek-enum-{index}")))
                             .trigger(
-                                studio_ui::ds::button(
+                                studio_ui::ds::row_button(
                                     SharedString::from(format!("peek-enum-button-{index}")),
                                     shown,
                                 )
                                 .style(ButtonStyle::Subtle)
-                                .size(ButtonSize::Compact)
                                 .end_icon(Icon::new(IconName::ChevronDown)),
                             )
                             .anchor(gpui::Anchor::TopLeft)
@@ -2656,11 +2651,10 @@ impl NodePeek {
         };
         let clear = (edit.property.nullable && !edit.old.is_null()).then(|| {
             let (property, old) = (edit.property.clone(), edit.old.clone());
-            IconButton::new(
+            studio_ui::ds::row_icon_button(
                 SharedString::from(format!("peek-clear-{}", edit.property.name)),
                 IconName::Close,
             )
-            .icon_size(IconSize::XSmall)
             .icon_color(Color::Muted)
             .tooltip(Tooltip::text("Set to none"))
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -2701,11 +2695,10 @@ impl NodePeek {
                     .children(clear)
                     .children(lines.then(|| {
                         let name = edit.property.name.clone();
-                        IconButton::new(
+                        studio_ui::ds::row_icon_button(
                             SharedString::from(format!("peek-expand-{name}")),
                             IconName::Maximize,
                         )
-                        .icon_size(IconSize::XSmall)
                         .icon_color(Color::Muted)
                         .tooltip(|_, cx| {
                             Tooltip::for_action("Open in the editor", &ExpandField, cx)
@@ -2724,9 +2717,8 @@ impl NodePeek {
                     // Whether the save landed is in the branch's history.
                     .when(unknown, |row| {
                         row.child(
-                            studio_ui::ds::button("peek-open-history", "Open history")
+                            studio_ui::ds::row_button("peek-open-history", "Open history")
                                 .style(ButtonStyle::Subtle)
-                                .size(ButtonSize::Compact)
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(
                                         Box::new(studio_actions::graph::OpenHistory),
@@ -2894,8 +2886,7 @@ impl NodePeek {
             format!("Add a {}", group.other_type)
         };
         let edge = group.edge.clone();
-        IconButton::new(("peek-add", index), IconName::Plus)
-            .icon_size(IconSize::XSmall)
+        studio_ui::ds::row_icon_button(("peek-add", index), IconName::Plus)
             .icon_color(Color::Muted)
             .when(!self.page, |button| button.visible_on_hover(header))
             .tooltip(Tooltip::text(tooltip))
@@ -3009,12 +3000,11 @@ impl NodePeek {
         let asked = self.removing.as_deref() == Some(edge_id.as_str());
         let edge = self.groups[index].group.edge.clone();
         if asked {
-            return studio_ui::ds::button(
+            return studio_ui::ds::row_button(
                 SharedString::from(format!("peek-remove-{index}-{n}")),
                 "Remove",
             )
             .style(ButtonStyle::Tinted(ui::TintColor::Error))
-            .size(ButtonSize::Compact)
             .tooltip(Tooltip::text(format!(
                 "Remove this {edge}; both nodes stay"
             )))
@@ -3024,11 +3014,10 @@ impl NodePeek {
             }))
             .into_any_element();
         }
-        IconButton::new(
+        studio_ui::ds::row_icon_button(
             SharedString::from(format!("peek-remove-{index}-{n}")),
             IconName::Close,
         )
-        .icon_size(IconSize::XSmall)
         .icon_color(Color::Muted)
         .visible_on_hover(row)
         .tooltip(Tooltip::text(format!("Remove this {edge}")))
@@ -3059,7 +3048,7 @@ impl NodePeek {
                     let label = format!("+{} more", format_count(more));
                     if self.page {
                         let reading = group.more.is_some();
-                        studio_ui::ds::button(
+                        studio_ui::ds::row_button(
                             SharedString::from(format!("peek-more-{index}")),
                             if reading {
                                 "Reading…".to_owned()
@@ -3068,7 +3057,6 @@ impl NodePeek {
                             },
                         )
                         .style(ButtonStyle::Subtle)
-                        .size(ButtonSize::Compact)
                         .disabled(reading)
                         .on_click(cx.listener(move |this, _, _, cx| this.show_more(index, cx)))
                         .into_any_element()
@@ -3235,7 +3223,7 @@ fn place_of(group: &Group, active: bool) -> Place {
 /// descent, its gutter margin (`GutterDimensions::default_gutter_margin`).
 fn editor_inset(window: &Window, cx: &App) -> gpui::Pixels {
     let font = window.text_style().font();
-    let size = ui::TextSize::Small.rems(cx).to_pixels(window.rem_size());
+    let size = studio_ui::ds::text::body_size(cx).to_pixels(window.rem_size());
     let text = cx.text_system();
     -text.descent(text.resolve_font(&font), size)
 }
@@ -3245,7 +3233,7 @@ fn editor_inset(window: &Window, cx: &App) -> gpui::Pixels {
 /// (spec 014).
 fn value_style(window: &Window, cx: &App) -> MarkdownStyle {
     let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
-    style.base_text_style.font_size = ui::TextSize::Small.rems(cx).into();
+    style.base_text_style.font_size = studio_ui::ds::text::body_size(cx).into();
     style.base_text_style.line_height = gpui::relative(1.5);
     style.soft_break_as_hard_break = true;
     style
@@ -3449,7 +3437,6 @@ impl NodePeek {
                     .child(div().flex_1())
                     .children(open_page.map(|open| {
                         studio_ui::ds::toolbar_icon_button("peek-open-page", IconName::ArrowUpRight)
-                            .icon_size(IconSize::Small)
                             .icon_color(Color::Muted)
                             .tooltip(Tooltip::text("Open the node's page"))
                             .on_click(move |_, window, cx| {
@@ -3501,8 +3488,7 @@ impl NodePeek {
                     // A node opened by id reads again by id; an edge is read with its table.
                     .when(self.newer && is_node, |meta| {
                         meta.child(
-                            studio_ui::ds::button("peek-newer", "Newer data · Refresh")
-                                .size(ButtonSize::Compact)
+                            studio_ui::ds::row_button("peek-newer", "Newer data · Refresh")
                                 .style(ButtonStyle::Tinted(ui::TintColor::Accent))
                                 .tooltip(Tooltip::text(
                                     "The branch moved since this was read. Refresh reads it at the head.",

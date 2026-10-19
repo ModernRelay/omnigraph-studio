@@ -489,12 +489,19 @@ than styling one-off elements.
   ghost (nothing until hovered; toolbars, rows), destructive (solid red) and glass (a floating
   pill). Zed's `ButtonStyle` picks the variant, so call sites keep `.style(…)`: Filled is
   primary, Outlined outline, Subtle ghost, Tinted(Error) destructive. Sizes keep Zed's
-  heights: medium 28 px (`size::CONTROL`, 10 px in), default 22 px (the header strips and the
-  status bar), compact 18 px (inside dense rows: a tab's close, a tree toggle, an inline Fix,
-  a setting's reset). An icon button is 22 px unless asked otherwise, as Zed's, so its hover
-  fill keeps 4 px clear in the 30 px status bar and 5 px in a 32 px strip; `ds::icon_button`
-  is the 28 px one, beside a field or a medium button (until 2026-10-18 every icon button
-  defaulted to 28 px, which nearly filled the strips it sat in). A label is the body size at 28 px and up (13 px at the default 15 px
+  heights, and a view names a button by where it sits, never by its size (since 2026-10-19,
+  when the same row action was an 18, 22 or 28 px square from one view to the next): a
+  control's, `ds::button` and `ds::icon_button`, 28 px (`size::CONTROL`, 10 px in), beside a
+  field or among a dialog's actions; a strip's, `ds::toolbar_button`, `ds::bar_button` and
+  their icon forms, 22 px (`size::BAR_BUTTON`: the header strips, floating bars and the
+  status bar); a row's or a card's, `ds::row_button` and `ds::row_icon_button`, 18 px
+  (`size::ROW_BUTTON`, a tag's height: a tree row's toggle, an inline Fix, Show more, a
+  setting's reset, a value's copy); and a tab's pin and close, `ds::inline_icon_button`, no
+  square beyond its icon. An icon button's icon follows its size: 14 px at 28 and 22 px,
+  12 px in a row and a tab. A plain `IconButton::new` is the 22 px one, as Zed's, so its
+  hover fill keeps 4 px clear in the 30 px status bar and 5 px in a 32 px strip (until
+  2026-10-18 every icon button defaulted to 28 px, which nearly filled the strips it sat
+  in). A label is the body size at 28 px and up (13 px at the default 15 px
   interface size, Tower's `text-sm`) and the small size below; a leading icon is 16 px at
   28 px and 12 px below, a trailing one (a chevron) 12 px, both at 80 % of the label's ink.
   A toggled button sits on the pressed fill; a disabled one fades to 64 %; a key hint on a
@@ -527,9 +534,10 @@ than styling one-off elements.
   palette. `script/check-design-tokens.py`, run in CI beside the layer check, refuses
   anything else outside the design system; an exception carries a `// ds-exempt: <reason>`.
   It also refuses any label or icon given a size (its builder chain is read whole), a label
-  given only the muted colour, a button given a sized or tinted icon, GPUI's text sizes, an
-  opacity written as a number, and Zed's `Divider`, `Banner`, `Callout`, `Chip` and
-  `Checkbox`; the forked Zed menu keeps upstream's calls.
+  given only the muted colour, a button given a sized or tinted icon, a button's size or an icon
+  button's icon size named directly (`ButtonSize::…`, `.icon_size`), any icon, label or type
+  size named in a view (`IconSize`, `LabelSize`, `TextSize`), GPUI's text sizes, an opacity written as a number, and Zed's `Divider`, `Banner`,
+  `Callout`, `Chip` and `Checkbox`; the forked Zed menu keeps upstream's calls.
   Data column widths and algorithm constants (zoom steps, layout forces, text-width
   estimates) are named once where they are used; the canvas's chip text is world geometry
   the zoom scales.
@@ -546,7 +554,9 @@ than styling one-off elements.
   `meta`; a page's one title is `text::page_title`) rather than setting a label's or an icon's
   size and colour themselves: a view adds at most a semantic `ui` `Color`. Text a view does
   not set itself (an agent's reply, the composer's editor) takes `ds::Prose` (`prose`,
-  `quiet_prose`), not GPUI's `text_sm()`. A button sizes and inks its own icons (above), so
+  `quiet_prose`), not GPUI's `text_sm()`; text that is not a label (a markdown value, a grid
+  cell, an editor's font) takes the size of its role, `ds::text::plain_size`, `body_size` or
+  `meta_size`, never a `TextSize` named in the view. A button sizes and inks its own icons (above), so
   it is given a plain `Icon::new`. The canvas's label fill and a far hub's dot are surface
   roles too (`canvas_label`, `canvas_hub`). The interface font is Inter by default (Tower's face; Inter 4.1, OFL-1.1, the
   regular, italic, medium, semibold and bold static files in `assets/fonts/inter/`, loaded
@@ -554,8 +564,8 @@ than styling one-off elements.
 - **Toolbars.** A document's toolbar and every header or notice strip (a table's, a query's,
   history's and its commit pane's, the review's, storage's, the inspector's header, the text
   editor's, a newer-data notice) holds `ds::toolbar_button`s and `ds::toolbar_icon_button`s;
-  a button inside a dense row (an inline Fix or Run, Show more, a crumb) is
-  `ButtonSize::Compact`. Toolbar buttons are Zed's 22 px
+  a button inside a dense row (an inline Fix or Run, Show more, a crumb) is a
+  `ds::row_button`. Toolbar buttons are Zed's 22 px
   size, Tower's `xs`, with small type and 12 px icons, set with no gap beyond their padding
   (`ds::toolbar_actions`), so the chrome reads smaller than the document it serves.
 - **Shadows, Tower's values** (`ds::elevation`, light and dark): `raised` for a solid item on
@@ -630,6 +640,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-19 | Buttons sized by role; every icon, label and type size from the design system | `script/check-design-tokens.py` with its new rules (`ButtonSize::`, `.icon_size`, `IconSize::`, `LabelSize::`, `TextSize::` and `.text_ui*` outside the system); `studio_ui` `controls_draw_at_their_sizes` (a toolbar icon button 22 px, a row button and a row icon button 18 px squares, a tab's inline icon under 18 px, the icon size each button size gives); workspace clippy `-D warnings` and the workspace suite (43 targets) on a copy of the parent commit with only these paths; offscreen glass snapshots on a scratch dev server: the design gallery, Person's table with its peek and a pinned tab, a hovered relationship group | Before: views chose 25 button sizes and 47 icon sizes by name, so one kind of row action was an 18, 22 or 28 px square (the session list, saved queries, the relationship tree, the peek, the review, a toast); 15 calls restated the default icon and four named `TextSize`. After: none, and the guard refuses them. Row actions are 18 px squares with 12 px icons, their hover fill 4 to 10 px smaller; labelled row buttons stay 18 px; a tab's pin and close and every toolbar's buttons are unchanged |
 | 2026-10-18 | One document fill with the sheet's corners; rules, dimming and floating bars by role | `script/check-design-tokens.py`; `cargo clippy` `-D warnings` on the ten touched crates; the `studio_ui`, `studio_workspace`, `type_table`, `graph_canvas`, `query_editor`, `history`, `review` and `inspectors` suites; offscreen glass snapshots of a query with results, Person's table, History, Storage, the schema, Settings and the ontology, their bottom corners cropped at 2×, sampled by pixel | Before: the table, schema, agent and ontology were white (255) with square bottom corners on the rounded sheet; a query, History and Storage were the glass sheet (245) with round ones. After: all seven are white with round corners. Settings rows, query results, storage sections and the agent's queue drew solid rules where the table's rows were dotted; the agent's composer edge was dotted beside a solid banner edge. Storage built its own 36 px header with a labelled Refresh; it takes the 48 px toolbar and the icon refresh History and the table use, as the review's header now does. The drafts bar was a solid card with `lg` corners beside the canvas's glass bars. Dimmed things used 0.45, 0.5, 0.55 and 0.6 |
 | 2026-10-18 | One corner setting; round ends only for labelled buttons; Tower's type scale, shadows and button type; spacing and alignment by token | `ds` `nested_radii_are_concentric` (the default scale, every pair at bases 1–20, 0 square); `studio_settings` row order with `studio.corner_radius`; `button` tests; workspace clippy `-D warnings`; offscreen snapshots in glass: a table, its peek, the canvas, settings, history, a query, the delete dialog, ⌘K | The canvas's mode switch was a bare 22 px segmented control beside two 28 px glass bars (the segmented track had been removed); it is a bar now, and all three share height, corner and shadow. The table's header text started 4 px right of its cells' (Zed pads a header cell); the inspector's rows 4 px right of their section labels (their hover inset); a peek group's children at 26 and 28 px under an arrow at 22. The branch picker was a 28 px pill with 13 px text beside a 22 px graph picker with 12 px text. Buttons were 12 px text with 14 px icons, 24–32 px apart in the table toolbar; they are 13 px with 16 px icons at 80 %, with their padding as their gap. Fourteen hover fills used Zed's theme hover; they use `surface::highlight` |
 | 2026-10-18 | Nested radii count the hairline; flush fills follow their container's corners; no raw radius utilities | `ds` test `nested_radii_are_concentric` (menu row, palette list and row, a row list, `radius::flush` for a card header and a modal footer); offscreen snapshots cropped at 2×: the gallery's card header, the delete dialog's footer, ⌘K's highlighted row, a tab's menu | Before, the card header's fill showed a square corner outside the card's curve; the menu row, palette card and palette row were 1 px rounder than their insets allowed, since the hairline was not counted. Fourteen `rounded_sm`/`rounded_md` calls became tokens by role: the inspector's rows SM, its image frame MD, a table cell's edit notice a menu surface, a dragged column, the agent picker and the tree's filter row pills |

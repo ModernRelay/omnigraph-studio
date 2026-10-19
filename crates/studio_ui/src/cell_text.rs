@@ -15,7 +15,6 @@ use gpui::{
     InspectorElementId, IntoElement, LayoutId, Length, Pixels, ShapedLine, SharedString, Style,
     TextAlign, TextStyleRefinement, TruncateFrom, Window, px,
 };
-use ui::TextSize;
 
 /// See the module documentation.
 pub struct CellText {
@@ -44,11 +43,6 @@ pub fn cell_text(text: impl Into<SharedString>, cx: &App) -> CellText {
 impl CellText {
     pub fn color(mut self, color: Hsla) -> Self {
         self.style.color = Some(color);
-        self
-    }
-
-    pub fn size(mut self, size: TextSize, cx: &App) -> Self {
-        self.style.font_size = Some(size.rems(cx).into());
         self
     }
 

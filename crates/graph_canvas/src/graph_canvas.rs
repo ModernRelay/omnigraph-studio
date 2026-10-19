@@ -2168,7 +2168,6 @@ impl GraphCanvas {
                             .when(!self.pinned.is_empty(), |panel| {
                                 panel.child(
                                     studio_ui::ds::bar_icon_button("reset-layout", IconName::RotateCcw)
-                                        .icon_size(IconSize::Small)
                                         .tooltip(|_window, cx| {
                                             Tooltip::for_action(
                                                 "Reset the layout: forget the nodes you placed",
@@ -2183,7 +2182,6 @@ impl GraphCanvas {
                             })
                             .child(
                                 studio_ui::ds::bar_icon_button("zoom-out", IconName::Dash)
-                                    .icon_size(IconSize::Small)
                                     .tooltip(|_window, cx| {
                                         Tooltip::for_action("Zoom out", &ZoomOut, cx)
                                     })
@@ -2202,7 +2200,6 @@ impl GraphCanvas {
                             )
                             .child(
                                 studio_ui::ds::bar_icon_button("zoom-in", IconName::Plus)
-                                    .icon_size(IconSize::Small)
                                     .tooltip(|_window, cx| {
                                         Tooltip::for_action("Zoom in", &ZoomIn, cx)
                                     })

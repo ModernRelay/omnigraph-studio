@@ -2037,7 +2037,6 @@ impl Workspace {
             .children(self.left.active_panel().map(dock_title))
             .child(
                 IconButton::new("search", IconName::MagnifyingGlass)
-                    .icon_size(IconSize::Small)
                     .tooltip(|_, cx| {
                         Tooltip::for_action(
                             "Search types, queries and commands",
@@ -2089,7 +2088,6 @@ impl Workspace {
                 IconName::ThreadsSidebarLeftClosed
             },
         )
-        .icon_size(IconSize::Small)
         .tooltip(move |_, cx| {
             Tooltip::for_action(
                 if open { "Hide sidebar" } else { "Show sidebar" },
@@ -2150,7 +2148,6 @@ impl Workspace {
                             SharedString::from(format!("panel-button-{id}-{}", lit as u8)),
                             icon,
                         )
-                        .icon_size(IconSize::Small)
                         .toggle_state(lit)
                         .when(!menu_open, |button| {
                             button.tooltip(move |_, cx| {
@@ -2410,24 +2407,20 @@ impl Workspace {
                     None
                 };
                 let end_button = if pinned {
-                    IconButton::new(
+                    studio_ui::ds::inline_icon_button(
                         SharedString::from(format!("unpin-{pane_id}-{index}")),
                         IconName::Pin,
                     )
-                    .size(ButtonSize::None)
-                    .icon_size(IconSize::XSmall)
                     .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Unpin"))
                     .on_click(
                         cx.listener(move |this, _, _, cx| this.toggle_pin(pane_id, index, cx)),
                     )
                 } else {
-                    IconButton::new(
+                    studio_ui::ds::inline_icon_button(
                         SharedString::from(format!("close-{pane_id}-{index}")),
                         IconName::Close,
                     )
-                    .size(ButtonSize::None)
-                    .icon_size(IconSize::XSmall)
                     // On hover only, the active tab's too, as Zed's `show_close_button: hover`:
                     // its slot stays, so the title sits evenly between the tab's edges.
                     .visible_on_hover(group.clone())
@@ -2583,7 +2576,6 @@ impl Workspace {
                 )),
                 icon,
             )
-            .icon_size(IconSize::Small)
             .disabled(!enabled)
             .tooltip(move |_, cx| {
                 if back {
@@ -2644,7 +2636,6 @@ impl Workspace {
         let zoomed = self.zoomed == Some(Zoomed::Pane(pane_id));
         let menu_button = |id: &'static str, icon: IconName, tooltip: &'static str| {
             IconButton::new(SharedString::from(format!("{id}-{pane_id}")), icon)
-                .icon_size(IconSize::Small)
                 .tooltip(Tooltip::text(tooltip))
         };
         h_flex()
@@ -2694,7 +2685,6 @@ impl Workspace {
                     SharedString::from(format!("zoom-pane-{pane_id}")),
                     IconName::Maximize,
                 )
-                .icon_size(IconSize::Small)
                 .toggle_state(zoomed)
                 .selected_icon(IconName::Minimize)
                 .tooltip(move |_, cx| {
@@ -2984,7 +2974,7 @@ impl Workspace {
                         .anchor(gpui::Anchor::BottomRight)
                         .attach(gpui::Anchor::TopRight)
                         .trigger_with_tooltip(
-                            IconButton::new("keys", IconName::Keyboard).icon_size(IconSize::Small),
+                            IconButton::new("keys", IconName::Keyboard),
                             Tooltip::text("Keys for this tab"),
                         )
                         // Zed's context menu: each key is an entry that runs it, its binding
@@ -3234,7 +3224,6 @@ impl Workspace {
                     IconName::Maximize
                 },
             )
-            .icon_size(IconSize::Small)
             // ⇧⎋ ends any zoom but zooms the active pane, not this dock, so only "Zoom out"
             // shows it.
             .tooltip(move |_, cx| {
@@ -3258,7 +3247,6 @@ impl Workspace {
                 SharedString::from(format!("hide-dock-{position:?}")),
                 IconName::Close,
             )
-            .icon_size(IconSize::Small)
             .tooltip(move |_, cx| {
                 Tooltip::for_action(hide_label, toggle_action(position).as_ref(), cx)
             })
@@ -3491,8 +3479,7 @@ impl Workspace {
                             }))
                     }))
                     .child(
-                        studio_ui::ds::icon_button(("dismiss-toast", id), IconName::Close)
-                            .icon_size(IconSize::XSmall)
+                        studio_ui::ds::row_icon_button(("dismiss-toast", id), IconName::Close)
                             .on_click(
                                 cx.listener(move |this, _, _, cx| this.dismiss_toast(id, cx)),
                             ),
@@ -3585,7 +3572,7 @@ impl Render for Workspace {
             .size_full()
             .relative()
             .font(ui_font)
-            .text_ui(cx)
+            .text_size(studio_ui::ds::text::plain_size(cx))
             .map(|root| {
                 if studio_ui::ds::is_glass(cx) {
                     // The page, then the wash painted once behind everything.

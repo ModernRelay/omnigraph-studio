@@ -5013,7 +5013,6 @@ impl TypeTable {
                     )
                     .child(
                         studio_ui::ds::toolbar_icon_button("refresh-table", IconName::RotateCw)
-                            .icon_size(IconSize::Small)
                             .tooltip(|_, cx| Tooltip::for_action("Refresh", &RefreshTable, cx))
                             .on_click(cx.listener(|this, _, window, cx| this.refresh(window, cx))),
                     ),
@@ -5719,9 +5718,8 @@ impl TypeTable {
                         .child(studio_ui::ds::text::error_note("Not read")),
                 )
                 .child(
-                    studio_ui::ds::button(("section-retry", index), "Retry")
+                    studio_ui::ds::row_button(("section-retry", index), "Retry")
                         .style(ButtonStyle::Subtle)
-                        .size(ButtonSize::Compact)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(section) =
                                 this.grouping.as_mut().and_then(|g| g.section_mut(index))
@@ -5742,9 +5740,8 @@ impl TypeTable {
             } else {
                 format!("Show {} more", format_count(remaining as i64))
             };
-            studio_ui::ds::button(("section-more", index), label)
+            studio_ui::ds::row_button(("section-more", index), label)
                 .style(ButtonStyle::Subtle)
-                .size(ButtonSize::Compact)
                 .color(Color::Accent)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let size = this.page_size(cx);
@@ -6398,9 +6395,8 @@ impl TypeTable {
         }
         if let Some(error) = self.more_error.clone() {
             start.push(
-                studio_ui::ds::button("retry-more", "Retry")
+                studio_ui::ds::row_button("retry-more", "Retry")
                     .style(ButtonStyle::Subtle)
-                    .size(ButtonSize::Compact)
                     .start_icon(Icon::new(IconName::Warning))
                     .tooltip(Tooltip::text(format!(
                         "The next page could not be read: {error}"

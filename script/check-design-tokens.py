@@ -29,7 +29,15 @@ every surface and nothing drifts. This refuses, outside the design system and te
   `error_note` and `ds::icon::lead`, `meta`, and add only a semantic `ui` `Color`;
 - a sized or tinted icon given to a button (`.start_icon(Icon::new(..).size(..))`,
   `.start_icon(ds::icon::lead(..))`): a button sizes and inks its own icons, so it takes a
-  plain `Icon::new(..)`.
+  plain `Icon::new(..)`;
+- a button's size or an icon button's icon size named directly (`.size(ButtonSize::Compact)`,
+  `.icon_size(IconSize::XSmall)`): views take the role for where the button sits
+  (`ds::button`, `toolbar_button`, `bar_button`, `row_button` and their icon forms,
+  `ds::inline_icon_button`), whose size gives the icon its size;
+- any icon or type size named in a view (`IconSize::XSmall`, `LabelSize::Small`,
+  `ui::TextSize::Small.rems(cx)`, `.text_ui_sm(cx)`): icons take `ds::icon::lead` or `meta`,
+  labels a `ds::text` role, and other text `ds::text::plain_size`, `body_size` or
+  `meta_size`.
 The last two rules read a file whole, since a builder chain spans lines.
 
 A line the rule cannot fit says why in a `// ds-exempt: <reason>` comment on it or the line
@@ -76,6 +84,10 @@ RULES = [
     ("GPUI text size", re.compile(r"\.text_(xs|sm|base|lg|xl|2xl|3xl)\(\)")),
     ("label outside ds::text", re.compile(r"\bLabel::new\(")),
     ("opacity as a number", re.compile(r"\.opacity\(\s*0?\.\d")),
+    ("button size outside a ds role", re.compile(r"\bButtonSize::[A-Z]|\.icon_size\(")),
+    ("icon size outside ds::icon", re.compile(r"\bIconSize::[A-Z]")),
+    ("type size outside ds::text",
+     re.compile(r"\b(TextSize|LabelSize)::[A-Z]|\.text_ui(_xs|_sm|_lg)?\(")),
 ]
 EXEMPT = re.compile(r"//\s*ds-exempt:\s*\S")
 # Builder chains that rebuild a role, whichever order the two calls come in.

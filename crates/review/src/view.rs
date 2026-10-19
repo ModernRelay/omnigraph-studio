@@ -24,7 +24,6 @@ use serde_json::Value;
 use studio_actions::review::{
     AcceptAndNext, EditChange, Merge, NextChange, PreviousChange, RevertAndNext,
 };
-use studio_ui::ds::Button;
 use studio_ui::ds::{radii, space};
 use studio_ui::menu::ContextMenu;
 use studio_ui::{ChangeCard, change_counts, group_digits, short_commit_id, type_swatch};
@@ -1888,7 +1887,7 @@ impl ReviewView {
             );
         }
 
-        let review_button = Button::new(
+        let review_button = studio_ui::ds::row_button(
             ("reviewed", ix),
             if reviewed {
                 "Reviewed"
@@ -1896,7 +1895,6 @@ impl ReviewView {
                 "Mark reviewed"
             },
         )
-        .size(ButtonSize::Compact)
         .style(ButtonStyle::Subtle)
         .toggle_state(reviewed)
         .when(reviewed, |b| b.start_icon(Icon::new(IconName::Check)))
@@ -1921,8 +1919,7 @@ impl ReviewView {
                 let branch = self.branch.clone();
                 let focus = focus.clone();
                 card = card.action(
-                    Button::new(("edit", ix), "Edit")
-                        .size(ButtonSize::Compact)
+                    studio_ui::ds::row_button(("edit", ix), "Edit")
                         .style(ButtonStyle::Subtle)
                         .start_icon(Icon::new(IconName::Pencil))
                         .disabled(done)
@@ -1942,8 +1939,7 @@ impl ReviewView {
             let blocked = state.revert_blocked.clone();
             let branch = self.branch.clone();
             card = card.action(
-                Button::new(("revert", ix), "Revert")
-                    .size(ButtonSize::Compact)
+                studio_ui::ds::row_button(("revert", ix), "Revert")
                     .style(ButtonStyle::Subtle)
                     .start_icon(Icon::new(IconName::Undo))
                     .disabled(blocked.is_some() || done)
@@ -2008,8 +2004,7 @@ impl ReviewView {
                 };
                 let branch = self.branch.clone();
                 let revert =
-                    studio_ui::ds::icon_button(("revert-relationship", change), IconName::Undo)
-                        .icon_size(IconSize::XSmall)
+                    studio_ui::ds::row_icon_button(("revert-relationship", change), IconName::Undo)
                         .style(ButtonStyle::Subtle)
                         .visible_on_hover(hover.clone())
                         .disabled(blocked.is_some() || done)

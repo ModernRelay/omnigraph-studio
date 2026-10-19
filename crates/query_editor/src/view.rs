@@ -29,7 +29,6 @@ use graph_client::{ReadError, WriteOutcome};
 use graph_store::{GraphSession, SessionEvent};
 use serde_json::{Map, Value};
 use studio_actions::query::{CopyCell, CopyRow, Explain, Run, Save, SaveAs};
-use studio_ui::ds::Button;
 use studio_ui::ds::{Dotted as _, space};
 use studio_ui::menu::ContextMenu;
 use studio_ui::{
@@ -2099,9 +2098,8 @@ impl QueryEditor {
                                     // a click.
                                     let checked = analysis.clone();
                                     row.child(
-                                        Button::new(("apply-fix", index), "Fix")
+                                        studio_ui::ds::row_button(("apply-fix", index), "Fix")
                                             .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                                            .size(ButtonSize::Compact)
                                             .tooltip(Tooltip::text(
                                                 "Apply the compiler's suggested edit",
                                             ))
@@ -2532,7 +2530,7 @@ impl QueryEditor {
                                 .px(px(space::MD))
                                 .child(
                                     studio_ui::cell_text((ix + 1).to_string(), cx)
-                                        .size(TextSize::XSmall, cx)
+                                        .meta(cx)
                                         .color(muted),
                                 ),
                         )
@@ -2997,9 +2995,8 @@ fn run_line(
         .gap(px(space::MD))
         .items_center()
         .child(
-            Button::new(("run-line-run", index), "Run")
+            studio_ui::ds::row_button(("run-line-run", index), "Run")
                 .style(ButtonStyle::Transparent)
-                .size(ButtonSize::Compact)
                 .color(Color::Muted)
                 .start_icon(Icon::new(IconName::PlayFilled))
                 .on_click(move |_, window, cx| {

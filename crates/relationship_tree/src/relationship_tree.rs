@@ -35,7 +35,6 @@ use studio_actions::tree::{
     PeekSelected, RerootHere, SelectNext, SelectPrevious, ShowOnCanvas, ToggleEmptyGroups,
 };
 use studio_ui::ds::space;
-use studio_ui::ds::{Button, IconButton};
 use studio_ui::menu::ContextMenu;
 use studio_ui::type_swatch;
 use studio_workspace::{PanelPosition, Workspace, WorkspaceEvent};
@@ -937,8 +936,7 @@ impl RelationshipTree {
                             .child(studio_ui::ds::text::error_note(message.clone()).truncate()),
                     )
                     .child(
-                        Button::new(("retry", row), "Retry")
-                            .size(ButtonSize::Compact)
+                        studio_ui::ds::row_button(("retry", row), "Retry")
                             .style(ButtonStyle::Subtle)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let target = target.clone();
@@ -1070,8 +1068,7 @@ impl RelationshipTree {
         };
         let menu = PopoverMenu::new(SharedString::from(format!("{}-{row}", id.0)))
             .trigger(
-                IconButton::new(id, IconName::ListTree)
-                    .icon_size(IconSize::XSmall)
+                studio_ui::ds::row_icon_button(id, IconName::ListTree)
                     .icon_color(Color::Muted)
                     .toggle_state(current.is_some())
                     .tooltip(Tooltip::text(tooltip)),
@@ -1169,8 +1166,7 @@ impl RelationshipTree {
                 .when(!breadcrumb.is_empty(), |d| {
                     d.child(h_flex().min_w_0().flex_wrap().gap(px(space::XXS)).children(
                         breadcrumb.into_iter().map(|(index, text)| {
-                            studio_ui::ds::button(("crumb", index), format!("{text} ›"))
-                                .size(ButtonSize::Compact)
+                            studio_ui::ds::row_button(("crumb", index), format!("{text} ›"))
                                 .style(ButtonStyle::Subtle)
                                 .tooltip(Tooltip::text("Explore from here again"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -1181,8 +1177,7 @@ impl RelationshipTree {
                 })
                 .when(newer, |d| {
                     d.child(
-                        studio_ui::ds::button("newer", "Newer data · Refresh")
-                            .size(ButtonSize::Compact)
+                        studio_ui::ds::row_button("newer", "Newer data · Refresh")
                             .style(ButtonStyle::Tinted(ui::TintColor::Accent))
                             .tooltip(Tooltip::text(
                                 "The branch moved since this tree was read. Refresh reads it again.",
@@ -1433,7 +1428,7 @@ impl Render for ExploreActions {
             .when(hide_empty || any_empty, |row| {
                 let tree = weak.clone();
                 row.child(
-                    IconButton::new(
+                    studio_ui::ds::row_icon_button(
                         "toggle-empty-groups",
                         if hide_empty {
                             IconName::EyeOff
@@ -1441,7 +1436,6 @@ impl Render for ExploreActions {
                             IconName::Eye
                         },
                     )
-                    .icon_size(IconSize::XSmall)
                     .icon_color(Color::Muted)
                     .toggle_state(hide_empty)
                     .tooltip(move |_, cx| {
@@ -1466,8 +1460,7 @@ impl Render for ExploreActions {
             .when(rooted, |row| {
                 let tree = weak.clone();
                 row.child(
-                    IconButton::new("collapse-to-root", IconName::ListCollapse)
-                        .icon_size(IconSize::XSmall)
+                    studio_ui::ds::row_icon_button("collapse-to-root", IconName::ListCollapse)
                         .icon_color(Color::Muted)
                         .tooltip(Tooltip::text("Collapse all"))
                         .on_click(move |_, _, cx| {
