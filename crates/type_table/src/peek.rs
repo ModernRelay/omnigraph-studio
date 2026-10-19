@@ -54,6 +54,8 @@ const PAGE_WIDTH: f32 = studio_ui::ds::size::READING_WIDTH;
 /// Debounce before relationship counts are read, so moving the cursor quickly through rows
 /// does not send a burst of reads.
 const COUNT_DELAY: Duration = Duration::from_millis(120);
+/// What a property the node holds no value for shows, borrowed like a value it holds.
+static NULL: Value = Value::Null;
 
 /// How far past the rows in view the view's list lays rows out. A group is read once its row
 /// is laid out, so this is how far ahead of a scroll the groups are read: a few rows.
@@ -261,7 +263,10 @@ pub struct NodePeek {
     groups_absent: Vec<(String, String)>,
     /// The head moved and the session is reading what changed: the view decides when it is in.
     awaiting_changes: bool,
-    _tasks: Vec<Task<()>>,
+    /// The node's read: a newer one replaces it, so an older answer never lands over it.
+    _node_read: Option<Task<()>>,
+    /// Takes the copied mark down; a refresh keeps it, and a second copy starts it again.
+    _copied: Option<Task<()>>,
     _subscription: Subscription,
 }
 
@@ -415,7 +420,8 @@ impl NodePeek {
             absent: HashMap::new(),
             groups_absent: Vec::new(),
             awaiting_changes: false,
-            _tasks: Vec::new(),
+            _node_read: None,
+            _copied: None,
             _subscription: subscription,
         };
         match values {
@@ -523,7 +529,6 @@ impl NodePeek {
         self.groups.clear();
         self.absent.clear();
         self.groups_absent.clear();
-        self._tasks.clear();
         // What it showed is let go; what it reads now is told again, under the new schema too.
         if let Some(scope) = &self.scope {
             self.session.update(cx, |session, _| {
@@ -568,7 +573,7 @@ impl NodePeek {
             session.head(&session.branch).map(str::to_owned)
         });
         let read = self.read_shown(&query, snapshot, cx);
-        self._tasks.push(cx.spawn(async move |this, cx| {
+        self._node_read = Some(cx.spawn(async move |this, cx| {
             let result = read.await;
             this.update(cx, |this, cx| {
                 match result {
@@ -2265,11 +2270,13 @@ impl NodePeek {
         )
     }
 
-    fn copy(&mut self, name: String, value: &Value, cx: &mut Context<Self>) {
-        cx.write_to_clipboard(ClipboardItem::new_string(studio_ui::value_text(value)));
+    /// Copies a property's value as it is when clicked.
+    fn copy(&mut self, name: String, cx: &mut Context<Self>) {
+        let text = studio_ui::value_text(&self.value_of(&name));
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
         self.copied = Some(name);
         cx.notify();
-        self._tasks.push(cx.spawn(async move |this, cx| {
+        self._copied = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(1500))
                 .await;
@@ -2279,17 +2286,6 @@ impl NodePeek {
             })
             .ok();
         }));
-    }
-
-    /// The properties to list, in schema order, with each one's declared type.
-    fn property_rows(&self) -> Vec<(String, Option<gq_language::Property>, String)> {
-        let Some(schema) = &self.schema else {
-            return Vec::new();
-        };
-        listed_properties(schema, &self.subject)
-            .into_iter()
-            .map(|p| (p.name.clone(), Some(p.clone()), p.display_type()))
-            .collect()
     }
 
     /// Keeps one markdown view per text value with markup, made again only when its text
@@ -2352,7 +2348,11 @@ impl NodePeek {
             }
         };
         let hover = studio_ui::ds::surface::highlight(cx);
-        let rows = self.property_rows();
+        let properties = self
+            .schema
+            .as_deref()
+            .map(|schema| listed_properties(schema, &self.subject))
+            .unwrap_or_default();
         let label_width = if self.page {
             studio_ui::ds::size::FIELD_LABEL_WIDE
         } else {
@@ -2363,59 +2363,61 @@ impl NodePeek {
             .mx(px(-space::XS))
             .gap(px(space::XXS))
             .children(
-                rows.into_iter()
+                properties
+                    .into_iter()
                     .enumerate()
-                    .map(|(index, (name, property, ty))| {
-                        let value = values.get(&name).cloned().unwrap_or(Value::Null);
-                        let title = match name.as_str() {
+                    .map(|(index, property)| {
+                        let name = property.name.as_str();
+                        let ty = property.display_type();
+                        // Borrowed: this runs at every draw, and a text value can be long.
+                        let value = values.get(name).unwrap_or(&NULL);
+                        let title = match name {
                             FROM_COLUMN => "from".to_owned(),
                             TO_COLUMN => "to".to_owned(),
-                            _ => name.clone(),
+                            _ => name.to_owned(),
                         };
-                        let copied = self.copied.as_deref() == Some(name.as_str());
-                        let editable = property.as_ref().is_some_and(|p| self.edits_property(p));
-                        let editing = self.edits.contains_key(&name);
-                        let saving = self.saving.contains(&name);
+                        let copied = self.copied.as_deref() == Some(name);
+                        let editable = self.edits_property(property);
+                        let editing = self.edits.contains_key(name);
+                        let saving = self.saving.contains(name);
                         // An unsaved value shows what was typed, with a dot, and opens on a click.
                         let draft = (editable && !editing && !saving)
-                            .then(|| self.draft_of(&name, cx))
+                            .then(|| self.draft_of(name, cx))
                             .flatten();
                         // An enum is a menu of its values and a boolean a switch, each saving
                         // as it is chosen; other values open an editor on a click.
-                        let picker = property
-                            .as_ref()
-                            .filter(|_| editable && !editing && !saving && draft.is_none())
-                            .and_then(|p| self.render_picker(index, p, &value, cx));
+                        let picker = (editable && !editing && !saving && draft.is_none())
+                            .then(|| self.render_picker(index, property, value, cx))
+                            .flatten();
                         let opens_editor = editable && picker.is_none() && !editing && !saving;
-                        let body = match (self.edits.get(&name), picker) {
-                            _ if let Some(then) = self.absent.get(&name) => studio_ui::ds::text::muted(
+                        let body = match (self.edits.get(name), picker) {
+                            _ if let Some(then) = self.absent.get(name) => studio_ui::ds::text::muted(
                                 absence_text(then, true),
                             )
                             .into_any_element(),
                             (Some(edit), _) => self.render_field_edit(edit, window, cx),
                             (None, _) if draft.is_some() => {
-                                let text = draft.as_ref().map(|d| d.text.clone()).unwrap_or_default();
+                                let text = draft.as_ref().map_or("", |d| d.text.as_str());
                                 h_flex()
                                     .gap(px(space::SM))
                                     .child(
-                                        studio_ui::ds::text::body(if text.trim().is_empty() { "—".to_owned() } else { studio_ui::text::first_line(&text) }),
+                                        studio_ui::ds::text::body(if text.trim().is_empty() { "—".to_owned() } else { studio_ui::text::first_line(text) }),
                                     )
                                     .child(Indicator::dot().color(Color::Accent))
                                     .into_any_element()
                             }
                             (None, Some(picker)) => picker,
                             (None, None) => {
-                                self.render_value(&name, property.as_ref(), &value, window, cx)
+                                self.render_value(name, Some(property), value, window, cx)
                             }
                         };
-                        let edit_property = property.clone();
-                        let copy_name = name.clone();
-                        let copy_value = value.clone();
+                        // Only a click's own: the copy reads the value as it is then.
+                        let edit_property = opens_editor.then(|| property.clone());
+                        let copy_name = name.to_owned();
                         // Text opens in the editor from a button the row shows on hover.
-                        let expands =
-                            opens_editor && property.as_ref().is_some_and(reads_as_markdown);
+                        let expands = opens_editor && reads_as_markdown(property);
                         let group = SharedString::from(format!("peek-property-{index}"));
-                        let expand_name = name;
+                        let expand_name = name.to_owned();
                         h_flex()
                             .id(("peek-property", index))
                             .group(group.clone())
@@ -2430,7 +2432,7 @@ impl NodePeek {
                                 row.tooltip(Tooltip::text(if draft.is_some() {
                                     format!(
                                         "Not saved; it holds “{}”. Click to edit; ⌘S saves this node's changes together",
-                                        display_value(property.as_ref(), &value)
+                                        display_value(Some(property), value)
                                     )
                                 } else if opens_editor {
                                     format!("{ty} · click to edit")
@@ -2441,12 +2443,10 @@ impl NodePeek {
                                 }))
                             })
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                if opens_editor {
-                                    if let Some(property) = edit_property.clone() {
-                                        this.start_edit(property, window, cx);
-                                    }
+                                if let Some(property) = edit_property.clone() {
+                                    this.start_edit(property, window, cx);
                                 } else if !editable {
-                                    this.copy(copy_name.clone(), &copy_value, cx)
+                                    this.copy(copy_name.clone(), cx)
                                 }
                             }))
                             .child(
@@ -4189,6 +4189,46 @@ mod tests {
         cx.run_until_parked();
         let last = writer.feeds.lock().unwrap().last().cloned().unwrap();
         assert!(last.contains("type=Knows"), "{last}");
+    }
+
+    /// A copy takes the value as it is when clicked, and its mark comes down after its own
+    /// pause: a refresh does not leave it up, and an earlier copy does not take it down.
+    #[gpui::test]
+    async fn a_copy_mark_comes_down_after_its_own_pause(cx: &mut TestAppContext) {
+        let (session, _writer) = session_followed(
+            PEOPLE,
+            |request| match request["name"].as_str() {
+                Some("studio_node") => {
+                    json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }])
+                }
+                _ => json!([]),
+            },
+            cx,
+        );
+        let (view, cx) = page(session, cx);
+        let copied = |cx: &mut VisualTestContext| view.read_with(cx, |view, _| view.copied.clone());
+        view.update(cx, |view, cx| view.copy("name".into(), cx));
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("Ada")
+        );
+        view.update(cx, |view, cx| view.refresh(cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(1500));
+        cx.run_until_parked();
+        assert_eq!(copied(cx), None, "down after a refresh too");
+
+        view.update(cx, |view, cx| view.copy("name".into(), cx));
+        cx.executor().advance_clock(Duration::from_millis(1000));
+        view.update(cx, |view, cx| view.copy("slug".into(), cx));
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        assert_eq!(copied(cx).as_deref(), Some("slug"), "its own pause");
+        cx.executor().advance_clock(Duration::from_millis(900));
+        cx.run_until_parked();
+        assert_eq!(copied(cx), None);
     }
 
     /// A peek of a row the table read shows what the table read: a commit to another node
