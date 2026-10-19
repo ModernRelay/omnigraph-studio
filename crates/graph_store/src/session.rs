@@ -942,7 +942,8 @@ impl GraphSession {
         self.heads.get(branch).map(String::as_str)
     }
 
-    /// Asks after `branch`'s head while the returned watch is held.
+    /// Asks after `branch`'s head while the returned watch is held: a branch not watched yet
+    /// at once, alone; the others at the next poll.
     pub fn watch_head(&mut self, branch: &str, cx: &mut Context<Self>) -> HeadWatch {
         let alive = Rc::new(());
         let new = !self
@@ -951,8 +952,8 @@ impl GraphSession {
             .any(|watched| watched == branch);
         self.head_watches
             .push((branch.to_owned(), Rc::downgrade(&alive)));
-        if new {
-            self.check_heads(cx);
+        if new && self.unavailable.is_none() && !self.head_reads.contains_key(branch) {
+            self.read_head(branch.to_owned(), cx);
         }
         HeadWatch { _alive: alive }
     }
@@ -3423,11 +3424,17 @@ mod tests {
         assert_eq!(probes.lock().unwrap().len(), 2);
         assert_eq!(events.take(), vec![landed("main"), moved("main", "c2")]);
 
-        // A watched branch is asked after at once, then with the session's own at each poll. A
-        // branch made elsewhere appears at the poll.
+        // A watched branch is asked after at once, alone, then with the session's own at each
+        // poll. A branch made elsewhere appears at the poll.
+        probes.lock().unwrap().clear();
         let watch = session.update(cx, |session, cx| session.watch_head("feature", cx));
         cx.run_until_parked();
         assert_eq!(head_of(cx, "feature").as_deref(), Some("f1"));
+        assert_eq!(
+            *probes.lock().unwrap(),
+            vec!["feature"],
+            "only the new branch"
+        );
         cx.add_empty_window()
             .update(|window, _| window.activate_window());
         heads.lock().unwrap().insert("feature".into(), "f2".into());
