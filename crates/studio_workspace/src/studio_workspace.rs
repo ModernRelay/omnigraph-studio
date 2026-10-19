@@ -489,8 +489,7 @@ impl Workspace {
                 .flex_none()
                 .tooltip(Tooltip::text(tooltip))
                 .child(
-                    Label::new(parts.join(" · "))
-                        .size(LabelSize::XSmall)
+                    studio_ui::ds::text::meta(parts.join(" · "))
                         .color(if busy { Color::Warning } else { Color::Muted })
                         .single_line(),
                 ),
@@ -2461,8 +2460,7 @@ impl Workspace {
                             .items_center()
                             .children(item.tab_icon(cx).map(studio_ui::ds::icon::meta))
                             .child(
-                                Label::new(item.tab_title(cx))
-                                    .size(LabelSize::Small)
+                                studio_ui::ds::text::body(item.tab_title(cx))
                                     .color(if strong { Color::Default } else { Color::Muted })
                                     .when(preview, |label| label.italic())
                                     .single_line(),
@@ -3057,8 +3055,7 @@ impl Workspace {
                         })
                         .child(
                             // As a button's icon: 80 % of the label's ink.
-                            Icon::new(IconName::DatabaseZap)
-                                .size(IconSize::XSmall)
+                            studio_ui::ds::icon::meta(IconName::DatabaseZap)
                                 .color(studio_ui::ds::text::icon_ink(cx)),
                         )
                         .when(unavailable.is_some(), |button| {
@@ -3070,11 +3067,7 @@ impl Workspace {
                                 .dispatch_action(Box::new(studio_actions::workspace::OpenGraph), cx)
                         }),
                 )
-                .child(
-                    Label::new("/")
-                        .size(LabelSize::Small)
-                        .color(Color::Disabled),
-                )
+                .child(studio_ui::ds::text::body("/").color(Color::Disabled))
                 .child(
                     PopoverMenu::new("branch-menu")
                         .anchor(gpui::Anchor::BottomLeft)

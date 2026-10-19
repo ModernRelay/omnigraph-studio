@@ -25,13 +25,13 @@ use studio_actions::agent::{Allow, AllowAlways, ClearQueue, Reject, Restart, Sen
 use studio_actions::graph::ReviewBranch;
 use studio_settings::StudioSettings;
 use studio_ui::ds;
-use studio_ui::ds::{Dotted as _, IconButton};
+use studio_ui::ds::{Dotted as _, IconButton, Prose as _};
 use studio_ui::menu::ContextMenu;
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
 use ui::{
-    Callout, CircularProgress, CommonAnimationExt as _, Indicator, KeyBinding, PopoverMenu,
-    Severity, Tooltip,
+    CircularProgress, CommonAnimationExt as _, Indicator, KeyBinding, PopoverMenu, Severity,
+    Tooltip,
 };
 
 use crate::cli_home::{self, CliHome};
@@ -2462,7 +2462,7 @@ impl Render for AgentPanel {
             .children(self.render_queue(cx))
             .child(gutter_row(
                 Some(studio_ui::ds::icon::lead(IconName::Person)),
-                div().text_sm().child(self.composer.clone()),
+                div().prose().child(self.composer.clone()),
             ))
             .child(self.render_composer_controls(cx));
 
@@ -2845,10 +2845,7 @@ impl AgentPanel {
             }
             Block::Exited => match &self.state {
                 State::Exited { message, stderr } => {
-                    let mut callout = Callout::new()
-                        .severity(Severity::Error)
-                        .icon(IconName::XCircle)
-                        .title(message.clone());
+                    let mut callout = studio_ui::ds::callout(Severity::Error, message.clone());
                     if !stderr.is_empty() {
                         callout =
                             callout.description_slot(studio_ui::ds::code_block(stderr.clone(), cx));
@@ -2880,7 +2877,7 @@ impl AgentPanel {
         match entry {
             Entry::User(text) => gutter_row(
                 Some(studio_ui::ds::icon::lead(IconName::Person)),
-                div().text_sm().child(text.clone()),
+                div().prose().child(text.clone()),
             )
             .when(index > 0, |row| row.mt(px(ds::space::XL)))
             .into_any_element(),
@@ -2889,14 +2886,14 @@ impl AgentPanel {
                 match self.markdown.get(&index) {
                     // Zed's markdown, as Zed's agent panel renders a reply.
                     Some((markdown, _)) => div()
-                        .text_sm()
+                        .prose()
                         .child(MarkdownElement::new(
                             markdown.clone(),
                             MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
                         ))
                         .into_any_element(),
                     None => div()
-                        .text_sm()
+                        .prose()
                         .child(text.trim().to_owned())
                         .into_any_element(),
                 },
@@ -2928,17 +2925,18 @@ impl AgentPanel {
             .into_any_element(),
             Entry::Notice { text, error } => gutter_row(
                 Some(
-                    Icon::new(if *error {
+                    studio_ui::ds::icon::meta(if *error {
                         IconName::Warning
                     } else {
                         IconName::Info
                     })
-                    .size(IconSize::XSmall)
                     .color(if *error { Color::Error } else { Color::Muted }),
                 ),
-                Label::new(text.clone())
-                    .size(LabelSize::Small)
-                    .color(if *error { Color::Error } else { Color::Muted }),
+                studio_ui::ds::text::body(text.clone()).color(if *error {
+                    Color::Error
+                } else {
+                    Color::Muted
+                }),
             )
             .into_any_element(),
             Entry::Permission(card) => {
@@ -2989,8 +2987,7 @@ impl AgentPanel {
                     .unwrap_or_default()
             }))
             .children(name.map(|name| {
-                Label::new(name)
-                    .size(LabelSize::Small)
+                studio_ui::ds::text::body(name)
                     .color(Color::Default)
                     .buffer_font(cx)
             }))
@@ -3126,8 +3123,7 @@ impl AgentPanel {
         match entry {
             Entry::Thought(text) => div()
                 .id(("thought", index))
-                .text_xs()
-                .text_color(Color::Muted.color(cx))
+                .quiet_prose(cx)
                 .child(text.trim().to_owned())
                 .into_any_element(),
             Entry::Tool {
@@ -3144,12 +3140,11 @@ impl AgentPanel {
                     .gap(px(ds::space::XS))
                     .tooltip(Tooltip::text(title.clone()))
                     .child(
-                        Label::new(if failed {
+                        studio_ui::ds::text::body(if failed {
                             format!("{} failed", tool_verb(title, *studio))
                         } else {
                             tool_verb(title, *studio)
                         })
-                        .size(LabelSize::Small)
                         .color(if failed { Color::Error } else { Color::Muted })
                         .single_line()
                         .truncate(),
@@ -3173,11 +3168,7 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let header = studio_ui::ds::card_header(cx)
-            .child(
-                Icon::new(IconName::Warning)
-                    .size(IconSize::XSmall)
-                    .color(Color::Warning),
-            )
+            .child(studio_ui::ds::icon::meta(IconName::Warning).color(Color::Warning))
             // Whole, wrapped: the end of a long command is where a second one would hide.
             .child(
                 div()
@@ -3244,7 +3235,7 @@ impl AgentPanel {
                     )),
             )
             .when(proposal.creates_from.is_some(), |header| {
-                header.child(ui::Chip::new("new").label_size(LabelSize::XSmall))
+                header.child(studio_ui::ds::tag("new", cx))
             });
         let params = proposal.params.as_ref().map(|params| {
             ds::fields().children(params.iter().map(|(key, value)| {
@@ -3354,8 +3345,8 @@ impl AgentPanel {
                             .id(("outcome", index))
                             .gap(px(ds::space::XS))
                             .when_some(tooltip, |d, tooltip| d.tooltip(Tooltip::text(tooltip)))
-                            .child(Icon::new(icon).size(IconSize::XSmall).color(color))
-                            .child(Label::new(label).size(LabelSize::Small).color(color)),
+                            .child(studio_ui::ds::icon::meta(icon).color(color))
+                            .child(studio_ui::ds::text::body(label).color(color)),
                     )
                     .when_some(commit, |d, (commit, changed)| {
                         d.child(studio_ui::ds::meta_code(IconName::GitCommit, commit, cx))
@@ -3579,8 +3570,7 @@ impl AgentPanel {
                     .child(Indicator::dot().color(if next { Color::Accent } else { Color::Muted }))
                     .child(
                         div().flex_1().min_w_0().child(
-                            Label::new(line)
-                                .size(LabelSize::Small)
+                            studio_ui::ds::text::body(line)
                                 .color(if next { Color::Default } else { Color::Muted })
                                 .single_line()
                                 .truncate(),

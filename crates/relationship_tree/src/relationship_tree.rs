@@ -758,8 +758,7 @@ impl RelationshipTree {
                         .child(studio_ui::ds::text::muted(rows::node_text(state, node)).truncate()),
                 )
                 .child(
-                    Label::new("already above")
-                        .size(LabelSize::XSmall)
+                    studio_ui::ds::text::meta("already above")
                         .color(Color::Disabled)
                         .single_line(),
                 )
@@ -823,27 +822,24 @@ impl RelationshipTree {
                     .min_w_0()
                     .flex_1()
                     .gap(px(space::SM))
-                    .child(Label::new(arrow).size(LabelSize::Small).color(muted))
+                    .child(studio_ui::ds::text::body(arrow).color(muted))
                     .child(
                         div().min_w_0().flex_shrink(1.).child(
-                            Label::new(key.group.edge.clone())
-                                .size(LabelSize::Small)
+                            studio_ui::ds::text::body(key.group.edge.clone())
                                 .color(text_color)
                                 .truncate(),
                         ),
                     )
                     .child(
                         div().min_w_0().flex_shrink(1.).child(
-                            Label::new(key.group.other_type.clone())
-                                .size(LabelSize::XSmall)
+                            studio_ui::ds::text::meta(key.group.other_type.clone())
                                 .color(muted)
                                 .truncate(),
                         ),
                     )
                     .children(grouped_by.map(|property| {
                         div().min_w_0().flex_shrink(1.).child(
-                            Label::new(format!("by {property}"))
-                                .size(LabelSize::XSmall)
+                            studio_ui::ds::text::meta(format!("by {property}"))
                                 .color(Color::Accent)
                                 .truncate(),
                         )
@@ -851,8 +847,7 @@ impl RelationshipTree {
                     .child(div().flex_1())
                     .children(group_menu)
                     .child(
-                        Label::new(count_label)
-                            .size(LabelSize::XSmall)
+                        studio_ui::ds::text::meta(count_label)
                             .color(if matches!(count, Loadable::Failed(_)) {
                                 Color::Error
                             } else {
@@ -895,8 +890,7 @@ impl RelationshipTree {
                     .gap(px(space::SM))
                     .child(
                         div().min_w_0().flex_shrink(1.).child(
-                            Label::new(text)
-                                .size(LabelSize::Small)
+                            studio_ui::ds::text::body(text)
                                 .color(if missing {
                                     Color::Muted
                                 } else {
@@ -928,8 +922,7 @@ impl RelationshipTree {
                 } else {
                     rows::more_label(*shown, *total, exploration.read(cx).page_size(cx))
                 };
-                Label::new(text)
-                    .size(LabelSize::XSmall)
+                studio_ui::ds::text::meta(text)
                     .color(Color::Accent)
                     .single_line()
                     .into_any_element()
@@ -944,11 +937,7 @@ impl RelationshipTree {
                     .min_w_0()
                     .flex_1()
                     .gap(px(space::XS))
-                    .child(
-                        Icon::new(IconName::Warning)
-                            .size(IconSize::XSmall)
-                            .color(Color::Error),
-                    )
+                    .child(studio_ui::ds::icon::meta(IconName::Warning).color(Color::Error))
                     .child(
                         div()
                             .id(("error", row))
@@ -1233,8 +1222,7 @@ impl RelationshipTree {
                                     .child(studio_ui::ds::text::body(filter).truncate()),
                             )
                             .child(
-                                Label::new("esc")
-                                    .size(LabelSize::XSmall)
+                                studio_ui::ds::text::meta("esc")
                                     .color(Color::Disabled),
                             ),
                     )
@@ -1568,7 +1556,9 @@ impl HoverCard {
                                 )
                                 .child(
                                     div().min_w_0().flex_1().child(
-                                        Label::new(value).size(LabelSize::XSmall).truncate(),
+                                        studio_ui::ds::text::meta(value)
+                                            .color(Color::Default)
+                                            .truncate(),
                                     ),
                                 )
                         })),

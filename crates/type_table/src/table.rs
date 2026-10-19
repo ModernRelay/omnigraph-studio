@@ -1274,9 +1274,7 @@ impl TypeTable {
         }
         Some(
             bar.children(self.bulk.notice.clone().map(|notice| {
-                Label::new(notice.message)
-                    .size(LabelSize::Small)
-                    .color(notice.tone.color())
+                studio_ui::ds::text::body(notice.message).color(notice.tone.color())
             }))
             .child(div().flex_1())
             .child(
@@ -4076,8 +4074,7 @@ impl TypeTable {
             )
             .children(self.drafts.notice.clone().map(|notice| {
                 div().min_w_0().flex_shrink(1.).child(
-                    Label::new(notice.message)
-                        .size(LabelSize::Small)
+                    studio_ui::ds::text::body(notice.message)
                         .color(notice.tone.color())
                         .truncate(),
                 )
@@ -5336,8 +5333,7 @@ impl TypeTable {
                     .overflow_hidden()
                     .when(column.align_right, |d| d.justify_end())
                     .child(
-                        Label::new(column.title.clone())
-                            .size(LabelSize::Small)
+                        studio_ui::ds::text::body(column.title.clone())
                             .color(if sorted.is_some() {
                                 Color::Default
                             } else {
@@ -5346,22 +5342,20 @@ impl TypeTable {
                             .single_line(),
                     )
                     .child(
-                        Label::new(match self.absent.get(&column.key) {
+                        studio_ui::ds::text::meta(match self.absent.get(&column.key) {
                             Some(then) => crate::peek::absence_text(then, false),
                             None => column.detail.clone(),
                         })
-                        .size(LabelSize::XSmall)
                         .color(Color::Disabled)
                         .single_line()
                         .truncate(),
                     )
                     .children(sorted.map(|sort| {
-                        Icon::new(if sort.descending {
+                        studio_ui::ds::icon::meta(if sort.descending {
                             IconName::ArrowDown
                         } else {
                             IconName::ArrowUp
                         })
-                        .size(IconSize::XSmall)
                         .color(Color::Accent)
                     }));
                 // An unpinned header drags onto another to move its column there.
@@ -5640,11 +5634,7 @@ impl TypeTable {
         } else if let Some(error) = &section.error {
             h_flex()
                 .gap(px(space::XS))
-                .child(
-                    Icon::new(IconName::Warning)
-                        .size(IconSize::XSmall)
-                        .color(Color::Error),
-                )
+                .child(studio_ui::ds::icon::meta(IconName::Warning).color(Color::Error))
                 .child(
                     div()
                         .id(("section-error", index))
@@ -5883,7 +5873,7 @@ impl TypeTable {
                 return div()
                     .id(SharedString::from(format!("relation-{}-{key}", row.id)))
                     .tooltip(Tooltip::text(error.clone()))
-                    .child(Label::new("?").size(LabelSize::Small).color(Color::Warning))
+                    .child(studio_ui::ds::text::body("?").color(Color::Warning))
                     .into_any_element();
             }
         };
@@ -5980,16 +5970,14 @@ impl TypeTable {
                 cell.tooltip(Tooltip::text(tooltip))
             })
             .child(
-                Label::new(text)
-                    .size(LabelSize::Small)
+                studio_ui::ds::text::body(text)
                     .color(color)
                     .single_line()
                     .truncate(),
             )
             .when(preview, |cell| {
                 cell.child(
-                    Label::new("· Preview")
-                        .size(LabelSize::Small)
+                    studio_ui::ds::text::body("· Preview")
                         .color(Color::Accent)
                         .single_line(),
                 )
@@ -6172,8 +6160,7 @@ impl TypeTable {
             _ if draft.is_some() => {
                 let text = draft.unwrap_or_default();
                 let empty = text.trim().is_empty();
-                Label::new(if empty { "—".to_owned() } else { text })
-                    .size(LabelSize::Small)
+                studio_ui::ds::text::body(if empty { "—".to_owned() } else { text })
                     .color(if empty {
                         Color::Disabled
                     } else {
@@ -6187,7 +6174,7 @@ impl TypeTable {
                 self.render_blob_cell(row, property)
             }
             Some(property) if property.enum_values.is_some() && !value.is_null() => {
-                ui::Chip::new(shown).into_any_element()
+                studio_ui::ds::chip(shown, cx).into_any_element()
             }
             _ => {
                 // One line in the cell's room, never measured: most cells are this.
@@ -6288,8 +6275,7 @@ impl TypeTable {
                                         .gap(px(space::SM))
                                         .child(Indicator::dot().color(notice.tone.color()))
                                         .child(
-                                            Label::new(notice.message)
-                                                .size(LabelSize::Small)
+                                            studio_ui::ds::text::body(notice.message)
                                                 .color(notice.tone.color()),
                                         )
                                         // Whether the save landed is in the branch's history.

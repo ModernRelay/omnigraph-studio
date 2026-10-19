@@ -430,6 +430,13 @@ than styling one-off elements.
   itself are surface roles: the canvas's here-ring and its halo, a pointed chip's hairline,
   the dot grid, the marquee, a highlighted span of query text, rows picked beside the cursor's,
   a card's hairline (also its footer's rule).
+- **Notices, chips and checkboxes** (since 2026-10-19). Zed's `Banner`, `Callout`, `Chip`
+  and `Checkbox` draw their own corners (4 px, 4 px, 2 px), tones and spacing, which the
+  corner setting never reached. Views take `ds::banner(severity)` (a box of the scale's small
+  corner), `ds::callout(severity, title)` (a strip under a rule, its description scrolling
+  past 128 px), `ds::chip` (a code-like value: a `ds::tag` in the buffer font; a "new"
+  marker is a tag) and `ds::checkbox` (a box of the extra-small corner, ink and a check when
+  on); a notice's fill and hairline by severity are `surface::notice`.
 - **Floating bars and lists.** Everything floating over a document is a `ds::float_bar` (the
   canvas's controls, the table's drafts bar) with bar buttons; a list of rows in a form is a
   `ds::row_list` with its own fill and hairline, and one floating under a field a
@@ -519,10 +526,10 @@ than styling one-off elements.
   `ds::elevation`, and `ds::text::weight::{BODY, HEADING}`. Only `ds` reads the theme's
   palette. `script/check-design-tokens.py`, run in CI beside the layer check, refuses
   anything else outside the design system; an exception carries a `// ds-exempt: <reason>`.
-  It also refuses a text or icon role rebuilt by hand (a label given a size and a muted or
-  error colour, or a muted colour alone; a muted icon given a size), which views take from
-  `ds::text` and `ds::icon`, a button given a sized or tinted icon, and Zed's `Divider`
-  (`ds::rule_h`); the forked Zed menu keeps upstream's calls.
+  It also refuses any label or icon given a size (its builder chain is read whole), a label
+  given only the muted colour, a button given a sized or tinted icon, GPUI's text sizes, an
+  opacity written as a number, and Zed's `Divider`, `Banner`, `Callout`, `Chip` and
+  `Checkbox`; the forked Zed menu keeps upstream's calls.
   Data column widths and algorithm constants (zoom steps, layout forces, text-width
   estimates) are named once where they are used; the canvas's chip text is world geometry
   the zoom scales.
@@ -536,8 +543,12 @@ than styling one-off elements.
   `text-sm` and `text-xs`. Body text is `Small`; labels, counts and metadata `XSmall`; buttons
   `Default`. Views take text and quiet icons by role (`ds::text::body`, `muted`, `meta`,
   `state` for an empty or waiting state's line, `error`, `error_note`; `ds::icon::lead`,
-  `meta`) rather than setting a label's or an icon's size and colour themselves. A button
-  sizes and inks its own icons (above), so it is given a plain `Icon::new`. The interface font is Inter by default (Tower's face; Inter 4.1, OFL-1.1, the
+  `meta`; a page's one title is `text::page_title`) rather than setting a label's or an icon's
+  size and colour themselves: a view adds at most a semantic `ui` `Color`. Text a view does
+  not set itself (an agent's reply, the composer's editor) takes `ds::Prose` (`prose`,
+  `quiet_prose`), not GPUI's `text_sm()`. A button sizes and inks its own icons (above), so
+  it is given a plain `Icon::new`. The canvas's label fill and a far hub's dot are surface
+  roles too (`canvas_label`, `canvas_hub`). The interface font is Inter by default (Tower's face; Inter 4.1, OFL-1.1, the
   regular, italic, medium, semibold and bold static files in `assets/fonts/inter/`, loaded
   with Zed's fonts); IBM Plex Sans and every installed font stay selectable.
 - **Toolbars.** A document's toolbar and every header or notice strip (a table's, a query's,

@@ -1878,6 +1878,8 @@ impl GraphCanvas {
             here_halo: studio_ui::ds::surface::here_halo(cx),
             pointed: studio_ui::ds::surface::pointed_border(cx),
             grid_dot: studio_ui::ds::surface::grid_dot(cx),
+            label_fill: studio_ui::ds::surface::canvas_label(cx),
+            hub_dot: studio_ui::ds::surface::canvas_hub(cx),
             font: theme::theme_settings(cx).ui_font(cx).clone(),
         };
         let scene = self.scene.clone();
@@ -2195,8 +2197,7 @@ impl GraphCanvas {
                 h_flex().child(
                     panel("canvas-error")
                         .child(
-                            Icon::new(IconName::Warning)
-                                .size(IconSize::Small)
+                            studio_ui::ds::icon::lead(IconName::Warning)
                                 .color(Color::Error),
                         )
                         .child(
@@ -2216,8 +2217,7 @@ impl GraphCanvas {
                 h_flex().child(
                     panel("canvas-capped")
                         .child(
-                            Icon::new(IconName::Warning)
-                                .size(IconSize::Small)
+                            studio_ui::ds::icon::lead(IconName::Warning)
                                 .color(Color::Warning),
                         )
                         .child(

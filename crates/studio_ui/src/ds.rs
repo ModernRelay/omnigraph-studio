@@ -276,6 +276,10 @@ pub mod size {
     pub const SHORT_RULE: f32 = ROW_ICON;
     /// A label-and-value field's row in a property grid.
     pub const FIELD_ROW: f32 = GUTTER;
+    /// A checkbox's box.
+    pub const CHECK: f32 = GAUGE;
+    /// The tallest a callout's description grows before it scrolls.
+    pub const NOTICE_MAX_HEIGHT: f32 = 128.;
 }
 
 /// How far something recedes when it is present but not in play.
@@ -510,6 +514,24 @@ pub mod surface {
         cx.theme().colors().text_accent
     }
 
+    /// A notice's fill and hairline by severity (a banner, a callout): the theme's status
+    /// colours, faint, as Zed's banner draws them.
+    pub fn notice(severity: ui::Severity, cx: &App) -> (Hsla, Hsla) {
+        let status = cx.theme().status();
+        match severity {
+            ui::Severity::Info => (
+                status.info_background.opacity(0.5),
+                cx.theme().colors().border.opacity(0.5),
+            ),
+            ui::Severity::Success => (status.success.opacity(0.1), status.success.opacity(0.2)),
+            ui::Severity::Warning => (
+                status.warning_background.opacity(0.5),
+                status.warning_border.opacity(0.4),
+            ),
+            ui::Severity::Error => (status.error.opacity(0.1), status.error.opacity(0.2)),
+        }
+    }
+
     /// The canvas's marquee while it is dragged: the accent, faint inside, firmer at its edge.
     pub fn marquee(cx: &App) -> Hsla {
         accent(cx).opacity(0.08)
@@ -545,6 +567,17 @@ pub mod surface {
     /// A pointed item's hairline on the canvas: the ink at 20 %, twice a control's.
     pub fn pointed_border(cx: &App) -> Hsla {
         cx.theme().colors().text.opacity(0.2)
+    }
+
+    /// A relationship's label on the canvas: a chip's fill, a little clear so the line under it
+    /// still reads.
+    pub fn canvas_label(cx: &App) -> Hsla {
+        solid(cx).opacity(0.95)
+    }
+
+    /// A closed hub drawn from afar as a dot on its line: the ink at a quarter.
+    pub fn canvas_hub(cx: &App) -> Hsla {
+        cx.theme().colors().text.opacity(0.25)
     }
 
     /// The canvas's dot grid: the ink, barely there.
@@ -809,6 +842,11 @@ pub mod text {
             .color(Color::Muted)
     }
 
+    /// Text at the default size in ink: a menu row's label, a view's summary sentence.
+    pub fn plain(text: impl Into<SharedString>) -> Label {
+        Label::new(text.into())
+    }
+
     /// The one line of an empty or waiting state ("No tab open", "Reading…", "Choose an
     /// agent"): the default size, muted.
     pub fn state(text: impl Into<SharedString>) -> Label {
@@ -837,6 +875,13 @@ pub mod text {
     /// A page's title size.
     pub fn page_title_size() -> LabelSize {
         LabelSize::Custom(rems_from_px(PAGE_TITLE))
+    }
+
+    /// The one large title a node's page carries.
+    pub fn page_title(text: impl Into<SharedString>) -> Label {
+        Label::new(text.into())
+            .size(page_title_size())
+            .weight(weight::HEADING)
     }
 
     /// A labelled control's icon beside its label: 80 % of the label's ink, as a button's.
@@ -1529,6 +1574,240 @@ pub fn tag(label: impl Into<SharedString>, cx: &App) -> Div {
         )
 }
 
+/// A code-like value in a quiet box, as a table shows an enum member: [`tag`] with the value
+/// in the buffer font. Zed's `Chip` keeps its own corner and hairline.
+pub fn chip(label: impl Into<SharedString>, cx: &App) -> Div {
+    div()
+        .flex_none()
+        .max_w(px(TAG_MAX_WIDTH))
+        .h(px(size::TAG))
+        .px(px(space::SM))
+        .flex()
+        .items_center()
+        .rounded(px(radii(cx).xs))
+        .bg(surface::tag(cx))
+        .child(
+            Label::new(label.into())
+                .size(LabelSize::XSmall)
+                .buffer_font(cx)
+                .single_line()
+                .truncate(),
+        )
+}
+
+/// A checkbox and its label: a box of the scale's extra-small corner, filled with the ink
+/// and a check when on. Zed's `Checkbox` keeps a 2 px corner of its own. The caller handles
+/// the click and keeps the state; a disabled one recedes and takes no pointer.
+pub fn checkbox(
+    id: impl Into<ElementId>,
+    checked: bool,
+    label: impl Into<SharedString>,
+    disabled: bool,
+    cx: &App,
+) -> Stateful<Div> {
+    let ink = cx.theme().colors().text;
+    let mark = div()
+        .size(px(size::CHECK))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(radii(cx).xs))
+        .border_1();
+    let mark = if checked {
+        mark.bg(ink).border_color(ink).child(
+            Icon::new(IconName::Check)
+                .size(IconSize::XSmall)
+                .color(Color::Custom(surface::document(cx))),
+        )
+    } else {
+        mark.bg(surface::document(cx))
+            .border_color(surface::control_border(cx))
+    };
+    h_flex()
+        .id(id.into())
+        .gap(px(space::SM))
+        .items_center()
+        .when(disabled, |row| row.opacity(opacity::DIMMED))
+        .when(!disabled, |row| row.cursor_pointer())
+        .child(mark)
+        .child(text::body(label))
+}
+
+/// A severity's icon and its colour, shared by [`Banner`] and [`Callout`].
+fn notice_icon(severity: ui::Severity) -> (IconName, Color) {
+    match severity {
+        ui::Severity::Info => (IconName::Info, Color::Muted),
+        ui::Severity::Success => (IconName::Check, Color::Success),
+        ui::Severity::Warning => (IconName::Warning, Color::Warning),
+        ui::Severity::Error => (IconName::XCircle, Color::Error),
+    }
+}
+
+/// A notice inside a document: its severity's icon, then what it says, and an action at its
+/// end, in a box of the scale's small corner (Zed's `Banner`, on the design system's corners,
+/// tones and spacing). Made by [`banner`].
+#[derive(IntoElement)]
+pub struct Banner {
+    severity: ui::Severity,
+    children: Vec<AnyElement>,
+    action_slot: Option<AnyElement>,
+    wrap_content: bool,
+}
+
+/// A [`Banner`] of `severity`.
+pub fn banner(severity: ui::Severity) -> Banner {
+    Banner {
+        severity,
+        children: Vec::new(),
+        action_slot: None,
+        wrap_content: false,
+    }
+}
+
+impl Banner {
+    pub fn action_slot(mut self, element: impl IntoElement) -> Self {
+        self.action_slot = Some(element.into_any_element());
+        self
+    }
+
+    /// Let the content and the action wrap onto lines of their own when narrow.
+    pub fn wrap_content(mut self, wrap: bool) -> Self {
+        self.wrap_content = wrap;
+        self
+    }
+}
+
+impl ParentElement for Banner {
+    fn extend(&mut self, elements: impl IntoIterator<Item = AnyElement>) {
+        self.children.extend(elements)
+    }
+}
+
+impl RenderOnce for Banner {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let (icon_name, color) = notice_icon(self.severity);
+        let (fill, border) = surface::notice(self.severity, cx);
+        let action = self.action_slot.is_some();
+        h_flex()
+            .min_w_0()
+            .py(px(space::XXS))
+            .pl(px(space::MD))
+            .pr(px(if action { space::XS } else { space::MD }))
+            .gap(px(space::SM))
+            .when(self.wrap_content, |banner| banner.flex_wrap())
+            .justify_between()
+            .rounded(px(radii(cx).sm))
+            .border_1()
+            .border_color(border)
+            .bg(fill)
+            .child(
+                h_flex()
+                    .items_start()
+                    .min_w_0()
+                    .flex_1()
+                    .gap(px(space::SM))
+                    .child(
+                        h_flex()
+                            .h(window.line_height())
+                            .flex_none()
+                            .child(icon::meta(icon_name).color(color)),
+                    )
+                    .child(div().min_w_0().flex_1().children(self.children)),
+            )
+            .children(self.action_slot)
+    }
+}
+
+/// A notice across a panel or a thread, flush with its edges under a rule: its severity's
+/// icon, a title with actions at its end, and a description that scrolls past
+/// `size::NOTICE_MAX_HEIGHT` (Zed's `Callout`, on the design system's tones and spacing).
+/// Made by [`callout`].
+#[derive(IntoElement)]
+pub struct Callout {
+    severity: ui::Severity,
+    title: SharedString,
+    description: Option<AnyElement>,
+    actions_slot: Option<AnyElement>,
+}
+
+/// A [`Callout`] of `severity` titled `title`.
+pub fn callout(severity: ui::Severity, title: impl Into<SharedString>) -> Callout {
+    Callout {
+        severity,
+        title: title.into(),
+        description: None,
+        actions_slot: None,
+    }
+}
+
+impl Callout {
+    /// A sentence under the title, muted.
+    pub fn description(mut self, description: impl Into<SharedString>) -> Self {
+        self.description = Some(text::muted(description).into_any_element());
+        self
+    }
+
+    /// Any content under the title (a code block, a list of problems).
+    pub fn description_slot(mut self, description: impl IntoElement) -> Self {
+        self.description = Some(description.into_any_element());
+        self
+    }
+
+    pub fn actions_slot(mut self, actions: impl IntoElement) -> Self {
+        self.actions_slot = Some(actions.into_any_element());
+        self
+    }
+}
+
+impl RenderOnce for Callout {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let (icon_name, color) = notice_icon(self.severity);
+        let (fill, _) = surface::notice(self.severity, cx);
+        let line = window.line_height();
+        h_flex()
+            .min_w_0()
+            .w_full()
+            .p(px(space::MD))
+            .gap(px(space::MD))
+            .items_start()
+            .border_t_1()
+            .border_color(surface::rule(cx))
+            .bg(fill)
+            .overflow_x_hidden()
+            .child(
+                h_flex()
+                    .h(line)
+                    .flex_none()
+                    .child(icon::lead(icon_name).color(color)),
+            )
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .w_full()
+                    .gap(px(space::XS))
+                    .child(
+                        h_flex()
+                            .min_h(line)
+                            .w_full()
+                            .gap(px(space::XS))
+                            .justify_between()
+                            .flex_wrap()
+                            .child(div().min_w_0().flex_1().child(text::body(self.title)))
+                            .children(self.actions_slot),
+                    )
+                    .children(self.description.map(|description| {
+                        div()
+                            .id("callout-description")
+                            .w_full()
+                            .max_h(px(size::NOTICE_MAX_HEIGHT))
+                            .overflow_y_scroll()
+                            .child(description)
+                    })),
+            )
+    }
+}
+
 /// A choice of two to four, as Tower's tabs: no track, quiet labels, the selected one on the
 /// pressed pill. Over content, put it in a [`float_bar`].
 pub fn segmented(_cx: &App) -> Div {
@@ -1825,6 +2104,22 @@ pub fn dotted<E: Styled>(element: E, cx: &App) -> E {
         element
     }
 }
+
+/// Text sizes for a container whose text a view does not set itself (a markdown reply, an
+/// editor, a run of text children), as [`text`] sets a label's.
+pub trait Prose: Styled + Sized {
+    /// Reading text: an agent's message, the composer: the default size, Tower's `text-sm`.
+    fn prose(self) -> Self {
+        self.text_sm()
+    }
+
+    /// Quiet reading text (an agent's thoughts): the small size, muted.
+    fn quiet_prose(self, cx: &App) -> Self {
+        self.text_xs().text_color(Color::Muted.color(cx))
+    }
+}
+
+impl<E: Styled> Prose for E {}
 
 /// [`dotted`] as a method, for a chain: `.border_b_1().dotted(cx)`.
 pub trait Dotted: Styled + Sized {

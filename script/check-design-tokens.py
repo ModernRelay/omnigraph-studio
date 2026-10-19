@@ -15,12 +15,18 @@ every surface and nothing drifts. This refuses, outside the design system and te
   (`cx.theme().colors()`, `cx.theme().status()`): views name a `ds::surface` role or a `ui`
   `Color`;
 - a font weight named directly (`FontWeight::MEDIUM`): views take `ds::text::weight`;
-- a `ui` component the design system wraps (`Switch::new`, `Headline::new`, `Divider`): views
-  take `ds::switch`, `ds::text::title` and `ds::text::heading`, and `ds::rule_h`;
-- a text or icon role built by hand (`Label::new(..).size(LabelSize::Small).color(Color::Muted)`,
-  `Label::new(..).color(Color::Muted)`, `Icon::new(..).size(IconSize::XSmall).color(Color::Muted)`):
-  views take `ds::text::body`, `muted`, `meta`, `state`, `error`, `error_note` and
-  `ds::icon::lead`, `meta`;
+- a `ui` component the design system wraps (`Switch`, `Headline`, `Divider`, `Banner`,
+  `Callout`, `Chip`, `Checkbox`, which draw their own corners, tones and spacing): views take
+  `ds::switch`, `ds::text::title` and `ds::text::heading`, `ds::rule_h`, `ds::banner`,
+  `ds::callout`, `ds::chip` or `ds::tag`, and `ds::checkbox`;
+- GPUI's text sizes (`.text_sm()`) and an opacity written as a number (`.opacity(0.6)`): views
+  take `ds::Prose` and `ds::opacity` or a `ds::surface` role;
+- a label made outside `ds::text` (`Label::new`): every view's text takes a role (`plain`,
+  `body`, `muted`, `meta`, `state`, `title`, `heading`, `page_title`, `error`, `error_note`);
+- a label or an icon given a size (`Label::new(..).size(LabelSize::Small)`,
+  `Icon::new(..).size(IconSize::XSmall)`), or a label given only the muted colour: views take
+  sizes from `ds::text::body`, `muted`, `meta`, `state`, `title`, `heading`, `error`,
+  `error_note` and `ds::icon::lead`, `meta`, and add only a semantic `ui` `Color`;
 - a sized or tinted icon given to a button (`.start_icon(Icon::new(..).size(..))`,
   `.start_icon(ds::icon::lead(..))`): a button sizes and inks its own icons, so it takes a
   plain `Icon::new(..)`.
@@ -66,7 +72,10 @@ RULES = [
     ("theme palette", re.compile(r"\.theme\(\)\s*\.\s*(colors|status)\(\)")),
     ("font weight", re.compile(r"\bFontWeight::[A-Z_]+")),
     ("component outside the design system",
-     re.compile(r"\b(Switch|Headline)::new\(|\bDivider::(horizontal|vertical)")),
+     re.compile(r"\b(Switch|Headline|Banner|Callout|Chip|Checkbox)::new\(|\bDivider::(horizontal|vertical)")),
+    ("GPUI text size", re.compile(r"\.text_(xs|sm|base|lg|xl|2xl|3xl)\(\)")),
+    ("label outside ds::text", re.compile(r"\bLabel::new\(")),
+    ("opacity as a number", re.compile(r"\.opacity\(\s*0?\.\d")),
 ]
 EXEMPT = re.compile(r"//\s*ds-exempt:\s*\S")
 # Builder chains that rebuild a role, whichever order the two calls come in.
@@ -80,6 +89,46 @@ ROLE_CHAINS = re.compile(
     rf"|Icon::new\((?:[^()]|\([^()]*\))*\)\s*(?:{ICON_SIZE}\s*\.color\(Color::Muted\)"
     rf"|\.color\(Color::Muted\)\s*{ICON_SIZE}))"
 )
+def chain_end(text, open_at):
+    """The index after the parenthesis closing the one at `open_at`, or -1."""
+    depth, j, quoted = 0, open_at, False
+    while j < len(text):
+        ch = text[j]
+        if quoted:
+            if ch == "\\":
+                j += 2
+                continue
+            if ch == '"':
+                quoted = False
+        elif ch == '"':
+            quoted = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return -1
+
+
+CALL = re.compile(r"\s*\.(\w+)\(")
+
+
+def sized_builders(text):
+    """Each `Label::new(..)` or `Icon::new(..)` whose builder chain sets a size."""
+    for match in re.finditer(r"\b(Label|Icon)::new\(", text):
+        end = chain_end(text, match.end() - 1)
+        while end > 0:
+            call = CALL.match(text, end)
+            if not call:
+                break
+            if call.group(1) == "size":
+                yield match.start()
+                break
+            end = chain_end(text, call.end() - 1)
+
+
 # A button's icon with a size or a colour of its own, or an icon role, which the button
 # overrides with its own size and ink.
 BUTTON_ICONS = re.compile(
@@ -108,6 +157,9 @@ def main() -> int:
             for match in ROLE_CHAINS.finditer(body):
                 line = body.count("\n", 0, match.start()) + 1
                 errors.append(f"{rel}:{line}: role built by hand: {match.group(0).split(chr(10))[0].strip()}")
+            for start in sized_builders(body):
+                line = body.count("\n", 0, start) + 1
+                errors.append(f"{rel}:{line}: size set by hand: {body[start:].split(chr(10))[0].strip()}")
             for match in BUTTON_ICONS.finditer(body):
                 line = body.count("\n", 0, match.start()) + 1
                 errors.append(f"{rel}:{line}: a button's icon sized or tinted: {match.group(0).strip()}")

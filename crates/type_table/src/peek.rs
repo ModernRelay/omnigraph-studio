@@ -2225,9 +2225,7 @@ impl NodePeek {
                 .child(Indicator::dot().color(Color::Accent))
                 .child(studio_ui::ds::text::body(label))
                 .children(self.drafts_notice.as_ref().map(|notice| {
-                    Label::new(notice.message.clone())
-                        .size(LabelSize::XSmall)
-                        .color(notice.tone.color())
+                    studio_ui::ds::text::meta(notice.message.clone()).color(notice.tone.color())
                 }))
                 .child(div().flex_1())
                 .child(
@@ -2493,8 +2491,7 @@ impl NodePeek {
                             })
                             .when(copied, |d| {
                                 d.child(
-                                    Label::new("Copied")
-                                        .size(LabelSize::XSmall)
+                                    studio_ui::ds::text::meta("Copied")
                                         .color(Color::Success),
                                 )
                             })
@@ -2519,8 +2516,7 @@ impl NodePeek {
                 .text_size(ui::TextSize::Small.rems(cx))
                 .child(MarkdownElement::new(view.clone(), value_style(window, cx)))
                 .into_any_element(),
-            None => Label::new(display_value(property, value))
-                .size(LabelSize::Small)
+            None => studio_ui::ds::text::body(display_value(property, value))
                 .color(if value.is_null() {
                     Color::Disabled
                 } else {
@@ -2722,11 +2718,7 @@ impl NodePeek {
                 h_flex()
                     .gap(px(space::SM))
                     .child(Indicator::dot().color(notice.tone.color()))
-                    .child(
-                        Label::new(notice.message)
-                            .size(LabelSize::XSmall)
-                            .color(notice.tone.color()),
-                    )
+                    .child(studio_ui::ds::text::meta(notice.message).color(notice.tone.color()))
                     // Whether the save landed is in the branch's history.
                     .when(unknown, |row| {
                         row.child(
@@ -2864,11 +2856,7 @@ impl NodePeek {
                 .pl(px(CHILD_INDENT))
                 .gap(px(space::SM))
                 .child(Indicator::dot().color(notice.tone.color()))
-                .child(
-                    Label::new(notice.message.clone())
-                        .size(LabelSize::XSmall)
-                        .color(notice.tone.color()),
-                )
+                .child(studio_ui::ds::text::meta(notice.message.clone()).color(notice.tone.color()))
         });
         let body = group
             .expanded
@@ -3484,15 +3472,14 @@ impl NodePeek {
                         )
                     }),
             )
-            .child(
-                Label::new(label.unwrap_or_else(|| id.clone()))
-                    .size(if page {
-                        studio_ui::ds::text::page_title_size()
-                    } else {
-                        LabelSize::Large
-                    })
-                    .weight(studio_ui::ds::text::weight::HEADING),
-            )
+            .child({
+                let title = label.unwrap_or_else(|| id.clone());
+                if page {
+                    studio_ui::ds::text::page_title(title)
+                } else {
+                    studio_ui::ds::text::heading(title)
+                }
+            })
             .child(
                 h_flex()
                     .flex_wrap()

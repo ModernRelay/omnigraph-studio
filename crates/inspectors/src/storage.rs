@@ -418,11 +418,7 @@ fn graph_row(ix: usize, graph: &GraphInfo, current: bool) -> AnyElement {
                     Some(graph.graph_id.clone()),
                 ))
                 .when(current, |d| {
-                    d.child(
-                        Label::new("open")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Accent),
-                    )
+                    d.child(studio_ui::ds::text::meta("open").color(Color::Accent))
                 }),
         )
         .child(

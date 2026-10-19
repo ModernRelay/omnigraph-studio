@@ -403,11 +403,8 @@ impl TextEditor {
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let branch = self.branch.clone();
         // Unsaved text read on a branch the window has left still saves there.
-        let elsewhere = (self.session.read(cx).branch != branch).then(|| {
-            Label::new(format!("Saves to {branch}"))
-                .size(LabelSize::Small)
-                .color(Color::Warning)
-        });
+        let elsewhere = (self.session.read(cx).branch != branch)
+            .then(|| studio_ui::ds::text::body(format!("Saves to {branch}")).color(Color::Warning));
         let dirty = self.is_dirty(cx);
         let mode = self.mode;
         let segment = |id: &'static str, label: &'static str, to: Mode, cx: &mut Context<Self>| {
@@ -423,8 +420,7 @@ impl TextEditor {
                     .gap(px(studio_ui::ds::space::SM))
                     .child(Indicator::dot().color(Color::Warning))
                     .child(
-                        Label::new("Changed elsewhere while you edited")
-                            .size(LabelSize::Small)
+                        studio_ui::ds::text::body("Changed elsewhere while you edited")
                             .color(Color::Warning),
                     )
                     .child(

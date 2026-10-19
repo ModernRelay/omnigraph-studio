@@ -19,7 +19,7 @@ use studio_ui::menu::ContextMenu;
 use studio_ui::{change_counts, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
-use ui::{Banner, Severity, Tooltip, right_click_menu};
+use ui::{Severity, Tooltip, right_click_menu};
 
 use crate::commit_view::{CommitCounts, CommitView};
 use crate::lanes::{Graph, GraphCommit, assign_lanes};
@@ -903,8 +903,7 @@ impl Render for HistoryView {
             );
         let warning = (count > LONG_HISTORY).then(|| {
             div().px(px(studio_ui::ds::space::XL)).py(px(studio_ui::ds::space::XS)).child(
-                Banner::new()
-                    .severity(Severity::Warning)
+                studio_ui::ds::banner(Severity::Warning)
                     .child(
                         studio_ui::ds::text::body(format!(
                             "{count} commits. The list loads in full until the server pages history (E10)."

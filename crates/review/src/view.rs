@@ -30,7 +30,7 @@ use studio_ui::menu::ContextMenu;
 use studio_ui::{ChangeCard, change_counts, group_digits, short_commit_id, type_swatch};
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace, workspace_for};
 use ui::prelude::*;
-use ui::{Banner, Checkbox, KeyBinding, PopoverMenu, Severity, ToggleState, Tooltip};
+use ui::{KeyBinding, PopoverMenu, Severity, Tooltip};
 
 use crate::conflicts::{conflict_wording, resolution_hint};
 
@@ -1364,8 +1364,7 @@ impl ReviewView {
                 group_digits(REVIEW_CHANGE_CAP)
             );
             banners.push(
-                Banner::new()
-                    .severity(Severity::Warning)
+                studio_ui::ds::banner(Severity::Warning)
                     .child(studio_ui::ds::text::body(text))
                     .into_any_element(),
             );
@@ -1376,8 +1375,7 @@ impl ReviewView {
             .filter(|head| Some(*head) != self.reviewed_head().as_ref());
         if let (Some(head), false) = (own_head, self.newer) {
             banners.push(
-                Banner::new()
-                    .severity(Severity::Info)
+                studio_ui::ds::banner(Severity::Info)
                     .child(
                         studio_ui::ds::text::body(format!(
                             "Your fixes moved {} to {}. Cards show the review as read; merging uses the new head.",
@@ -1394,8 +1392,7 @@ impl ReviewView {
         }
         if self.newer && !matches!(self.merge, MergeState::Moved { .. }) {
             banners.push(
-                Banner::new()
-                    .severity(Severity::Info)
+                studio_ui::ds::banner(Severity::Info)
                     .child(studio_ui::ds::text::body(format!(
                         "Newer data: {} changed after this review was read.",
                         self.branch
@@ -1492,24 +1489,25 @@ impl ReviewView {
                     .child(refresh)
                     .when(self.branch != "main", |row| {
                         row.child(
-                            Checkbox::new(
+                            studio_ui::ds::checkbox(
                                 "delete-after-merge",
-                                ToggleState::from(self.delete_branch),
+                                self.delete_branch,
+                                format!("Delete {}", self.branch),
+                                !mergeable,
+                                cx,
                             )
-                            .label(format!("Delete {}", self.branch))
-                            .disabled(!mergeable)
-                            .on_click(cx.listener(
-                                |this, state: &ToggleState, _, cx| {
-                                    this.delete_branch = state.selected();
+                            .when(mergeable, |checkbox| {
+                                checkbox.on_click(cx.listener(|this, _, _, cx| {
+                                    this.delete_branch = !this.delete_branch;
                                     cx.notify();
-                                },
-                            )),
+                                }))
+                            }),
                         )
                     })
                     .child(merge_button),
             )
             .child(h_flex().gap(px(space::MD)).child(scope_menu).child(search))
-            .child(Label::new(sentence))
+            .child(studio_ui::ds::text::plain(sentence))
             .when(!detail.is_empty(), |d| {
                 d.child(studio_ui::ds::text::muted(detail))
             })
@@ -1692,8 +1690,7 @@ impl ReviewView {
                 None,
             ),
         };
-        let mut banner = Banner::new()
-            .severity(severity)
+        let mut banner = studio_ui::ds::banner(severity)
             .wrap_content(true)
             .child(studio_ui::ds::text::body(text));
         if let Some(action) = action {
@@ -1750,7 +1747,7 @@ impl ReviewView {
                         v_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(Label::new(words).color(Color::Conflict))
+                            .child(studio_ui::ds::text::plain(words).color(Color::Conflict))
                             .child(
                                 h_flex()
                                     .gap(px(space::MD))
@@ -1762,11 +1759,7 @@ impl ReviewView {
                     )
                     .when(reviewable, |d| {
                         d.cursor_pointer()
-                            .child(
-                                Label::new("Show change")
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Accent),
-                            )
+                            .child(studio_ui::ds::text::meta("Show change").color(Color::Accent))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.open_conflict(&conflict_for_click, cx)
                             }))

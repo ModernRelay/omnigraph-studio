@@ -238,7 +238,7 @@ fn pieces_row(pieces: Vec<Piece>) -> Div {
                 PieceKind::Removed => (Color::Deleted, true),
                 PieceKind::Added => (Color::Created, false),
             };
-            let label = Label::new(piece.text).size(LabelSize::Small).color(color);
+            let label = crate::ds::text::body(piece.text).color(color);
             // Its own space, so a struck removal does not strike it.
             let space = piece.spaced.then(|| crate::ds::text::body(" "));
             space
@@ -477,8 +477,7 @@ fn value_label(value: &Option<Value>, color: Color, strike: bool) -> Label {
         Some(value) => format_value(value),
         None => "—".into(),
     };
-    let mut label = Label::new(text)
-        .size(LabelSize::Small)
+    let mut label = crate::ds::text::body(text)
         .color(color)
         .single_line()
         .truncate();
@@ -502,11 +501,7 @@ impl RenderOnce for ChangeCard {
             .gap(px(space::INLINE))
             .min_w_0()
             .tooltip(ui::Tooltip::text(kind.label()))
-            .child(
-                Label::new(kind.symbol())
-                    .size(LabelSize::Small)
-                    .color(kind.color()),
-            )
+            .child(crate::ds::text::body(kind.symbol()).color(kind.color()))
             .map(|header| match &self.endpoints {
                 Some((from, to)) => header.child(
                     crate::ds::text::body(format!("{from} → {to}"))
@@ -535,7 +530,7 @@ impl RenderOnce for ChangeCard {
             .children(
                 self.status
                     .clone()
-                    .map(|(text, color)| Label::new(text).size(LabelSize::XSmall).color(color)),
+                    .map(|(text, color)| crate::ds::text::meta(text).color(color)),
             )
             .children(self.actions);
         let rows = self.rows.iter().map(|row| property_row(row, kind));
@@ -701,9 +696,7 @@ impl RenderOnce for RelationshipLine {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let mirror = self.kind.is_none();
         let symbol = match self.kind {
-            Some(kind) => Label::new(kind.symbol())
-                .size(LabelSize::Small)
-                .color(kind.color()),
+            Some(kind) => crate::ds::text::body(kind.symbol()).color(kind.color()),
             None => crate::ds::text::muted("·"),
         };
         let tooltip = match self.kind {
@@ -738,8 +731,7 @@ impl RenderOnce for RelationshipLine {
                     .min_w_0()
                     .gap(px(space::INLINE))
                     .child(
-                        Label::new(self.other)
-                            .size(LabelSize::Small)
+                        crate::ds::text::body(self.other)
                             .color(if mirror { Color::Muted } else { Color::Default })
                             .single_line()
                             .truncate(),
@@ -752,7 +744,7 @@ impl RenderOnce for RelationshipLine {
             .children(self.note.map(crate::ds::text::meta))
             .children(
                 self.status
-                    .map(|(text, color)| Label::new(text).size(LabelSize::XSmall).color(color)),
+                    .map(|(text, color)| crate::ds::text::meta(text).color(color)),
             )
             .children(self.actions);
         let kind = self.kind.unwrap_or(ChangeKind::Unchanged);
@@ -792,8 +784,7 @@ impl RenderOnce for RelationshipLine {
 pub fn change_counts(added: usize, changed: usize, removed: usize) -> Div {
     let part = |count: usize, kind: ChangeKind| {
         (count > 0).then(|| {
-            Label::new(format!("{}{}", kind.symbol(), crate::group_digits(count)))
-                .size(LabelSize::Small)
+            crate::ds::text::body(format!("{}{}", kind.symbol(), crate::group_digits(count)))
                 .color(kind.color())
         })
     };

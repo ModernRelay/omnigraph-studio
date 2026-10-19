@@ -32,6 +32,9 @@ pub(crate) struct Palette {
     pub pointed: Hsla,
     /// The dot grid's dots.
     pub grid_dot: Hsla,
+    /// A relationship label's fill, and a closed hub's dot from afar.
+    pub label_fill: Hsla,
+    pub hub_dot: Hsla,
     pub font: Font,
 }
 
@@ -53,6 +56,8 @@ const PILL_MARK: f32 = studio_ui::ds::size::ROW_ICON;
 /// Below this text size a node is drawn as its mark alone, unless it is selected or pointed at.
 const MARK_ONLY_BELOW: f32 = 8.5;
 const TYPE_MARK_ONLY_BELOW: f32 = 6.;
+/// A closed hub's dot from afar: its radius, in screen pixels.
+const HUB_DOT: f32 = 4.;
 /// The dot grid's spacing, in screen pixels.
 const DOT_STEP: f32 = 22.;
 /// Up to this many relationships, the schema labels every line.
@@ -456,7 +461,7 @@ pub(crate) fn paint(
                 None,
                 LABEL_TEXT * scale.max(0.8),
                 PillStyle {
-                    fill: palette.card.opacity(0.95 * alpha),
+                    fill: palette.label_fill.opacity(alpha),
                     border: palette.border.opacity(alpha),
                     shadow: !label_all,
                     ring: None,
@@ -499,7 +504,7 @@ pub(crate) fn paint(
         if text_size < mark_only_below && !focus && !pointed && !root {
             rects[index] = match node.kind {
                 SceneKind::Hub { .. } | SceneKind::More { .. } => {
-                    paint_dot(p, 4., palette.text.opacity(0.25 * alpha), window)
+                    paint_dot(p, HUB_DOT, palette.hub_dot.opacity(alpha), window)
                 }
                 _ => {
                     let first = initial_char(&node.label, &node.color_key);

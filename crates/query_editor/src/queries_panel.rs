@@ -416,22 +416,16 @@ fn unserved_row(index: usize, alias: &CliAlias) -> AnyElement {
             "This graph serves no stored query named {}",
             alias.query
         )))
+        .child(studio_ui::ds::icon::meta(IconName::Link).color(Color::Disabled))
         .child(
-            Icon::new(IconName::Link)
-                .size(IconSize::XSmall)
-                .color(Color::Disabled),
-        )
-        .child(
-            Label::new(alias.name.clone())
-                .size(LabelSize::Small)
+            studio_ui::ds::text::body(alias.name.clone())
                 .color(Color::Disabled)
                 .single_line()
                 .truncate(),
         )
         .child(div().flex_1())
         .child(
-            Label::new(alias.query.clone())
-                .size(LabelSize::XSmall)
+            studio_ui::ds::text::meta(alias.query.clone())
                 .color(Color::Disabled)
                 .single_line()
                 .truncate(),

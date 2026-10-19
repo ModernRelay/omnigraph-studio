@@ -435,9 +435,7 @@ impl CommitView {
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(full_id.clone()))
                     })
                     .child(
-                        Label::new(short_commit_id(&self.commit_id))
-                            .size(LabelSize::Large)
-                            .weight(studio_ui::ds::text::weight::HEADING)
+                        studio_ui::ds::text::heading(short_commit_id(&self.commit_id))
                             .buffer_font(cx),
                     ),
             )

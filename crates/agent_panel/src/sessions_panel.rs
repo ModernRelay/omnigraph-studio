@@ -21,7 +21,7 @@ use gpui::{
 use studio_actions::agent::{NewConversation, OpenConversation};
 use studio_settings::StudioSettings;
 use studio_ui::ds;
-use studio_ui::ds::IconButton;
+use studio_ui::ds::{IconButton, Prose as _};
 use studio_ui::menu::ContextMenu;
 use studio_workspace::{ToastKind, Workspace};
 use ui::prelude::*;
@@ -327,7 +327,7 @@ impl SessionsPanel {
                 .key_context("ConversationTitle")
                 .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.commit_rename(cx)))
                 .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| this.cancel_rename(cx)))
-                .child(div().flex_1().text_sm().child(editor.clone()))
+                .child(div().flex_1().prose().child(editor.clone()))
                 .into_any_element();
         }
         let sessions = self.sessions.read(cx);
@@ -413,23 +413,20 @@ fn conversation_row(
     let id = record.session.clone();
     let (end, state_text): (AnyElement, Option<&str>) = match state {
         RowState::Running => (
-            Icon::new(IconName::LoadCircle)
-                .size(IconSize::XSmall)
+            studio_ui::ds::icon::meta(IconName::LoadCircle)
                 .color(Color::Accent)
                 .with_rotate_animation(2)
                 .into_any_element(),
             Some("Running"),
         ),
         RowState::Waiting => (
-            Icon::new(IconName::Warning)
-                .size(IconSize::XSmall)
+            studio_ui::ds::icon::meta(IconName::Warning)
                 .color(Color::Warning)
                 .into_any_element(),
             Some("Waiting for your answer"),
         ),
         RowState::Failed => (
-            Icon::new(IconName::XCircle)
-                .size(IconSize::XSmall)
+            studio_ui::ds::icon::meta(IconName::XCircle)
                 .color(Color::Error)
                 .into_any_element(),
             Some("The agent stopped"),

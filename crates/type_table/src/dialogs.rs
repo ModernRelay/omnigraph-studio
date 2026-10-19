@@ -282,11 +282,7 @@ fn render_field(field: &Field, cx: &App) -> AnyElement {
                 .child(studio_ui::ds::text::body(p.name.clone()))
                 .child(studio_ui::ds::text::meta(p.display_type()))
                 .when(p.is_key, |d| {
-                    d.child(
-                        Label::new("key")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Accent),
-                    )
+                    d.child(studio_ui::ds::text::meta("key").color(Color::Accent))
                 })
                 .when(required && !p.is_key, |d| {
                     d.child(studio_ui::ds::text::meta("required"))
@@ -329,9 +325,7 @@ impl Render for InsertRowModal {
                     .children(fields)
                     .children(blocked.map(studio_ui::ds::text::error))
                     .children(self.notice.clone().map(|notice| {
-                        Label::new(notice.message)
-                            .size(LabelSize::Small)
-                            .color(notice.tone.color())
+                        studio_ui::ds::text::body(notice.message).color(notice.tone.color())
                     })),
             )
             .child(
@@ -834,9 +828,7 @@ impl Render for InsertEdgeModal {
                     .children(fields)
                     .children(blocked.map(studio_ui::ds::text::error))
                     .children(self.notice.clone().map(|notice| {
-                        Label::new(notice.message)
-                            .size(LabelSize::Small)
-                            .color(notice.tone.color())
+                        studio_ui::ds::text::body(notice.message).color(notice.tone.color())
                     })),
             )
             .child(
@@ -1303,9 +1295,7 @@ impl Render for DeleteRowModal {
                             body.child(field_box(&self.confirm, false, cx))
                         })
                         .children(notice.map(|notice| {
-                            Label::new(notice.message)
-                                .size(LabelSize::Small)
-                                .color(notice.tone.color())
+                            studio_ui::ds::text::body(notice.message).color(notice.tone.color())
                         })),
                 )
             })
@@ -1446,8 +1436,7 @@ impl Render for SaveViewModal {
                     .child(field_box(&self.name, false, cx))
                     .when(replaces, |d| {
                         d.child(
-                            Label::new(format!("Replaces the view “{name}”."))
-                                .size(LabelSize::Small)
+                            studio_ui::ds::text::body(format!("Replaces the view “{name}”."))
                                 .color(Color::Warning),
                         )
                     }),

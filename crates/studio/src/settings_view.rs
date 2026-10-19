@@ -19,7 +19,7 @@ use studio_ui::menu::ContextMenu;
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use theme::ThemeRegistry;
 use ui::prelude::*;
-use ui::{Callout, PopoverMenu, Severity, Tooltip};
+use ui::{PopoverMenu, Severity, Tooltip};
 
 pub struct SettingsView {
     search: Entity<Editor>,
@@ -752,10 +752,7 @@ fn file_problems(
     };
     Some(
         div().w_full().max_w(px(ds::size::READING_WIDTH)).child(
-            Callout::new()
-                .severity(Severity::Warning)
-                .icon(IconName::Warning)
-                .title(title)
+            studio_ui::ds::callout(Severity::Warning, title)
                 .description_slot(
                     v_flex()
                         .gap(px(space::XS))

@@ -7,11 +7,13 @@ use gpui::{
 };
 use studio_actions::agent::{Allow, AllowAlways, Reject};
 use studio_actions::table::{DeleteRow, EditCell, InsertRow, PeekRow};
-use studio_ui::ds::{self, ActivityRow, SidebarRow, radii, size, space, surface, text};
+use studio_ui::ds::{
+    self, ActivityRow, Dotted as _, SidebarRow, radii, size, space, surface, text,
+};
 use studio_ui::{GridColumn, grid_header};
 use studio_workspace::{Item, ItemEvent, SavedItem};
+use ui::Severity;
 use ui::prelude::*;
-use ui::{Callout, Severity};
 
 pub struct DesignGallery {
     focus_handle: FocusHandle,
@@ -85,7 +87,8 @@ impl Render for DesignGallery {
                     .child(
                         div()
                             .size(px(value))
-                            .rounded(px(space::XXS))
+                            .rounded(px(radii(cx).xs))
+                            // ds-exempt: a specimen of a spacing step, not interface
                             .bg(surface::accent(cx).opacity(0.35)),
                     )
                     .child(text::meta(format!("{name} {value}")))
@@ -277,11 +280,7 @@ impl Render for DesignGallery {
                 .flex_none()
                 .child(studio_ui::ds::icon::meta(IconName::DatabaseZap))
                 .child(text::body("knowledge"))
-                .child(
-                    Label::new("/")
-                        .size(LabelSize::Small)
-                        .color(Color::Disabled),
-                )
+                .child(studio_ui::ds::text::body("/").color(Color::Disabled))
                 .child(studio_ui::ds::icon::meta(IconName::GitBranch))
                 .child(text::body("main"))
                 .child(studio_ui::ds::icon::meta(IconName::ChevronUpDown))
@@ -348,7 +347,7 @@ impl Render for DesignGallery {
                     .child(text::body("Retitle person-000000"))
                     .child(div().flex_1())
                     .child(ds::meta(IconName::GitBranch, "agent/20261012-095049"))
-                    .child(ui::Chip::new("new").label_size(LabelSize::XSmall)),
+                    .child(studio_ui::ds::tag("new", cx)),
             )
             .child(
                 ds::card_body()
@@ -637,7 +636,7 @@ impl Render for DesignGallery {
                     None,
                 )
                 .border_b_1()
-                .border_color(ds::surface::rule(cx)),
+                .dotted(cx),
             )
             .child(ds::setting_row(
                 "g-setting-size",
@@ -755,25 +754,21 @@ impl Render for DesignGallery {
             .child(
                 ds::MenuRow::new("g-menu-peek")
                     .toggle_state(true)
-                    .child(Label::new("Peek")),
+                    .child(text::plain("Peek")),
             )
-            .child(ds::MenuRow::new("g-menu-edit").child(Label::new("Edit cell")))
+            .child(ds::MenuRow::new("g-menu-edit").child(text::plain("Edit cell")))
             .child(
                 ds::MenuRow::new("g-menu-wrap")
-                    .start_slot(
-                        Icon::new(IconName::Check)
-                            .size(IconSize::Small)
-                            .color(Color::Accent),
-                    )
-                    .child(Label::new("Wrap long text")),
+                    .start_slot(studio_ui::ds::icon::lead(IconName::Check).color(Color::Accent))
+                    .child(text::plain("Wrap long text")),
             )
             .child(
                 ds::MenuRow::new("g-menu-disabled")
                     .disabled(true)
-                    .child(Label::new("Paste").color(Color::Disabled)),
+                    .child(text::plain("Paste").color(Color::Disabled)),
             )
             .child(ds::menu_separator(cx))
-            .child(ds::MenuRow::new("g-menu-delete").child(Label::new("Delete row")));
+            .child(ds::MenuRow::new("g-menu-delete").child(text::plain("Delete row")));
 
         v_flex()
             .id("design-gallery")
@@ -865,10 +860,7 @@ impl Render for DesignGallery {
             .child(section(
                 "Callout",
                 div().w(px(size::MODAL_WIDTH)).child(
-                    Callout::new()
-                        .severity(Severity::Error)
-                        .icon(IconName::XCircle)
-                        .title("The agent stopped")
+                    studio_ui::ds::callout(Severity::Error, "The agent stopped")
                         .description("Errors are the one place for a sentence."),
                 ),
             ))

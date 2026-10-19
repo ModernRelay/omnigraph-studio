@@ -1276,11 +1276,7 @@ impl QueryEditor {
             facts.push(
                 h_flex()
                     .gap(px(space::XS))
-                    .child(
-                        Icon::new(IconName::Warning)
-                            .size(IconSize::XSmall)
-                            .color(Color::Warning),
-                    )
+                    .child(studio_ui::ds::icon::meta(IconName::Warning).color(Color::Warning))
                     .child(ds::text::meta("This graph no longer serves it"))
                     .into_any_element(),
             );
@@ -2078,8 +2074,7 @@ impl QueryEditor {
                                 .cursor_pointer()
                                 .hover(move |s| s.bg(hover))
                                 .child(
-                                    Icon::new(IconName::XCircle)
-                                        .size(IconSize::XSmall)
+                                    studio_ui::ds::icon::meta(IconName::XCircle)
                                         .color(Color::Error),
                                 )
                                 .child(studio_ui::ds::text::meta(problem.code.clone()))
@@ -2221,11 +2216,7 @@ impl QueryEditor {
                 .bg(background)
                 .border_b_1()
                 .border_color(border)
-                .child(
-                    Icon::new(IconName::Warning)
-                        .size(IconSize::Small)
-                        .color(Color::Warning),
-                )
+                .child(studio_ui::ds::icon::lead(IconName::Warning).color(Color::Warning))
                 .child(ds::text::body(what))
                 .child(div().flex_1())
                 .child(
@@ -2688,8 +2679,8 @@ impl QueryEditor {
                         .gap(px(space::MD))
                         .child(studio_ui::ds::text::meta(name.clone()))
                         .child(
-                            Label::new(value.clone())
-                                .size(LabelSize::XSmall)
+                            studio_ui::ds::text::meta(value.clone())
+                                .color(Color::Default)
                                 .single_line()
                                 .truncate(),
                         )
@@ -2815,7 +2806,7 @@ impl QueryEditor {
                     .child(
                         div()
                             .pt(px(space::XXS))
-                            .child(Icon::new(icon).size(IconSize::Small).color(color)),
+                            .child(studio_ui::ds::icon::lead(icon).color(color)),
                     )
                     .child(
                         v_flex()
@@ -3009,13 +3000,11 @@ fn run_line(
                 }),
         )
         .children(note.map(|note| {
-            Label::new(note.text)
-                .size(LabelSize::XSmall)
-                .color(if note.failed {
-                    Color::Error
-                } else {
-                    Color::Muted
-                })
+            studio_ui::ds::text::meta(note.text).color(if note.failed {
+                Color::Error
+            } else {
+                Color::Muted
+            })
         }))
         .into_any_element()
 }
@@ -3041,7 +3030,11 @@ fn render_facts(facts: &[(String, String)]) -> impl IntoElement {
                 .when(!name.is_empty(), |fact| {
                     fact.child(studio_ui::ds::text::meta(name.clone()))
                 })
-                .child(Label::new(value).size(LabelSize::XSmall).single_line())
+                .child(
+                    studio_ui::ds::text::meta(value)
+                        .color(Color::Default)
+                        .single_line(),
+                )
         }))
 }
 

@@ -139,11 +139,7 @@ impl RenderOnce for CopyableValue {
             return h_flex()
                 .id(self.id)
                 .tooltip(Tooltip::text("Not reported by this server"))
-                .child(
-                    Label::new("—")
-                        .size(LabelSize::Small)
-                        .color(Color::Disabled),
-                )
+                .child(crate::ds::text::body("—").color(Color::Disabled))
                 .into_any_element();
         };
         let mut label = crate::ds::text::body(value.clone())

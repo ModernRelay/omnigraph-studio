@@ -123,8 +123,7 @@ pub fn resizable_grid_header(
                 .when(column.align_right, |d| d.justify_end())
                 .child(crate::ds::text::muted(column.title.clone()).single_line())
                 .children(column.detail.clone().map(|detail| {
-                    Label::new(detail)
-                        .size(LabelSize::XSmall)
+                    crate::ds::text::meta(detail)
                         .color(Color::Disabled)
                         .single_line()
                 }))
