@@ -68,6 +68,9 @@ pub enum GatewayEvent {
 /// quit while it was sent), it says nothing more.
 pub type OnOutcome = Box<dyn FnOnce(&Seen) + Send>;
 
+/// What an approved write that was not sent, because the CLI stopped waiting, records.
+pub const NOT_SENT: &str = "The agent's CLI stopped waiting, so nothing was sent.";
+
 /// How long the gateway waits after a connection it could not take, before taking the next.
 const ACCEPT_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
 
@@ -330,6 +333,13 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
                 () = gone => None,
             };
             let Some(decided) = decided else {
+                // An approval that came as the CLI gave up is not sent: it says so, rather
+                // than being dropped and taken for a write whose outcome is unknown.
+                if let Some(Ok(Some(on_outcome))) =
+                    futures::FutureExt::now_or_never(decision.as_mut())
+                {
+                    on_outcome(&Seen::Refused(NOT_SENT.into()));
+                }
                 shared
                     .events
                     .unbounded_send(GatewayEvent::Abandoned { id })

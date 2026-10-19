@@ -36,7 +36,7 @@ use ui::{
 
 use crate::cli_home::{self, CliHome};
 use crate::gateway::{Gateway, GatewayEvent, OnOutcome, Seen};
-use crate::gateway_rules::{Sandbox, WriteSummary};
+use crate::gateway_rules::{Sandbox, WriteKind, WriteSummary};
 use crate::host::{AgentLaunch, HostCommand, HostEvent, Opened, SessionLaunch};
 use crate::sessions::{AgentSessions, Live, SessionRecord};
 use crate::socket::{ToolRequest, ToolSocket};
@@ -58,6 +58,15 @@ const UNKNOWN_OUTCOME: &str = "The server did not confirm this change. It was no
 check the branch history before the agent tries it again.";
 
 /// A gateway write's outcome, as Studio's activity records it.
+/// Hands the gateway its decision. An approval it can no longer take, the CLI having given up
+/// meanwhile, records that nothing was sent, rather than being dropped and taken for a write
+/// whose outcome is unknown.
+fn hand_over(decide: oneshot::Sender<Option<OnOutcome>>, approval: Option<OnOutcome>) {
+    if let Err(Some(approval)) = decide.send(approval) {
+        approval(&Seen::Refused(crate::gateway::NOT_SENT.into()));
+    }
+}
+
 fn outcome_kind(seen: &Seen) -> OutcomeKind {
     match seen {
         Seen::Committed { commit, .. } => OutcomeKind::Committed {
@@ -530,7 +539,7 @@ pub struct AgentPanel {
     next_run: u64,
     /// The card of each write the gateway forwards, by the gateway's id: the entry, and
     /// whether the write creates the agent's branch.
-    gateway_cards: std::collections::HashMap<u64, (usize, bool)>,
+    gateway_cards: std::collections::HashMap<u64, (usize, WriteKind)>,
 }
 
 impl EventEmitter<ItemEvent> for AgentPanel {}
@@ -1637,16 +1646,17 @@ impl AgentPanel {
             creates_from: write.creates_branch.then(|| branch.base.clone()),
             state,
         }));
-        self.gateway_cards.insert(id, (index, write.creates_branch));
-        let (branch, description, creates_branch) = (
+        self.gateway_cards.insert(id, (index, write.kind));
+        // A write that makes or deletes the agent's branch reads the branch list again.
+        let (branch, description, moves_branches) = (
             branch.name.clone(),
             format!("Agent CLI: {}", write.summary),
-            write.creates_branch,
+            write.creates_branch || write.kind == WriteKind::BranchDelete,
         );
         match waiting {
             None => {
-                let approval = self.record_outcome(branch, description, creates_branch, cx);
-                decide.send(Some(approval)).ok();
+                let approval = self.record_outcome(branch, description, moves_branches, cx);
+                hand_over(decide, Some(approval));
             }
             Some(decision) => {
                 cx.spawn(async move |this, cx| {
@@ -1665,12 +1675,12 @@ impl AgentPanel {
                                 this.set_proposal_state(index, ProposalState::Rejected, cx);
                             }
                             allow.then(|| {
-                                this.record_outcome(branch, description, creates_branch, cx)
+                                this.record_outcome(branch, description, moves_branches, cx)
                             })
                         })
                         .ok()
                         .flatten();
-                    decide.send(approval).ok();
+                    hand_over(decide, approval);
                 })
                 .detach();
             }
@@ -1696,9 +1706,10 @@ impl AgentPanel {
     }
 
     fn gateway_finished(&mut self, id: u64, outcome: Seen, cx: &mut Context<Self>) {
-        let Some((index, creates_branch)) = self.gateway_cards.remove(&id) else {
+        let Some((index, kind)) = self.gateway_cards.remove(&id) else {
             return;
         };
+        let creates_branch = matches!(kind, WriteKind::BranchCreate);
         let state = match &outcome {
             Seen::Committed {
                 commit: Some(commit),
@@ -1722,6 +1733,13 @@ impl AgentPanel {
         if let Some(branch) = &mut self.branch {
             if went_through && creates_branch && !branch.created {
                 branch.created = true;
+                created = true;
+            }
+            // The agent deleted its branch: there is nothing to review, and its next write
+            // makes it again.
+            if went_through && kind == WriteKind::BranchDelete && branch.created {
+                branch.created = false;
+                branch.changes = 0;
                 created = true;
             }
             if matches!(
@@ -3763,6 +3781,24 @@ mod tests {
         assert_eq!(format_cost(0.0042, "USD"), "0.0042 USD");
         assert_eq!(format_cost(0.411, "USD"), "0.41 USD");
         assert_eq!(format_cost(0., "USD"), "0.00 USD");
+    }
+
+    #[test]
+    fn an_approval_the_gateway_cannot_take_records_that_nothing_was_sent() {
+        let (decide, decision) = oneshot::channel::<Option<OnOutcome>>();
+        drop(decision);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let heard = seen.clone();
+        hand_over(
+            decide,
+            Some(Box::new(move |outcome: &Seen| {
+                *heard.lock().unwrap() = Some(outcome.clone());
+            })),
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(Seen::Refused(crate::gateway::NOT_SENT.into()))
+        );
     }
 
     #[test]
