@@ -743,6 +743,8 @@ impl GraphSession {
 
     pub fn reload_branches(&mut self, cx: &mut Context<Self>) {
         self.branches = Loadable::Loading;
+        // A poll's list asked for before this would land as the newer one.
+        self.branch_recheck = None;
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let moves = self.branch_moves;
@@ -3320,6 +3322,76 @@ mod tests {
     /// poll came while none was. Another writer's commit lands like Studio's own; Studio's own
     /// commit is the head without asking. Each poll reads the branch list too, so a branch made
     /// elsewhere appears.
+    /// A branch list read again after a branch was made or deleted is not overwritten by a
+    /// poll's list asked for before it, which answers later.
+    #[gpui::test]
+    async fn a_polls_older_branch_list_does_not_replace_a_reloaded_one(cx: &mut TestAppContext) {
+        let lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (gate_tx, gate_rx) = futures::channel::oneshot::channel::<()>();
+        let gate = Arc::new(std::sync::Mutex::new(Some(gate_rx)));
+        let (count, held) = (lists.clone(), gate.clone());
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let (count, held) = (count.clone(), held.clone());
+            async move {
+                let body = if path.ends_with("/schema") {
+                    serde_json::json!({ "schema_source": "node Person {\n  slug: String @key\n}\n" })
+                } else if path.ends_with("/query") {
+                    serde_json::json!({ "query_name": "studio_head", "target": { "branch": "main" }, "row_count": 0, "rows": [], "graph_commit_id": "c1" })
+                } else if path.ends_with("/branches") {
+                    // The first list, then the poll's (held until the reload landed), then the
+                    // reload's, made after a branch was.
+                    match count.fetch_add(1, Ordering::SeqCst) {
+                        0 => serde_json::json!({ "branches": ["main"] }),
+                        1 => {
+                            let gate = held.lock().unwrap().take().unwrap();
+                            gate.await.ok();
+                            serde_json::json!({ "branches": ["main"] })
+                        }
+                        _ => serde_json::json!({ "branches": ["main", "made"] }),
+                    }
+                } else {
+                    serde_json::json!({})
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        let listed = |cx: &mut TestAppContext| {
+            session.read_with(cx, |session, _| session.branches.loaded().cloned())
+        };
+        assert_eq!(listed(cx), Some(vec!["main".to_owned()]));
+
+        // The poll asks; a branch is made meanwhile and the list is read again.
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        session.update(cx, |session, cx| session.reload_branches(cx));
+        cx.run_until_parked();
+        assert_eq!(listed(cx), Some(vec!["main".to_owned(), "made".to_owned()]));
+
+        // The poll's answer, asked for before the branch was made, comes last.
+        gate_tx.send(()).ok();
+        cx.run_until_parked();
+        assert_eq!(
+            listed(cx),
+            Some(vec!["main".to_owned(), "made".to_owned()]),
+            "the newer list stays"
+        );
+    }
+
     #[gpui::test]
     async fn the_head_watch_sees_other_writers_commits_while_a_window_is_active(
         cx: &mut TestAppContext,
