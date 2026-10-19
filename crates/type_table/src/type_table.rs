@@ -231,8 +231,8 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-/// Opens a type's table, or activates it when it is open.
-/// Opens a type's table, at the branch head or read-only at a commit.
+/// Opens a type's table, at the branch head or read-only at a commit, or activates it when it
+/// is open.
 fn open_type(
     workspace: &mut Workspace,
     type_name: &str,
@@ -402,6 +402,8 @@ fn undo_delete(workspace: &mut Workspace, action: &UndoDelete, cx: &mut Context<
     let query =
         graph_store::deletes::undo_query(session.clone(), schema, action.commit.clone(), cx);
     let (commit, what) = (action.commit.clone(), action.what.clone());
+    // To the delete's branch, though the window moves elsewhere while the rows are read.
+    let branch = action.branch.clone();
     cx.spawn(async move |workspace, cx| {
         let toast = |kind: ToastKind, message: String, cx: &mut gpui::AsyncApp| {
             workspace
@@ -420,7 +422,8 @@ fn undo_delete(workspace: &mut Workspace, action: &UndoDelete, cx: &mut Context<
             }
         };
         let write = session.update(cx, |session, cx| {
-            session.write(&query, Some(commit), format!("Undo: {what}"), cx)
+            let description = format!("Undo: {what}");
+            session.write_on(&branch, &query, Some(commit), description, None, cx)
         });
         write.await;
     })
