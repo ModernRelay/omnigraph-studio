@@ -264,6 +264,12 @@ pub struct ReviewView {
     head_moved_while_writing: bool,
     /// The session asks after the reviewed branch's head while the review is open.
     _head_watch: HeadWatch,
+    _target_watch: HeadWatch,
+    /// The dry run is for heads that moved (a fix landed, the target moved) and is read again
+    /// once no fix or merge is out.
+    preview_again: bool,
+    /// The target's head as the session knew it when the dry run was asked for.
+    preview_target: Option<String>,
     _load_task: Option<Task<()>>,
     _names_task: Option<Task<()>>,
     _preview_task: Option<Task<()>>,
@@ -338,10 +344,18 @@ impl ReviewView {
                 SessionEvent::HeadMoved { branch, .. } if *branch == this.branch => {
                     this.compare_head(cx)
                 }
+                // The dry run merged into the target as it was.
+                SessionEvent::HeadMoved { branch, head }
+                    if *branch == this.target
+                        && this.preview_target.as_deref() != Some(head.as_str()) =>
+                {
+                    this.preview_moved(cx)
+                }
                 SessionEvent::SchemaChanged => cx.notify(),
                 _ => {}
             });
         let head_watch = session.update(cx, |session, cx| session.watch_head(&branch, cx));
+        let target_watch = session.update(cx, |session, cx| session.watch_head(&target, cx));
         let mut view = Self {
             session,
             branch,
@@ -371,6 +385,9 @@ impl ReviewView {
             fixes_in_flight: HashMap::new(),
             head_moved_while_writing: false,
             _head_watch: head_watch,
+            _target_watch: target_watch,
+            preview_again: false,
+            preview_target: None,
             _load_task: None,
             _names_task: None,
             _preview_task: None,
@@ -498,6 +515,7 @@ impl ReviewView {
     /// its conflicts show before anyone merges. A dry run that cannot be read says nothing.
     fn read_preview(&mut self, cx: &mut Context<Self>) {
         self.preview = Preview::Reading;
+        self.preview_target = self.session.read(cx).head(&self.target).map(str::to_owned);
         let read = self.session.update(cx, |session, cx| {
             session.merge_preview(&self.branch, &self.target, cx)
         });
@@ -515,6 +533,32 @@ impl ReviewView {
             })
             .ok();
         }));
+    }
+
+    /// The heads the dry run merged moved: it is read again for them, once no fix or merge is
+    /// out; a review being read reads its own.
+    fn preview_moved(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.load, LoadState::Ready) {
+            return;
+        }
+        if self.fixes_running > 0 || self.merging() {
+            self.preview_again = true;
+            return;
+        }
+        self.preview_again = false;
+        // A merge's own outcome shows in its place.
+        if !matches!(self.merge, MergeState::Idle) {
+            return;
+        }
+        let changed = self
+            .data
+            .as_ref()
+            .is_some_and(|data| !data.folded.changes.is_empty());
+        if self.scope.is_none() && changed {
+            self.read_preview(cx);
+        } else {
+            self.preview = Preview::Unread;
+        }
     }
 
     /// The conflicts the conflicts view lists: a merge's, else a dry run's.
@@ -929,6 +973,7 @@ impl ReviewView {
             WriteOutcome::Committed(output) => match output.commit {
                 Some(commit) => {
                     self.bound_head = Some(commit.graph_commit_id.clone());
+                    self.preview_again = true;
                     let commit = commit.graph_commit_id;
                     if edited {
                         FixState::Edited { commit }
@@ -976,6 +1021,8 @@ impl ReviewView {
             .is_some_and(|head| head != bound)
         {
             self.newer = true;
+            // The dry run merged the head reviewed, which another writer has moved past.
+            self.preview = Preview::Unread;
             cx.emit(ItemEvent::UpdateTab);
             cx.notify();
         }
@@ -987,6 +1034,9 @@ impl ReviewView {
             && std::mem::take(&mut self.head_moved_while_writing)
         {
             self.compare_head(cx);
+        }
+        if self.preview_again && self.fixes_running == 0 && !self.merging() {
+            self.preview_moved(cx);
         }
     }
 
@@ -2725,6 +2775,16 @@ pub(crate) mod tests {
             .map(|request| request.rsplit(' ').next().unwrap().to_owned())
             .collect();
         assert_eq!(bound, ["f2", "r1"]);
+        // The dry run was for the head before the fixes: it is read once more after them.
+        let dry_runs = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.contains("/branches/merge") && request.contains("\"dry_run\":true")
+            })
+            .count();
+        assert_eq!(dry_runs, 1, "{:?}", asked.lock().unwrap());
         view.read_with(cx, |view, _| {
             assert_eq!(view.fixes_running, 0);
             assert_eq!(view.bound_head.as_deref(), Some("r2"));
