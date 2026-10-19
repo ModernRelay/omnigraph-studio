@@ -190,7 +190,8 @@ fn always(status: u16, body: Value) -> Writes {
     Arc::new(move |_| (status, body.clone()))
 }
 
-/// As [`session`], every write's request body recorded, in order.
+/// As [`session`], every write's request body recorded, in order, with `if_graph_commit` added
+/// for a write bound to a commit.
 pub(crate) fn session_recording_writes(
     schema: &str,
     cx: &mut TestAppContext,
@@ -317,9 +318,19 @@ fn serve_with(
             } else if let Some(writer) = writer.as_ref().filter(|_| path.ends_with("/changes")) {
                 (200, writer.feed(&query))
             } else if path.contains("/mutate") {
+                // A write bound to a commit carries it in the body the writes see.
+                let bound = request
+                    .headers()
+                    .get(graph_client::IF_GRAPH_COMMIT_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
                 let mut bytes = Vec::new();
                 request.into_body().read_to_end(&mut bytes).await.ok();
-                writes(&serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+                let mut body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                if let (Some(bound), Some(body)) = (bound, body.as_object_mut()) {
+                    body.insert("if_graph_commit".into(), Value::String(bound));
+                }
+                writes(&body)
             } else {
                 // A second branch, for views that follow the window to another one.
                 (200, json!({ "branches": ["main", "fix"] }))

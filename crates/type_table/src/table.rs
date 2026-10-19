@@ -48,7 +48,7 @@ use ui::{
 use crate::dialogs::{
     DeleteRowModal, DeleteTarget, InsertEdgeModal, InsertRowModal, SaveViewModal,
 };
-use crate::grouping::{GROUP_LIMIT, Grouping, Line, SECTION_FIRST_PAGE};
+use crate::grouping::{GROUP_LIMIT, Grouping, Line, Lines, SECTION_FIRST_PAGE};
 use crate::model::{
     ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN, Row, SaveResult,
     TableKind, Tone, changed_elsewhere, chips_that_fit, count_of, display_value, edge_columns,
@@ -262,7 +262,7 @@ pub struct TypeTable {
     /// Rows grouped by one property: sections by value, each read on its own.
     grouping: Option<Grouping>,
     /// The grouped grid's lines as this frame drew them.
-    frame_lines: Option<Rc<Vec<Line>>>,
+    frame_lines: Option<Rc<Lines>>,
     /// How the lines drawn this frame look, filled by the row callback for the row styling.
     frame_looks: Rc<RefCell<HashMap<usize, RowLook>>>,
     /// The places this frame's lines draw.
@@ -1088,8 +1088,9 @@ impl TypeTable {
             };
         let count = rows.len();
         let description = format!("Set {} on {count} {} rows", property.name, self.type_name);
+        let bound = self.list_bound(&property);
         let write = self.session.update(cx, |session, cx| {
-            session.write(&query, None, description, cx)
+            session.write(&query, bound, description, cx)
         });
         self.bulk.saving = true;
         self.bulk.notice = None;
@@ -1765,8 +1766,10 @@ impl TypeTable {
             .collect()
     }
 
-    /// The count of the table's rows, through its filters (`filtered`) or of every row.
-    fn count_query(&self, filtered: bool) -> Result<BuiltQuery, BuildError> {
+    /// The count of the table's rows, through its filters (`filtered`) or of every row; `None`
+    /// when it is 0 without a read: a filter on a property the commit shown does not hold
+    /// matches no row there.
+    fn count_query(&self, filtered: bool) -> Result<Option<BuiltQuery>, BuildError> {
         let schema = self
             .schema
             .as_ref()
@@ -1776,11 +1779,22 @@ impl TypeTable {
         } else {
             Vec::new()
         };
-        let filters = filters.as_slice();
+        let without: Vec<String> = self.absent.keys().cloned().collect();
+        let Some(filters) = builder::filters_without(&filters, &without) else {
+            return Ok(None);
+        };
         match self.kind {
-            TableKind::Node => builder::node_count(schema, &self.type_name, filters),
-            TableKind::Edge => builder::edge_count(schema, &self.type_name, filters),
+            TableKind::Node => builder::node_count(schema, &self.type_name, &filters),
+            TableKind::Edge => builder::edge_count(schema, &self.type_name, &filters),
         }
+        .map(Some)
+    }
+
+    /// The commit a write setting `property` is bound to, besides its row's value: a list
+    /// cannot be compared in a write's `where`, so a write of one is bound to the commit the
+    /// table shows, which follows the head while nothing the table shows changes.
+    fn list_bound(&self, property: &Property) -> Option<String> {
+        property.list.then(|| self.paging.pinned.clone()).flatten()
     }
 
     fn rows_from(&self, rows: &Value) -> Vec<Row> {
@@ -2665,19 +2679,22 @@ impl TypeTable {
 
     fn spawn_count(
         &mut self,
-        query: Result<BuiltQuery, BuildError>,
+        query: Result<Option<BuiltQuery>, BuildError>,
         snapshot: Option<String>,
         filtered: bool,
         cx: &mut Context<Self>,
     ) -> Option<Task<()>> {
         let query = match query {
-            Ok(query) => query,
-            Err(error) => {
-                let failed = Loadable::Failed(error.to_string());
+            Ok(Some(query)) => query,
+            result => {
+                let value = match result {
+                    Err(error) => Loadable::Failed(error.to_string()),
+                    _ => Loadable::Loaded(0),
+                };
                 if filtered {
-                    self.count = failed;
+                    self.count = value;
                 } else {
-                    self.total = failed;
+                    self.total = value;
                 }
                 return None;
             }
@@ -3427,8 +3444,9 @@ impl TypeTable {
         self.saves_in_flight += 1;
         self.finish_editing(window, cx);
         let description = format!("Set {} of {row_id}", property.name);
+        let bound = self.list_bound(&property);
         let write = self.session.update(cx, |session, cx| {
-            session.write(&query, None, description, cx)
+            session.write(&query, bound, description, cx)
         });
         let (session, branch) = (self.session.clone(), self.branch.clone());
         // Detached: a write is never cancelled by closing the tab.
@@ -3768,8 +3786,12 @@ impl TypeTable {
             self.type_name,
             if rows.len() == 1 { "row" } else { "rows" },
         );
+        let bound = edits
+            .iter()
+            .filter_map(|edit| self.property_of(&edit.column))
+            .find_map(|property| self.list_bound(&property));
         let write = self.session.update(cx, |session, cx| {
-            session.write(&query, None, description, cx)
+            session.write(&query, bound, description, cx)
         });
         self.drafts.saving = true;
         self.saves_in_flight += 1;
@@ -5410,12 +5432,12 @@ impl TypeTable {
             .collect();
         // Grouped, the grid draws lines (headers, rows, read-more lines); otherwise one line
         // per row. Per line: the row it shows, if any.
-        // The lines are worked out once a frame and shared with the row callback, which the
-        // list calls more than once a frame.
-        let lines: Option<Rc<Vec<Line>>> = self
+        // The lines are worked out once a frame, by section, and shared with the row callback,
+        // which the list calls more than once a frame.
+        let lines: Option<Rc<Lines>> = self
             .grouping
             .as_ref()
-            .map(|grouping| Rc::new(grouping.lines()));
+            .map(|grouping| Rc::new(grouping.line_map()));
         self.frame_lines = lines.clone();
         // How each drawn line looks (picked, dimmed, the cursor's, a group header) is worked
         // out by the row callback for the lines it draws, not for every loaded row.
@@ -5461,14 +5483,10 @@ impl TypeTable {
                     let rows = match &this.frame_lines {
                         None => range.start.min(this.rows.len())..range.end.min(this.rows.len()),
                         Some(lines) => {
-                            let rows = lines
-                                .get(range.start.min(lines.len())..range.end.min(lines.len()))
-                                .unwrap_or_default()
-                                .iter()
-                                .filter_map(|line| match line {
-                                    Line::Row(row) => Some(*row),
-                                    _ => None,
-                                });
+                            let rows = lines.slice(range.clone()).filter_map(|line| match line {
+                                Line::Row(row) => Some(row),
+                                _ => None,
+                            });
                             let (first, last) = rows.fold((usize::MAX, 0), |(lo, hi), row| {
                                 (lo.min(row), hi.max(row + 1))
                             });
@@ -5495,10 +5513,9 @@ impl TypeTable {
                         this.want_blob_metas(range.clone(), cx);
                         return range.map(|ix| this.render_row(ix, window, cx)).collect();
                     };
-                    let range = range.start.min(lines.len())..range.end.min(lines.len());
-                    let shown = &lines[range];
+                    let shown: Vec<Line> = lines.slice(range).collect();
                     // An open section reads its first rows when its read line comes into view.
-                    for line in shown {
+                    for line in &shown {
                         if let Line::More(index) = *line
                             && this
                                 .grouping
@@ -5718,7 +5735,7 @@ impl TypeTable {
         for ix in range {
             let row = match lines {
                 Some(lines) => match lines.get(ix) {
-                    Some(Line::Row(row)) => Some(*row),
+                    Some(Line::Row(row)) => Some(row),
                     Some(Line::Header(_)) => {
                         looks.insert(
                             ix,
@@ -6885,7 +6902,6 @@ mod tests {
         });
     }
 
-    /// A cell saved on one branch lands after the window moved to another: it lets go of the
     /// A draft is saved bound to the value it was typed over, not the one a Refresh put in the
     /// cell since: a change made elsewhere meanwhile is a conflict, not overwritten.
     #[gpui::test]
@@ -6939,6 +6955,54 @@ mod tests {
         assert!(!params.contains(&"Ada"), "not to the one shown: {params:?}");
     }
 
+    /// A list cannot be compared in a write's `where`: a draft setting one is bound to the
+    /// commit the table shows, and one setting only scalars is bound to their values alone.
+    #[gpui::test]
+    async fn a_list_draft_is_bound_to_the_commit_the_table_shows(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        const TAGGED: &str =
+            "node Person {\n  slug: String @key\n  name: String\n  tags: [String]?\n}\n";
+        let (session, sent) = crate::test_support::session_recording_writes(TAGGED, cx);
+        let (table, cx) = cx.add_window_view({
+            let session = session.clone();
+            |window, cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            }
+        });
+        cx.run_until_parked();
+        let draft = |property: &str, old: Value, text: &str, cx: &mut VisualTestContext| {
+            session.update(cx, |session, cx| {
+                let key = DraftKey {
+                    type_name: "Person".into(),
+                    id: "p1".into(),
+                    property: property.into(),
+                };
+                let text = text.into();
+                session.set_draft(key, graph_store::DraftEntry { old, text }, cx);
+            });
+            cx.run_until_parked();
+            table.update_in(cx, |table, window, cx| table.save_drafts(window, cx));
+            cx.run_until_parked();
+        };
+        draft("tags", Value::Null, "math, poetry", cx);
+        draft("name", "Ada".into(), "Ada King", cx);
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(sent[0]["if_graph_commit"], "c1", "{}", sent[0]);
+        assert!(sent[1].get("if_graph_commit").is_none(), "{}", sent[1]);
+    }
+
+    /// A cell saved on one branch lands after the window moved to another: it lets go of the
     /// draft of the branch it was saved on, never that of the branch shown, which stays.
     #[gpui::test]
     async fn a_save_that_lands_after_a_branch_switch_keeps_the_new_branchs_draft(
@@ -7296,13 +7360,40 @@ mod tests {
             assert_eq!(table.absent.get("born"), Some(&PropertyThen::Absent));
             assert!(matches!(table.first_page, Loadable::Loaded(())));
         });
-        let names = names.lock().unwrap().clone();
+        let read = names.lock().unwrap().clone();
         assert_eq!(
-            names
-                .iter()
+            read.iter()
                 .filter(|n| n.starts_with("studio_page"))
                 .collect::<Vec<_>>(),
             ["studio_page", "studio_page_fields"]
+        );
+
+        // Sorted and filtered by it there, the table pages without naming it and counts 0
+        // without a read: no row held it.
+        let reads_before = read.len();
+        table.update(cx, |table, cx| {
+            table.sort = Some(builder::Sort {
+                property: "born".into(),
+                descending: false,
+            });
+            table.filters = vec![Filter {
+                property: "born".into(),
+                op: FilterOp::Gt,
+                value: serde_json::json!("1815-12-10"),
+            }];
+            table.reload(true, cx);
+        });
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert!(matches!(table.first_page, Loadable::Loaded(())));
+            assert_eq!(table.count, Loadable::Loaded(0));
+        });
+        let names = names.lock().unwrap().clone();
+        let after = &names[reads_before..];
+        assert!(after.iter().all(|name| name != "studio_page"), "{after:?}");
+        assert!(
+            !after.iter().any(|name| name == "studio_count"),
+            "{after:?}"
         );
     }
 

@@ -67,6 +67,64 @@ impl Section {
     }
 }
 
+/// A grouped grid's lines, as [`Grouping::lines`] lists them, held per section rather than per
+/// row: the grid lays them out each frame, and an open section can hold thousands of rows.
+#[derive(Debug, Clone, Default)]
+pub struct Lines {
+    sections: Vec<SectionLines>,
+    len: usize,
+    other_values: bool,
+}
+
+/// One section's lines: its header at `start`, then its rows while open, then its read-more
+/// line.
+#[derive(Debug, Clone)]
+struct SectionLines {
+    start: usize,
+    index: usize,
+    rows: std::ops::Range<usize>,
+    more: bool,
+}
+
+impl Lines {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The line at `ix`, found by its section.
+    pub fn get(&self, ix: usize) -> Option<Line> {
+        if ix >= self.len {
+            return None;
+        }
+        let at = self.sections.partition_point(|section| section.start <= ix);
+        if let Some(section) = at.checked_sub(1).map(|at| &self.sections[at]) {
+            let offset = ix - section.start;
+            if offset == 0 {
+                return Some(Line::Header(section.index));
+            }
+            if offset <= section.rows.len() {
+                return Some(Line::Row(section.rows.start + offset - 1));
+            }
+            if section.more && offset == section.rows.len() + 1 {
+                return Some(Line::More(section.index));
+            }
+        }
+        (self.other_values && ix + 1 == self.len).then_some(Line::OtherValues)
+    }
+
+    /// The lines in `range`, those past the end left out.
+    pub fn slice(&self, range: std::ops::Range<usize>) -> impl Iterator<Item = Line> + '_ {
+        range.filter_map(|ix| self.get(ix))
+    }
+
+    /// The rows the lines show, in line order.
+    fn rows(&self) -> impl Iterator<Item = usize> + '_ {
+        self.sections
+            .iter()
+            .flat_map(|section| section.rows.clone())
+    }
+}
+
 /// One line of a grouped grid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Line {
@@ -249,7 +307,38 @@ impl Grouping {
         }
     }
 
-    /// The grid's lines: each header, then its rows and a read-more line while it is open.
+    /// The grid's lines, by section: each header, then its rows and a read-more line while it
+    /// is open.
+    pub fn line_map(&self) -> Lines {
+        let mut sections = Vec::new();
+        let mut len = 0;
+        for (index, section) in self.sections().iter().enumerate() {
+            let rows = if section.expanded {
+                section.range.clone()
+            } else {
+                0..0
+            };
+            let more = section.expanded
+                && (section.loading || section.error.is_some() || section.has_more());
+            sections.push(SectionLines {
+                start: len,
+                index,
+                rows: rows.clone(),
+                more,
+            });
+            len += 1 + rows.len() + usize::from(more);
+        }
+        let other_values = !self.complete && matches!(self.sections, Loadable::Loaded(_));
+        Lines {
+            sections,
+            len: len + usize::from(other_values),
+            other_values,
+        }
+    }
+
+    /// The grid's lines, one by one: each header, then its rows and a read-more line while it
+    /// is open.
+    #[cfg(test)]
     pub fn lines(&self) -> Vec<Line> {
         let mut lines = Vec::new();
         for (index, section) in self.sections().iter().enumerate() {
@@ -291,14 +380,7 @@ impl Grouping {
     /// The row `step` rows away from `row` among the rows shown, staying at the ends; from no
     /// row, the first shown.
     pub fn step_row(&self, row: Option<usize>, step: isize) -> Option<usize> {
-        let shown: Vec<usize> = self
-            .lines()
-            .into_iter()
-            .filter_map(|line| match line {
-                Line::Row(row) => Some(row),
-                _ => None,
-            })
-            .collect();
+        let shown: Vec<usize> = self.line_map().rows().collect();
         let at = row.and_then(|row| shown.iter().position(|r| *r == row));
         let Some(at) = at else {
             return shown.first().copied();
@@ -309,14 +391,7 @@ impl Grouping {
 
     /// The rows shown between two rows, both included, in line order.
     pub fn rows_between(&self, a: usize, b: usize) -> Vec<usize> {
-        let shown: Vec<usize> = self
-            .lines()
-            .into_iter()
-            .filter_map(|line| match line {
-                Line::Row(row) => Some(row),
-                _ => None,
-            })
-            .collect();
+        let shown: Vec<usize> = self.line_map().rows().collect();
         let (Some(x), Some(y)) = (
             shown.iter().position(|r| *r == a),
             shown.iter().position(|r| *r == b),
@@ -360,6 +435,35 @@ mod tests {
             GROUP_LIMIT,
         );
         grouping
+    }
+
+    /// The line map finds each line where the list of lines has it, however its sections are
+    /// open, read, being read or complete.
+    #[test]
+    fn the_line_map_matches_the_lines() {
+        for case in 0..64u32 {
+            let mut grouping = grouped();
+            if let Loadable::Loaded(sections) = &mut grouping.sections {
+                let mut next = 0;
+                for (i, section) in sections.iter_mut().enumerate() {
+                    let bits = case >> (i * 2);
+                    section.expanded = bits & 1 == 1;
+                    let n = ((bits >> 1) & 1) as usize * (i + 2);
+                    section.range = next..next + n;
+                    next += n;
+                    section.loading = case % 5 == i as u32;
+                }
+            }
+            grouping.complete = case % 3 == 0;
+            let lines = grouping.lines();
+            let map = grouping.line_map();
+            assert_eq!(map.len(), lines.len(), "case {case}");
+            for (ix, line) in lines.iter().enumerate() {
+                assert_eq!(map.get(ix), Some(*line), "case {case}, line {ix}");
+            }
+            assert_eq!(map.get(lines.len()), None);
+            assert_eq!(map.slice(0..lines.len() + 3).collect::<Vec<_>>(), lines);
+        }
     }
 
     #[test]
