@@ -31,6 +31,8 @@ pub struct SettingsView {
     text_inputs: Vec<TextInput>,
     /// The font choices, read from the system when a font setting is first drawn.
     fonts: Option<Options>,
+    /// The settings as values, read again when they change rather than at every frame.
+    values: SettingsValues,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -38,8 +40,8 @@ pub struct SettingsView {
 type Options = Rc<[(SharedString, Value)]>;
 
 /// A text setting's field. It writes when the person presses Enter or leaves it, not on every
-/// key, and shows the setting's value again whenever it changes elsewhere, unless it holds
-/// typing not yet written.
+/// key, and when the tab closes or Studio quits with typing in it; it shows the setting's value
+/// again whenever it changes elsewhere, unless it holds typing not yet written.
 struct TextInput {
     field: &'static SettingField,
     editor: Entity<Editor>,
@@ -102,7 +104,17 @@ impl SettingsView {
                 }
             }),
             cx.observe_global_in::<StudioSettings>(window, |this, window, cx| {
+                this.values = StudioSettings::get(cx).values();
                 this.show_text_values(window, cx)
+            }),
+            // Typing a field holds when the tab closes, or Studio quits, is written: the field
+            // hears no loss of focus then. At quit it is written before the last writes are
+            // waited for, as the windows close only after.
+            cx.on_release(|this, cx| this.commit_typing(cx)),
+            cx.on_app_quit(|this, cx| {
+                this.commit_typing(cx);
+                studio_settings::writes_done();
+                async {}
             }),
         ];
         let mut text_inputs = Vec::new();
@@ -141,6 +153,7 @@ impl SettingsView {
             scope: Scope::All,
             text_inputs,
             fonts: None,
+            values: StudioSettings::get(cx).values(),
             _subscriptions: subscriptions,
         };
         this.show_text_values(window, cx);
@@ -151,12 +164,11 @@ impl SettingsView {
     /// not yet written: a control pressed while a field has focus draws the values before the
     /// field hears it lost focus and writes.
     fn show_text_values(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let values = StudioSettings::get(cx).values();
         for input in &mut self.text_inputs {
             if input.edited(cx) {
                 continue;
             }
-            let text = studio_ui::value_text(values.value_in(&self.scope, input.field));
+            let text = studio_ui::value_text(self.values.value_in(&self.scope, input.field));
             if input.editor.read(cx).text(cx) != text {
                 input
                     .editor
@@ -187,18 +199,31 @@ impl SettingsView {
 
     /// Shows another scope's values, after writing any typing to the scope it was typed in.
     fn set_scope(&mut self, scope: Scope, window: &mut Window, cx: &mut Context<Self>) {
-        for index in 0..self.text_inputs.len() {
-            if self.text_inputs[index].edited(cx) {
-                self.write_text(index, window, cx);
-            }
-        }
+        self.commit_typing(cx);
         self.scope = scope;
         self.show_text_values(window, cx);
         cx.notify();
     }
 
-    /// Writes text field `index` to its setting: empty is unset where the setting may be.
+    /// Writes text field `index` to its setting, then shows the value as the settings hold it,
+    /// trimmed or refused.
     fn write_text(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.commit_text(index, cx);
+        self.show_text_values(window, cx);
+    }
+
+    /// Writes every field's typing not yet written to its setting, in the scope it was typed in.
+    fn commit_typing(&mut self, cx: &mut App) {
+        for index in 0..self.text_inputs.len() {
+            if self.text_inputs[index].edited(cx) {
+                self.commit_text(index, cx);
+            }
+        }
+    }
+
+    /// Writes text field `index`'s text to its setting, when it differs: empty is unset where
+    /// the setting may be. Every way a field is written comes here.
+    fn commit_text(&mut self, index: usize, cx: &mut App) {
         let Some(input) = self.text_inputs.get(index) else {
             return;
         };
@@ -220,8 +245,6 @@ impl SettingsView {
             target.set(value, cx);
         }
         self.text_inputs[index].shown = typed;
-        // The value as the settings hold it, trimmed or refused.
-        self.show_text_values(window, cx);
     }
 
     /// Text field `index`'s control: the field, which Enter writes.
@@ -529,7 +552,6 @@ impl Render for SettingsView {
             .collect();
         self.section = self.section.min(sections.len().saturating_sub(1));
         let chosen = sections.get(self.section).copied().unwrap_or_default();
-        let values = StudioSettings::get(cx).values();
         let shown: Vec<&'static SettingField> = studio_settings::fields()
             .iter()
             .filter(in_scope)
@@ -550,6 +572,7 @@ impl Render for SettingsView {
             self.fonts = Some(font_options(cx));
         }
         let fonts = self.fonts.clone();
+        let values = &self.values;
         let path = studio_settings::settings_path();
         let settings_problems = studio_settings::settings_problems(cx);
         let keymap_problems = studio_settings::keymap_problems(cx).to_vec();
@@ -638,7 +661,7 @@ impl Render for SettingsView {
                                 .position(|input| std::ptr::eq(input.field, field));
                             let control = match text_input {
                                 Some(index) => self.text_control(index, cx),
-                                None => control(&target, &values, fonts.as_ref(), cx),
+                                None => control(&target, values, fonts.as_ref(), cx),
                             };
                             let row = ds::setting_row(
                                 target.id("row"),
@@ -859,5 +882,37 @@ mod tests {
         // value they hold.
         cx.run_until_parked();
         assert_eq!(text(cx), "/usr/local/bin/omnigraph");
+    }
+
+    /// Typing a field holds when the tab closes is written then: the field hears no loss of
+    /// focus as it goes. Written once, not again by anything after.
+    #[gpui::test]
+    fn typing_is_written_when_the_tab_closes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            studio_settings::init_test(cx);
+        });
+        let (view, cx): (_, &mut VisualTestContext) =
+            cx.add_window_view(|window, cx| SettingsView::new(None, window, cx));
+        // This test's settings refuse a write by setting their values again, which counts it.
+        let writes = Rc::new(std::cell::Cell::new(0));
+        let _counted = cx.update(|_, cx| {
+            let writes = writes.clone();
+            cx.observe_global::<StudioSettings>(move |_| writes.set(writes.get() + 1))
+        });
+        let index = view.read_with(cx, |view, _| cli_field(view));
+        let editor = view.read_with(cx, |view, _| view.text_inputs[index].editor.clone());
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("/opt/omnigraph", window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(writes.get(), 0, "typing alone writes nothing");
+
+        // The tab goes with its window; the update that closes it releases the view.
+        drop(view);
+        cx.update(|window, _| window.remove_window());
+        cx.run_until_parked();
+        assert_eq!(writes.get(), 1);
     }
 }
