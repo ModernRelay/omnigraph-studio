@@ -3,8 +3,9 @@
 //! at, as every node property saves, so a value changed elsewhere meanwhile is not overwritten.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use editor::{CurrentLineHighlight, Editor, EditorEvent};
+use editor::{CurrentLineHighlight, Editor, EditorEvent, MultiBufferOffset};
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Subscription,
     Task, Window,
@@ -20,6 +21,10 @@ use ui::prelude::*;
 use ui::{Indicator, Tooltip};
 
 use crate::model::{Notice, SaveResult, Tone, node_rows, same_value};
+
+/// How long typing must pause before the preview shows the text: each update copies all of
+/// it, and Zed's own markdown preview waits longer.
+const PREVIEW_AFTER: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -48,8 +53,11 @@ pub struct TextEditor {
     type_name: String,
     id: String,
     property: String,
-    /// What saves are bound to: the value as it was read, or as it was last saved.
+    /// What saves are bound to: the value as it was read, or as it was last saved; set
+    /// through [`Self::set_old`] only.
     old: Loadable<Value>,
+    /// `old` as the editor shows it, made once per value rather than at each keystroke.
+    old_text: Option<String>,
     /// The text differs from `old`: found once per edit, not on every draw of the tab.
     unsaved: bool,
     /// The commit the value is read at: the one a field was being edited at, else the head.
@@ -59,6 +67,9 @@ pub struct TextEditor {
     label: Option<String>,
     editor: Entity<Editor>,
     preview: Entity<Markdown>,
+    /// The preview shows older text: typed while it was hidden, it catches up when shown.
+    preview_behind: bool,
+    _preview: Option<Task<()>>,
     mode: Mode,
     state: State,
     focus_handle: FocusHandle,
@@ -93,15 +104,12 @@ impl TextEditor {
         });
         let preview = cx.new(|cx| Markdown::new(SharedString::default(), None, None, cx));
         let mut subscriptions = vec![
-            // The preview follows the text as it is typed; the tab's dot follows whether it
-            // differs from the saved value.
+            // The preview follows the text once typing pauses; the tab's dot follows whether
+            // it differs from the saved value.
             cx.subscribe_in(&editor, window, |this, _, event: &EditorEvent, _, cx| {
                 if let EditorEvent::BufferEdited = event {
-                    let text = this.editor.read(cx).text(cx);
-                    this.unsaved =
-                        matches!(&this.old, Loadable::Loaded(old) if text != edit_text(old));
-                    this.preview
-                        .update(cx, |preview, cx| preview.replace(text, cx));
+                    this.unsaved = this.differs(cx);
+                    this.preview_later(cx);
                     if matches!(this.state, State::Saved) {
                         this.state = State::Idle;
                     }
@@ -137,12 +145,15 @@ impl TextEditor {
             id,
             property,
             old: Loadable::Loading,
+            old_text: None,
             unsaved: false,
             read_at,
             typed,
             label: None,
             editor,
             preview,
+            preview_behind: false,
+            _preview: None,
             mode: Mode::Split,
             state: State::Idle,
             focus_handle: cx.focus_handle(),
@@ -161,24 +172,83 @@ impl TextEditor {
     fn set_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         self.editor
             .update(cx, |editor, cx| editor.set_text(text.clone(), window, cx));
+        self.preview_behind = false;
         self.preview
             .update(cx, |preview, cx| preview.replace(text, cx));
+    }
+
+    /// Binds saves to `old`, and keeps the text it shows for comparing with what is typed.
+    fn set_old(&mut self, old: Loadable<Value>) {
+        self.old_text = match &old {
+            Loadable::Loaded(value) => Some(edit_text(value)),
+            _ => None,
+        };
+        self.old = old;
+    }
+
+    /// Whether the text differs from the value saves are bound to, compared where it lies:
+    /// a keystroke copies none of it.
+    fn differs(&self, cx: &App) -> bool {
+        let Some(old) = &self.old_text else {
+            return false;
+        };
+        let buffer = self.editor.read(cx).buffer().read(cx).read(cx);
+        let end = buffer.len();
+        if end.0 != old.len() {
+            return true;
+        }
+        let mut rest = old.as_str();
+        for chunk in buffer.text_for_range(MultiBufferOffset(0)..end) {
+            match rest.strip_prefix(chunk) {
+                Some(after) => rest = after,
+                None => return true,
+            }
+        }
+        !rest.is_empty()
+    }
+
+    /// Brings the preview up to the text once typing pauses, or when it is next shown.
+    fn preview_later(&mut self, cx: &mut Context<Self>) {
+        if self.mode == Mode::Edit {
+            self.preview_behind = true;
+            self._preview = None;
+            return;
+        }
+        self._preview = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PREVIEW_AFTER).await;
+            this.update(cx, |this, cx| this.preview_now(cx)).ok();
+        }));
+    }
+
+    fn preview_now(&mut self, cx: &mut Context<Self>) {
+        self.preview_behind = false;
+        let text = self.text(cx);
+        self.preview
+            .update(cx, |preview, cx| preview.replace(text, cx));
+    }
+
+    fn set_mode(&mut self, to: Mode, cx: &mut Context<Self>) {
+        self.mode = to;
+        if to != Mode::Edit && self.preview_behind {
+            self.preview_now(cx);
+        }
+        cx.notify();
     }
 
     /// Reads the node: the value saves are bound to, and the text, unless some was typed.
     fn read(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(schema) = self.schema.clone() else {
-            self.old = Loadable::Failed("The schema is still loading.".into());
+            self.set_old(Loadable::Failed("The schema is still loading.".into()));
             return;
         };
         let query = match builder::node_by_id(&schema, &self.type_name, &self.id) {
             Ok(query) => query,
             Err(error) => {
-                self.old = Loadable::Failed(error.to_string());
+                self.set_old(Loadable::Failed(error.to_string()));
                 return;
             }
         };
-        self.old = Loadable::Loading;
+        self.set_old(Loadable::Loading);
         // The branch the editor saves to, which it keeps while the window moves elsewhere.
         let read = match self.read_at.clone() {
             Some(at) => self
@@ -199,17 +269,17 @@ impl TextEditor {
                         Some(row) => {
                             let value = row.values.get(&property).cloned().unwrap_or(Value::Null);
                             this.label = this.label_from(&row.values);
-                            let text = this.typed.take().unwrap_or_else(|| edit_text(&value));
-                            this.unsaved = text != edit_text(&value);
+                            this.set_old(Loadable::Loaded(value));
+                            let old = this.old_text.clone().unwrap_or_default();
+                            let text = this.typed.take().unwrap_or(old);
+                            this.unsaved = this.old_text.as_ref() != Some(&text);
                             this.set_text(text, window, cx);
-                            this.old = Loadable::Loaded(value);
                         }
-                        None => {
-                            this.old =
-                                Loadable::Failed("This node does not exist on this branch.".into())
-                        }
+                        None => this.set_old(Loadable::Failed(
+                            "This node does not exist on this branch.".into(),
+                        )),
                     },
-                    Err(error) => this.old = Loadable::Failed(error.to_string()),
+                    Err(error) => this.set_old(Loadable::Failed(error.to_string())),
                 }
                 cx.emit(ItemEvent::UpdateTab);
                 cx.notify();
@@ -287,8 +357,8 @@ impl TextEditor {
                 this.state = match result {
                     SaveResult::Saved { .. } => {
                         // Typing while it was written stays unsaved.
-                        this.unsaved = this.text(cx) != edit_text(&new);
-                        this.old = Loadable::Loaded(new);
+                        this.set_old(Loadable::Loaded(new));
+                        this.unsaved = this.differs(cx);
                         // A draft kept for the property elsewhere on the branch written is now
                         // saved too, though the window moved to another branch meanwhile.
                         let key = DraftKey {
@@ -341,12 +411,8 @@ impl TextEditor {
         let dirty = self.is_dirty(cx);
         let mode = self.mode;
         let segment = |id: &'static str, label: &'static str, to: Mode, cx: &mut Context<Self>| {
-            studio_ui::ds::segment(id, label, mode == to, cx).on_click(cx.listener(
-                move |this, _, _, cx| {
-                    this.mode = to;
-                    cx.notify();
-                },
-            ))
+            studio_ui::ds::segment(id, label, mode == to, cx)
+                .on_click(cx.listener(move |this, _, _, cx| this.set_mode(to, cx)))
         };
         let status = match &self.state {
             State::Idle => None,
@@ -706,6 +772,40 @@ mod tests {
             assert_eq!(view.text(cx), "Ada Lovelace");
             assert!(view.is_dirty(cx));
         });
+    }
+
+    /// Typing finds the tab dirty or clean against the value read, a text typed back to it
+    /// included; the preview catches up once typing pauses, and a hidden one when shown.
+    #[gpui::test]
+    async fn typing_is_compared_with_the_value_and_previewed_after_a_pause(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = editor_answering(200, committed("c2", "c1"), cx);
+        let type_text = |text: &'static str, cx: &mut VisualTestContext| {
+            view.update_in(cx, |view, window, cx| {
+                view.editor
+                    .update(cx, |editor, cx| editor.set_text(text, window, cx))
+            });
+            cx.run_until_parked();
+        };
+        let preview = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, cx| view.preview.read(cx).source().to_string())
+        };
+        type_text("Ada", cx);
+        view.read_with(cx, |view, cx| assert!(!view.is_dirty(cx), "typed back"));
+        type_text("Adb", cx);
+        view.read_with(cx, |view, cx| assert!(view.is_dirty(cx), "same length"));
+        assert_eq!(preview(cx), "Ada Lovelace", "not while typing");
+        cx.executor().advance_clock(PREVIEW_AFTER);
+        cx.run_until_parked();
+        assert_eq!(preview(cx), "Adb", "once typing pauses");
+        view.update(cx, |view, cx| view.set_mode(Mode::Edit, cx));
+        type_text("Ada Byron", cx);
+        cx.executor().advance_clock(PREVIEW_AFTER);
+        cx.run_until_parked();
+        assert_eq!(preview(cx), "Adb", "hidden");
+        view.update(cx, |view, cx| view.set_mode(Mode::Split, cx));
+        assert_eq!(preview(cx), "Ada Byron", "shown");
     }
 
     /// A refused save keeps the text and says why (constitution III).
