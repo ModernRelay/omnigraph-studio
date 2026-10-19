@@ -18,6 +18,20 @@ use ui::prelude::*;
 
 pub const STORAGE_KEY: &str = "inspector:storage";
 
+/// The storage tables' columns, sized to the values they hold; a header and its rows share one.
+mod col {
+    pub const GRAPH: f32 = 140.;
+    pub const STATE: f32 = 110.;
+    pub const FLAG: f32 = 60.;
+    pub const ACTION: f32 = 180.;
+    pub const FAILURE: f32 = 160.;
+    pub const KIND: f32 = 56.;
+    pub const TYPE: f32 = 150.;
+    pub const ROWS: f32 = 90.;
+    pub const VERSION: f32 = 80.;
+    pub const NATIVE: f32 = 130.;
+}
+
 pub struct StorageInspector {
     session: Entity<GraphSession>,
     branch: String,
@@ -218,12 +232,12 @@ impl StorageInspector {
         };
         let header = h_flex()
             .gap(px(space::MD))
-            .child(column("Graph", 140.))
-            .child(column("State", 110.))
-            .child(column("Reads", 60.))
-            .child(column("Writes", 60.))
-            .child(column("Action", 180.))
-            .child(column("Failure", 160.))
+            .child(column("Graph", col::GRAPH))
+            .child(column("State", col::STATE))
+            .child(column("Reads", col::FLAG))
+            .child(column("Writes", col::FLAG))
+            .child(column("Action", col::ACTION))
+            .child(column("Failure", col::FAILURE))
             .child(div().flex_1().child(heading("Storage root")))
             .into_any_element();
         let mut all = vec![header];
@@ -258,11 +272,11 @@ impl StorageInspector {
                 h_flex()
                     .gap(px(space::MD))
                     .pt(px(space::MD))
-                    .child(column("Kind", 56.))
-                    .child(column("Type", 150.))
-                    .child(column("Rows", 90.))
-                    .child(column("Version", 80.))
-                    .child(column("Native branch", 130.))
+                    .child(column("Kind", col::KIND))
+                    .child(column("Type", col::TYPE))
+                    .child(column("Rows", col::ROWS))
+                    .child(column("Version", col::VERSION))
+                    .child(column("Native branch", col::NATIVE))
                     .child(div().flex_1().child(heading("Dataset path")))
                     .into_any_element(),
             );
@@ -270,9 +284,9 @@ impl StorageInspector {
                 rows.push(
                     h_flex()
                         .gap(px(space::MD))
-                        .min_h(px(24.))
+                        .min_h(px(studio_ui::ds::size::SIDEBAR_ROW))
                         .child(
-                            div().w(px(56.)).flex_none().child(
+                            div().w(px(col::KIND)).flex_none().child(
                                 Label::new(match dataset.entity_kind {
                                     EntityKind::Node => "node",
                                     EntityKind::Edge => "edge",
@@ -283,7 +297,7 @@ impl StorageInspector {
                         )
                         .child(
                             h_flex()
-                                .w(px(150.))
+                                .w(px(col::TYPE))
                                 .flex_none()
                                 .gap(px(space::SM))
                                 .child(studio_ui::kind_swatch(
@@ -299,16 +313,16 @@ impl StorageInspector {
                                     .plain(),
                                 ),
                         )
-                        .child(div().w(px(90.)).flex_none().child(CopyableValue::new(
+                        .child(div().w(px(col::ROWS)).flex_none().child(CopyableValue::new(
                             ("rows", ix),
                             Some(dataset.entity_count.to_string()),
                         )))
-                        .child(div().w(px(80.)).flex_none().child(CopyableValue::new(
+                        .child(div().w(px(col::VERSION)).flex_none().child(CopyableValue::new(
                             ("version", ix),
                             Some(dataset.published_dataset_version.to_string()),
                         )))
                         .child(
-                            div().w(px(130.)).flex_none().child(CopyableValue::new(
+                            div().w(px(col::NATIVE)).flex_none().child(CopyableValue::new(
                                 ("native", ix),
                                 Some(
                                     dataset
@@ -371,10 +385,10 @@ fn column(text: &'static str, width: f32) -> Div {
 fn kv(label: &'static str, value: CopyableValue) -> AnyElement {
     h_flex()
         .gap(px(space::LG))
-        .min_h(px(24.))
+        .min_h(px(studio_ui::ds::size::SIDEBAR_ROW))
         .child(
             div()
-                .w(px(140.))
+                .w(px(studio_ui::ds::size::FIELD_LABEL))
                 .flex_none()
                 .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
         )
@@ -389,10 +403,10 @@ fn graph_row(ix: usize, graph: &GraphInfo, current: bool) -> AnyElement {
     let yes_no = |b: bool| if b { "yes" } else { "no" };
     h_flex()
         .gap(px(space::MD))
-        .min_h(px(24.))
+        .min_h(px(studio_ui::ds::size::SIDEBAR_ROW))
         .child(
             h_flex()
-                .w(px(140.))
+                .w(px(col::GRAPH))
                 .flex_none()
                 .gap(px(space::XS))
                 .child(CopyableValue::new(
@@ -409,30 +423,30 @@ fn graph_row(ix: usize, graph: &GraphInfo, current: bool) -> AnyElement {
         )
         .child(
             div()
-                .w(px(110.))
+                .w(px(col::STATE))
                 .flex_none()
                 .child(CopyableValue::new(("graph-state", ix), Some(state)).plain()),
         )
         .child(
             div()
-                .w(px(60.))
+                .w(px(col::FLAG))
                 .flex_none()
                 .child(Label::new(yes_no(graph.read_available)).size(LabelSize::Small)),
         )
         .child(
             div()
-                .w(px(60.))
+                .w(px(col::FLAG))
                 .flex_none()
                 .child(Label::new(yes_no(graph.write_available)).size(LabelSize::Small)),
         )
         .child(
             div()
-                .w(px(180.))
+                .w(px(col::ACTION))
                 .flex_none()
                 .child(CopyableValue::new(("graph-action", ix), Some(action)).plain()),
         )
         .child(
-            div().w(px(160.)).flex_none().child(
+            div().w(px(col::FAILURE)).flex_none().child(
                 Label::new(failure.unwrap_or_else(|| "none".into()))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
@@ -480,7 +494,7 @@ fn section(title: &str, error: Option<String>, rows: Vec<AnyElement>, cx: &App) 
 
 impl Render for StorageInspector {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let border = cx.theme().colors().border_variant;
+        let border = studio_ui::ds::surface::rule(cx);
         let graph_id = self.session.read(cx).graph_id.clone();
         let loading = self.snapshot.is_loading();
         let server = self.render_server(cx);

@@ -78,6 +78,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 script/check-layers.py
+      - run: python3 script/check-design-tokens.py
 
   deny:
     runs-on: ubuntu-24.04

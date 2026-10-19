@@ -65,7 +65,7 @@ impl Offers {
     /// The rows: a node by its label with its id after it, a value as itself. `on_pick` runs
     /// on press, before the field loses focus to the click.
     pub fn rows(&self, id: &'static str, on_pick: OnPick, cx: &App) -> Vec<Stateful<Div>> {
-        let highlight = cx.theme().colors().element_selected;
+        let highlight = studio_ui::ds::surface::highlight(cx);
         self.items
             .iter()
             .enumerate()

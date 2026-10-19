@@ -1818,17 +1818,18 @@ impl GraphCanvas {
     // ---- painting ----
 
     fn render_canvas(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
         let palette = paint::Palette {
-            text: colors.text,
-            muted: colors.text_muted,
+            text: Color::Default.color(cx),
+            muted: Color::Muted.color(cx),
             // Chips are white cards in the light theme.
-            card: if cx.theme().appearance.is_light() {
-                gpui::white()
-            } else {
-                colors.elevated_surface_background
-            },
-            border: colors.border_variant,
+            card: studio_ui::ds::surface::solid(cx),
+            border: studio_ui::ds::surface::floating_border(cx),
+            // The canvas paints drop shadows only; a rim would draw as a halo.
+            shadow: studio_ui::ds::elevation::float(cx)
+                .into_iter()
+                .filter(|shadow| !shadow.inset)
+                .collect(),
+            on_tint: studio_ui::ds::surface::on_tint(cx),
             font: theme::theme_settings(cx).ui_font(cx).clone(),
         };
         let scene = self.scene.clone();
@@ -1903,7 +1904,6 @@ impl GraphCanvas {
 
     /// The caption, bottom left: what is drawn, and what a click does.
     fn render_caption(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
         let text = match self.mode {
             Mode::Schema => {
                 let schema = self.session.read(cx).schema_model();
@@ -1939,13 +1939,9 @@ impl GraphCanvas {
             .px(px(space::CONTROL_INSET))
             .py(px(space::XS))
             .rounded(px(studio_ui::ds::radii(cx).bar()))
-            .bg(if cx.theme().appearance.is_light() {
-                gpui::white()
-            } else {
-                colors.elevated_surface_background
-            })
+            .bg(studio_ui::ds::surface::solid(cx))
             .border_1()
-            .border_color(colors.border_variant)
+            .border_color(studio_ui::ds::surface::floating_border(cx))
             .shadow(studio_ui::ds::elevation::float(cx))
             .child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted))
     }
@@ -2363,7 +2359,7 @@ impl Render for GraphCanvas {
                 self.fit(viewport);
             }
         }
-        let background = cx.theme().colors().editor_background;
+        let background = studio_ui::ds::surface::document(cx);
         let canvas = self.render_canvas(window, cx).into_any_element();
         let overlay = self.render_overlay(cx).into_any_element();
         // The area being drawn: a tinted rectangle from where the drag began to the pointer.
@@ -2371,7 +2367,7 @@ impl Render for GraphCanvas {
             .area
             .zip(self.bounds.get())
             .map(|((from, to), bounds)| {
-                let accent = cx.theme().colors().text_accent;
+                let accent = studio_ui::ds::surface::accent(cx);
                 div()
                     .absolute()
                     .left(from.x.min(to.x) - bounds.origin.x)
@@ -2436,7 +2432,7 @@ impl Render for GraphCanvas {
                     anchored()
                         .position(*position)
                         .anchor(gpui::Anchor::TopLeft)
-                        .snap_to_window_with_margin(px(8.))
+                        .snap_to_window_with_margin(px(space::MD))
                         .child(menu.clone()),
                 )
                 .with_priority(1)

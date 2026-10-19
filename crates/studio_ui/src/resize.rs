@@ -69,7 +69,7 @@ pub fn column_resize_handle(
     on_reset: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     cx: &App,
 ) -> Stateful<Div> {
-    let line = cx.theme().colors().border_focused;
+    let line = crate::ds::surface::focus(cx);
     let group = SharedString::from(format!("column-resize-{index}"));
     div()
         .id(("column-resize", index))
@@ -78,13 +78,13 @@ pub fn column_resize_handle(
         .top_0()
         .bottom_0()
         .right_0()
-        .w(px(6.))
+        .w(px(crate::ds::size::RESIZE_HANDLE))
         .cursor_col_resize()
         .flex()
         .justify_end()
         .child(
             div()
-                .w(px(2.))
+                .w(px(crate::ds::size::DRAG_LINE))
                 .h_full()
                 .when(active, |d| d.bg(line))
                 .group_hover(group, |d| d.bg(line)),

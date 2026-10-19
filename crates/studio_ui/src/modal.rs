@@ -6,7 +6,7 @@
 //! The workspace draws the dim and places the card a quarter of the way down the free space
 //! (`studio_workspace`'s modal layer); a modal draws only its card.
 
-use gpui::{AnyElement, App, ClickEvent, Div, ElementId, FontWeight, SharedString, Window};
+use gpui::{AnyElement, App, ClickEvent, Div, ElementId, SharedString, Window};
 use ui::Tooltip;
 use ui::prelude::*;
 
@@ -95,7 +95,7 @@ impl RenderOnce for ModalHeader {
                         div().min_w_0().flex_1().child(
                             Label::new(self.title)
                                 .size(LabelSize::Large)
-                                .weight(FontWeight::SEMIBOLD)
+                                .weight(crate::ds::text::weight::HEADING)
                                 .single_line()
                                 .truncate(),
                         ),

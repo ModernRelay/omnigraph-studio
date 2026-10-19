@@ -525,7 +525,7 @@ impl Render for TextEditor {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::save))
             .size_full()
-            .bg(cx.theme().colors().editor_background)
+            .bg(studio_ui::ds::surface::document(cx))
             .child(self.render_toolbar(cx))
             .child(div().flex_1().min_h_0().child(body))
     }

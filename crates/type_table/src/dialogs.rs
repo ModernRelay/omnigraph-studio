@@ -769,7 +769,6 @@ impl InsertEdgeModal {
             End::From => &self.from,
             End::To => &self.to,
         };
-        let colors = cx.theme().colors();
         let focused = endpoint.editor.focus_handle(cx).is_focused(window);
         let offers = (focused && !endpoint.offers.is_empty()).then(|| {
             let pick = cx.listener(move |this, index: &usize, window, cx| {
@@ -777,9 +776,9 @@ impl InsertEdgeModal {
             });
             studio_ui::ds::row_list(cx)
                 .id(("endpoint-suggestions", end as usize))
-                .max_h(px(208.))
+                .max_h(px(studio_ui::ds::size::LIST_MAX_HEIGHT))
                 .overflow_y_scroll()
-                .border_color(colors.border_variant)
+                .border_color(studio_ui::ds::surface::rule(cx))
                 .children(endpoint.offers.rows(
                     "endpoint-suggestion",
                     Rc::new(move |index, window, cx| pick(&index, window, cx)),
@@ -1233,7 +1232,7 @@ impl DeleteRowModal {
             Loadable::Loaded(plan) => {
                 let hidden = plan.dependents.len().saturating_sub(DEPENDENTS_NAMED);
                 let list = studio_ui::ds::row_list(cx)
-                    .bg(cx.theme().colors().editor_background)
+                    .bg(studio_ui::ds::surface::document(cx))
                     .border_color(studio_ui::ds::surface::floating_border(cx))
                     .children(plan.dependents.iter().take(DEPENDENTS_NAMED).map(|d| {
                         h_flex()

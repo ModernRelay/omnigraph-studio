@@ -555,8 +555,8 @@ impl HistoryView {
         let hover_bg = studio_ui::ds::surface::hover(cx);
         // One accent for the branch's own lane; merged branches' lanes in a quiet grey, so the
         // graph reads as structure, not a palette.
-        let accent = cx.theme().colors().text_accent;
-        let quiet = cx.theme().colors().text_muted.opacity(0.55);
+        let accent = studio_ui::ds::surface::accent(cx);
+        let quiet = Color::Muted.color(cx).opacity(0.55);
         let graph_width = self.graph_width();
         let now = now_micros();
         range
@@ -670,11 +670,14 @@ impl HistoryView {
                             }),
                     )
                     .child(
-                        div().max_w(px(140.)).flex_none().child(
-                            studio_ui::ds::text::meta(actor.unwrap_or_else(|| "—".into()))
-                                .single_line()
-                                .truncate(),
-                        ),
+                        div()
+                            .max_w(px(studio_ui::ds::TAG_MAX_WIDTH))
+                            .flex_none()
+                            .child(
+                                studio_ui::ds::text::meta(actor.unwrap_or_else(|| "—".into()))
+                                    .single_line()
+                                    .truncate(),
+                            ),
                     )
                     .child(
                         h_flex().w(px(WHEN_WIDTH)).flex_none().justify_end().child(
@@ -878,7 +881,7 @@ impl Render for HistoryView {
                     .child(
                         Label::new("History")
                             .size(LabelSize::Default)
-                            .weight(gpui::FontWeight::MEDIUM),
+                            .weight(studio_ui::ds::text::weight::HEADING),
                     )
             })
             .child(studio_ui::ds::meta_row([

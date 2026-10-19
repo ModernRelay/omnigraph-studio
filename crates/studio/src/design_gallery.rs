@@ -64,7 +64,6 @@ fn section(title: &'static str, body: impl IntoElement) -> Div {
 
 impl Render for DesignGallery {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
         let glass = ds::is_glass(cx);
         let focus = self.focus_handle.clone();
 
@@ -86,8 +85,8 @@ impl Render for DesignGallery {
                     .child(
                         div()
                             .size(px(value))
-                            .rounded(px(2.))
-                            .bg(colors.text_accent.opacity(0.35)),
+                            .rounded(px(space::XXS))
+                            .bg(surface::accent(cx).opacity(0.35)),
                     )
                     .child(text::meta(format!("{name} {value}")))
             }),
@@ -107,11 +106,11 @@ impl Render for DesignGallery {
                     .items_center()
                     .child(
                         div()
-                            .size(px(40.))
+                            .size(px(size::STRIP))
                             .rounded(px(value))
                             .border_1()
-                            .border_color(colors.border)
-                            .bg(colors.editor_background),
+                            .border_color(surface::control_border(cx))
+                            .bg(surface::document(cx)),
                     )
                     .child(text::meta(format!("{name} {value}")))
             }),
@@ -122,7 +121,7 @@ impl Render for DesignGallery {
                 .items_center()
                 .child(
                     div()
-                        .size(px(56.))
+                        .size(px(2. * size::CONTROL))
                         .rounded(px(radii(cx).md))
                         .bg(fill)
                         .border_1()
@@ -133,8 +132,8 @@ impl Render for DesignGallery {
         };
         let surfaces = h_flex()
             .gap(px(space::XL))
-            .child(swatch("chrome", colors.panel_background, false))
-            .child(swatch("document", colors.editor_background, false))
+            .child(swatch("chrome", surface::chrome(cx), false))
+            .child(swatch("document", surface::document(cx), false))
             .child(swatch("sunken", surface::sunken(cx), false))
             .child(swatch("hover", surface::hover(cx), false))
             .child(swatch(
@@ -175,7 +174,7 @@ impl Render for DesignGallery {
                 if glass {
                     d.bg(surface::page(cx)).child(ds::wash())
                 } else {
-                    d.bg(colors.panel_background)
+                    d.bg(surface::chrome(cx))
                         .border_1()
                         .border_color(surface::rule(cx))
                 }
@@ -444,13 +443,13 @@ impl Render for DesignGallery {
         let feed = if glass { ds::sheet(cx) } else { ds::card(cx) }.children(feed_rows);
 
         let empty = div()
-            .h(px(240.))
+            .h(px(size::PREVIEW_MAX_HEIGHT))
             .rounded(px(radii(cx).md))
             .border_1()
             .border_color(surface::rule(cx))
             .child(
                 ds::empty_state(IconName::Sparkle, "No tab open").child(
-                    div().w(px(220.)).child(
+                    div().w(px(size::STATE_ACTIONS)).child(
                         studio_ui::ds::button("g-search", "Search")
                             .full_width()
                             .style(ButtonStyle::Outlined)
@@ -466,7 +465,7 @@ impl Render for DesignGallery {
         // What a view shows instead of its content: reading it, and failing to.
         let state_frame = || {
             div()
-                .h(px(160.))
+                .h(px(size::PREVIEW_MAX_HEIGHT))
                 .rounded(px(radii(cx).md))
                 .border_1()
                 .border_color(surface::rule(cx))
@@ -475,11 +474,11 @@ impl Render for DesignGallery {
             .gap(px(space::LG))
             .child(
                 state_frame()
-                    .w(px(360.))
+                    .w(px(size::STATE_DETAIL_WIDTH))
                     .child(ds::loading_state("Reading Person…")),
             )
             .child(
-                state_frame().w(px(360.)).child(
+                state_frame().w(px(size::STATE_DETAIL_WIDTH)).child(
                     ds::error_state(
                         "Person could not be read",
                         "Could not reach the server: the connection was refused",
@@ -506,17 +505,20 @@ impl Render for DesignGallery {
         let ticks = h_flex()
             .gap(px(space::MD))
             .children(tick_colors.into_iter().map(|status| {
-                div().w(px(1.5)).h(px(8.)).bg(match status {
-                    Some(status) => surface::status(status),
-                    None => surface::rule(cx),
-                })
+                div()
+                    .w(px(size::DRAG_LINE))
+                    .h(px(space::MD))
+                    .bg(match status {
+                        Some(status) => surface::status(status),
+                        None => surface::rule(cx),
+                    })
             }));
         let card_a = ds::card(cx)
             .p(px(space::LG))
             .gap(px(space::MD))
             .child(ds::tile(IconName::Folder, cx))
             .child(div().h(px(space::XL)))
-            .child(text::body("Saved queries").weight(gpui::FontWeight::MEDIUM))
+            .child(text::body("Saved queries").weight(studio_ui::ds::text::weight::HEADING))
             .child(ds::meta_row([
                 text::meta("4 queries").into_any_element(),
                 h_flex()
@@ -536,7 +538,7 @@ impl Render for DesignGallery {
             .child(ds::tile(IconName::Code, cx))
             .child(
                 v_flex()
-                    .child(text::body("People without a company").weight(gpui::FontWeight::MEDIUM))
+                    .child(text::body("People without a company").weight(studio_ui::ds::text::weight::HEADING))
                     .child(text::muted("Every Person with no WorksAt edge").single_line()),
             )
             .child(ticks)
@@ -561,8 +563,12 @@ impl Render for DesignGallery {
                     .px(px(space::LG))
                     .gap(px(space::LG))
                     .child(ds::number_badge(n.to_string(), hue))
-                    .child(div().w(px(160.)).child(text::body(subject)))
-                    .child(div().w(px(120.)).child(text::muted(property)))
+                    .child(
+                        div()
+                            .w(px(size::FIELD_LABEL_WIDE))
+                            .child(text::body(subject)),
+                    )
+                    .child(div().w(px(size::FIELD_LABEL)).child(text::muted(property)))
                     .child(text::body(value));
                 if index < 2 {
                     ds::row_rule(row, cx)
@@ -576,13 +582,13 @@ impl Render for DesignGallery {
             .child(ds::section_rule("Today", cx))
             .child(
                 h_flex()
-                    .h(px(36.))
+                    .h(px(size::FEED_ROW))
                     .px(px(space::LG))
                     .gap(px(space::SM))
                     .rounded(px(radii(cx).md))
                     .border_1()
                     .border_color(surface::raised_border(cx))
-                    .bg(colors.editor_background)
+                    .bg(surface::document(cx))
                     .child(
                         Icon::new(IconName::Plus)
                             .size(IconSize::XSmall)
@@ -630,7 +636,7 @@ impl Render for DesignGallery {
                             .w(px(size::GUTTER))
                             .flex()
                             .justify_center()
-                            .pt(px(4.))
+                            .pt(px(space::XS))
                             .child(
                                 Icon::new(IconName::Person)
                                     .size(IconSize::Small)
@@ -764,7 +770,7 @@ impl Render for DesignGallery {
             .child(
                 ds::modal_body().child(
                     ds::row_list(cx)
-                        .bg(colors.editor_background)
+                        .bg(surface::document(cx))
                         .border_color(surface::floating_border(cx))
                         .child(
                             h_flex()
@@ -794,7 +800,7 @@ impl Render for DesignGallery {
 
         // A context menu (spec 002, "Menus"): a group header, rows, the highlighted row, a
         // checked one, a disabled one, and a separator.
-        let menu = ds::menu_surface(v_flex().w(px(240.)).p(px(space::XS)), cx)
+        let menu = ds::menu_surface(v_flex().w(px(size::STATE_ACTIONS)).p(px(space::XS)), cx)
             .child(ds::menu_header("Row".into()))
             .child(
                 ds::MenuRow::new("g-menu-peek")
@@ -848,16 +854,25 @@ impl Render for DesignGallery {
                     .child(
                         v_flex()
                             .gap(px(space::XXXL))
-                            .child(section("Table and footer", div().w(px(720.)).child(table)))
-                            .child(section("Dock tabs", div().w(px(340.)).child(dock_tabs))),
+                            .child(section(
+                                "Table and footer",
+                                div().w(px(size::READING_WIDTH)).child(table),
+                            ))
+                            .child(section(
+                                "Dock tabs",
+                                div().w(px(size::INSPECTOR_WIDTH)).child(dock_tabs),
+                            )),
                     ),
             )
             .child(
                 h_flex()
                     .gap(px(space::XXXL))
                     .items_start()
-                    .child(section("Card", div().w(px(520.)).child(card)))
-                    .child(section("Empty state", div().w(px(360.)).child(empty))),
+                    .child(section("Card", div().w(px(size::MODAL_WIDTH)).child(card)))
+                    .child(section(
+                        "Empty state",
+                        div().w(px(size::STATE_DETAIL_WIDTH)).child(empty),
+                    )),
             )
             .child(section("Buttons", buttons))
             .child(
@@ -870,24 +885,36 @@ impl Render for DesignGallery {
             .child(section("Loading and error states", states))
             .child(section(
                 "Settings rows · segmented control",
-                div().w(px(720.)).child(settings_rows),
+                div().w(px(size::READING_WIDTH)).child(settings_rows),
             ))
             .child(
                 h_flex()
                     .gap(px(space::XXXL))
                     .items_start()
-                    .child(section("Card · folder", div().w(px(300.)).child(card_a)))
+                    .child(section(
+                        "Card · folder",
+                        div().w(px(size::SIDEBAR_WIDTH)).child(card_a),
+                    ))
                     .child(section(
                         "Card · saved query",
-                        div().w(px(300.)).child(card_b),
+                        div().w(px(size::SIDEBAR_WIDTH)).child(card_b),
                     ))
-                    .child(section("Agent prompt", div().w(px(520.)).child(composer))),
+                    .child(section(
+                        "Agent prompt",
+                        div().w(px(size::MODAL_WIDTH)).child(composer),
+                    )),
             )
-            .child(section("Timeline", div().w(px(820.)).child(timeline)))
-            .child(section("Activity", div().w(px(760.)).child(feed)))
+            .child(section(
+                "Timeline",
+                div().w(px(size::READING_WIDTH)).child(timeline),
+            ))
+            .child(section(
+                "Activity",
+                div().w(px(size::READING_WIDTH)).child(feed),
+            ))
             .child(section(
                 "Callout",
-                div().w(px(520.)).child(
+                div().w(px(size::MODAL_WIDTH)).child(
                     Callout::new()
                         .severity(Severity::Error)
                         .icon(IconName::XCircle)

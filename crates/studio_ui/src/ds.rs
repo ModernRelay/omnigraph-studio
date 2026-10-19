@@ -197,16 +197,60 @@ pub mod size {
     pub const INSPECTOR_WIDTH: f32 = 340.;
     /// The widest a state's detail line runs before it wraps (`state_detail`).
     pub const STATE_DETAIL_WIDTH: f32 = 360.;
-    /// Width of a field's label column.
+    /// Width of a field's label column: a dialog's, an inspector's properties, storage's facts.
     pub const FIELD_LABEL: f32 = 112.;
+    /// A label column on a page, which reads at a document's width.
+    pub const FIELD_LABEL_WIDE: f32 = 160.;
     /// The gap around and between glass sheets.
     pub const SHEET_GAP: f32 = 8.;
+    /// The hit area of a divider that resizes a dock or a split, centred on its line.
+    pub const RESIZE_HANDLE: f32 = 6.;
+    /// The column of an empty state's actions.
+    pub const STATE_ACTIONS: f32 = 240.;
     /// A disclosure chevron (`IconSize::XSmall`).
     pub const DISCLOSURE: f32 = 12.;
     /// A status or type dot.
     pub const DOT: f32 = 7.;
     /// A tag, a count badge, a write target: the small chips inside rows and headers.
     pub const TAG: f32 = 18.;
+    /// A line being dragged (a column's or a dock's new edge).
+    pub const DRAG_LINE: f32 = 2.;
+    /// A coloured line down an item's leading edge: a change card's kind.
+    pub const ACCENT_LINE: f32 = 2.;
+    /// The tallest a preview (an image, a document's first page) shows before it opens.
+    pub const PREVIEW_MAX_HEIGHT: f32 = 240.;
+    /// A short label before a value ("From", "To").
+    pub const SHORT_LABEL: f32 = 40.;
+    /// The tallest a modal grows before its body scrolls.
+    pub const MODAL_MAX_HEIGHT: f32 = 560.;
+    /// A type mark's initial (the 16 px mark), in its own small size.
+    pub const MARK_TEXT: f32 = 9.;
+    /// A new window's size when none was remembered.
+    pub const WINDOW_WIDTH: f32 = 1440.;
+    pub const WINDOW_HEIGHT: f32 = 900.;
+    /// The least a code editor shrinks to when results share its column.
+    pub const EDITOR_MIN_HEIGHT: f32 = 120.;
+    /// A small gauge or spinner beside small text, and its stroke.
+    pub const GAUGE: f32 = 14.;
+    pub const GAUGE_STROKE: f32 = 2.;
+    /// A document's own navigation column (the settings' sections).
+    pub const NAV: f32 = 200.;
+    /// A stepper's value between its − and +: two controls wide.
+    pub const STEPPER_VALUE: f32 = 2. * CONTROL;
+    /// A wide field or an inline preview of a long value (a command line).
+    pub const FIELD_WIDE: f32 = 320.;
+    /// A narrow field in a bar (a filter's value).
+    pub const FIELD_NARROW: f32 = 180.;
+    /// A field in a bar or a row (a bulk edit's value, a setting's text).
+    pub const FIELD: f32 = 220.;
+    /// A popover's narrowest and widest: a field's offers, a cell's notice.
+    pub const POPOVER_MIN: f32 = 220.;
+    pub const POPOVER_MAX: f32 = 420.;
+    /// The tallest a list in a popover or a dialog grows before it scrolls.
+    pub const LIST_MAX_HEIGHT: f32 = 240.;
+    /// The widest a reading column or a floating bar over one grows: settings, a page, the
+    /// table's drafts bar.
+    pub const READING_WIDTH: f32 = 720.;
     /// A hairline border's width. A border sits inside its box, so it is part of the gap
     /// between a surface's edge and its children's (`radius::within`, `radius::around`).
     pub const HAIRLINE: f32 = 1.;
@@ -364,6 +408,108 @@ pub mod surface {
     /// The glass window's base, under [`super::wash`].
     pub fn page(cx: &App) -> Hsla {
         cx.theme().colors().editor_background
+    }
+
+    /// The window's own fill when flat, behind the columns.
+    pub fn window(cx: &App) -> Hsla {
+        cx.theme().colors().background
+    }
+
+    /// The active tab: clear on glass, the document's fill when flat, so it joins the document.
+    pub fn tab_active(cx: &App) -> Hsla {
+        if is_glass(cx) {
+            gpui::transparent_black()
+        } else {
+            cx.theme().colors().editor_background
+        }
+    }
+
+    /// An inactive tab: barely shaded on glass, the tab strip's tint when flat.
+    pub fn tab_inactive(cx: &App) -> Hsla {
+        if is_glass(cx) {
+            gpui::black().opacity(0.025)
+        } else {
+            cx.theme().colors().tab_bar_background.opacity(0.35)
+        }
+    }
+
+    /// A pane's header strip: clear on glass, the sunken tint when flat.
+    pub fn header_strip(cx: &App) -> Hsla {
+        if is_glass(cx) {
+            gpui::transparent_black()
+        } else {
+            sunken(cx)
+        }
+    }
+
+    /// The document's own fill: a table, a query, a page, a solid card or field on glass.
+    pub fn document(cx: &App) -> Hsla {
+        cx.theme().colors().editor_background
+    }
+
+    /// The fill of the window's chrome when flat: the docks and their panels.
+    pub fn chrome(cx: &App) -> Hsla {
+        cx.theme().colors().panel_background
+    }
+
+    /// The status bar's fill.
+    pub fn status_bar(cx: &App) -> Hsla {
+        cx.theme().colors().status_bar_background
+    }
+
+    /// Where a dragged tab or column will land.
+    pub fn drop_target(cx: &App) -> Hsla {
+        cx.theme().colors().drop_target_background
+    }
+
+    /// A control's hairline: an outlined field or chip (10 % ink, as an outline button's).
+    pub fn control_border(cx: &App) -> Hsla {
+        cx.theme().colors().text.opacity(0.1)
+    }
+
+    /// The focused control's ring, and a line being dragged (a column's new width).
+    pub fn focus(cx: &App) -> Hsla {
+        cx.theme().colors().border_focused
+    }
+
+    /// The accent: a selection on the canvas, the commit a view stands on.
+    pub fn accent(cx: &App) -> Hsla {
+        cx.theme().colors().text_accent
+    }
+
+    /// A bar that asks before something irreversible (a write the agent prepared): the theme's
+    /// warning fill and hairline.
+    pub fn warning(cx: &App) -> Hsla {
+        cx.theme().status().warning_background
+    }
+
+    pub fn warning_border(cx: &App) -> Hsla {
+        cx.theme().status().warning_border
+    }
+
+    /// The hairline of a field or chip that refuses its value.
+    pub fn error_border(cx: &App) -> Hsla {
+        cx.theme().status().error_border
+    }
+
+    /// A page of a document (a PDF's page): paper white in either theme.
+    pub fn paper(_cx: &App) -> Hsla {
+        gpui::white()
+    }
+
+    /// Text on a solid tint (a type mark's initial, a solid button's label): white.
+    pub fn on_tint(_cx: &App) -> Hsla {
+        gpui::white()
+    }
+
+    /// A solid item floating over a document or the canvas (a bar over a table, a chip on the
+    /// canvas): white in the light theme, the elevated surface in a dark one.
+    pub fn solid(cx: &App) -> Hsla {
+        if cx.theme().appearance.is_light() {
+            gpui::white()
+        } else {
+            cx.theme().colors().elevated_surface_background
+        }
     }
 }
 
@@ -531,8 +677,19 @@ pub fn wash() -> Div {
 pub mod text {
     use super::*;
 
+    /// Font weights by role. Inter's heavier cuts read heavy at Studio's sizes, so there are
+    /// two: the body's, for everything that is read (rows, buttons, segments, a key column),
+    /// and the heading's, for what names a surface (a toolbar's, a page's or a dialog's title,
+    /// a tree's root, a card's subject).
+    pub mod weight {
+        use gpui::FontWeight;
+
+        pub const BODY: FontWeight = FontWeight::NORMAL;
+        pub const HEADING: FontWeight = FontWeight::MEDIUM;
+    }
+
     pub fn title(text: impl Into<SharedString>) -> Label {
-        Label::new(text.into()).weight(gpui::FontWeight::MEDIUM)
+        Label::new(text.into()).weight(weight::HEADING)
     }
 
     pub fn body(text: impl Into<SharedString>) -> Label {
@@ -549,6 +706,16 @@ pub mod text {
         Label::new(text.into())
             .size(LabelSize::XSmall)
             .color(Color::Muted)
+    }
+
+    /// A page's title size: the one large heading a node's page carries.
+    pub fn page_title_size() -> LabelSize {
+        LabelSize::Custom(rems_from_px(22_f32))
+    }
+
+    /// A labelled control's icon beside its label: 80 % of the label's ink, as a button's.
+    pub fn icon_ink(cx: &App) -> Color {
+        Color::Custom(cx.theme().colors().text.opacity(0.8))
     }
 
     pub fn code(text: impl Into<SharedString>, cx: &App) -> Label {
@@ -847,6 +1014,40 @@ pub fn toolbar_button(id: impl Into<ElementId>, label: impl Into<SharedString>) 
 /// An icon button in a document's toolbar, beside [`toolbar_button`]s.
 pub fn toolbar_icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButton {
     icon_button(id, icon).size(ButtonSize::Default)
+}
+
+/// A toast's surface: on glass a small floating glass surface, like the canvas's bars; flat,
+/// the floating fill, hairline and shadow.
+pub fn toast_surface<E: Styled>(element: E, cx: &App) -> E {
+    if is_glass(cx) {
+        element
+            .bg(surface::glass(
+                cx.theme().colors().elevated_surface_background,
+                0.9,
+                cx,
+            ))
+            .shadow(elevation::float(cx))
+    } else {
+        element
+            .bg(surface::floating(cx))
+            .border_1()
+            .border_color(surface::floating_border(cx))
+            .shadow(elevation::floating(cx))
+    }
+}
+
+/// What follows the pointer while a tab or a column is dragged: a small solid chip.
+pub fn drag_preview(cx: &App) -> Div {
+    h_flex()
+        .px(px(space::MD))
+        .py(px(space::XS))
+        .gap(px(space::MD))
+        .items_center()
+        .rounded(px(radii(cx).sm))
+        .bg(surface::floating(cx))
+        .border_1()
+        .border_color(surface::floating_border(cx))
+        .shadow(elevation::float(cx))
 }
 
 /// A toolbar's buttons, set close: a ghost button's own padding is the space between them.
@@ -1207,7 +1408,7 @@ pub fn segment(
         .child(
             Label::new(label.into())
                 .size(LabelSize::Small)
-                .when(selected, |label| label.weight(gpui::FontWeight::MEDIUM))
+                .weight(text::weight::BODY)
                 .color(if selected {
                     Color::Default
                 } else {
@@ -1828,7 +2029,7 @@ impl RenderOnce for TimelineEntry {
             .children(self.lead)
             .child(
                 text::body(self.subject)
-                    .weight(gpui::FontWeight::MEDIUM)
+                    .weight(text::weight::HEADING)
                     .single_line(),
             )
             .child(text::muted(self.verb).single_line())

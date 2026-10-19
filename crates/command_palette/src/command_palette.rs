@@ -1027,7 +1027,7 @@ impl Render for CommandPalette {
             .child(
                 div()
                     .rounded(px(radii(cx).palette_list()))
-                    .bg(cx.theme().colors().editor_background)
+                    .bg(surface::document(cx))
                     .border_1()
                     .border_color(surface::floating_border(cx))
                     .shadow(elevation::raised(cx))

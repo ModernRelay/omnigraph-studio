@@ -21,8 +21,15 @@ pub(crate) struct Palette {
     pub card: Hsla,
     /// The chip hairline.
     pub border: Hsla,
+    /// A chip's shadow, the design system's floating one.
+    pub shadow: Vec<BoxShadow>,
+    /// A type mark's letter on its tint.
+    pub on_tint: Hsla,
     pub font: Font,
 }
+
+/// The dot grid's dots, across.
+const GRID_DOT: f32 = 1.2;
 
 /// A chip's text size at zoom 1, and a hub's or "+K more"'s.
 const CHIP_TEXT: f32 = 13.;
@@ -168,8 +175,8 @@ pub(crate) enum Role {
 impl Role {
     pub(crate) fn weight(self) -> FontWeight {
         match self {
-            Role::RootName => FontWeight::MEDIUM,
-            _ => FontWeight::NORMAL,
+            Role::RootName => studio_ui::ds::text::weight::HEADING,
+            _ => studio_ui::ds::text::weight::BODY,
         }
     }
 }
@@ -433,7 +440,7 @@ pub(crate) fn paint(
             let pieces = [Piece {
                 text: label.clone(),
                 color: palette.muted.opacity(alpha),
-                weight: FontWeight::NORMAL,
+                weight: studio_ui::ds::text::weight::BODY,
             }];
             paint_pill(
                 at,
@@ -680,8 +687,11 @@ fn paint_dots(bounds: Bounds<Pixels>, palette: &Palette, window: &mut Window) {
         let mut x = (left / DOT_STEP).ceil() * DOT_STEP;
         while x < f32::from(bounds.right()) {
             window.paint_quad(quad(
-                Bounds::new(point(px(x - 0.6), px(y - 0.6)), size(px(1.2), px(1.2))),
-                px(0.6),
+                Bounds::new(
+                    point(px(x - GRID_DOT / 2.), px(y - GRID_DOT / 2.)),
+                    size(px(GRID_DOT), px(GRID_DOT)),
+                ),
+                px(GRID_DOT / 2.),
                 color,
                 px(0.),
                 color,
@@ -765,26 +775,7 @@ fn paint_pill(
         );
     }
     if style.shadow {
-        window.paint_drop_shadows(
-            rect,
-            radius,
-            &[
-                BoxShadow {
-                    color: gpui::black().opacity(0.05),
-                    offset: point(px(0.), px(1.)),
-                    blur_radius: px(2.),
-                    spread_radius: px(0.),
-                    inset: false,
-                },
-                BoxShadow {
-                    color: gpui::black().opacity(0.08),
-                    offset: point(px(0.), px(4.)),
-                    blur_radius: px(10.),
-                    spread_radius: px(-4.),
-                    inset: false,
-                },
-            ],
-        );
+        window.paint_drop_shadows(rect, radius, &palette.shadow);
     }
     window.paint_quad(quad(
         rect,
@@ -826,7 +817,7 @@ fn shape_letter(
     window: &mut Window,
 ) -> ShapedLine {
     let font = Font {
-        weight: FontWeight::SEMIBOLD,
+        weight: studio_ui::ds::text::weight::HEADING,
         ..palette.font.clone()
     };
     window.text_system().shape_line(
@@ -835,7 +826,7 @@ fn shape_letter(
         &[TextRun {
             len: letter.len(),
             font,
-            color: gpui::white().opacity(alpha),
+            color: palette.on_tint.opacity(alpha),
             background_color: None,
             underline: None,
             strikethrough: None,

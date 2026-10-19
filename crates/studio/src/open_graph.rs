@@ -265,8 +265,9 @@ impl OpenGraphModal {
 
     fn render_servers(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let connections = ConnectionRegistry::global(cx).read(cx).connections.clone();
+        // A third of the wide modal; the graphs take the rest.
         v_flex()
-            .w(px(240.))
+            .w(px(size::MODAL_WIDE / 3.))
             .flex_none()
             .gap(px(space::XXS))
             .child(pane_label("Servers"))
@@ -540,7 +541,7 @@ impl Render for OpenGraphModal {
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.confirm(window, cx)))
             .w(px(size::MODAL_WIDE))
-            .max_h(px(560.))
+            .max_h(px(size::MODAL_MAX_HEIGHT))
             .child(
                 ds::ModalHeader::new("Open a graph")
                     .description(SharedString::from(
@@ -557,7 +558,7 @@ impl Render for OpenGraphModal {
                             .child(servers)
                             .child(
                                 div()
-                                    .w_px()
+                                    .w(px(size::HAIRLINE))
                                     .self_stretch()
                                     .bg(ds::surface::floating_border(cx)),
                             )

@@ -508,8 +508,8 @@ impl BlobView {
                     .h(h)
                     // Transparent pixels show a checkerboard, as Zed's viewer does.
                     .bg(checkerboard(
-                        cx.theme().colors().panel_background,
-                        8. * scale.max(0.5),
+                        ds::surface::chrome(cx),
+                        ds::space::MD * scale.max(0.5),
                     ))
                     .border_1()
                     .border_color(ds::surface::rule(cx))
@@ -594,10 +594,10 @@ impl BlobView {
                     .flex_none()
                     .w(px(width))
                     .h(px(height))
-                    .bg(gpui::white())
+                    .bg(ds::surface::paper(cx))
                     .border_1()
                     .border_color(ds::surface::rule(cx))
-                    .shadow_sm()
+                    .shadow(ds::elevation::raised(cx))
                     .child(img(image.source()).size_full())
             }))
             .when(count > pages.len(), |list| {
@@ -990,7 +990,7 @@ impl Render for BlobView {
             .on_action(cx.listener(Self::actual_size))
             .on_action(cx.listener(Self::fit))
             .size_full()
-            .bg(cx.theme().colors().editor_background)
+            .bg(studio_ui::ds::surface::document(cx))
             .child(body)
     }
 }

@@ -1997,8 +1997,7 @@ impl Workspace {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        let panel = colors.panel_background;
+        let panel = studio_ui::ds::surface::chrome(cx);
         let hairline = studio_ui::ds::surface::rule(cx);
         // The column's header is its panel's own, as a Zed panel draws its header: the panel's
         // title and its buttons. Panels are switched, and the sidebar shown and hidden, from
@@ -2334,19 +2333,14 @@ impl Workspace {
     /// joined to the content below it. Pinned tabs come first with a pin; a preview tab's title
     /// is in italics until it is kept (a double click, or work in it).
     fn render_tabs(&self, pane_id: PaneId, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
         // In the glass style the tab strip is part of the sheet: the active tab is clear and the
         // others are barely shaded.
-        let (editor_bg, inactive_bg) = if studio_ui::ds::is_glass(cx) {
-            (gpui::transparent_black(), gpui::black().opacity(0.025))
-        } else {
-            (
-                colors.editor_background,
-                colors.tab_bar_background.opacity(0.35),
-            )
-        };
+        let (editor_bg, inactive_bg) = (
+            studio_ui::ds::surface::tab_active(cx),
+            studio_ui::ds::surface::tab_inactive(cx),
+        );
         let hairline = studio_ui::ds::surface::rule(cx);
-        let hover_bg = colors.ghost_element_hover;
+        let hover_bg = studio_ui::ds::surface::highlight(cx);
         let split = self.panes.len() > 1;
         let focused_pane = pane_id == self.active_pane;
         let in_corner = first_tab_in_sheet_corner(
@@ -2359,7 +2353,7 @@ impl Workspace {
         let Some(pane) = self.pane(pane_id) else {
             return h_flex().into_any_element();
         };
-        let drop_bg = colors.drop_target_background;
+        let drop_bg = studio_ui::ds::surface::drop_target(cx);
         // Tabs past the strip's width scroll, as Zed's do; the active tab is brought into view
         // when it changes.
         let scroll = self
@@ -2458,7 +2452,7 @@ impl Workspace {
                                     .bottom_0()
                                     .left_0()
                                     .w_full()
-                                    .h(px(1.))
+                                    .h(px(studio_ui::ds::size::HAIRLINE))
                                     .bg(hairline),
                             )
                     })
@@ -2544,7 +2538,8 @@ impl Workspace {
                 div()
                     .id(SharedString::from(format!("tabs-end-{pane_id}")))
                     .flex_1()
-                    .min_w(px(24.))
+                    // A strip full of tabs keeps a gutter to drop on.
+                    .min_w(px(studio_ui::ds::size::GUTTER))
                     .h_full()
                     .border_b_1()
                     .border_color(hairline)
@@ -2559,12 +2554,7 @@ impl Workspace {
     /// A pane's header strip, as Zed's tab bar starts: Back and Forward for this pane, then its
     /// tabs. The top-left pane makes room for the traffic lights when the sidebar is hidden.
     fn render_pane_header(&self, pane_id: PaneId, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        let header_bg = if studio_ui::ds::is_glass(cx) {
-            gpui::transparent_black()
-        } else {
-            colors.editor_background.blend(gpui::black().opacity(0.02))
-        };
+        let header_bg = studio_ui::ds::surface::header_strip(cx);
         let hairline = studio_ui::ds::surface::rule(cx);
         let top_left = self.center.top_left() == pane_id;
         let zoomed = self.zoomed == Some(Zoomed::Pane(pane_id));
@@ -2739,7 +2729,7 @@ impl Workspace {
         };
         // A tab dragged over the content: near an edge it splits the pane that way, as Zed's
         // drop targets (a fifth of the shorter side); elsewhere it moves into this pane.
-        let drop_bg = cx.theme().colors().drop_target_background;
+        let drop_bg = studio_ui::ds::surface::drop_target(cx);
         let overlay = self
             .drop_target
             .filter(|(target, _)| *target == pane_id && cx.has_active_drag())
@@ -2906,7 +2896,7 @@ impl Workspace {
         footer: Option<ItemFooter>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let status_background = cx.theme().colors().status_bar_background;
+        let status_background = studio_ui::ds::surface::status_bar(cx);
         let glass = studio_ui::ds::is_glass(cx);
         let hairline = studio_ui::ds::surface::rule(cx);
         let mut footer = footer.unwrap_or_default();
@@ -3060,7 +3050,7 @@ impl Workspace {
                             // As a button's icon: 80 % of the label's ink.
                             Icon::new(IconName::DatabaseZap)
                                 .size(IconSize::XSmall)
-                                .color(Color::Custom(cx.theme().colors().text.opacity(0.8))),
+                                .color(studio_ui::ds::text::icon_ink(cx)),
                         )
                         .when(unavailable.is_some(), |button| {
                             button.child(Indicator::dot().color(Color::Warning))
@@ -3122,7 +3112,7 @@ impl Workspace {
         bottom: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let editor_background = cx.theme().colors().editor_background;
+        let editor_background = studio_ui::ds::surface::document(cx);
         let center = self.center.clone();
         let body =
             div()
@@ -3154,7 +3144,7 @@ impl Workspace {
         let panel = self.bottom.active_panel()?;
         let glass = studio_ui::ds::is_glass(cx);
         let hairline = studio_ui::ds::surface::rule(cx);
-        let panel_background = cx.theme().colors().panel_background;
+        let panel_background = studio_ui::ds::surface::chrome(cx);
         let column = if glass && alone {
             studio_ui::ds::sheet(cx)
         } else {
@@ -3287,16 +3277,15 @@ impl Workspace {
                     .into_any_element()
             }
         };
-        let colors = cx.theme().colors();
         Some(
             v_flex()
                 .id("zoomed")
                 .debug_selector(|| "zoomed".into())
                 .absolute()
                 .inset(px(ZOOM_INSET))
-                .bg(colors.editor_background)
+                .bg(studio_ui::ds::surface::document(cx))
                 .border_1()
-                .border_color(colors.border)
+                .border_color(studio_ui::ds::surface::floating_border(cx))
                 .rounded(px(studio_ui::ds::radii(cx).lg))
                 .shadow(studio_ui::ds::elevation::float(cx))
                 .overflow_hidden()
@@ -3324,19 +3313,23 @@ impl Workspace {
         };
         if self.session.is_none() {
             return studio_ui::ds::empty_state(IconName::Server, "No graph open")
-                .child(div().w(px(240.)).child(action_button(
-                    "open-graph",
-                    "Open a graph",
-                    IconName::FolderOpen,
-                    Box::new(studio_actions::workspace::OpenGraph),
-                    cx,
-                )))
+                .child(
+                    div()
+                        .w(px(studio_ui::ds::size::STATE_ACTIONS))
+                        .child(action_button(
+                            "open-graph",
+                            "Open a graph",
+                            IconName::FolderOpen,
+                            Box::new(studio_actions::workspace::OpenGraph),
+                            cx,
+                        )),
+                )
                 .into_any_element();
         }
         studio_ui::ds::empty_state(IconName::Sparkle, "No tab open")
             .child(
                 v_flex()
-                    .w(px(240.))
+                    .w(px(studio_ui::ds::size::STATE_ACTIONS))
                     .gap(px(studio_ui::ds::space::XS))
                     .child(action_button(
                         "search",
@@ -3375,7 +3368,7 @@ impl Workspace {
             return None;
         }
         let panel = self.panel_body(self.right.active_panel()?);
-        let editor_background = cx.theme().colors().editor_background;
+        let editor_background = studio_ui::ds::surface::document(cx);
         let hairline = studio_ui::ds::surface::rule(cx);
         let column = if studio_ui::ds::is_glass(cx) {
             studio_ui::ds::sheet(cx)
@@ -3428,7 +3421,6 @@ impl Workspace {
     }
 
     fn render_toasts(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
         // Under the header strips, so a toast never covers a document's footer or composer.
         v_flex()
             .absolute()
@@ -3453,26 +3445,9 @@ impl Workspace {
                     .gap(px(studio_ui::ds::space::MD))
                     .px(px(studio_ui::ds::space::LG))
                     .py(px(studio_ui::ds::space::MD))
-                    .max_w(px(420.))
+                    .max_w(px(studio_ui::ds::size::POPOVER_MAX))
                     .rounded(px(studio_ui::ds::radii(cx).md))
-                    .map(|toast| {
-                        if studio_ui::ds::is_glass(cx) {
-                            // A small floating glass surface, like the canvas's pills.
-                            toast
-                                .bg(studio_ui::ds::surface::glass(
-                                    colors.elevated_surface_background,
-                                    0.9,
-                                    cx,
-                                ))
-                                .shadow(studio_ui::ds::elevation::float(cx))
-                        } else {
-                            toast
-                                .bg(colors.elevated_surface_background)
-                                .border_1()
-                                .border_color(colors.border_variant)
-                                .shadow(studio_ui::ds::elevation::floating(cx))
-                        }
-                    })
+                    .map(|toast| studio_ui::ds::toast_surface(toast, cx))
                     .child(Indicator::dot().color(color))
                     // `min_w_0` lets the text wrap inside the toast instead of widening it.
                     .child(
@@ -3579,7 +3554,6 @@ impl Render for Workspace {
         // As Zed's workspace does: the window's rem size is the UI font size, which every `ui`
         // size is relative to, and the root carries the UI font.
         let ui_font = theme_settings::setup_ui_font(window, cx);
-        let colors = cx.theme().colors();
         let mut root = v_flex()
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
@@ -3593,10 +3567,10 @@ impl Render for Workspace {
                     root.bg(studio_ui::ds::surface::page(cx))
                         .child(studio_ui::ds::wash())
                 } else {
-                    root.bg(colors.background)
+                    root.bg(studio_ui::ds::surface::window(cx))
                 }
             })
-            .text_color(colors.text)
+            .text_color(Color::Default.color(cx))
             .on_action(cx.listener(|this, _: &CloseActiveItem, window, cx| {
                 let index = this.pane(this.active_pane).map_or(0, |p| p.active);
                 this.close_item(index, window, cx);
@@ -3950,17 +3924,7 @@ struct DraggedTab {
 
 impl Render for DraggedTab {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors();
-        h_flex()
-            .h(px(studio_ui::ds::size::CONTROL))
-            .px(px(studio_ui::ds::space::LG))
-            .gap(px(studio_ui::ds::space::MD))
-            .items_center()
-            .bg(colors.elevated_surface_background)
-            .border_1()
-            .border_color(colors.border)
-            .rounded(px(studio_ui::ds::radii(cx).sm))
-            .shadow(studio_ui::ds::elevation::float(cx))
+        studio_ui::ds::drag_preview(cx)
             .children(
                 self.icon
                     .map(|icon| Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)),
@@ -4034,15 +3998,15 @@ fn split_handle(path: Vec<usize>, boundary: usize, axis: SplitAxis) -> impl Into
     let handle = match axis {
         SplitAxis::Horizontal => handle
             .top_0()
-            .left(px(-3.))
+            .left(px(-studio_ui::ds::size::RESIZE_HANDLE / 2.))
             .h_full()
-            .w(px(6.))
+            .w(px(studio_ui::ds::size::RESIZE_HANDLE))
             .cursor_col_resize(),
         SplitAxis::Vertical => handle
             .left_0()
-            .top(px(-3.))
+            .top(px(-studio_ui::ds::size::RESIZE_HANDLE / 2.))
             .w_full()
-            .h(px(6.))
+            .h(px(studio_ui::ds::size::RESIZE_HANDLE))
             .cursor_row_resize(),
     };
     handle.on_drag(drag, |drag, _, _, cx| {
@@ -4199,19 +4163,19 @@ fn resize_handle(position: PanelPosition) -> impl IntoElement {
             .top_0()
             .right_0()
             .h_full()
-            .w(px(5.))
+            .w(px(studio_ui::ds::size::RESIZE_HANDLE))
             .cursor_col_resize(),
         PanelPosition::Right => handle
             .top_0()
             .left_0()
             .h_full()
-            .w(px(5.))
+            .w(px(studio_ui::ds::size::RESIZE_HANDLE))
             .cursor_col_resize(),
         PanelPosition::Bottom => handle
             .top_0()
             .left_0()
             .w_full()
-            .h(px(5.))
+            .h(px(studio_ui::ds::size::RESIZE_HANDLE))
             .cursor_row_resize(),
     };
     handle.on_drag(DraggedDock(position), |dock, _, _, cx| {

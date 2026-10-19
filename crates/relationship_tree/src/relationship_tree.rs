@@ -664,11 +664,10 @@ impl RelationshipTree {
         sticky: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let colors = cx.theme().colors();
-        let selected_bg = colors.element_selected;
-        let hover_bg = colors.element_hover;
-        let focus_border = colors.border_focused;
-        let panel_bg = colors.panel_background;
+        let selected_bg = studio_ui::ds::surface::selected_chrome(cx);
+        let hover_bg = studio_ui::ds::surface::hover(cx);
+        let focus_border = studio_ui::ds::surface::focus(cx);
+        let panel_bg = studio_ui::ds::surface::chrome(cx);
         let entry = &self.entries[self.visible[row]];
         let Some(exploration) = &self.exploration else {
             return div().into_any_element();
@@ -741,17 +740,20 @@ impl RelationshipTree {
                         div().min_w_0().flex_shrink(1.).child(
                             Label::new(label.unwrap_or_else(|| node.id.clone()))
                                 .size(LabelSize::Small)
-                                .when(root, |label| label.weight(gpui::FontWeight::MEDIUM))
+                                .when(root, |label| label.weight(studio_ui::ds::text::weight::HEADING))
                                 .truncate(),
                         ),
                     )
                     .children(key.map(|key| {
-                        div().min_w(rems(2.5)).flex_shrink(1.).child(
-                            Label::new(key)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .truncate_start(),
-                        )
+                        div()
+                            .min_w(px(studio_ui::ds::size::SHORT_LABEL))
+                            .flex_shrink(1.)
+                            .child(
+                                Label::new(key)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .truncate_start(),
+                            )
                     }))
                     .child(div().flex_1())
                     .children(hint.map(|hint| {
@@ -1556,7 +1558,7 @@ impl HoverCard {
             + 8.;
         v_flex()
             .gap(px(space::XS))
-            .max_w(px(320.))
+            .max_w(px(studio_ui::ds::size::FIELD_WIDE))
             .child(
                 h_flex()
                     .gap(px(space::SM))
@@ -1565,7 +1567,7 @@ impl HoverCard {
                         div().min_w_0().flex_shrink(1.).child(
                             Label::new(self.label.clone().unwrap_or_else(|| self.id.clone()))
                                 .size(LabelSize::Small)
-                                .weight(gpui::FontWeight::MEDIUM)
+                                .weight(studio_ui::ds::text::weight::HEADING)
                                 .truncate(),
                         ),
                     )
@@ -1592,7 +1594,7 @@ impl HoverCard {
                         .pt(px(space::XS))
                         .gap(px(space::XXS))
                         .border_t_1()
-                        .border_color(cx.theme().colors().border_variant)
+                        .border_color(studio_ui::ds::surface::rule(cx))
                         .children(self.relationship.clone().map(|relationship| {
                             Label::new(relationship)
                                 .size(LabelSize::XSmall)

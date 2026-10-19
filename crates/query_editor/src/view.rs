@@ -1026,7 +1026,7 @@ impl QueryEditor {
         if self.editor.read(cx).text(cx) != analysis.text {
             return;
         }
-        let error = cx.theme().status().error;
+        let error = Color::Error.color(cx);
         let key = HighlightKey::ConsoleAnsiHighlight(DIAGNOSTIC_KEY);
         self.problem_starts = self.editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
@@ -2099,13 +2099,16 @@ impl QueryEditor {
         if analysis.problems.is_empty() {
             return None;
         }
-        let colors = cx.theme().colors();
-        let (border, hover) = (colors.border_variant, colors.ghost_element_hover);
+        let (border, hover) = (
+            studio_ui::ds::surface::rule(cx),
+            studio_ui::ds::surface::highlight(cx),
+        );
         Some(
             v_flex()
                 .id("query-problems")
                 .flex_none()
-                .max_h(px(112.))
+                // Four problems, then it scrolls.
+                .max_h(px(4. * studio_ui::ds::size::ROW))
                 .overflow_y_scroll()
                 .py(px(space::XS))
                 .border_t_1()
@@ -2252,8 +2255,7 @@ impl QueryEditor {
     fn render_confirm(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         use studio_ui::ds::{self, size, space};
         let pending = self.pending_write.as_ref()?;
-        let status = cx.theme().status();
-        let (background, border) = (status.warning_background, status.warning_border);
+        let (background, border) = (ds::surface::warning(cx), ds::surface::warning_border(cx));
         let what = if pending.prepared.statement {
             format!("`{}` changes branches.", pending.prepared.label)
         } else {
@@ -2560,8 +2562,10 @@ impl QueryEditor {
         };
         let places = self.result_places(rows, window);
         let border = studio_ui::ds::surface::rule(cx);
-        let colors = cx.theme().colors();
-        let (selected_bg, row_selected_bg) = (colors.element_selected, colors.ghost_element_hover);
+        let (selected_bg, row_selected_bg) = (
+            studio_ui::ds::surface::selected_document(cx),
+            studio_ui::ds::surface::hover(cx),
+        );
         let (muted, disabled, default) = (
             Color::Muted.color(cx),
             Color::Disabled.color(cx),
@@ -2754,7 +2758,7 @@ impl QueryEditor {
                     PlanItem::Note { name, value } => h_flex()
                         .id(("plan-note", ix))
                         .h(px(PLAN_ROW_HEIGHT))
-                        .pl(px(12.))
+                        .pl(px(space::LG))
                         .pr(px(space::MD))
                         .gap(px(space::MD))
                         .child(
@@ -2948,7 +2952,7 @@ impl Render for QueryEditor {
             None => Some(
                 div()
                     .h(relative(0.42))
-                    .min_h(px(120.))
+                    .min_h(px(studio_ui::ds::size::EDITOR_MIN_HEIGHT))
                     .flex_none()
                     .pt(px(space::XS))
                     .border_b_1()

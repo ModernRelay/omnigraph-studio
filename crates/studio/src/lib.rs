@@ -172,7 +172,16 @@ fn open_settings(workspace: &mut Workspace, window: &mut Window, cx: &mut Contex
 pub fn window_options(bounds: Option<gpui::Bounds<gpui::Pixels>>, cx: &App) -> WindowOptions {
     let bounds = bounds
         .or_else(|| studio_workspace::saved_window_bounds(cx))
-        .unwrap_or_else(|| gpui::Bounds::centered(None, size(px(1440.), px(900.)), cx));
+        .unwrap_or_else(|| {
+            gpui::Bounds::centered(
+                None,
+                size(
+                    px(studio_ui::ds::size::WINDOW_WIDTH),
+                    px(studio_ui::ds::size::WINDOW_HEIGHT),
+                ),
+                cx,
+            )
+        });
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(gpui::TitlebarOptions {

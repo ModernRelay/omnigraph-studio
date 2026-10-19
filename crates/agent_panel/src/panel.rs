@@ -2406,7 +2406,7 @@ fn tool_verb(title: &str, studio: Option<StudioTool>) -> String {
 
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let editor_bg = cx.theme().colors().editor_background;
+        let editor_bg = ds::surface::document(cx);
         let body = match &self.state {
             State::Setup => self.render_setup(cx).into_any_element(),
             _ => {
@@ -2550,7 +2550,7 @@ impl AgentPanel {
             .p(px(ds::space::XXL))
             .child(
                 v_flex()
-                    .w(px(320.))
+                    .w(px(ds::size::FIELD_WIDE))
                     .gap(px(ds::space::XS))
                     .child(
                         h_flex()
@@ -3161,7 +3161,7 @@ impl AgentPanel {
             Entry::Thought(text) => div()
                 .id(("thought", index))
                 .text_xs()
-                .text_color(cx.theme().colors().text_muted)
+                .text_color(Color::Muted.color(cx))
                 .child(text.trim().to_owned())
                 .into_any_element(),
             Entry::Tool {
@@ -3539,9 +3539,9 @@ impl AgentPanel {
         let ratio = (usage.used as f32 / usage.size as f32).clamp(0., 1.);
         let nearly_full = ratio >= 0.85;
         let color = if nearly_full {
-            cx.theme().status().warning
+            Color::Warning.color(cx)
         } else {
-            cx.theme().colors().text_muted
+            Color::Muted.color(cx)
         };
         let percent = format!("{}%", (ratio * 100.).round() as u32);
         let title = format!("{percent} of the context window");
@@ -3560,11 +3560,16 @@ impl AgentPanel {
                 .gap(px(ds::space::XS))
                 .items_center()
                 .child(
-                    CircularProgress::new(usage.used as f32, usage.size as f32, px(14.), cx)
-                        .stroke_width(px(2.))
-                        // A visible track, so the ring reads as a gauge, not a spinner.
-                        .bg_color(cx.theme().colors().border)
-                        .progress_color(color),
+                    CircularProgress::new(
+                        usage.used as f32,
+                        usage.size as f32,
+                        px(ds::size::GAUGE),
+                        cx,
+                    )
+                    .stroke_width(px(ds::size::GAUGE_STROKE))
+                    // A visible track, so the ring reads as a gauge, not a spinner.
+                    .bg_color(ds::surface::control_border(cx))
+                    .progress_color(color),
                 )
                 // The number only when it matters.
                 .when(nearly_full, |row| {
@@ -3612,7 +3617,7 @@ impl AgentPanel {
                         }),
                     ),
             );
-        let border = cx.theme().colors().border_variant;
+        let border = ds::surface::rule(cx);
         let rows: Vec<AnyElement> = self
             .queue
             .entries

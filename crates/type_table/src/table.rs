@@ -1244,7 +1244,7 @@ impl TypeTable {
         if self.selection.len() < 2 {
             return None;
         }
-        let border = cx.theme().colors().border_variant;
+        let border = studio_ui::ds::surface::rule(cx);
         let count = self.selection.len();
         let read_only = self.kind == TableKind::Edge || self.at_commit.is_some();
         let editable: Vec<String> = self
@@ -1267,7 +1267,7 @@ impl TypeTable {
             .child(
                 Label::new(format!("{count} rows selected"))
                     .size(LabelSize::Small)
-                    .weight(gpui::FontWeight::MEDIUM),
+                    .weight(studio_ui::ds::text::weight::HEADING),
             );
         if read_only {
             bar = bar.child(studio_ui::ds::text::muted(self.read_only_label()));
@@ -1312,7 +1312,7 @@ impl TypeTable {
                 .when(chosen.is_some(), |bar| {
                     bar.child(
                         studio_ui::ds::field_frame(false, cx)
-                            .w(px(220.))
+                            .w(px(studio_ui::ds::size::FIELD))
                             .child(studio_ui::ds::field_input(self.bulk_editor.clone())),
                     )
                     .child(
@@ -4051,14 +4051,9 @@ impl TypeTable {
         if count == 0 && !self.drafts.saving {
             return None;
         }
-        let colors = cx.theme().colors();
         let (border, fill) = (
-            colors.border_variant,
-            if cx.theme().appearance.is_light() {
-                gpui::white()
-            } else {
-                colors.elevated_surface_background
-            },
+            studio_ui::ds::surface::floating_border(cx),
+            studio_ui::ds::surface::solid(cx),
         );
         let saving = self.drafts.saving;
         let focus = self.focus_handle.clone();
@@ -4069,7 +4064,7 @@ impl TypeTable {
         let pill = h_flex()
             .id("drafts-bar")
             .occlude()
-            .max_w(px(720.))
+            .max_w(px(studio_ui::ds::size::READING_WIDTH))
             .pl(px(space::LG))
             .pr(px(space::SM))
             .py(px(space::XS))
@@ -4088,7 +4083,7 @@ impl TypeTable {
                     format!("{} not saved", plural(count, "draft", "drafts"))
                 })
                 .size(LabelSize::Small)
-                .weight(gpui::FontWeight::MEDIUM),
+                .weight(studio_ui::ds::text::weight::HEADING),
             )
             .children(self.drafts.notice.clone().map(|notice| {
                 div().min_w_0().flex_shrink(1.).child(
@@ -4127,7 +4122,7 @@ impl TypeTable {
         Some(
             h_flex()
                 .absolute()
-                .bottom_3()
+                .bottom(px(space::LG))
                 .left_0()
                 .right_0()
                 .px(px(space::LG))
@@ -4883,7 +4878,7 @@ impl TypeTable {
             .child(
                 Label::new(self.type_name.clone())
                     .size(LabelSize::Default)
-                    .weight(gpui::FontWeight::MEDIUM),
+                    .weight(studio_ui::ds::text::weight::HEADING),
             )
             .child(
                 div()
@@ -4967,7 +4962,7 @@ impl TypeTable {
         if self.filters.is_empty() && self.filter_draft.is_none() {
             return None;
         }
-        let editor_bg = cx.theme().colors().editor_background;
+        let editor_bg = studio_ui::ds::surface::document(cx);
         let mut bar = h_flex()
             .flex_none()
             .flex_wrap()
@@ -5013,7 +5008,13 @@ impl TypeTable {
             let property_table = table.clone();
             let chosen_icon = self.key_icon(&draft.property);
             let rule = studio_ui::ds::surface::rule(cx);
-            let divider = move || div().w(px(1.)).h_full().flex_none().bg(rule);
+            let divider = move || {
+                div()
+                    .w(px(studio_ui::ds::size::HAIRLINE))
+                    .h_full()
+                    .flex_none()
+                    .bg(rule)
+            };
             let chevron = || {
                 Icon::new(IconName::ChevronDown)
                     .size(IconSize::XSmall)
@@ -5026,9 +5027,9 @@ impl TypeTable {
                 .rounded_full()
                 .border_1()
                 .border_color(if draft.error.is_some() {
-                    cx.theme().status().error_border
+                    studio_ui::ds::surface::error_border(cx)
                 } else {
-                    cx.theme().colors().border_focused
+                    studio_ui::ds::surface::focus(cx)
                 })
                 .bg(editor_bg)
                 .overflow_hidden()
@@ -5124,7 +5125,7 @@ impl TypeTable {
                                 this.move_suggestion(-1, cx)
                             }))
                             .relative()
-                            .w(px(180.))
+                            .w(px(studio_ui::ds::size::FIELD_NARROW))
                             .px(px(space::MD))
                             .child(self.filter_editor.clone())
                             .children(offers),
@@ -5188,8 +5189,10 @@ impl TypeTable {
 
     /// The values the filter's value field offers, under it: ↑/↓ highlight, ↵ or a click picks.
     fn render_suggestions(&self, draft: &FilterDraft, cx: &mut Context<Self>) -> AnyElement {
-        let colors = cx.theme().colors();
-        let (bg, border) = (colors.elevated_surface_background, colors.border_variant);
+        let (bg, border) = (
+            studio_ui::ds::surface::floating(cx),
+            studio_ui::ds::surface::floating_border(cx),
+        );
         let pick =
             cx.listener(|this, index: &usize, window, cx| this.pick_suggestion(*index, window, cx));
         let items = draft.offers.rows(
@@ -5205,15 +5208,16 @@ impl TypeTable {
                 deferred(
                     anchored()
                         .anchor(Anchor::TopLeft)
-                        .offset(point(px(-4.), px(28.)))
-                        .snap_to_window_with_margin(px(8.))
+                        // Under the value field, its list's rows on the field's text.
+                        .offset(point(px(-space::XS), px(studio_ui::ds::size::CONTROL)))
+                        .snap_to_window_with_margin(px(space::MD))
                         .child(
                             studio_ui::ds::row_list(cx)
                                 .id("filter-suggestions")
                                 .occlude()
-                                .min_w(px(220.))
-                                .max_w(px(360.))
-                                .max_h(px(260.))
+                                .min_w(px(studio_ui::ds::size::POPOVER_MIN))
+                                .max_w(px(studio_ui::ds::size::POPOVER_MAX))
+                                .max_h(px(studio_ui::ds::size::LIST_MAX_HEIGHT))
                                 .overflow_y_scroll()
                                 .border_color(border)
                                 .bg(bg)
@@ -5639,7 +5643,7 @@ impl TypeTable {
                 div().min_w_0().flex_shrink(1.).child(
                     Label::new(text)
                         .size(LabelSize::Small)
-                        .weight(gpui::FontWeight::MEDIUM)
+                        .weight(studio_ui::ds::text::weight::HEADING)
                         .color(if missing {
                             Color::Muted
                         } else {
@@ -6134,11 +6138,10 @@ impl TypeTable {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let column = &self.columns[col];
-        let colors = cx.theme().colors();
         let (focus_border, divider, editor_bg) = (
-            colors.border_focused,
-            colors.border_variant,
-            colors.editor_background,
+            studio_ui::ds::surface::focus(cx),
+            studio_ui::ds::surface::rule(cx),
+            studio_ui::ds::surface::document(cx),
         );
         let is_cursor = self.cursor == Some(Cursor { row: ix, col });
         let editing = self
@@ -6251,8 +6254,9 @@ impl TypeTable {
                 if numeric {
                     text = text.buffer_font(cx).align_end();
                 }
+                // A key is read like any value; its column header says it is the key.
                 if matches!(column.role, ColumnRole::Key) {
-                    text = text.weight(gpui::FontWeight::MEDIUM);
+                    text = text.weight(studio_ui::ds::text::weight::BODY);
                 }
                 text.into_any_element()
             }
@@ -6323,12 +6327,16 @@ impl TypeTable {
                 deferred(
                     anchored()
                         .anchor(Anchor::TopLeft)
-                        .offset(point(px(-1.), px(ROW_HEIGHT + 2.)))
-                        .snap_to_window_with_margin(px(8.))
+                        // Under the cell, its edge on the cell's, a hairline's gap below it.
+                        .offset(point(
+                            px(-studio_ui::ds::size::HAIRLINE),
+                            px(ROW_HEIGHT + space::XXS),
+                        ))
+                        .snap_to_window_with_margin(px(space::MD))
                         .child(
                             v_flex()
-                                .min_w(px(280.))
-                                .max_w(px(460.))
+                                .min_w(px(studio_ui::ds::size::POPOVER_MIN))
+                                .max_w(px(studio_ui::ds::size::POPOVER_MAX))
                                 .px(px(space::MD))
                                 .py(px(space::SM))
                                 .gap(px(space::XS))
@@ -6485,7 +6493,7 @@ impl Render for TypeTable {
         if typing {
             context.add("editing");
         }
-        let background = cx.theme().colors().editor_background;
+        let background = studio_ui::ds::surface::document(cx);
         let toolbar = self.render_toolbar(cx);
         let filter_bar = self.render_filter_bar(window, cx);
         let bulk_bar = self.render_bulk_bar(cx);
@@ -6556,7 +6564,7 @@ impl Render for TypeTable {
                     anchored()
                         .position(*position)
                         .anchor(Anchor::TopLeft)
-                        .snap_to_window_with_margin(px(8.))
+                        .snap_to_window_with_margin(px(space::MD))
                         .child(menu.clone()),
                 )
                 .with_priority(1)
@@ -6616,15 +6624,7 @@ struct DraggedColumn {
 
 impl Render for DraggedColumn {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .px(px(space::MD))
-            .py(px(space::XS))
-            .rounded(px(studio_ui::ds::radii(cx).sm))
-            .bg(cx.theme().colors().elevated_surface_background)
-            .border_1()
-            .border_color(cx.theme().colors().border)
-            .shadow_md()
-            .child(Label::new(self.title.clone()).size(LabelSize::Small))
+        studio_ui::ds::drag_preview(cx).child(Label::new(self.title.clone()).size(LabelSize::Small))
     }
 }
 

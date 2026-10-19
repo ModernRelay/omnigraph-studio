@@ -492,10 +492,9 @@ fn value_label(value: &Option<Value>, color: Color, strike: bool) -> Label {
 
 impl RenderOnce for ChangeCard {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let colors = cx.theme().colors();
         let accent = self.kind.color().color(cx);
         let border = if self.selected {
-            colors.border_focused
+            crate::ds::surface::focus(cx)
         } else {
             crate::ds::surface::rule(cx)
         };
@@ -578,8 +577,9 @@ impl RenderOnce for ChangeCard {
             .border_color(border)
             .overflow_hidden()
             .child(
+                // The change's mark: a line of its colour down the card's leading edge.
                 div()
-                    .w(px(2.))
+                    .w(px(crate::ds::size::ACCENT_LINE))
                     .h_full()
                     .flex_none()
                     // Its fill meets the card's left corners.

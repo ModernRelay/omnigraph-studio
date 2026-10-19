@@ -223,10 +223,10 @@ pub fn type_mark(type_name: &str, label: &str, cx: &App) -> Div {
         .justify_center()
         .rounded(px(ds::radii(cx).xs))
         .bg(color)
-        .text_color(gpui::white())
-        .text_size(px(9.))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .line_height(px(9.))
+        .text_color(ds::surface::on_tint(cx))
+        .text_size(px(ds::size::MARK_TEXT))
+        .font_weight(ds::text::weight::HEADING)
+        .line_height(px(ds::size::MARK_TEXT))
         .child(initial)
 }
 

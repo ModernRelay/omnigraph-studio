@@ -11,7 +11,7 @@
 
 use gpui::{
     AnyView, App, BoxShadow, ClickEvent, CursorStyle, DefiniteLength, ElementId, FocusHandle,
-    FontWeight, Hsla, MouseButton, Role, Stateful, Window, point,
+    Hsla, MouseButton, Role, Stateful, Window, point,
 };
 use ui::prelude::*;
 use ui::{ElevationIndex, KeyBinding, TintColor};
@@ -490,7 +490,7 @@ impl RenderOnce for Button {
                         .child(
                             Label::new(self.label)
                                 .color(ink)
-                                .weight(FontWeight::MEDIUM)
+                                .weight(ds::text::weight::BODY)
                                 .size(self.label_size.unwrap_or(label_size(size))),
                         )
                         .children(self.key_binding.map(|key| match key_ink {

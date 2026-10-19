@@ -228,7 +228,7 @@ impl SettingsView {
     fn text_control(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         ds::field_frame(false, cx)
             .key_context("SettingsField")
-            .w(px(260.))
+            .w(px(ds::size::FIELD))
             .on_action(cx.listener(move |this, _: &menu::Confirm, window, cx| {
                 this.write_text(index, window, cx)
             }))
@@ -293,7 +293,7 @@ fn stepper(
         )
         .child(
             div()
-                .w(px(56.))
+                .w(px(ds::size::STEPPER_VALUE))
                 .flex()
                 .justify_center()
                 .child(ds::text::body(shown)),
@@ -387,12 +387,15 @@ fn agent_control(target: &Target, current: Value, cx: &App) -> AnyElement {
         .child(segments)
         .when(!command.is_empty(), |control| {
             control.child(
-                div().max_w(px(320.)).overflow_hidden().child(
-                    ds::text::code(command.join(" "), cx)
-                        .color(Color::Muted)
-                        .single_line()
-                        .truncate(),
-                ),
+                div()
+                    .max_w(px(ds::size::FIELD_WIDE))
+                    .overflow_hidden()
+                    .child(
+                        ds::text::code(command.join(" "), cx)
+                            .color(Color::Muted)
+                            .single_line()
+                            .truncate(),
+                    ),
             )
         })
         .into_any_element()
@@ -560,7 +563,7 @@ impl Render for SettingsView {
         };
 
         let nav = v_flex()
-            .w(px(200.))
+            .w(px(ds::size::NAV))
             .flex_none()
             .h_full()
             .pt(px(space::PAGE))
@@ -597,7 +600,7 @@ impl Render for SettingsView {
         let empty = groups.is_empty();
         let body = v_flex()
             .w_full()
-            .max_w(px(720.))
+            .max_w(px(ds::size::READING_WIDTH))
             .gap(px(space::BETWEEN))
             .children(groups.into_iter().map(|(section, fields)| {
                 let count = fields.len();
@@ -680,7 +683,7 @@ impl Render for SettingsView {
                     .child(
                         h_flex()
                             .w_full()
-                            .max_w(px(720.))
+                            .max_w(px(ds::size::READING_WIDTH))
                             .gap(px(space::CONTROLS))
                             .child(
                                 Headline::new(if searching {
@@ -692,7 +695,7 @@ impl Render for SettingsView {
                             )
                             .child(div().flex_1())
                             .children(self.render_scope(cx))
-                            .child(ds::search_field(self.search.clone(), cx).w(px(220.)))
+                            .child(ds::search_field(self.search.clone(), cx).w(px(ds::size::FIELD)))
                             .child(
                                 studio_ui::ds::icon_button("reveal-settings", IconName::Folder)
                                     .icon_size(IconSize::Small)
@@ -751,7 +754,7 @@ fn file_problems(
         count => format!("{count} problems in {file}"),
     };
     Some(
-        div().w_full().max_w(px(720.)).child(
+        div().w_full().max_w(px(ds::size::READING_WIDTH)).child(
             Callout::new()
                 .severity(Severity::Warning)
                 .icon(IconName::Warning)
@@ -789,13 +792,13 @@ fn problem_text(problem: &str, cx: &App) -> impl IntoElement {
         }
     }
     let code = HighlightStyle {
-        color: Some(cx.theme().colors().text),
+        color: Some(Color::Default.color(cx)),
         background_color: Some(ds::surface::tag(cx)),
         ..HighlightStyle::default()
     };
     div()
         .text_ui_sm(cx)
-        .text_color(cx.theme().colors().text_muted)
+        .text_color(Color::Muted.color(cx))
         .child(StyledText::new(text).with_highlights(spans.into_iter().map(|span| (span, code))))
 }
 

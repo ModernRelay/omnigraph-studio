@@ -26,7 +26,7 @@ use studio_ui::ds::IconButton;
 use studio_ui::ds::space;
 use studio_ui::menu::ContextMenu;
 use ui::prelude::*;
-use ui::{Indicator, PopoverMenu, Switch, ToggleState, Tooltip, rems_from_px};
+use ui::{Indicator, PopoverMenu, Switch, ToggleState, Tooltip};
 
 use crate::blob::{
     IMAGE_MAX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, save_value, suggested_file_name,
@@ -855,7 +855,7 @@ impl NodePeek {
                             .child(
                                 gpui::img(image.source())
                                     .max_w_full()
-                                    .max_h(px(240.))
+                                    .max_h(px(studio_ui::ds::size::PREVIEW_MAX_HEIGHT))
                                     .object_fit(gpui::ObjectFit::Contain),
                             )
                             .into_any_element(),
@@ -2369,7 +2369,11 @@ impl NodePeek {
         };
         let hover = studio_ui::ds::surface::highlight(cx);
         let rows = self.property_rows();
-        let label_width = if self.page { 160. } else { 96. };
+        let label_width = if self.page {
+            studio_ui::ds::size::FIELD_LABEL_WIDE
+        } else {
+            studio_ui::ds::size::FIELD_LABEL
+        };
         // Pulled out by the rows' hover inset, as a relationship group's rows are.
         v_flex()
             .mx(px(-space::XS))
@@ -2982,7 +2986,7 @@ impl NodePeek {
         let index = adding.index;
         let other = self.groups[index].group.other_type.clone();
         let hover = studio_ui::ds::surface::highlight(cx);
-        let selected = cx.theme().colors().element_selected;
+        let selected = studio_ui::ds::surface::highlight(cx);
         let branch = self.session.read(cx).branch.clone();
         let replaces = self.holds_one(index)
             && matches!(self.groups[index].count, Loadable::Loaded(n) if n > 0);
@@ -3277,7 +3281,7 @@ impl NodePeek {
                     })
                     .child(
                         div()
-                            .w(px(40.))
+                            .w(px(studio_ui::ds::size::SHORT_LABEL))
                             .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
                     )
                     .child(studio_ui::type_swatch(ty, cx))
@@ -3582,11 +3586,11 @@ impl NodePeek {
             .child(
                 Label::new(label.unwrap_or_else(|| id.clone()))
                     .size(if page {
-                        LabelSize::Custom(rems_from_px(22_f32))
+                        studio_ui::ds::text::page_title_size()
                     } else {
                         LabelSize::Large
                     })
-                    .weight(gpui::FontWeight::MEDIUM),
+                    .weight(studio_ui::ds::text::weight::HEADING),
             )
             .child(
                 h_flex()

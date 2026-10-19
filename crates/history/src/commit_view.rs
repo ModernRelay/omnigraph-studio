@@ -408,7 +408,7 @@ impl CommitView {
                     .child(
                         Label::new(short_commit_id(&self.commit_id))
                             .size(LabelSize::Large)
-                            .weight(gpui::FontWeight::MEDIUM)
+                            .weight(studio_ui::ds::text::weight::HEADING)
                             .buffer_font(cx),
                     ),
             )

@@ -1413,7 +1413,8 @@ impl ReviewView {
                     menu
                 }))
             });
-        let search = studio_ui::ds::search_field(self.search.clone(), cx).w(px(280.));
+        let search =
+            studio_ui::ds::search_field(self.search.clone(), cx).w(px(studio_ui::ds::size::FIELD));
 
         v_flex()
             .flex_none()
@@ -1653,7 +1654,7 @@ impl ReviewView {
         let Some(conflicts) = self.conflicts() else {
             return div().into_any_element();
         };
-        let surface = cx.theme().colors().surface_background;
+        let surface = studio_ui::ds::surface::document(cx);
         let border = studio_ui::ds::surface::rule(cx);
         v_flex()
             .id("conflicts")
