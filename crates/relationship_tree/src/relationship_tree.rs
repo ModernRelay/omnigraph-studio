@@ -16,6 +16,7 @@
 mod rows;
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable,
@@ -102,14 +103,7 @@ fn reveal(
     if selected {
         return;
     }
-    let visible = exploration.update(cx, |exploration, cx| {
-        let visible = exploration
-            .schema(cx)
-            .and_then(|schema| exploration.state().path_of(&schema, &node))
-            .is_some();
-        exploration.reveal(node, cx);
-        visible
-    });
+    let visible = exploration.update(cx, |exploration, cx| exploration.reveal(node, cx));
     if !visible {
         window.focus(&tree.focus_handle(cx), cx);
     }
@@ -129,7 +123,8 @@ impl StickyCandidate for StickyRow {
 
 pub struct RelationshipTree {
     exploration: Option<Entity<Exploration>>,
-    entries: Vec<Entry>,
+    /// The exploration's, shared with it and the canvas: made once per change.
+    entries: Arc<Vec<Entry>>,
     /// Indices into `entries` of the rows shown under the filter.
     visible: Vec<usize>,
     selected: Option<RowId>,
@@ -179,7 +174,7 @@ impl RelationshipTree {
         );
         let mut tree = Self {
             exploration: None,
-            entries: Vec::new(),
+            entries: Arc::default(),
             visible: Vec::new(),
             selected: None,
             selected_row_index_hint: None,
@@ -197,11 +192,6 @@ impl RelationshipTree {
         }
         tree.set_session(session, cx);
         tree
-    }
-
-    /// The exploration this tree shows.
-    pub fn exploration(&self) -> Option<&Entity<Exploration>> {
-        self.exploration.as_ref()
     }
 
     fn set_session(&mut self, session: Option<Entity<GraphSession>>, cx: &mut Context<Self>) {
@@ -255,7 +245,7 @@ impl RelationshipTree {
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.entries = match &self.exploration {
             Some(exploration) => exploration.read(cx).entries(cx),
-            None => Vec::new(),
+            None => Arc::default(),
         };
         self.refilter(cx);
     }
@@ -491,7 +481,7 @@ impl RelationshipTree {
                 }
             }
             EntryKind::Cycle { ancestor, .. } => {
-                if let Some(ancestor_row) = self.visible.iter().position(|ix| *ix == ancestor) {
+                if let Ok(ancestor_row) = self.visible.binary_search(&ancestor) {
                     self.select_row(ancestor_row, cx);
                 }
             }
@@ -1325,7 +1315,8 @@ impl RelationshipTree {
                     let entry = this.visible[anchor.row];
                     rows::ancestors(&this.entries, entry)
                         .into_iter()
-                        .filter_map(|ix| this.visible.iter().position(|v| *v == ix))
+                        // The rows drawn are in tree order.
+                        .filter_map(|ix| this.visible.binary_search(&ix).ok())
                         .map(|row| this.render_row(row, selected == Some(row), focused, true, cx))
                         .collect()
                 },

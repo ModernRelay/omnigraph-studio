@@ -14,7 +14,9 @@
 //! relationship grouped by a property shows one row per value, from
 //! `builder::neighbour_values`, each opening to the neighbours with that value.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use gpui::{
@@ -920,6 +922,11 @@ impl ExploreState {
 
     /// The reads the visible entries still need, each once, in tree order.
     pub fn missing_loads(&self, schema: &SchemaModel) -> Vec<LoadTarget> {
+        self.missing_in(&self.entries(schema))
+    }
+
+    /// [`Self::missing_loads`] of the state flattened as `entries`.
+    fn missing_in(&self, entries: &[Entry]) -> Vec<LoadTarget> {
         if self.root.is_none() {
             return Vec::new();
         }
@@ -928,23 +935,23 @@ impl ExploreState {
         }
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        for entry in self.entries(schema) {
-            let target = match entry.kind {
+        for entry in entries {
+            let target = match &entry.kind {
                 EntryKind::Group {
                     key,
                     count: Loadable::NotLoaded,
                     ..
-                } => LoadTarget::Count(key),
-                EntryKind::Field { key, .. } if !self.neighbours.contains_key(&key) => {
-                    LoadTarget::Page(key)
+                } => LoadTarget::Count(key.clone()),
+                EntryKind::Field { key, .. } if !self.neighbours.contains_key(key) => {
+                    LoadTarget::Page(key.clone())
                 }
                 EntryKind::Loading {
                     target: LoadTarget::Page(key),
-                } if !self.neighbours.contains_key(&key) => LoadTarget::Page(key),
+                } if !self.neighbours.contains_key(key) => LoadTarget::Page(key.clone()),
                 EntryKind::Loading {
                     target: LoadTarget::Values(key, by),
                 } if !self.values.contains_key(&(key.clone(), by.clone())) => {
-                    LoadTarget::Values(key, by)
+                    LoadTarget::Values(key.clone(), by.clone())
                 }
                 _ => continue,
             };
@@ -957,11 +964,7 @@ impl ExploreState {
 
     /// The shallowest visible path at which `node` appears.
     pub fn path_of(&self, schema: &SchemaModel, node: &NodeRef) -> Option<ExplorePath> {
-        self.entries(schema)
-            .into_iter()
-            .filter(|entry| matches!(&entry.kind, EntryKind::Node { node: n, .. } if n == node))
-            .min_by_key(|entry| entry.depth)
-            .map(|entry| entry.path)
+        path_in(&self.entries(schema), node)
     }
 
     /// Applies the answer to a root read.
@@ -1097,11 +1100,60 @@ struct ExplorationRegistry(HashMap<EntityId, WeakEntity<Exploration>>);
 
 impl Global for ExplorationRegistry {}
 
+/// The shallowest of `entries` at which `node` appears.
+fn path_in(entries: &[Entry], node: &NodeRef) -> Option<ExplorePath> {
+    entries
+        .iter()
+        .filter(|entry| matches!(&entry.kind, EntryKind::Node { node: n, .. } if n == node))
+        .min_by_key(|entry| entry.depth)
+        .map(|entry| entry.path.clone())
+}
+
+/// The exploration's state and its flattening as last made, under the schema it was made
+/// with. Any access to the state through `&mut` lets the flattening go, so it is never stale,
+/// and the tree, the canvas and the reads still due share one walk of the tree per change.
+#[derive(Default)]
+struct Flattened {
+    state: ExploreState,
+    entries: RefCell<Option<MadeEntries>>,
+}
+
+/// A flattening, and the schema it was made under.
+type MadeEntries = (Arc<SchemaModel>, Arc<Vec<Entry>>);
+
+impl Flattened {
+    fn entries(&self, schema: &Arc<SchemaModel>) -> Arc<Vec<Entry>> {
+        let mut held = self.entries.borrow_mut();
+        if let Some((made_with, entries)) = held.as_ref()
+            && Arc::ptr_eq(made_with, schema)
+        {
+            return entries.clone();
+        }
+        let entries = Arc::new(self.state.entries(schema));
+        *held = Some((schema.clone(), entries.clone()));
+        entries
+    }
+}
+
+impl Deref for Flattened {
+    type Target = ExploreState;
+    fn deref(&self) -> &ExploreState {
+        &self.state
+    }
+}
+
+impl DerefMut for Flattened {
+    fn deref_mut(&mut self) -> &mut ExploreState {
+        self.entries.get_mut().take();
+        &mut self.state
+    }
+}
+
 /// One session's exploration. Get it with [`Exploration::for_session`]; the tree and the
 /// canvas of a session share it.
 pub struct Exploration {
     session: Entity<GraphSession>,
-    state: ExploreState,
+    state: Flattened,
     pin: Option<String>,
     newer_available: bool,
     generation: u64,
@@ -1172,7 +1224,7 @@ impl Exploration {
         });
         Self {
             session,
-            state: ExploreState::default(),
+            state: Flattened::default(),
             pin: None,
             newer_available: false,
             generation: 0,
@@ -1235,11 +1287,12 @@ impl Exploration {
         self.newer_available
     }
 
-    /// The exploration flattened in tree order; empty until the schema loads.
-    pub fn entries(&self, cx: &App) -> Vec<Entry> {
+    /// The exploration flattened in tree order; empty until the schema loads. Made once per
+    /// change to it, whoever asks.
+    pub fn entries(&self, cx: &App) -> Arc<Vec<Entry>> {
         match self.schema(cx) {
             Some(schema) => self.state.entries(&schema),
-            None => Vec::new(),
+            None => Arc::default(),
         }
     }
 
@@ -1247,22 +1300,25 @@ impl Exploration {
     pub fn root_at(&mut self, node: NodeRef, cx: &mut Context<Self>) {
         self.reset_reads(cx);
         let grouping = std::mem::take(&mut self.state.grouping);
-        self.state = ExploreState::rooted(node);
+        *self.state = ExploreState::rooted(node);
         self.state.grouping = grouping;
         self.request_missing(cx);
         self.changed(cx);
         cx.emit(ExplorationEvent::SelectionChanged);
     }
 
-    /// Selects `node` where it is already visible, else roots the exploration at it.
-    pub fn reveal(&mut self, node: NodeRef, cx: &mut Context<Self>) {
+    /// Selects `node` where it is already visible, else roots the exploration at it; whether it
+    /// was visible.
+    pub fn reveal(&mut self, node: NodeRef, cx: &mut Context<Self>) -> bool {
         let path = self
             .schema(cx)
-            .and_then(|schema| self.state.path_of(&schema, &node));
+            .and_then(|schema| path_in(&self.state.entries(&schema), &node));
+        let shown = path.is_some();
         match path {
             Some(path) => self.select(Some(path), cx),
             None => self.root_at(node, cx),
         }
+        shown
     }
 
     /// Makes the node at `path` the root, at the same commit.
@@ -1300,7 +1356,7 @@ impl Exploration {
         state.values = values;
         state.grouping = grouping;
         state.searches = searches;
-        self.state = state;
+        *self.state = state;
         self.request_missing(cx);
         self.changed(cx);
         cx.emit(ExplorationEvent::SelectionChanged);
@@ -1496,7 +1552,8 @@ impl Exploration {
         if self.pin.is_none() && self.state.root_status == Loadable::Loading {
             return;
         }
-        for target in self.state.missing_loads(&schema) {
+        let entries = self.state.entries(&schema);
+        for target in self.state.missing_in(&entries) {
             self.start(target, cx);
         }
     }
@@ -1507,7 +1564,7 @@ impl Exploration {
         };
         let query = match &target {
             LoadTarget::Root => {
-                let Some(root) = &self.state.root else {
+                let Some(root) = self.state.root.clone() else {
                     return;
                 };
                 self.state.root_status = Loadable::Loading;
@@ -1532,12 +1589,13 @@ impl Exploration {
             }
             LoadTarget::Page(key) => {
                 let page_size = self.page_size(cx);
+                let search = self.state.searches.get(key).cloned();
                 let list = self.state.neighbours.entry(key.clone()).or_default();
                 list.status = PageStatus::Loading;
                 list.page_size = page_size;
                 let value = key.within.as_ref().map(|within| within.value.value());
                 let narrow = Narrow {
-                    search: self.state.searches.get(key).map(String::as_str),
+                    search: search.as_deref(),
                     value: key
                         .within
                         .as_ref()
