@@ -167,13 +167,14 @@ struct Fix {
     edited: bool,
 }
 
-/// What a reviewed mark is kept by: the entity and the last commit that changed it.
+/// What a reviewed mark is kept by: the entity and what its change does, so the mark holds
+/// until the entity changes again, whichever commits the review reads the change from. A review
+/// since a merge reads every change at the reviewed head, which a fix moves.
 fn mark_key(change: &FoldedChange) -> String {
-    format!(
-        "{}@{}",
-        change.key(),
-        change.commits.last().map_or("", String::as_str)
-    )
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{:?}{:?}", change.before, change.after).hash(&mut hasher);
+    format!("{}@{:016x}", change.key(), hasher.finish())
 }
 
 /// A commit under review: from the commit list, or the cause of its change-feed block.
@@ -2723,15 +2724,20 @@ pub(crate) mod tests {
         );
     }
 
-    /// A reviewed mark holds for the change as it was reviewed: changed again since, it is
-    /// reviewed again.
+    /// A reviewed mark holds for the change as it was reviewed, read from any commit: changed
+    /// again since, it is reviewed again.
     #[test]
-    fn a_reviewed_mark_is_kept_by_the_change_and_its_last_commit() {
+    fn a_reviewed_mark_is_kept_by_the_change_as_it_was_reviewed() {
         let reviewed = change("p1", json!({"name": "Ada"}));
-        let mut again = reviewed.clone();
-        again.commits.push("c2".into());
-        assert_eq!(mark_key(&reviewed), mark_key(&reviewed.clone()));
-        assert_ne!(mark_key(&reviewed), mark_key(&again));
+        let mut read_again = reviewed.clone();
+        read_again.commits = vec!["r1".into()];
+        assert_eq!(
+            mark_key(&reviewed),
+            mark_key(&read_again),
+            "another head, same change"
+        );
+        let again = change("p1", json!({"name": "Ada Lovelace"}));
+        assert_ne!(mark_key(&reviewed), mark_key(&again), "changed again");
     }
 
     /// Fixes asked for one after the other go one at a time, each bound to the commit the one
