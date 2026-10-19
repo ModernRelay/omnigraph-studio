@@ -43,7 +43,6 @@ pub struct SessionsPanel {
     renaming: Option<(String, Entity<Editor>, Subscription)>,
     /// The search field shows: asked for in the header, or holding text.
     search_open: bool,
-    /// An import or delete at the agent in flight; it holds the agent's process while it runs.
     /// The list drawn, as descriptors: only the visible rows are built (constitution IX).
     list_state: ListState,
     rows: Vec<ListRow>,
