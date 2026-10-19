@@ -1132,10 +1132,12 @@ impl TypeTable {
                 let changed = output.affected_nodes as usize;
                 match output.commit.as_ref() {
                     Some(commit) if changed == rows.len() => {
+                        let places = self.row_places();
                         for (id, _) in &rows {
-                            if let Some(ix) = self.row_index(id) {
-                                self.set_cell(ix, &column, new.clone());
-                                self.set_dimmed(ix, !self.row_fits(ix));
+                            if let Some(at) = places.get(id) {
+                                self.set_cell_at(at, &column, new.clone());
+                                let fits = self.row_fits(at[0]);
+                                self.set_dimmed_at(at, !fits);
                             }
                         }
                         if self.paging.advance_for_own_commit(
@@ -2332,24 +2334,56 @@ impl TypeTable {
     /// Sets a cell of the row at `ix`, and of every other copy of that row: grouped by a
     /// relationship, a row related to two neighbours shows in both sections.
     fn set_cell(&mut self, ix: usize, column: &str, value: Value) {
-        let Some(id) = self.rows.get(ix).map(|row| row.id.clone()) else {
-            return;
-        };
-        for row in self.rows.iter_mut().filter(|row| row.id == id) {
-            set_value(row, column, value.clone());
-        }
-        if let Some(row) = self.cell_text.borrow_mut().get_mut(&id) {
-            row.remove(column);
-        }
+        let places = self.places_of(ix);
+        self.set_cell_at(&places, column, value);
     }
 
     /// Dims the row at `ix` and its copies, or shows them plainly again.
     fn set_dimmed(&mut self, ix: usize, dimmed: bool) {
-        let Some(id) = self.rows.get(ix).map(|row| row.id.clone()) else {
+        let places = self.places_of(ix);
+        self.set_dimmed_at(&places, dimmed);
+    }
+
+    /// Where the row at `ix` shows: there, and at each of its copies.
+    fn places_of(&self, ix: usize) -> Vec<usize> {
+        let Some(id) = self.rows.get(ix).map(|row| &row.id) else {
+            return Vec::new();
+        };
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.id == *id)
+            .map(|(ix, _)| ix)
+            .collect()
+    }
+
+    /// Where each loaded row shows, by id: a batch looks its rows up in one walk of the table,
+    /// not one per row.
+    fn row_places(&self) -> HashMap<String, Vec<usize>> {
+        let mut places: HashMap<String, Vec<usize>> = HashMap::new();
+        for (ix, row) in self.rows.iter().enumerate() {
+            places.entry(row.id.clone()).or_default().push(ix);
+        }
+        places
+    }
+
+    /// Sets a cell of one row at every place it shows (`places`).
+    fn set_cell_at(&mut self, places: &[usize], column: &str, value: Value) {
+        let Some(&first) = places.first() else {
             return;
         };
-        for row in self.rows.iter_mut().filter(|row| row.id == id) {
-            row.dimmed = dimmed;
+        for &ix in places {
+            set_value(&mut self.rows[ix], column, value.clone());
+        }
+        if let Some(row) = self.cell_text.borrow_mut().get_mut(&self.rows[first].id) {
+            row.remove(column);
+        }
+    }
+
+    /// Dims one row at every place it shows (`places`), or shows it plainly again.
+    fn set_dimmed_at(&mut self, places: &[usize], dimmed: bool) {
+        for &ix in places {
+            self.rows[ix].dimmed = dimmed;
         }
     }
 
@@ -2812,11 +2846,9 @@ impl TypeTable {
                 if let Some(position) = position {
                     let dimmed = !row_matches(&self.filters, &values);
                     self.rows.insert(position, Row { id, values, dimmed });
-                    if let Some(cursor) = &mut self.cursor
-                        && cursor.row >= position
-                    {
-                        cursor.row += 1;
-                    }
+                    // The row a range starts from moves with the rows below it; the cursor goes
+                    // to the new row.
+                    self.rows_inserted(position, 1);
                     self.cursor = Some(Cursor {
                         row: position,
                         col: self.cursor.map_or(0, |c| c.col),
@@ -2860,62 +2892,86 @@ impl TypeTable {
             self.newer = true;
             cx.emit(ItemEvent::UpdateTab);
         }
-        for id in ids {
-            self.remove_row(id, cx);
-            self.selection.shift_remove(id);
-        }
+        self.remove_rows(ids, cx);
         cx.notify();
     }
 
-    fn remove_row(&mut self, id: &str, cx: &mut Context<Self>) {
-        // A row put back (an undone delete) shows its values afresh.
-        self.cell_text.borrow_mut().remove(id);
-        if let Some(index) = self.rows.iter().position(|row| row.id == id) {
-            let row = self.rows.remove(index);
+    /// Takes rows out of the table with every copy of each (grouped by a relationship, a row
+    /// related to two neighbours shows in both sections), in one pass: a batch of thousands
+    /// costs one walk of the rows and one drafts sync, not one of each per row.
+    fn remove_rows(&mut self, ids: &[String], cx: &mut Context<Self>) {
+        let going: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        {
+            // A row put back (an undone delete) shows its values afresh.
+            let mut shown = self.cell_text.borrow_mut();
+            for id in &going {
+                shown.remove(*id);
+            }
+        }
+        // From the last row up, so each index is the row's place once the rows after it went.
+        let mut found: HashSet<&str> = HashSet::new();
+        let mut counted: i64 = 0;
+        let mut gone = Vec::new();
+        for (index, row) in self.rows.iter().enumerate().rev() {
+            if !going.contains(row.id.as_str()) {
+                continue;
+            }
+            gone.push(index);
+            // The first copy found counts the row once.
+            if found.insert(row.id.as_str()) && !row.dimmed {
+                counted += 1;
+            }
+        }
+        // A deleted row leaves the selection whether or not it is loaded.
+        self.selection.retain(|id| !going.contains(id.as_str()));
+        if gone.is_empty() {
+            return;
+        }
+        let distinct = found.len() as i64;
+        for &index in &gone {
             if let Some(grouping) = &mut self.grouping {
                 grouping.removed(index);
             }
             self.row_removed(index);
-            // Grouped by a relationship, the row's other copies go too.
-            while let Some(copy) = self.rows.iter().position(|row| row.id == id) {
-                self.rows.remove(copy);
-                if let Some(grouping) = &mut self.grouping {
-                    grouping.removed(copy);
-                }
-                self.row_removed(copy);
-            }
-            self.selection.shift_remove(id);
-            if !row.dimmed
-                && let Loadable::Loaded(n) = &mut self.count
-            {
-                *n -= 1;
-            }
-            if let Loadable::Loaded(n) = &mut self.total {
-                *n -= 1;
-            }
-            self.cells.retain(|(row_id, _), _| row_id != id);
-            self.drop_row_drafts(id, cx);
-            if let Some(cursor) = &mut self.cursor {
-                if self.rows.is_empty() {
-                    self.cursor = None;
-                } else if cursor.row >= self.rows.len() || cursor.row > index {
-                    cursor.row = cursor.row.saturating_sub(1).min(self.rows.len() - 1);
-                }
-            }
-            if self.peek.as_ref().is_some_and(|(peeked, _)| peeked == id) {
-                self.close_peek(cx);
-            }
+        }
+        self.rows.retain(|row| !going.contains(row.id.as_str()));
+        if let Loadable::Loaded(n) = &mut self.count {
+            *n -= counted;
+        }
+        if let Loadable::Loaded(n) = &mut self.total {
+            *n -= distinct;
+        }
+        self.cells
+            .retain(|(row_id, _), _| !going.contains(row_id.as_str()));
+        self.drop_rows_drafts(&going, cx);
+        // Moved up past each row that went (`row_removed`); on the last row, the one above.
+        if self.rows.is_empty() {
+            self.cursor = None;
+        } else if let Some(cursor) = &mut self.cursor {
+            cursor.row = cursor.row.min(self.rows.len() - 1);
+        }
+        if self
+            .peek
+            .as_ref()
+            .is_some_and(|(peeked, _)| going.contains(peeked.as_str()))
+        {
+            self.close_peek(cx);
         }
     }
 
-    /// Keeps the selection anchor on its row after the row at `index` went; the anchor goes
-    /// with its own row.
+    /// Keeps the selection anchor and the cursor on their rows after the row at `index` went:
+    /// the anchor goes with its own row, and a cursor on it stays at its place, on the next row.
     fn row_removed(&mut self, index: usize) {
         self.selection_anchor = match self.selection_anchor {
             Some(anchor) if anchor == index => None,
             Some(anchor) if anchor > index => Some(anchor - 1),
             anchor => anchor,
         };
+        if let Some(cursor) = &mut self.cursor
+            && cursor.row > index
+        {
+            cursor.row -= 1;
+        }
     }
 
     // ---- cursor ----
@@ -3570,12 +3626,12 @@ impl TypeTable {
     }
 
     /// A deleted row's drafts go with it.
-    fn drop_row_drafts(&mut self, id: &str, cx: &mut Context<Self>) {
+    fn drop_rows_drafts(&mut self, ids: &HashSet<&str>, cx: &mut Context<Self>) {
         let keys: Vec<DraftKey> = self
             .session
             .read(cx)
             .drafts()
-            .filter(|(key, _)| key.type_name == self.type_name && key.id == id)
+            .filter(|(key, _)| key.type_name == self.type_name && ids.contains(key.id.as_str()))
             .map(|(key, _)| key.clone())
             .collect();
         self.session.update(cx, |session, cx| {
@@ -3583,7 +3639,8 @@ impl TypeTable {
                 session.remove_draft(key, cx);
             }
         });
-        self.draft_notices.retain(|(row, _), _| row != id);
+        self.draft_notices
+            .retain(|(row, _), _| !ids.contains(row.as_str()));
         self.sync_drafts(cx);
     }
 
@@ -3696,9 +3753,10 @@ impl TypeTable {
             }
         };
         // Show the new values with an amber dot while the save is out.
+        let places = self.row_places();
         for edit in &edits {
-            if let Some(ix) = self.row_index(&edit.row_id) {
-                self.set_cell(ix, &edit.column, edit.new.clone());
+            if let Some(at) = places.get(&edit.row_id) {
+                self.set_cell_at(at, &edit.column, edit.new.clone());
             }
             self.cells.insert(
                 (edit.row_id.clone(), edit.column.clone()),
@@ -3801,9 +3859,10 @@ impl TypeTable {
                 if let SaveResult::Refused(notice) | SaveResult::Unknown(notice) =
                     save_result(&outcome, branch)
                 {
+                    let places = self.row_places();
                     for edit in edits {
-                        if let Some(ix) = self.row_index(&edit.row_id) {
-                            self.set_cell(ix, &edit.column, edit.old.clone());
+                        if let Some(at) = places.get(&edit.row_id) {
+                            self.set_cell_at(at, &edit.column, edit.old.clone());
                         }
                         self.cells
                             .remove(&(edit.row_id.clone(), edit.column.clone()));
@@ -3826,9 +3885,11 @@ impl TypeTable {
     }
 
     fn refresh_dimmed(&mut self, edits: &[DraftEdit]) {
+        let places = self.row_places();
         for edit in edits {
-            if let Some(ix) = self.row_index(&edit.row_id) {
-                self.set_dimmed(ix, !self.row_fits(ix));
+            if let Some(at) = places.get(&edit.row_id) {
+                let fits = self.row_fits(at[0]);
+                self.set_dimmed_at(at, !fits);
             }
         }
     }
@@ -7139,11 +7200,51 @@ mod tests {
         table.update(cx, |table, cx| {
             table.selection.extend(["p1".to_owned(), "p2".to_owned()]);
             table.selection_anchor = Some(1);
-            table.remove_row("p1", cx);
+            table.remove_rows(&["p1".to_owned()], cx);
             assert_eq!(table.selection.iter().collect::<Vec<_>>(), ["p2"]);
             assert_eq!(table.selection_anchor, Some(0), "still on p2");
-            table.remove_row("p2", cx);
+            table.remove_rows(&["p2".to_owned()], cx);
             assert!(table.selection.is_empty() && table.selection_anchor.is_none());
+        });
+    }
+
+    /// Rows deleted together leave in one pass: the cursor stays on its row, and a deleted row
+    /// the table never loaded still leaves the selection.
+    #[gpui::test]
+    async fn rows_deleted_together_leave_in_one_pass(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session(PEOPLE, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        table.update(cx, |table, cx| {
+            assert_eq!(table.rows.len(), 2);
+            table.cursor = Some(Cursor { row: 1, col: 0 });
+            table
+                .selection
+                .extend(["p2".to_owned(), "unloaded".to_owned()]);
+            table.remove_rows(&["p1".to_owned(), "unloaded".to_owned()], cx);
+            let ids: Vec<&str> = table.rows.iter().map(|row| row.id.as_str()).collect();
+            assert_eq!(ids, ["p2"]);
+            assert_eq!(
+                table.cursor.map(|c| c.row),
+                Some(0),
+                "the cursor stays on p2"
+            );
+            assert_eq!(table.selection.iter().collect::<Vec<_>>(), ["p2"]);
+            table.remove_rows(&["p2".to_owned()], cx);
+            assert!(table.rows.is_empty() && table.cursor.is_none());
         });
     }
 
