@@ -4809,11 +4809,7 @@ impl TypeTable {
                 self.kind == TableKind::Edge,
                 cx,
             ))
-            .child(
-                Label::new(self.type_name.clone())
-                    .size(LabelSize::Default)
-                    .weight(studio_ui::ds::text::weight::HEADING),
-            )
+            .child(studio_ui::ds::text::title(self.type_name.clone()))
             .child(
                 div()
                     .id("row-count")

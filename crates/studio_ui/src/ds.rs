@@ -690,8 +690,16 @@ pub mod text {
         pub const HEADING: FontWeight = FontWeight::MEDIUM;
     }
 
+    /// A toolbar's or a card's title: the body size, the heading weight.
     pub fn title(text: impl Into<SharedString>) -> Label {
         Label::new(text.into()).weight(weight::HEADING)
+    }
+
+    /// A page's section heading (a settings page's): a step larger than a title.
+    pub fn heading(text: impl Into<SharedString>) -> Label {
+        Label::new(text.into())
+            .size(LabelSize::Large)
+            .weight(weight::HEADING)
     }
 
     pub fn body(text: impl Into<SharedString>) -> Label {

@@ -878,11 +878,7 @@ impl Render for HistoryView {
                             .size(IconSize::Small)
                             .color(Color::Muted),
                     )
-                    .child(
-                        Label::new("History")
-                            .size(LabelSize::Default)
-                            .weight(studio_ui::ds::text::weight::HEADING),
-                    )
+                    .child(studio_ui::ds::text::title("History"))
             })
             .child(studio_ui::ds::meta_row([
                 studio_ui::ds::meta(IconName::GitBranch, self.branch.clone()).into_any_element(),

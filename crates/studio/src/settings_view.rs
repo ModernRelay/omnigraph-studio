@@ -685,14 +685,11 @@ impl Render for SettingsView {
                             .w_full()
                             .max_w(px(ds::size::READING_WIDTH))
                             .gap(px(space::CONTROLS))
-                            .child(
-                                Headline::new(if searching {
-                                    SharedString::from("Search")
-                                } else {
-                                    SharedString::from(chosen)
-                                })
-                                .size(HeadlineSize::Small),
-                            )
+                            .child(ds::text::heading(if searching {
+                                SharedString::from("Search")
+                            } else {
+                                SharedString::from(chosen)
+                            }))
                             .child(div().flex_1())
                             .children(self.render_scope(cx))
                             .child(ds::search_field(self.search.clone(), cx).w(px(ds::size::FIELD)))

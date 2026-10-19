@@ -1419,11 +1419,15 @@ impl ReviewView {
             .child(
                 h_flex()
                     .gap(px(space::MD))
-                    .child(Icon::new(IconName::GitBranch).color(Color::Muted))
                     .child(
-                        Headline::new(format!("{} → {}", self.branch, self.target))
-                            .size(HeadlineSize::Small),
+                        Icon::new(IconName::GitBranch)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
                     )
+                    .child(studio_ui::ds::text::title(format!(
+                        "{} → {}",
+                        self.branch, self.target
+                    )))
                     .child(div().flex_1())
                     .child(refresh)
                     .when(self.branch != "main", |row| {

@@ -520,11 +520,15 @@ impl Render for StorageInspector {
                     .gap(px(space::MD))
                     .border_b_1()
                     .border_color(border)
-                    .child(Icon::new(IconName::Server).color(Color::Muted))
                     .child(
-                        Headline::new(format!("Storage · {graph_id} @ {}", self.branch))
-                            .size(HeadlineSize::XSmall),
+                        Icon::new(IconName::Server)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
                     )
+                    .child(studio_ui::ds::text::title(format!(
+                        "Storage · {graph_id} @ {}",
+                        self.branch
+                    )))
                     .when(loading, |d| {
                         d.child(Label::new("Reading…").size(LabelSize::Small).color(Color::Muted))
                     })
