@@ -1,7 +1,7 @@
 //! The review tab (spec 008): what a branch changed since it forked from its target, folded per
 //! entity, with fixes bound to the reviewed head and a merge that checks the head first.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use editor::{Editor, EditorEvent};
 use gpui::{
@@ -256,6 +256,9 @@ pub struct ReviewView {
     /// Fixes waiting for the one out: each is sent bound to the head the one before left.
     fix_queue: VecDeque<Fix>,
     fix_out: bool,
+    /// What each fix asked for and not back yet shows, by its change's key: a Refresh while it
+    /// is out keeps its card showing it, so the fix is not asked for a second time.
+    fixes_in_flight: HashMap<String, FixState>,
     /// The session saw the branch's head move while a fix or the merge was out; compared once
     /// they are back, since each moves the bound head itself.
     head_moved_while_writing: bool,
@@ -365,6 +368,7 @@ impl ReviewView {
             fixes_running: 0,
             fix_queue: VecDeque::new(),
             fix_out: false,
+            fixes_in_flight: HashMap::new(),
             head_moved_while_writing: false,
             _head_watch: head_watch,
             _load_task: None,
@@ -425,7 +429,11 @@ impl ReviewView {
                     .zip(&data.revert_blocked)
                     .map(|(change, blocked)| CardState {
                         reviewed: self.reviewed_keys.contains(&mark_key(change)),
-                        fix: FixState::Idle,
+                        fix: self
+                            .fixes_in_flight
+                            .get(&change.key())
+                            .cloned()
+                            .unwrap_or(FixState::Idle),
                         revert_blocked: blocked.clone(),
                     })
                     .collect();
@@ -732,6 +740,12 @@ impl ReviewView {
     /// left, so a second fix asked for quickly is not refused as "moved" by the first.
     fn queue_fix(&mut self, fix: Fix, cx: &mut Context<Self>) {
         self.fixes_running += 1;
+        let showing = if fix.edited {
+            FixState::Saving
+        } else {
+            FixState::Running
+        };
+        self.fixes_in_flight.insert(fix.key.clone(), showing);
         self.fix_queue.push_back(fix);
         self.send_next_fix(cx);
         cx.notify();
@@ -910,6 +924,7 @@ impl ReviewView {
     ) {
         self.fixes_running = self.fixes_running.saturating_sub(1);
         self.fix_out = false;
+        self.fixes_in_flight.remove(key);
         let fix = match outcome {
             WriteOutcome::Committed(output) => match output.commit {
                 Some(commit) => {
@@ -2720,6 +2735,42 @@ pub(crate) mod tests {
                     card.fix
                 );
             }
+        });
+    }
+
+    /// A Refresh that lands while a fix is out keeps the fix's card showing it: Revert is not
+    /// offered again, and the fix is sent once.
+    #[gpui::test]
+    async fn a_refresh_while_a_fix_is_out_does_not_offer_it_again(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, asked) = reviewed_server_writing(false, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        asked.lock().unwrap().clear();
+        view.update(cx, |view, cx| {
+            view.revert(0, cx);
+            // The review read again lands before the fix is back.
+            let data = view.data.take().unwrap();
+            view.finish_load(Ok(data), cx);
+            assert!(view.cards[0].fix.done(), "{:?}", view.cards[0].fix);
+            view.revert(0, cx);
+            assert_eq!(view.fixes_running, 1, "not asked for again");
+        });
+        cx.run_until_parked();
+        let writes = asked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.contains("/mutate"))
+            .count();
+        assert_eq!(writes, 1);
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.cards[0].fix, FixState::Reverted { .. }));
         });
     }
 
