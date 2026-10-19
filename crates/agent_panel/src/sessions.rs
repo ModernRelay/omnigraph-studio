@@ -248,7 +248,6 @@ impl AgentSessions {
         self.deleted.contains(session)
     }
 
-    /// Adds conversations the agent knows and the list does not; returns how many were new.
     /// `name`, or `name-2`, `name-3`, … when another of `graph`'s conversations writes to it:
     /// an agent branch is named after the second a conversation began, which two can share.
     pub fn unused_branch(&self, graph: &str, name: String) -> String {
@@ -266,6 +265,7 @@ impl AgentSessions {
             .expect("a free name")
     }
 
+    /// Adds conversations the agent knows and the list does not; returns how many were new.
     pub fn import(&mut self, records: Vec<SessionRecord>, cx: &mut Context<Self>) -> usize {
         let mut added = 0;
         for mut record in records {

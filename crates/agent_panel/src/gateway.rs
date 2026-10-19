@@ -28,6 +28,12 @@ const MAX_HEAD: usize = 64 * 1024;
 pub const MAX_BODY: usize = 64 * 1024 * 1024;
 /// How long a request may take to arrive whole, its body included.
 const READ_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a request's line and headers, its token among them, may take: any local process
+/// can open a connection, and one that sends nothing is let go before it holds one long.
+const HEAD_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
+/// The most connections open at once; one past them is closed unread, so connections held
+/// open by another process cannot use up Studio's file descriptors.
+const MAX_CONNECTIONS: usize = 64;
 /// The most a write's answer may take before the gateway stops reading it for the card.
 const MAX_WRITE_ANSWER: usize = 8 * 1024 * 1024;
 /// Request headers passed on to the server; the gateway sets the token and contract itself.
@@ -122,6 +128,10 @@ impl Gateway {
                     continue;
                 };
                 connections.retain(|task: &smol::Task<()>| !task.is_finished());
+                if connections.len() >= MAX_CONNECTIONS {
+                    drop(stream);
+                    continue;
+                }
                 connections.push(smol::spawn(serve_connection(stream, shared.clone())));
             }
         }
@@ -465,12 +475,12 @@ fn is_health(method: &str, path: &str) -> bool {
 
 /// Reads one request. Its token is checked once its headers are in, before its body (up to
 /// [`MAX_BODY`]) is read: only the conversation's CLI makes Studio read that much.
-async fn read_request(stream: &mut TcpStream, token: &str) -> Result<Request, ReadFailure> {
-    let mut buffer = Vec::with_capacity(8 * 1024);
+/// Reads into `buffer` up to the end of a request's headers, and where that is.
+async fn read_head(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<usize, ReadFailure> {
     let mut chunk = [0u8; 8 * 1024];
-    let head_end = loop {
-        if let Some(end) = find(&buffer, b"\r\n\r\n") {
-            break end + 4;
+    loop {
+        if let Some(end) = find(buffer, b"\r\n\r\n") {
+            return Ok(end + 4);
         }
         if buffer.len() > MAX_HEAD {
             return Err(ReadFailure::Answer(
@@ -487,7 +497,21 @@ async fn read_request(stream: &mut TcpStream, token: &str) -> Result<Request, Re
             return Err(ReadFailure::Gone);
         }
         buffer.extend_from_slice(&chunk[..read]);
-    };
+    }
+}
+
+async fn read_request(stream: &mut TcpStream, token: &str) -> Result<Request, ReadFailure> {
+    let mut buffer = Vec::with_capacity(8 * 1024);
+    let mut chunk = [0u8; 8 * 1024];
+    let head_end = {
+        let head = futures::FutureExt::fuse(read_head(stream, &mut buffer));
+        let late = futures::FutureExt::fuse(smol::Timer::after(HEAD_WITHIN));
+        futures::pin_mut!(head, late);
+        futures::select! {
+            end = head => end,
+            _ = late => Err(ReadFailure::Gone),
+        }
+    }?;
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut parsed = httparse::Request::new(&mut headers);
     match parsed.parse(&buffer[..head_end]) {
