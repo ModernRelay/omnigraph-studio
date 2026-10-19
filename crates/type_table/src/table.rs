@@ -58,7 +58,7 @@ use crate::model::{
 };
 use crate::offers::Offers;
 use crate::peek::{KnownRelation, NEIGHBOUR_LIMIT, Neighbour, NodePeek, PeekSubject};
-use crate::suggest::{self, NODE_SUGGESTIONS};
+use crate::suggest;
 
 /// Rows per neighbour read when a relationship column comes into view: a page's worth, as the
 /// page reads do.
@@ -4730,20 +4730,11 @@ impl TypeTable {
                     draft.answers = Some(text);
                     return;
                 };
-                let needle = suggest::needle(&text, list).to_owned();
+                let needle = suggest::needle(&text, list);
+                let search =
+                    suggest::search_nodes(&session, &schema, &type_name, needle, snapshot, cx);
                 draft._suggest_task = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(120))
-                        .await;
-                    let Ok(query) =
-                        builder::node_search(&schema, &type_name, &needle, NODE_SUGGESTIONS)
-                    else {
-                        return;
-                    };
-                    let read = cx.update(|cx| {
-                        session.update(cx, |session, cx| session.read(&query, snapshot, cx))
-                    });
-                    let result = read.await;
+                    let result = search.await;
                     this.update(cx, |this, cx| {
                         let Some(draft) = &mut this.filter_draft else {
                             return;
@@ -4753,9 +4744,7 @@ impl TypeTable {
                         }
                         // A failed search offers nothing, not what an earlier one found.
                         match result {
-                            Ok(output) => draft
-                                .offers
-                                .set(suggest::from_node_rows(&output.rows), typed),
+                            Ok(rows) => draft.offers.set(suggest::from_node_rows(&rows), typed),
                             Err(_) => draft.offers.clear(),
                         }
                         draft.answers = Some(text);

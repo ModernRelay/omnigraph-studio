@@ -2,6 +2,12 @@
 //! values or `true`/`false` from the schema, and for "related to" the other type's nodes,
 //! searched on the server by id or label.
 
+use std::time::Duration;
+
+use gpui::{App, Entity, Task};
+use gq_language::{SchemaModel, builder};
+use graph_store::GraphSession;
+
 /// One offered value: what goes in the field, and a label shown beside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Suggestion {
@@ -11,6 +17,36 @@ pub struct Suggestion {
 
 /// How many nodes a "related to" search offers.
 pub const NODE_SUGGESTIONS: u32 = 8;
+
+/// The pause in typing a field that names a node waits for before it searches.
+pub const NODE_SEARCH_DELAY: Duration = Duration::from_millis(120);
+
+/// The rows of `type_name`'s nodes that `text` names (`builder::node_search`), read at
+/// `snapshot` once typing pauses: what a field that names a node offers. The search is built at
+/// once, so one that cannot be built fails without the wait.
+pub fn search_nodes(
+    session: &Entity<GraphSession>,
+    schema: &SchemaModel,
+    type_name: &str,
+    text: &str,
+    snapshot: Option<String>,
+    cx: &App,
+) -> Task<Result<serde_json::Value, String>> {
+    let query = match builder::node_search(schema, type_name, text, NODE_SUGGESTIONS) {
+        Ok(query) => query,
+        Err(error) => return Task::ready(Err(error.to_string())),
+    };
+    let session = session.downgrade();
+    cx.spawn(async move |cx| {
+        cx.background_executor().timer(NODE_SEARCH_DELAY).await;
+        let read = session
+            .update(cx, |session, cx| session.read(&query, snapshot, cx))
+            .map_err(|_| "The graph was closed.".to_owned())?;
+        read.await
+            .map(|output| output.rows)
+            .map_err(|error| error.to_string())
+    })
+}
 
 /// A node search's rows (`builder::node_search`) as offers: the id goes in the field, the label
 /// beside it.

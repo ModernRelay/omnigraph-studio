@@ -5,7 +5,6 @@
 
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
@@ -20,7 +19,7 @@ use ui::prelude::*;
 
 use crate::model::{Notice, SaveResult, Tone, parse_input, save_result};
 use crate::offers::Offers;
-use crate::suggest::{self, NODE_SUGGESTIONS};
+use crate::suggest;
 use crate::table::TypeTable;
 use studio_actions::table::{SelectNextSuggestion, SelectPreviousSuggestion};
 use studio_ui::ds::{
@@ -539,18 +538,10 @@ impl InsertEdgeModal {
             return;
         }
         endpoint.picked = None;
-        let type_name = endpoint.type_name.clone();
+        let search =
+            suggest::search_nodes(&session, &schema, &endpoint.type_name, &text, snapshot, cx);
         endpoint.search = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(120))
-                .await;
-            let Ok(query) = builder::node_search(&schema, &type_name, &text, NODE_SUGGESTIONS)
-            else {
-                return;
-            };
-            let read = cx
-                .update(|cx| session.update(cx, |session, cx| session.read(&query, snapshot, cx)));
-            let result = read.await;
+            let result = search.await;
             this.update(cx, |this, cx| {
                 let endpoint = this.endpoint_mut(end);
                 if endpoint.generation != generation {
@@ -558,9 +549,7 @@ impl InsertEdgeModal {
                 }
                 // A failed search offers nothing, not what an earlier one found.
                 match result {
-                    Ok(output) => endpoint
-                        .offers
-                        .set(suggest::from_node_rows(&output.rows), true),
+                    Ok(rows) => endpoint.offers.set(suggest::from_node_rows(&rows), true),
                     Err(_) => endpoint.offers.clear(),
                 }
                 endpoint.answers = Some(text);
@@ -1522,7 +1511,7 @@ mod tests {
             window.focus(&modal.focus_handle(cx), cx)
         });
         cx.simulate_input("radia");
-        cx.executor().advance_clock(Duration::from_millis(120));
+        cx.executor().advance_clock(suggest::NODE_SEARCH_DELAY);
         cx.run_until_parked();
         modal.read_with(cx, |modal, _| {
             assert_eq!(modal.from.offers.len(), 2);

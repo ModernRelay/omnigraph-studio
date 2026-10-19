@@ -2026,7 +2026,8 @@ pub fn node_labels(
 }
 
 /// Nodes of one type whose id starts with `text`, or whose label contains it (spec 002, ⌘P go
-/// to a node). Columns: `id`, then `label` when the type has a label other than its key.
+/// to a node); with no text, the type's first nodes. Columns: `id`, then `label` when the type
+/// has a label other than its key.
 pub fn node_search(
     schema: &SchemaModel,
     type_name: &str,
@@ -2042,9 +2043,14 @@ pub fn node_search(
     if let Some(label) = label {
         columns.push(format!("$n.{label} as label"));
     }
-    let predicate = text_match("n", label, text, &mut params);
+    // No text has no spelling to try, and `()` is not a filter.
+    let predicate = if text.is_empty() {
+        String::new()
+    } else {
+        format!("\n    {}", text_match("n", label, text, &mut params))
+    };
     let text = format!(
-        "query studio_find({sig}) {{\n  match {{\n    $n: {ty}\n    {predicate}\n  }}\n  return {{ {columns} }}\n  order {{ $n.@id asc }}\n  limit {limit}\n}}\n",
+        "query studio_find({sig}) {{\n  match {{\n    $n: {ty}{predicate}\n  }}\n  return {{ {columns} }}\n  order {{ $n.@id asc }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         ty = node.name,
         columns = columns.join(", "),
@@ -2100,12 +2106,14 @@ fn text_match(var: &str, label: Option<&str>, text: &str, params: &mut Params) -
 }
 
 /// Whether a node with this id and label answers [`node_search`] for `text`, decided as the
-/// query's predicate decides it (`label` is the search's `label` column).
+/// query's predicate decides it (`label` is the search's `label` column): every node answers
+/// no text.
 pub fn search_matches(id: &str, label: Option<&str>, text: &str) -> bool {
-    spellings(text).iter().any(|spelling| {
-        id.starts_with(spelling.as_str())
-            || label.is_some_and(|label| label.contains(spelling.as_str()))
-    })
+    text.is_empty()
+        || spellings(text).iter().any(|spelling| {
+            id.starts_with(spelling.as_str())
+                || label.is_some_and(|label| label.contains(spelling.as_str()))
+        })
 }
 
 /// Whether every node that answers [`node_search`] for `text` also answered it for
@@ -2113,10 +2121,13 @@ pub fn search_matches(id: &str, label: Option<&str>, text: &str) -> bool {
 /// an id starting with it, or a label containing it, matched before. A caller holding every
 /// node that answered `previous` filters them with [`search_matches`] instead of asking again.
 /// Checked rather than assumed from `text` starting with `previous`: lowercasing can change a
-/// letter by what follows it (a final sigma).
+/// letter by what follows it (a final sigma). Every node answered no text.
 pub fn search_narrows(previous: &str, text: &str) -> bool {
+    if previous.is_empty() {
+        return true;
+    }
     let before = spellings(previous);
-    !before.is_empty()
+    !text.is_empty()
         && spellings(text).iter().all(|spelling| {
             before
                 .iter()
@@ -3629,6 +3640,10 @@ mod tests {
             "{}",
             person.text
         );
+        // No text lists the type's first nodes: a field that names a node, just opened.
+        let first = node_search(&schema, "Person", "", 5).unwrap();
+        assert_compiles(&first);
+        assert!(first.params.is_empty());
     }
 
     #[test]
@@ -3644,7 +3659,10 @@ mod tests {
         assert!(search_narrows("Ada", "Ada L"));
         assert!(!search_narrows("ada", "ad"), "shorter text can match more");
         assert!(!search_narrows("ada", "grace"));
-        assert!(!search_narrows("", "ada"));
+        // Every node answers no text (the type's first nodes).
+        assert!(search_matches("p-1", None, ""));
+        assert!(search_narrows("", "ada"));
+        assert!(!search_narrows("ada", ""));
         // "ΑΣ" lowercases to "ας" but "ΑΣΑ" to "ασα": the lowercase spelling does not grow,
         // so the narrower search asks again.
         assert!(!search_narrows("ΑΣ", "ΑΣΑ"));

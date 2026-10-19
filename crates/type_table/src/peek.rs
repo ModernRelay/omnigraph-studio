@@ -34,6 +34,7 @@ use crate::model::{
     FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, display_value, field_rows, format_count,
     node_rows, reads_as_markdown, same_value, save_result,
 };
+use crate::suggest;
 use graph_client::api::ReadOutput;
 use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError};
 
@@ -1821,25 +1822,15 @@ impl NodePeek {
             return;
         };
         let text = adding.editor.read(cx).text(cx).trim().to_owned();
-        let query = match builder::node_search(&schema, &group.group.other_type, &text, 8) {
-            Ok(query) => query,
-            Err(error) => {
-                adding.found = Loadable::Failed(error.to_string());
-                return;
-            }
-        };
-        let session = self.session.downgrade();
+        let other = &group.group.other_type;
+        let search = suggest::search_nodes(&self.session, &schema, other, &text, None, cx);
         adding._search = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(COUNT_DELAY).await;
-            let Ok(read) = session.update(cx, |session, cx| session.read(&query, None, cx)) else {
-                return;
-            };
-            let result = read.await;
+            let result = search.await;
             this.update(cx, |this, cx| {
                 if let Some(adding) = this.adding.as_mut() {
                     adding.found = match result {
-                        Ok(output) => Loadable::Loaded(neighbours_from(&output.rows)),
-                        Err(error) => Loadable::Failed(error.to_string()),
+                        Ok(rows) => Loadable::Loaded(neighbours_from(&rows)),
+                        Err(error) => Loadable::Failed(error),
                     };
                     adding.answers = Some(text);
                     adding.highlighted = 0;
