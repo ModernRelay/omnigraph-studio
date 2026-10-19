@@ -470,6 +470,9 @@ pub enum ChangeOp {
     Insert,
     Update,
     Delete,
+    /// An operation a newer server names: the change still decodes, read by its images.
+    #[serde(other)]
+    Other,
 }
 
 /// An entity's properties at one side of a change. A null keeps its key; an absent key means
@@ -868,5 +871,7 @@ mod contract_tests {
         assert_eq!(error.error, "slow down");
         let state: GraphAvailability = serde_json::from_str(r#""draining""#).unwrap();
         assert_eq!(state, GraphAvailability::Other);
+        let op: super::ChangeOp = serde_json::from_str(r#""upsert""#).unwrap();
+        assert_eq!(op, super::ChangeOp::Other);
     }
 }

@@ -1199,6 +1199,11 @@ fn content_range_starts_at(served: &str, start: u64) -> bool {
 /// unread.
 async fn read_body(mut body: AsyncBody, skip: u64, limit: usize) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
+    // A whole body, every JSON answer's, is read straight into `bytes`: no buffer is made.
+    if skip == 0 && limit == usize::MAX {
+        body.read_to_end(&mut bytes).await?;
+        return Ok(bytes);
+    }
     let mut buffer = vec![0; limit.min(256 * 1024).max(usize::from(skip > 0) * 64 * 1024)];
     let mut skipped = 0;
     while skipped < skip {
