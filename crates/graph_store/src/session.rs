@@ -1693,7 +1693,7 @@ impl GraphSession {
         let key = self.pinned_key(query, commit);
         // Neither an answer nor a read someone still waits for: carried from an earlier
         // commit when nothing it depends on changed since.
-        let none = match self.pinned_reads.get(&key) {
+        let none = match self.pinned_reads.held(&key) {
             None => true,
             Some(Held::Pending(pending)) => pending.read.upgrade().is_none(),
             Some(Held::Done(_)) => false,

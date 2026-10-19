@@ -68,6 +68,12 @@ impl<K: Hash + Eq + Clone, V: Clone, P: Clone> Memo<K, V, P> {
         Some(held)
     }
 
+    /// What is held for `key`, borrowed and without marking it used: telling a read under way
+    /// from an answer copies neither.
+    pub(crate) fn held(&self, key: &K) -> Option<&Held<V, P>> {
+        Some(&self.entries.get(key)?.held)
+    }
+
     /// The answer held for `key`, without marking it used.
     pub(crate) fn peek(&self, key: &K) -> Option<&V> {
         match &self.entries.get(key)?.held {
