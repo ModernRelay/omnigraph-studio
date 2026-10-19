@@ -1912,9 +1912,8 @@ impl QueryEditor {
                 if let Some(graph) = rows.graph.clone() {
                     let title = format!("{} · result", rows.label);
                     end.push(
-                        ds::button("result-canvas", "Canvas")
+                        ds::toolbar_button("result-canvas", "Canvas")
                             .style(ButtonStyle::Subtle)
-                            .label_size(LabelSize::XSmall)
                             .start_icon(Icon::new(IconName::GitGraph).size(IconSize::XSmall))
                             .tooltip(Tooltip::text(format!(
                                 "Draw the result's {} nodes, linking those in the same row",
@@ -2155,7 +2154,7 @@ impl QueryEditor {
                                     row.child(
                                         Button::new(("apply-fix", index), "Fix")
                                             .style(ButtonStyle::Tinted(ui::TintColor::Accent))
-                                            .label_size(LabelSize::XSmall)
+                                            .size(ButtonSize::Compact)
                                             .tooltip(Tooltip::text(
                                                 "Apply the compiler's suggested edit",
                                             ))
@@ -3078,7 +3077,7 @@ fn run_line(
         .child(
             Button::new(("run-line-run", index), "Run")
                 .style(ButtonStyle::Transparent)
-                .label_size(LabelSize::XSmall)
+                .size(ButtonSize::Compact)
                 .color(Color::Muted)
                 .start_icon(
                     Icon::new(IconName::PlayFilled)

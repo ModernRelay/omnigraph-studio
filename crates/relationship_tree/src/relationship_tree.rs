@@ -1003,7 +1003,7 @@ impl RelationshipTree {
                     )
                     .child(
                         Button::new(("retry", row), "Retry")
-                            .label_size(LabelSize::XSmall)
+                            .size(ButtonSize::Compact)
                             .style(ButtonStyle::Subtle)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let target = target.clone();
@@ -1238,7 +1238,7 @@ impl RelationshipTree {
                     d.child(h_flex().min_w_0().flex_wrap().gap(px(space::XXS)).children(
                         breadcrumb.into_iter().map(|(index, text)| {
                             studio_ui::ds::button(("crumb", index), format!("{text} ›"))
-                                .label_size(LabelSize::XSmall)
+                                .size(ButtonSize::Compact)
                                 .style(ButtonStyle::Subtle)
                                 .tooltip(Tooltip::text("Explore from here again"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -1250,7 +1250,7 @@ impl RelationshipTree {
                 .when(newer, |d| {
                     d.child(
                         studio_ui::ds::button("newer", "Newer data · Refresh")
-                            .label_size(LabelSize::XSmall)
+                            .size(ButtonSize::Compact)
                             .style(ButtonStyle::Tinted(ui::TintColor::Accent))
                             .tooltip(Tooltip::text(
                                 "The branch moved since this tree was read. Refresh reads it again.",

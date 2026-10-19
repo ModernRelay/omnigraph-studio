@@ -5709,7 +5709,7 @@ impl TypeTable {
                 .child(
                     studio_ui::ds::button(("section-retry", index), "Retry")
                         .style(ButtonStyle::Subtle)
-                        .label_size(LabelSize::XSmall)
+                        .size(ButtonSize::Compact)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(section) =
                                 this.grouping.as_mut().and_then(|g| g.section_mut(index))
@@ -5732,7 +5732,7 @@ impl TypeTable {
             };
             studio_ui::ds::button(("section-more", index), label)
                 .style(ButtonStyle::Subtle)
-                .label_size(LabelSize::XSmall)
+                .size(ButtonSize::Compact)
                 .color(Color::Accent)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let size = this.page_size(cx);
@@ -6402,7 +6402,7 @@ impl TypeTable {
             start.push(
                 studio_ui::ds::button("retry-more", "Retry")
                     .style(ButtonStyle::Subtle)
-                    .label_size(LabelSize::XSmall)
+                    .size(ButtonSize::Compact)
                     .start_icon(
                         Icon::new(IconName::Warning)
                             .size(IconSize::XSmall)

@@ -1166,7 +1166,7 @@ impl ReviewView {
         let border = studio_ui::ds::surface::rule(cx);
         let focus = self.focus_handle.clone();
         let mergeable = self.mergeable();
-        let merge_button = studio_ui::ds::button(
+        let merge_button = studio_ui::ds::toolbar_button(
             "merge",
             format!("Merge {} into {}", self.branch, self.target),
         )
@@ -1194,7 +1194,7 @@ impl ReviewView {
             move |_, cx| Tooltip::with_meta(title.clone(), None, cli.clone(), cx)
         })
         .on_click(cx.listener(|this, _, _, cx| this.merge(cx)));
-        let refresh = studio_ui::ds::button("refresh", "Refresh")
+        let refresh = studio_ui::ds::toolbar_button("refresh", "Refresh")
             .style(ButtonStyle::Subtle)
             .start_icon(Icon::new(IconName::RotateCw).size(IconSize::Small))
             .on_click(cx.listener(|this, _, _, cx| this.reload(cx)));
@@ -1376,7 +1376,7 @@ impl ReviewView {
         let view = cx.entity().downgrade();
         let scope_menu = PopoverMenu::new("review-scope")
             .trigger(
-                studio_ui::ds::button("review-scope-button", scope_label)
+                studio_ui::ds::toolbar_button("review-scope-button", scope_label)
                     .style(ButtonStyle::Outlined)
                     .end_icon(
                         Icon::new(IconName::ChevronDown)
@@ -1805,7 +1805,7 @@ impl ReviewView {
                 "Mark reviewed"
             },
         )
-        .label_size(LabelSize::XSmall)
+        .size(ButtonSize::Compact)
         .style(ButtonStyle::Subtle)
         .toggle_state(reviewed)
         .when(reviewed, |b| {
@@ -1833,7 +1833,7 @@ impl ReviewView {
                 let focus = focus.clone();
                 card = card.action(
                     Button::new(("edit", ix), "Edit")
-                        .label_size(LabelSize::XSmall)
+                        .size(ButtonSize::Compact)
                         .style(ButtonStyle::Subtle)
                         .start_icon(Icon::new(IconName::Pencil).size(IconSize::XSmall))
                         .disabled(done)
@@ -1854,7 +1854,7 @@ impl ReviewView {
             let branch = self.branch.clone();
             card = card.action(
                 Button::new(("revert", ix), "Revert")
-                    .label_size(LabelSize::XSmall)
+                    .size(ButtonSize::Compact)
                     .style(ButtonStyle::Subtle)
                     .start_icon(Icon::new(IconName::Undo).size(IconSize::XSmall))
                     .disabled(blocked.is_some() || done)

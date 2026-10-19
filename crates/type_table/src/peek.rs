@@ -2757,7 +2757,7 @@ impl NodePeek {
                         row.child(
                             studio_ui::ds::button("peek-open-history", "Open history")
                                 .style(ButtonStyle::Subtle)
-                                .label_size(LabelSize::XSmall)
+                                .size(ButtonSize::Compact)
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(
                                         Box::new(studio_actions::graph::OpenHistory),
@@ -3089,7 +3089,6 @@ impl NodePeek {
             )
             .style(ButtonStyle::Tinted(ui::TintColor::Error))
             .size(ButtonSize::Compact)
-            .label_size(LabelSize::XSmall)
             .tooltip(Tooltip::text(format!(
                 "Remove this {edge}; both nodes stay"
             )))
@@ -3147,7 +3146,7 @@ impl NodePeek {
                             },
                         )
                         .style(ButtonStyle::Subtle)
-                        .label_size(LabelSize::XSmall)
+                        .size(ButtonSize::Compact)
                         .disabled(reading)
                         .on_click(cx.listener(move |this, _, _, cx| this.show_more(index, cx)))
                         .into_any_element()
@@ -3612,7 +3611,7 @@ impl NodePeek {
                     .when(self.newer && is_node, |meta| {
                         meta.child(
                             studio_ui::ds::button("peek-newer", "Newer data · Refresh")
-                                .label_size(LabelSize::XSmall)
+                                .size(ButtonSize::Compact)
                                 .style(ButtonStyle::Tinted(ui::TintColor::Accent))
                                 .tooltip(Tooltip::text(
                                     "The branch moved since this was read. Refresh reads it at the head.",

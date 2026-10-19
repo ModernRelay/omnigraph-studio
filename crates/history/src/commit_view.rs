@@ -442,7 +442,7 @@ impl CommitView {
             .child(
                 PopoverMenu::new("open-table-at")
                     .trigger(
-                        studio_ui::ds::button("open-table-at-button", "Table")
+                        studio_ui::ds::toolbar_button("open-table-at-button", "Table")
                             .style(ButtonStyle::Subtle)
                             .start_icon(Icon::new(IconName::Table).size(IconSize::XSmall))
                             .tooltip(Tooltip::text(
@@ -470,7 +470,7 @@ impl CommitView {
                     }),
             )
             .child(
-                studio_ui::ds::button("query-at", "Query")
+                studio_ui::ds::toolbar_button("query-at", "Query")
                     .style(ButtonStyle::Subtle)
                     .start_icon(Icon::new(IconName::FileCode).size(IconSize::XSmall))
                     .tooltip(Tooltip::text("Open a query that reads this commit"))
