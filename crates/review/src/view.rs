@@ -213,6 +213,10 @@ enum LoadState {
     Ready,
 }
 
+/// Why a list is not fixed from a review that does not show what the branch holds now.
+const LIST_NEEDS_HEAD: &str = "A list is checked only against what the branch holds now, which \
+     this review does not show: fix it from the review of all the branch's changes.";
+
 pub struct ReviewView {
     session: Entity<GraphSession>,
     branch: String,
@@ -761,6 +765,23 @@ impl ReviewView {
                 return;
             }
         };
+        let lists = change.after.as_ref().is_some_and(|after| {
+            schema.node(&change.type_name).is_some_and(|node| {
+                node.properties.iter().any(|property| {
+                    property.list
+                        && change
+                            .before
+                            .as_ref()
+                            .and_then(|before| before.properties.get(&property.name))
+                            != after.properties.get(&property.name)
+                })
+            })
+        });
+        if lists && !self.shows_head() {
+            self.cards[ix].revert_blocked = Some(LIST_NEEDS_HEAD.into());
+            cx.notify();
+            return;
+        }
         let request = ChangeRequest {
             query: query.text.clone(),
             name: Some(query.name.clone()),
@@ -779,6 +800,13 @@ impl ReviewView {
 
     fn merging(&self) -> bool {
         matches!(self.merge, MergeState::Checking | MergeState::Merging)
+    }
+
+    /// Whether every card shows its entity as the reviewed head holds it: not so for one commit
+    /// of the branch, nor for a review cut short. A fix is bound to that head, and a list,
+    /// which a write's `where` cannot compare, is safe to fix only from what it holds.
+    fn shows_head(&self) -> bool {
+        self.scope.is_none() && self.data.as_ref().is_some_and(|data| !data.partial)
     }
 
     /// Sends `fix` once the fixes before it are back. Each is bound to the head the one before
@@ -871,6 +899,10 @@ impl ReviewView {
     }
 
     fn open_edit(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // As the button is: a card fixed already shows values its fix replaced.
+        if self.cards.get(ix).is_none_or(|card| card.fix.done()) {
+            return;
+        }
         let Some(values) = self.edit_values(ix, cx) else {
             return;
         };
@@ -907,12 +939,26 @@ impl ReviewView {
         let Some(ix) = self.card_of(key) else {
             return;
         };
+        if self.cards.get(ix).is_none_or(|card| card.fix.done()) {
+            return;
+        }
         let Some(change) = self.data.as_ref().and_then(|d| d.folded.changes.get(ix)) else {
             return;
         };
         let Some(schema) = self.session.read(cx).schema_model() else {
             return;
         };
+        let lists = changes.iter().any(|(property, ..)| {
+            schema
+                .node(&change.type_name)
+                .and_then(|node| node.property(property))
+                .is_some_and(|property| property.list)
+        });
+        if lists && !self.shows_head() {
+            self.cards[ix].fix = FixState::Refused(LIST_NEEDS_HEAD.into());
+            cx.notify();
+            return;
+        }
         let parts: Result<Vec<_>, _> = changes
             .iter()
             .map(|(property, old, new)| {
