@@ -538,8 +538,8 @@ impl GraphSession {
         self.reload_stored_queries(cx);
     }
 
-    /// Reads the graph's stored-query catalog. A server that serves none for the graph (a 404)
-    /// has an empty catalog, not a failed one.
+    /// Reads the graph's stored-query catalog. A graph without stored queries answers an empty
+    /// one; a 404 is a graph the server no longer serves, and shows as a failure.
     pub fn reload_stored_queries(&mut self, cx: &mut Context<Self>) {
         self.stored_queries = Loadable::Loading;
         let client = self.client(cx);
@@ -550,9 +550,6 @@ impl GraphSession {
             this.update(cx, |this, cx| this.note_read(&read, cx)).ok();
             let result = match read {
                 Ok(output) => Loadable::Loaded(Arc::new(output.queries)),
-                Err(ReadError::Refused(error)) if error.status == 404 => {
-                    Loadable::Loaded(Arc::new(Vec::new()))
-                }
                 Err(error) => Loadable::Failed(error.to_string()),
             };
             this.update(cx, |this, cx| {
@@ -3661,15 +3658,12 @@ mod tests {
             assert_eq!(session.head("main"), Some("c5"));
         });
 
-        // A server that serves no catalog for the graph: an empty one, not a failure.
+        // A graph the server no longer serves: the catalog failed, it is not empty.
         serves.store(false, Ordering::SeqCst);
         session.update(cx, |session, cx| session.reload_stored_queries(cx));
         cx.run_until_parked();
         session.read_with(cx, |session, _| {
-            assert_eq!(
-                session.stored_queries.loaded().map(|queries| queries.len()),
-                Some(0)
-            )
+            assert!(matches!(session.stored_queries, Loadable::Failed(_)))
         });
     }
 
