@@ -1215,15 +1215,19 @@ impl ReviewView {
         }
     }
 
-    fn net_of(&self, type_name: &str, id: Option<&str>) -> Option<NetChange> {
-        let id = id?;
+    /// What the branch did to each entity, by type and id: conflicts look their entity up in
+    /// one pass, not one walk of every change each.
+    fn nets(&self) -> HashMap<(&str, &str), NetChange> {
         self.data
-            .as_ref()?
-            .folded
-            .changes
             .iter()
-            .find(|c| c.id == id && c.type_name == type_name)
-            .and_then(FoldedChange::net)
+            .flat_map(|data| data.folded.changes.iter())
+            .filter_map(|change| {
+                Some((
+                    (change.type_name.as_str(), change.id.as_str()),
+                    change.net()?,
+                ))
+            })
+            .collect()
     }
 
     // ---- rendering ----
@@ -1414,27 +1418,6 @@ impl ReviewView {
 
         // What is reviewed (everything since the fork, or one commit) and a search over the
         // cards.
-        let commits: Vec<(String, String)> = self
-            .data
-            .as_ref()
-            .map(|data| {
-                let now = studio_ui::now_micros();
-                data.commits
-                    .iter()
-                    .map(|commit| {
-                        let mut label = short_commit_id(&commit.id);
-                        if let Some(actor) = &commit.actor_id {
-                            label.push_str(&format!(" · {actor}"));
-                        }
-                        label.push_str(&format!(
-                            " · {}",
-                            studio_ui::relative_time(commit.created_at, now)
-                        ));
-                        (commit.id.clone(), label)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         let scope_label = match &self.scope {
             None => "Since the fork".to_owned(),
             Some(id) => format!("Commit {}", short_commit_id(id)),
@@ -1452,7 +1435,31 @@ impl ReviewView {
             )
             .menu(move |window, cx| {
                 let view = view.clone();
-                let commits = commits.clone();
+                // Labelled as the menu opens, not at each draw: a branch can hold thousands of
+                // commits since its fork.
+                let now = studio_ui::now_micros();
+                let commits: Vec<(String, String)> = view
+                    .upgrade()?
+                    .read(cx)
+                    .data
+                    .as_ref()
+                    .map(|data| {
+                        data.commits
+                            .iter()
+                            .map(|commit| {
+                                let mut label = short_commit_id(&commit.id);
+                                if let Some(actor) = &commit.actor_id {
+                                    label.push_str(&format!(" · {actor}"));
+                                }
+                                label.push_str(&format!(
+                                    " · {}",
+                                    studio_ui::relative_time(commit.created_at, now)
+                                ));
+                                (commit.id.clone(), label)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                     let since = view.clone();
                     menu = menu.entry("Since the fork", None, move |_, cx| {
@@ -1718,6 +1725,7 @@ impl ReviewView {
         };
         let surface = studio_ui::ds::surface::document(cx);
         let border = studio_ui::ds::surface::rule(cx);
+        let nets = self.nets();
         v_flex()
             .id("conflicts")
             .flex_1()
@@ -1738,7 +1746,10 @@ impl ReviewView {
                 .color(Color::Muted),
             )
             .children(conflicts.iter().enumerate().map(|(ix, conflict)| {
-                let here = self.net_of(&conflict.type_name, conflict.entity_id.as_deref());
+                let here = conflict
+                    .entity_id
+                    .as_deref()
+                    .and_then(|id| nets.get(&(conflict.type_name.as_str(), id)).copied());
                 let words = conflict_wording(conflict.kind, here, &self.target);
                 let entity = conflict.entity_id.clone().unwrap_or_else(|| "—".into());
                 let conflict_for_click = conflict.clone();
