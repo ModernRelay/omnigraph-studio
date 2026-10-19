@@ -457,6 +457,11 @@ impl GraphClient {
             .map(Duration::from_secs);
         let headers = response.headers().clone();
         let (skip, keep) = match limit {
+            // An answer that is not the value is read from its start, so its message reads
+            // whole however little of the value was asked for.
+            BodyLimit::First(keep) | BodyLimit::Range { len: keep, .. } if !status.is_success() => {
+                (0, keep.max(ERROR_BODY_BYTES))
+            }
             BodyLimit::First(keep) => (0, keep),
             BodyLimit::Range { start, len } if status == StatusCode::OK => (start, len),
             BodyLimit::Range { len, .. } => (0, len),
@@ -1175,6 +1180,9 @@ fn classify_write<T: DeserializeOwned>(raw: RawResponse) -> WriteOutcome<T> {
     }
 }
 
+/// The least of an error answer's body a read keeps, whatever it asked for of the value.
+const ERROR_BODY_BYTES: usize = 64 * 1024;
+
 /// How much of a response body is kept.
 #[derive(Debug, Clone, Copy)]
 enum BodyLimit {
@@ -1841,6 +1849,10 @@ mod tests {
                         .status(302)
                         .header("location", "s3://bucket/report.pdf")
                         .body(AsyncBody::empty())
+                } else if url.contains("id=gone") {
+                    ok().status(404).body(AsyncBody::from(
+                        r#"{"error":"no Note with id gone at this commit"}"#,
+                    ))
                 } else {
                     Response::builder().status(404).body(AsyncBody::empty())
                 };
@@ -1958,6 +1970,11 @@ mod tests {
             "an empty range sends nothing"
         );
         assert_eq!(seen.lock().unwrap().len(), 3);
+        // A refusal's message reads whole, however few bytes of the value were asked for.
+        assert!(matches!(
+            block_on(client.blob_bytes("g", &cell("gone"), at, 40..44)),
+            Err(ReadError::Refused(e)) if e.message == "no Note with id gone at this commit"
+        ));
     }
 
     #[test]
