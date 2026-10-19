@@ -93,9 +93,7 @@ impl RenderOnce for ModalHeader {
                     .items_center()
                     .child(
                         div().min_w_0().flex_1().child(
-                            Label::new(self.title)
-                                .size(LabelSize::Large)
-                                .weight(crate::ds::text::weight::HEADING)
+                            crate::ds::text::heading(self.title)
                                 .single_line()
                                 .truncate(),
                         ),
