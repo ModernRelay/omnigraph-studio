@@ -122,11 +122,6 @@ impl ExplorePath {
         Self(steps)
     }
 
-    pub fn parent(&self) -> Option<Self> {
-        let (_, rest) = self.0.split_last()?;
-        Some(Self(rest.to_vec()))
-    }
-
     pub fn starts_with(&self, prefix: &ExplorePath) -> bool {
         self.0.starts_with(&prefix.0)
     }
@@ -1230,6 +1225,7 @@ impl Exploration {
     }
 
     /// The commit every read of this exploration is pinned to.
+    #[cfg(test)]
     pub fn pin(&self) -> Option<&str> {
         self.pin.as_deref()
     }
@@ -1421,10 +1417,9 @@ impl Exploration {
         let Some(schema) = self.schema(cx) else {
             return;
         };
+        // A target read or being read is in the state already, so it is not among these.
         for target in self.state.prefetch_targets(&schema, path) {
-            if !self.tasks.contains_key(&target) {
-                self.start(target, cx);
-            }
+            self.start(target, cx);
         }
     }
 
@@ -1441,9 +1436,11 @@ impl Exploration {
     }
 
     /// Reads a failed target again. Reads are idempotent, so this is safe (writes never retry).
+    /// A root is read again at the branch head, with everything below it: one not found at
+    /// the pinned commit would not be found there again, and nothing below it was shown.
     pub fn retry(&mut self, target: &LoadTarget, cx: &mut Context<Self>) {
         match target {
-            LoadTarget::Root => self.state.root_status = Loadable::NotLoaded,
+            LoadTarget::Root => return self.refresh(cx),
             LoadTarget::Count(key) => {
                 self.state.counts.remove(key);
             }
@@ -2321,6 +2318,44 @@ mod tests {
         assert_eq!(state.root_status, Loadable::Loaded(()));
         assert!(!state.reroot(&ExplorePath::root()));
         let _ = schema;
+    }
+
+    /// A root not found at the exploration's commit is not found there again: Retry reads it
+    /// at the branch head, where another writer may have made it since.
+    #[gpui::test]
+    async fn a_missing_root_is_retried_at_the_head(cx: &mut gpui::TestAppContext) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::test_server::followed_session;
+        let created = Arc::new(AtomicBool::new(false));
+        let exists = created.clone();
+        let (session, served) = followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\n",
+            move |asked| {
+                // Made at c2: a read pinned to c1 still finds nothing.
+                if exists.load(Ordering::SeqCst) && asked["snapshot"].is_null() {
+                    json!([{ "id": "p1", "label": "Ada" }])
+                } else {
+                    json!([])
+                }
+            },
+            cx,
+        );
+        cx.run_until_parked();
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        exploration.update(cx, |exploration, cx| exploration.root_at(person("p1"), cx));
+        cx.run_until_parked();
+        let status = |cx: &mut gpui::TestAppContext| {
+            exploration.read_with(cx, |exploration, _| exploration.state().root_status.clone())
+        };
+        assert!(matches!(status(cx), Loadable::Failed(_)), "not there yet");
+        created.store(true, Ordering::SeqCst);
+        served.lock().unwrap().head = "c2".into();
+        exploration.update(cx, |exploration, cx| {
+            exploration.retry(&LoadTarget::Root, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(status(cx), Loadable::Loaded(()));
     }
 
     /// Another writer's commit that changed nothing the exploration shows moves its pin to the

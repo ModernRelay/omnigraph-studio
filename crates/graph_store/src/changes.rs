@@ -325,12 +325,6 @@ pub struct TypeCounts {
     pub removed: usize,
 }
 
-impl TypeCounts {
-    pub fn total(&self) -> usize {
-        self.added + self.changed + self.removed
-    }
-}
-
 impl FoldedChanges {
     /// Counts per type, in the order the cards appear.
     pub fn counts(&self) -> Vec<TypeCounts> {
