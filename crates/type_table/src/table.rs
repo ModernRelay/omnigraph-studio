@@ -1443,7 +1443,7 @@ impl TypeTable {
                     },
                 )
                 .style(ButtonStyle::Subtle)
-                .start_icon(Icon::new(IconName::Eye).size(IconSize::Small))
+                .start_icon(Icon::new(IconName::Eye))
                 .disabled(self.all_columns.len() < 2)
                 .when(!open, |button| {
                     button.tooltip(Tooltip::text(
@@ -1529,7 +1529,7 @@ impl TypeTable {
                     },
                 )
                 .style(ButtonStyle::Subtle)
-                .start_icon(Icon::new(IconName::ListTree).size(IconSize::Small))
+                .start_icon(Icon::new(IconName::ListTree))
                 .disabled(choices.is_empty())
                 .when(!open, |button| {
                     button.tooltip(Tooltip::text(
@@ -1662,7 +1662,7 @@ impl TypeTable {
                     active.clone().unwrap_or_else(|| "Views".into()),
                 )
                 .style(ButtonStyle::Subtle)
-                .start_icon(Icon::new(IconName::Star).size(IconSize::Small))
+                .start_icon(Icon::new(IconName::Star))
                 .when(!open, |button| {
                     button.tooltip(Tooltip::text(
                         "Saved filters, order, grouping and columns for this type",
@@ -4910,7 +4910,7 @@ impl TypeTable {
                     .child(
                         studio_ui::ds::toolbar_button("add-filter", "Filter")
                             .style(ButtonStyle::Subtle)
-                            .start_icon(Icon::new(IconName::Filter).size(IconSize::Small))
+                            .start_icon(Icon::new(IconName::Filter))
                             .tooltip(|_, cx| Tooltip::for_action("Add a filter", &AddFilter, cx))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_filter_draft(window, cx)
@@ -4919,7 +4919,7 @@ impl TypeTable {
                     .child(
                         studio_ui::ds::toolbar_button("insert-row", "Row")
                             .style(ButtonStyle::Subtle)
-                            .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
+                            .start_icon(Icon::new(IconName::Plus))
                             .disabled(pinned)
                             .tooltip(move |_, cx| {
                                 if pinned {
@@ -5019,7 +5019,7 @@ impl TypeTable {
                         .trigger(
                             Button::new("filter-property-button", chosen)
                                 .style(ButtonStyle::Subtle)
-                                .start_icon(studio_ui::ds::icon::meta(chosen_icon))
+                                .start_icon(Icon::new(chosen_icon))
                                 .end_icon(chevron()),
                         )
                         .menu(move |window, cx| {
@@ -6338,11 +6338,7 @@ impl TypeTable {
                 studio_ui::ds::button("retry-more", "Retry")
                     .style(ButtonStyle::Subtle)
                     .size(ButtonSize::Compact)
-                    .start_icon(
-                        Icon::new(IconName::Warning)
-                            .size(IconSize::XSmall)
-                            .color(Color::Error),
-                    )
+                    .start_icon(Icon::new(IconName::Warning))
                     .tooltip(Tooltip::text(format!(
                         "The next page could not be read: {error}"
                     )))

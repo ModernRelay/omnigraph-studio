@@ -2561,7 +2561,7 @@ impl NodePeek {
                                 )
                                 .style(ButtonStyle::Subtle)
                                 .size(ButtonSize::Compact)
-                                .end_icon(studio_ui::ds::icon::meta(IconName::ChevronDown)),
+                                .end_icon(Icon::new(IconName::ChevronDown)),
                             )
                             .anchor(gpui::Anchor::TopLeft)
                             .menu(move |window, cx| {
@@ -3475,7 +3475,7 @@ impl NodePeek {
                             studio_ui::ds::toolbar_button("peek-explore", "Explore")
                                 .style(ButtonStyle::Subtle)
                                 .start_icon(
-                                    studio_ui::ds::icon::meta(IconName::Crosshair),
+                                    Icon::new(IconName::Crosshair),
                                 )
                                 .tooltip(Tooltip::text("Walk the graph from this node"))
                                 .on_click(move |_, window, cx| {

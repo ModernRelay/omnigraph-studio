@@ -3084,8 +3084,8 @@ impl Workspace {
                                 .tooltip(Tooltip::text(format!(
                                     "Reads and edits in this window use {branch}. Switch branch."
                                 )))
-                                .start_icon(studio_ui::ds::icon::meta(IconName::GitBranch))
-                                .end_icon(studio_ui::ds::icon::meta(IconName::ChevronUpDown)),
+                                .start_icon(Icon::new(IconName::GitBranch))
+                                .end_icon(Icon::new(IconName::ChevronUpDown)),
                         )
                         .menu(move |window, cx| {
                             let session = session_for_menu.clone();
@@ -3317,7 +3317,7 @@ impl Workspace {
             studio_ui::ds::button(id, label)
                 .full_width()
                 .style(ButtonStyle::Outlined)
-                .start_icon(studio_ui::ds::icon::lead(icon))
+                .start_icon(Icon::new(icon))
                 .key_binding(binding)
                 .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
         };

@@ -471,7 +471,7 @@ impl CommitView {
                     .trigger(
                         studio_ui::ds::toolbar_button("open-table-at-button", "Table")
                             .style(ButtonStyle::Subtle)
-                            .start_icon(Icon::new(IconName::Table).size(IconSize::XSmall))
+                            .start_icon(Icon::new(IconName::Table))
                             .tooltip(Tooltip::text(
                                 "Open a type's table as it was at this commit",
                             )),
@@ -499,7 +499,7 @@ impl CommitView {
             .child(
                 studio_ui::ds::toolbar_button("query-at", "Query")
                     .style(ButtonStyle::Subtle)
-                    .start_icon(Icon::new(IconName::FileCode).size(IconSize::XSmall))
+                    .start_icon(Icon::new(IconName::FileCode))
                     .tooltip(Tooltip::text("Open a query that reads this commit"))
                     .on_click(move |_, window, cx| {
                         window.dispatch_action(

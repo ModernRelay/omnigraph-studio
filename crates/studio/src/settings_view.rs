@@ -321,7 +321,7 @@ fn dropdown(target: &Target, current: Value, options: Options) -> AnyElement {
         .trigger(
             studio_ui::ds::button(target.id("trigger"), shown)
                 .style(ButtonStyle::Outlined)
-                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+                .end_icon(Icon::new(IconName::ChevronDown)),
         )
         .menu(move |window, cx| {
             let options = options.clone();

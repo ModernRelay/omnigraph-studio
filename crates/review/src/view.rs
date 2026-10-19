@@ -1241,7 +1241,7 @@ impl ReviewView {
             format!("Merge {} into {}", self.branch, self.target),
         )
         .style(ButtonStyle::Filled)
-        .start_icon(Icon::new(IconName::GitBranch).size(IconSize::Small))
+        .start_icon(Icon::new(IconName::GitBranch))
         .key_binding(KeyBinding::for_action_in(&Merge, &focus, cx))
         .disabled(!mergeable)
         .tooltip({
@@ -1422,7 +1422,7 @@ impl ReviewView {
             .trigger(
                 studio_ui::ds::toolbar_button("review-scope-button", scope_label)
                     .style(ButtonStyle::Outlined)
-                    .end_icon(studio_ui::ds::icon::meta(IconName::ChevronDown)),
+                    .end_icon(Icon::new(IconName::ChevronDown)),
             )
             .menu(move |window, cx| {
                 let view = view.clone();
@@ -1860,9 +1860,7 @@ impl ReviewView {
         .size(ButtonSize::Compact)
         .style(ButtonStyle::Subtle)
         .toggle_state(reviewed)
-        .when(reviewed, |b| {
-            b.start_icon(Icon::new(IconName::Check).size(IconSize::XSmall))
-        })
+        .when(reviewed, |b| b.start_icon(Icon::new(IconName::Check)))
         .tooltip({
             let focus = focus.clone();
             move |_, cx| {
@@ -1887,7 +1885,7 @@ impl ReviewView {
                     Button::new(("edit", ix), "Edit")
                         .size(ButtonSize::Compact)
                         .style(ButtonStyle::Subtle)
-                        .start_icon(Icon::new(IconName::Pencil).size(IconSize::XSmall))
+                        .start_icon(Icon::new(IconName::Pencil))
                         .disabled(done)
                         .tooltip(move |_, cx| {
                             Tooltip::for_action_in(
@@ -1908,7 +1906,7 @@ impl ReviewView {
                 Button::new(("revert", ix), "Revert")
                     .size(ButtonSize::Compact)
                     .style(ButtonStyle::Subtle)
-                    .start_icon(Icon::new(IconName::Undo).size(IconSize::XSmall))
+                    .start_icon(Icon::new(IconName::Undo))
                     .disabled(blocked.is_some() || done)
                     .tooltip(move |_, cx| match &blocked {
                         Some(reason) => Tooltip::simple(reason.clone(), cx),

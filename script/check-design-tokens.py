@@ -15,12 +15,16 @@ every surface and nothing drifts. This refuses, outside the design system and te
   (`cx.theme().colors()`, `cx.theme().status()`): views name a `ds::surface` role or a `ui`
   `Color`;
 - a font weight named directly (`FontWeight::MEDIUM`): views take `ds::text::weight`;
-- a `ui` component the design system wraps (`Switch::new`, `Headline::new`): views take
-  `ds::switch`, `ds::text::title` and `ds::text::heading`;
+- a `ui` component the design system wraps (`Switch::new`, `Headline::new`, `Divider`): views
+  take `ds::switch`, `ds::text::title` and `ds::text::heading`, and `ds::rule_h`;
 - a text or icon role built by hand (`Label::new(..).size(LabelSize::Small).color(Color::Muted)`,
-  `Icon::new(..).size(IconSize::XSmall).color(Color::Muted)`): views take `ds::text::body`,
-  `muted`, `meta`, `error`, `error_note` and `ds::icon::lead`, `meta`. This rule reads a
-  file whole, since a builder chain spans lines.
+  `Label::new(..).color(Color::Muted)`, `Icon::new(..).size(IconSize::XSmall).color(Color::Muted)`):
+  views take `ds::text::body`, `muted`, `meta`, `state`, `error`, `error_note` and
+  `ds::icon::lead`, `meta`;
+- a sized or tinted icon given to a button (`.start_icon(Icon::new(..).size(..))`,
+  `.start_icon(ds::icon::lead(..))`): a button sizes and inks its own icons, so it takes a
+  plain `Icon::new(..)`.
+The last two rules read a file whole, since a builder chain spans lines.
 
 A line the rule cannot fit says why in a `// ds-exempt: <reason>` comment on it or the line
 above, so every exception shows up in review.
@@ -61,7 +65,8 @@ RULES = [
     ("raw colour", re.compile(r"gpui::(black|white)\(\)|\brgb\(0x|\brgba\(0x|\bhsla\(")),
     ("theme palette", re.compile(r"\.theme\(\)\s*\.\s*(colors|status)\(\)")),
     ("font weight", re.compile(r"\bFontWeight::[A-Z_]+")),
-    ("component outside the design system", re.compile(r"\b(Switch|Headline)::new\(")),
+    ("component outside the design system",
+     re.compile(r"\b(Switch|Headline)::new\(|\bDivider::(horizontal|vertical)")),
 ]
 EXEMPT = re.compile(r"//\s*ds-exempt:\s*\S")
 # Builder chains that rebuild a role, whichever order the two calls come in.
@@ -70,9 +75,16 @@ LABEL_TONE = r"\.color\(Color::(?:Muted|Error)\)"
 ICON_SIZE = r"\.size\(IconSize::(?:Small|XSmall)\)"
 ROLE_CHAINS = re.compile(
     rf"\b(?:Label::new\((?:[^()]|\([^()]*\))*\)\s*(?:{LABEL_SIZE}\s*{LABEL_TONE}|{LABEL_TONE}\s*{LABEL_SIZE}"
-    rf"|\.size\(LabelSize::Small\)(?!\s*\.color\())"
+    rf"|\.size\(LabelSize::Small\)(?!\s*\.color\()"
+    rf"|\.color\(Color::Muted\)(?!\s*\.size\())"
     rf"|Icon::new\((?:[^()]|\([^()]*\))*\)\s*(?:{ICON_SIZE}\s*\.color\(Color::Muted\)"
     rf"|\.color\(Color::Muted\)\s*{ICON_SIZE}))"
+)
+# A button's icon with a size or a colour of its own, or an icon role, which the button
+# overrides with its own size and ink.
+BUTTON_ICONS = re.compile(
+    r"\.(?:start|end)_icon\(\s*(?:(?:studio_ui|crate)::ds::icon::|"
+    r"Icon::new\((?:[^()]|\([^()]*\))*\)\s*\.(?:size|color)\()"
 )
 # The Zed menu fork stays close to upstream.
 ROLE_EXEMPT_FILES = {"crates/studio_ui/src/menu.rs"}
@@ -96,6 +108,9 @@ def main() -> int:
             for match in ROLE_CHAINS.finditer(body):
                 line = body.count("\n", 0, match.start()) + 1
                 errors.append(f"{rel}:{line}: role built by hand: {match.group(0).split(chr(10))[0].strip()}")
+            for match in BUTTON_ICONS.finditer(body):
+                line = body.count("\n", 0, match.start()) + 1
+                errors.append(f"{rel}:{line}: a button's icon sized or tinted: {match.group(0).strip()}")
         lines = text.splitlines()
         in_test = False
         for index, line in enumerate(lines):

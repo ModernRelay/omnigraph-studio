@@ -1935,7 +1935,7 @@ impl GraphCanvas {
                 // An empty state's action is an outline button, as every empty state's is.
                 studio_ui::ds::button("explore-search", "Search nodes")
                     .style(ButtonStyle::Outlined)
-                    .start_icon(Icon::new(IconName::MagnifyingGlass).size(IconSize::Small))
+                    .start_icon(Icon::new(IconName::MagnifyingGlass))
                     .key_binding(ui::KeyBinding::for_action(
                         &studio_actions::workspace::GoTo,
                         cx,

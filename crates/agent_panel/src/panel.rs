@@ -2173,7 +2173,7 @@ fn option_picker(
             .style(ButtonStyle::Subtle)
             .color(Color::Muted)
             .disabled(option.pending)
-            .start_icon(icon.size(IconSize::XSmall).color(Color::Muted))
+            .start_icon(icon)
             .tooltip(move |_, cx| match &meta {
                 Some(meta) => Tooltip::with_meta(title.clone(), None, meta.clone(), cx),
                 None => Tooltip::simple(title.clone(), cx),
@@ -2567,13 +2567,14 @@ impl AgentPanel {
             .child(
                 v_flex()
                     .w(px(ds::size::FIELD_WIDE))
-                    .gap(px(ds::space::XS))
+                    // Outlined choices a step apart, so their edges and shadows do not touch.
+                    .gap(px(ds::space::MD))
                     .child(
                         h_flex()
                             .gap(px(ds::space::SM))
                             .mb(px(ds::space::MD))
                             .justify_center()
-                            .child(Label::new("Choose an agent").color(Color::Muted))
+                            .child(studio_ui::ds::text::state("Choose an agent"))
                             .child(
                                 div()
                                     .id("agent-info")
@@ -2607,7 +2608,7 @@ impl AgentPanel {
                         studio_ui::ds::button(("preset", index), *name)
                             .full_width()
                             .style(ButtonStyle::Outlined)
-                            .start_icon(studio_ui::ds::icon::lead(IconName::ZedAssistant))
+                            .start_icon(Icon::new(IconName::ZedAssistant))
                             .tooltip(Tooltip::text(format!(
                                 "Runs {shown}; npx downloads it the first time you send a message"
                             )))
@@ -2619,9 +2620,10 @@ impl AgentPanel {
                         h_flex()
                             .my(px(ds::space::MD))
                             .gap(px(ds::space::MD))
-                            .child(ui::Divider::horizontal())
+                            .items_center()
+                            .child(studio_ui::ds::rule_h(cx))
                             .child(studio_ui::ds::text::meta("or"))
-                            .child(ui::Divider::horizontal()),
+                            .child(studio_ui::ds::rule_h(cx)),
                     )
                     .child(
                         h_flex()
@@ -3189,18 +3191,16 @@ impl AgentPanel {
             }
             None => studio_ui::ds::card_footer(cx).children(card.options.iter().enumerate().map(
                 |(option_index, option)| {
-                    let (icon, color) = match option.kind {
-                        PermissionOptionKind::AllowOnce => (IconName::Check, Color::Success),
-                        PermissionOptionKind::AllowAlways => {
-                            (IconName::CheckDouble, Color::Success)
-                        }
-                        _ => (IconName::Close, Color::Error),
+                    let icon = match option.kind {
+                        PermissionOptionKind::AllowOnce => IconName::Check,
+                        PermissionOptionKind::AllowAlways => IconName::CheckDouble,
+                        _ => IconName::Close,
                     };
                     studio_ui::ds::button(
                         ("permission", index * 16 + option_index),
                         option.name.clone(),
                     )
-                    .start_icon(Icon::new(icon).size(IconSize::XSmall).color(color))
+                    .start_icon(Icon::new(icon))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.choose_option(index, option_index, cx)
                     }))
@@ -3280,11 +3280,7 @@ impl AgentPanel {
             ProposalState::Waiting(_) => studio_ui::ds::card_footer(cx)
                 .child(
                     studio_ui::ds::button(("allow", index), "Allow")
-                        .start_icon(
-                            Icon::new(IconName::Check)
-                                .size(IconSize::XSmall)
-                                .color(Color::Success),
-                        )
+                        .start_icon(Icon::new(IconName::Check))
                         .when_some(key(&Allow, cx), |button, key| button.key_binding(key))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.decide(index, Decision::Allow, cx)
@@ -3292,11 +3288,7 @@ impl AgentPanel {
                 )
                 .child(
                     studio_ui::ds::button(("always", index), "Always on this branch")
-                        .start_icon(
-                            Icon::new(IconName::CheckDouble)
-                                .size(IconSize::XSmall)
-                                .color(Color::Success),
-                        )
+                        .start_icon(Icon::new(IconName::CheckDouble))
                         .when_some(key(&AllowAlways, cx), |button, key| button.key_binding(key))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.decide(index, Decision::AllowAlways, cx)
@@ -3305,11 +3297,7 @@ impl AgentPanel {
                 .child(div().flex_1())
                 .child(
                     studio_ui::ds::button(("reject", index), "Reject")
-                        .start_icon(
-                            Icon::new(IconName::Close)
-                                .size(IconSize::XSmall)
-                                .color(Color::Error),
-                        )
+                        .start_icon(Icon::new(IconName::Close))
                         .when_some(key(&Reject, cx), |button, key| button.key_binding(key))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.decide(index, Decision::Reject, cx)
@@ -3688,7 +3676,7 @@ impl AgentPanel {
                 .child(div().flex_1())
                 .child(
                     studio_ui::ds::button("review", "Review")
-                        .start_icon(Icon::new(IconName::Eye).size(IconSize::XSmall))
+                        .start_icon(Icon::new(IconName::Eye))
                         .on_click(cx.listener(|this, _, window, cx| this.review(window, cx))),
                 )
                 .into_any_element(),

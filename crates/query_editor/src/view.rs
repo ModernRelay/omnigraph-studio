@@ -664,12 +664,12 @@ impl QueryEditor {
             .trigger(
                 studio_ui::ds::toolbar_button("snapshot-picker-button", label)
                     .style(ButtonStyle::Subtle)
-                    .start_icon(studio_ui::ds::icon::meta(if pinned.is_some() {
+                    .start_icon(Icon::new(if pinned.is_some() {
                         IconName::GitCommit
                     } else {
                         IconName::GitBranch
                     }))
-                    .end_icon(studio_ui::ds::icon::meta(IconName::ChevronDown))
+                    .end_icon(Icon::new(IconName::ChevronDown))
                     .tooltip(Tooltip::text(match &pinned {
                         Some(commit) => {
                             format!("Reads run at commit {commit}; writes are refused")
@@ -1863,7 +1863,7 @@ impl QueryEditor {
                     end.push(
                         ds::toolbar_button("result-canvas", "Canvas")
                             .style(ButtonStyle::Subtle)
-                            .start_icon(Icon::new(IconName::GitGraph).size(IconSize::XSmall))
+                            .start_icon(Icon::new(IconName::GitGraph))
                             .tooltip(Tooltip::text(format!(
                                 "Draw the result's {} nodes, linking those in the same row",
                                 graph.0.len()
@@ -1999,7 +1999,7 @@ impl QueryEditor {
             .when(self.stored.is_none(), |toolbar| {
                 toolbar.child(
                     studio_ui::ds::toolbar_button("explain", "Explain")
-                        .start_icon(Icon::new(IconName::ListTree).size(IconSize::XSmall))
+                        .start_icon(Icon::new(IconName::ListTree))
                         .key_binding(KeyBinding::for_action_in(&Explain, &focus, cx))
                         .tooltip({
                             let focus = focus.clone();
@@ -2020,7 +2020,7 @@ impl QueryEditor {
             .child(
                 studio_ui::ds::toolbar_button("run", "Run")
                     .style(ButtonStyle::Filled)
-                    .start_icon(Icon::new(IconName::PlayFilled).size(IconSize::XSmall))
+                    .start_icon(Icon::new(IconName::PlayFilled))
                     .key_binding(KeyBinding::for_action_in(&Run, &focus, cx))
                     .disabled(busy)
                     .tooltip({
@@ -2840,7 +2840,7 @@ impl QueryEditor {
                                         diagnostic.message
                                     ),
                                 )
-                                .start_icon(Icon::new(IconName::ArrowRight).size(IconSize::XSmall))
+                                .start_icon(Icon::new(IconName::ArrowRight))
                                 .disabled(at.is_none())
                                 .on_click(cx.listener(
                                     move |this, _, window, cx| {
@@ -3001,7 +3001,7 @@ fn run_line(
                 .style(ButtonStyle::Transparent)
                 .size(ButtonSize::Compact)
                 .color(Color::Muted)
-                .start_icon(studio_ui::ds::icon::meta(IconName::PlayFilled))
+                .start_icon(Icon::new(IconName::PlayFilled))
                 .on_click(move |_, window, cx| {
                     editor
                         .update(cx, |editor, cx| editor.run_declaration(index, window, cx))

@@ -312,7 +312,7 @@ impl Render for DesignGallery {
                     .child(div().flex_1())
                     .child(
                         studio_ui::ds::button("g-filter", "Filter")
-                            .start_icon(Icon::new(IconName::Filter).size(IconSize::Small)),
+                            .start_icon(Icon::new(IconName::Filter)),
                     ),
             )
             .child(grid_header(&columns, px(0.), cx))
@@ -367,18 +367,14 @@ impl Render for DesignGallery {
                     .child(
                         studio_ui::ds::button("g-allow", "Allow")
                             .start_icon(
-                                Icon::new(IconName::Check)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Success),
+                                Icon::new(IconName::Check),
                             )
                             .key_binding(ui::KeyBinding::for_action_in(&Allow, &focus, cx)),
                     )
                     .child(
                         studio_ui::ds::button("g-always", "Always on this branch")
                             .start_icon(
-                                Icon::new(IconName::CheckDouble)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Success),
+                                Icon::new(IconName::CheckDouble),
                             )
                             .key_binding(ui::KeyBinding::for_action_in(&AllowAlways, &focus, cx)),
                     )
@@ -386,9 +382,7 @@ impl Render for DesignGallery {
                     .child(
                         studio_ui::ds::button("g-reject", "Reject")
                             .start_icon(
-                                Icon::new(IconName::Close)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Error),
+                                Icon::new(IconName::Close),
                             )
                             .key_binding(ui::KeyBinding::for_action_in(&Reject, &focus, cx)),
                     ),
@@ -437,7 +431,7 @@ impl Render for DesignGallery {
                         studio_ui::ds::button("g-search", "Search")
                             .full_width()
                             .style(ButtonStyle::Outlined)
-                            .start_icon(studio_ui::ds::icon::lead(IconName::MagnifyingGlass)),
+                            .start_icon(Icon::new(IconName::MagnifyingGlass)),
                     ),
                 ),
             );
@@ -713,7 +707,7 @@ impl Render for DesignGallery {
                     )
                     .child(
                         ds::Button::new("g-icon-label", "Row")
-                            .start_icon(Icon::new(IconName::Plus).size(IconSize::Small)),
+                            .start_icon(Icon::new(IconName::Plus)),
                     )
                     .child(ds::icon_button("g-icon-ghost", IconName::Ellipsis))
                     .child(ds::icon_button("g-icon-toggled", IconName::Filter).toggle_state(true)),

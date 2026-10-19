@@ -304,14 +304,14 @@ impl OpenGraphModal {
             .child(
                 studio_ui::ds::button("add-server", "Add server…")
                     .style(ButtonStyle::Subtle)
-                    .start_icon(Icon::new(IconName::Plus).size(IconSize::Small))
+                    .start_icon(Icon::new(IconName::Plus))
                     .on_click(cx.listener(|this, _, window, cx| this.show_add(true, window, cx))),
             )
     }
 
     fn render_graphs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(connection) = &self.selected else {
-            return v_flex().child(Label::new("Add a server to start.").color(Color::Muted));
+            return v_flex().child(studio_ui::ds::text::state("Add a server to start."));
         };
         let c = connection.read(cx);
         let status = match &c.state {
@@ -358,7 +358,7 @@ impl OpenGraphModal {
                         ConnectionState::Unreachable(_) | ConnectionState::Idle => row.child(
                             studio_ui::ds::button("retry-connect", "Retry")
                                 .style(ButtonStyle::Subtle)
-                                .start_icon(Icon::new(IconName::RotateCw).size(IconSize::XSmall))
+                                .start_icon(Icon::new(IconName::RotateCw))
                                 .on_click(cx.listener(move |_, _, _, cx| {
                                     selected.update(cx, |c, cx| c.connect(cx));
                                 })),

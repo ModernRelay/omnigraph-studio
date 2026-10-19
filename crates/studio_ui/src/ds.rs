@@ -809,6 +809,12 @@ pub mod text {
             .color(Color::Muted)
     }
 
+    /// The one line of an empty or waiting state ("No tab open", "Reading…", "Choose an
+    /// agent"): the default size, muted.
+    pub fn state(text: impl Into<SharedString>) -> Label {
+        Label::new(text.into()).color(Color::Muted)
+    }
+
     /// A refusal or a failure in a sentence: the body size in the error colour.
     pub fn error(text: impl Into<SharedString>) -> Label {
         Label::new(text.into())
@@ -1178,6 +1184,11 @@ pub fn drag_preview(cx: &App) -> Div {
 /// A toolbar's buttons, set close: a ghost button's own padding is the space between them.
 pub fn toolbar_actions() -> Div {
     h_flex().flex_none().items_center()
+}
+
+/// A hairline that fills the row it sits in, as either side of a centred "or".
+pub fn rule_h(cx: &App) -> Div {
+    div().flex_1().h(px(size::HAIRLINE)).bg(surface::rule(cx))
 }
 
 /// A short vertical hairline between groups in a strip (Delta's footer: context | facts).
@@ -1727,7 +1738,7 @@ pub fn empty_state(icon: IconName, title: impl Into<SharedString>) -> Div {
                 .size(IconSize::Medium)
                 .color(Color::Disabled),
         )
-        .child(Label::new(title.into()).color(Color::Muted))
+        .child(text::state(title))
 }
 
 /// What a view shows while its content is read, where the content will be: a muted line, as
@@ -1738,7 +1749,7 @@ pub fn loading_state(title: impl Into<SharedString>) -> Div {
         .items_center()
         .justify_center()
         .p(px(space::PAGE))
-        .child(Label::new(title.into()).color(Color::Muted))
+        .child(text::state(title))
 }
 
 /// A view whose content could not be read, laid out as an [`empty_state`]: an error icon, what

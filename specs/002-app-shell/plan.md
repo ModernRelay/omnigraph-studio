@@ -520,8 +520,9 @@ than styling one-off elements.
   palette. `script/check-design-tokens.py`, run in CI beside the layer check, refuses
   anything else outside the design system; an exception carries a `// ds-exempt: <reason>`.
   It also refuses a text or icon role rebuilt by hand (a label given a size and a muted or
-  error colour, a muted icon given a size), which views take from `ds::text` and `ds::icon`;
-  the forked Zed menu keeps upstream's calls.
+  error colour, or a muted colour alone; a muted icon given a size), which views take from
+  `ds::text` and `ds::icon`, a button given a sized or tinted icon, and Zed's `Divider`
+  (`ds::rule_h`); the forked Zed menu keeps upstream's calls.
   Data column widths and algorithm constants (zoom steps, layout forces, text-width
   estimates) are named once where they are used; the canvas's chip text is world geometry
   the zoom scales.
@@ -534,8 +535,9 @@ than styling one-off elements.
   (93.75 %), at which Zed's `Default`, `Small` and `XSmall` labels are 13, 11 and 9 px, Tower's
   `text-sm` and `text-xs`. Body text is `Small`; labels, counts and metadata `XSmall`; buttons
   `Default`. Views take text and quiet icons by role (`ds::text::body`, `muted`, `meta`,
-  `error`, `error_note`; `ds::icon::lead`, `meta`) rather than setting a label's or an
-  icon's size and colour themselves. The interface font is Inter by default (Tower's face; Inter 4.1, OFL-1.1, the
+  `state` for an empty or waiting state's line, `error`, `error_note`; `ds::icon::lead`,
+  `meta`) rather than setting a label's or an icon's size and colour themselves. A button
+  sizes and inks its own icons (above), so it is given a plain `Icon::new`. The interface font is Inter by default (Tower's face; Inter 4.1, OFL-1.1, the
   regular, italic, medium, semibold and bold static files in `assets/fonts/inter/`, loaded
   with Zed's fonts); IBM Plex Sans and every installed font stay selectable.
 - **Toolbars.** A document's toolbar and every header or notice strip (a table's, a query's,
