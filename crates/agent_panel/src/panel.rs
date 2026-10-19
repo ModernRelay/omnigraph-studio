@@ -286,10 +286,15 @@ impl Entries {
         self.get_mut(last)
     }
 
-    /// Every entry, to change any of them.
-    fn iter_mut(&mut self) -> std::slice::IterMut<'_, Entry> {
-        self.stale_from = 0;
-        self.list.iter_mut()
+    /// Offers every entry to `change`, which says whether it changed it: the hashes go stale
+    /// from the first changed only, so settling a turn's open tools leaves the rest of a long
+    /// conversation as hashed.
+    fn change_each(&mut self, mut change: impl FnMut(&mut Entry) -> bool) {
+        for (index, entry) in self.list.iter_mut().enumerate() {
+            if change(entry) {
+                self.stale_from = self.stale_from.min(index);
+            }
+        }
     }
 
     fn clear(&mut self) {
@@ -923,25 +928,24 @@ impl AgentPanel {
         // Options can only be set on a running session.
         self.config_options.clear();
         self.setting_option = None;
-        for entry in self.entries.iter_mut() {
-            match entry {
-                Entry::Permission(card) if card.reply.is_some() => {
-                    card.reply = None;
-                    card.answer = Some("Cancelled".into());
-                }
-                Entry::Proposal(proposal)
-                    if matches!(proposal.state, ProposalState::Waiting(_)) =>
-                {
-                    proposal.state = ProposalState::Rejected;
-                }
-                // A write on its way runs to its end, but its card no longer hears how: the
-                // session's activity records it.
-                Entry::Proposal(proposal) if matches!(proposal.state, ProposalState::Running) => {
-                    proposal.state = ProposalState::Unknown;
-                }
-                _ => {}
+        self.entries.change_each(|entry| match entry {
+            Entry::Permission(card) if card.reply.is_some() => {
+                card.reply = None;
+                card.answer = Some("Cancelled".into());
+                true
             }
-        }
+            Entry::Proposal(proposal) if matches!(proposal.state, ProposalState::Waiting(_)) => {
+                proposal.state = ProposalState::Rejected;
+                true
+            }
+            // A write on its way runs to its end, but its card no longer hears how: the
+            // session's activity records it.
+            Entry::Proposal(proposal) if matches!(proposal.state, ProposalState::Running) => {
+                proposal.state = ProposalState::Unknown;
+                true
+            }
+            _ => false,
+        });
         self.gateway_cards.clear();
     }
 
@@ -1134,13 +1138,15 @@ impl AgentPanel {
 
     /// Gives every tool still pending or running the status it ended with.
     fn settle_open_tools(&mut self, ended: ToolCallStatus) {
-        for entry in self.entries.iter_mut() {
-            if let Entry::Tool { status, .. } = entry
-                && matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress)
+        self.entries.change_each(|entry| match entry {
+            Entry::Tool { status, .. }
+                if matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress) =>
             {
                 *status = ended;
+                true
             }
-        }
+            _ => false,
+        });
     }
 
     fn apply_update(&mut self, update: SessionUpdate, cx: &mut Context<Self>) {
@@ -3871,14 +3877,20 @@ mod tests {
         assert_eq!(entries.hash(0), first);
         assert_ne!(entries.hash(1), second);
         let second = entries.hash(1);
-        for entry in entries.iter_mut() {
-            if let Entry::User(text) = entry {
+        entries.change_each(|entry| match entry {
+            Entry::User(text) => {
                 text.push('?');
+                true
             }
-        }
+            _ => false,
+        });
+        assert_eq!(entries.stale_from, 0, "stale from the entry changed");
         entries.rehash();
         assert_ne!(entries.hash(0), first);
         assert_eq!(entries.hash(1), second);
+        // Changing nothing leaves every hash as it is.
+        entries.change_each(|_| false);
+        assert_eq!(entries.stale_from, entries.len());
         entries.clear();
         entries.rehash();
         assert!(entries.is_empty() && entries.hash(0) == 0);
