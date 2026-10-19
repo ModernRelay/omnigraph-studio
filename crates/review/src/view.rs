@@ -2339,14 +2339,23 @@ async fn commits_since_fork(
     head: Option<&str>,
     cx: &mut AsyncApp,
 ) -> Result<(Option<String>, Option<String>, Vec<ReviewCommit>), String> {
-    let branch_commits = session
-        .update(cx, |session, cx| session.commits(branch, true, cx))
+    // The lists the session keeps, which a commit Studio sees drops: the branch's read again
+    // only when it does not reach the reviewed head (or no head says which commit is the
+    // head), and the target's as kept, since commits it gained after the fork do not move it.
+    let read = |branch: &str, fresh: bool, cx: &mut AsyncApp| {
+        session.update(cx, |session, cx| session.commits(branch, fresh, cx))
+    };
+    let mut branch_commits = read(branch, head.is_none(), cx)
         .await
         .map_err(|e| e.to_string())?;
-    let target_commits = session
-        .update(cx, |session, cx| session.commits(target, true, cx))
-        .await
-        .map_err(|e| e.to_string())?;
+    if let Some(head) = head
+        && !branch_commits
+            .iter()
+            .any(|commit| commit.graph_commit_id == head)
+    {
+        branch_commits = read(branch, true, cx).await.map_err(|e| e.to_string())?;
+    }
+    let target_commits = read(target, false, cx).await.map_err(|e| e.to_string())?;
     // Commits made after the reviewed head are not the review's.
     let from_head = head
         .and_then(|head| {
