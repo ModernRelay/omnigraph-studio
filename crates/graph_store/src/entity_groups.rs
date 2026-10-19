@@ -109,6 +109,17 @@ pub struct RelationshipEntry {
     pub replaces: Option<(usize, String)>,
 }
 
+/// The lines a card draws ([`EntityGroups::lines`]): the first few, how many there are, and the
+/// added, changed and removed among all of them; mirrors count on their own card.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CardLines {
+    pub entries: Vec<RelationshipEntry>,
+    pub total: usize,
+    pub added: usize,
+    pub changed: usize,
+    pub removed: usize,
+}
+
 /// A review's changes by entity, in display order: [`GroupSection::Existing`] first, each
 /// section by type in the fold's type order, and inside a type changed, removed, unchanged,
 /// then added, each in fold order.
@@ -428,7 +439,63 @@ impl EntityGroups {
         schema: Option<&SchemaModel>,
         names: &NodeNames,
     ) -> Vec<RelationshipEntry> {
+        self.lines(folded, ix, schema, names, usize::MAX).entries
+    }
+
+    /// Each line of group `ix`'s card in order, as its change and whether it is a mirror.
+    fn line_changes(&self, ix: usize) -> impl Iterator<Item = (&GroupRelationship, bool)> {
         let group = &self.groups[ix];
+        // A moved relationship's removal is in its addition's entry.
+        let moved_from =
+            |change: usize| group.repoints.iter().any(|(removed, _)| *removed == change);
+        group
+            .relationships
+            .iter()
+            .filter(move |r| !moved_from(r.change))
+            .map(|r| (r, false))
+            .chain(group.mirrors.iter().map(|m| (m, true)))
+    }
+
+    /// How many lines group `ix`'s card has.
+    pub fn line_count(&self, ix: usize) -> usize {
+        self.line_changes(ix).count()
+    }
+
+    /// Where the line of `change` is on group `ix`'s card.
+    pub fn line_of(&self, ix: usize, change: usize) -> Option<usize> {
+        self.line_changes(ix)
+            .position(|(relationship, _)| relationship.change == change)
+    }
+
+    /// Group `ix`'s card's first `take` lines ([`Self::entries`]) and what all its lines count,
+    /// without making the lines it leaves out: a node with thousands of relationship changes
+    /// draws its first few at the cost of a few.
+    pub fn lines(
+        &self,
+        folded: &FoldedChanges,
+        ix: usize,
+        schema: Option<&SchemaModel>,
+        names: &NodeNames,
+        take: usize,
+    ) -> CardLines {
+        let group = &self.groups[ix];
+        let mut lines = CardLines::default();
+        for (relationship, mirror) in self.line_changes(ix) {
+            lines.total += 1;
+            if mirror {
+                continue;
+            }
+            let moved = group
+                .repoints
+                .iter()
+                .any(|(_, added)| *added == relationship.change);
+            match (moved, folded.changes[relationship.change].net()) {
+                (true, _) | (false, Some(NetChange::Changed)) => lines.changed += 1,
+                (false, Some(NetChange::Added)) => lines.added += 1,
+                (false, Some(NetChange::Removed)) => lines.removed += 1,
+                (false, None) => {}
+            }
+        }
         let other_name = |relationship: &GroupRelationship| {
             relationship
                 .other_group
@@ -482,16 +549,12 @@ impl EntityGroups {
                 replaces,
             }
         };
-        // A moved relationship's removal is in its addition's entry.
-        let moved_from =
-            |change: usize| group.repoints.iter().any(|(removed, _)| *removed == change);
-        group
-            .relationships
-            .iter()
-            .filter(|r| !moved_from(r.change))
-            .map(|r| entry(r, false))
-            .chain(group.mirrors.iter().map(|m| entry(m, true)))
-            .collect()
+        lines.entries = self
+            .line_changes(ix)
+            .take(take)
+            .map(|(relationship, mirror)| entry(relationship, mirror))
+            .collect();
+        lines
     }
 }
 
@@ -721,6 +784,21 @@ mod tests {
         assert_eq!(lines[0].other, "Ana Lima", "a name read from the graph");
         // Theo's label is his key: the id is his name.
         assert_eq!(lines[1].other, "theo");
+        // A card's first lines alone, with what all its lines count.
+        let first = groups.lines(&folded, 0, Some(&schema), &names, 1);
+        assert_eq!(first.entries, lines[..1]);
+        let count = |net: NetChange| lines.iter().filter(|line| line.net == Some(net)).count();
+        assert_eq!(
+            (first.total, first.added, first.changed, first.removed),
+            (
+                lines.len(),
+                count(NetChange::Added),
+                count(NetChange::Changed),
+                count(NetChange::Removed)
+            )
+        );
+        assert_eq!(groups.line_count(0), lines.len());
+        assert_eq!(groups.line_of(0, lines[1].change), Some(1));
         assert_eq!(
             maya.relationships[0].other_group, None,
             "ana is not in the review"

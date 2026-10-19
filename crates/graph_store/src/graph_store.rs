@@ -31,7 +31,7 @@ pub use connection::{
     Connection, ConnectionEvent, ConnectionState, GraphListing, ServerEntry, ServerSource,
 };
 pub use entity_groups::{
-    EntityGroup, EntityGroups, GroupRelationship, GroupRun, GroupSection, NodeNames,
+    CardLines, EntityGroup, EntityGroups, GroupRelationship, GroupRun, GroupSection, NodeNames,
     RelationshipEntry, entity_name, relationship_words,
 };
 pub use exploration::*;

@@ -1941,23 +1941,22 @@ impl ReviewView {
             );
         }
 
-        let entries = data.groups.entries(&data.folded, ix, schema, &self.names);
-        let counts = change_cards::relationship_counts(&entries);
         // A card of many relationships shows its first few until opened, and opens by itself
-        // for a relationship selected below them (from a mirror, or a change of a fix).
+        // for a relationship selected below them (from a mirror, or a change of a fix). Only the
+        // lines it shows are made.
         let card_key = (group.type_name.clone(), group.id.clone());
-        let selected_at = self
-            .selected
-            .and_then(|s| entries.iter().position(|entry| entry.change == s));
-        let shown = change_cards::lines_shown(
-            entries.len(),
-            self.open_cards.contains(&card_key),
-            selected_at,
-        );
-        let left_out = entries.len() - shown;
-        let lines = entries
+        let total = data.groups.line_count(ix);
+        let selected_at = self.selected.and_then(|s| data.groups.line_of(ix, s));
+        let shown =
+            change_cards::lines_shown(total, self.open_cards.contains(&card_key), selected_at);
+        let left_out = total - shown;
+        let card_lines = data
+            .groups
+            .lines(&data.folded, ix, schema, &self.names, shown);
+        let counts = (card_lines.added, card_lines.changed, card_lines.removed);
+        let lines = card_lines
+            .entries
             .into_iter()
-            .take(shown)
             .map(|entry| {
                 let change = entry.change;
                 let mirror = entry.net.is_none();

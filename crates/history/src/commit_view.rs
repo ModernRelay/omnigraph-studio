@@ -515,19 +515,20 @@ impl CommitView {
                     &self.names,
                     ("commit-change", ix),
                 );
-                let entries = self.groups.entries(&self.folded, ix, schema, &self.names);
-                let counts = change_cards::relationship_counts(&entries);
                 let group = &self.groups.groups[ix];
                 let card_key = (group.type_name.clone(), group.id.clone());
-                let shown = change_cards::lines_shown(
-                    entries.len(),
-                    self.open_cards.contains(&card_key),
-                    None,
-                );
-                let left_out = entries.len() - shown;
-                let lines = entries
+                let total = self.groups.line_count(ix);
+                let shown =
+                    change_cards::lines_shown(total, self.open_cards.contains(&card_key), None);
+                let left_out = total - shown;
+                // Only the lines the card shows are made.
+                let card_lines = self
+                    .groups
+                    .lines(&self.folded, ix, schema, &self.names, shown);
+                let counts = (card_lines.added, card_lines.changed, card_lines.removed);
+                let lines = card_lines
+                    .entries
                     .into_iter()
-                    .take(shown)
                     .map(|entry| {
                         let edge = &self.folded.changes[entry.change];
                         let was = entry

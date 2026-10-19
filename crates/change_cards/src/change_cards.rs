@@ -77,21 +77,6 @@ pub fn entity_card(
     }
 }
 
-/// Added, changed and removed relationships among a card's entries; mirrors are counted on
-/// their own card.
-pub fn relationship_counts(entries: &[RelationshipEntry]) -> (usize, usize, usize) {
-    entries
-        .iter()
-        .fold((0, 0, 0), |(added, changed, removed), entry| {
-            match entry.net {
-                Some(NetChange::Added) => (added + 1, changed, removed),
-                Some(NetChange::Changed) => (added, changed + 1, removed),
-                Some(NetChange::Removed) => (added, changed, removed + 1),
-                None => (added, changed, removed),
-            }
-        })
-}
-
 /// A card's line for one relationship entry: what changed, which way it points, the other
 /// end, and a changed relationship's property rows; for one moved to another end
 /// ([`RelationshipEntry::replaces`], `was` its removed edge), both ends and the old edge's
