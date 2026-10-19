@@ -16,7 +16,11 @@ every surface and nothing drifts. This refuses, outside the design system and te
   `Color`;
 - a font weight named directly (`FontWeight::MEDIUM`): views take `ds::text::weight`;
 - a `ui` component the design system wraps (`Switch::new`, `Headline::new`): views take
-  `ds::switch`, `ds::text::title` and `ds::text::heading`.
+  `ds::switch`, `ds::text::title` and `ds::text::heading`;
+- a text or icon role built by hand (`Label::new(..).size(LabelSize::Small).color(Color::Muted)`,
+  `Icon::new(..).size(IconSize::XSmall).color(Color::Muted)`): views take `ds::text::body`,
+  `muted`, `meta`, `error`, `error_note` and `ds::icon::lead`, `meta`. This rule reads a
+  file whole, since a builder chain spans lines.
 
 A line the rule cannot fit says why in a `// ds-exempt: <reason>` comment on it or the line
 above, so every exception shows up in review.
@@ -60,6 +64,18 @@ RULES = [
     ("component outside the design system", re.compile(r"\b(Switch|Headline)::new\(")),
 ]
 EXEMPT = re.compile(r"//\s*ds-exempt:\s*\S")
+# Builder chains that rebuild a role, whichever order the two calls come in.
+LABEL_SIZE = r"\.size\(LabelSize::(?:Small|XSmall)\)"
+LABEL_TONE = r"\.color\(Color::(?:Muted|Error)\)"
+ICON_SIZE = r"\.size\(IconSize::(?:Small|XSmall)\)"
+ROLE_CHAINS = re.compile(
+    rf"\b(?:Label::new\((?:[^()]|\([^()]*\))*\)\s*(?:{LABEL_SIZE}\s*{LABEL_TONE}|{LABEL_TONE}\s*{LABEL_SIZE}"
+    rf"|\.size\(LabelSize::Small\)(?!\s*\.color\())"
+    rf"|Icon::new\((?:[^()]|\([^()]*\))*\)\s*(?:{ICON_SIZE}\s*\.color\(Color::Muted\)"
+    rf"|\.color\(Color::Muted\)\s*{ICON_SIZE}))"
+)
+# The Zed menu fork stays close to upstream.
+ROLE_EXEMPT_FILES = {"crates/studio_ui/src/menu.rs"}
 
 
 def views():
@@ -74,7 +90,13 @@ def views():
 def main() -> int:
     errors = []
     for rel, path in views():
-        lines = path.read_text().splitlines()
+        text = path.read_text()
+        if rel not in ROLE_EXEMPT_FILES:
+            body = text.split("#[cfg(test)]\nmod ")[0]
+            for match in ROLE_CHAINS.finditer(body):
+                line = body.count("\n", 0, match.start()) + 1
+                errors.append(f"{rel}:{line}: role built by hand: {match.group(0).split(chr(10))[0].strip()}")
+        lines = text.splitlines()
         in_test = False
         for index, line in enumerate(lines):
             # A test module runs to the end of its file; a test-only item elsewhere is

@@ -1204,8 +1204,7 @@ impl TypeTable {
             .border_b_1()
             .border_color(border)
             .child(
-                Label::new(format!("{count} rows selected"))
-                    .size(LabelSize::Small)
+                studio_ui::ds::text::body(format!("{count} rows selected"))
                     .weight(studio_ui::ds::text::weight::HEADING),
             );
         if read_only {
@@ -4068,12 +4067,11 @@ impl TypeTable {
             .gap(px(space::MD))
             .child(Indicator::dot().color(Color::Accent))
             .child(
-                Label::new(if saving {
+                studio_ui::ds::text::body(if saving {
                     "Saving drafts…".to_owned()
                 } else {
                     format!("{} not saved", plural(count, "draft", "drafts"))
                 })
-                .size(LabelSize::Small)
                 .weight(studio_ui::ds::text::weight::HEADING),
             )
             .children(self.drafts.notice.clone().map(|notice| {
@@ -5001,11 +4999,7 @@ impl TypeTable {
                     .flex_none()
                     .bg(rule)
             };
-            let chevron = || {
-                Icon::new(IconName::ChevronDown)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted)
-            };
+            let chevron = || studio_ui::ds::icon::meta(IconName::ChevronDown);
             // The filter being written is the pill it will become, outlined while it is open.
             let pill = h_flex()
                 .h(px(studio_ui::ds::size::PILL))
@@ -5025,11 +5019,7 @@ impl TypeTable {
                         .trigger(
                             Button::new("filter-property-button", chosen)
                                 .style(ButtonStyle::Subtle)
-                                .start_icon(
-                                    Icon::new(chosen_icon)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Muted),
-                                )
+                                .start_icon(studio_ui::ds::icon::meta(chosen_icon))
                                 .end_icon(chevron()),
                         )
                         .menu(move |window, cx| {
@@ -5155,12 +5145,9 @@ impl TypeTable {
                             )),
                         ),
                 );
-            bar = bar.child(pill).children(
-                draft
-                    .error
-                    .clone()
-                    .map(|error| Label::new(error).size(LabelSize::Small).color(Color::Error)),
-            );
+            bar = bar
+                .child(pill)
+                .children(draft.error.clone().map(studio_ui::ds::text::error));
         }
         if !self.filters.is_empty() {
             bar = bar.child(div().flex_1()).child(
@@ -5607,19 +5594,14 @@ impl TypeTable {
             .items_center()
             .overflow_hidden()
             .cursor_pointer()
-            .child(
-                Icon::new(if section.expanded {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                })
-                .size(IconSize::XSmall)
-                .color(Color::Muted),
-            )
+            .child(studio_ui::ds::icon::meta(if section.expanded {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            }))
             .child(
                 div().min_w_0().flex_shrink(1.).child(
-                    Label::new(text)
-                        .size(LabelSize::Small)
+                    studio_ui::ds::text::body(text)
                         .weight(studio_ui::ds::text::weight::HEADING)
                         .color(if missing {
                             Color::Muted
@@ -5667,11 +5649,7 @@ impl TypeTable {
                     div()
                         .id(("section-error", index))
                         .tooltip(Tooltip::text(error.clone()))
-                        .child(
-                            Label::new("Not read")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Error),
-                        ),
+                        .child(studio_ui::ds::text::error_note("Not read")),
                 )
                 .child(
                     studio_ui::ds::button(("section-retry", index), "Retry")
@@ -6581,7 +6559,7 @@ struct DraggedColumn {
 
 impl Render for DraggedColumn {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        studio_ui::ds::drag_preview(cx).child(Label::new(self.title.clone()).size(LabelSize::Small))
+        studio_ui::ds::drag_preview(cx).child(studio_ui::ds::text::body(self.title.clone()))
     }
 }
 

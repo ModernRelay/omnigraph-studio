@@ -2461,11 +2461,7 @@ impl Render for AgentPanel {
             )))
             .children(self.render_queue(cx))
             .child(gutter_row(
-                Some(
-                    Icon::new(IconName::Person)
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                ),
+                Some(studio_ui::ds::icon::lead(IconName::Person)),
                 div().text_sm().child(self.composer.clone()),
             ))
             .child(self.render_composer_controls(cx));
@@ -2517,10 +2513,7 @@ impl AgentPanel {
                     .gap(px(ds::space::XS))
                     .items_center()
                     .child(
-                        Icon::new(IconName::ArrowCircle)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted)
-                            .with_rotate_animation(2),
+                        studio_ui::ds::icon::meta(IconName::ArrowCircle).with_rotate_animation(2),
                     )
                     .child(ds::text::meta("Working"))
                     .into_any_element(),
@@ -2590,11 +2583,7 @@ impl AgentPanel {
                                          never sees your token, and its changes land on a branch \
                                          of its own, for you to review.",
                                     ))
-                                    .child(
-                                        Icon::new(IconName::Info)
-                                            .size(IconSize::XSmall)
-                                            .color(Color::Muted),
-                                    ),
+                                    .child(studio_ui::ds::icon::meta(IconName::Info)),
                             ),
                     )
                     // A question asked before an agent was chosen waits, and says so.
@@ -2604,13 +2593,11 @@ impl AgentPanel {
                             .first()
                             .map(|queued| queued.text.clone())
                             .map(|question| {
-                                div().mb(px(ds::space::MD)).child(
-                                    Label::new(format!(
+                                div()
+                                    .mb(px(ds::space::MD))
+                                    .child(studio_ui::ds::text::muted(format!(
                                         "“{question}” is sent once you choose an agent."
-                                    ))
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                                )
+                                    )))
                             }),
                     )
                     .children(PRESETS.iter().enumerate().map(|(index, (name, command))| {
@@ -2620,11 +2607,7 @@ impl AgentPanel {
                         studio_ui::ds::button(("preset", index), *name)
                             .full_width()
                             .style(ButtonStyle::Outlined)
-                            .start_icon(
-                                Icon::new(IconName::ZedAssistant)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            )
+                            .start_icon(studio_ui::ds::icon::lead(IconName::ZedAssistant))
                             .tooltip(Tooltip::text(format!(
                                 "Runs {shown}; npx downloads it the first time you send a message"
                             )))
@@ -2637,7 +2620,7 @@ impl AgentPanel {
                             .my(px(ds::space::MD))
                             .gap(px(ds::space::MD))
                             .child(ui::Divider::horizontal())
-                            .child(Label::new("or").size(LabelSize::XSmall).color(Color::Muted))
+                            .child(studio_ui::ds::text::meta("or"))
                             .child(ui::Divider::horizontal()),
                     )
                     .child(
@@ -2894,21 +2877,13 @@ impl AgentPanel {
     ) -> AnyElement {
         match entry {
             Entry::User(text) => gutter_row(
-                Some(
-                    Icon::new(IconName::Person)
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                ),
+                Some(studio_ui::ds::icon::lead(IconName::Person)),
                 div().text_sm().child(text.clone()),
             )
             .when(index > 0, |row| row.mt(px(ds::space::XL)))
             .into_any_element(),
             Entry::Agent(text) => gutter_row(
-                lead.then(|| {
-                    Icon::new(IconName::ZedAssistant)
-                        .size(IconSize::Small)
-                        .color(Color::Muted)
-                }),
+                lead.then(|| studio_ui::ds::icon::lead(IconName::ZedAssistant)),
                 match self.markdown.get(&index) {
                     // Zed's markdown, as Zed's agent panel renders a reply.
                     Some((markdown, _)) => div()
@@ -2929,11 +2904,7 @@ impl AgentPanel {
                 gutter_row(None, self.activity_step(index, entry, cx)).into_any_element()
             }
             Entry::Plan(items) => gutter_row(
-                Some(
-                    Icon::new(IconName::ListTodo)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                ),
+                Some(studio_ui::ds::icon::meta(IconName::ListTodo)),
                 v_flex()
                     .gap(px(ds::space::XXS))
                     .children(items.iter().map(|(content, status)| {
@@ -2949,7 +2920,7 @@ impl AgentPanel {
                         h_flex()
                             .gap(px(ds::space::MD))
                             .child(icon.size(IconSize::XSmall))
-                            .child(Label::new(content.clone()).size(LabelSize::Small))
+                            .child(studio_ui::ds::text::body(content.clone()))
                     })),
             )
             .into_any_element(),
@@ -3005,20 +2976,16 @@ impl AgentPanel {
             .gap(px(ds::space::XS))
             .items_center()
             .cursor_pointer()
-            .child(
-                Label::new(if running {
-                    "Running".to_owned()
-                } else {
-                    // "Query people", "Mutate retitle": the CLI's subcommand, capitalized.
-                    let mut chars = command.chars();
-                    chars
-                        .next()
-                        .map(|first| first.to_uppercase().chain(chars).collect())
-                        .unwrap_or_default()
-                })
-                .size(LabelSize::Small)
-                .color(Color::Muted),
-            )
+            .child(studio_ui::ds::text::muted(if running {
+                "Running".to_owned()
+            } else {
+                // "Query people", "Mutate retitle": the CLI's subcommand, capitalized.
+                let mut chars = command.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_uppercase().chain(chars).collect())
+                    .unwrap_or_default()
+            }))
             .children(name.map(|name| {
                 Label::new(name)
                     .size(LabelSize::Small)
@@ -3026,26 +2993,18 @@ impl AgentPanel {
                     .buffer_font(cx)
             }))
             .when(failed, |row| {
-                row.child(
-                    Label::new("· failed")
-                        .size(LabelSize::Small)
-                        .color(Color::Error),
-                )
+                row.child(studio_ui::ds::text::error("· failed"))
             })
             .child(if running {
-                Icon::new(IconName::ArrowCircle)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted)
+                studio_ui::ds::icon::meta(IconName::ArrowCircle)
                     .with_rotate_animation(2)
                     .into_any_element()
             } else {
-                Icon::new(if folded {
+                studio_ui::ds::icon::meta(if folded {
                     IconName::ChevronRight
                 } else {
                     IconName::ChevronDown
                 })
-                .size(IconSize::XSmall)
-                .color(Color::Muted)
                 .into_any_element()
             })
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -3062,11 +3021,7 @@ impl AgentPanel {
         });
         let card = ds::code_block_highlighted(text.trim_end().to_owned(), highlights, cx);
         gutter_row(
-            lead.then(|| {
-                Icon::new(IconName::ZedAssistant)
-                    .size(IconSize::Small)
-                    .color(Color::Muted)
-            }),
+            lead.then(|| studio_ui::ds::icon::lead(IconName::ZedAssistant)),
             v_flex()
                 .w_full()
                 .gap(px(ds::space::SM))
@@ -3115,32 +3070,22 @@ impl AgentPanel {
             .gap(px(ds::space::XS))
             .items_center()
             .cursor_pointer()
-            .child(
-                Label::new(activity_summary(thoughts, &kinds))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
+            .child(studio_ui::ds::text::muted(activity_summary(
+                thoughts, &kinds,
+            )))
             .when(failed > 0, |row| {
-                row.child(
-                    Label::new(format!("· {failed} failed"))
-                        .size(LabelSize::Small)
-                        .color(Color::Error),
-                )
+                row.child(studio_ui::ds::text::error(format!("· {failed} failed")))
             })
             .child(if running {
-                Icon::new(IconName::ArrowCircle)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted)
+                studio_ui::ds::icon::meta(IconName::ArrowCircle)
                     .with_rotate_animation(2)
                     .into_any_element()
             } else {
-                Icon::new(if expanded {
+                studio_ui::ds::icon::meta(if expanded {
                     IconName::ChevronDown
                 } else {
                     IconName::ChevronRight
                 })
-                .size(IconSize::XSmall)
-                .color(Color::Muted)
                 .into_any_element()
             })
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -3150,11 +3095,7 @@ impl AgentPanel {
                 cx.notify();
             }));
         gutter_row(
-            lead.then(|| {
-                Icon::new(IconName::ZedAssistant)
-                    .size(IconSize::Small)
-                    .color(Color::Muted)
-            }),
+            lead.then(|| studio_ui::ds::icon::lead(IconName::ZedAssistant)),
             v_flex()
                 .gap(px(ds::space::XS))
                 .child(header)
@@ -3213,9 +3154,7 @@ impl AgentPanel {
                     )
                     .when(running, |row| {
                         row.child(
-                            Icon::new(IconName::ArrowCircle)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted)
+                            studio_ui::ds::icon::meta(IconName::ArrowCircle)
                                 .with_rotate_animation(2),
                         )
                     })
@@ -3242,14 +3181,12 @@ impl AgentPanel {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .child(Label::new(card.title.clone()).size(LabelSize::Small)),
+                    .child(studio_ui::ds::text::body(card.title.clone())),
             );
         let footer = match &card.answer {
-            Some(answer) => studio_ui::ds::card_footer(cx).child(
-                Label::new(answer.clone())
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-            ),
+            Some(answer) => {
+                studio_ui::ds::card_footer(cx).child(studio_ui::ds::text::meta(answer.clone()))
+            }
             None => studio_ui::ds::card_footer(cx).children(card.options.iter().enumerate().map(
                 |(option_index, option)| {
                     let (icon, color) = match option.kind {
@@ -3284,14 +3221,9 @@ impl AgentPanel {
     ) -> AnyElement {
         let focus = self.focus_handle.clone();
         let header = studio_ui::ds::card_header(cx)
+            .child(studio_ui::ds::icon::meta(IconName::Pencil))
             .child(
-                Icon::new(IconName::Pencil)
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-            )
-            .child(
-                Label::new(proposal.summary.clone())
-                    .size(LabelSize::Small)
+                studio_ui::ds::text::body(proposal.summary.clone())
                     .single_line()
                     .truncate(),
             )
@@ -3537,11 +3469,7 @@ impl AgentPanel {
                         .hover(|style| style.bg(ds::surface::highlight(cx)))
                         .tooltip(Tooltip::text(about))
                         .child(Indicator::dot().color(dot))
-                        .child(
-                            Label::new(agent_name)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
+                        .child(studio_ui::ds::text::muted(agent_name))
                         .on_click(|_, window, cx| {
                             window.dispatch_action(
                                 Box::new(studio_actions::workspace::OpenSettings),

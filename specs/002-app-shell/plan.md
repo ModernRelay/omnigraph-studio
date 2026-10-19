@@ -517,6 +517,9 @@ than styling one-off elements.
   `ds::elevation`, and `ds::text::weight::{BODY, HEADING}`. Only `ds` reads the theme's
   palette. `script/check-design-tokens.py`, run in CI beside the layer check, refuses
   anything else outside the design system; an exception carries a `// ds-exempt: <reason>`.
+  It also refuses a text or icon role rebuilt by hand (a label given a size and a muted or
+  error colour, a muted icon given a size), which views take from `ds::text` and `ds::icon`;
+  the forked Zed menu keeps upstream's calls.
   Data column widths and algorithm constants (zoom steps, layout forces, text-width
   estimates) are named once where they are used; the canvas's chip text is world geometry
   the zoom scales.

@@ -1991,7 +1991,7 @@ impl GraphCanvas {
             .border_1()
             .border_color(studio_ui::ds::surface::floating_border(cx))
             .shadow(studio_ui::ds::elevation::float(cx))
-            .child(Label::new(text).size(LabelSize::XSmall).color(Color::Muted))
+            .child(studio_ui::ds::text::meta(text))
     }
 
     /// The most nodes this graph's canvas draws (setting `studio.canvas_max_nodes`, or the
@@ -2069,9 +2069,7 @@ impl GraphCanvas {
                             panel("canvas-mode")
                                 .child(
                                     div().px(px(space::MD)).child(
-                                        Label::new(summary)
-                                            .size(LabelSize::Small)
-                                            .color(Color::Muted)
+                                        studio_ui::ds::text::muted(summary)
                                             .single_line(),
                                     ),
                                 )
@@ -2129,14 +2127,10 @@ impl GraphCanvas {
                             .gap(px(space::MD))
                             .cursor_pointer()
                             .child(
-                                Icon::new(IconName::MagnifyingGlass)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
+                                studio_ui::ds::icon::lead(IconName::MagnifyingGlass),
                             )
                             .child(
-                                Label::new("Search nodes…")
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
+                                studio_ui::ds::text::muted("Search nodes…"),
                             )
                             .child(ui::KeyBinding::for_action(
                                 &studio_actions::workspace::GoTo,
@@ -2206,9 +2200,7 @@ impl GraphCanvas {
                                 .color(Color::Error),
                         )
                         .child(
-                            Label::new(message)
-                                .size(LabelSize::Small)
-                                .color(Color::Error),
+                            studio_ui::ds::text::error(message),
                         )
                         .child(
                             studio_ui::ds::bar_button("canvas-retry", "Retry")
@@ -2229,10 +2221,9 @@ impl GraphCanvas {
                                 .color(Color::Warning),
                         )
                         .child(
-                            Label::new(format!(
+                            studio_ui::ds::text::body(format!(
                                 "Too many nodes to draw · {hidden} not shown (limit {cap})"
-                            ))
-                            .size(LabelSize::Small),
+                            )),
                         )
                         .child(
                             studio_ui::ds::bar_button("canvas-tree", "Show in tree")

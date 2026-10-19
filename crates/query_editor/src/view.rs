@@ -664,20 +664,12 @@ impl QueryEditor {
             .trigger(
                 studio_ui::ds::toolbar_button("snapshot-picker-button", label)
                     .style(ButtonStyle::Subtle)
-                    .start_icon(
-                        Icon::new(if pinned.is_some() {
-                            IconName::GitCommit
-                        } else {
-                            IconName::GitBranch
-                        })
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                    )
-                    .end_icon(
-                        Icon::new(IconName::ChevronDown)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
+                    .start_icon(studio_ui::ds::icon::meta(if pinned.is_some() {
+                        IconName::GitCommit
+                    } else {
+                        IconName::GitBranch
+                    }))
+                    .end_icon(studio_ui::ds::icon::meta(IconName::ChevronDown))
                     .tooltip(Tooltip::text(match &pinned {
                         Some(commit) => {
                             format!("Reads run at commit {commit}; writes are refused")
@@ -1992,17 +1984,15 @@ impl QueryEditor {
                     .gap(px(space::INLINE))
                     .items_center()
                     .tooltip(Tooltip::text(tip))
-                    .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+                    .child(studio_ui::ds::icon::lead(icon))
                     .child(studio_ui::ds::text::title(title).single_line().truncate())
                     .children(kind.map(studio_ui::ds::text::muted))
             }))
-            .children(self.file_error.clone().map(|error| {
-                Label::new(error)
-                    .size(LabelSize::Small)
-                    .color(Color::Error)
-                    .single_line()
-                    .truncate()
-            }))
+            .children(
+                self.file_error
+                    .clone()
+                    .map(|error| studio_ui::ds::text::error(error).single_line().truncate()),
+            )
             .child(div().flex_1())
             .child(self.render_snapshot_picker(cx))
             // A stored query's plan needs its text, which the server does not send.
@@ -2093,7 +2083,7 @@ impl QueryEditor {
                                         .color(Color::Error),
                                 )
                                 .child(studio_ui::ds::text::meta(problem.code.clone()))
-                                .child(Label::new(problem.message.clone()).size(LabelSize::Small))
+                                .child(studio_ui::ds::text::body(problem.message.clone()))
                                 .children(
                                     problem.fix.clone().map(|fix| {
                                         studio_ui::ds::text::muted(format!("Fix: {fix}"))
@@ -2679,16 +2669,12 @@ impl QueryEditor {
                                 this.light_plan_parts(None, cx);
                             }
                         }))
-                        .child(
-                            Icon::new(if *depth == 0 {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ArrowRight
-                            })
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                        )
-                        .child(Label::new(node.clone()).size(LabelSize::Small))
+                        .child(studio_ui::ds::icon::meta(if *depth == 0 {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ArrowRight
+                        }))
+                        .child(studio_ui::ds::text::body(node.clone()))
                         .child(render_facts(facts))
                         .when(!facts.is_empty(), |d| {
                             d.tooltip(Tooltip::text(facts_tooltip(facts)))
@@ -3015,11 +3001,7 @@ fn run_line(
                 .style(ButtonStyle::Transparent)
                 .size(ButtonSize::Compact)
                 .color(Color::Muted)
-                .start_icon(
-                    Icon::new(IconName::PlayFilled)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted),
-                )
+                .start_icon(studio_ui::ds::icon::meta(IconName::PlayFilled))
                 .on_click(move |_, window, cx| {
                     editor
                         .update(cx, |editor, cx| editor.run_declaration(index, window, cx))

@@ -287,12 +287,13 @@ impl OpenGraphModal {
                             .child(
                                 v_flex()
                                     .min_w_0()
-                                    .child(Label::new(c.server.name.clone()).size(LabelSize::Small))
+                                    .child(studio_ui::ds::text::body(c.server.name.clone()))
                                     .child(
-                                        Label::new(format!("{} · {source}", c.server.url))
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted)
-                                            .truncate(),
+                                        studio_ui::ds::text::meta(format!(
+                                            "{} · {source}",
+                                            c.server.url
+                                        ))
+                                        .truncate(),
                                     ),
                             )
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -344,11 +345,7 @@ impl OpenGraphModal {
                     .px(px(space::MD))
                     .gap(px(space::MD))
                     .child(Indicator::dot().color(state_color(&state)))
-                    .child(
-                        Label::new(status)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
+                    .child(studio_ui::ds::text::muted(status))
                     .child(div().flex_1())
                     .map(|row| match &state {
                         ConnectionState::Connecting => row.child(
@@ -397,11 +394,9 @@ impl OpenGraphModal {
                 )
             })
             .child(pane_label("Graphs"))
-            .children(listing_note.map(|n| {
-                div()
-                    .px(px(space::MD))
-                    .child(Label::new(n).size(LabelSize::Small).color(Color::Muted))
-            }))
+            .children(
+                listing_note.map(|n| div().px(px(space::MD)).child(studio_ui::ds::text::muted(n))),
+            )
             .children(
                 graphs
                     .into_iter()
@@ -419,20 +414,12 @@ impl OpenGraphModal {
                         let id = graph.clone();
                         MenuRow::new(("graph", index))
                             .height(size::ROW)
-                            .start_slot(
-                                Icon::new(IconName::Folder)
-                                    .size(IconSize::Small)
-                                    .color(Color::Muted),
-                            )
+                            .start_slot(studio_ui::ds::icon::lead(IconName::Folder))
                             .child(
                                 h_flex()
                                     .gap(px(space::MD))
-                                    .child(Label::new(graph).size(LabelSize::Small))
-                                    .child(
-                                        Label::new(detail)
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
-                                    ),
+                                    .child(studio_ui::ds::text::body(graph))
+                                    .child(studio_ui::ds::text::meta(detail)),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open(id.clone(), window, cx)
@@ -463,11 +450,7 @@ impl OpenGraphModal {
         let field = |label: &'static str, editor: &Entity<Editor>| {
             v_flex()
                 .gap(px(space::XS))
-                .child(
-                    Label::new(label)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
+                .child(studio_ui::ds::text::meta(label))
                 .child(
                     studio_ui::ds::field_frame(false, cx)
                         .child(studio_ui::ds::field_input(editor.clone())),
@@ -477,7 +460,7 @@ impl OpenGraphModal {
             .flex_1()
             .min_w_0()
             .gap(px(space::LG))
-            .child(Label::new("Add a server").size(LabelSize::Small))
+            .child(studio_ui::ds::text::body("Add a server"))
             .child(field("Address", &self.new_url))
             .child(field("Name", &self.new_name))
             .child(field("Bearer token", &self.new_token))
@@ -560,11 +543,7 @@ impl Render for OpenGraphModal {
                             )
                             .child(body),
                     )
-                    .children(
-                        self.error
-                            .clone()
-                            .map(|e| Label::new(e).size(LabelSize::Small).color(Color::Error)),
-                    ),
+                    .children(self.error.clone().map(studio_ui::ds::text::error)),
             )
     }
 }
