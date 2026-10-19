@@ -755,11 +755,20 @@ impl QueryEditor {
         cx.notify();
     }
 
+    /// Whether the text differs from the file's, compared where it lies: a keystroke copies
+    /// none of it.
     fn sync_unsaved(&mut self, cx: &App) {
-        self.unsaved = self
-            .saved_text
-            .as_ref()
-            .is_some_and(|saved| *saved != self.editor.read(cx).text(cx));
+        let Some(saved) = &self.saved_text else {
+            self.unsaved = false;
+            return;
+        };
+        let buffer = self.editor.read(cx).buffer().read(cx).read(cx);
+        let end = buffer.len();
+        self.unsaved = !studio_ui::text::pieces_are(
+            end.0,
+            buffer.text_for_range(MultiBufferOffset(0)..end),
+            saved,
+        );
     }
 
     /// ⌘S: writes the file this tab edits; a new query is saved in this graph's queries folder,

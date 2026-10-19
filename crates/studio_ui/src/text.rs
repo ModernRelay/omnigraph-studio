@@ -70,9 +70,36 @@ pub fn first_line(text: &str) -> String {
     line
 }
 
+/// Whether text held in pieces, `len` bytes in all (an editor's buffer, chunk by chunk), is
+/// `text`: compared where it lies, so a keystroke copies none of it.
+pub fn pieces_are<'a>(len: usize, pieces: impl IntoIterator<Item = &'a str>, text: &str) -> bool {
+    if len != text.len() {
+        return false;
+    }
+    let mut rest = text;
+    for piece in pieces {
+        match rest.strip_prefix(piece) {
+            Some(after) => rest = after,
+            None => return false,
+        }
+    }
+    rest.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pieces_are_compared_with_a_text_in_place() {
+        assert!(pieces_are(11, ["hello", " ", "world"], "hello world"));
+        assert!(!pieces_are(11, ["hello", " ", "worle"], "hello world"));
+        assert!(
+            !pieces_are(5, ["hello"], "hello world"),
+            "a length that differs"
+        );
+        assert!(pieces_are(0, std::iter::empty(), ""));
+    }
 
     #[test]
     fn plain_text_reads_as_itself_and_markup_is_rendered() {

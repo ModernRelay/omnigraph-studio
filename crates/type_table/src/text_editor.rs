@@ -194,17 +194,7 @@ impl TextEditor {
         };
         let buffer = self.editor.read(cx).buffer().read(cx).read(cx);
         let end = buffer.len();
-        if end.0 != old.len() {
-            return true;
-        }
-        let mut rest = old.as_str();
-        for chunk in buffer.text_for_range(MultiBufferOffset(0)..end) {
-            match rest.strip_prefix(chunk) {
-                Some(after) => rest = after,
-                None => return true,
-            }
-        }
-        !rest.is_empty()
+        !studio_ui::text::pieces_are(end.0, buffer.text_for_range(MultiBufferOffset(0)..end), old)
     }
 
     /// Brings the preview up to the text once typing pauses, or when it is next shown.
