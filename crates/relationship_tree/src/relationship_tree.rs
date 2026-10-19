@@ -740,7 +740,9 @@ impl RelationshipTree {
                         div().min_w_0().flex_shrink(1.).child(
                             Label::new(label.unwrap_or_else(|| node.id.clone()))
                                 .size(LabelSize::Small)
-                                .when(root, |label| label.weight(studio_ui::ds::text::weight::HEADING))
+                                .when(root, |label| {
+                                    label.weight(studio_ui::ds::text::weight::HEADING)
+                                })
                                 .truncate(),
                         ),
                     )

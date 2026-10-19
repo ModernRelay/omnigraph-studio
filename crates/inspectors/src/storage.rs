@@ -317,20 +317,28 @@ impl StorageInspector {
                             ("rows", ix),
                             Some(dataset.entity_count.to_string()),
                         )))
-                        .child(div().w(px(col::VERSION)).flex_none().child(CopyableValue::new(
-                            ("version", ix),
-                            Some(dataset.published_dataset_version.to_string()),
-                        )))
                         .child(
-                            div().w(px(col::NATIVE)).flex_none().child(CopyableValue::new(
-                                ("native", ix),
-                                Some(
-                                    dataset
-                                        .native_dataset_branch
-                                        .clone()
-                                        .unwrap_or_else(|| "none".into()),
-                                ),
-                            )),
+                            div()
+                                .w(px(col::VERSION))
+                                .flex_none()
+                                .child(CopyableValue::new(
+                                    ("version", ix),
+                                    Some(dataset.published_dataset_version.to_string()),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .w(px(col::NATIVE))
+                                .flex_none()
+                                .child(CopyableValue::new(
+                                    ("native", ix),
+                                    Some(
+                                        dataset
+                                            .native_dataset_branch
+                                            .clone()
+                                            .unwrap_or_else(|| "none".into()),
+                                    ),
+                                )),
                         )
                         .child(div().flex_1().min_w_0().child(CopyableValue::new(
                             ("path", ix),

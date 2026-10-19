@@ -10,8 +10,8 @@
 //! button and a press leaves the focus where it was, as Zed's buttons do.
 
 use gpui::{
-    AnyView, App, BoxShadow, ClickEvent, CursorStyle, DefiniteLength, ElementId, FocusHandle,
-    Hsla, MouseButton, Role, Stateful, Window, point,
+    AnyView, App, BoxShadow, ClickEvent, CursorStyle, DefiniteLength, ElementId, FocusHandle, Hsla,
+    MouseButton, Role, Stateful, Window, point,
 };
 use ui::prelude::*;
 use ui::{ElevationIndex, KeyBinding, TintColor};

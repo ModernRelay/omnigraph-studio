@@ -538,7 +538,10 @@ impl Render for DesignGallery {
             .child(ds::tile(IconName::Code, cx))
             .child(
                 v_flex()
-                    .child(text::body("People without a company").weight(studio_ui::ds::text::weight::HEADING))
+                    .child(
+                        text::body("People without a company")
+                            .weight(studio_ui::ds::text::weight::HEADING),
+                    )
                     .child(text::muted("Every Person with no WorksAt edge").single_line()),
             )
             .child(ticks)
