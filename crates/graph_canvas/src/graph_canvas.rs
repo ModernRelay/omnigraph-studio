@@ -265,7 +265,9 @@ pub struct GraphCanvas {
     pinned: HashMap<String, Vec2>,
     layout_key: Option<(Mode, Option<NodeRef>)>,
     layout_generation: u64,
-    _layout_task: Option<Task<()>>,
+    /// The layout being worked out off the main thread, until it is applied: a fit waits
+    /// for it, rather than framing the layout it replaces.
+    layout_task: Option<Task<()>>,
     /// The ontology's last layout: what it was laid out from, and where it put each type. The
     /// same types, sizes, pins and relationships are not laid out again: a count changes no
     /// place, since each type has room for a six-digit one.
@@ -421,7 +423,7 @@ impl GraphCanvas {
             pinned: HashMap::new(),
             layout_key: None,
             layout_generation: 0,
-            _layout_task: None,
+            layout_task: None,
             ontology_layout: None,
             hub_limits: HashMap::new(),
             center: Vec2::default(),
@@ -579,7 +581,7 @@ impl GraphCanvas {
                     .filter(|(laid, links, _)| *laid == nodes && *links == edges)
                 {
                     let positions = positions.clone();
-                    self._layout_task = None;
+                    self.layout_task = None;
                     self.apply_layout(scene, widths, positions, cx);
                     return;
                 }
@@ -587,9 +589,10 @@ impl GraphCanvas {
                     let positions = layout::ontology_positions(&nodes, &edges);
                     (nodes, edges, positions)
                 });
-                self._layout_task = Some(cx.spawn(async move |this, cx| {
+                self.layout_task = Some(cx.spawn(async move |this, cx| {
                     let (nodes, edges, positions) = positions.await;
                     this.update(cx, |this, cx| {
+                        this.layout_task = None;
                         if this.layout_generation == generation {
                             this.ontology_layout = Some((nodes, edges, positions.clone()));
                             this.apply_layout(scene, widths, positions, cx);
@@ -647,9 +650,10 @@ impl GraphCanvas {
     ) {
         let generation = self.layout_generation;
         let positions = cx.background_spawn(async move { place() });
-        self._layout_task = Some(cx.spawn(async move |this, cx| {
+        self.layout_task = Some(cx.spawn(async move |this, cx| {
             let positions = positions.await;
             this.update(cx, |this, cx| {
+                this.layout_task = None;
                 if this.layout_generation == generation {
                     this.apply_layout(scene, widths, positions, cx);
                 }
@@ -2391,7 +2395,10 @@ impl Render for GraphCanvas {
             && !self.scene.nodes.is_empty()
         {
             let resized = self.fitted_size.is_some_and(|size| size != viewport.size);
-            if self.fit_pending || (resized && !self.camera_touched) {
+            // A fit asked for waits for the layout under way: drawn meanwhile, the canvas
+            // still shows the one it replaces.
+            let fit = self.fit_pending && self.layout_task.is_none();
+            if fit || (resized && !self.camera_touched) {
                 if self.fit_pending {
                     self.camera_touched = false;
                 }
