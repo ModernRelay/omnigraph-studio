@@ -159,9 +159,23 @@ impl Scope {
         let Some(entry) = self.entries.get_mut(at.index) else {
             return;
         };
-        let listed = listed_ids(&entry.depends, rows).unwrap_or_default();
         entry.known = true;
-        entry.list(listed);
+        match listed_ids(&entry.depends, rows) {
+            Some(ids) => entry.list(ids),
+            // A list whose answer names its nodes in no column read here: any change to the
+            // listed type counts, as for an answer given without its nodes.
+            None if matches!(
+                entry.depends,
+                Depends::EdgesAt {
+                    listed: Some(_),
+                    ..
+                }
+            ) =>
+            {
+                entry.unlisted = true
+            }
+            None => {}
+        }
     }
 
     /// The read at `at` failed: the view shows nothing it would have listed.
@@ -279,6 +293,18 @@ mod tests {
             !scope.unchanged(&since(json!([]), &["Person"])),
             "a type the feed was not asked about"
         );
+    }
+
+    /// A list answer whose rows name no ids lists nothing known: any change to its listed type
+    /// counts, not none.
+    #[test]
+    fn a_list_answer_without_its_ids_counts_its_whole_type() {
+        let (mut scope, _handle) = Scope::new(1, "main".into());
+        let (read, token) = scope.add(neighbours_of("p1"));
+        scope.answered(read, &json!([{ "name": "Bob" }]));
+        drop(token);
+        let asked = ["Person", "Knows"];
+        assert!(!scope.unchanged(&since(json!([node("Person", "p9")]), &asked)));
     }
 
     #[test]
