@@ -365,6 +365,9 @@ struct SettingsFileState {
     /// Changes made so far: a write that comes back for an older one does not apply its
     /// reading over a newer change.
     edits: u64,
+    /// Changes still being written: the watch reads the file again only once they are in,
+    /// since a reading of an earlier change would undo a newer one held in memory.
+    writing: usize,
 }
 
 impl Global for SettingsFileState {}
@@ -601,6 +604,7 @@ pub fn init(cx: &mut App) {
         keymap: Vec::new(),
         writable: true,
         edits: 0,
+        writing: 0,
     });
     apply(settings, cx);
     watch(cx);
@@ -617,6 +621,7 @@ pub fn init_test(cx: &mut App) {
         keymap: Vec::new(),
         writable: false,
         edits: 0,
+        writing: 0,
     });
     cx.set_global(StudioSettings::default());
 }
@@ -732,6 +737,7 @@ pub fn update(cx: &mut App, f: impl FnOnce(&mut StudioSettings)) {
     }
     let state = cx.global_mut::<SettingsFileState>();
     state.edits += 1;
+    state.writing += 1;
     let edit = state.edits;
     apply(new.clone(), cx);
     let path = settings_path();
@@ -803,6 +809,7 @@ fn saved(edit: u64, written: Written, cx: &mut App) {
     let path = settings_path();
     let latest = cx.global::<SettingsFileState>().edits == edit;
     let state = cx.global_mut::<SettingsFileState>();
+    state.writing = state.writing.saturating_sub(1);
     match written {
         Written::Unread(error) => {
             state.error = Some(format!(
@@ -846,7 +853,10 @@ fn watch(cx: &mut App) {
             cx.background_executor().timer(Duration::from_secs(2)).await;
             let path = settings_path();
             let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-            let changed = cx.update(|cx| cx.global::<SettingsFileState>().modified != modified);
+            let changed = cx.update(|cx| {
+                let state = cx.global::<SettingsFileState>();
+                state.writing == 0 && state.modified != modified
+            });
             if changed {
                 let (reading, modified, error) = read_file();
                 cx.update(|cx| {
