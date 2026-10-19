@@ -170,18 +170,16 @@ impl SchemaModel {
             .nodes
             .iter()
             .map(|node| {
-                let keys: Vec<String> = node
-                    .constraints
-                    .iter()
-                    .filter_map(|c| match c {
-                        Constraint::Key(names) if names.len() == 1 => Some(names[0].clone()),
-                        _ => None,
-                    })
-                    .collect();
+                let keys = key_members(&node.constraints);
                 let mut properties: Vec<Property> =
                     node.properties.iter().map(|p| property(p, &keys)).collect();
                 in_declared_order(&file, &node.name, &mut properties);
-                let key = properties.iter().find(|p| p.is_key).map(|p| p.name.clone());
+                // The node's id is its key's value only when the key is one property.
+                let composite = composite_members(&node.constraints);
+                let key = properties
+                    .iter()
+                    .find(|p| p.is_key && !composite.contains(&p.name))
+                    .map(|p| p.name.clone());
                 NodeType {
                     name: node.name.clone(),
                     properties,
@@ -193,8 +191,9 @@ impl SchemaModel {
             .edges
             .iter()
             .map(|edge| {
+                let keys = key_members(&edge.constraints);
                 let mut properties: Vec<Property> =
-                    edge.properties.iter().map(|p| property(p, &[])).collect();
+                    edge.properties.iter().map(|p| property(p, &keys)).collect();
                 in_declared_order(&file, &edge.name, &mut properties);
                 EdgeType {
                     name: edge.name.clone(),
@@ -328,6 +327,30 @@ pub fn traversal_token(edge: &str) -> String {
     }
 }
 
+/// The properties named by a type's `@key` constraints, a composite key's members included.
+fn key_members(constraints: &[Constraint]) -> Vec<String> {
+    constraints
+        .iter()
+        .filter_map(|c| match c {
+            Constraint::Key(names) => Some(names.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// The members of a type's keys of more than one property.
+fn composite_members(constraints: &[Constraint]) -> Vec<String> {
+    constraints
+        .iter()
+        .filter_map(|c| match c {
+            Constraint::Key(names) if names.len() > 1 => Some(names.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
 fn property(shape: &PropertyShape, keys: &[String]) -> Property {
     let PropType {
         scalar,
@@ -349,6 +372,7 @@ fn property(shape: &PropertyShape, keys: &[String]) -> Property {
         ScalarType::Vector(n) => (ScalarKind::Vector, format!("Vector({n})")),
         ScalarType::Blob => (ScalarKind::Blob, "Blob".to_owned()),
     };
+    // Every member of a key, a composite one's too: the server refuses to change any of them.
     let is_key = keys.contains(&shape.name)
         || shape
             .property_constraints
@@ -373,6 +397,23 @@ pub(crate) mod tests {
 
     pub fn dev() -> SchemaModel {
         SchemaModel::parse(DEV_SCHEMA).expect("dev schema compiles")
+    }
+
+    /// Every member of a composite key is a key the server will not let change; the node has
+    /// no single key for its id.
+    #[test]
+    fn a_composite_keys_members_are_keys() {
+        let schema = SchemaModel::parse(
+            "node Pair {\n  alpha: String\n  zeta: String\n  note: String?\n  @key(alpha, zeta)\n}\n",
+        )
+        .unwrap();
+        let pair = schema.node("Pair").unwrap();
+        assert_eq!(pair.key, None);
+        for name in ["alpha", "zeta"] {
+            let member = pair.property(name).unwrap();
+            assert!(member.is_key && !member.editable_in_cell(), "{name}");
+        }
+        assert!(pair.property("note").unwrap().editable_in_cell());
     }
 
     #[test]
