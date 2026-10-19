@@ -12,14 +12,23 @@ use ui::prelude::*;
 use crate::view::HistoryView;
 
 pub(crate) struct HistoryPanel {
+    session: Option<Entity<GraphSession>>,
+    /// Made when the panel is first drawn: a window whose History is never shown reads no
+    /// history.
     view: Option<Entity<HistoryView>>,
+    /// The keyboard's place until the list exists, handed to it when it does.
+    focus_handle: FocusHandle,
     _subscription: Option<Subscription>,
 }
 
 impl HistoryPanel {
     /// The list's focus, which takes the keyboard when the panel is shown from its button.
     pub(crate) fn focus(&self, cx: &App) -> Option<FocusHandle> {
-        self.view.as_ref().map(|view| view.focus_handle(cx))
+        Some(
+            self.view
+                .as_ref()
+                .map_or_else(|| self.focus_handle.clone(), |view| view.focus_handle(cx)),
+        )
     }
 }
 
@@ -34,27 +43,43 @@ impl HistoryPanel {
             cx.subscribe_in(
                 &workspace,
                 window,
-                |this, workspace, event: &WorkspaceEvent, window, cx| {
+                |this, workspace, event: &WorkspaceEvent, _window, cx| {
                     let WorkspaceEvent::SessionChanged = event;
-                    let session = workspace.read(cx).session().cloned();
-                    this.view =
-                        session.map(|session| cx.new(|cx| HistoryView::panel(session, window, cx)));
+                    this.session = workspace.read(cx).session().cloned();
+                    this.view = None;
                     cx.notify();
                 },
             )
         });
         Self {
-            view: session.map(|session| cx.new(|cx| HistoryView::panel(session, window, cx))),
+            session,
+            view: None,
+            focus_handle: cx.focus_handle(),
             _subscription: subscription,
         }
     }
 }
 
 impl Render for HistoryPanel {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.view.is_none()
+            && let Some(session) = self.session.clone()
+        {
+            let view = cx.new(|cx| HistoryView::panel(session, window, cx));
+            if self.focus_handle.is_focused(window) {
+                window.focus(&view.focus_handle(cx), cx);
+            }
+            self.view = Some(view);
+        }
         match &self.view {
             Some(view) => div().size_full().child(view.clone()).into_any_element(),
-            None => studio_ui::ds::empty_state(IconName::HistoryRerun, "No graph open")
+            None => div()
+                .size_full()
+                .track_focus(&self.focus_handle)
+                .child(studio_ui::ds::empty_state(
+                    IconName::HistoryRerun,
+                    "No graph open",
+                ))
                 .into_any_element(),
         }
     }
