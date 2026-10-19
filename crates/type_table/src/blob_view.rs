@@ -24,8 +24,8 @@ use ui::Tooltip;
 use ui::prelude::*;
 
 use crate::blob::{
-    ShownImage, hex_dump_lines, read_value, save_bytes, save_value, sniff_image,
-    suggested_file_name,
+    ShownImage, hex_dump_lines, read_value, save_value, sniff_image, suggested_file_name,
+    text_prefix,
 };
 use crate::pdf;
 
@@ -61,10 +61,8 @@ enum Content {
     },
     /// The text, and whether it is cut at [`TEXT_SHOWN`].
     Text(Entity<Editor>, bool),
-    Bytes {
-        /// Shared, so each frame's code block takes it without a copy.
-        hex: SharedString,
-    },
+    /// The hex dump, in a read-only editor as text is: it lays out only the lines in view.
+    Bytes(Entity<Editor>),
     TooLarge,
     External(String),
     Null,
@@ -91,14 +89,18 @@ pub struct BlobView {
     content: Loadable<Content>,
     /// Bytes read so far while reading.
     progress: u64,
-    bytes: Option<Arc<Vec<u8>>>,
+    /// The value's first kilobyte, which names a saved file; the rest is let go once shown, and
+    /// a save reads it again range by range.
+    head: Vec<u8>,
     zoom: Zoom,
     pan: Point<Pixels>,
     drag: Option<Point<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
     export: Option<Export>,
     focus_handle: FocusHandle,
-    _load: Task<()>,
+    /// The read, started when the tab is first drawn: tabs restored with the workspace read
+    /// nothing until they are shown.
+    _load: Option<Task<()>>,
     _export: Option<Task<()>>,
 }
 
@@ -107,10 +109,9 @@ impl BlobView {
         session: Entity<GraphSession>,
         cell: BlobCell,
         snapshot: Option<String>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let load = Self::load(&session, &cell, &snapshot, window, cx);
         cx.on_release(|this: &mut Self, cx| this.release_images(cx))
             .detach();
         Self {
@@ -120,14 +121,14 @@ impl BlobView {
             size: None,
             content: Loadable::Loading,
             progress: 0,
-            bytes: None,
+            head: Vec::new(),
             zoom: Zoom::Fit,
             pan: Point::default(),
             drag: None,
             bounds: None,
             export: None,
             focus_handle: cx.focus_handle(),
-            _load: load,
+            _load: None,
             _export: None,
         }
     }
@@ -221,6 +222,7 @@ impl BlobView {
             };
             this.update_in(cx, |this, window, cx| {
                 this.release_images(cx);
+                this.head = bytes[..bytes.len().min(1024)].to_vec();
                 this.content = Loadable::Loaded(match kind {
                     Kind::Image { image, size, name } => Content::Image {
                         image,
@@ -228,24 +230,14 @@ impl BlobView {
                         format: name,
                     },
                     Kind::Pdf { pages, count } => Content::Pdf { pages, count },
-                    Kind::Text(text, cut) => Content::Text(
-                        cx.new(|cx| {
-                            let mut editor = Editor::multi_line(window, cx);
-                            editor.set_text(text, window, cx);
-                            editor.set_read_only(true);
-                            editor
-                        }),
-                        cut,
-                    ),
-                    Kind::Bytes(hex) => Content::Bytes { hex: hex.into() },
+                    Kind::Text(text, cut) => Content::Text(read_only(text, window, cx), cut),
+                    Kind::Bytes(hex) => Content::Bytes(read_only(hex, window, cx)),
                     Kind::Unreadable(reason) => {
                         this.content = Loadable::Failed(reason);
-                        this.bytes = Some(bytes.clone());
                         cx.notify();
                         return;
                     }
                 });
-                this.bytes = Some(bytes);
                 cx.emit(ItemEvent::UpdateTab);
                 cx.notify();
             })
@@ -340,31 +332,22 @@ impl BlobView {
     // ---- save and open elsewhere ----
 
     fn file_name(&self) -> String {
-        let head: Vec<u8> = self
-            .bytes
-            .as_ref()
-            .map(|bytes| bytes.iter().take(1024).copied().collect())
-            .unwrap_or_default();
-        suggested_file_name(&self.cell.id, &self.cell.property, &head)
+        suggested_file_name(&self.cell.id, &self.cell.property, &self.head)
     }
 
-    /// Writes the value to `path`: from memory when it was read, else range by range.
+    /// Writes the value to `path`, range by range: what was shown is not kept whole.
     fn write_to(&mut self, path: PathBuf, then_open: bool, cx: &mut Context<Self>) {
         let (Some(size), session) = (self.size, self.session.downgrade()) else {
             return;
         };
-        let (cell, snapshot, bytes) =
-            (self.cell.clone(), self.snapshot.clone(), self.bytes.clone());
+        let (cell, snapshot) = (self.cell.clone(), self.snapshot.clone());
         self.export = Some(Export::Busy(if then_open {
             "Opening…"
         } else {
             "Saving…"
         }));
         self._export = Some(cx.spawn(async move |this, cx| {
-            let written = match bytes {
-                Some(bytes) => save_bytes(bytes, path, cx).await,
-                None => save_value(session, cell, snapshot, size, path, cx, |_, _| {}).await,
-            };
+            let written = save_value(session, cell, snapshot, size, path, cx, |_, _| {}).await;
             this.update(cx, |this, cx| {
                 this.export = Some(match written {
                     Ok(path) if then_open => {
@@ -652,6 +635,16 @@ enum Kind {
     Unreadable(String),
 }
 
+/// A read-only editor of `text`, which lays out only the lines in view.
+fn read_only(text: String, window: &mut Window, cx: &mut App) -> Entity<Editor> {
+    cx.new(|cx| {
+        let mut editor = Editor::multi_line(window, cx);
+        editor.set_text(text, window, cx);
+        editor.set_read_only(true);
+        editor
+    })
+}
+
 /// What a value is, with its images decoded; call it from a background task.
 fn classify(bytes: &[u8], svg: &SvgRenderer) -> Kind {
     let unreadable = || Kind::Unreadable("The image could not be decoded.".into());
@@ -687,26 +680,26 @@ fn classify(bytes: &[u8], svg: &SvgRenderer) -> Kind {
             Err(reason) => Kind::Unreadable(reason),
         };
     }
-    if let Ok(text) = std::str::from_utf8(bytes) {
+    // Judged by what is shown, and the rest of a character it may cut.
+    if let Some(text) = text_prefix(&bytes[..bytes.len().min(TEXT_SHOWN + 3)]) {
+        // An SVG only if it parses as one: a page or a source file may hold an icon's markup.
         // Looked for in the bytes: a character may straddle the 4,096th.
         if bytes[..bytes.len().min(4096)]
             .windows(4)
             .any(|window| window == b"<svg")
+            && let Some(image) = ShownImage::decode(ImageFormat::Svg, bytes.to_vec(), svg)
         {
-            return match ShownImage::decode(ImageFormat::Svg, bytes.to_vec(), svg) {
-                Some(image) => Kind::Image {
-                    image,
-                    size: None,
-                    name: "SVG",
-                },
-                None => unreadable(),
+            return Kind::Image {
+                image,
+                size: None,
+                name: "SVG",
             };
         }
         let mut end = text.len().min(TEXT_SHOWN);
         while !text.is_char_boundary(end) {
             end -= 1;
         }
-        return Kind::Text(text[..end].to_owned(), end < text.len());
+        return Kind::Text(text[..end].to_owned(), end < bytes.len());
     }
     Kind::Bytes(hex_dump_lines(&bytes[..bytes.len().min(HEX_MAX)], 16))
 }
@@ -767,12 +760,7 @@ impl Item for BlobView {
             Loadable::Loaded(Content::Image { size: Some(_), .. } | Content::Pdf { .. })
         );
         if zoomable {
-            let scale = match &self.content {
-                Loadable::Loaded(Content::Pdf { .. }) => {
-                    self.pdf_width() / (PDF_DRAW_WIDTH / 2) as f32
-                }
-                _ => self.scale(),
-            };
+            let scale = self.shown_scale();
             let percent = format!("{}%", (scale * 100.).round());
             let focus = self.focus_handle.clone();
             end.push(
@@ -887,7 +875,16 @@ impl Item for BlobView {
 }
 
 impl Render for BlobView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self._load.is_none() {
+            self._load = Some(Self::load(
+                &self.session,
+                &self.cell,
+                &self.snapshot,
+                window,
+                cx,
+            ));
+        }
         let body = match &self.content {
             Loadable::Loading | Loadable::NotLoaded => {
                 studio_ui::ds::loading_state(match self.size {
@@ -959,10 +956,8 @@ impl Render for BlobView {
                 .py(px(ds::space::MD))
                 .child(editor.clone())
                 .into_any_element(),
-            Loadable::Loaded(Content::Bytes { hex }) => v_flex()
-                .id("blob-bytes")
+            Loadable::Loaded(Content::Bytes(hex)) => v_flex()
                 .size_full()
-                .overflow_y_scroll()
                 .p(px(ds::space::LG))
                 .gap(px(ds::space::SM))
                 .child(ds::text::meta(format!(
@@ -971,12 +966,12 @@ impl Render for BlobView {
                         (HEX_MAX as u64).min(self.size.unwrap_or(HEX_MAX as u64))
                     )
                 )))
-                .child(ds::code_block(hex.clone(), cx))
+                .child(div().flex_1().min_h_0().child(hex.clone()))
                 .into_any_element(),
         };
-        // Images and PDFs take zoom keys; text keeps its keys for the editor.
+        // Images and PDFs take zoom keys; text and bytes keep their keys for the editor.
         let context = match &self.content {
-            Loadable::Loaded(Content::Text(..)) => "BlobText",
+            Loadable::Loaded(Content::Text(..) | Content::Bytes(_)) => "BlobText",
             _ => "BlobView",
         };
         div()

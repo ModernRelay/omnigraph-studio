@@ -11,14 +11,19 @@ pub struct Page {
     pub height: u32,
 }
 
-/// A document's pages drawn `width` pixels wide, the first `max_pages` of them, and how many
-/// pages it has.
+/// The most pixels one page is drawn with, a tall letter page's at 1,600 wide: a page far
+/// taller than it is wide (a web page saved as one) is drawn narrower, not tens of thousands of
+/// pixels tall.
+const PAGE_PIXELS: f64 = 1600. * 2400.;
+
+/// A document's pages drawn `width` pixels wide (narrower for a page that would pass
+/// [`PAGE_PIXELS`]), the first `max_pages` of them, and how many pages it has.
 #[cfg(target_os = "macos")]
 pub fn render(bytes: &[u8], width: u32, max_pages: usize) -> Result<(Vec<Page>, usize), String> {
     use objc2_core_foundation::{CFData, CGPoint, CGRect, CGSize};
     use objc2_core_graphics::{
-        CGBitmapContextCreate, CGBitmapContextGetData, CGColorSpace, CGContext, CGDataProvider,
-        CGImageAlphaInfo, CGPDFBox, CGPDFDocument, CGPDFPage,
+        CGBitmapContextCreate, CGColorSpace, CGContext, CGDataProvider, CGImageAlphaInfo, CGPDFBox,
+        CGPDFDocument, CGPDFPage,
     };
 
     let data = CFData::from_bytes(bytes);
@@ -44,12 +49,21 @@ pub fn render(bytes: &[u8], width: u32, max_pages: usize) -> Result<(Vec<Page>, 
         if page_w <= 0. || page_h <= 0. {
             continue;
         }
-        let height = ((page_h / page_w) * width as f64).round().max(1.) as u32;
-        let (w, h) = (width as usize, height as usize);
-        // RGBA, premultiplied: the page is drawn on white, so every pixel is opaque.
+        let (mut draw_w, mut draw_h) = (width as f64, (page_h / page_w) * width as f64);
+        if draw_w * draw_h > PAGE_PIXELS {
+            let shrink = (PAGE_PIXELS / (draw_w * draw_h)).sqrt();
+            (draw_w, draw_h) = (draw_w * shrink, draw_h * shrink);
+        }
+        let (w, h) = (
+            draw_w.round().max(1.) as usize,
+            draw_h.round().max(1.) as usize,
+        );
+        // RGBA, premultiplied: the page is drawn on white, so every pixel is opaque. Drawn
+        // straight into the page's own pixels, which the context only borrows.
+        let mut rgba = vec![0u8; w * h * 4];
         let context = unsafe {
             CGBitmapContextCreate(
-                std::ptr::null_mut(),
+                rgba.as_mut_ptr().cast(),
                 w,
                 h,
                 8,
@@ -64,23 +78,19 @@ pub fn render(bytes: &[u8], width: u32, max_pages: usize) -> Result<(Vec<Page>, 
         CGContext::fill_rect(Some(&context), full);
         // The page's own transform places and turns it but never enlarges it, so the bitmap's
         // scale is applied first and the page is fitted to its own size in points.
-        let scale = width as f64 / page_w;
+        let scale = w as f64 / page_w;
         CGContext::scale_ctm(Some(&context), scale, scale);
         let points = CGRect::new(CGPoint::new(0., 0.), CGSize::new(page_w, page_h));
         let transform =
             CGPDFPage::drawing_transform(Some(&page), CGPDFBox::MediaBox, points, 0, true);
         CGContext::concat_ctm(Some(&context), transform);
         CGContext::draw_pdf_page(Some(&context), Some(&page));
-        let pixels = CGBitmapContextGetData(Some(&context));
-        if pixels.is_null() {
-            return Err("The page could not be drawn.".into());
-        }
-        // The bitmap's first row is the page's top.
-        let rgba = unsafe { std::slice::from_raw_parts(pixels as *const u8, w * h * 4) }.to_vec();
+        // The bitmap's first row is the page's top; the context lets go of the pixels first.
+        drop(context);
         pages.push(Page {
             rgba,
-            width,
-            height,
+            width: w as u32,
+            height: h as u32,
         });
     }
     Ok((pages, count))
@@ -159,6 +169,30 @@ pub(crate) mod tests {
         assert_eq!(image.get_pixel(5, 5).0, [255, 255, 255, 255]);
         let mark = image.get_pixel(40, 200 - 40).0;
         assert!(mark[0] < 40 && mark[1] < 40 && mark[2] < 40, "{mark:?}");
+    }
+
+    /// A page far taller than wide is drawn narrower, to the page pixel budget, keeping its
+    /// shape.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_very_tall_page_is_drawn_within_the_pixel_budget() {
+        let tall = String::from_utf8(one_page_pdf())
+            .unwrap()
+            .replace("/MediaBox [0 0 200 100]", "/MediaBox [0 0 200 4000]");
+        // The longer box moves the objects after it; the system's reader finds them anyway.
+        let (pages, _) = render(tall.as_bytes(), 1600, 1).unwrap();
+        let page = &pages[0];
+        assert!(
+            (page.width as f64) * (page.height as f64) <= PAGE_PIXELS * 1.01,
+            "{} × {}",
+            page.width,
+            page.height
+        );
+        assert_eq!((page.height as f64 / page.width as f64).round(), 20.);
+        assert_eq!(
+            page.rgba.len(),
+            page.width as usize * page.height as usize * 4
+        );
     }
 
     #[test]

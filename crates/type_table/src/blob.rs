@@ -12,8 +12,9 @@ use gpui::{
 use graph_client::{BlobCell, BlobMeta};
 use graph_store::GraphSession;
 
-/// How much of a value the peek reads to decide how to show it.
-pub const PREVIEW_PREFIX: u64 = 64 * 1024;
+/// How much of a value the peek reads to decide how to show it: the text it shows, and the
+/// rest of a character that text may cut.
+pub const PREVIEW_PREFIX: u64 = TEXT_SHOWN as u64 + 3;
 /// The largest image the peek reads whole to draw it.
 pub const IMAGE_MAX: u64 = 8 * 1024 * 1024;
 /// How much text the peek shows.
@@ -47,10 +48,12 @@ impl ShownImage {
     /// Decodes an image of `format`; call it from a background task. `None` when the bytes do
     /// not decode.
     pub fn decode(format: ImageFormat, bytes: Vec<u8>, svg: &SvgRenderer) -> Option<Self> {
-        let image = Image::from_bytes(format, bytes);
+        // GPUI draws an SVG as it is shown: parsed here, so text that is no SVG is not one.
         if format == ImageFormat::Svg {
-            return Some(ShownImage::Svg(Arc::new(image)));
+            svg.parse_svg(&bytes).ok()?;
+            return Some(ShownImage::Svg(Arc::new(Image::from_bytes(format, bytes))));
         }
+        let image = Image::from_bytes(format, bytes);
         image
             .to_image_data(svg.clone())
             .ok()
@@ -116,8 +119,22 @@ pub fn sniff_image(bytes: &[u8]) -> Option<ImageFormat> {
     }
 }
 
+/// The text a value's first bytes are, when they read as text: UTF-8 up to a character their
+/// end may cut, with no NUL. A value is judged by the bytes shown of it, so an invalid byte
+/// past them does not make the whole a hex dump.
+pub fn text_prefix(bytes: &[u8]) -> Option<&str> {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) if error.error_len().is_none() => {
+            std::str::from_utf8(&bytes[..error.valid_up_to()]).ok()?
+        }
+        Err(_) => return None,
+    };
+    (!text.contains('\0')).then_some(text)
+}
+
 /// The file name a saved value is offered under: the row and the property, and the extension
-/// its first bytes announce (`.txt` for UTF-8 text, `.bin` otherwise).
+/// its first bytes announce (`.txt` for text, `.pdf`, `.bin` otherwise).
 pub fn suggested_file_name(id: &str, property: &str, prefix: &[u8]) -> String {
     let safe = |part: &str| -> String {
         part.chars()
@@ -135,32 +152,42 @@ pub fn suggested_file_name(id: &str, property: &str, prefix: &[u8]) -> String {
         Some(ImageFormat::Jpeg) => "jpg",
         Some(ImageFormat::Gif) => "gif",
         Some(ImageFormat::Webp) => "webp",
-        _ if !prefix.is_empty() && std::str::from_utf8(prefix).is_ok() => "txt",
+        _ if crate::pdf::is_pdf(prefix) => "pdf",
+        _ if text_prefix(prefix).is_some_and(|text| !text.is_empty()) => "txt",
         _ => "bin",
     };
     format!("{}-{}.{extension}", safe(id), safe(property))
 }
 
-/// A value being saved to a file: written to `<file>.part` beside it range by range, and moved
-/// to the chosen name only when whole, so a stopped save never leaves a partial file there.
+/// A value being saved to a file: written to a `.part` file of its own beside it, range by
+/// range, and moved to the chosen name only when whole. A save stopped any way, a closed tab
+/// included, removes its part file, and two saves to one name never share one.
 pub struct RangeSave {
     path: std::path::PathBuf,
     part: std::path::PathBuf,
     size: u64,
     written: u64,
+    /// Moved into place: nothing to remove.
+    placed: bool,
 }
 
 impl RangeSave {
     pub fn begin(path: std::path::PathBuf, size: u64) -> std::io::Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let mut part = path.clone().into_os_string();
-        part.push(".part");
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        part.push(format!(".{}-{n}.part", std::process::id()));
         let part = std::path::PathBuf::from(part);
-        std::fs::File::create(&part)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)?;
         Ok(Self {
             path,
             part,
             size,
             written: 0,
+            placed: false,
         })
     }
 
@@ -179,22 +206,25 @@ impl RangeSave {
     }
 
     /// Moves the file into place, or removes it when the value came back short.
-    pub fn finish(self) -> Result<std::path::PathBuf, String> {
+    pub fn finish(mut self) -> Result<std::path::PathBuf, String> {
         if self.written != self.size {
-            self.abandon();
             return Err("The value ended before its size; nothing was saved.".into());
         }
-        match std::fs::rename(&self.part, &self.path) {
-            Ok(()) => Ok(self.path),
-            Err(error) => {
-                std::fs::remove_file(&self.part).ok();
-                Err(format!("Could not write: {error}"))
-            }
-        }
+        std::fs::rename(&self.part, &self.path)
+            .map_err(|error| format!("Could not write: {error}"))?;
+        self.placed = true;
+        Ok(self.path.clone())
     }
 
-    pub fn abandon(self) {
-        std::fs::remove_file(&self.part).ok();
+    /// Stops the save; its part file goes.
+    pub fn abandon(self) {}
+}
+
+impl Drop for RangeSave {
+    fn drop(&mut self) {
+        if !self.placed {
+            std::fs::remove_file(&self.part).ok();
+        }
     }
 }
 
@@ -278,24 +308,6 @@ pub async fn save_value(
     cx.background_spawn(async move { save.finish() }).await
 }
 
-/// Writes bytes already read to `path`, the same way: whole or not at all.
-pub async fn save_bytes(
-    bytes: Arc<Vec<u8>>,
-    path: PathBuf,
-    cx: &AsyncApp,
-) -> Result<PathBuf, String> {
-    cx.background_spawn(async move {
-        let mut save = RangeSave::begin(path, bytes.len() as u64)
-            .map_err(|error| format!("Could not write: {error}"))?;
-        if let Err(error) = save.append(&bytes) {
-            save.abandon();
-            return Err(format!("Could not write: {error}"));
-        }
-        save.finish()
-    })
-    .await
-}
-
 /// How many bytes to read for a preview of a value of `size` bytes whose first bytes are
 /// `prefix`: the whole value for an image that fits, else nothing more.
 pub fn bytes_wanted(prefix: &[u8], size: u64) -> u64 {
@@ -318,15 +330,7 @@ pub fn preview(bytes: Vec<u8>, size: u64, svg: &SvgRenderer) -> Preview {
     {
         return Preview::Image(image);
     }
-    // Text, allowing for a character cut at the end of the prefix.
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(text) => Some(text),
-        Err(error) if error.error_len().is_none() => {
-            std::str::from_utf8(&bytes[..error.valid_up_to()]).ok()
-        }
-        Err(_) => None,
-    };
-    if let Some(text) = text.filter(|text| !text.contains('\0')) {
+    if let Some(text) = text_prefix(&bytes) {
         let mut end = text.len().min(TEXT_SHOWN);
         while !text.is_char_boundary(end) {
             end -= 1;
@@ -405,29 +409,41 @@ mod tests {
     #[test]
     fn a_save_lands_whole_or_not_at_all() {
         let dir = std::env::temp_dir().join(format!("studio-blob-save-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("value.bin");
-        let part = dir.join("value.bin.part");
+        let parts = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+                .filter(|name| name.ends_with(".part"))
+                .count()
+        };
 
         let mut save = RangeSave::begin(path.clone(), 6).unwrap();
         save.append(b"abc").unwrap();
         assert!(
-            part.exists() && !path.exists(),
+            parts() == 1 && !path.exists(),
             "nothing under the name until whole"
         );
+        // A second save to the name writes a part of its own.
+        let other = RangeSave::begin(path.clone(), 6).unwrap();
+        assert_eq!(parts(), 2);
+        drop(other);
+        assert_eq!(parts(), 1, "a dropped save removes its part");
         save.append(b"def").unwrap();
         assert_eq!(save.finish().unwrap(), path);
         assert_eq!(std::fs::read(&path).unwrap(), b"abcdef");
-        assert!(!part.exists());
+        assert_eq!(parts(), 0);
 
         // A short value, or a stopped save, leaves neither file.
         std::fs::remove_file(&path).unwrap();
         let mut short = RangeSave::begin(path.clone(), 6).unwrap();
         short.append(b"abc").unwrap();
         assert!(short.finish().is_err());
-        assert!(!path.exists() && !part.exists());
+        assert!(!path.exists() && parts() == 0);
         RangeSave::begin(path.clone(), 6).unwrap().abandon();
-        assert!(!part.exists());
+        assert_eq!(parts(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -442,6 +458,22 @@ mod tests {
             suggested_file_name("n1", "raw", &[0xff, 0x00, 0x13]),
             "n1-raw.bin"
         );
+        // Text whose first bytes cut a character, and a PDF.
+        let cut = &"日本語のテキスト".as_bytes()[..16];
+        assert_eq!(suggested_file_name("n1", "notes", cut), "n1-notes.txt");
+        assert_eq!(
+            suggested_file_name("n1", "scan", b"%PDF-1.7\n%"),
+            "n1-scan.pdf"
+        );
+    }
+
+    /// Text that holds an SVG's markup is no SVG unless it parses as one.
+    #[test]
+    fn only_an_svg_decodes_as_one() {
+        let page = b"<html><body><svg viewBox=\"0 0 1 1\"></svg><p>hi</body></html>".to_vec();
+        assert!(ShownImage::decode(ImageFormat::Svg, page, &svg()).is_none());
+        let icon = b"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1 1\"/>".to_vec();
+        assert!(ShownImage::decode(ImageFormat::Svg, icon, &svg()).is_some());
     }
 
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
