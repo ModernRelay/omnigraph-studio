@@ -31,11 +31,12 @@ one is picked up it goes through OmniGraph's own RFC process.
 | E28 | Merge bound to the reviewed source head (a precondition on the source, as `If-Graph-Commit` binds a write to its target) | 008 | Checks the source head just before merging; a commit landing in between is merged too, and the outcome says the merge took a commit made after the review was read |
 
 These landed in OmniGraph 0.14 (`edge-20261017-d883c49`, checked 2026-10-17; the HTTP contract
-header is still `0.13`), and so are on every server Studio supports. Studio uses E7, E6 and
-E23: a review reads its fork and head from the merge base, and a merge is confirmed by the
+header is still `0.13`), and so are on every server Studio supports. Studio uses E7, E6, E8
+and E23: a review reads its fork and head from the merge base, and a merge is confirmed by the
 source head becoming the merge base; a branch its target was merged into is reviewed from
-`GET /diff` from that base; the agent's CLI is chosen by its `version --json`. E8 and E24 are
-not used yet. Paged commit lists (E10, #1013) landed on main after that build.
+`GET /diff` from that base; a review asks a dry-run merge whether the branch merges cleanly;
+the agent's CLI is chosen by its `version --json`. E24 is not used yet. Paged commit lists
+(E10, #1013) landed on main after that build.
 
 | ID | Feature | Operation | Spec |
 |---|---|---|---|
