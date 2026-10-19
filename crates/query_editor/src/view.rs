@@ -148,7 +148,7 @@ struct BuiltRows {
 impl BuiltRows {
     /// The rows of an answer that holds them, not a plan's or a failure's.
     fn of(
-        result: &Result<ReadOutput, ReadError>,
+        result: &mut Result<ReadOutput, ReadError>,
         columns: Option<&[ResultColumn]>,
         schema: Option<Arc<SchemaModel>>,
     ) -> Option<Self> {
@@ -158,12 +158,14 @@ impl BuiltRows {
         }
     }
 
+    /// Takes the answer's rows into the table.
     fn new(
-        output: &ReadOutput,
+        output: &mut ReadOutput,
         columns: Option<&[ResultColumn]>,
         schema: Option<Arc<SchemaModel>>,
     ) -> Self {
-        let table = ResultTable::new(output.columns.clone(), &output.rows, columns);
+        let rows = std::mem::take(&mut output.rows);
+        let table = ResultTable::new(output.columns.clone(), rows, columns);
         let widths = (0..table.columns.len())
             .map(|i| table.column_width(i))
             .collect();
@@ -1600,7 +1602,8 @@ impl QueryEditor {
             let columns = prepared.columns.clone();
             let (result, built) = cx
                 .background_spawn(async move {
-                    let built = BuiltRows::of(&result, columns.as_deref(), schema);
+                    let mut result = result;
+                    let built = BuiltRows::of(&mut result, columns.as_deref(), schema);
                     (result, built)
                 })
                 .await;
@@ -1626,7 +1629,8 @@ impl QueryEditor {
         elapsed: Duration,
         schema: Option<Arc<SchemaModel>>,
     ) {
-        let built = BuiltRows::of(&result, prepared.columns.as_deref(), schema);
+        let mut result = result;
+        let built = BuiltRows::of(&mut result, prepared.columns.as_deref(), schema);
         self.show_read(prepared, branch, result, built, elapsed);
     }
 
@@ -1662,14 +1666,15 @@ impl QueryEditor {
                 elapsed,
                 commit: output.graph_commit_id,
             }),
-            Ok(output) => {
+            Ok(mut output) => {
                 let BuiltRows {
                     table,
                     widths,
                     right_aligned,
                     graph,
-                } = built
-                    .unwrap_or_else(|| BuiltRows::new(&output, prepared.columns.as_deref(), None));
+                } = built.unwrap_or_else(|| {
+                    BuiltRows::new(&mut output, prepared.columns.as_deref(), None)
+                });
                 // A width the person dragged a column to wins over the one from its content.
                 let widths = widths
                     .into_iter()

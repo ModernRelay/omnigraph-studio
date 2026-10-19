@@ -25,18 +25,25 @@ pub struct ResultTable {
 }
 
 impl ResultTable {
-    /// Builds a table from a read's `columns` and `rows`. `expected` is the compiler's view of
-    /// the same query; its types are matched to the server's columns by position, because the
-    /// compiler names `$p.name` `name` where the server names it `p.name`.
-    pub fn new(columns: Vec<String>, rows: &Value, expected: Option<&[ResultColumn]>) -> Self {
+    /// Builds a table from a read's `columns` and `rows`, whose cells move into it: a large
+    /// answer is held once, not twice. `expected` is the compiler's view of the same query; its
+    /// types are matched to the server's columns by position, because the compiler names
+    /// `$p.name` `name` where the server names it `p.name`.
+    pub fn new(columns: Vec<String>, rows: Value, expected: Option<&[ResultColumn]>) -> Self {
+        // A column named twice reads the same cell twice, so it is copied rather than moved.
+        let unique = columns.iter().collect::<HashSet<_>>().len() == columns.len();
         let rows = match rows {
             Value::Array(items) => items
-                .iter()
-                .map(|row| {
-                    columns
+                .into_iter()
+                .map(|row| match row {
+                    Value::Object(mut cells) if unique => columns
+                        .iter()
+                        .map(|column| cells.remove(column).unwrap_or(Value::Null))
+                        .collect(),
+                    row => columns
                         .iter()
                         .map(|column| row.get(column).cloned().unwrap_or(Value::Null))
-                        .collect()
+                        .collect(),
                 })
                 .collect(),
             _ => Vec::new(),
@@ -416,17 +423,13 @@ mod tests {
             {"p": {"@id": "p2", "name": "Bob"}, "c": {"@id": "c1", "name": "Acme"}},
             {"p": {"@id": "p1", "name": "Ada"}, "c": {"@id": "c1", "name": "Acme"}}
         ]);
-        let table = ResultTable::new(
-            vec!["p".into(), "c".into()],
-            &rows,
-            Some(&[person, company]),
-        );
+        let table = ResultTable::new(vec!["p".into(), "c".into()], rows, Some(&[person, company]));
         let (nodes, links) = table.graph(&schema).unwrap();
         let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
         assert_eq!(ids, ["p1", "c1", "p2"]);
         assert_eq!(nodes[0].label.as_deref(), Some("Ada"));
         assert_eq!(links, [(0, 1), (2, 1)]);
-        let plain = ResultTable::new(vec!["n".into()], &serde_json::json!([{"n": 1}]), None);
+        let plain = ResultTable::new(vec!["n".into()], serde_json::json!([{"n": 1}]), None);
         assert!(plain.graph(&schema).is_none());
     }
 
@@ -439,27 +442,30 @@ mod tests {
         ];
         let table = ResultTable::new(
             vec!["p.name".into(), "p.born".into()],
-            &rows,
+            rows.clone(),
             Some(&expected),
         );
         assert_eq!(table.rows[1], vec![json!("Alan"), Value::Null]);
         assert_eq!(table.types, [Some("String".into()), Some("Date?".into())]);
         // A different column count means the compiler described another query.
-        let table = ResultTable::new(vec!["p.name".into()], &rows, Some(&expected));
+        let table = ResultTable::new(vec!["p.name".into()], rows, Some(&expected));
         assert_eq!(table.types, [None]);
         assert!(table.row_json(0).unwrap().contains("\"p.name\": \"Ada\""));
         assert!(table.row_json(5).is_none());
+        // A column named twice shows its cell twice.
+        let twice = ResultTable::new(vec!["a".into(), "a".into()], json!([{"a": 1}]), None);
+        assert_eq!(twice.rows, [vec![json!(1), json!(1)]]);
     }
 
     #[test]
     fn column_widths_follow_content_within_bounds() {
         let rows = json!([{"a": "x", "b": "a very long value that goes on and on and on and on and on and on"}]);
-        let table = ResultTable::new(vec!["a".into(), "b".into()], &rows, None);
+        let table = ResultTable::new(vec!["a".into(), "b".into()], rows, None);
         assert_eq!(table.column_width(0), 72.);
         assert_eq!(table.column_width(1), 360.);
         // A narrow value under a title and its type: the header sets the width, so the title is
         // never cut.
-        let mut counted = ResultTable::new(vec!["friends".into()], &json!([{"friends": 1}]), None);
+        let mut counted = ResultTable::new(vec!["friends".into()], json!([{"friends": 1}]), None);
         counted.types = vec![Some("BigInt?".into())];
         assert!(counted.column_width(0) >= 7. * 7.5 + 6. + 7. * 6.6 + 24.);
     }
