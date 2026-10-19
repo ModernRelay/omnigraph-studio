@@ -53,7 +53,7 @@ use crate::model::{
     ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN, Row, SaveResult,
     TableKind, Tone, changed_elsewhere, chips_that_fit, count_of, display_value, edge_columns,
     edge_rows, edit_text, field_rows, filter_parts, format_count, insert_position, node_columns,
-    node_rows, parse_filter_list, parse_filter_value, parse_input, preset_start, reads_as_markdown,
+    node_rows, parse_filter_list, parse_filter_value, parse_input, preset_range, reads_as_markdown,
     relation_sample, row_matches, same_value, save_result,
 };
 use crate::offers::Offers;
@@ -1761,7 +1761,7 @@ impl TypeTable {
                     .find(|p| p.name == filter.property)
                     .map(|p| p.kind);
                 Filter {
-                    value: preset_start(filter.op, kind, now),
+                    value: preset_range(filter.op, kind, now),
                     ..filter.clone()
                 }
             })

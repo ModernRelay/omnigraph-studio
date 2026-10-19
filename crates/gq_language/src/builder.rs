@@ -706,6 +706,23 @@ fn property_clause(
             } else {
                 ty
             };
+            // A date preset holds its range, `[start, end)`: today, this week, the last 30 days.
+            if op.is_date_preset() {
+                let (start, end) = match &filter.value {
+                    Value::Array(bounds) if bounds.len() == 2 => {
+                        (bounds[0].clone(), Some(bounds[1].clone()))
+                    }
+                    start => (start.clone(), None),
+                };
+                let from = params.add(&format!("f{i}"), &ty, start);
+                return match end {
+                    Some(end) => {
+                        let to = params.add(&format!("f{i}_end"), &ty, end);
+                        format!("{target} >= {from}\n    {target} < {to}")
+                    }
+                    None => format!("{target} >= {from}"),
+                };
+            }
             let param = params.add(&format!("f{i}"), &ty, filter.value.clone());
             let operator = match op {
                 FilterOp::Eq => "=",
@@ -713,10 +730,13 @@ fn property_clause(
                 FilterOp::Lt => "<",
                 FilterOp::Le => "<=",
                 FilterOp::Gt => ">",
-                FilterOp::Ge | FilterOp::Today | FilterOp::ThisWeek | FilterOp::Last30Days => ">=",
+                FilterOp::Ge => ">=",
                 FilterOp::Contains => "contains",
                 FilterOp::In => "in",
-                FilterOp::IsEmpty
+                FilterOp::Today
+                | FilterOp::ThisWeek
+                | FilterOp::Last30Days
+                | FilterOp::IsEmpty
                 | FilterOp::IsNotEmpty
                 | FilterOp::HasAny
                 | FilterOp::HasNone
@@ -3079,6 +3099,20 @@ mod tests {
         assert_compiles(&page);
         assert_eq!(page.params["after"], json!("person-000010"));
         assert_compiles(&node_count(&schema, "Person", &filters).unwrap());
+        // A date preset reads its range: on or after its start and before its end.
+        let today = [Filter {
+            property: "born".into(),
+            op: FilterOp::Today,
+            value: json!(["2026-10-14", "2026-10-15"]),
+        }];
+        let page = node_page(&schema, "Person", &today, None, &PageStart::First, 50).unwrap();
+        assert_compiles(&page);
+        assert!(
+            page.text.contains(">= $f0") && page.text.contains("< $f0_end"),
+            "{}",
+            page.text
+        );
+        assert_eq!(page.params["f0_end"], json!("2026-10-15"));
     }
 
     #[test]

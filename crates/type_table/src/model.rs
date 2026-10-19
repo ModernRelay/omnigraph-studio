@@ -660,23 +660,28 @@ pub fn parse_filter_list(property: &Property, text: &str) -> Result<Value, Strin
     Ok(Value::Array(values))
 }
 
-/// Where a date preset starts at `now`: today, the Monday of this week, or 30 days ago; a
-/// `Date` as `YYYY-MM-DD`, a `DateTime` as that local midnight in UTC.
-pub fn preset_start(
+/// The days a date preset takes at `now`, as `[start, end)`: today; this week, from Monday;
+/// the last 30 days, through today. A `Date` as `YYYY-MM-DD`, a `DateTime` as that local
+/// midnight in UTC.
+pub fn preset_range(
     op: FilterOp,
     kind: Option<ScalarKind>,
     now: chrono::DateTime<chrono::Local>,
 ) -> Value {
     use chrono::{Datelike as _, Duration, TimeZone as _};
     let today = now.date_naive();
-    let start = match op {
-        FilterOp::ThisWeek => today - Duration::days(today.weekday().num_days_from_monday() as i64),
-        FilterOp::Last30Days => today - Duration::days(30),
-        _ => today,
+    let tomorrow = today + Duration::days(1);
+    let (start, end) = match op {
+        FilterOp::ThisWeek => {
+            let monday = today - Duration::days(today.weekday().num_days_from_monday() as i64);
+            (monday, monday + Duration::days(7))
+        }
+        FilterOp::Last30Days => (today - Duration::days(30), tomorrow),
+        _ => (today, tomorrow),
     };
-    match kind {
+    let day = |day: chrono::NaiveDate| match kind {
         Some(ScalarKind::DateTime) => {
-            let midnight = start.and_hms_opt(0, 0, 0).expect("midnight exists");
+            let midnight = day.and_hms_opt(0, 0, 0).expect("midnight exists");
             let local = chrono::Local
                 .from_local_datetime(&midnight)
                 .earliest()
@@ -688,8 +693,9 @@ pub fn preset_start(
                     .to_string(),
             )
         }
-        _ => Value::String(start.format("%Y-%m-%d").to_string()),
-    }
+        _ => Value::String(day.format("%Y-%m-%d").to_string()),
+    };
+    Value::Array(vec![day(start), day(end)])
 }
 
 fn compare(a: &Value, b: &Value) -> Option<Ordering> {
@@ -740,12 +746,20 @@ pub fn row_matches(filters: &[Filter], values: &Map<String, Value>) -> bool {
                 Some(Ordering::Less | Ordering::Equal)
             ),
             FilterOp::Gt => compare(value, &filter.value) == Some(Ordering::Greater),
-            FilterOp::Ge | FilterOp::Today | FilterOp::ThisWeek | FilterOp::Last30Days => {
-                matches!(
-                    compare(value, &filter.value),
-                    Some(Ordering::Greater | Ordering::Equal)
-                )
-            }
+            FilterOp::Ge => matches!(
+                compare(value, &filter.value),
+                Some(Ordering::Greater | Ordering::Equal)
+            ),
+            // Within the preset's `[start, end)`.
+            FilterOp::Today | FilterOp::ThisWeek | FilterOp::Last30Days => match &filter.value {
+                Value::Array(bounds) if bounds.len() == 2 => {
+                    matches!(
+                        compare(value, &bounds[0]),
+                        Some(Ordering::Greater | Ordering::Equal)
+                    ) && compare(value, &bounds[1]) == Some(Ordering::Less)
+                }
+                _ => false,
+            },
         }
     })
 }
@@ -1511,19 +1525,19 @@ mod tests {
             .unwrap();
         let date = Some(ScalarKind::Date);
         assert_eq!(
-            preset_start(FilterOp::Today, date, now),
-            json!("2026-10-14")
+            preset_range(FilterOp::Today, date, now),
+            json!(["2026-10-14", "2026-10-15"])
         );
         assert_eq!(
-            preset_start(FilterOp::ThisWeek, date, now),
-            json!("2026-10-12")
+            preset_range(FilterOp::ThisWeek, date, now),
+            json!(["2026-10-12", "2026-10-19"])
         );
         assert_eq!(
-            preset_start(FilterOp::Last30Days, date, now),
-            json!("2026-09-14")
+            preset_range(FilterOp::Last30Days, date, now),
+            json!(["2026-09-14", "2026-10-15"])
         );
-        let instant = preset_start(FilterOp::Today, Some(ScalarKind::DateTime), now);
-        let text = instant.as_str().unwrap();
+        let instant = preset_range(FilterOp::Today, Some(ScalarKind::DateTime), now);
+        let text = instant[0].as_str().unwrap();
         assert!(text.ends_with('Z') && text.len() == 20, "{text}");
     }
 
@@ -1552,11 +1566,28 @@ mod tests {
             &row
         ));
         assert!(row_matches(
-            &[filter("born", FilterOp::ThisWeek, json!("2026-10-12"))],
+            &[filter(
+                "born",
+                FilterOp::ThisWeek,
+                json!(["2026-10-12", "2026-10-19"])
+            )],
             &row
         ));
         assert!(!row_matches(
-            &[filter("born", FilterOp::Today, json!("2026-10-14"))],
+            &[filter(
+                "born",
+                FilterOp::Today,
+                json!(["2026-10-14", "2026-10-15"])
+            )],
+            &row
+        ));
+        // A day after the range is outside it: a preset is not "on or after".
+        assert!(!row_matches(
+            &[filter(
+                "born",
+                FilterOp::Today,
+                json!(["2026-10-12", "2026-10-13"])
+            )],
             &row
         ));
         assert!(row_matches(
