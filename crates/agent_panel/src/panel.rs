@@ -444,6 +444,18 @@ impl MessageQueue {
         }
         Some(self.entries.remove(0).text)
     }
+
+    /// A message taken to send that could not go: first in line again.
+    fn put_back(&mut self, text: String) {
+        self.entries.insert(
+            0,
+            Queued {
+                id: self.next_id,
+                text,
+            },
+        );
+        self.next_id += 1;
+    }
 }
 
 struct Host {
@@ -1044,9 +1056,7 @@ impl AgentPanel {
                 self.state = State::Ready { agent };
                 self.replace_on_replay = false;
                 // What was sent before the agent was ready goes now, in order.
-                if let Some(text) = self.queue.on_turn_ended() {
-                    self.prompt(text, cx);
-                }
+                self.send_queued(cx);
             }
             HostEvent::Update(update) => {
                 if std::mem::take(&mut self.replace_on_replay) {
@@ -1116,9 +1126,7 @@ impl AgentPanel {
                         error: true,
                     }),
                 }
-                if let Some(next) = self.queue.on_turn_ended() {
-                    self.prompt(next, cx);
-                }
+                self.send_queued(cx);
             }
             HostEvent::Exited {
                 message,
@@ -1324,7 +1332,12 @@ impl AgentPanel {
         // A message sent while the agent works, starts or is still to be chosen waits its
         // turn in the queue, with any sent before it.
         match &self.state {
-            State::Ready { .. } => self.prompt(text, cx),
+            // One that cannot go (the agent just stopped) waits in the queue, not lost.
+            State::Ready { .. } => {
+                if !self.prompt(text.clone(), cx) {
+                    self.queue.push(text);
+                }
+            }
             State::Prompting { .. } | State::Starting => self.queue.push(text),
             State::Setup => {
                 self.queue.push(text);
@@ -1342,17 +1355,20 @@ impl AgentPanel {
         cx.notify();
     }
 
-    fn prompt(&mut self, text: String, cx: &mut Context<Self>) {
-        let Some(host) = &self.host else { return };
+    /// Sends `text` as the next turn; whether it went.
+    fn prompt(&mut self, text: String, cx: &mut Context<Self>) -> bool {
+        let Some(host) = &self.host else {
+            return false;
+        };
         let agent = match &self.state {
             State::Ready { agent } => agent.clone(),
-            _ => return,
+            _ => return false,
         };
-        if host
+        let sent = host
             .commands
             .unbounded_send(HostCommand::Prompt(text.clone()))
-            .is_ok()
-        {
+            .is_ok();
+        if sent {
             if let Some(id) = self.session_id.clone() {
                 self.sessions.update(cx, |sessions, cx| {
                     sessions.suggest_title(&id, &text, cx);
@@ -1363,6 +1379,16 @@ impl AgentPanel {
             self.state = State::Prompting { agent };
             self.thread.scroll_to_end();
             cx.notify();
+        }
+        sent
+    }
+
+    /// Sends the next queued message as a turn ends; one that cannot go stays first in line.
+    fn send_queued(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.queue.on_turn_ended()
+            && !self.prompt(text.clone(), cx)
+        {
+            self.queue.put_back(text);
         }
     }
 
@@ -3764,6 +3790,12 @@ mod tests {
         let b = queue.entries[1].id;
         assert_eq!(queue.take(b).as_deref(), Some("b"));
         assert_eq!(queue.entries.len(), 1);
+        // One taken to send that could not go is first in line again.
+        let taken = queue.on_turn_ended().unwrap();
+        queue.push("c".into());
+        queue.put_back(taken);
+        assert_eq!(queue.on_turn_ended().as_deref(), Some("a"));
+        assert_eq!(queue.on_turn_ended().as_deref(), Some("c"));
     }
 
     /// An entry changed by any way there is changes its hash; the others keep theirs, so the

@@ -49,7 +49,8 @@ pub struct CliHome {
 
 impl Drop for CliHome {
     fn drop(&mut self) {
-        if let Ok(home) = self.home()
+        // Opened, not made: a folder removed meanwhile is not made again to be cleaned.
+        if let Ok(home) = Confined::open(&self.cwd).and_then(|cwd| cwd.existing_dirs(&self.folder))
             && home.holds("credentials", self.credentials.as_bytes())
         {
             home.remove("credentials".as_ref()).ok();

@@ -451,7 +451,16 @@ async fn connect(
                 close: sessions.close.is_some(),
             };
 
-            while let Some(command) = commands.next().await {
+            // An agent that exits cleanly ends the transport, not this loop: its end is watched
+            // for too, so every conversation hears that the agent stopped.
+            let mut closed = std::pin::pin!(connection.incoming_closed());
+            loop {
+                let next = std::pin::pin!(commands.next());
+                let command = match futures::future::select(next, closed.as_mut()).await {
+                    futures::future::Either::Left((Some(command), _)) => command,
+                    futures::future::Either::Left((None, _)) => break,
+                    futures::future::Either::Right(((), _)) => return Ok(()),
+                };
                 match command {
                     ConnectionCommand::Open {
                         launch,
