@@ -17,8 +17,8 @@ use graph_client::{ReadError, WriteOutcome};
 use graph_store::fixes::compose;
 use graph_store::{
     ChangeFold, EntityGroup, EntityGroups, FoldedChange, FoldedChanges, GraphSession, GroupRun,
-    GroupSection, HeadWatch, NetChange, NodeNames, REVIEW_CHANGE_CAP, SessionEvent, TypeCounts,
-    commits_since, contains_merge_of, fork_point, revert_query, summary_sentence,
+    GroupSection, HeadWatch, NodeNames, REVIEW_CHANGE_CAP, SessionEvent, TypeCounts, commits_since,
+    contains_merge_of, fork_point, revert_query, summary_sentence,
 };
 use serde_json::Value;
 use studio_actions::review::{
@@ -132,6 +132,29 @@ enum MergeState {
     },
 }
 
+/// The indexes of `changes` in order of type and id, for [`ReviewData::change_to`].
+fn entity_order(changes: &[FoldedChange]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..changes.len()).collect();
+    order.sort_by(|&a, &b| {
+        (changes[a].type_name.as_str(), changes[a].id.as_str())
+            .cmp(&(changes[b].type_name.as_str(), changes[b].id.as_str()))
+    });
+    order
+}
+
+impl ReviewData {
+    /// The change to the entity of type `type_name` with `id`, if the branch changed it.
+    fn change_to(&self, type_name: &str, id: &str) -> Option<usize> {
+        let changes = &self.folded.changes;
+        let key = |ix: usize| (changes[ix].type_name.as_str(), changes[ix].id.as_str());
+        let found = self
+            .by_entity
+            .binary_search_by(|&ix| key(ix).cmp(&(type_name, id)))
+            .ok()?;
+        Some(self.by_entity[found])
+    }
+}
+
 struct ReviewData {
     /// The merge base: the newest commit of the branch's history the target holds.
     fork: Option<String>,
@@ -149,6 +172,9 @@ struct ReviewData {
     /// Why each change cannot be reverted, when it cannot: worked out with the fold, off the
     /// main thread, since a review holds up to 20,000 changes.
     revert_blocked: Vec<Option<String>>,
+    /// The changes' indexes in order of type and id, sorted with the fold: a conflict finds its
+    /// entity's change by a search, not a walk of every change at each frame.
+    by_entity: Vec<usize>,
     partial: bool,
     /// The feed went past the reviewed head while reading: the branch moved.
     moved_while_reading: bool,
@@ -1275,30 +1301,10 @@ impl ReviewView {
             return;
         };
         let Some(data) = &self.data else { return };
-        if let Some(ix) = data
-            .folded
-            .changes
-            .iter()
-            .position(|c| &c.id == id && c.type_name == conflict.type_name)
-        {
+        if let Some(ix) = data.change_to(&conflict.type_name, id) {
             self.show_conflicts = false;
             self.select(ix, cx);
         }
-    }
-
-    /// What the branch did to each entity, by type and id: conflicts look their entity up in
-    /// one pass, not one walk of every change each.
-    fn nets(&self) -> HashMap<(&str, &str), NetChange> {
-        self.data
-            .iter()
-            .flat_map(|data| data.folded.changes.iter())
-            .filter_map(|change| {
-                Some((
-                    (change.type_name.as_str(), change.id.as_str()),
-                    change.net()?,
-                ))
-            })
-            .collect()
     }
 
     // ---- rendering ----
@@ -1758,7 +1764,11 @@ impl ReviewView {
         };
         let surface = studio_ui::ds::surface::document(cx);
         let border = studio_ui::ds::surface::rule(cx);
-        let nets = self.nets();
+        // What the branch did to a conflict's entity.
+        let net = |type_name: &str, id: &str| {
+            let data = self.data.as_ref()?;
+            data.folded.changes[data.change_to(type_name, id)?].net()
+        };
         v_flex()
             .id("conflicts")
             .flex_1()
@@ -1780,7 +1790,7 @@ impl ReviewView {
                 let here = conflict
                     .entity_id
                     .as_deref()
-                    .and_then(|id| nets.get(&(conflict.type_name.as_str(), id)).copied());
+                    .and_then(|id| net(&conflict.type_name, id));
                 let words = conflict_wording(conflict.kind, here, &self.target);
                 let entity = conflict.entity_id.clone().unwrap_or_else(|| "—".into());
                 let conflict_for_click = conflict.clone();
@@ -2175,6 +2185,7 @@ async fn read_review(
                 search: Vec::new(),
                 counts: Vec::new(),
                 revert_blocked: Vec::new(),
+                by_entity: Vec::new(),
                 partial: false,
                 moved_while_reading: false,
                 merged_in: false,
@@ -2211,7 +2222,7 @@ impl Fed {
     ) -> ReviewData {
         let fold = self.fold;
         let schema = session.read_with(cx, |session, _| session.schema_model());
-        let (folded, groups, search, revert_blocked) = cx
+        let (folded, groups, search, revert_blocked, by_entity) = cx
             .background_executor()
             .spawn(async move {
                 let folded = fold.finish();
@@ -2225,7 +2236,8 @@ impl Fed {
                         revert_query(schema, change).err().map(|e| e.0)
                     })
                     .collect();
-                (folded, groups, search, revert_blocked)
+                let by_entity = entity_order(&folded.changes);
+                (folded, groups, search, revert_blocked, by_entity)
             })
             .await;
         let counts = folded.counts();
@@ -2240,6 +2252,7 @@ impl Fed {
             search,
             counts,
             revert_blocked,
+            by_entity,
             partial: self.partial,
             moved_while_reading: self.moved_while_reading,
             merged_in: false,
@@ -2302,24 +2315,9 @@ async fn fold_feed(
             reached_head |= id == head;
             blocks.push(block);
         }
-        // Fold off the main thread (constitution IX).
-        let (folded, complete) = cx
-            .background_executor()
-            .spawn(async move {
-                let mut complete = true;
-                for block in blocks {
-                    complete &= fold.add_block_capped(block, REVIEW_CHANGE_CAP);
-                }
-                (fold, complete)
-            })
-            .await;
+        let (folded, complete) = fold_blocks(fold, blocks, this, cx).await;
         fold = folded;
         let raw = fold.raw_changes();
-        this.update(cx, |this, cx| {
-            this.load = LoadState::Loading { folded: raw };
-            cx.notify();
-        })
-        .ok();
         let more =
             page.next_page_token.is_some() || (!reached_head && page.caught_up == Some(false));
         if !complete || (raw >= REVIEW_CHANGE_CAP && more) {
@@ -2349,6 +2347,60 @@ async fn fold_feed(
         partial,
         moved_while_reading,
     })
+}
+
+/// Folds `blocks` into `fold` off the main thread (constitution IX), up to the change cap, and
+/// shows how many changes are folded: the fold, and whether every change fit.
+async fn fold_blocks(
+    mut fold: ChangeFold,
+    blocks: Vec<ChangeBlockOutput>,
+    this: &WeakEntity<ReviewView>,
+    cx: &mut AsyncApp,
+) -> (ChangeFold, bool) {
+    let (fold, complete) = cx
+        .background_executor()
+        .spawn(async move {
+            let mut complete = true;
+            for block in blocks {
+                complete &= fold.add_block_capped(block, REVIEW_CHANGE_CAP);
+            }
+            (fold, complete)
+        })
+        .await;
+    let folded = fold.raw_changes();
+    this.update(cx, |this, cx| {
+        this.load = LoadState::Loading { folded };
+        cx.notify();
+    })
+    .ok();
+    (fold, complete)
+}
+
+/// Folds a paged list of changes up to the change cap: `read` reads the page a token names
+/// (the first for none), at most `limit` changes, as one block and the next page's token. The
+/// fold, and whether the cap left changes out.
+async fn fold_pages(
+    this: &WeakEntity<ReviewView>,
+    cx: &mut AsyncApp,
+    mut read: impl AsyncFnMut(
+        Option<String>,
+        u32,
+        &mut AsyncApp,
+    ) -> Result<(ChangeBlockOutput, Option<String>), String>,
+) -> Result<(ChangeFold, bool), String> {
+    let mut fold = ChangeFold::new();
+    let mut token = None;
+    loop {
+        let limit = FEED_PAGE.min(REVIEW_CHANGE_CAP - fold.raw_changes()).max(1) as u32;
+        let (block, next) = read(token.take(), limit, cx).await?;
+        let (folded, complete) = fold_blocks(fold, vec![block], this, cx).await;
+        fold = folded;
+        match next {
+            Some(next) if complete && fold.raw_changes() < REVIEW_CHANGE_CAP => token = Some(next),
+            Some(_) => return Ok((fold, true)),
+            None => return Ok((fold, false)),
+        }
+    }
 }
 
 /// The branch's commits since it forked from `target`, newest first, up to `head` when the
@@ -2419,44 +2471,24 @@ async fn read_review_since_merge(
         merged_parent_commit_id: None,
         actor_id: None,
     };
-    let mut fold = ChangeFold::new();
-    let mut partial = false;
-    let mut token: Option<String> = None;
-    loop {
-        let limit = FEED_PAGE.min(REVIEW_CHANGE_CAP - fold.raw_changes()).max(1) as u32;
-        let page = session
-            .update(cx, |session, cx| {
-                session.diff(&base, &head, token.clone(), limit, cx)
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-        let block = ChangeBlockOutput {
-            cause: cause.clone(),
-            changes: page.changes,
-        };
-        let (folded, complete) = cx
-            .background_executor()
-            .spawn(async move {
-                let complete = fold.add_block_capped(block, REVIEW_CHANGE_CAP);
-                (fold, complete)
-            })
-            .await;
-        fold = folded;
-        let raw = fold.raw_changes();
-        this.update(cx, |this, cx| {
-            this.load = LoadState::Loading { folded: raw };
-            cx.notify();
-        })
-        .ok();
-        match page.next_page_token {
-            Some(next) if complete && raw < REVIEW_CHANGE_CAP => token = Some(next),
-            Some(_) => {
-                partial = true;
-                break;
-            }
-            None => break,
-        }
-    }
+    let (fold, partial) = fold_pages(
+        &this,
+        cx,
+        async |token: Option<String>, limit: u32, cx: &mut AsyncApp| {
+            let page = session
+                .update(cx, |session, cx| {
+                    session.diff(&base, &head, token, limit, cx)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            let block = ChangeBlockOutput {
+                cause: cause.clone(),
+                changes: page.changes,
+            };
+            Ok((block, page.next_page_token))
+        },
+    )
+    .await?;
     let fed = Fed {
         fold,
         commits: since.into_iter().rev().collect(),
@@ -2482,44 +2514,24 @@ async fn read_commit_review(
     let Some(commit) = scope else {
         return Err("A review of one commit names the commit.".into());
     };
-    let mut fold = ChangeFold::new();
-    let mut partial = false;
-    let mut token: Option<String> = None;
-    loop {
-        let limit = FEED_PAGE.min(REVIEW_CHANGE_CAP - fold.raw_changes()).max(1) as u32;
-        let page = session
-            .update(cx, |session, cx| {
-                session.commit_changes(&commit, token.clone(), limit, cx)
-            })
-            .await
-            .map_err(|e| e.to_string())?;
-        let block = ChangeBlockOutput {
-            cause: page.cause,
-            changes: page.changes,
-        };
-        let (folded, complete) = cx
-            .background_executor()
-            .spawn(async move {
-                let complete = fold.add_block_capped(block, REVIEW_CHANGE_CAP);
-                (fold, complete)
-            })
-            .await;
-        fold = folded;
-        let raw = fold.raw_changes();
-        this.update(cx, |this, cx| {
-            this.load = LoadState::Loading { folded: raw };
-            cx.notify();
-        })
-        .ok();
-        match page.next_page_token {
-            Some(next) if complete && raw < REVIEW_CHANGE_CAP => token = Some(next),
-            Some(_) => {
-                partial = true;
-                break;
-            }
-            None => break,
-        }
-    }
+    let (fold, partial) = fold_pages(
+        &this,
+        cx,
+        async |token: Option<String>, limit: u32, cx: &mut AsyncApp| {
+            let page = session
+                .update(cx, |session, cx| {
+                    session.commit_changes(&commit, token, limit, cx)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            let block = ChangeBlockOutput {
+                cause: page.cause,
+                changes: page.changes,
+            };
+            Ok((block, page.next_page_token))
+        },
+    )
+    .await?;
     let fed = Fed {
         fold,
         commits: since.into_iter().rev().collect(),
@@ -2719,6 +2731,7 @@ pub(crate) mod tests {
             search: folded.changes.iter().map(search_text_of).collect(),
             counts: folded.counts(),
             revert_blocked: vec![None; 3],
+            by_entity: entity_order(&folded.changes),
             folded,
             groups,
             partial: false,
@@ -2752,6 +2765,11 @@ pub(crate) mod tests {
             shown("maya"),
             ["§ Person +1 r0", "maya", "Note +1 r1", "lunch"]
         );
+        // A conflict finds its entity's change by type and id.
+        assert_eq!(data.change_to("Person", "maya"), Some(0));
+        assert_eq!(data.change_to("Note", "lunch"), Some(1));
+        assert_eq!(data.change_to("About", "e1"), Some(2));
+        assert_eq!(data.change_to("Person", "lunch"), None);
     }
 
     /// A reviewed mark holds for the change as it was reviewed, read from any commit: changed
