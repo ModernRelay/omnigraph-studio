@@ -2025,12 +2025,15 @@ fn spellings(text: &str) -> Vec<String> {
             None => String::new(),
         }
     };
-    let words: Vec<String> = text.split(' ').map(capitalize).collect();
+    // Capitalized from the lowercase spelling, so "LOVELACE" or "aDA" also finds "Lovelace",
+    // "Ada".
+    let lower = text.to_lowercase();
+    let words: Vec<String> = lower.split(' ').map(capitalize).collect();
     let mut found: Vec<String> = Vec::new();
     for spelling in [
         text.to_owned(),
-        text.to_lowercase(),
-        capitalize(text),
+        lower.clone(),
+        capitalize(&lower),
         words.join(" "),
     ] {
         if !spelling.is_empty() && !found.contains(&spelling) {
@@ -2660,6 +2663,8 @@ mod tests {
         assert_eq!(spellings("ada lov"), ["ada lov", "Ada lov", "Ada Lov"]);
         assert_eq!(spellings("Ada"), ["Ada", "ada"]);
         assert_eq!(spellings("person-0001"), ["person-0001", "Person-0001"]);
+        // Typed in capitals: capitalized from the lowercase spelling.
+        assert_eq!(spellings("LOVELACE"), ["LOVELACE", "lovelace", "Lovelace"]);
         let schema = dev();
         let query = node_search(&schema, "Person", "ada", 5).unwrap();
         assert!(
