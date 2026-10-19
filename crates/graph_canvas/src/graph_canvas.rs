@@ -1264,7 +1264,27 @@ impl GraphCanvas {
                 self.pinned.insert(key, *at);
             }
         }
+        self.keep_ontology_as_drawn();
         cx.emit(ItemEvent::UpdateTab);
+    }
+
+    /// After types were placed: the ontology as drawn is the layout of its pins now, so a later
+    /// rebuild of the same ontology (a count, an expansion elsewhere) keeps every type where it
+    /// is, rather than laying the rest out again around the new pins.
+    fn keep_ontology_as_drawn(&mut self) {
+        if self.mode != Mode::Schema {
+            return;
+        }
+        let Some((nodes, _, positions)) = &mut self.ontology_layout else {
+            return;
+        };
+        if nodes.len() != self.positions.len() || nodes.len() != self.scene.nodes.len() {
+            return;
+        }
+        for (node, drawn) in nodes.iter_mut().zip(&self.scene.nodes) {
+            node.pinned = pin_key(&drawn.id).and_then(|key| self.pinned.get(&key).copied());
+        }
+        *positions = self.positions.as_ref().clone();
     }
 
     // ---- the right-click menu ----
@@ -1616,6 +1636,7 @@ impl GraphCanvas {
                 self.pinned.insert(key, *at);
             }
         }
+        self.keep_ontology_as_drawn();
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
