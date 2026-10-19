@@ -379,7 +379,8 @@ impl Global for SettingsFileState {}
 /// development run never rewrites the tabs, drafts and conversations of the app the person
 /// uses. A bundled app is not a development run, whichever profile built it. A test binary
 /// (Cargo's `deps`) has a directory of its own, so no crate's test reads or rewrites a
-/// development run's. Found once, at the first call: a run keeps one directory.
+/// development run's, nor the person's data, whatever `CARGO_TARGET_DIR` names the build
+/// directory. Found once, at the first call: a run keeps one directory.
 pub fn data_dir() -> PathBuf {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(find_data_dir).clone()
@@ -426,16 +427,9 @@ fn find_data_dir() -> PathBuf {
 }
 
 /// Whether an executable is Cargo's build output rather than an installed app: it sits in a
-/// profile directory (or its `examples`) under a `target` directory, and not in a macOS bundle.
-/// A test binary Cargo built: in a build directory's `deps`.
-fn is_test_binary(exe: &std::path::Path) -> bool {
-    is_build_output(exe)
-        && exe
-            .parent()
-            .and_then(|dir| dir.file_name())
-            .is_some_and(|name| name == "deps")
-}
-
+/// profile directory (or its `examples` or `deps`) of a Cargo build directory, and not in a
+/// macOS bundle. A build directory is one named `target` or one holding the `CACHEDIR.TAG`
+/// Cargo writes into every build directory, so `CARGO_TARGET_DIR` may name it anything.
 fn is_build_output(exe: &std::path::Path) -> bool {
     let parts: Vec<&std::ffi::OsStr> = exe.iter().collect();
     if parts
@@ -452,8 +446,27 @@ fn is_build_output(exe: &std::path::Path) -> bool {
     };
     profile
         .and_then(|profile| profile.parent())
-        .and_then(|target| target.file_name())
-        .is_some_and(|name| name == "target")
+        .is_some_and(|build| {
+            build.file_name().is_some_and(|name| name == "target")
+                || build.join("CACHEDIR.TAG").is_file()
+        })
+}
+
+/// A test binary Cargo built: in a `deps` directory, named for its crate and the hexadecimal
+/// hash Cargo appends to every file there (`studio_settings-f7f2cad5771331a9`). The name is
+/// enough on its own, so a test whose build directory is not recognised still keeps out of the
+/// person's data.
+fn is_test_binary(exe: &std::path::Path) -> bool {
+    let in_deps = exe
+        .parent()
+        .and_then(|dir| dir.file_name())
+        .is_some_and(|name| name == "deps");
+    let hashed = exe
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.rsplit_once('-'))
+        .is_some_and(|(_, hash)| !hash.is_empty() && hash.chars().all(|c| c.is_ascii_hexdigit()));
+    in_deps && (hashed || is_build_output(exe))
 }
 
 /// Where a graph's saved queries live (spec 007): one folder per [`graph_key`] under the data
@@ -1029,6 +1042,29 @@ mod tests {
         ));
         assert!(!test("/w/omnigraph-studio/target/debug/omnigraph-studio"));
         assert!(!test("/w/omnigraph-studio/target/debug/examples/snapshot"));
+        // `CARGO_TARGET_DIR` may name the build directory anything: a test binary is known by
+        // its hashed name, and a build directory by the tag Cargo writes into it.
+        assert!(test(
+            "/w/elsewhere/debug/deps/studio_settings-f7f2cad5771331a9"
+        ));
+        assert!(test(
+            "C:/w/elsewhere/debug/deps/studio_settings-f7f2cad5771331a9.exe"
+        ));
+        assert!(!test("/opt/deps/omnigraph-studio"));
+        let build = std::env::temp_dir().join(format!("studio-build-dir-{}", std::process::id()));
+        let run = build.join("debug").join("omnigraph-studio");
+        let example = build.join("debug").join("examples").join("snapshot");
+        std::fs::create_dir_all(&build).unwrap();
+        assert!(!is_build_output(&run));
+        std::fs::write(
+            build.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        assert!(is_build_output(&run));
+        assert!(is_build_output(&example));
+        assert!(!is_test_binary(&run));
+        std::fs::remove_dir_all(&build).unwrap();
         if std::env::var_os("OMNIGRAPH_STUDIO_DATA").is_none() {
             assert!(
                 data_dir().starts_with(std::env::temp_dir()),
