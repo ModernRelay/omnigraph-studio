@@ -723,13 +723,8 @@ impl Workspace {
         // A graph the window has open keeps its session, its tabs and its place among the
         // graphs: it is shown, on the branch the new session is for. A second session for it
         // would leave its tabs on the first, and a write in flight unseen.
-        let open = self
-            .session
-            .iter()
-            .chain(self.parked.iter().map(|parked| &parked.session))
-            .find(|open| same_graph(open, &session, cx))
-            .cloned();
-        if let Some(open) = open {
+        let (url, graph) = graph_key_of(&session, cx);
+        if let Some(open) = self.open_session_for(&url, &graph, cx) {
             let branch = session.read(cx).branch.clone();
             open.update(cx, |open, cx| open.set_branch(branch, cx));
             self.show_graph(open.entity_id(), window, cx);
@@ -771,12 +766,8 @@ impl Workspace {
         saved: Option<SavedWorkspace>,
         cx: &mut Context<Self>,
     ) {
-        let open = self
-            .session
-            .iter()
-            .chain(self.parked.iter().map(|parked| &parked.session))
-            .any(|open| same_graph(open, &session, cx));
-        if open {
+        let (url, graph) = graph_key_of(&session, cx);
+        if self.open_session_for(&url, &graph, cx).is_some() {
             return;
         }
         self.graph_order.push(session.entity_id());
@@ -918,6 +909,25 @@ impl Workspace {
     }
 
     /// The graphs open in this window, in the order they were opened, and which is shown.
+    /// The session this window has open for `graph` on the server at `url`. A graph is matched
+    /// by its server's address, as its saved state is kept, so one open under another name the
+    /// CLI gives that server is the same graph.
+    pub fn open_session_for(
+        &self,
+        url: &str,
+        graph: &str,
+        cx: &App,
+    ) -> Option<Entity<GraphSession>> {
+        self.session
+            .iter()
+            .chain(self.parked.iter().map(|parked| &parked.session))
+            .find(|open| {
+                let open = open.read(cx);
+                open.graph_id == graph && open.connection.read(cx).server.url == url
+            })
+            .cloned()
+    }
+
     pub fn open_graphs(&self) -> Vec<(Entity<GraphSession>, bool)> {
         self.graph_order
             .iter()
@@ -2245,14 +2255,7 @@ impl Workspace {
         let (color, server, url, state) = match &self.session {
             Some(session) => {
                 let connection = session.read(cx).connection.read(cx);
-                let color = match &connection.state {
-                    ConnectionState::Ready => Color::Success,
-                    ConnectionState::Connecting | ConnectionState::Idle => Color::Muted,
-                    ConnectionState::ContractMismatch { .. } | ConnectionState::TooOld { .. } => {
-                        Color::Warning
-                    }
-                    _ => Color::Error,
-                };
+                let color = connection_color(&connection.state);
                 // The server's round trip from the last health check, beside its state.
                 let state = match (&connection.state, connection.latency) {
                     (ConnectionState::Ready, Some(latency)) => {
@@ -3498,12 +3501,6 @@ fn graph_key_of(session: &Entity<GraphSession>, cx: &App) -> (String, String) {
     (url, session.graph_id.clone())
 }
 
-/// Whether two sessions are the same graph on the same server: by its address, as its saved
-/// state is kept, so two names the CLI gives one server are one.
-fn same_graph(a: &Entity<GraphSession>, b: &Entity<GraphSession>, cx: &App) -> bool {
-    graph_key_of(a, cx) == graph_key_of(b, cx)
-}
-
 /// The button on a committed write's toast: Undo for a delete Studio can put back (History
 /// still holds the commit), else the commit.
 fn committed_follow_up(
@@ -4294,6 +4291,17 @@ impl Render for ConfirmClose {
     }
 }
 
+/// The colour of a connection's status dot: connected, on the way, a server Studio cannot use,
+/// or one it cannot reach or that refused the token.
+pub fn connection_color(state: &ConnectionState) -> Color {
+    match state {
+        ConnectionState::Ready => Color::Success,
+        ConnectionState::Connecting | ConnectionState::Idle => Color::Muted,
+        ConnectionState::ContractMismatch { .. } | ConnectionState::TooOld { .. } => Color::Warning,
+        ConnectionState::Unauthorized | ConnectionState::Unreachable(_) => Color::Error,
+    }
+}
+
 /// The workspace that owns a window, if any.
 pub fn workspace_for(window: &Window) -> Option<Entity<Workspace>> {
     window.root::<Workspace>().flatten()
@@ -4757,6 +4765,12 @@ mod tests {
             source: graph_store::ServerSource::Environment,
             known_graphs: Vec::new(),
         };
+        // The CLI can give one server two names, each its own connection.
+        let renamed = graph_store::ServerEntry {
+            name: "test-admin".into(),
+            ..server.clone()
+        };
+        let other = cx.new(|_| graph_store::Connection::new(renamed, None, http.clone()).unwrap());
         let connection = cx.new(|_| graph_store::Connection::new(server, None, http).unwrap());
         let session = |graph: &str, cx: &mut gpui::TestAppContext| {
             let connection = connection.clone();
@@ -4764,6 +4778,7 @@ mod tests {
             cx.new(|cx| GraphSession::new(connection, graph, "main".into(), cx))
         };
         let (shown, behind) = (session("notes", cx), session("crm", cx));
+        let behind_again = cx.new(|cx| GraphSession::new(other, "crm".into(), "main".into(), cx));
         let (workspace, cx) = cx.add_window_view(Workspace::new);
         workspace.update_in(cx, |workspace, window, cx| {
             let tabs = |workspace: &Workspace| -> usize {
@@ -4792,6 +4807,12 @@ mod tests {
                     .iter()
                     .all(|parked| { parked.panes.iter().all(|pane| pane.items.is_empty()) })
             );
+            assert_eq!(workspace.open_graphs().len(), 2);
+            // The graph under the server's other name is the one open: found by its address,
+            // and not opened a second time.
+            let found = workspace.open_session_for("http://studio.test", "crm", cx);
+            assert_eq!(found.map(|s| s.entity_id()), Some(behind.entity_id()));
+            workspace.add_behind(behind_again.clone(), None, cx);
             assert_eq!(workspace.open_graphs().len(), 2);
 
             workspace.show_graph(behind.entity_id(), window, cx);

@@ -167,6 +167,14 @@ impl Connection {
         }
     }
 
+    /// Connects, unless it is connected or connecting already: a server a window shows or opens
+    /// is connected once.
+    pub fn connect_if_idle(&mut self, cx: &mut Context<Self>) {
+        if self.state == ConnectionState::Idle {
+            self.connect(cx);
+        }
+    }
+
     /// Replaces the token: typed in after the server refused the old one, or changed in the
     /// CLI's files (spec 003). Requests made after this use it, and a connection in use checks
     /// again; one not yet used connects when it is.

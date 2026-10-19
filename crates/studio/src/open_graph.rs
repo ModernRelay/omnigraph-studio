@@ -12,7 +12,7 @@ use graph_store::{
 };
 use studio_ui::ds::{self, MenuRow, size, space};
 use studio_workspace::ModalView;
-use studio_workspace::Workspace;
+use studio_workspace::{Workspace, connection_color};
 use ui::Indicator;
 use ui::prelude::*;
 
@@ -100,10 +100,8 @@ impl OpenGraphModal {
         }
         let selected = first_choice(&connections, cx);
         // A server the dialog shows first is connected, as one chosen in it is.
-        if let Some(connection) = &selected
-            && matches!(connection.read(cx).state, ConnectionState::Idle)
-        {
-            connection.update(cx, |c, cx| c.connect(cx));
+        if let Some(connection) = &selected {
+            connection.update(cx, |c, cx| c.connect_if_idle(cx));
         }
         Self {
             workspace,
@@ -170,15 +168,11 @@ impl OpenGraphModal {
         ConnectionRegistry::global(cx).read(cx).save(cx);
         if let Some(workspace) = self.workspace.upgrade() {
             // A graph the window has open is shown as it is, on its own branch.
+            let url = &connection.read(cx).server.url;
             let open = workspace
                 .read(cx)
-                .open_graphs()
-                .into_iter()
-                .find(|(session, _)| {
-                    let session = session.read(cx);
-                    session.graph_id == graph_id && session.connection == connection
-                })
-                .map(|(session, _)| session.entity_id());
+                .open_session_for(url, &graph_id, cx)
+                .map(|session| session.entity_id());
             // One another window has open is shown there: a graph is open in one window at a
             // time, since its tabs and drafts are saved by graph.
             let elsewhere = open
@@ -273,7 +267,7 @@ impl OpenGraphModal {
                     .enumerate()
                     .map(|(index, connection)| {
                         let c = connection.read(cx);
-                        let color = state_color(&c.state);
+                        let color = connection_color(&c.state);
                         let selected = self.selected.as_ref() == Some(&connection);
                         let source = match c.server.source {
                             ServerSource::Cli => "CLI config",
@@ -344,7 +338,7 @@ impl OpenGraphModal {
                     .min_h(px(size::CONTROL))
                     .px(px(space::MD))
                     .gap(px(space::MD))
-                    .child(Indicator::dot().color(state_color(&state)))
+                    .child(Indicator::dot().color(connection_color(&state)))
                     .child(studio_ui::ds::text::muted(status))
                     .child(div().flex_1())
                     .map(|row| match &state {
@@ -495,15 +489,6 @@ fn first_choice(connections: &[Entity<Connection>], cx: &App) -> Option<Entity<C
         .find(|c| c.read(cx).state == ConnectionState::Ready)
         .or_else(|| connections.first())
         .cloned()
-}
-
-fn state_color(state: &ConnectionState) -> Color {
-    match state {
-        ConnectionState::Ready => Color::Success,
-        ConnectionState::Connecting | ConnectionState::Idle => Color::Muted,
-        ConnectionState::ContractMismatch { .. } | ConnectionState::TooOld { .. } => Color::Warning,
-        ConnectionState::Unauthorized | ConnectionState::Unreachable(_) => Color::Error,
-    }
 }
 
 impl Render for OpenGraphModal {

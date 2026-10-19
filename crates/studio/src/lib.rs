@@ -10,11 +10,12 @@ mod menus;
 mod open_graph;
 mod settings_view;
 
+use deep_link::DeepLink;
 use gpui::{
     App, AppContext as _, Context, Entity, Focusable as _, Window, WindowBounds, WindowOptions, px,
     size,
 };
-use graph_store::{ConnectionRegistry, ConnectionState, open_session};
+use graph_store::{ConnectionRegistry, open_session};
 use studio_actions::workspace::{NewWindow, OpenGraph, OpenLink, OpenSettings, Quit, RevealLog};
 use studio_workspace::{SavedWindow, ToastKind, Workspace};
 
@@ -302,9 +303,7 @@ fn reopen_window(
         else {
             continue;
         };
-        if connection.read(cx).state == ConnectionState::Idle {
-            connection.update(cx, |connection, cx| connection.connect(cx));
-        }
+        connection.update(cx, |connection, cx| connection.connect_if_idle(cx));
         let session = open_session(connection, graph.graph.clone(), graph.branch.clone(), cx);
         if index == saved.session.shown {
             workspace.update(cx, |workspace, cx| {
@@ -340,9 +339,7 @@ fn environment_graph(cx: &App) -> Option<(Entity<graph_store::Connection>, Strin
 fn ask_for_graph(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
     let registry = ConnectionRegistry::global(cx);
     for connection in registry.read(cx).connections.clone() {
-        if connection.read(cx).state == ConnectionState::Idle {
-            connection.update(cx, |connection, cx| connection.connect(cx));
-        }
+        connection.update(cx, |connection, cx| connection.connect_if_idle(cx));
     }
     let handle = workspace.downgrade();
     workspace.update(cx, |workspace, cx| {
@@ -416,16 +413,9 @@ pub fn open_link(link: &str, cx: &mut App) {
     let open_in = move |workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App| {
         // The graph, if the window has it open, moved to the branch the link names; else opened
         // here.
-        let open = workspace
-            .read(cx)
-            .open_graphs()
-            .into_iter()
-            .find(|(session, _)| {
-                let session = session.read(cx);
-                session.graph_id == target.graph && session.connection == connection
-            });
-        match open {
-            Some((session, _)) => {
+        let url = &connection.read(cx).server.url;
+        match workspace.read(cx).open_session_for(url, &target.graph, cx) {
+            Some(session) => {
                 if let Some(branch) = named_branch.clone() {
                     session.update(cx, |session, cx| session.set_branch(branch, cx));
                 }
@@ -434,9 +424,7 @@ pub fn open_link(link: &str, cx: &mut App) {
                 })
             }
             None => {
-                if connection.read(cx).state == ConnectionState::Idle {
-                    connection.update(cx, |connection, cx| connection.connect(cx));
-                }
+                connection.update(cx, |connection, cx| connection.connect_if_idle(cx));
                 let session =
                     open_session(connection.clone(), target.graph.clone(), branch.clone(), cx);
                 workspace.update(cx, |workspace, cx| {
@@ -484,10 +472,8 @@ pub fn open_link(link: &str, cx: &mut App) {
     cx.activate(true);
 }
 
-use deep_link::DeepLink;
-
-/// The workspace window that has `graph` on `connection` open, with its session there. A graph
-/// is open in one window at a time: its tabs and drafts are saved by graph.
+/// The workspace window that has `graph` on `connection`'s server open, with its session there.
+/// A graph is open in one window at a time: its tabs and drafts are saved by graph.
 pub(crate) fn window_holding(
     connection: &Entity<graph_store::Connection>,
     graph: &str,
@@ -500,16 +486,8 @@ pub(crate) fn window_holding(
         .into_iter()
         .filter_map(|window| window.downcast::<Workspace>())
         .find_map(|handle| {
-            let session = handle
-                .read(cx)
-                .ok()?
-                .open_graphs()
-                .into_iter()
-                .map(|(session, _)| session)
-                .find(|session| {
-                    let session = session.read(cx);
-                    session.graph_id == graph && session.connection == *connection
-                })?;
+            let url = &connection.read(cx).server.url;
+            let session = handle.read(cx).ok()?.open_session_for(url, graph, cx)?;
             Some((handle, session))
         })
 }
