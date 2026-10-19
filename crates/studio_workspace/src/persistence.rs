@@ -458,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_windows_read_back_and_an_older_file_is_one_window() {
+    fn saved_windows_read_back_and_a_file_without_them_is_none() {
         let windows = vec![
             SavedWindow {
                 session: showing(&["crm", "notes"]),
@@ -483,7 +483,7 @@ mod tests {
             .keys()
             .cloned()
             .collect();
-        assert_eq!(keys, ["windows"], "only the new shape is written");
+        assert_eq!(keys, ["windows"]);
         assert_eq!(parse_session(&text), Some(windows));
         assert_eq!(parse_session("{}"), Some(Vec::new()));
         assert_eq!(parse_session("not json"), None);

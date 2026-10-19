@@ -39,12 +39,14 @@ use studio_ui::menu::{ContextMenu, ContextMenuEntry, ContextMenuItem};
 use ui::prelude::*;
 use ui::{ButtonLike, Indicator, PopoverMenu, Tooltip, right_click_menu};
 
-pub use item::{Item, ItemEvent, ItemFooter, ItemHandle, KeyHint};
-pub use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};
-pub use panels::{Dock, PanelEntry, PanelPosition};
+use item::ItemHandle;
+pub use item::{Item, ItemEvent, ItemFooter, KeyHint};
+use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};
+pub use panels::PanelPosition;
+use panels::{Dock, PanelEntry};
 pub use persistence::{
     SavedGraph, SavedItem, SavedPane, SavedSession, SavedWindow, SavedWorkspace,
-    keep_saved_windows, load_windows, register_item_kind, restore_enabled, saved_window_bounds,
+    keep_saved_windows, load_windows, register_item_kind, saved_window_bounds,
 };
 
 /// A modal: dismissing it emits [`DismissEvent`]. Following Zed's modal layer, the workspace
@@ -64,8 +66,7 @@ pub trait ModalView: Render + Focusable + EventEmitter<DismissEvent> {
 }
 
 /// Where a modal sits (spec 002, "Modals"), after Tower's: a dialog over a dim, a quarter of
-/// the way down the space it leaves free; the command palette near the top over a light veil,
-/// a quick look over the page that keeps its colour.
+/// the way down the space it leaves free; the command palette near the top over a light veil.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ModalPlacement {
     #[default]
@@ -1824,7 +1825,8 @@ impl Workspace {
         true
     }
 
-    pub fn has_modal(&self) -> bool {
+    #[cfg(test)]
+    fn has_modal(&self) -> bool {
         self.modal.is_some()
     }
 
@@ -3489,7 +3491,6 @@ impl Workspace {
     }
 }
 
-/// Whether two sessions are the same graph on the same server.
 /// The server and graph a session's saved state is kept under.
 fn graph_key_of(session: &Entity<GraphSession>, cx: &App) -> (String, String) {
     let session = session.read(cx);
@@ -3497,9 +3498,10 @@ fn graph_key_of(session: &Entity<GraphSession>, cx: &App) -> (String, String) {
     (url, session.graph_id.clone())
 }
 
+/// Whether two sessions are the same graph on the same server: by its address, as its saved
+/// state is kept, so two names the CLI gives one server are one.
 fn same_graph(a: &Entity<GraphSession>, b: &Entity<GraphSession>, cx: &App) -> bool {
-    let (a, b) = (a.read(cx), b.read(cx));
-    a.graph_id == b.graph_id && a.connection == b.connection
+    graph_key_of(a, cx) == graph_key_of(b, cx)
 }
 
 /// The button on a committed write's toast: Undo for a delete Studio can put back (History
@@ -3884,10 +3886,6 @@ fn toggle_action(position: PanelPosition) -> Box<dyn Action> {
     }
 }
 
-/// Whether the first tab of a pane sits in the document sheet's rounded corner: on glass, in
-/// the top-left pane, unless the traffic lights' space comes first (`render_pane_header`: the
-/// sidebar hidden, or no graph open). GPUI clips a sheet's children to its rectangle, not its
-/// corners, so that tab takes the sheet's radius or its shade shows outside the curve.
 /// Where a pane meets the bottom of the document sheet on glass. GPUI clips a child to the
 /// sheet's rectangle, not its rounded corners, so the pane rounds its document fill into the
 /// corners it reaches and keeps its tab's content a corner's radius above the sheet's edge,
@@ -3917,6 +3915,10 @@ impl SheetFloor {
     }
 }
 
+/// Whether the first tab of a pane sits in the document sheet's rounded corner: on glass, in
+/// the top-left pane, unless the traffic lights' space comes first (`render_pane_header`: the
+/// sidebar hidden, or no graph open). GPUI clips a sheet's children to its rectangle, not its
+/// corners, so that tab takes the sheet's radius or its shade shows outside the curve.
 fn first_tab_in_sheet_corner(
     glass: bool,
     top_left_pane: bool,
