@@ -400,13 +400,17 @@ pub fn open_link(link: &str, cx: &mut App) {
             ),
         );
     };
-    let branch = target.branch.clone().unwrap_or_else(|| "main".into());
+    // A link that names no branch opens a graph on main, and leaves one the window has open on
+    // its own branch, as "Open a graph" does.
+    let named_branch = target.branch.clone();
+    let branch = named_branch.clone().unwrap_or_else(|| "main".into());
     // The window that has the graph open, else the active one.
     let window = window_holding(&connection, &target.graph, cx)
         .map(|(handle, _)| handle.into())
         .or_else(|| link_window(cx));
     let open_in = move |workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App| {
-        // The graph, if the window has it open, moved to the link's branch; else opened here.
+        // The graph, if the window has it open, moved to the branch the link names; else opened
+        // here.
         let open = workspace
             .read(cx)
             .open_graphs()
@@ -417,7 +421,9 @@ pub fn open_link(link: &str, cx: &mut App) {
             });
         match open {
             Some((session, _)) => {
-                session.update(cx, |session, cx| session.set_branch(branch.clone(), cx));
+                if let Some(branch) = named_branch.clone() {
+                    session.update(cx, |session, cx| session.set_branch(branch, cx));
+                }
                 workspace.update(cx, |workspace, cx| {
                     workspace.show_graph(session.entity_id(), window, cx)
                 })
