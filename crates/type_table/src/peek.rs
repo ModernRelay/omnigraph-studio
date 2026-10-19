@@ -26,7 +26,7 @@ use studio_ui::ds::IconButton;
 use studio_ui::ds::space;
 use studio_ui::menu::ContextMenu;
 use ui::prelude::*;
-use ui::{Indicator, PopoverMenu, Switch, ToggleState, Tooltip};
+use ui::{Indicator, PopoverMenu, ToggleState, Tooltip};
 
 use crate::blob::{
     IMAGE_MAX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, save_value, suggested_file_name,
@@ -2646,7 +2646,7 @@ impl NodePeek {
             let on = value.as_bool().unwrap_or(false);
             let property = property.clone();
             return Some(
-                Switch::new(("peek-switch", index), on.into())
+                studio_ui::ds::switch(("peek-switch", index), on.into(), cx)
                     .on_click(move |state, window, cx| {
                         let chosen = Value::Bool(*state == ToggleState::Selected);
                         this.update(cx, |this, cx| {

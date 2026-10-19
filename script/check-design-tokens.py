@@ -14,7 +14,8 @@ every surface and nothing drifts. This refuses, outside the design system and te
 - a raw colour (`gpui::black()`, `rgb(0x…)`, `hsla(…)`) or the theme's palette read directly
   (`cx.theme().colors()`, `cx.theme().status()`): views name a `ds::surface` role or a `ui`
   `Color`;
-- a font weight named directly (`FontWeight::MEDIUM`): views take `ds::text::weight`.
+- a font weight named directly (`FontWeight::MEDIUM`): views take `ds::text::weight`;
+- a `ui` component the design system wraps (`Switch::new`): views take `ds::switch`.
 
 A line the rule cannot fit says why in a `// ds-exempt: <reason>` comment on it or the line
 above, so every exception shows up in review.
@@ -55,6 +56,7 @@ RULES = [
     ("raw colour", re.compile(r"gpui::(black|white)\(\)|\brgb\(0x|\brgba\(0x|\bhsla\(")),
     ("theme palette", re.compile(r"\.theme\(\)\s*\.\s*(colors|status)\(\)")),
     ("font weight", re.compile(r"\bFontWeight::[A-Z_]+")),
+    ("component outside the design system", re.compile(r"\bSwitch::new\(")),
 ]
 EXEMPT = re.compile(r"//\s*ds-exempt:\s*\S")
 

@@ -1018,6 +1018,11 @@ pub fn toolbar_icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButt
     icon_button(id, icon).size(ButtonSize::Default)
 }
 
+/// A switch: on in the primary button's ink, as Tower's; off on the theme's quiet track.
+pub fn switch(id: impl Into<ElementId>, state: ui::ToggleState, cx: &App) -> ui::Switch {
+    ui::Switch::new(id, state).color(ui::SwitchColor::Custom(cx.theme().colors().text))
+}
+
 /// A toast's surface: on glass a small floating glass surface, like the canvas's bars; flat,
 /// the floating fill, hairline and shadow.
 pub fn toast_surface<E: Styled>(element: E, cx: &App) -> E {

@@ -19,7 +19,7 @@ use studio_ui::menu::ContextMenu;
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use theme::ThemeRegistry;
 use ui::prelude::*;
-use ui::{Callout, PopoverMenu, Severity, Switch, Tooltip};
+use ui::{Callout, PopoverMenu, Severity, Tooltip};
 
 pub struct SettingsView {
     search: Entity<Editor>,
@@ -449,7 +449,7 @@ fn control(
         FieldKind::Toggle => {
             let on = current.as_bool().unwrap_or_default();
             let switch_target = target.clone();
-            Switch::new(target.id("switch"), on.into())
+            ds::switch(target.id("switch"), on.into(), cx)
                 .on_click(move |state, _, cx| {
                     switch_target.set(Value::Bool(*state == ToggleState::Selected), cx)
                 })
