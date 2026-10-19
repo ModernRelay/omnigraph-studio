@@ -1604,11 +1604,7 @@ pub fn tag(label: impl Into<SharedString>, cx: &App) -> Div {
         .items_center()
         .rounded(px(radii(cx).xs))
         .bg(surface::tag(cx))
-        .child(
-            crate::cell_text(label, cx)
-                .size(ui::TextSize::XSmall, cx)
-                .hug(),
-        )
+        .child(crate::cell_text(label, cx).meta(cx).hug())
 }
 
 /// A code-like value in a quiet box, as a table shows an enum member: [`tag`] with the value

@@ -714,6 +714,27 @@ mod tests {
                                 .child(ds::bar_icon_button("zoom", ui::IconName::Plus)),
                         ),
                 )
+                // Each size by its role. Before `button`, whose label the test measures.
+                .child(
+                    div()
+                        .debug_selector(|| "toolbar-icon-button".into())
+                        .child(ds::toolbar_icon_button("t", ui::IconName::Plus)),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "row-button".into())
+                        .child(ds::row_button("r", "Show all")),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "row-icon-button".into())
+                        .child(ds::row_icon_button("ri", ui::IconName::Copy)),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "inline-icon-button".into())
+                        .child(ds::inline_icon_button("ii", ui::IconName::Close)),
+                )
                 .child(
                     div()
                         .debug_selector(|| "icon-button".into())
@@ -802,7 +823,8 @@ mod tests {
 
     /// The design system's controls draw at their tokens: a button as tall as a control with its
     /// content 10 px in, an icon button a circle, a field as tall as a button, a pill button
-    /// round in a pill, and a floating bar's buttons inside its border.
+    /// round in a pill, a floating bar's buttons inside its border, and each button role at its
+    /// size, an icon button's icon following that size.
     #[gpui::test]
     fn controls_draw_at_their_sizes(cx: &mut TestAppContext) {
         cx.update(studio_theme::init_test);
@@ -850,6 +872,34 @@ mod tests {
                 "{selector}"
             );
             assert!(button.top() >= bar.top() + gpui::px(1.), "{selector}");
+        }
+        for (selector, side) in [
+            ("toolbar-icon-button", ds::size::BAR_BUTTON),
+            ("row-button", ds::size::ROW_BUTTON),
+            ("row-icon-button", ds::size::ROW_BUTTON),
+        ] {
+            assert_eq!(
+                f32::from(bounds(cx, selector).size.height),
+                side,
+                "{selector}"
+            );
+        }
+        let row_icon = bounds(cx, "row-icon-button");
+        assert_eq!(row_icon.size.width, row_icon.size.height, "a square");
+        assert!(
+            f32::from(bounds(cx, "inline-icon-button").size.height) < ds::size::ROW_BUTTON,
+            "a tab's icon has no square beyond itself"
+        );
+        // `IconSize` has no `Debug`.
+        use ui::{ButtonSize, IconSize};
+        for (size, icon) in [
+            (ButtonSize::Large, IconSize::Medium),
+            (ButtonSize::Medium, IconSize::Small),
+            (ButtonSize::Default, IconSize::Small),
+            (ButtonSize::Compact, IconSize::XSmall),
+            (ButtonSize::None, IconSize::XSmall),
+        ] {
+            assert!(super::icon_button_icon_size(size) == icon);
         }
     }
 
