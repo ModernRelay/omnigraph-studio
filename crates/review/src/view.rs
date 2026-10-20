@@ -1555,6 +1555,12 @@ impl ReviewView {
                     let beyond_review = took.is_some() && took != bound;
                     let commit = commit.map(|c| c.graph_commit_id);
                     this.update(cx, |this, cx| {
+                        // Known gone as soon as the merge says so, while what it took is
+                        // checked: a fix asked for meanwhile is refused for that reason.
+                        if matches!(deleted, Some(Ok(()))) {
+                            this._head_watch = None;
+                            this.branch_deleted = true;
+                        }
                         this.merge = MergeState::Merged {
                             outcome,
                             commit: commit.clone(),
