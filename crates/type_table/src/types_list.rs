@@ -16,7 +16,7 @@ use ui::prelude::*;
 /// One row of the sidebar's list.
 enum Row {
     Ontology,
-    Explorer,
+    Canvas,
     Schema,
     Section(&'static str),
     Type { name: String, is_edge: bool },
@@ -132,7 +132,7 @@ impl Render for TypesList {
         if self.rows_for.as_deref() != Some(&*schema.source) {
             let mut rows = vec![
                 Row::Ontology,
-                Row::Explorer,
+                Row::Canvas,
                 Row::Schema,
                 Row::Section("Types"),
             ];
@@ -187,7 +187,7 @@ impl TypesList {
                 })
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenOntology), cx))
                 .into_any_element(),
-            Row::Explorer => view_row("view-explorer", "Canvas", IconName::Crosshair)
+            Row::Canvas => view_row("view-canvas", "Canvas", IconName::Crosshair)
                 .selected(canvas_open && self.exploring(cx))
                 .tooltip_fn(|_, cx| {
                     Tooltip::for_action(
