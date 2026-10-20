@@ -40,7 +40,7 @@ use ui::prelude::*;
 use ui::{ButtonLike, Indicator, PopoverMenu, Tooltip, right_click_menu};
 
 use item::ItemHandle;
-pub use item::{Item, ItemEvent, ItemFooter, KeyHint};
+pub use item::{Item, ItemEvent, ItemStatus, KeyHint};
 use pane::{Member, Pane, PaneId, SplitAxis, SplitDirection, Tab};
 pub use panels::PanelPosition;
 use panels::{Dock, PanelEntry};
@@ -199,7 +199,7 @@ pub struct Workspace {
     /// What the CLI's files could not give, and the servers not added at start, as last shown.
     cli_errors: Vec<String>,
     _settings_subscription: Subscription,
-    /// Studio's memory and CPU for the footer while `studio.show_performance` is on (the
+    /// Studio's memory and CPU for the status bar while `studio.show_performance` is on (the
     /// default), read every two seconds while the window is in front.
     performance: Option<Performance>,
     /// Whether this window is in front, which the memory and CPU reading waits for.
@@ -487,7 +487,7 @@ impl Workspace {
         }
     }
 
-    /// Studio's memory and CPU, muted at the end of the footer; in the warning colour past
+    /// Studio's memory and CPU, muted at the end of the status bar; in the warning colour past
     /// 2 GB or half a core.
     fn render_performance(&self) -> Option<impl IntoElement> {
         let reading = self.performance.as_ref()?;
@@ -517,7 +517,7 @@ impl Workspace {
         };
         Some(
             div()
-                .id("footer-performance")
+                .id("status-performance")
                 .flex_none()
                 .tooltip(Tooltip::text(tooltip))
                 .child(
@@ -2153,7 +2153,7 @@ impl Workspace {
 
     // ---- rendering ----
 
-    /// A header or footer strip of a column (spec 002, after Delta): fixed height, and a place
+    /// A column's header strip (spec 002, after Delta): fixed height, and a place
     /// to drag the window from. As in Zed's title bar, the move starts on the first mouse move
     /// after a press, so clicks on the strip's buttons still land.
     fn strip(
@@ -3140,15 +3140,15 @@ impl Workspace {
     /// the bottom and right docks' panel buttons.
     fn render_status_bar(
         &self,
-        footer: Option<ItemFooter>,
+        status: Option<ItemStatus>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let status_background = studio_ui::ds::surface::status_bar(cx);
         let glass = studio_ui::ds::is_glass(cx);
         let hairline = studio_ui::ds::surface::rule(cx);
-        let mut footer = footer.unwrap_or_default();
-        let keys = std::mem::take(&mut footer.keys);
-        let has_start = !footer.start.is_empty();
+        let mut status = status.unwrap_or_default();
+        let keys = std::mem::take(&mut status.keys);
+        let has_start = !status.start.is_empty();
         let shown = self.session.is_some();
         let running = self.session.as_ref().and_then(|session| {
             let s = session.read(cx);
@@ -3175,9 +3175,9 @@ impl Workspace {
             .child(self.render_server_switcher(cx))
             .children(self.render_graph_and_branch(cx))
             .when(has_start, |bar| bar.child(studio_ui::ds::divider_v(cx)))
-            .children(footer.start);
+            .children(status.start);
         let docks_right = shown && !(self.bottom.panels.is_empty() && self.right.panels.is_empty());
-        let has_end = !footer.end.is_empty();
+        let has_end = !status.end.is_empty();
         let performance = self.render_performance();
         // Zed's 4 px between the left side's items, which are chips with padding of their own;
         // the right side's are bare text, so they keep 8 px, and a rule sets the window's
@@ -3194,7 +3194,7 @@ impl Workspace {
                     .child(studio_ui::ds::spinner())
                     .child(studio_ui::ds::text::meta(text).single_line())
             }))
-            .children(footer.end)
+            .children(status.end)
             // The tab's keys, behind one button: the bar names facts, not shortcuts.
             .when(!keys.is_empty(), |bar| {
                 bar.child(
@@ -3270,7 +3270,7 @@ impl Workspace {
                 .flex_none()
                 .child(
                     h_flex()
-                        .id("footer-graph")
+                        .id("status-graph")
                         .h(px(studio_ui::ds::size::BAR_BUTTON))
                         // A 22 px button's inset, so it reads as the branch button beside it.
                         .px(px(studio_ui::ds::space::MD))
@@ -3650,7 +3650,7 @@ impl Workspace {
     }
 
     /// Follows a dock edge being dragged. Sizes are measured from the window's edges, inside the
-    /// glass style's gap and above the document footer.
+    /// glass style's gap and above the status bar.
     fn resize_dock(
         &mut self,
         event: &DragMoveEvent<DraggedDock>,
@@ -3678,7 +3678,7 @@ impl Workspace {
     }
 
     fn render_toasts(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        // Under the header strips, so a toast never covers a document's footer or composer.
+        // Under the header strips, so a toast never covers the status bar or a composer.
         v_flex()
             .absolute()
             .top(px(HEADER_HEIGHT + studio_ui::ds::space::MD))
@@ -3994,10 +3994,10 @@ impl Render for Workspace {
             #[cfg(target_os = "macos")]
             window.set_traffic_light_position(lights);
         }
-        let footer = self
+        let status = self
             .pane(self.active_pane)
             .and_then(|pane| pane.active_item())
-            .and_then(|item| item.footer(window, cx));
+            .and_then(|item| item.status(window, cx));
         // Where the bottom dock spans, as Zed's `bottom_dock_layout`.
         let layout = cx
             .try_global::<StudioSettings>()
@@ -4062,7 +4062,7 @@ impl Render for Workspace {
                 .child(docks)
                 .children(self.render_zoomed(cx)),
         )
-        .child(self.render_status_bar(footer, cx))
+        .child(self.render_status_bar(status, cx))
         .child(self.render_toasts(cx))
         .children(modal)
     }
@@ -4163,7 +4163,7 @@ fn first_tab_in_sheet_corner(
     glass && top_left_pane && sidebar_shown && graph_open
 }
 
-/// How often the footer's memory and CPU are read.
+/// How often the status bar's memory and CPU are read.
 const PERFORMANCE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The last reading of Studio's memory and CPU, and the CPU share since the one before.

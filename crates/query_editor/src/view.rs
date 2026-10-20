@@ -36,7 +36,7 @@ use studio_ui::{
     grid_cell, grid_header, grid_places, is_numeric, resizable_grid_header, short_commit_id,
     value_text,
 };
-use studio_workspace::{Item, ItemEvent, ItemFooter, KeyHint, SavedItem};
+use studio_workspace::{Item, ItemEvent, ItemStatus, KeyHint, SavedItem};
 use ui::prelude::*;
 use ui::{KeyBinding, PopoverMenu, Tooltip};
 
@@ -455,10 +455,10 @@ impl Item for QueryEditor {
         })
     }
 
-    /// The window's footer, as the table's: the result's facts on the leading side, what the
-    /// keyboard does with it on the trailing side.
-    fn footer(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<ItemFooter> {
-        Some(self.footer_parts(cx))
+    /// The tab's part of the status bar, as the table's: the result's facts on the leading
+    /// side, what the keyboard does with it on the trailing side.
+    fn status(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<ItemStatus> {
+        Some(self.status_parts(cx))
     }
 
     /// The draft comes back after a restart (spec 007: the text is never cleared). It is
@@ -989,7 +989,7 @@ impl QueryEditor {
             .to_offset(&snapshot)
             .0;
         self.sync_params(window, cx);
-        // The toolbar and the window's footer name the declaration under the cursor, and before
+        // The toolbar and the status bar name the declaration under the cursor, and before
         // a run the result area shows its columns. Only a new declaration notifies: the tab
         // draws again anyway because its editor changed, and a notify on every key would draw
         // the rows again too.
@@ -1082,7 +1082,7 @@ impl QueryEditor {
         self.analysis = Some(analysis);
         self.sync_params(window, cx);
         self.sync_run_lines(cx);
-        // What the declaration returns, in the window's footer, follows the check.
+        // What the declaration returns, in the status bar, follows the check.
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
@@ -1605,7 +1605,7 @@ impl QueryEditor {
                 self.send_read(prepared, cx);
             }
         }
-        // The window's footer shows the run.
+        // The status bar shows the run.
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
@@ -1900,7 +1900,7 @@ impl QueryEditor {
         self.selected = Some((row, column));
         window.focus(&self.results_focus, cx);
         if first {
-            // The footer offers copying once a cell is selected.
+            // The status bar offers copying once a cell is selected.
             cx.emit(ItemEvent::UpdateTab);
         }
         cx.notify();
@@ -1927,7 +1927,7 @@ impl QueryEditor {
         self.results_scroll
             .scroll_to_item(row, ScrollStrategy::Nearest);
         if first {
-            // The footer offers copying once a cell is selected.
+            // The status bar offers copying once a cell is selected.
             cx.emit(ItemEvent::UpdateTab);
         }
         cx.notify();
@@ -1951,7 +1951,7 @@ impl QueryEditor {
 
     // ---- rendering ----
 
-    fn footer_parts(&self, cx: &mut Context<Self>) -> ItemFooter {
+    fn status_parts(&self, cx: &mut Context<Self>) -> ItemStatus {
         use studio_ui::ds;
         let mut start = Vec::new();
         let mut end = Vec::new();
@@ -1979,7 +1979,7 @@ impl QueryEditor {
                 start.push(
                     ds::meta(IconName::Clock, format_elapsed(rows.elapsed)).into_any_element(),
                 );
-                // Where the rows were read, when it is not the branch the footer shows: the
+                // Where the rows were read, when it is not the branch the status bar shows: the
                 // branch changed since, and a commit pin is named by the commit itself.
                 if !rows.target.starts_with("commit ") && rows.target != self.branch(cx) {
                     start.push(
@@ -2066,7 +2066,7 @@ impl QueryEditor {
                 }
             }
         }
-        ItemFooter { start, end, keys }
+        ItemStatus { start, end, keys }
     }
 
     /// The page's toolbar, as the table's: what the page runs on the leading side (the query

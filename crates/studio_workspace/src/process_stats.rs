@@ -1,4 +1,4 @@
-//! Studio's own memory and CPU use, for the footer when `studio.show_performance` is on
+//! Studio's own memory and CPU use, for the status bar when `studio.show_performance` is on
 //! (spec 002). Memory is what the system charges the app: on macOS the physical footprint, the
 //! figure Activity Monitor shows, and on Linux the resident set. Other platforms report none.
 

@@ -19,7 +19,7 @@ use graph_store::{GraphSession, Loadable};
 use serde_json::json;
 use studio_actions::canvas::{ActualSize, FitToWindow, ZoomIn, ZoomOut};
 use studio_ui::ds;
-use studio_workspace::{Item, ItemEvent, ItemFooter, KeyHint, SavedItem};
+use studio_workspace::{Item, ItemEvent, ItemStatus, KeyHint, SavedItem};
 use ui::Tooltip;
 use ui::prelude::*;
 
@@ -752,7 +752,7 @@ impl Item for BlobView {
     }
 
     /// The value's kind, size and commit; zoom for an image or a PDF; Save and Open with.
-    fn footer(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<ItemFooter> {
+    fn status(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<ItemStatus> {
         let mut start = vec![ds::text::meta(self.facts()).into_any_element()];
         if let Loadable::Loading = self.content
             && let Some(size) = self.size.filter(|size| *size > 0)
@@ -878,7 +878,7 @@ impl Item for BlobView {
         } else {
             Vec::new()
         };
-        Some(ItemFooter { start, end, keys })
+        Some(ItemStatus { start, end, keys })
     }
 }
 

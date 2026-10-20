@@ -39,7 +39,7 @@ use studio_ui::ds::Button;
 use studio_ui::ds::space;
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::{ColumnDrag, ColumnResize, GridPlace, ROW_HEIGHT, columns_in_view, grid_places};
-use studio_workspace::{Item, ItemEvent, ItemFooter, KeyHint, SavedItem, ToastKind, Workspace};
+use studio_workspace::{Item, ItemEvent, ItemStatus, KeyHint, SavedItem, ToastKind, Workspace};
 use ui::prelude::*;
 use ui::{
     ColumnWidthConfig, Indicator, PopoverMenu, PopoverMenuHandle, Table, TableInteractionState,
@@ -495,8 +495,8 @@ impl Item for TypeTable {
         self.newer
     }
 
-    fn footer(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<ItemFooter> {
-        Some(self.footer_parts(cx))
+    fn status(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<ItemStatus> {
+        Some(self.status_parts(cx))
     }
 }
 
@@ -6935,7 +6935,7 @@ impl TypeTable {
     /// The table's part of the footer strip: how much is loaded and the commit every page is
     /// read at, then the keys that act on the cursor, as key caps (spec 002: layout, not
     /// sentences).
-    fn footer_parts(&self, cx: &mut Context<Self>) -> ItemFooter {
+    fn status_parts(&self, cx: &mut Context<Self>) -> ItemStatus {
         // The status bar names only what is happening: the row count is in the toolbar, and the
         // keys are behind its keyboard button.
         let mut start = Vec::new();
@@ -6994,7 +6994,7 @@ impl TypeTable {
                 key("Refresh", &RefreshTable),
             ],
         };
-        ItemFooter {
+        ItemStatus {
             start,
             end: Vec::new(),
             keys,

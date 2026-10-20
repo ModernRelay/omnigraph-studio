@@ -21,7 +21,7 @@ pub enum ItemEvent {
 /// Zed's status items, and the keys it answers, which the bar lists in a panel behind one
 /// button rather than spelling them out. A tab's controls belong in the tab.
 #[derive(Default)]
-pub struct ItemFooter {
+pub struct ItemStatus {
     pub start: Vec<AnyElement>,
     pub end: Vec<AnyElement>,
     pub keys: Vec<KeyHint>,
@@ -83,8 +83,8 @@ pub trait Item: Render + Focusable + EventEmitter<ItemEvent> {
         None
     }
 
-    /// The tab's part of the footer strip; `None` shows only the graph and branch.
-    fn footer(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<ItemFooter> {
+    /// The tab's part of the status bar; `None` shows only the graph and branch.
+    fn status(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<ItemStatus> {
         None
     }
 
@@ -108,7 +108,7 @@ pub trait ItemHandle: 'static {
     fn focus_handle(&self, cx: &App) -> FocusHandle;
     fn boxed_clone(&self) -> Box<dyn ItemHandle>;
     fn serialize(&self, cx: &App) -> Option<SavedItem>;
-    fn footer(&self, window: &mut Window, cx: &mut App) -> Option<ItemFooter>;
+    fn status(&self, window: &mut Window, cx: &mut App) -> Option<ItemStatus>;
     fn caches_its_parts(&self, cx: &App) -> bool;
 }
 
@@ -153,8 +153,8 @@ impl<T: Item> ItemHandle for Entity<T> {
         self.read(cx).serialize(cx)
     }
 
-    fn footer(&self, window: &mut Window, cx: &mut App) -> Option<ItemFooter> {
-        self.update(cx, |item, cx| item.footer(window, cx))
+    fn status(&self, window: &mut Window, cx: &mut App) -> Option<ItemStatus> {
+        self.update(cx, |item, cx| item.status(window, cx))
     }
 
     fn caches_its_parts(&self, cx: &App) -> bool {
