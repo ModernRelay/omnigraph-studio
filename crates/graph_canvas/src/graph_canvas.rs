@@ -420,6 +420,11 @@ impl GraphCanvas {
             }),
             cx.subscribe(&session, |this, _, event: &SessionEvent, cx| match event {
                 SessionEvent::SchemaChanged => this.rebuild(cx),
+                // The ontology is the schema itself, as the types list: it shows another
+                // writer's change at once. The explorer's data says it is newer instead.
+                SessionEvent::SchemaMoved if this.results.is_none() && this.show_schema => {
+                    this.rebuild(cx)
+                }
                 // Counts are drawn on the ontology's types only.
                 SessionEvent::CountsChanged if this.results.is_none() && this.show_schema => {
                     this.rebuild(cx)
@@ -514,11 +519,20 @@ impl GraphCanvas {
     /// there; then centers on it.
     pub fn show_node(&mut self, node: NodeRef, cx: &mut Context<Self>) {
         self.show_schema = false;
-        self.center_on = Some(SceneId::Node(node.clone()));
-        self.selected = Some(SceneId::Node(node.clone()));
-        self.exploration
-            .update(cx, |exploration, cx| exploration.reveal(node, cx));
+        let id = SceneId::Node(node.clone());
+        self.center_on = Some(id.clone());
+        self.selected = Some(id.clone());
+        let shown = self
+            .exploration
+            .update(cx, |exploration, cx| exploration.reveal(node.clone(), cx));
         self.rebuild(cx);
+        // In the tree but not drawn here (a hub draws some of its neighbours): rooted at it,
+        // it is.
+        if shown && self.scene.index_of(&id).is_none() {
+            self.exploration
+                .update(cx, |exploration, cx| exploration.root_at(node, cx));
+            self.rebuild(cx);
+        }
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
@@ -819,7 +833,10 @@ impl GraphCanvas {
     }
 
     /// Stops a glide where it is drawn, before the person moves the view by hand.
+    /// The person takes the camera: a glide under way stops where it is, and a node still to be
+    /// centred on once drawn is let go, so the view does not move off on its own later.
     fn settle_camera(&mut self) {
+        self.center_on = None;
         if let Some(glide) = self.glide.take() {
             let now = Instant::now();
             if glide.is_running(now) {
@@ -1639,15 +1656,8 @@ impl GraphCanvas {
                 }
             })
             .collect();
-        self.exploration.update(cx, |e, cx| {
-            for path in &paths {
-                if open {
-                    e.expand(path, cx);
-                } else {
-                    e.collapse(path, cx);
-                }
-            }
-        });
+        self.exploration
+            .update(cx, |e, cx| e.set_open(&paths, open, cx));
     }
 
     /// Keeps the marked chips where they are drawn now.

@@ -89,10 +89,13 @@ impl StorageInspector {
         let branch = session.read(cx).branch.clone();
         // Its storage is the session branch's: another branch's is read at once. The server's
         // health, readiness and graphs are the same on every branch, and stay.
-        let subscription = cx.subscribe(&session, |this: &mut Self, _, event, cx| {
-            if let SessionEvent::BranchChanged = event {
-                this.reload_snapshot(cx);
+        let subscription = cx.subscribe(&session, |this: &mut Self, _, event, cx| match event {
+            SessionEvent::BranchChanged => this.reload_snapshot(true, cx),
+            // A commit moves the tables' versions and rows: read again, the old shown meanwhile.
+            SessionEvent::HeadMoved { branch, .. } if *branch == this.branch => {
+                this.reload_snapshot(false, cx)
             }
+            _ => {}
         });
         let mut view = Self {
             session,
@@ -139,11 +142,14 @@ impl StorageInspector {
         cx.notify();
     }
 
-    /// Reads the storage of the session's branch again, the server's facts kept.
-    fn reload_snapshot(&mut self, cx: &mut Context<Self>) {
+    /// Reads the storage of the session's branch again, the server's facts kept; `clear` shows
+    /// it reading meanwhile, as for another branch, rather than the storage read last.
+    fn reload_snapshot(&mut self, clear: bool, cx: &mut Context<Self>) {
         self.branch = self.session.read(cx).branch.clone();
         let branch = self.branch.clone();
-        self.snapshot = Loadable::Loading;
+        if clear {
+            self.snapshot = Loadable::Loading;
+        }
         let read = self
             .session
             .update(cx, |session, cx| session.branch_snapshot(&branch, cx));

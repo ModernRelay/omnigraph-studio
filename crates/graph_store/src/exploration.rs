@@ -1370,13 +1370,25 @@ impl Exploration {
     }
 
     pub fn expand(&mut self, path: &ExplorePath, cx: &mut Context<Self>) {
-        self.state.expand(path);
-        self.request_missing(cx);
-        self.changed(cx);
+        self.set_open(std::slice::from_ref(path), true, cx);
     }
 
     pub fn collapse(&mut self, path: &ExplorePath, cx: &mut Context<Self>) {
-        self.state.collapse(path);
+        self.set_open(std::slice::from_ref(path), false, cx);
+    }
+
+    /// Opens (`open`) or closes every one of `paths`, as one change: views draw it once.
+    pub fn set_open(&mut self, paths: &[ExplorePath], open: bool, cx: &mut Context<Self>) {
+        for path in paths {
+            if open {
+                self.state.expand(path);
+            } else {
+                self.state.collapse(path);
+            }
+        }
+        if open {
+            self.request_missing(cx);
+        }
         self.changed(cx);
     }
 
@@ -2417,6 +2429,34 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(status(cx), Loadable::Loaded(()));
+    }
+
+    /// Paths opened or closed together are one change: views draw them once, not once a path.
+    #[gpui::test]
+    async fn paths_opened_together_are_one_change(cx: &mut gpui::TestAppContext) {
+        use crate::test_server::followed_session;
+        let (session, _served) = followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\n",
+            |_| json!([]),
+            cx,
+        );
+        cx.run_until_parked();
+        let exploration = cx.update(|cx| Exploration::for_session(&session, cx));
+        let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = changes.clone();
+        let _counting = cx.update(|cx| {
+            cx.subscribe(&exploration, move |_, event: &ExplorationEvent, _| {
+                if matches!(event, ExplorationEvent::Changed) {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            })
+        });
+        let paths = vec![ExplorePath::root(); 3];
+        for open in [true, false] {
+            exploration.update(cx, |exploration, cx| exploration.set_open(&paths, open, cx));
+        }
+        cx.run_until_parked();
+        assert_eq!(changes.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// Another writer's commit that changed nothing the exploration shows moves its pin to the
