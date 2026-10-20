@@ -775,6 +775,13 @@ impl GraphClient {
         self.read(Method::GET, &["graphs"], &[], None).await
     }
 
+    /// The graphs this credential may know of, for one that may not list the server's
+    /// (`graph_list` is a server policy): an identity credential's, by id only.
+    pub async fn discover_graphs(&self) -> Result<crate::api::GraphDiscoveryResponse, ReadError> {
+        self.read(Method::GET, &["graphs", "discovery"], &[], None)
+            .await
+    }
+
     pub async fn schema(&self, graph: &str) -> Result<SchemaOutput, ReadError> {
         self.read(Method::GET, &["graphs", graph, "schema"], &[], None)
             .await

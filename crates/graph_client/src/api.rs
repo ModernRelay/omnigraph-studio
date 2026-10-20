@@ -44,6 +44,18 @@ pub struct GraphListResponse {
     pub graphs: Vec<GraphInfo>,
 }
 
+/// `GET /graphs/discovery`: the graphs an identity credential (managed or OIDC) may know of,
+/// with no storage or serving metadata. A static token is refused it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GraphDiscoveryResponse {
+    pub graphs: Vec<GraphDiscoveryEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GraphDiscoveryEntry {
+    pub graph_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GraphInfo {
     pub graph_id: String,
@@ -701,6 +713,8 @@ mod contract_tests {
                 "branch_delete_error_details",
             ],
         ),
+        ("GraphDiscoveryResponse", &["graphs"]),
+        ("GraphDiscoveryEntry", &["graph_id"]),
         (
             "CommitListOutput",
             &["commits", "head_commit_id", "next_page_token"],

@@ -77,8 +77,12 @@ impl ConnectionState {
 pub enum GraphListing {
     Unknown,
     Listed(Vec<GraphInfo>),
-    /// The token may not list graphs (`graph_list` needs a cluster policy); graph ids come from
-    /// the CLI's profiles or are typed in.
+    /// The token may not list graphs, but may discover them: an identity credential, which the
+    /// server answers with the ids of the graphs it may know of and nothing about their state.
+    Discovered(Vec<String>),
+    /// The token may neither list nor discover graphs (`graph_list` needs a cluster policy,
+    /// and a static token is refused discovery); graph ids come from the CLI's targets or are
+    /// typed in.
     NotAllowed,
     Failed(String),
 }
@@ -190,10 +194,11 @@ impl Connection {
         &self.client
     }
 
-    /// Graph ids to offer: the listed graphs, then known ids the listing lacks.
+    /// Graph ids to offer: the listed or discovered graphs, then known ids the listing lacks.
     pub fn graph_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = match &self.graphs {
             GraphListing::Listed(graphs) => graphs.iter().map(|g| g.graph_id.clone()).collect(),
+            GraphListing::Discovered(ids) => ids.clone(),
             _ => Vec::new(),
         };
         for id in &self.server.known_graphs {
@@ -408,7 +413,15 @@ async fn probe(client: &GraphClient) -> Probe {
         Err(ReadError::Refused(summary)) if summary.status == 401 => {
             return Probe::Failed(ConnectionState::Unauthorized);
         }
-        Err(ReadError::Refused(summary)) if summary.status == 403 => GraphListing::NotAllowed,
+        // A credential that may not list the server's graphs may still discover its own.
+        Err(ReadError::Refused(summary)) if summary.status == 403 => {
+            match client.discover_graphs().await {
+                Ok(found) => {
+                    GraphListing::Discovered(found.graphs.into_iter().map(|g| g.graph_id).collect())
+                }
+                Err(_) => GraphListing::NotAllowed,
+            }
+        }
         Err(error) => GraphListing::Failed(error.to_string()),
     };
     Probe::Ready {
@@ -453,6 +466,59 @@ mod tests {
         connection.update(cx, |connection, cx| connection.connect(cx));
         cx.run_until_parked();
         connection.read_with(cx, |connection, _| connection.state.clone())
+    }
+
+    /// A token that may not list the server's graphs discovers the ones it may know of; one
+    /// refused discovery too (a static token) has graph ids typed in.
+    #[gpui::test]
+    async fn a_token_that_may_not_list_graphs_discovers_them(cx: &mut TestAppContext) {
+        for discovers in [true, false] {
+            let http = FakeHttpClient::create(move |request| {
+                let path = request.uri().path().to_owned();
+                async move {
+                    let (status, body) = if path.ends_with("/healthz") {
+                        (
+                            200,
+                            r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#,
+                        )
+                    } else if path.ends_with("/graphs/discovery") && discovers {
+                        (
+                            200,
+                            r#"{"graphs":[{"graph_id":"knowledge","display_name":"knowledge"}]}"#,
+                        )
+                    } else {
+                        (403, r#"{"error":"forbidden","code":"forbidden"}"#)
+                    };
+                    Ok(Response::builder()
+                        .status(status)
+                        .header(graph_client::CONTRACT_HEADER, "0.13")
+                        .body(AsyncBody::from(body))
+                        .unwrap())
+                }
+            });
+            let server = ServerEntry {
+                name: "dev".into(),
+                url: "http://127.0.0.1:8787".into(),
+                source: ServerSource::Environment,
+                known_graphs: Vec::new(),
+            };
+            let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+            connection.update(cx, |connection, cx| connection.connect(cx));
+            cx.run_until_parked();
+            connection.read_with(cx, |connection, _| {
+                assert_eq!(connection.state, ConnectionState::Ready);
+                if discovers {
+                    assert_eq!(
+                        connection.graphs,
+                        GraphListing::Discovered(vec!["knowledge".into()])
+                    );
+                    assert_eq!(connection.graph_ids(), ["knowledge"]);
+                } else {
+                    assert_eq!(connection.graphs, GraphListing::NotAllowed);
+                    assert!(connection.graph_ids().is_empty());
+                }
+            });
+        }
     }
 
     /// A connection whose token is still being read waits to connect, sending nothing it

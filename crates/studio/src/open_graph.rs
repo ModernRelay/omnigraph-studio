@@ -164,10 +164,11 @@ impl OpenGraphModal {
         let graph_id = graph_id.trim().to_owned();
         // A graph id typed in is kept with its server, for a token that cannot list graphs. One
         // the server lists needs no keeping, and kept would be offered after its deletion.
-        let listed = matches!(
-            &connection.read(cx).graphs,
-            GraphListing::Listed(graphs) if graphs.iter().any(|g| g.graph_id == graph_id)
-        );
+        let listed = match &connection.read(cx).graphs {
+            GraphListing::Listed(graphs) => graphs.iter().any(|g| g.graph_id == graph_id),
+            GraphListing::Discovered(ids) => ids.contains(&graph_id),
+            _ => false,
+        };
         if !listed {
             connection.update(cx, |connection, _| connection.remember_graph(&graph_id));
             ConnectionRegistry::global(cx).read(cx).save(cx);
