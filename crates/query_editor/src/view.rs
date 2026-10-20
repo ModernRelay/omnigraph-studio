@@ -11,8 +11,8 @@ use editor::display_map::{
 };
 use editor::scroll::Autoscroll;
 use editor::{
-    Anchor, Bias, Editor, EditorEvent, HighlightKey, MultiBufferOffset, SelectionEffects,
-    ToOffset as _,
+    Anchor, Bias, Editor, EditorEvent, HighlightKey, MultiBufferOffset, MultiBufferSnapshot,
+    SelectionEffects, ToOffset as _,
 };
 use gpui::{
     AnyView, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, Entity, EventEmitter,
@@ -71,9 +71,9 @@ struct Prepared {
     params: Option<Value>,
     columns: Option<Vec<ResultColumn>>,
     map: SourceMap,
-    /// Where the settings prefix and the declaration sent start in the editor, followed
-    /// through typing while the run is out: `map` is placed by them when the answer comes.
-    anchors: Option<(Anchor, Anchor)>,
+    /// The editor's text as it was sent, which `map` maps into: a place the answer names is
+    /// anchored in it, so the anchor follows every edit made since.
+    sent: Option<MultiBufferSnapshot>,
     /// The stored query to invoke by name instead of sending `text` (spec 007).
     stored: Option<String>,
 }
@@ -1312,7 +1312,7 @@ impl QueryEditor {
             params: (!values.is_empty()).then_some(Value::Object(values)),
             columns: None,
             map: SourceMap::default(),
-            anchors: None,
+            sent: None,
             stored: Some(name.clone()),
         })
     }
@@ -1405,30 +1405,13 @@ impl QueryEditor {
         }
     }
 
-    /// Anchors at the settings prefix's start and the declaration's, for a run's [`SourceMap`].
-    fn anchors_at(&self, prefix: usize, declaration: usize, cx: &App) -> (Anchor, Anchor) {
-        let snapshot = self.editor.read(cx).buffer().read(cx).snapshot(cx);
-        (
-            snapshot.anchor_after(MultiBufferOffset(prefix)),
-            snapshot.anchor_after(MultiBufferOffset(declaration)),
-        )
+    fn snapshot(&self, cx: &App) -> MultiBufferSnapshot {
+        self.editor.read(cx).buffer().read(cx).snapshot(cx)
     }
 
-    /// `map` placed where the text it was made for is now.
-    fn placed(&self, map: SourceMap, anchors: Option<(Anchor, Anchor)>, cx: &App) -> SourceMap {
-        match anchors {
-            Some((prefix, declaration)) => SourceMap {
-                prefix_start: self.offset_of(&prefix, cx),
-                start: self.offset_of(&declaration, cx),
-                ..map
-            },
-            None => map,
-        }
-    }
-
-    /// Holds where the diagnostic of the output shown points, so a jump to it lands there
-    /// after later edits too.
-    fn hold_diagnostic(&mut self, cx: &App) {
+    /// Holds where the diagnostic of the output shown points, anchored in the text the run
+    /// sent (`sent`, else the text now), so a jump to it lands there after any edit.
+    fn hold_diagnostic(&mut self, sent: Option<&MultiBufferSnapshot>, cx: &App) {
         let byte = match &self.output {
             Output::Failed(Failure {
                 diagnostic: Some(diagnostic),
@@ -1440,8 +1423,11 @@ impl QueryEditor {
             }) => diagnostic.byte,
             _ => None,
         };
+        let now = sent.is_none().then(|| self.snapshot(cx));
+        let Some(snapshot) = sent.or(now.as_ref()) else {
+            return;
+        };
         self.diagnostic_at = byte.map(|byte| {
-            let snapshot = self.editor.read(cx).buffer().read(cx).snapshot(cx);
             let byte = MultiBufferOffset(byte.min(snapshot.len().0));
             snapshot.anchor_before(snapshot.clip_offset(byte, Bias::Left))
         });
@@ -1503,11 +1489,12 @@ impl QueryEditor {
                 statement: !statement.targets_branch(),
                 params: None,
                 columns: None,
+                // Past the end, so the end itself is a place in the statement.
                 map: SourceMap {
-                    prefix_len: source.len(),
+                    prefix_len: source.len() + 1,
                     ..Default::default()
                 },
-                anchors: Some(self.anchors_at(outline.prefix.start, outline.prefix.start, cx)),
+                sent: Some(self.snapshot(cx)),
                 stored: None,
             });
         }
@@ -1556,9 +1543,8 @@ impl QueryEditor {
                 prefix_len: outline.prefix.end,
                 inserted: if explained { "explain ".len() } else { 0 },
                 start: declaration.range.start,
-                ..Default::default()
             },
-            anchors: Some(self.anchors_at(outline.prefix.start, declaration.range.start, cx)),
+            sent: Some(self.snapshot(cx)),
             stored: None,
         })
     }
@@ -1587,23 +1573,26 @@ impl QueryEditor {
         // A read still out from an earlier run would land over what this one shows; a read
         // this one sends replaces it.
         self.run_task = None;
-        self.unlight_plan(cx);
         match self.prepare(false, cx) {
-            Err(message) => self.output = Output::Failed(Failure::new(message)),
+            Err(message) => self.replace_output(Output::Failed(Failure::new(message)), cx),
             Ok(prepared) if prepared.write && self.at_commit.is_some() => {
                 let commit = self
                     .at_commit
                     .as_deref()
                     .map(short_commit_id)
                     .unwrap_or_default();
-                self.output = Output::Failed(Failure::new(format!(
-                    "Read-only: this query reads commit {commit}. Open a new query to write to a branch."
-                )));
+                self.replace_output(
+                    Output::Failed(Failure::new(format!(
+                        "Read-only: this query reads commit {commit}. Open a new query to write to \
+                         a branch."
+                    ))),
+                    cx,
+                );
             }
             Ok(prepared) if prepared.write => {
                 // A read stopped for it says nothing more.
                 if matches!(self.output, Output::Running { .. }) {
-                    self.output = Output::Empty;
+                    self.replace_output(Output::Empty, cx);
                 }
                 // Never on ⌘↵ alone: the person confirms the branch first.
                 let branch = self.branch(cx);
@@ -1626,9 +1615,8 @@ impl QueryEditor {
             return;
         }
         self.run_task = None;
-        self.unlight_plan(cx);
         match self.prepare(true, cx) {
-            Err(message) => self.output = Output::Failed(Failure::new(message)),
+            Err(message) => self.replace_output(Output::Failed(Failure::new(message)), cx),
             Ok(prepared) => self.send_read(prepared, cx),
         }
         cx.emit(ItemEvent::UpdateTab);
@@ -1683,10 +1671,9 @@ impl QueryEditor {
             this.update(cx, |this, cx| {
                 // A new output replaces the plan whose operator lit the text.
                 this.light_plan_parts(None, cx);
-                let mut prepared = prepared;
-                prepared.map = this.placed(prepared.map, prepared.anchors, cx);
+                let sent = prepared.sent.clone();
                 this.show_read(prepared, branch, answer, elapsed);
-                this.hold_diagnostic(cx);
+                this.hold_diagnostic(sent.as_ref(), cx);
                 cx.emit(ItemEvent::UpdateTab);
                 this.run_task = None;
                 cx.notify();
@@ -1787,11 +1774,14 @@ impl QueryEditor {
         }) && self.at_commit.is_none()
             && self.branch(cx) == branch;
         if !same {
-            self.output = Output::Failed(Failure::new(
-                "The query, its parameters or its branch changed after Run; nothing was written. \
-                 Run it again to confirm the write as it is now."
-                    .to_owned(),
-            ));
+            self.replace_output(
+                Output::Failed(Failure::new(
+                    "The query, its parameters or its branch changed after Run; nothing was \
+                     written. Run it again to confirm the write as it is now."
+                        .to_owned(),
+                )),
+                cx,
+            );
             let focus = self.main_focus(cx);
             window.focus(&focus, cx);
             cx.notify();
@@ -1824,14 +1814,13 @@ impl QueryEditor {
         self.writing = true;
         // A read still out would land over the write's outcome.
         self.run_task = None;
-        self.unlight_plan(cx);
         self.replace_output(
             Output::Running {
                 label: format!("Writing {} to {branch}…", prepared.label).into(),
             },
             cx,
         );
-        let (map, anchors) = (prepared.map, prepared.anchors);
+        let (map, sent) = (prepared.map, prepared.sent.clone());
         let name = prepared.name.clone();
         // Detached, not stored: closing the tab must not cancel a write in flight, and the
         // session logs its outcome either way (constitution III).
@@ -1859,8 +1848,7 @@ impl QueryEditor {
                 };
                 this.note_run(name.as_deref(), note);
                 cx.emit(ItemEvent::UpdateTab);
-                let map = this.placed(map, anchors, cx);
-                this.output = Output::Written(match outcome {
+                let written = Output::Written(match outcome {
                     WriteOutcome::Committed(output) => WriteResult::Committed {
                         branch: output.branch,
                         nodes: output.affected_nodes,
@@ -1879,7 +1867,8 @@ impl QueryEditor {
                     },
                     WriteOutcome::Unknown { reason } => WriteResult::Unknown { reason },
                 });
-                this.hold_diagnostic(cx);
+                this.replace_output(written, cx);
+                this.hold_diagnostic(sent.as_ref(), cx);
                 cx.notify();
             })
             .ok();
@@ -2732,12 +2721,11 @@ impl QueryEditor {
             .into_any_element()
     }
 
-    /// Lights the parts of the query that the plan operator at `ix` stands for, or none
-    /// (spec 007). The declaration is found again by name, so edits since the plan was read
-    /// move the light with the text.
-    /// Shows `output` while a run is out. The rows it replaces are dropped off the main thread,
-    /// where a large answer's would hold up a frame.
+    /// Shows `output` in place of the output shown. A plan's operator lit in the text goes out
+    /// with it, and the rows it replaces are dropped off the main thread, where a large
+    /// answer's would hold up a frame.
     fn replace_output(&mut self, output: Output, cx: &mut Context<Self>) {
+        self.unlight_plan(cx);
         let replaced = std::mem::replace(&mut self.output, output);
         if matches!(replaced, Output::Rows(_)) {
             cx.background_spawn(async move { drop(replaced) }).detach();
@@ -2752,6 +2740,9 @@ impl QueryEditor {
         }
     }
 
+    /// Lights the parts of the query that the plan operator at `ix` stands for, or none
+    /// (spec 007). The declaration is found again by name, so edits since the plan was read
+    /// move the light with the text.
     fn light_plan_parts(&mut self, ix: Option<usize>, cx: &mut Context<Self>) {
         let key = HighlightKey::ConsoleAnsiHighlight(PLAN_KEY);
         self.plan_hovered = ix;
@@ -3383,7 +3374,7 @@ mod tests {
                 params: None,
                 columns: None,
                 map: SourceMap::default(),
-                anchors: None,
+                sent: None,
                 stored: None,
             };
             editor.finish_read(prepared, "main".into(), Ok(output), Duration::ZERO, None);
@@ -3440,7 +3431,7 @@ mod tests {
                     params: None,
                     columns: None,
                     map: SourceMap::default(),
-                    anchors: None,
+                    sent: None,
                     stored: None,
                 };
                 editor.finish_read(prepared, "main".into(), Ok(output), Duration::ZERO, None);
@@ -3471,7 +3462,7 @@ mod tests {
                     params: None,
                     columns: None,
                     map: SourceMap::default(),
-                    anchors: None,
+                    sent: None,
                     stored: None,
                 },
                 branch: "main".into(),

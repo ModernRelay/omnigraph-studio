@@ -112,7 +112,15 @@ fn placed(
     prefix: usize,
     declaration: &Range<usize>,
 ) -> Option<(Diagnostic, Option<Range<usize>>)> {
-    let end = declaration.start + text[declaration.clone()].trim_end().len();
+    // Its last word: an unclosed declaration runs on to the next, over blank lines and any
+    // comment above it.
+    let end = gq_language::tokenize(&text[declaration.clone()])
+        .iter()
+        .rev()
+        .find(|token| token.kind != gq_language::TokenKind::Comment)
+        .map_or(declaration.start, |token| {
+            declaration.start + token.range.end
+        });
     let moved = |at: usize| (at >= prefix).then(|| (declaration.start + at - prefix).min(end));
     let at = match diagnostic.byte {
         Some(byte) => {

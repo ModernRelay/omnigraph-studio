@@ -365,12 +365,11 @@ pub fn rows_label(count: i64) -> String {
 }
 
 /// Where the text sent to the server came from, so a position the server reports can be
-/// mapped back into the editor: the settings prefix, which starts at `prefix_start` in the
-/// editor, is copied as is, then `inserted` bytes the editor added (`explain `), then the
-/// declaration that starts at `start` in the editor.
+/// mapped back into the editor's text as it was sent: the settings prefix is copied as is,
+/// then `inserted` bytes the editor added (`explain `), then the declaration that starts at
+/// `start` in the editor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SourceMap {
-    pub prefix_start: usize,
     pub prefix_len: usize,
     pub inserted: usize,
     pub start: usize,
@@ -379,7 +378,7 @@ pub struct SourceMap {
 impl SourceMap {
     pub fn editor_offset(self, sent: usize) -> usize {
         if sent < self.prefix_len {
-            self.prefix_start + sent
+            sent
         } else {
             self.start + sent.saturating_sub(self.prefix_len + self.inserted)
         }
@@ -588,7 +587,6 @@ mod tests {
             prefix_len: 11,
             inserted: 8,
             start: 41,
-            ..Default::default()
         };
         assert_eq!(map.editor_offset(3), 3);
         assert_eq!(map.editor_offset(19), 41);
@@ -601,13 +599,5 @@ mod tests {
         assert_eq!(diagnostic.code.as_deref(), Some("Q001"));
         assert_eq!(diagnostic.message, "expected return_clause");
         assert_eq!(diagnostic.byte, Some(47));
-        // Two lines typed above everything while it ran: both parts moved down by them.
-        let moved = SourceMap {
-            prefix_start: 2,
-            start: 43,
-            ..map
-        };
-        assert_eq!(moved.editor_offset(3), 5);
-        assert_eq!(moved.editor_offset(25), 49);
     }
 }
