@@ -186,7 +186,8 @@ enum Decision {
     Reject,
 }
 
-enum ProposalState {
+/// Where a write the gateway holds is: waiting for the person's answer, sent, or how it ended.
+enum WriteState {
     Waiting(oneshot::Sender<Decision>),
     Running,
     /// The commit it made, and what changed. A write that made none is `Done`.
@@ -202,13 +203,15 @@ enum ProposalState {
     Done(String),
 }
 
-struct Proposal {
+/// The card of a write the agent's CLI sends through the gateway (spec 013): what it does, the
+/// branch it writes and the base it creates that branch from, and where it is.
+struct WriteCard {
     summary: String,
     query: String,
     params: Option<Map<String, Value>>,
     branch: String,
     creates_from: Option<String>,
-    state: ProposalState,
+    state: WriteState,
 }
 
 /// An `omnigraph_run` under way or done, and the stop that kills its command.
@@ -251,7 +254,7 @@ enum Entry {
     },
     Plan(Vec<(String, PlanEntryStatus)>),
     Permission(PermissionCard),
-    Proposal(Proposal),
+    Write(WriteCard),
     Notice {
         text: String,
         error: bool,
@@ -263,7 +266,7 @@ impl Entry {
     fn waits(&self) -> bool {
         match self {
             Entry::Permission(card) => card.reply.is_some(),
-            Entry::Proposal(proposal) => matches!(proposal.state, ProposalState::Waiting(_)),
+            Entry::Write(card) => matches!(card.state, WriteState::Waiting(_)),
             _ => false,
         }
     }
@@ -419,20 +422,19 @@ fn hash_entry(entry: &Entry, hasher: &mut impl std::hash::Hasher) {
             card.options.len().hash(hasher);
             card.answer.hash(hasher);
         }
-        Entry::Proposal(proposal) => {
-            proposal.summary.hash(hasher);
-            proposal.query.hash(hasher);
-            proposal.branch.hash(hasher);
-            proposal.creates_from.hash(hasher);
-            proposal
-                .params
+        Entry::Write(card) => {
+            card.summary.hash(hasher);
+            card.query.hash(hasher);
+            card.branch.hash(hasher);
+            card.creates_from.hash(hasher);
+            card.params
                 .as_ref()
                 .map(|params| Value::Object(params.clone()).to_string())
                 .hash(hasher);
-            match &proposal.state {
-                ProposalState::Waiting(_) => 0u8.hash(hasher),
-                ProposalState::Running => 1u8.hash(hasher),
-                ProposalState::Committed {
+            match &card.state {
+                WriteState::Waiting(_) => 0u8.hash(hasher),
+                WriteState::Running => 1u8.hash(hasher),
+                WriteState::Committed {
                     commit,
                     nodes,
                     edges,
@@ -442,13 +444,13 @@ fn hash_entry(entry: &Entry, hasher: &mut impl std::hash::Hasher) {
                     nodes.hash(hasher);
                     edges.hash(hasher);
                 }
-                ProposalState::Refused(reason) => {
+                WriteState::Refused(reason) => {
                     3u8.hash(hasher);
                     reason.hash(hasher);
                 }
-                ProposalState::Unknown => 4u8.hash(hasher),
-                ProposalState::Rejected => 5u8.hash(hasher),
-                ProposalState::Done(label) => {
+                WriteState::Unknown => 4u8.hash(hasher),
+                WriteState::Rejected => 5u8.hash(hasher),
+                WriteState::Done(label) => {
                     6u8.hash(hasher);
                     label.hash(hasher);
                 }
@@ -1187,14 +1189,14 @@ impl AgentPanel {
         self.options_changed();
         self.entries.cancel_permissions();
         self.entries.change_each(|entry| match entry {
-            Entry::Proposal(proposal) if matches!(proposal.state, ProposalState::Waiting(_)) => {
-                proposal.state = ProposalState::Rejected;
+            Entry::Write(card) if matches!(card.state, WriteState::Waiting(_)) => {
+                card.state = WriteState::Rejected;
                 true
             }
             // A write on its way runs to its end, but its card no longer hears how: the
             // session's activity records it.
-            Entry::Proposal(proposal) if matches!(proposal.state, ProposalState::Running) => {
-                proposal.state = ProposalState::Unknown;
+            Entry::Write(card) if matches!(card.state, WriteState::Running) => {
+                card.state = WriteState::Unknown;
                 true
             }
             _ => false,
@@ -1791,10 +1793,10 @@ impl AgentPanel {
 
     fn decide(&mut self, index: usize, decision: Decision, cx: &mut Context<Self>) {
         match self.entries.get_mut(index) {
-            Some(Entry::Proposal(proposal)) => {
-                if let ProposalState::Waiting(_) = proposal.state {
-                    let ProposalState::Waiting(reply) =
-                        std::mem::replace(&mut proposal.state, ProposalState::Running)
+            Some(Entry::Write(card)) => {
+                if let WriteState::Waiting(_) = card.state {
+                    let WriteState::Waiting(reply) =
+                        std::mem::replace(&mut card.state, WriteState::Running)
                     else {
                         return;
                     };
@@ -1892,9 +1894,9 @@ impl AgentPanel {
             GatewayEvent::Finished { id, outcome } => self.gateway_finished(id, outcome, cx),
             GatewayEvent::Abandoned { id } => {
                 if let Some((index, ..)) = self.gateway_cards.remove(&id) {
-                    self.set_proposal_state(
+                    self.set_write_state(
                         index,
-                        ProposalState::Refused(
+                        WriteState::Refused(
                             "Not sent: the CLI stopped waiting before you decided.".into(),
                         ),
                         cx,
@@ -1921,11 +1923,11 @@ impl AgentPanel {
         let index = self.entries.len();
         let (state, waiting) = if ask {
             let (reply, decision) = oneshot::channel();
-            (ProposalState::Waiting(reply), Some(decision))
+            (WriteState::Waiting(reply), Some(decision))
         } else {
-            (ProposalState::Running, None)
+            (WriteState::Running, None)
         };
-        self.entries.push(Entry::Proposal(Proposal {
+        self.entries.push(Entry::Write(WriteCard {
             summary: write.summary.clone(),
             query: write.query.clone().unwrap_or_default(),
             params: write.params.clone(),
@@ -1960,7 +1962,7 @@ impl AgentPanel {
                             if let Some(Decision::Reject) = decision {
                                 // Nothing is sent, so no outcome comes for the card.
                                 this.gateway_cards.remove(&id);
-                                this.set_proposal_state(index, ProposalState::Rejected, cx);
+                                this.set_write_state(index, WriteState::Rejected, cx);
                             }
                             allow.then(|| {
                                 this.record_outcome(branch, description, moves_branches, cx)
@@ -2002,18 +2004,18 @@ impl AgentPanel {
                 commit: Some(commit),
                 nodes,
                 edges,
-            } => ProposalState::Committed {
+            } => WriteState::Committed {
                 commit: commit.clone(),
                 nodes: *nodes,
                 edges: *edges,
             },
-            Seen::Committed { commit: None, .. } => ProposalState::Done(if creates_branch {
+            Seen::Committed { commit: None, .. } => WriteState::Done(if creates_branch {
                 "Branch created".into()
             } else {
                 "Done".into()
             }),
-            Seen::Refused(message) => ProposalState::Refused(message.clone()),
-            Seen::Unknown(_) => ProposalState::Unknown,
+            Seen::Refused(message) => WriteState::Refused(message.clone()),
+            Seen::Unknown(_) => WriteState::Unknown,
         };
         let went_through = matches!(outcome, Seen::Committed { .. });
         let mut created = false;
@@ -2042,7 +2044,7 @@ impl AgentPanel {
         if created {
             self.remember_session(cx);
         }
-        self.set_proposal_state(index, state, cx);
+        self.set_write_state(index, state, cx);
     }
 
     /// Studio found (or did not find) a CLI that speaks the graph's API for this conversation.
@@ -2264,9 +2266,9 @@ impl AgentPanel {
         }
     }
 
-    fn set_proposal_state(&mut self, index: usize, state: ProposalState, cx: &mut Context<Self>) {
-        if let Some(Entry::Proposal(proposal)) = self.entries.get_mut(index) {
-            proposal.state = state;
+    fn set_write_state(&mut self, index: usize, state: WriteState, cx: &mut Context<Self>) {
+        if let Some(Entry::Write(card)) = self.entries.get_mut(index) {
+            card.state = state;
         }
         cx.notify();
     }
@@ -3288,8 +3290,8 @@ impl AgentPanel {
             Entry::Permission(card) => {
                 gutter_row(None, self.render_permission(index, card, cx)).into_any_element()
             }
-            Entry::Proposal(proposal) => {
-                gutter_row(None, self.render_proposal(index, proposal, cx)).into_any_element()
+            Entry::Write(card) => {
+                gutter_row(None, self.render_write(index, card, cx)).into_any_element()
             }
         }
     }
@@ -3573,40 +3575,35 @@ impl AgentPanel {
             .into_any_element()
     }
 
-    fn render_proposal(
-        &self,
-        index: usize,
-        proposal: &Proposal,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_write(&self, index: usize, card: &WriteCard, cx: &mut Context<Self>) -> AnyElement {
         let focus = self.focus_handle.clone();
         let header = studio_ui::ds::card_header(cx)
             .child(studio_ui::ds::icon::meta(IconName::Pencil))
             .child(
-                studio_ui::ds::text::body(proposal.summary.clone())
+                studio_ui::ds::text::body(card.summary.clone())
                     .single_line()
                     .truncate(),
             )
             .child(div().flex_1())
             .child(
                 div()
-                    .id(("proposal-branch", index))
-                    .tooltip(Tooltip::text(match &proposal.creates_from {
+                    .id(("card-branch", index))
+                    .tooltip(Tooltip::text(match &card.creates_from {
                         Some(base) => format!(
                             "Runs on {}, which Studio creates from {base} first",
-                            proposal.branch
+                            card.branch
                         ),
-                        None => format!("Runs on {}", proposal.branch),
+                        None => format!("Runs on {}", card.branch),
                     }))
                     .child(studio_ui::ds::meta(
                         IconName::GitBranch,
-                        proposal.branch.clone(),
+                        card.branch.clone(),
                     )),
             )
-            .when(proposal.creates_from.is_some(), |header| {
+            .when(card.creates_from.is_some(), |header| {
                 header.child(studio_ui::ds::tag("new", cx))
             });
-        let params = proposal.params.as_ref().map(|params| {
+        let params = card.params.as_ref().map(|params| {
             ds::fields().children(params.iter().map(|(key, value)| {
                 ds::field(
                     format!("${key}"),
@@ -3623,10 +3620,10 @@ impl AgentPanel {
             }))
         });
         // A write with no query or parameters (a branch created through the CLI) has no body.
-        let body = (!proposal.query.is_empty() || params.is_some()).then(|| {
+        let body = (!card.query.is_empty() || params.is_some()).then(|| {
             ds::card_body()
-                .when(!proposal.query.is_empty(), |body| {
-                    body.child(ds::code_block(proposal.query.clone(), cx))
+                .when(!card.query.is_empty(), |body| {
+                    body.child(ds::code_block(card.query.clone(), cx))
                 })
                 .children(params)
         });
@@ -3636,8 +3633,8 @@ impl AgentPanel {
         let key = |action: &dyn gpui::Action, cx: &App| {
             keyed.then(|| KeyBinding::for_action_in(action, &focus, cx))
         };
-        let footer = match &proposal.state {
-            ProposalState::Waiting(_) => studio_ui::ds::card_footer(cx)
+        let footer = match &card.state {
+            WriteState::Waiting(_) => studio_ui::ds::card_footer(cx)
                 .child(
                     studio_ui::ds::button(("allow", index), "Allow")
                         .start_icon(Icon::new(IconName::Check))
@@ -3664,15 +3661,15 @@ impl AgentPanel {
                         })),
                 ),
             state => {
-                // A running proposal turns the spinner; the others name their outcome's icon.
+                // A running card turns the spinner; the others name their outcome's icon.
                 let (icon, color, label, tooltip): (
                     Option<IconName>,
                     Color,
                     String,
                     Option<String>,
                 ) = match state {
-                    ProposalState::Running => (None, Color::Accent, "Running".into(), None),
-                    ProposalState::Committed {
+                    WriteState::Running => (None, Color::Accent, "Running".into(), None),
+                    WriteState::Committed {
                         commit,
                         nodes,
                         edges,
@@ -3684,25 +3681,25 @@ impl AgentPanel {
                             "Commit {commit}: {nodes} nodes and {edges} edges changed"
                         )),
                     ),
-                    ProposalState::Refused(message) => (
+                    WriteState::Refused(message) => (
                         Some(IconName::XCircle),
                         Color::Error,
                         "Refused".into(),
                         Some(message.clone()),
                     ),
-                    ProposalState::Unknown => (
+                    WriteState::Unknown => (
                         Some(IconName::Warning),
                         Color::Warning,
                         "Outcome unknown".into(),
                         Some(UNKNOWN_OUTCOME.into()),
                     ),
-                    ProposalState::Done(label) => {
+                    WriteState::Done(label) => {
                         (Some(IconName::Check), Color::Success, label.clone(), None)
                     }
                     _ => (Some(IconName::Close), Color::Muted, "Rejected".into(), None),
                 };
                 let commit = match state {
-                    ProposalState::Committed {
+                    WriteState::Committed {
                         commit,
                         nodes,
                         edges,
