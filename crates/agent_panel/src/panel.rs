@@ -3,6 +3,7 @@
 
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::schema::v1::{
@@ -11,7 +12,7 @@ use agent_client_protocol::schema::v1::{
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOptions,
     SessionUpdate, StopReason, ToolCallStatus,
 };
-use editor::Editor;
+use editor::{Editor, EditorEvent};
 use futures::channel::{mpsc, oneshot};
 use futures::future::Shared;
 use futures::{FutureExt as _, StreamExt as _};
@@ -54,7 +55,6 @@ pub const PRESETS: &[(&str, &[&str])] = &[
 const UNKNOWN_OUTCOME: &str = "The server did not confirm this change. It was not retried; \
 check the branch history before the agent tries it again.";
 
-/// A gateway write's outcome, as Studio's activity records it.
 /// Hands the gateway its decision. An approval it can no longer take, the CLI having given up
 /// meanwhile, records that nothing was sent, rather than being dropped and taken for a write
 /// whose outcome is unknown.
@@ -64,6 +64,7 @@ fn hand_over(decide: oneshot::Sender<Option<OnOutcome>>, approval: Option<OnOutc
     }
 }
 
+/// A gateway write's outcome, as Studio's activity records it.
 fn outcome_kind(seen: &Seen) -> OutcomeKind {
     match seen {
         Seen::Committed { commit, .. } => OutcomeKind::Committed {
@@ -112,12 +113,24 @@ pub fn open(
 
 /// Opens one of the graph's conversations in its own tab, or shows the tab it is in; the agent
 /// starts and replays it.
+///
+/// A conversation has one tab, in whichever pane it is, also while a split or a restore fills
+/// a pane with copies: a second tab would load the session again and take the first one's
+/// replies, permission prompts and CLI credentials.
 pub fn open_session(
     workspace: &mut Workspace,
     id: String,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Option<Entity<AgentPanel>> {
+    let open = workspace.all_items().find_map(|item| {
+        let panel = item.to_any().downcast::<AgentPanel>().ok()?;
+        (panel.read(cx).session_id.as_deref() == Some(id.as_str())).then_some(panel)
+    });
+    if let Some(panel) = open {
+        workspace.activate_item_by_id(panel.entity_id(), window, cx);
+        return Some(panel);
+    }
     let session = workspace.session()?.clone();
     let handle = cx.entity().downgrade();
     let panel = workspace.open_item(format!("agent:{id}"), window, cx, move |window, cx| {
@@ -136,14 +149,9 @@ pub fn new_conversation(
 ) -> Option<Entity<AgentPanel>> {
     let session = workspace.session()?.clone();
     let handle = cx.entity().downgrade();
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let key = format!(
-        "agent:new:{}",
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
-    workspace.open_item(key, window, cx, move |window, cx| {
+    Some(workspace.add_item(window, cx, move |window, cx| {
         AgentPanel::new(session, handle, None, window, cx)
-    })
+    }))
 }
 
 enum State {
@@ -216,6 +224,18 @@ struct PermissionCard {
     answer: Option<String>,
 }
 
+impl PermissionCard {
+    /// Answers "cancelled" if the card still waits, and says so on it; whether it waited.
+    fn cancel(&mut self) -> bool {
+        let Some(reply) = self.reply.take() else {
+            return false;
+        };
+        reply.send(RequestPermissionOutcome::Cancelled).ok();
+        self.answer = Some("Cancelled".into());
+        true
+    }
+}
+
 enum Entry {
     User(String),
     Agent(String),
@@ -236,6 +256,17 @@ enum Entry {
         text: String,
         error: bool,
     },
+}
+
+impl Entry {
+    /// A card waiting for the person's answer.
+    fn waits(&self) -> bool {
+        match self {
+            Entry::Permission(card) => card.reply.is_some(),
+            Entry::Proposal(proposal) => matches!(proposal.state, ProposalState::Waiting(_)),
+            _ => false,
+        }
+    }
 }
 
 /// One item of the thread's list: an entry, a query the agent ran, a run of steps folded to
@@ -312,11 +343,36 @@ impl Entries {
         }
     }
 
+    /// Answers every permission request still waiting "cancelled", as ACP asks of a client
+    /// that cancels the turn: their cards say so, and no key answers them after.
+    fn cancel_permissions(&mut self) {
+        self.change_each(|entry| match entry {
+            Entry::Permission(card) => card.cancel(),
+            _ => false,
+        });
+    }
+
     fn clear(&mut self) {
         self.version += 1;
         self.list.clear();
         self.hashes.clear();
         self.stale_from = 0;
+    }
+
+    /// Takes the entries from `at` on out of the thread.
+    fn take_from(&mut self, at: usize) -> Vec<Entry> {
+        let at = at.min(self.list.len());
+        self.version += 1;
+        self.hashes.truncate(at);
+        self.stale_from = self.stale_from.min(at);
+        self.list.split_off(at)
+    }
+
+    fn extend(&mut self, entries: Vec<Entry>) {
+        if !entries.is_empty() {
+            self.version += 1;
+            self.list.extend(entries);
+        }
     }
 
     /// Brings the hashes up to the entries.
@@ -461,6 +517,14 @@ impl MessageQueue {
         Some(self.entries.remove(0).text)
     }
 
+    /// "Send now": `text` goes once the turn stops. A message "Send now" asked for before it,
+    /// not sent yet, goes back first in line rather than being lost.
+    fn send_after_cancel(&mut self, text: String) {
+        if let Some(earlier) = self.after_cancel.replace(text) {
+            self.put_back(earlier);
+        }
+    }
+
     /// A message taken to send that could not go: first in line again.
     fn put_back(&mut self, text: String) {
         self.entries.insert(
@@ -471,6 +535,20 @@ impl MessageQueue {
             },
         );
         self.next_id += 1;
+    }
+
+    /// Puts `text` in line: first, as "Send now" asks, or after the rest.
+    fn enqueue(&mut self, text: String, first: bool) {
+        if first {
+            self.put_back(text);
+        } else {
+            self.push(text);
+        }
+    }
+
+    /// Something is waiting to be sent, which closing the tab would drop.
+    fn holds_messages(&self) -> bool {
+        !self.entries.is_empty() || self.after_cancel.is_some()
     }
 }
 
@@ -536,13 +614,17 @@ pub struct AgentPanel {
     workspace: WeakEntity<Workspace>,
     /// The graph's conversations, which this tab records itself in.
     sessions: Entity<AgentSessions>,
-    /// The tab's key until the agent names the session.
-    new_key: SharedString,
+    /// Whether the tab last said it holds unsaved work ([`AgentPanel::holds_work`]): the tab
+    /// is told when that changes, not at every change.
+    dirty: bool,
     /// The agent's replies as rendered markdown, by entry index, with how much of the text each
     /// has taken in; a streaming reply appends its new tail.
     markdown: std::collections::HashMap<usize, (Entity<Markdown>, usize)>,
     focus_handle: FocusHandle,
     composer: Entity<Editor>,
+    /// The composer holds something to send: read once an edit, not at every frame the Send
+    /// button is drawn.
+    has_draft: bool,
     custom_command: Entity<Editor>,
     /// The thread as a list that lays out only what shows (as Zed's agent thread does), and
     /// the blocks it last drew with their fingerprints, to remeasure only what changed.
@@ -563,10 +645,13 @@ pub struct AgentPanel {
     host: Option<Host>,
     /// Making what a start needs on disk, off the main thread; dropped, the start is not made.
     preparing: Option<Task<()>>,
-    /// The agent comes back after it stopped, with the conversation on screen: when it replays
-    /// the conversation (`session/load`), the replay replaces what is shown instead of adding
-    /// to it.
-    replace_on_replay: bool,
+    /// The agent comes back after it stopped, with the conversation on screen, this many entries
+    /// long: when it replays the conversation (`session/load`), the replay replaces them
+    /// instead of adding to them.
+    replace_on_replay: Option<usize>,
+    /// What was said while the agent came back to a conversation (a setup problem, the CLI it
+    /// found), kept aside while the agent replays the conversation and shown after it.
+    said_while_starting: Vec<Entry>,
     /// The conversation this tab holds: the one it loads before the agent answers, then the one
     /// the agent opened. `None` starts a new one.
     session_id: Option<String>,
@@ -580,6 +665,12 @@ pub struct AgentPanel {
     config_options: Vec<SessionConfigOption>,
     /// A value chosen and sent but not yet confirmed, shown in the meantime.
     setting_option: Option<(String, SessionConfigOptionValue)>,
+    /// The options as the composer shows them, made when they or the value being set change,
+    /// not at every frame the composer is drawn: a model picker holds every model's name.
+    option_views: Vec<Rc<OptionView>>,
+    /// Each query card's text and highlights, by entry, kept while the entry's hash holds: a
+    /// running query's card is drawn at every frame of its spinner.
+    query_cards: std::cell::RefCell<std::collections::HashMap<usize, (u64, Rc<QueryCard>)>>,
     usage: Option<Usage>,
     /// Runs of tool calls and thoughts opened to their steps, by the run's first entry.
     expanded_activity: std::collections::HashSet<usize>,
@@ -626,11 +717,17 @@ impl Item for AgentPanel {
         Some(IconName::ZedAssistant)
     }
 
+    /// A conversation is one tab; a new one has no key until the agent names its session.
     fn dedupe_key(&self, _cx: &App) -> Option<SharedString> {
-        Some(match &self.session_id {
-            Some(id) => format!("agent:{id}").into(),
-            None => self.new_key.clone(),
-        })
+        self.session_id
+            .as_ref()
+            .map(|id| format!("agent:{id}").into())
+    }
+
+    /// Closing drops a draft, the messages waiting their turn and the cards waiting for an
+    /// answer, so it asks first.
+    fn is_dirty(&self, _cx: &App) -> bool {
+        self.holds_work()
     }
 
     /// The tab comes back after a restart with its conversation.
@@ -672,6 +769,19 @@ impl AgentPanel {
             cx.notify();
         })
         .detach();
+        cx.subscribe(
+            &composer,
+            |this: &mut Self, composer, event: &EditorEvent, cx| {
+                if let EditorEvent::BufferEdited = event {
+                    let has_draft = !composer.read(cx).text(cx).trim().is_empty();
+                    if has_draft != this.has_draft {
+                        this.has_draft = has_draft;
+                        cx.notify();
+                    }
+                }
+            },
+        )
+        .detach();
         let sessions = AgentSessions::global(cx);
         // A tab title follows the conversation's title; a deleted conversation's tab closes.
         cx.observe(&sessions, |this: &mut Self, sessions, cx| {
@@ -687,8 +797,17 @@ impl AgentPanel {
         })
         .detach();
         // Whatever changes the conversation (a turn, an approval card, a decision), the graph's
-        // list learns what it is doing now; a closed tab's agent stops with it.
-        cx.observe_self(|this, cx| this.sync_live(cx)).detach();
+        // list learns what it is doing now, and the tab whether it holds unsaved work; a closed
+        // tab's agent stops with it.
+        cx.observe_self(|this, cx| {
+            this.sync_live(cx);
+            let dirty = this.holds_work();
+            if dirty != this.dirty {
+                this.dirty = dirty;
+                cx.emit(ItemEvent::UpdateTab);
+            }
+        })
+        .detach();
         cx.on_release(|this, cx| {
             if let Some(id) = this.session_id.clone() {
                 this.sessions
@@ -708,9 +827,10 @@ impl AgentPanel {
             session,
             workspace,
             sessions,
-            new_key: format!("agent:new:{}", cx.entity_id()).into(),
+            dirty: false,
             focus_handle,
             composer,
+            has_draft: false,
             custom_command,
             thread: {
                 let thread = ListState::new(0, ListAlignment::Top, px(800.));
@@ -728,13 +848,16 @@ impl AgentPanel {
             adapter: Adapter::Other,
             host: None,
             preparing: None,
-            replace_on_replay: false,
+            replace_on_replay: None,
+            said_while_starting: Vec::new(),
             session_id,
             failed: false,
             cwd: None,
             _focus: Some(focus),
             config_options: Vec::new(),
             setting_option: None,
+            option_views: Vec::new(),
+            query_cards: Default::default(),
             usage: None,
             expanded_activity: std::collections::HashSet::new(),
             folded_queries: std::collections::HashSet::new(),
@@ -899,25 +1022,25 @@ impl AgentPanel {
             }
             Err(error) => {
                 self.cli_ready = Some(false);
-                self.entries.push(Entry::Notice {
-                    text: format!(
+                self.say(
+                    format!(
                         "Studio could not set up the omnigraph CLI for this conversation \
                          ({error}), so the agent cannot reach the graph."
                     ),
-                    error: true,
-                });
+                    true,
+                );
                 (None, None)
             }
         };
         // The shared rules and the skill help the agent; without them it still has the CLI.
         if let Some(error) = rules {
-            self.entries.push(Entry::Notice {
-                text: format!(
+            self.say(
+                format!(
                     "Studio could not write AGENTS.md and the omnigraph-studio skill for the \
                      agent ({error}); it can still reach the graph."
                 ),
-                error: true,
-            });
+                true,
+            );
         }
         let instructions = cli_home
             .as_ref()
@@ -1014,11 +1137,32 @@ impl AgentPanel {
     }
 
     fn fail_start(&mut self, message: String, cx: &mut Context<Self>) {
+        self.show_held();
         self.state = State::Exited {
             message,
             stderr: String::new(),
         };
         cx.notify();
+    }
+
+    /// Shows a notice of Studio's own in the thread. While the agent comes back to a
+    /// conversation it replays, the notice waits with what else was said meanwhile
+    /// ([`AgentPanel::said_while_starting`]) until the agent is ready or stopped: landing in
+    /// the replay, it would split a replayed message in two.
+    fn say(&mut self, text: String, error: bool) {
+        let notice = Entry::Notice { text, error };
+        if matches!(self.state, State::Starting) && self.session_id.is_some() {
+            self.said_while_starting.push(notice);
+        } else {
+            self.entries.push(notice);
+        }
+    }
+
+    /// Shows what was said while the agent came back, after the conversation it replayed.
+    fn show_held(&mut self) {
+        self.replace_on_replay = None;
+        self.entries
+            .extend(std::mem::take(&mut self.said_while_starting));
     }
 
     fn stop_host(&mut self) {
@@ -1029,12 +1173,9 @@ impl AgentPanel {
         // Options can only be set on a running session.
         self.config_options.clear();
         self.setting_option = None;
+        self.options_changed();
+        self.entries.cancel_permissions();
         self.entries.change_each(|entry| match entry {
-            Entry::Permission(card) if card.reply.is_some() => {
-                card.reply = None;
-                card.answer = Some("Cancelled".into());
-                true
-            }
             Entry::Proposal(proposal) if matches!(proposal.state, ProposalState::Waiting(_)) => {
                 proposal.state = ProposalState::Rejected;
                 true
@@ -1055,12 +1196,15 @@ impl AgentPanel {
     fn restart(&mut self, _: &Restart, _window: &mut Window, cx: &mut Context<Self>) {
         self.stop_host();
         self.clear_thread();
+        // What the start given up said is said again by this one.
+        self.said_while_starting.clear();
         self.start(cx);
     }
 
     /// Forgets the thread on screen, before the agent shows it again.
     fn clear_thread(&mut self) {
         self.entries.clear();
+        self.query_cards.borrow_mut().clear();
         self.markdown.clear();
         self.expanded_activity.clear();
         self.folded_queries.clear();
@@ -1131,13 +1275,15 @@ impl AgentPanel {
             } => {
                 // The agent could not load the conversation asked for and opened a new one on
                 // its branch: the record follows the new one, rather than two conversations
-                // sharing a branch.
+                // sharing a branch, and the thread says the agent lacks what came before.
+                let mut lost = false;
                 if opened == Opened::New
                     && let Some(asked) = self.session_id.take().filter(|asked| *asked != session)
                 {
                     let new = session.clone();
                     self.sessions
                         .update(cx, |sessions, cx| sessions.rebind(&asked, new, cx));
+                    lost = true;
                 }
                 self.session_id = Some(session);
                 self.remember_session(cx);
@@ -1145,7 +1291,17 @@ impl AgentPanel {
                 // A loaded conversation replays itself and keeps its own options; a new one
                 // starts from the ones chosen last for this agent.
                 match opened {
-                    Opened::New => self.apply_preferences(cx),
+                    Opened::New => {
+                        self.apply_preferences(cx);
+                        if lost {
+                            self.entries.push(Entry::Notice {
+                                text: "The agent could not load this conversation, so a new \
+                                       one starts on its branch without the earlier messages."
+                                    .into(),
+                                error: false,
+                            });
+                        }
+                    }
                     Opened::Loaded => {}
                     Opened::Resumed => self.entries.push(Entry::Notice {
                         text: "Resumed: the agent has the earlier messages but cannot show them."
@@ -1154,12 +1310,21 @@ impl AgentPanel {
                     }),
                 }
                 self.state = State::Ready { agent };
-                self.replace_on_replay = false;
+                self.show_held();
                 // What was sent before the agent was ready goes now, in order.
                 self.send_queued(cx);
             }
             HostEvent::Update(update) => {
-                if std::mem::take(&mut self.replace_on_replay) {
+                // What was said before the replay began waits with what is said during it.
+                // Only the conversation itself replays: a title, an option or the usage the
+                // agent sends first leaves the thread on screen, which stays if no replay
+                // comes.
+                if replays(&update)
+                    && let Some(shown) = self.replace_on_replay.take()
+                {
+                    let mut said = self.entries.take_from(shown);
+                    said.append(&mut self.said_while_starting);
+                    self.said_while_starting = said;
                     self.clear_thread();
                 }
                 self.apply_update(update, cx)
@@ -1167,9 +1332,11 @@ impl AgentPanel {
             HostEvent::ConfigOptions(options) => {
                 self.config_options = options;
                 self.setting_option = None;
+                self.options_changed();
             }
             HostEvent::ConfigOptionFailed { message } => {
                 self.setting_option = None;
+                self.options_changed();
                 self.entries.push(Entry::Notice {
                     text: format!("The agent did not change the option: {message}"),
                     error: true,
@@ -1198,6 +1365,9 @@ impl AgentPanel {
                 } else {
                     ToolCallStatus::Failed
                 });
+                // Nor does a permission request of the turn still wait: the agent no longer
+                // asks it.
+                self.entries.cancel_permissions();
                 if let State::Prompting { agent } = &self.state {
                     self.state = State::Ready {
                         agent: agent.clone(),
@@ -1235,6 +1405,7 @@ impl AgentPanel {
             } => {
                 self.stop_host();
                 self.settle_open_tools(ToolCallStatus::Failed);
+                self.show_held();
                 self.failed = failed;
                 self.state = State::Exited { message, stderr };
             }
@@ -1336,6 +1507,7 @@ impl AgentPanel {
             }
             SessionUpdate::ConfigOptionUpdate(update) => {
                 self.config_options = update.config_options;
+                self.options_changed();
             }
             SessionUpdate::UsageUpdate(update) => {
                 self.usage = Some(Usage {
@@ -1384,8 +1556,19 @@ impl AgentPanel {
             .is_ok()
         {
             self.setting_option = Some((id, value));
+            self.options_changed();
         }
         cx.notify();
+    }
+
+    /// Makes the composer's options again from the agent's and the value being set.
+    fn options_changed(&mut self) {
+        self.option_views = self
+            .config_options
+            .iter()
+            .filter_map(|option| OptionView::new(option, self.setting_option.as_ref()))
+            .map(Rc::new)
+            .collect();
     }
 
     /// Sets the options chosen last for this agent where the new session differs and still
@@ -1424,31 +1607,37 @@ impl AgentPanel {
 
     // ---- prompting ----
 
+    /// Sends `text`, or queues it after the messages waiting before it.
     pub fn send_text(&mut self, text: String, _window: &mut Window, cx: &mut Context<Self>) {
+        self.send_or_queue(text, false, cx);
+    }
+
+    /// Sends `text` as the next turn when the agent is ready for one. A message sent while the
+    /// agent works, starts or is still to be chosen waits its turn in the queue: `first` in
+    /// line, as "Send now" asks, or after any sent before it.
+    fn send_or_queue(&mut self, text: String, first: bool, cx: &mut Context<Self>) {
         let text = text.trim().to_owned();
         if text.is_empty() {
             return;
         }
-        // A message sent while the agent works, starts or is still to be chosen waits its
-        // turn in the queue, with any sent before it.
         match &self.state {
             // One that cannot go (the agent just stopped) waits in the queue, not lost.
             State::Ready { .. } => {
                 if !self.prompt(text.clone(), cx) {
-                    self.queue.push(text);
+                    self.queue.enqueue(text, first);
                 }
             }
-            State::Prompting { .. } | State::Starting => self.queue.push(text),
+            State::Prompting { .. } | State::Starting => self.queue.enqueue(text, first),
             State::Setup => {
-                self.queue.push(text);
+                self.queue.enqueue(text, first);
                 self.entries.push(Entry::Notice {
                     text: "Choose an agent to send this to.".into(),
                     error: false,
                 });
             }
             State::Idle | State::Exited { .. } => {
-                self.queue.push(text);
-                self.replace_on_replay = !self.entries.is_empty();
+                self.queue.enqueue(text, first);
+                self.replace_on_replay = (!self.entries.is_empty()).then_some(self.entries.len());
                 self.start(cx);
             }
         }
@@ -1512,26 +1701,29 @@ impl AgentPanel {
         }
         self.composer
             .update(cx, |editor, cx| editor.clear(window, cx));
-        self.send_at_once(text, window, cx);
+        self.send_at_once(text, cx);
     }
 
-    fn send_at_once(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// Stops the turn and sends `text` once it has stopped; with no turn running it goes now,
+    /// or first when the agent is not ready for it yet.
+    fn send_at_once(&mut self, text: String, cx: &mut Context<Self>) {
         if matches!(self.state, State::Prompting { .. })
             && let Some(host) = &self.host
         {
-            self.queue.after_cancel = Some(text);
+            self.queue.send_after_cancel(text);
             host.commands.unbounded_send(HostCommand::Cancel).ok();
+            self.entries.cancel_permissions();
             cx.notify();
         } else {
             self.queue.paused = false;
-            self.send_text(text, window, cx);
+            self.send_or_queue(text, true, cx);
         }
     }
 
     /// Sends a queued message at once, stopping the turn if one runs.
-    fn send_queued_now(&mut self, id: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn send_queued_now(&mut self, id: usize, cx: &mut Context<Self>) {
         if let Some(text) = self.queue.take(id) {
-            self.send_at_once(text, window, cx);
+            self.send_at_once(text, cx);
         }
     }
 
@@ -1559,16 +1751,17 @@ impl AgentPanel {
         cx.notify();
     }
 
-    /// Stops the turn and the CLI runs it started; the queue waits until the person sends
-    /// again.
+    /// Stops the turn and the CLI runs it started, and answers the turn's waiting permission
+    /// requests; the queue waits until the person sends again.
     fn stop(&mut self, _: &Stop, _window: &mut Window, cx: &mut Context<Self>) {
         self.stop_runs();
         if let Some(host) = &self.host {
             host.commands.unbounded_send(HostCommand::Cancel).ok();
+            self.entries.cancel_permissions();
             if !self.queue.entries.is_empty() {
                 self.queue.paused = true;
-                cx.notify();
             }
+            cx.notify();
         }
     }
 
@@ -1576,11 +1769,13 @@ impl AgentPanel {
 
     /// The oldest card still waiting for the person.
     fn pending_index(&self) -> Option<usize> {
-        self.entries.iter().position(|entry| match entry {
-            Entry::Permission(card) => card.reply.is_some(),
-            Entry::Proposal(proposal) => matches!(proposal.state, ProposalState::Waiting(_)),
-            _ => false,
-        })
+        self.entries.iter().position(Entry::waits)
+    }
+
+    /// What closing the tab would drop: a draft in the composer, a message waiting its turn,
+    /// or a card waiting for the person's answer.
+    fn holds_work(&self) -> bool {
+        self.has_draft || self.queue.holds_messages() || self.pending_index().is_some()
     }
 
     fn decide(&mut self, index: usize, decision: Decision, cx: &mut Context<Self>) {
@@ -1596,9 +1791,6 @@ impl AgentPanel {
                 }
             }
             Some(Entry::Permission(card)) => {
-                let Some(reply) = card.reply.take() else {
-                    return;
-                };
                 let wanted: &[PermissionOptionKind] = match decision {
                     Decision::Allow => &[PermissionOptionKind::AllowOnce],
                     Decision::AllowAlways => &[
@@ -1612,19 +1804,12 @@ impl AgentPanel {
                 };
                 let option = wanted
                     .iter()
-                    .find_map(|kind| card.options.iter().find(|o| o.kind == *kind));
+                    .find_map(|kind| card.options.iter().position(|o| o.kind == *kind));
                 match option {
-                    Some(option) => {
-                        card.answer = Some(option.name.clone());
-                        reply
-                            .send(RequestPermissionOutcome::Selected(
-                                SelectedPermissionOutcome::new(option.option_id.clone()),
-                            ))
-                            .ok();
-                    }
+                    // Answered as a click on that option is.
+                    Some(option) => return self.choose_option(index, option, cx),
                     None => {
-                        card.answer = Some("Cancelled".into());
-                        reply.send(RequestPermissionOutcome::Cancelled).ok();
+                        card.cancel();
                     }
                 }
             }
@@ -1870,26 +2055,26 @@ impl AgentPanel {
                 if let Some(configured) = configured
                     && std::fs::canonicalize(&configured).ok() != std::fs::canonicalize(&cli).ok()
                 {
-                    self.entries.push(Entry::Notice {
-                        text: format!(
+                    self.say(
+                        format!(
                             "`agent.omnigraph_cli` ({}) does not speak this graph's HTTP API \
                              ({contract}), so the agent uses {}{}.",
                             configured.display(),
                             cli.display(),
                             version.map(|v| format!(" ({v})")).unwrap_or_default()
                         ),
-                        error: false,
-                    });
+                        false,
+                    );
                 }
             }
             cli_home::CliChoice::NoMatch { found } => {
-                self.entries.push(Entry::Notice {
-                    text: format!(
+                self.say(
+                    format!(
                         "{} The agent cannot reach the graph until one is.",
                         cli_home::no_cli_text(contract, &found)
                     ),
-                    error: false,
-                });
+                    false,
+                );
             }
         }
         cx.notify();
@@ -2096,6 +2281,16 @@ impl AgentPanel {
     }
 }
 
+/// What a query card shows: the CLI's subcommand, the query's name, its text with its
+/// highlights, and the rest of its arguments.
+struct QueryCard {
+    command: String,
+    name: Option<String>,
+    text: SharedString,
+    highlights: Vec<(std::ops::Range<usize>, &'static str)>,
+    params: String,
+}
+
 /// One of the agent's session options as the composer shows it, with a value chosen but not yet
 /// confirmed standing in for the agent's.
 #[derive(Clone)]
@@ -2279,7 +2474,7 @@ impl OptionView {
 /// A composer picker: the option's icon and current value, borderless, opening its values. The
 /// model's menu also holds the agent: a new conversation, and choosing another agent.
 fn option_picker(
-    option: OptionView,
+    option: Rc<OptionView>,
     icon: Icon,
     panel: &WeakEntity<AgentPanel>,
     agent: Option<String>,
@@ -2394,6 +2589,20 @@ fn trim_point(number: String) -> String {
 fn format_cost(amount: f64, currency: &str) -> String {
     let precision = if amount > 0. && amount < 0.01 { 4 } else { 2 };
     format!("{amount:.precision$} {currency}")
+}
+
+/// Whether `update` is part of the conversation an agent replays when it loads one: its
+/// messages, thoughts, tool calls and plan.
+fn replays(update: &SessionUpdate) -> bool {
+    matches!(
+        update,
+        SessionUpdate::UserMessageChunk(_)
+            | SessionUpdate::AgentMessageChunk(_)
+            | SessionUpdate::AgentThoughtChunk(_)
+            | SessionUpdate::ToolCall(_)
+            | SessionUpdate::ToolCallUpdate(_)
+            | SessionUpdate::Plan(_)
+    )
 }
 
 fn content_text(content: &ContentBlock) -> String {
@@ -2552,7 +2761,7 @@ impl Render for AgentPanel {
                 let key = self.thread_key();
                 if self.synced_thread != Some(key) {
                     self.sync_markdown(cx);
-                    self.sync_thread(cx);
+                    self.sync_thread();
                     self.synced_thread = Some(key);
                 }
                 self.render_thread(window, cx).into_any_element()
@@ -2615,7 +2824,7 @@ impl AgentPanel {
         let can_send = matches!(
             self.state,
             State::Ready { .. } | State::Idle | State::Exited { .. } | State::Starting
-        ) && !self.composer.read(cx).text(cx).trim().is_empty();
+        ) && self.has_draft;
         let send_or_stop = if running {
             ds::composer_button("stop", IconName::Stop, false, cx)
                 .tooltip(|_, cx| Tooltip::for_action("Stop", &Stop, cx))
@@ -2638,7 +2847,9 @@ impl AgentPanel {
         }
         end.extend(self.render_usage(cx));
         end.extend(self.render_options(cx));
-        if matches!(self.state, State::Exited { .. }) {
+        // Starting too: an agent that never answers (a program waiting on its input, one
+        // without its ACP flag) is not waited for forever.
+        if matches!(self.state, State::Exited { .. } | State::Starting) {
             end.push(
                 ds::icon_button("restart", IconName::RotateCw)
                     .icon_color(Color::Muted)
@@ -2861,11 +3072,14 @@ impl AgentPanel {
     }
 
     /// What a block shows, folded to a number: a block whose number is unchanged keeps its
-    /// measured height. Markdown that finishes parsing remeasures its block by itself.
-    fn fingerprint(&self, block: &Block) -> u64 {
+    /// measured height. Markdown that finishes parsing remeasures its block by itself. The
+    /// `first` block carries the thread's top margin (`render_block`), so one that becomes
+    /// first, or stops being so, is measured again.
+    fn fingerprint(&self, block: &Block, first: bool) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         block.hash(&mut hasher);
+        first.hash(&mut hasher);
         let entries = match *block {
             Block::Entry { index, .. } => index..index + 1,
             Block::Query { index, .. } => {
@@ -2890,27 +3104,17 @@ impl AgentPanel {
         hasher.finish()
     }
 
-    /// Brings the list up to the thread: from the first block that differs from what it last
-    /// drew, the blocks are measured again; those above keep their heights and the scroll.
-    fn sync_thread(&mut self, _cx: &mut Context<Self>) {
+    /// Brings the list up to the thread: the blocks between those it starts and ends with as
+    /// last drawn are measured again; the others keep their heights, and the scroll stays.
+    fn sync_thread(&mut self) {
         self.entries.rehash();
         let blocks: Vec<(Block, u64)> = self
             .blocks()
             .into_iter()
-            .map(|block| (block, self.fingerprint(&block)))
+            .enumerate()
+            .map(|(position, block)| (block, self.fingerprint(&block, position == 0)))
             .collect();
-        let same = self
-            .shown_blocks
-            .iter()
-            .zip(&blocks)
-            .take_while(|(shown, now)| shown == now)
-            .count();
-        if same == blocks.len() && same == self.shown_blocks.len() {
-            return;
-        }
-        self.thread
-            .splice(same..self.shown_blocks.len(), blocks.len() - same);
-        self.shown_blocks = blocks;
+        studio_ui::rows::sync(&self.thread, &mut self.shown_blocks, blocks);
     }
 
     /// Measures again the block that shows entry `index`, whose markdown finished parsing.
@@ -3091,14 +3295,16 @@ impl AgentPanel {
         let Entry::Tool { status, .. } = entry else {
             return div().into_any_element();
         };
-        let Some((command, text, params)) = shown_query(entry) else {
+        let Some(card) = self.query_card(index, entry) else {
             return div().into_any_element();
         };
-        let tokens = gq_language::tokenize(&text);
-        let name = tokens
-            .iter()
-            .find(|token| token.kind == gq_language::TokenKind::QueryName)
-            .map(|token| text[token.range.clone()].to_owned());
+        let QueryCard {
+            command,
+            name,
+            text,
+            highlights,
+            params,
+        } = &*card;
         let running = matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
         let failed = matches!(status, ToolCallStatus::Failed);
         let folded = self.folded_queries.contains(&index);
@@ -3117,7 +3323,7 @@ impl AgentPanel {
                     .map(|first| first.to_uppercase().chain(chars).collect())
                     .unwrap_or_default()
             }))
-            .children(name.map(|name| {
+            .children(name.clone().map(|name| {
                 studio_ui::ds::text::body(name)
                     .color(Color::Default)
                     .buffer_font(cx)
@@ -3142,13 +3348,8 @@ impl AgentPanel {
                 this.folds += 1;
                 cx.notify();
             }));
-        let highlights = tokens.into_iter().filter_map(|token| {
-            token
-                .kind
-                .syntax_name()
-                .map(|name| (token.range.clone(), name))
-        });
-        let card = ds::code_block_highlighted(text.trim_end().to_owned(), highlights, cx);
+        let params = params.clone();
+        let card = ds::code_block_highlighted(text.clone(), highlights.iter().cloned(), cx);
         gutter_row(
             lead.then(|| studio_ui::ds::icon::lead(IconName::ZedAssistant)),
             v_flex()
@@ -3162,6 +3363,39 @@ impl AgentPanel {
                 }),
         )
         .into_any_element()
+    }
+
+    /// What the query card of entry `index` shows, made once while the entry is unchanged.
+    fn query_card(&self, index: usize, entry: &Entry) -> Option<Rc<QueryCard>> {
+        let hash = self.entries.hash(index);
+        if let Some((held, card)) = self.query_cards.borrow().get(&index)
+            && *held == hash
+        {
+            return Some(card.clone());
+        }
+        let (command, text, params) = shown_query(entry)?;
+        let tokens = gq_language::tokenize(&text);
+        let name = tokens
+            .iter()
+            .find(|token| token.kind == gq_language::TokenKind::QueryName)
+            .map(|token| text[token.range.clone()].to_owned());
+        let shown = text.trim_end();
+        let highlights = tokens
+            .into_iter()
+            .filter(|token| token.range.end <= shown.len())
+            .filter_map(|token| token.kind.syntax_name().map(|name| (token.range, name)))
+            .collect();
+        let card = Rc::new(QueryCard {
+            command,
+            name,
+            text: shown.to_owned().into(),
+            highlights,
+            params,
+        });
+        self.query_cards
+            .borrow_mut()
+            .insert(index, (hash, card.clone()));
+        Some(card)
     }
 
     /// A run of tool calls and thoughts as one muted line ("Thought 1 time, ran 2 queries"),
@@ -3499,18 +3733,16 @@ impl AgentPanel {
     /// the agent. Before the agent offers a model, the agent's name and state stand there.
     fn render_options(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let panel = cx.entity().downgrade();
-        let options: Vec<OptionView> = if self.host.is_some() {
-            self.config_options
-                .iter()
-                .filter_map(|option| OptionView::new(option, self.setting_option.as_ref()))
-                .collect()
+        let options: Vec<Rc<OptionView>> = if self.host.is_some() {
+            self.option_views.clone()
         } else {
             Vec::new()
         };
         let (shown, more): (Vec<_>, Vec<_>) = options
             .into_iter()
             .partition(|option| option.picker_icon().is_some());
-        let (models, shown): (Vec<_>, Vec<_>) = shown.into_iter().partition(OptionView::is_model);
+        let (models, shown): (Vec<_>, Vec<_>) =
+            shown.into_iter().partition(|option| option.is_model());
         let (agent_name, dot, state) = self.status();
 
         let mut pickers: Vec<AnyElement> = shown
@@ -3523,7 +3755,7 @@ impl AgentPanel {
         if !more.is_empty() {
             let summary = more
                 .iter()
-                .map(OptionView::summary)
+                .map(|option| option.summary())
                 .collect::<Vec<_>>()
                 .join(" · ");
             let panel = panel.clone();
@@ -3744,8 +3976,8 @@ impl AgentPanel {
                                     .tooltip(Tooltip::text(
                                         "Stop the agent's turn and send this at once",
                                     ))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.send_queued_now(id, window, cx)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.send_queued_now(id, cx)
                                     })),
                             ),
                     )
@@ -3902,9 +4134,15 @@ mod tests {
         queue.push("third".into());
         assert_eq!(queue.on_turn_ended().as_deref(), Some("second"));
         // "Send now" goes ahead of the line, once.
-        queue.after_cancel = Some("urgent".into());
+        queue.send_after_cancel("urgent".into());
         assert_eq!(queue.on_turn_ended().as_deref(), Some("urgent"));
         assert_eq!(queue.on_turn_ended().as_deref(), Some("third"));
+        assert_eq!(queue.on_turn_ended(), None);
+        // "Send now" twice before the turn stops: the later goes at once, the earlier is next.
+        queue.send_after_cancel("first now".into());
+        queue.send_after_cancel("second now".into());
+        assert_eq!(queue.on_turn_ended().as_deref(), Some("second now"));
+        assert_eq!(queue.on_turn_ended().as_deref(), Some("first now"));
         assert_eq!(queue.on_turn_ended(), None);
         // Taking one out by id leaves the rest in order.
         queue.push("a".into());
@@ -3918,6 +4156,58 @@ mod tests {
         queue.put_back(taken);
         assert_eq!(queue.on_turn_ended().as_deref(), Some("a"));
         assert_eq!(queue.on_turn_ended().as_deref(), Some("c"));
+        // "Send now" on the last in line while no turn runs (the agent starting) puts it
+        // first, not back at the end.
+        assert!(!queue.holds_messages(), "nothing for a close to drop");
+        queue.enqueue("d".into(), false);
+        queue.enqueue("e".into(), false);
+        let e = queue.entries[1].id;
+        let now = queue.take(e).unwrap();
+        queue.enqueue(now, true);
+        assert_eq!(queue.on_turn_ended().as_deref(), Some("e"));
+        assert_eq!(queue.on_turn_ended().as_deref(), Some("d"));
+        // A message waiting for the stopped turn is work a close would drop too.
+        queue.send_after_cancel("after".into());
+        assert!(queue.holds_messages());
+        assert_eq!(queue.on_turn_ended().as_deref(), Some("after"));
+        assert!(!queue.holds_messages());
+    }
+
+    /// Stopping a turn, "Send now" and a turn's end answer each permission request still
+    /// waiting "cancelled", as ACP asks of a client: the card says so, and no longer waits for
+    /// a key that would answer a request nobody asks any more.
+    #[test]
+    fn a_cancelled_turn_answers_its_waiting_permission_requests() {
+        let mut entries = Entries::default();
+        let card = |reply, answer: Option<&str>| {
+            Entry::Permission(PermissionCard {
+                title: "Run a command".into(),
+                options: Vec::new(),
+                reply,
+                answer: answer.map(str::to_owned),
+            })
+        };
+        let (reply, mut asked) = oneshot::channel();
+        entries.push(card(Some(reply), None));
+        entries.push(card(None, Some("Allow once")));
+        entries.push(Entry::Agent("Done.".into()));
+        assert!(entries[0].waits());
+        entries.cancel_permissions();
+        assert!(matches!(
+            asked.try_recv(),
+            Ok(Some(RequestPermissionOutcome::Cancelled))
+        ));
+        assert!(!entries.iter().any(Entry::waits));
+        let answer = |entry: &Entry| match entry {
+            Entry::Permission(card) => card.answer.clone(),
+            _ => None,
+        };
+        assert_eq!(answer(&entries[0]).as_deref(), Some("Cancelled"));
+        assert_eq!(
+            answer(&entries[1]).as_deref(),
+            Some("Allow once"),
+            "an answered card keeps its answer"
+        );
     }
 
     /// An entry changed by any way there is changes its hash; the others keep theirs, so the

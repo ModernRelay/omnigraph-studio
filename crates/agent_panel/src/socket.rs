@@ -211,23 +211,44 @@ impl ToolSocket {
         let instructions: std::sync::Arc<str> = instructions.into();
         async move {
             let Some(listener) = listener else { return };
-            let mut connections = Vec::new();
-            loop {
-                // A connection it could not take (out of descriptors, reset before it was
-                // taken) ends that connection, not the socket.
-                let Ok((reader, writer)) = sys::accept(&listener).await else {
-                    smol::Timer::after(std::time::Duration::from_millis(100)).await;
-                    continue;
-                };
-                connections.retain(|task: &smol::Task<()>| !task.is_finished());
-                connections.push(smol::spawn(serve_connection(
-                    reader,
-                    writer,
-                    tools.clone(),
-                    instructions.clone(),
-                )));
-            }
+            serve_each(
+                || sys::accept(&listener),
+                |(reader, writer)| {
+                    serve_connection(reader, writer, tools.clone(), instructions.clone())
+                },
+            )
+            .await;
         }
+    }
+}
+
+/// The most connections a listener of Studio's serves at once; one past them is closed unread,
+/// so connections held open by another process cannot use up Studio's file descriptors.
+const MAX_CONNECTIONS: usize = 64;
+
+/// How long a listener waits after a connection it could not take, before taking the next.
+const ACCEPT_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Serves each connection `accept` takes on a task of its own, at most [`MAX_CONNECTIONS`] at
+/// once. A connection it could not take (out of descriptors, reset before it was taken) ends
+/// that connection, not the listener.
+pub(crate) async fn serve_each<C, A, S>(mut accept: impl FnMut() -> A, serve: impl Fn(C) -> S)
+where
+    A: Future<Output = std::io::Result<C>>,
+    S: Future<Output = ()> + Send + 'static,
+{
+    let mut connections: Vec<smol::Task<()>> = Vec::new();
+    loop {
+        let Ok(connection) = accept().await else {
+            smol::Timer::after(ACCEPT_RETRY).await;
+            continue;
+        };
+        connections.retain(|task| !task.is_finished());
+        if connections.len() >= MAX_CONNECTIONS {
+            drop(connection);
+            continue;
+        }
+        connections.push(smol::spawn(serve(connection)));
     }
 }
 

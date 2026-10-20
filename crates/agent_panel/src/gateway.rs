@@ -31,9 +31,6 @@ const READ_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
 /// How long a request's line and headers, its token among them, may take: any local process
 /// can open a connection, and one that sends nothing is let go before it holds one long.
 const HEAD_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
-/// The most connections open at once; one past them is closed unread, so connections held
-/// open by another process cannot use up Studio's file descriptors.
-const MAX_CONNECTIONS: usize = 64;
 /// The most a write's answer may take before the gateway stops reading it for the card.
 const MAX_WRITE_ANSWER: usize = 8 * 1024 * 1024;
 /// Request headers passed on to the server; the gateway sets the token and contract itself.
@@ -70,9 +67,6 @@ pub type OnOutcome = Box<dyn FnOnce(&Seen) + Send>;
 
 /// What an approved write that was not sent, because the CLI stopped waiting, records.
 pub const NOT_SENT: &str = "The agent's CLI stopped waiting, so nothing was sent.";
-
-/// How long the gateway waits after a connection it could not take, before taking the next.
-const ACCEPT_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// A forwarded write's outcome, as the gateway saw the server's answer.
 #[derive(Debug, Clone, PartialEq)]
@@ -122,21 +116,11 @@ impl Gateway {
         });
         async move {
             let Some(listener) = listener else { return };
-            let mut connections = Vec::new();
-            loop {
-                // A connection it could not take (out of descriptors, reset before it was
-                // taken) ends that connection, not the gateway.
-                let Ok((stream, _)) = listener.accept().await else {
-                    smol::Timer::after(ACCEPT_RETRY).await;
-                    continue;
-                };
-                connections.retain(|task: &smol::Task<()>| !task.is_finished());
-                if connections.len() >= MAX_CONNECTIONS {
-                    drop(stream);
-                    continue;
-                }
-                connections.push(smol::spawn(serve_connection(stream, shared.clone())));
-            }
+            crate::socket::serve_each(
+                || listener.accept(),
+                |(stream, _)| serve_connection(stream, shared.clone()),
+            )
+            .await;
         }
     }
 }

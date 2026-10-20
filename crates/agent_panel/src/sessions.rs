@@ -387,8 +387,8 @@ fn read_records(path: &Path) -> Vec<SessionRecord> {
     read
 }
 
-/// The file's object. A file that exists but is not a JSON object is set aside, so the next
-/// write does not replace every conversation it lists.
+/// The preferences file's object. A file that exists but is not a JSON object is set aside, so
+/// the next write does not replace every agent's choices it holds.
 fn read(path: &Path) -> Map<String, Value> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Map::new();
@@ -575,8 +575,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// One record Studio cannot read leaves the others, and the file is set aside before the
-    /// next save writes only those.
     /// A conversation the agent could not load, replaced by a new one on its branch, is one
     /// record under the new session, not two on one branch.
     #[gpui::test]
@@ -604,6 +602,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// One record Studio cannot read leaves the others, and the file is set aside before the
+    /// next save writes only those.
     #[test]
     fn a_record_that_cannot_be_read_leaves_the_others() {
         let dir = std::env::temp_dir().join(format!("studio-agent-records-{}", std::process::id()));

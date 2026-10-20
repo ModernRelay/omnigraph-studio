@@ -231,6 +231,21 @@ impl Routes {
         }
         self.sessions.insert(session, events);
     }
+
+    /// Routes `session` to `events` unless another conversation still listens to it: a second
+    /// would take its replies, tool calls and permission requests. A route whose conversation
+    /// let go (its tab closed, its session about to be freed) is taken over. Whether it was
+    /// routed.
+    fn claim(&mut self, session: SessionId, events: mpsc::UnboundedSender<HostEvent>) -> bool {
+        let held = self
+            .sessions
+            .get(&session)
+            .is_some_and(|routed| !routed.is_closed() && !routed.same_receiver(&events));
+        if !held {
+            self.add(session, events);
+        }
+        !held
+    }
 }
 
 type SharedRoutes = Arc<Mutex<Routes>>;
@@ -550,13 +565,27 @@ async fn open_session(
     // resume it (without); one it no longer knows starts anew.
     let mut opened = None;
     let mut config_options = Vec::new();
-    if let Some(id) = launch.resume.clone() {
+    if let Some(id) = launch.resume.clone()
+        && (can.load || can.resume)
+    {
         let id = SessionId::new(id);
+        // Routed before it is asked for: a load's replay arrives as updates while it runs. A
+        // session another open conversation still listens to is not opened a second time.
+        let claimed = routes
+            .lock()
+            .is_ok_and(|mut routes| routes.claim(id.clone(), events.clone()));
+        if !claimed {
+            opened_or_failed(&opening);
+            events
+                .unbounded_send(HostEvent::Exited {
+                    message: "This conversation is open in another tab.".to_owned(),
+                    stderr: String::new(),
+                    failed: false,
+                })
+                .ok();
+            return Ok(());
+        }
         if can.load {
-            // The replay arrives as updates while the load runs.
-            if let Ok(mut routes) = routes.lock() {
-                routes.add(id.clone(), events.clone());
-            }
             let loaded = connection
                 .send_request(
                     LoadSessionRequest::new(id.clone(), launch.cwd.clone())
@@ -564,18 +593,11 @@ async fn open_session(
                 )
                 .block_task()
                 .await;
-            match loaded {
-                Ok(loaded) => {
-                    opened = Some((id.clone(), Opened::Loaded));
-                    config_options = loaded.config_options.unwrap_or_default();
-                }
-                Err(_) => {
-                    if let Ok(mut routes) = routes.lock() {
-                        routes.remove(&id, &events);
-                    }
-                }
+            if let Ok(loaded) = loaded {
+                opened = Some((id.clone(), Opened::Loaded));
+                config_options = loaded.config_options.unwrap_or_default();
             }
-        } else if can.resume {
+        } else {
             let resumed = connection
                 .send_request(
                     ResumeSessionRequest::new(id.clone(), launch.cwd.clone())
@@ -587,6 +609,11 @@ async fn open_session(
                 opened = Some((id.clone(), Opened::Resumed));
                 config_options = resumed.config_options.unwrap_or_default();
             }
+        }
+        if opened.is_none()
+            && let Ok(mut routes) = routes.lock()
+        {
+            routes.remove(&id, &events);
         }
     }
     let (session_id, opened) = match opened {
@@ -630,12 +657,18 @@ async fn open_session(
         })
         .ok();
 
+    // Turns sent and not ended: one still running when the panel lets go is stopped. The
+    // agent's process serves other conversations, so it would go on spending and running tools
+    // with nobody watching.
+    let turns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     while let Some(command) = commands.next().await {
         match command {
             HostCommand::Prompt(text) => {
                 let connection_for_turn = connection.clone();
                 let session_id = session_id.clone();
                 let events = events.clone();
+                let turns = turns.clone();
+                turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 connection.spawn(async move {
                     let response = connection_for_turn
                         .send_request(PromptRequest::new(
@@ -647,6 +680,7 @@ async fn open_session(
                     let stop = response
                         .map(|response| response.stop_reason)
                         .map_err(|error| error.to_string());
+                    turns.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     events.unbounded_send(HostEvent::TurnEnded { stop }).ok();
                     Ok(())
                 })?;
@@ -684,6 +718,11 @@ async fn open_session(
     let ours = routes
         .lock()
         .is_ok_and(|mut routes| routes.remove(&session_id, &events));
+    if ours && turns.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        connection
+            .send_notification(CancelNotification::new(session_id.clone()))
+            .ok();
+    }
     if ours && can.close {
         connection
             .send_request(CloseSessionRequest::new(session_id))
@@ -837,6 +876,18 @@ mod tests {
         routes.add(SessionId::new("b"), back_tx);
         routes.update(SessionId::new("b"), chunk("again"));
         assert_eq!(text(back_rx.try_recv().ok()), "again");
+
+        // A second conversation asking for a session another still listens to is refused, and
+        // takes none of its traffic; once that one lets go, the next one takes the session.
+        let (second_tx, mut second_rx) = mpsc::unbounded();
+        assert!(!routes.claim(SessionId::new("b"), second_tx.clone()));
+        routes.update(SessionId::new("b"), chunk("still the first's"));
+        assert_eq!(text(back_rx.try_recv().ok()), "still the first's");
+        assert!(second_rx.try_recv().is_err());
+        drop(back_rx);
+        assert!(routes.claim(SessionId::new("b"), second_tx));
+        routes.update(SessionId::new("b"), chunk("the second's"));
+        assert_eq!(text(second_rx.try_recv().ok()), "the second's");
     }
 }
 

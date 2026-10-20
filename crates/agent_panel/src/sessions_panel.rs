@@ -8,6 +8,7 @@
 //! its own tab, or shows the tab it is in.
 
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::SessionInfo;
@@ -23,7 +24,7 @@ use studio_settings::StudioSettings;
 use studio_ui::ds;
 use studio_ui::ds::Prose as _;
 use studio_ui::menu::ContextMenu;
-use studio_workspace::{ToastKind, Workspace};
+use studio_workspace::{ToastKind, Workspace, WorkspaceEvent};
 use ui::prelude::*;
 use ui::{Indicator, PopoverMenu, Tooltip, right_click_menu};
 
@@ -49,6 +50,9 @@ pub struct SessionsPanel {
     /// Something the rows are made from changed (the conversations, the search, the graph,
     /// what shows): they are made again at the next draw, not at every frame.
     rows_stale: bool,
+    /// The conversation of the tab shown as last seen, so the list draws again when another
+    /// is shown, not whenever the workspace does.
+    shown_conversation: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -67,7 +71,9 @@ enum ListRow {
         count: usize,
         open: bool,
     },
-    Conversation(String),
+    /// A conversation's row, with its record as the list was made: the list is made again
+    /// when any record changes, so a frame does not look each one up.
+    Conversation(Rc<SessionRecord>),
     End,
 }
 
@@ -109,9 +115,26 @@ impl SessionsPanel {
                 }
             }),
         ];
-        // The shown tab marks its conversation; the graph decides which are listed.
+        // The graph decides which are listed, so a graph shown or closed makes the rows again.
+        // The shown tab marks its conversation, drawn as the rows draw: the workspace redraws
+        // for many things (a spinner's frame, a toast), and only a change of the tab shown
+        // draws the list again.
         if let Some(workspace) = workspace.upgrade() {
-            subscriptions.push(cx.observe(&workspace, |this, _, cx| this.rows_changed(cx)));
+            subscriptions.push(
+                cx.subscribe(
+                    &workspace,
+                    |this, _, event: &WorkspaceEvent, cx| match event {
+                        WorkspaceEvent::SessionChanged => this.rows_changed(cx),
+                    },
+                ),
+            );
+            subscriptions.push(cx.observe(&workspace, |this, _, cx| {
+                let shown = this.shown(cx);
+                if shown != this.shown_conversation {
+                    this.shown_conversation = shown;
+                    cx.notify();
+                }
+            }));
         }
         Self {
             workspace,
@@ -123,6 +146,7 @@ impl SessionsPanel {
             list_state: ListState::new(0, ListAlignment::Top, px(ds::size::SIDEBAR_ROW * 8.)),
             rows: Vec::new(),
             rows_stale: true,
+            shown_conversation: None,
             _subscriptions: subscriptions,
         }
     }
@@ -139,16 +163,19 @@ impl SessionsPanel {
         Some(session.read(cx).settings_key(cx))
     }
 
-    /// The conversation in the shown tab.
+    /// The conversation in the shown tab; a new one has none until the agent names it.
     fn shown(&self, cx: &App) -> Option<String> {
         let workspace = self.workspace.upgrade()?;
         let key = workspace.read(cx).active_item()?.dedupe_key(cx)?;
-        let id = key.strip_prefix("agent:")?;
-        (!id.starts_with("new:")).then(|| id.to_owned())
+        key.strip_prefix("agent:").map(str::to_owned)
     }
 
-    /// The agent the settings name, if any.
+    /// The agent the settings name, as this panel runs it to import or delete conversations;
+    /// none on Windows, where the agent panel does not run agents yet.
     fn agent(cx: &App) -> Option<AgentLaunch> {
+        if cfg!(windows) {
+            return None;
+        }
         let settings = &StudioSettings::get(cx).agent;
         (!settings.command.is_empty()).then(|| AgentLaunch {
             command: settings.command.clone(),
@@ -226,7 +253,11 @@ impl SessionsPanel {
         else {
             self.toast(
                 ToastKind::Info,
-                "Removed. Another agent holds the conversation, so it stays there.",
+                if cfg!(windows) {
+                    "Removed here. Agents do not run on Windows yet, so it stays at the agent."
+                } else {
+                    "Removed. Another agent holds the conversation, so it stays there."
+                },
                 cx,
             );
             return;
@@ -574,7 +605,7 @@ impl SessionsPanel {
             .into_iter()
             .filter(matches)
             .collect();
-        let id = |record: &&SessionRecord| ListRow::Conversation(record.session.clone());
+        let id = |record: &&SessionRecord| ListRow::Conversation(Rc::new((*record).clone()));
         let mut rows = Vec::new();
         if self.search_open || searching {
             rows.push(ListRow::Search);
@@ -651,11 +682,8 @@ impl SessionsPanel {
                     }))
                     .into_any_element()
             }
-            ListRow::Conversation(id) => {
-                let Some(record) = self.sessions.read(cx).get(&id).cloned() else {
-                    return div().into_any_element();
-                };
-                let shown = self.shown(cx).as_deref() == Some(id.as_str());
+            ListRow::Conversation(record) => {
+                let shown = self.shown(cx).as_deref() == Some(record.session.as_str());
                 self.row(&record, shown, cx)
             }
             ListRow::End => div().h(px(ds::space::SM)).into_any_element(),
@@ -828,8 +856,6 @@ impl Render for DeleteConversation {
     }
 }
 
-/// When a conversation was last active, as a sidebar fits it: "now", "5m", "3h", "2d", "12 Oct",
-/// and "Oct 2025" from another year.
 /// The agent's name from its command: the package or program, without a version or path.
 fn agent_name(command: &str) -> String {
     let program = command
