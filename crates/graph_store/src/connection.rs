@@ -42,12 +42,10 @@ pub enum ConnectionState {
     TooOld {
         version: String,
     },
+    /// The server answered 401: the token sent was refused, or none was sent
+    /// ([`Connection::token_unread`] says why when the keychain did not give one).
     Unauthorized,
     Unreachable(String),
-    /// The server's token could not be read from the OS keychain (locked, or access denied),
-    /// for this reason. Studio does not connect without it, which the server would refuse as a
-    /// wrong token; a token typed in connects ([`Connection::set_token`]).
-    TokenUnreadable(String),
 }
 
 impl ConnectionState {
@@ -70,7 +68,6 @@ impl ConnectionState {
             }
             ConnectionState::Unauthorized => "Token refused".into(),
             ConnectionState::Unreachable(_) => "Unreachable".into(),
-            ConnectionState::TokenUnreadable(_) => "Token not read from the keychain".into(),
         }
     }
 }
@@ -103,6 +100,10 @@ pub struct Connection {
     /// Why the token last typed for this server could not be saved to the OS keychain: it
     /// lasts this run only. `None` once one is saved.
     pub token_unsaved: Option<String>,
+    /// Why the token saved for this server could not be read from the OS keychain (locked,
+    /// access denied, no keychain service): Studio connects without one, which a server that
+    /// asks for none accepts. `None` once a token is set.
+    pub token_unread: Option<String>,
     _task: Option<Task<()>>,
     /// The next health re-check (spec 003).
     _health_check: Option<Task<()>>,
@@ -119,6 +120,15 @@ const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 impl EventEmitter<ConnectionEvent> for Connection {}
 
 impl Connection {
+    /// The status-bar text for its state: a token refused because none could be read from the
+    /// keychain says so, rather than that a token was refused.
+    pub fn label(&self) -> String {
+        match (&self.state, &self.token_unread) {
+            (ConnectionState::Unauthorized, Some(_)) => "Token not read from the keychain".into(),
+            (state, _) => state.label(),
+        }
+    }
+
     pub fn new(
         server: ServerEntry,
         token: Option<String>,
@@ -133,6 +143,7 @@ impl Connection {
             latency: None,
             graphs: GraphListing::Unknown,
             token_unsaved: None,
+            token_unread: None,
             _task: None,
             _health_check: None,
             token_pending: false,
@@ -146,35 +157,23 @@ impl Connection {
     }
 
     /// Takes the token read from the OS keychain, which is none when none was saved. One that
-    /// could not be read ends the wait without connecting
-    /// ([`ConnectionState::TokenUnreadable`]).
+    /// could not be read ends the wait too: Studio connects without a token and keeps why
+    /// ([`Connection::token_unread`]). A server that asks for one answers 401, and a token
+    /// typed in then connects.
     pub(crate) fn token_read(
         &mut self,
         read: anyhow::Result<Option<(String, Vec<u8>)>>,
         cx: &mut Context<Self>,
     ) {
-        let token = match read {
-            Ok(None) => None,
+        let (token, unread) = match read {
+            Ok(None) => (None, None),
             Ok(Some((_, bytes))) => match String::from_utf8(bytes) {
-                Ok(token) => Some(token),
-                Err(_) => {
-                    return self.token_unreadable("The keychain's entry is not text.".into(), cx);
-                }
+                Ok(token) => (Some(token), None),
+                Err(_) => (None, Some("the keychain's entry is not text".to_owned())),
             },
-            Err(error) => return self.token_unreadable(error.to_string(), cx),
+            Err(error) => (None, Some(error.to_string())),
         };
-        self.set_token(token, cx);
-    }
-
-    /// Ends the wait for a token that could not be read, for `reason`: nothing connects until
-    /// one is typed in.
-    fn token_unreadable(&mut self, reason: String, cx: &mut Context<Self>) {
-        self.token_pending = false;
-        self._task = None;
-        self._health_check = None;
-        self.state = ConnectionState::TokenUnreadable(reason);
-        cx.emit(ConnectionEvent::StateChanged);
-        cx.notify();
+        self.replace_token(token, unread, cx);
     }
 
     /// Records how saving the token to the OS keychain ended ([`Connection::token_unsaved`]).
@@ -230,14 +229,25 @@ impl Connection {
     /// CLI's files (spec 003). Requests made after this use it, and a connection in use checks
     /// again; one not yet used connects when it is.
     pub fn set_token(&mut self, token: Option<String>, cx: &mut Context<Self>) {
+        self.replace_token(token, None, cx);
+    }
+
+    /// Replaces the token, keeping `unread` as why the keychain did not give one.
+    fn replace_token(
+        &mut self,
+        token: Option<String>,
+        unread: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.token_pending = false;
         self.client.set_token(token);
-        if let ConnectionState::TokenUnreadable(_) = self.state {
-            // The token missing is in.
-            self.state = ConnectionState::Connecting;
-        }
+        let unread_changed = unread != self.token_unread;
+        self.token_unread = unread;
         if self.state != ConnectionState::Idle {
             self.connect(cx);
+        } else if unread_changed {
+            cx.emit(ConnectionEvent::StateChanged);
+            cx.notify();
         }
     }
 
@@ -253,12 +263,8 @@ impl Connection {
         }
     }
 
-    /// Checks health and contract, then reads the graph list. A connection whose token could
-    /// not be read stays as it is until one is typed in.
+    /// Checks health and contract, then reads the graph list.
     pub fn connect(&mut self, cx: &mut Context<Self>) {
-        if let ConnectionState::TokenUnreadable(_) = self.state {
-            return;
-        }
         self.state = ConnectionState::Connecting;
         // The probe schedules the next check when it ends.
         self._health_check = None;
@@ -456,6 +462,9 @@ mod tests {
     async fn a_connect_waits_for_its_token_and_a_cancel_stays(cx: &mut TestAppContext) {
         let sent = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
         let seen = sent.clone();
+        // Whether the server answers a read sent without a token; it answers 401 otherwise.
+        let open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let answers_anyone = open.clone();
         let http = FakeHttpClient::create(move |request| {
             let path = request.uri().path().to_owned();
             let token = request
@@ -463,15 +472,23 @@ mod tests {
                 .get("authorization")
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
+            let refused = token.is_none()
+                && !answers_anyone.load(std::sync::atomic::Ordering::SeqCst)
+                && !path.ends_with("/healthz");
             seen.lock().unwrap().push(token);
             async move {
-                let body = if path.ends_with("/healthz") {
-                    r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#
+                let (status, body) = if path.ends_with("/healthz") {
+                    (
+                        200,
+                        r#"{"status":"ok","version":"0.14.0","internal_schema_version":16}"#,
+                    )
+                } else if refused {
+                    (401, r#"{"error":"unauthorized","code":"unauthorized"}"#)
                 } else {
-                    r#"{"graphs":[]}"#
+                    (200, r#"{"graphs":[]}"#)
                 };
                 Ok(Response::builder()
-                    .status(200)
+                    .status(status)
                     .header(graph_client::CONTRACT_HEADER, "0.13")
                     .body(AsyncBody::from(body))
                     .unwrap())
@@ -518,27 +535,36 @@ mod tests {
             assert_eq!(connection.state, ConnectionState::Idle);
         });
 
-        // A token the keychain could not give: the wait ends without connecting, which the
-        // server would refuse as a wrong token, and a connect asked for later sends nothing.
-        // A token typed in connects. A token that could not be saved says so.
+        // A token the keychain could not give: the wait ends and Studio connects without one,
+        // keeping why. A server that asks for no token is ready.
+        let read_failed = |cx: &mut TestAppContext| {
+            sent.lock().unwrap().clear();
+            connection.update(cx, |connection, cx| {
+                connection.await_token();
+                connection.connect(cx);
+                connection.token_read(Err(anyhow::anyhow!("the keychain is locked")), cx);
+            });
+            cx.run_until_parked();
+            let sent = sent.lock().unwrap();
+            assert!(!sent.is_empty(), "connected without the token");
+            assert!(sent.iter().all(Option::is_none), "no token sent");
+            drop(sent);
+            connection.read_with(cx, |connection, _| {
+                assert_eq!(
+                    connection.token_unread.as_deref(),
+                    Some("the keychain is locked")
+                );
+                connection.state.clone()
+            })
+        };
+        open.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(read_failed(cx), ConnectionState::Ready);
+
+        // A server that asks for one answers 401; a token typed in connects and ends the
+        // keychain's reason. A token that could not be saved says so.
+        open.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(read_failed(cx), ConnectionState::Unauthorized);
         sent.lock().unwrap().clear();
-        connection.update(cx, |connection, cx| {
-            connection.await_token();
-            connection.connect(cx);
-            connection.token_read(Err(anyhow::anyhow!("the keychain is locked")), cx);
-            connection.connect(cx);
-        });
-        cx.run_until_parked();
-        connection.read_with(cx, |connection, _| {
-            assert_eq!(
-                connection.state,
-                ConnectionState::TokenUnreadable("the keychain is locked".into())
-            )
-        });
-        assert!(
-            sent.lock().unwrap().is_empty(),
-            "nothing sent without the token"
-        );
         connection.update(cx, |connection, cx| {
             connection.set_token(Some("typed".into()), cx);
             connection.token_saved(Err("access denied".into()), cx);
@@ -546,6 +572,7 @@ mod tests {
         cx.run_until_parked();
         connection.read_with(cx, |connection, _| {
             assert_eq!(connection.state, ConnectionState::Ready);
+            assert_eq!(connection.token_unread, None);
             assert_eq!(connection.token_unsaved.as_deref(), Some("access denied"));
         });
         assert!(

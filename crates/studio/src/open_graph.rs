@@ -323,20 +323,26 @@ impl OpenGraphModal {
             return v_flex().child(studio_ui::ds::text::state("Add a server to start."));
         };
         let c = connection.read(cx);
-        let status = match &c.state {
-            ConnectionState::Unreachable(error) => format!("Could not reach the server: {error}"),
-            ConnectionState::Unauthorized => "The server refused the token.".into(),
-            ConnectionState::TokenUnreadable(reason) => {
-                format!("Studio could not read the token from the keychain: {reason}")
+        let status = match (&c.state, &c.token_unread) {
+            (ConnectionState::Unreachable(error), _) => {
+                format!("Could not reach the server: {error}")
             }
-            state => state.label(),
+            (ConnectionState::Unauthorized, Some(reason)) => format!(
+                "The server asks for a token, and Studio could not read it from the keychain: \
+                 {reason}"
+            ),
+            (ConnectionState::Unauthorized, None) => "The server refused the token.".into(),
+            (state, _) => state.label(),
         };
         let state = c.state.clone();
-        // A token typed in replaces one the server refused or the keychain would not give.
-        let asks_token = matches!(
-            state,
-            ConnectionState::Unauthorized | ConnectionState::TokenUnreadable(_)
-        );
+        // A token typed in replaces one the server refused, or one the keychain would not give
+        // to a server that asks for one.
+        let asks_token = state == ConnectionState::Unauthorized;
+        // Why the keychain gave no token, under a status that does not say it already.
+        let unread = c
+            .token_unread
+            .clone()
+            .filter(|_| state != ConnectionState::Unauthorized);
         let unsaved = c.token_unsaved.clone();
         let cli = c.server.source == ServerSource::Cli;
         let selected = connection.clone();
@@ -384,6 +390,14 @@ impl OpenGraphModal {
                         _ => row,
                     }),
             )
+            .children(unread.map(|reason| {
+                div()
+                    .px(px(space::MD))
+                    .child(studio_ui::ds::text::muted(format!(
+                        "Studio could not read the token from the keychain: {reason}. It \
+                         connects without one."
+                    )))
+            }))
             .children(unsaved.map(|reason| {
                 div()
                     .px(px(space::MD))

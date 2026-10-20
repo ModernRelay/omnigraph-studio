@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use futures::FutureExt as _;
@@ -539,6 +540,12 @@ pub struct GraphSession {
     /// A read of the schema the person asked for is under way: a recheck in its place would
     /// cancel it, and it reads the newest schema anyway.
     reloading_schema: bool,
+    /// A recheck of the schema under way ([`Self::recheck_schema`]), and whether its read has
+    /// left: one at a time, so a reason to check met meanwhile neither cancels it nor sends
+    /// another. One met after the read left checks once more when it is back
+    /// (`recheck_schema_again`), since that read may have missed what moved.
+    schema_recheck: Option<Arc<AtomicBool>>,
+    recheck_schema_again: bool,
     /// The property chosen to name each type's nodes in this graph (spec 002, "Node names"),
     /// as the settings held it when the schema was last named by it.
     labels: BTreeMap<String, String>,
@@ -611,6 +618,8 @@ impl GraphSession {
             _recheck: None,
             watched: Vec::new(),
             reloading_schema: false,
+            schema_recheck: None,
+            recheck_schema_again: false,
             labels: BTreeMap::new(),
             _settings: None,
             _schema_task: None,
@@ -818,6 +827,9 @@ impl GraphSession {
             self.schema = Loadable::Loading;
         }
         self.reloading_schema = true;
+        // Takes a recheck's place: this read is sent after whatever asked for one.
+        self.schema_recheck = None;
+        self.recheck_schema_again = false;
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         // Read and compiled off the main thread: a large schema takes a while to compile.
@@ -942,7 +954,7 @@ impl GraphSession {
 
     /// Reads the schema again while keeping the one held, and takes it if its text changed: a
     /// head move, or a head probe the server refused, showed another writer may have changed
-    /// it.
+    /// it. `read` is a text read already, which is taken without asking again.
     fn recheck_schema(
         &mut self,
         read: Option<graph_client::api::SchemaOutput>,
@@ -953,13 +965,28 @@ impl GraphSession {
         if self.reloading_schema {
             return;
         }
+        // One at a time. A read not yet sent answers for this reason too; one sent may have
+        // been answered before what moved, so the schema is asked once more after it.
+        if let Some(sent) = &self.schema_recheck {
+            if sent.load(Ordering::SeqCst) {
+                self.recheck_schema_again = true;
+            }
+            return;
+        }
+        // A text read already was read before this reason to check, as a read sent is.
+        let sent = Arc::new(AtomicBool::new(read.is_some()));
+        self.schema_recheck = Some(sent.clone());
+        self.recheck_schema_again = false;
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         let known = self.schema_text.clone();
         let read = cx.background_spawn(async move {
             let read = match read {
                 Some(output) => Ok(output),
-                None => client.schema(&graph).await,
+                None => {
+                    sent.store(true, Ordering::SeqCst);
+                    client.schema(&graph).await
+                }
             };
             // Compiled off the main thread, and only when it is another text.
             let parsed = read
@@ -972,6 +999,8 @@ impl GraphSession {
         self._schema_task = Some(cx.spawn(async move |this, cx| {
             let (read, parsed) = read.await;
             this.update(cx, |this, cx| {
+                this.schema_recheck = None;
+                let again = std::mem::take(&mut this.recheck_schema_again);
                 this.note_read(&read, cx);
                 if let Some(Loadable::Loaded(model)) = parsed
                     && this.schema_text.as_deref() != Some(&*model.source)
@@ -984,6 +1013,10 @@ impl GraphSession {
                     // The heads are asked after under it: the server refuses a head probe of
                     // a type the old one named and this one renamed or dropped.
                     this.check_heads(cx);
+                }
+                // A recheck the heads started since is sent after the reasons met meanwhile.
+                if again && this.schema_recheck.is_none() {
+                    this.recheck_schema(None, cx);
                 }
             })
             .ok();
@@ -1456,8 +1489,9 @@ impl GraphSession {
 
     /// Reads `branch`'s change feed after the newest commit its log holds, up to the feed's
     /// head, asked only about the types views read: every change carries its images, so an
-    /// unfiltered read costs what every type wrote.
-    fn read_changes(&mut self, branch: &str, cx: &mut Context<Self>) {
+    /// unfiltered read costs what every type wrote. `own` is a head that one of Studio's own
+    /// commits moved.
+    fn read_changes(&mut self, branch: &str, own: bool, cx: &mut Context<Self>) {
         if self.change_reads.contains_key(branch) {
             self.change_reads_again.insert(branch.to_owned());
             return;
@@ -1476,11 +1510,14 @@ impl GraphSession {
             return;
         };
         if names.is_empty() {
-            // Nobody reads the branch: the log starts again at its head. The schema is still
-            // compared, as the feed read would: another writer may have changed it, and a query
-            // editor or History open on the graph reads under it.
+            // Nobody reads the branch: the log starts again at its head. Another writer's
+            // commit may have changed the schema, which a query editor or History open on the
+            // graph reads under: it is compared, as the feed read would. Studio's own data
+            // commit changes no schema.
             log.last = Some(head);
-            self.recheck_schema(None, cx);
+            if !own {
+                self.recheck_schema(None, cx);
+            }
             return;
         }
         let (client, graph, epoch) = (self.client(cx), self.graph_id.clone(), self.schema_epoch);
@@ -1575,7 +1612,7 @@ impl GraphSession {
                     this.recheck_schema(read, cx);
                 }
                 if this.change_reads_again.remove(&branch) {
-                    this.read_changes(&branch, cx);
+                    this.read_changes(&branch, false, cx);
                 }
             })
             .ok();
@@ -1744,7 +1781,7 @@ impl GraphSession {
         }
         self.heads.insert(branch.clone(), head.clone());
         // Before views hear of the move, so they find the read under way.
-        self.read_changes(&branch, cx);
+        self.read_changes(&branch, own || placed, cx);
         if previous.is_some() && !own && !placed {
             self.commit_lists.forget(&branch);
             self.head_commits.forget(&branch);
@@ -4923,6 +4960,53 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(held(cx), (added, Some("c3".into())));
         assert_eq!(moved.get(), 2);
+    }
+
+    /// Rechecks of the schema go one at a time: reasons met before a read leaves are answered
+    /// by it, and one met after it left asks once more once it is back. Studio's own commit to
+    /// a branch no view reads changes no schema, and reads none.
+    #[gpui::test]
+    async fn schema_rechecks_go_one_at_a_time(cx: &mut TestAppContext) {
+        use crate::test_server::followed_session;
+        use serde_json::json;
+
+        const SCHEMA: &str = "node Person {\n  slug: String @key\n}\n";
+        let (session, served) = followed_session(SCHEMA, |_| json!([]), cx);
+        let reads = |cx: &mut TestAppContext| {
+            cx.run_until_parked();
+            std::mem::take(&mut served.lock().unwrap().schema_reads)
+        };
+        reads(cx);
+
+        session.update(cx, |session, cx| {
+            for _ in 0..3 {
+                session.recheck_schema(None, cx);
+            }
+        });
+        assert_eq!(reads(cx), 1);
+
+        session.update(cx, |session, cx| {
+            session.recheck_schema(None, cx);
+            // Its read has left: reasons met now ask once more after it.
+            session
+                .schema_recheck
+                .as_ref()
+                .unwrap()
+                .store(true, Ordering::SeqCst);
+            session.recheck_schema(None, cx);
+            session.recheck_schema(None, cx);
+        });
+        assert_eq!(reads(cx), 2);
+
+        served.lock().unwrap().commit("c2", Vec::new());
+        session.update(cx, |session, cx| {
+            session.committed("main".into(), "c2".into(), Some("c1".into()), cx)
+        });
+        assert_eq!(reads(cx), 0);
+        assert_eq!(
+            session.read_with(cx, |session, _| session.head("main").map(str::to_owned)),
+            Some("c2".into())
+        );
     }
 
     /// A head move reads the change feed after the commit the log last holds, asked only about
