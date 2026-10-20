@@ -46,6 +46,9 @@ pub struct SessionsPanel {
     /// The list drawn, as descriptors: only the visible rows are built (constitution IX).
     list_state: ListState,
     rows: Vec<ListRow>,
+    /// Something the rows are made from changed (the conversations, the search, the graph,
+    /// what shows): they are made again at the next draw, not at every frame.
+    rows_stale: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -54,7 +57,7 @@ pub struct SessionsPanel {
 #[derive(Clone, PartialEq)]
 enum ListRow {
     Search,
-    Note(SharedString),
+    Note(Note),
     /// A section's label; the first sits under the panel's own title, not a section's gap.
     Label {
         title: &'static str,
@@ -66,6 +69,13 @@ enum ListRow {
     },
     Conversation(String),
     End,
+}
+
+/// The note a list with no conversation row shows.
+#[derive(Clone, Copy, PartialEq)]
+enum Note {
+    NoMatch,
+    NoConversations,
 }
 
 /// What a row shows at its end.
@@ -93,16 +103,16 @@ impl SessionsPanel {
             editor
         });
         let mut subscriptions = vec![
-            cx.observe(&sessions, |_, _, cx| cx.notify()),
-            cx.subscribe(&search, |_, _, event: &EditorEvent, cx| {
+            cx.observe(&sessions, |this, _, cx| this.rows_changed(cx)),
+            cx.subscribe(&search, |this, _, event: &EditorEvent, cx| {
                 if let EditorEvent::BufferEdited = event {
-                    cx.notify();
+                    this.rows_changed(cx);
                 }
             }),
         ];
         // The shown tab marks its conversation; the graph decides which are listed.
         if let Some(workspace) = workspace.upgrade() {
-            subscriptions.push(cx.observe(&workspace, |_, _, cx| cx.notify()));
+            subscriptions.push(cx.observe(&workspace, |this, _, cx| this.rows_changed(cx)));
         }
         Self {
             workspace,
@@ -113,8 +123,15 @@ impl SessionsPanel {
             search_open: false,
             list_state: ListState::new(0, ListAlignment::Top, px(ds::size::SIDEBAR_ROW * 8.)),
             rows: Vec::new(),
+            rows_stale: true,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// The rows are made again at the next draw.
+    fn rows_changed(&mut self, cx: &mut Context<Self>) {
+        self.rows_stale = true;
+        cx.notify();
     }
 
     fn graph(&self, cx: &App) -> Option<String> {
@@ -257,7 +274,7 @@ impl SessionsPanel {
             self.search
                 .update(cx, |editor, cx| editor.clear(window, cx));
         }
-        cx.notify();
+        self.rows_changed(cx);
     }
 
     /// Adds the agent's conversations in this graph's directory that the list does not have.
@@ -576,15 +593,9 @@ impl SessionsPanel {
         }
         if pinned.is_empty() && recent.is_empty() && archived.is_empty() {
             rows.push(ListRow::Note(if searching {
-                "No conversation matches.".into()
+                Note::NoMatch
             } else {
-                match studio_ui::shortcut_text(&studio_actions::agent::OpenAgent, cx) {
-                    Some(keys) => {
-                        format!("No conversations yet. Ask the agent from the Agent tab ({keys}).")
-                            .into()
-                    }
-                    None => "No conversations yet. Ask the agent from the Agent tab.".into(),
-                }
+                Note::NoConversations
             }));
         }
         if !pinned.is_empty() {
@@ -628,7 +639,19 @@ impl SessionsPanel {
                     this.toggle_search(window, cx);
                 }))
                 .into_any_element(),
-            ListRow::Note(note) => ds::sidebar_note(note).into_any_element(),
+            // Its words are made as it draws: the shortcut they name follows the keymap.
+            ListRow::Note(Note::NoMatch) => {
+                ds::sidebar_note("No conversation matches.").into_any_element()
+            }
+            ListRow::Note(Note::NoConversations) => ds::sidebar_note(
+                match studio_ui::shortcut_text(&studio_actions::agent::OpenAgent, cx) {
+                    Some(keys) => {
+                        format!("No conversations yet. Ask the agent from the Agent tab ({keys}).")
+                    }
+                    None => "No conversations yet. Ask the agent from the Agent tab.".to_owned(),
+                },
+            )
+            .into_any_element(),
             ListRow::Label { title, first } => ds::section_label(title)
                 .when(first, |label| label.pt(px(ds::space::XS)))
                 .into_any_element(),
@@ -636,7 +659,7 @@ impl SessionsPanel {
                 ds::section_disclosure("archived", "Archived", count, open)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.show_archived = !this.show_archived;
-                        cx.notify();
+                        this.rows_changed(cx);
                     }))
                     .into_any_element()
             }
@@ -657,8 +680,11 @@ impl Render for SessionsPanel {
         let Some(graph) = self.graph(cx) else {
             return v_flex().into_any_element();
         };
-        let rows = self.list_rows(&graph, cx);
-        studio_ui::rows::sync(&self.list_state, &mut self.rows, rows);
+        if self.rows_stale {
+            let rows = self.list_rows(&graph, cx);
+            studio_ui::rows::sync(&self.list_state, &mut self.rows, rows);
+            self.rows_stale = false;
+        }
         list(
             self.list_state.clone(),
             // A row's root takes the list's width, so a note wraps at it.

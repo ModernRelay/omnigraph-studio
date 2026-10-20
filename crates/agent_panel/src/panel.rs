@@ -261,6 +261,10 @@ enum Block {
     Exited,
 }
 
+/// What a thread was brought up to: its entries' version, its folds' count, and how the agent
+/// stopped ([`AgentPanel::thread_key`]).
+type ThreadKey = (u64, u64, Option<u64>);
+
 /// The thread's entries, and what each shows folded to a number, kept as they change: a
 /// streamed token rehashes the entry it lands in, not the whole conversation (a tool's input
 /// can hold a whole file). Every way to change an entry marks it, so none goes stale.
@@ -270,6 +274,8 @@ struct Entries {
     hashes: Vec<u64>,
     /// The first entry whose hash may be stale.
     stale_from: usize,
+    /// Counts the changes: a draw that finds it as it last was has nothing to bring up to date.
+    version: u64,
 }
 
 impl std::ops::Deref for Entries {
@@ -282,10 +288,12 @@ impl std::ops::Deref for Entries {
 
 impl Entries {
     fn push(&mut self, entry: Entry) {
+        self.version += 1;
         self.list.push(entry);
     }
 
     fn get_mut(&mut self, index: usize) -> Option<&mut Entry> {
+        self.version += 1;
         self.stale_from = self.stale_from.min(index);
         self.list.get_mut(index)
     }
@@ -302,11 +310,13 @@ impl Entries {
         for (index, entry) in self.list.iter_mut().enumerate() {
             if change(entry) {
                 self.stale_from = self.stale_from.min(index);
+                self.version += 1;
             }
         }
     }
 
     fn clear(&mut self) {
+        self.version += 1;
         self.list.clear();
         self.hashes.clear();
         self.stale_from = 0;
@@ -541,6 +551,9 @@ pub struct AgentPanel {
     /// the blocks it last drew with their fingerprints, to remeasure only what changed.
     thread: ListState,
     shown_blocks: Vec<(Block, u64)>,
+    /// What the thread was last brought up to ([`AgentPanel::thread_key`]): a frame with
+    /// nothing new skips the walk of every entry.
+    synced_thread: Option<ThreadKey>,
     /// Each reply's markdown is watched: its parse finishes after the text arrives, and the
     /// block grows then.
     _markdown_watch: std::collections::HashMap<usize, Subscription>,
@@ -575,6 +588,8 @@ pub struct AgentPanel {
     expanded_activity: std::collections::HashSet<usize>,
     /// Query calls whose card is folded away, by entry.
     folded_queries: std::collections::HashSet<usize>,
+    /// Counts the changes to which runs are open and which queries folded.
+    folds: u64,
     queue: MessageQueue,
     /// Whether a CLI that speaks the graph's API was found for this conversation (spec 013);
     /// `None` while Studio looks.
@@ -702,6 +717,7 @@ impl AgentPanel {
                 thread
             },
             shown_blocks: Vec::new(),
+            synced_thread: None,
             _markdown_watch: std::collections::HashMap::new(),
             state: State::Setup,
             entries: Entries::default(),
@@ -721,6 +737,7 @@ impl AgentPanel {
             usage: None,
             expanded_activity: std::collections::HashSet::new(),
             folded_queries: std::collections::HashSet::new(),
+            folds: 0,
             queue: MessageQueue::default(),
             cli_ready: None,
             cli_waiting: Vec::new(),
@@ -1046,6 +1063,7 @@ impl AgentPanel {
         self.markdown.clear();
         self.expanded_activity.clear();
         self.folded_queries.clear();
+        self.folds += 1;
         self.usage = None;
     }
 
@@ -2530,8 +2548,12 @@ impl Render for AgentPanel {
         let body = match &self.state {
             State::Setup => self.render_setup(cx).into_any_element(),
             _ => {
-                self.sync_markdown(cx);
-                self.sync_thread(cx);
+                let key = self.thread_key();
+                if self.synced_thread != Some(key) {
+                    self.sync_markdown(cx);
+                    self.sync_thread(cx);
+                    self.synced_thread = Some(key);
+                }
                 self.render_thread(window, cx).into_any_element()
             }
         };
@@ -2743,6 +2765,21 @@ impl AgentPanel {
                             ),
                     ),
             )
+    }
+
+    /// What the thread's blocks are made from: its entries, which runs are open and which
+    /// queries folded, and how the agent stopped, if it did.
+    fn thread_key(&self) -> ThreadKey {
+        use std::hash::{Hash, Hasher};
+        let exited = match &self.state {
+            State::Exited { message, stderr } => {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                (message, stderr).hash(&mut hasher);
+                Some(hasher.finish())
+            }
+            _ => None,
+        };
+        (self.entries.version, self.folds, exited)
     }
 
     /// Brings each agent reply's markdown up to its text: new replies get an entity, a growing
@@ -3105,6 +3142,7 @@ impl AgentPanel {
                 if !this.folded_queries.remove(&index) {
                     this.folded_queries.insert(index);
                 }
+                this.folds += 1;
                 cx.notify();
             }));
         let highlights = tokens.into_iter().filter_map(|token| {
@@ -3186,6 +3224,7 @@ impl AgentPanel {
                 if !this.expanded_activity.remove(&start) {
                     this.expanded_activity.insert(start);
                 }
+                this.folds += 1;
                 cx.notify();
             }));
         gutter_row(
