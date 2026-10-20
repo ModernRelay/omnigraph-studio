@@ -2888,7 +2888,7 @@ impl NodePeek {
         let branch = self.session.read(cx).branch.clone();
         let label = match count {
             1 => "1 change not saved".to_owned(),
-            n => format!("{n} changes not saved"),
+            n => format!("{} changes not saved", studio_ui::group_digits(n)),
         };
         Some(
             h_flex()

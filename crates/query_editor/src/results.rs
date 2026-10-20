@@ -355,12 +355,12 @@ pub fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
-/// `1 row`, `12 rows`.
+/// `1 row`, `12,480 rows`: grouped, as Studio writes every count.
 pub fn rows_label(count: i64) -> String {
     if count == 1 {
         "1 row".into()
     } else {
-        format!("{count} rows")
+        format!("{} rows", studio_ui::group_count(count))
     }
 }
 
@@ -587,6 +587,7 @@ mod tests {
         assert_eq!(format_elapsed(Duration::from_millis(1250)), "1.2 s");
         assert_eq!(rows_label(1), "1 row");
         assert_eq!(rows_label(0), "0 rows");
+        assert_eq!(rows_label(12_480), "12,480 rows");
     }
 
     #[test]

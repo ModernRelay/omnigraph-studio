@@ -1381,7 +1381,7 @@ impl TypeTable {
             .border_b_1()
             .border_color(border)
             .child(
-                studio_ui::ds::text::body(format!("{count} rows selected"))
+                studio_ui::ds::text::body(format!("{} selected", plural(count, "row", "rows")))
                     .weight(studio_ui::ds::text::weight::HEADING),
             );
         if read_only {
@@ -7010,9 +7010,10 @@ fn filter_placeholder(op: FilterOp) -> &'static str {
     }
 }
 
-/// "1 draft", "3 drafts".
+/// "1 draft", "3 drafts", "1,200 rows": the count grouped, as Studio writes every count.
 fn plural(count: usize, one: &str, many: &str) -> String {
-    format!("{count} {}", if count == 1 { one } else { many })
+    let word = if count == 1 { one } else { many };
+    format!("{} {word}", studio_ui::group_digits(count))
 }
 
 fn set_value(row: &mut Row, column: &str, value: Value) {
