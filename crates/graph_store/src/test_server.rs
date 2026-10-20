@@ -18,6 +18,8 @@ pub(crate) type Rows = Box<dyn Fn(&Value) -> Value + Send>;
 pub(crate) struct Served {
     pub head: String,
     pub schema: String,
+    /// The schema read fails, as a server that cannot answer it.
+    pub schema_fails: bool,
     /// Each commit with its parent and changes, oldest first.
     pub commits: Vec<(String, String, Vec<Value>)>,
     /// The query string of every feed read.
@@ -100,6 +102,7 @@ pub(crate) fn followed_session(
     let served = Arc::new(Mutex::new(Served {
         head: "c1".into(),
         schema: schema.into(),
+        schema_fails: false,
         commits: Vec::new(),
         feeds: Vec::new(),
         rows: Box::new(rows),
@@ -113,6 +116,15 @@ pub(crate) fn followed_session(
             let mut bytes = Vec::new();
             request.into_body().read_to_end(&mut bytes).await.ok();
             let mut served = state.lock().unwrap();
+            if path.ends_with("/schema") && served.schema_fails {
+                return Ok(Response::builder()
+                    .status(500)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(
+                        r#"{"error":"the schema could not be read"}"#,
+                    ))
+                    .unwrap());
+            }
             let body = if path.ends_with("/schema") {
                 json!({ "schema_source": served.schema })
             } else if path.ends_with("/changes") {

@@ -24,7 +24,7 @@ use graph_client::{
 };
 use serde_json::Value;
 
-use crate::carry::{ChangeLog, FeedFold, Since, answer_unchanged};
+use crate::carry::{ChangeLog, ChangesSince, FeedFold, Since, answer_unchanged};
 use crate::connection::Connection;
 use crate::degrees::{DEGREE_BATCH, DegreeBatchKey, DegreeBatches, page_counts};
 use crate::memo::{Held, Memo};
@@ -203,6 +203,18 @@ struct PinnedRead {
     schema: u64,
 }
 
+impl PinnedRead {
+    /// The key of `query` read at `commit` under schema epoch `schema`.
+    fn of(query: &BuiltQuery, commit: &str, schema: u64) -> Self {
+        Self {
+            commit: commit.to_owned(),
+            query: query.text.clone(),
+            params: params_key(&query.params),
+            schema,
+        }
+    }
+}
+
 /// One node's count through a relationship group, at a commit and schema epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DegreeAt {
@@ -258,6 +270,73 @@ fn params_key(params: &serde_json::Map<String, Value>) -> String {
 /// The first wait before a graph that answered 503 is asked again; it doubles up to the cap.
 const RECHECK_FIRST: Duration = Duration::from_secs(5);
 const RECHECK_CAP: Duration = Duration::from_secs(60);
+
+/// What an answer kept at an earlier commit of `log`'s branch gives for commit `to`: walks back
+/// from `to` past `kept`, the commits a family of answers was kept at, the newest first, and
+/// gives what `take` makes of the first that stands for `to` over the range since it. A commit
+/// whose answer is no longer held (`held` says) leaves `kept` first, so the walk never goes
+/// back for it.
+fn carry_back<T>(
+    log: Option<&ChangeLog>,
+    to: &str,
+    kept: &mut Vec<String>,
+    held: impl Fn(&str) -> bool,
+    mut take: impl FnMut(&str, &ChangesSince) -> Option<T>,
+) -> Option<T> {
+    kept.retain(|commit| commit == to || held(commit));
+    let mut remaining: HashSet<&str> = kept
+        .iter()
+        .map(String::as_str)
+        .filter(|commit| *commit != to)
+        .collect();
+    let mut found = None;
+    // One walk back from `to` gives the range since each kept commit it passes.
+    log?.since_each(to, |start, since| {
+        if !remaining.remove(start) {
+            return false;
+        }
+        found = take(start, since);
+        found.is_some() || remaining.is_empty()
+    });
+    found
+}
+
+/// The node reads a page of `type_name`'s nodes answers, each with its key at the page's commit
+/// under schema epoch `epoch`: the read of one node by its id, answered by its row.
+fn node_answers(
+    schema: &SchemaModel,
+    type_name: &str,
+    output: &ReadOutput,
+    epoch: u64,
+) -> Vec<(PinnedRead, ReadOutput)> {
+    let Some(commit) = &output.graph_commit_id else {
+        return Vec::new();
+    };
+    let rows = output
+        .rows
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    rows.iter()
+        .filter_map(|row| {
+            let id = row.get("n")?.get("@id")?.as_str()?;
+            let query = builder::node_by_id(schema, type_name, id).ok()?;
+            let key = PinnedRead::of(&query, commit, epoch);
+            let answer = ReadOutput {
+                query_name: query.name,
+                target: ReadTargetOutput {
+                    branch: None,
+                    snapshot: Some(commit.clone()),
+                },
+                row_count: 1,
+                columns: output.columns.clone(),
+                rows: Value::Array(vec![row.clone()]).into(),
+                graph_commit_id: Some(commit.clone()),
+            };
+            Some((key, answer))
+        })
+        .collect()
+}
 
 /// About what an answer takes in memory: its rows' text and numbers, and their containers.
 fn read_bytes(output: &ReadOutput) -> usize {
@@ -405,6 +484,12 @@ pub struct GraphSession {
     head_check_missed: bool,
     _head_poll: Option<Task<()>>,
     _recheck: Option<Task<()>>,
+    /// The branches watched at the last head check: one no longer watched has its moves go
+    /// unseen from then, so its commit list and head commit are read again when next asked for.
+    watched: Vec<String>,
+    /// A read of the schema the person asked for is under way: a recheck in its place would
+    /// cancel it, and it reads the newest schema anyway.
+    reloading_schema: bool,
     _schema_task: Option<Task<()>>,
     _branches_task: Option<Task<()>>,
     _datasets_task: Option<Task<()>>,
@@ -463,6 +548,8 @@ impl GraphSession {
             head_check_missed: false,
             _head_poll: None,
             _recheck: None,
+            watched: Vec::new(),
+            reloading_schema: false,
             _schema_task: None,
             _branches_task: None,
             _datasets_task: None,
@@ -655,8 +742,13 @@ impl GraphSession {
         Self::to_outcome(work, cx)
     }
 
+    /// Reads the schema again. One held stays while it is read, so views keep drawing it, and
+    /// stays if it cannot be read: a failed read says nothing about the schema.
     pub fn reload_schema(&mut self, cx: &mut Context<Self>) {
-        self.schema = Loadable::Loading;
+        if !matches!(self.schema, Loadable::Loaded(_)) {
+            self.schema = Loadable::Loading;
+        }
+        self.reloading_schema = true;
         let client = self.client(cx);
         let graph = self.graph_id.clone();
         // Read and compiled off the main thread: a large schema takes a while to compile.
@@ -676,16 +768,22 @@ impl GraphSession {
                 (Err(error), _) => Loadable::Failed(error.to_string()),
                 (Ok(()), None) => Loadable::Failed("The schema could not be read.".into()),
             };
-            this.update(cx, |this, cx| this.install_schema(result, cx))
-                .ok();
+            this.update(cx, |this, cx| {
+                this.reloading_schema = false;
+                this.install_schema(result, cx)
+            })
+            .ok();
         }));
     }
 
     /// Takes a schema read from the server at the person's asking, or the first: views take it
     /// at once ([`SessionEvent::SchemaChanged`]).
     fn install_schema(&mut self, schema: Loadable<Arc<SchemaModel>>, cx: &mut Context<Self>) {
-        if let Loadable::Loaded(model) = &schema {
-            self.start_schema_epoch(model);
+        match &schema {
+            Loadable::Loaded(model) => self.start_schema_epoch(model),
+            // The schema held is still the graph's.
+            _ if matches!(self.schema, Loadable::Loaded(_)) => return,
+            _ => {}
         }
         self.schema = schema;
         cx.emit(SessionEvent::SchemaChanged);
@@ -723,7 +821,7 @@ impl GraphSession {
     ) {
         // A reload under way reads the newest schema anyway, and views take it at once; a
         // recheck in its place would cancel it.
-        if matches!(self.schema, Loadable::Loading) {
+        if self.reloading_schema {
             return;
         }
         let client = self.client(cx);
@@ -760,8 +858,23 @@ impl GraphSession {
         }));
     }
 
+    /// Reads the branch list again. One held stays while it is read, and stays if it cannot
+    /// be read.
     pub fn reload_branches(&mut self, cx: &mut Context<Self>) {
-        self.branches = Loadable::Loading;
+        self.read_branches(None, cx);
+    }
+
+    /// [`Self::reload_branches`] after Studio made or deleted `changed`: its commit list and
+    /// head commit are read again when next asked for, whatever the lists show, since a branch
+    /// deleted and made again under its name has another history.
+    fn reload_branches_after(&mut self, changed: String, cx: &mut Context<Self>) {
+        self.read_branches(Some(changed), cx);
+    }
+
+    fn read_branches(&mut self, changed: Option<String>, cx: &mut Context<Self>) {
+        if !matches!(self.branches, Loadable::Loaded(_)) {
+            self.branches = Loadable::Loading;
+        }
         // A poll's list asked for before this would land as the newer one.
         self.branch_recheck = None;
         let client = self.client(cx);
@@ -776,21 +889,59 @@ impl GraphSession {
                 Err(error) => Loadable::Failed(error.to_string()),
             };
             this.update(cx, |this, cx| {
-                // A branch deleted and made again under its name has another history. The first
-                // list changes nothing read before it: lists asked for meanwhile (main's, as the
-                // window opens) stay, rather than being read twice.
-                if this.branches_read {
-                    this.commit_lists.clear();
-                    this.head_commits.clear();
+                if let Some(changed) = &changed {
+                    this.forget_branch(changed);
                 }
-                this.branches_read |= matches!(result, Loadable::Loaded(_));
-                this.branches = result;
+                let result = match result {
+                    Loadable::Loaded(branches) => branches,
+                    // The list held is still the graph's.
+                    _ if matches!(this.branches, Loadable::Loaded(_)) => return,
+                    failed => {
+                        this.branches = failed;
+                        cx.emit(SessionEvent::BranchesChanged);
+                        cx.notify();
+                        return;
+                    }
+                };
+                // The first list changes nothing read before it: lists asked for meanwhile
+                // (main's, as the window opens) stay, rather than being read twice.
+                if this.branches_read {
+                    this.forget_branches_changed(&result);
+                }
+                this.branches_read = true;
+                this.branches = Loadable::Loaded(result);
                 cx.emit(SessionEvent::BranchesChanged);
                 cx.notify();
                 this.leave_missing_branch(moves, cx);
             })
             .ok();
         }));
+    }
+
+    /// Forgets the commit list and head commit of every branch that came or went since the list
+    /// held, or of all of them when none is held to compare with: a branch made, or deleted and
+    /// made again under its name, has another history.
+    fn forget_branches_changed(&mut self, branches: &[String]) {
+        let Some(held) = self.branches.loaded() else {
+            self.commit_lists.clear();
+            self.head_commits.clear();
+            return;
+        };
+        let changed: Vec<String> = held
+            .iter()
+            .filter(|branch| !branches.contains(branch))
+            .chain(branches.iter().filter(|branch| !held.contains(branch)))
+            .cloned()
+            .collect();
+        for branch in &changed {
+            self.forget_branch(branch);
+        }
+    }
+
+    /// Forgets what was read of `branch`'s history: its commit list and head commit.
+    fn forget_branch(&mut self, branch: &String) {
+        self.commit_lists.forget(branch);
+        self.head_commits.forget(branch);
     }
 
     /// Moves the session to main when the branch list, asked for after its last move (`moves`),
@@ -956,6 +1107,20 @@ impl GraphSession {
             cx.notify();
         }
         removed
+    }
+
+    /// Lets go of every unsaved value on `branch`, which Studio deleted: a branch made again
+    /// under its name starts without them, and saving one could write it over a value that
+    /// only reads the same.
+    fn drop_drafts_of(&mut self, branch: &str, cx: &mut Context<Self>) {
+        if self
+            .drafts
+            .remove(branch)
+            .is_some_and(|drafts| !drafts.is_empty())
+        {
+            cx.emit(SessionEvent::DraftsChanged);
+            cx.notify();
+        }
     }
 
     /// The commit `branch`'s head was last seen at, once a watched branch has been asked after
@@ -1280,6 +1445,12 @@ impl GraphSession {
         self.heads.retain(|branch, _| watched.contains(branch));
         self.change_logs
             .retain(|branch, _| watched.contains(branch));
+        for branch in std::mem::replace(&mut self.watched, watched.clone()) {
+            if !watched.contains(&branch) {
+                self.commit_lists.forget(&branch);
+                self.head_commits.forget(&branch);
+            }
+        }
         if self.unavailable.is_some() {
             return;
         }
@@ -1348,10 +1519,7 @@ impl GraphSession {
                 };
                 let branches = branch_order(output.branches);
                 if this.branches.loaded() != Some(&branches) {
-                    // As after any branch list read: a branch deleted and made again under its
-                    // name has another history.
-                    this.commit_lists.clear();
-                    this.head_commits.clear();
+                    this.forget_branches_changed(&branches);
                     this.branches = Loadable::Loaded(branches);
                     cx.emit(SessionEvent::BranchesChanged);
                     cx.notify();
@@ -1377,7 +1545,7 @@ impl GraphSession {
             // A head read sent before this commit could answer with the head before it.
             self.head_reads.remove(&branch);
         }
-        let previous = self.heads.insert(branch.clone(), head.clone());
+        let previous = self.heads.get(&branch).cloned();
         if previous.as_deref() == Some(head.as_str()) {
             return;
         }
@@ -1386,11 +1554,13 @@ impl GraphSession {
             && parent != previous.as_deref()
             && self.watched_branches().contains(&branch)
         {
-            // Not on top of the head it replaces, which may be newer: a write that took
-            // minutes answers after the watch saw another writer's commit on top of it. The
-            // head is read again now rather than at the next poll.
-            self.read_head(branch.clone(), cx);
+            // Not on top of the head held, which may be newer: a write that took minutes
+            // answers after the watch saw another writer's commit on top of it. The head held
+            // stays, and is read again now rather than at the next poll to say which is newer.
+            self.read_head(branch, cx);
+            return;
         }
+        self.heads.insert(branch.clone(), head.clone());
         // Before views hear of the move, so they find the read under way.
         self.read_changes(&branch, cx);
         if previous.is_some() && !own {
@@ -1409,46 +1579,26 @@ impl GraphSession {
     /// Keeps what an answer's rows also answer (`builder::Seeds`): whole nodes as their node
     /// reads, counts as each node's count. Nothing already held is replaced, and nothing is kept
     /// when the schema changed while it was read.
-    fn seed(&mut self, seeds: &Seeds, output: &ReadOutput, epoch: u64) {
-        let (Some(commit), Some(schema)) = (output.graph_commit_id.clone(), self.schema_model())
-        else {
+    /// `nodes` are the node reads a page's rows answer ([`node_answers`]), made off the main
+    /// thread.
+    fn seed(
+        &mut self,
+        seeds: &Seeds,
+        output: &ReadOutput,
+        nodes: Vec<(PinnedRead, ReadOutput)>,
+        epoch: u64,
+    ) {
+        let Some(commit) = output.graph_commit_id.clone() else {
             return;
         };
         if epoch != self.schema_epoch {
             return;
         }
-        let rows = output
-            .rows
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or_default();
         match seeds {
-            Seeds::Nodes { type_name } => {
-                for row in rows {
-                    let Some(id) = row
-                        .get("n")
-                        .and_then(|node| node.get("@id"))
-                        .and_then(Value::as_str)
-                    else {
-                        continue;
-                    };
-                    let Ok(query) = builder::node_by_id(&schema, type_name, id) else {
-                        continue;
-                    };
-                    let key = self.pinned_key(&query, &commit);
+            Seeds::Nodes { .. } => {
+                for (key, answer) in nodes {
                     if !self.pinned_reads.holds(&key) {
                         self.kept_at(&key);
-                        let answer = ReadOutput {
-                            query_name: query.name,
-                            target: ReadTargetOutput {
-                                branch: None,
-                                snapshot: Some(commit.clone()),
-                            },
-                            row_count: 1,
-                            columns: output.columns.clone(),
-                            rows: Value::Array(vec![row.clone()]).into(),
-                            graph_commit_id: Some(commit.clone()),
-                        };
                         self.pinned_reads.insert(key, answer);
                     }
                 }
@@ -1489,34 +1639,24 @@ impl GraphSession {
             key.id.clone(),
             key.schema,
         );
-        let commits = self.degree_commits.get(&family)?;
-        let mut remaining: HashSet<&str> = commits
-            .iter()
-            .map(String::as_str)
-            .filter(|commit| *commit != key.commit)
-            .collect();
+        let kept = self.degree_commits.get_mut(&family)?;
         let counts = &self.degree_counts;
-        let mut carried = None;
-        // One walk back from `key`'s commit gives the range since each kept commit it passes.
-        self.change_logs
-            .get(&self.branch)?
-            .since_each(&key.commit, |start, since| {
-                if !remaining.remove(start) {
-                    return false;
-                }
-                let at = DegreeAt {
-                    commit: start.to_owned(),
-                    ..key.clone()
-                };
-                if let Some(n) = counts.peek(&at)
-                    && !since.edges_at(&key.group.edge, &key.id)
-                {
-                    carried = Some(*n);
-                    return true;
-                }
-                remaining.is_empty()
-            });
-        let carried = carried?;
+        let at = |commit: &str| DegreeAt {
+            commit: commit.to_owned(),
+            ..key.clone()
+        };
+        let carried = carry_back(
+            self.change_logs.get(&self.branch),
+            &key.commit,
+            kept,
+            |commit| counts.peek(&at(commit)).is_some(),
+            |start, since| {
+                counts
+                    .peek(&at(start))
+                    .filter(|_| !since.edges_at(&key.group.edge, &key.id))
+                    .copied()
+            },
+        )?;
         self.count_kept_at(key);
         self.degree_counts.insert(key.clone(), carried);
         Some(carried)
@@ -1541,56 +1681,33 @@ impl GraphSession {
             return None;
         }
         let family = (key.query.clone(), key.params.clone(), key.schema);
-        let commits = self.pinned_commits.get(&family)?;
+        let kept = self.pinned_commits.get_mut(&family)?;
         let reads = &self.pinned_reads;
         let at = |commit: &str| PinnedRead {
             commit: commit.to_owned(),
             ..key.clone()
         };
-        let (kept, gone): (Vec<&str>, Vec<&str>) = commits
-            .iter()
-            .map(String::as_str)
-            .filter(|commit| *commit != key.commit)
-            .partition(|commit| reads.peek(&at(commit)).is_some());
-        let mut remaining: HashSet<&str> = kept.into_iter().collect();
-        let gone: Vec<String> = gone.into_iter().map(str::to_owned).collect();
-        let mut found = None;
-        // One walk back from `key`'s commit gives the range since each kept answer it passes,
-        // the newest first.
-        if let Some(log) = self.change_logs.get(&self.branch) {
-            log.since_each(&key.commit, |start, since| {
-                if !remaining.remove(start) {
-                    return false;
-                }
-                if let Some(output) = reads.peek(&at(start))
-                    && answer_unchanged(since, depends, &output.rows)
-                {
-                    let mut output = output.clone();
-                    output.graph_commit_id = Some(key.commit.clone());
-                    output.target.branch = None;
-                    output.target.snapshot = Some(key.commit.clone());
-                    found = Some(output);
-                    return true;
-                }
-                remaining.is_empty()
-            });
-        }
-        if !gone.is_empty()
-            && let Some(commits) = self.pinned_commits.get_mut(&family)
-        {
-            commits.retain(|commit| !gone.contains(commit));
-        }
-        found
+        let mut output = carry_back(
+            self.change_logs.get(&self.branch),
+            &key.commit,
+            kept,
+            |commit| reads.peek(&at(commit)).is_some(),
+            |start, since| {
+                reads
+                    .peek(&at(start))
+                    .filter(|output| answer_unchanged(since, depends, &output.rows))
+                    .cloned()
+            },
+        )?;
+        output.graph_commit_id = Some(key.commit.clone());
+        output.target.branch = None;
+        output.target.snapshot = Some(key.commit.clone());
+        Some(output)
     }
 
     /// The memo key of `query` read at `commit`, under the session's schema.
     fn pinned_key(&self, query: &BuiltQuery, commit: &str) -> PinnedRead {
-        PinnedRead {
-            commit: commit.to_owned(),
-            query: query.text.clone(),
-            params: params_key(&query.params),
-            schema: self.schema_epoch,
-        }
+        PinnedRead::of(query, commit, self.schema_epoch)
     }
 
     /// Notes that an answer for `key` is kept, so a miss at another commit finds it.
@@ -1608,22 +1725,35 @@ impl GraphSession {
         snapshot: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<ReadOutput, ReadError>> {
+        let key = snapshot
+            .as_deref()
+            .map(|commit| self.pinned_key(query, commit));
         // An answer kept at its commit filed what its rows answer when it was read.
-        let kept = snapshot.as_deref().is_some_and(|commit| {
-            self.pinned_reads
-                .peek(&self.pinned_key(query, commit))
-                .is_some()
-        });
-        let read = self.read_kept(query, snapshot, cx);
+        let kept = key
+            .as_ref()
+            .is_some_and(|key| self.pinned_reads.peek(key).is_some());
+        let read = self.read_kept(query, snapshot, key, cx);
         let Some(seeds) = query.seeds.clone().filter(|_| !kept) else {
             return read;
         };
         // What its rows also answer is kept too, at the commit and schema it was read under.
         let epoch = self.schema_epoch;
+        let schema = self.schema_model();
         cx.spawn(async move |this, cx| {
             let result = read.await;
             if let Ok(output) = &result {
-                this.update(cx, |this, _| this.seed(&seeds, output, epoch))
+                // A page holds hundreds of nodes, each a query to build and a row to copy.
+                let nodes = match (&seeds, schema) {
+                    (Seeds::Nodes { type_name }, Some(schema)) => {
+                        let (type_name, output) = (type_name.clone(), output.clone());
+                        cx.background_spawn(async move {
+                            node_answers(&schema, &type_name, &output, epoch)
+                        })
+                        .await
+                    }
+                    _ => Vec::new(),
+                };
+                this.update(cx, |this, _| this.seed(&seeds, output, nodes, epoch))
                     .ok();
             }
             result
@@ -1695,11 +1825,12 @@ impl GraphSession {
         })
     }
 
-    /// [`GraphSession::read`] without its seeds.
+    /// [`GraphSession::read`] without its seeds; `key` is the read's memo key at `snapshot`.
     fn read_kept(
         &mut self,
         query: &BuiltQuery,
         snapshot: Option<String>,
+        key: Option<PinnedRead>,
         cx: &mut Context<Self>,
     ) -> Task<Result<ReadOutput, ReadError>> {
         let request = QueryRequest {
@@ -1709,10 +1840,9 @@ impl GraphSession {
             branch: snapshot.is_none().then(|| self.branch.clone()),
             snapshot,
         };
-        let Some(commit) = request.snapshot.as_deref() else {
+        let Some(key) = key else {
             return self.read_request(request, cx);
         };
-        let key = self.pinned_key(query, commit);
         // Neither an answer nor a read someone still waits for: carried from an earlier
         // commit when nothing it depends on changed since.
         let none = match self.pinned_reads.held(&key) {
@@ -2434,9 +2564,10 @@ impl GraphSession {
             });
             this.update(cx, |this, cx| {
                 let went_through = matches!(outcome, OutcomeKind::Committed { .. });
+                let made = (creates_branch && went_through).then(|| branch.clone());
                 this.finish_write(branch, description, outcome, None, None, cx);
-                if creates_branch && went_through {
-                    this.reload_branches(cx);
+                if let Some(made) = made {
+                    this.reload_branches_after(made, cx);
                 }
             })
             .ok();
@@ -2527,8 +2658,8 @@ impl GraphSession {
                 .await;
             let kind = outcome_kind(&outcome, |_| None);
             this.update(cx, |this, cx| {
-                this.finish_write(branch, description, kind, None, None, cx);
-                this.reload_branches(cx);
+                this.finish_write(branch.clone(), description, kind, None, None, cx);
+                this.reload_branches_after(branch, cx);
             })
             .ok();
             outcome
@@ -2550,13 +2681,16 @@ impl GraphSession {
             let outcome = client.delete_branch(&graph, &name).await;
             let kind = outcome_kind(&outcome, |_| None);
             this.update(cx, |this, cx| {
-                // Only a branch that is gone moves the session; a refused or unknown delete
-                // leaves it where the person is.
-                if this.branch == name && matches!(outcome, WriteOutcome::Committed(_)) {
-                    this.set_branch("main".into(), cx);
+                // Only a branch that is gone moves the session and loses its drafts; a refused or
+                // unknown delete leaves both where they are.
+                if matches!(outcome, WriteOutcome::Committed(_)) {
+                    if this.branch == name {
+                        this.set_branch("main".into(), cx);
+                    }
+                    this.drop_drafts_of(&name, cx);
                 }
-                this.finish_write(name, description, kind, None, None, cx);
-                this.reload_branches(cx);
+                this.finish_write(name.clone(), description, kind, None, None, cx);
+                this.reload_branches_after(name, cx);
             })
             .ok();
             outcome
@@ -2610,7 +2744,8 @@ impl GraphSession {
                     if this.branch == source {
                         this.set_branch(target, cx);
                     }
-                    this.reload_branches(cx);
+                    this.drop_drafts_of(&source, cx);
+                    this.reload_branches_after(source, cx);
                 }
             })
             .ok();
@@ -3946,6 +4081,21 @@ mod tests {
         again.await.unwrap();
         assert_eq!(reads_of("main"), 1);
 
+        // Away from main and back: its commits went unwatched meanwhile, so it is read again.
+        session.update(cx, |session, cx| session.set_branch("feature".into(), cx));
+        session.update(cx, |session, cx| session.set_branch("main".into(), cx));
+        cx.run_until_parked();
+        let back = session.update(cx, |session, cx| session.commits("main", false, cx));
+        back.await.unwrap();
+        assert_eq!(reads_of("main"), 2);
+        let feature_again = session.update(cx, |session, cx| session.commits("feature", false, cx));
+        feature_again.await.unwrap();
+        assert_eq!(
+            reads_of("feature"),
+            2,
+            "feature, watched a moment, is read again too"
+        );
+
         // A commit on main: main is read again, feature is not.
         let query = BuiltQuery {
             name: "m".into(),
@@ -3962,20 +4112,32 @@ mod tests {
             let read = session.update(cx, |session, cx| session.commits(branch, false, cx));
             read.await.unwrap();
         }
-        assert_eq!((reads_of("main"), reads_of("feature")), (2, 1));
+        assert_eq!((reads_of("main"), reads_of("feature")), (3, 2));
 
         // Refresh reads it again whatever was kept.
         let fresh = session.update(cx, |session, cx| session.commits("feature", true, cx));
         fresh.await.unwrap();
-        assert_eq!(reads_of("feature"), 2);
+        assert_eq!(reads_of("feature"), 3);
 
-        // The branch list read again (a branch made or deleted): every list is read again.
+        // The branch list read again unchanged: nothing is read again.
         drop(_panel);
         session.update(cx, |session, cx| session.reload_branches(cx));
         cx.run_until_parked();
         let read = session.update(cx, |session, cx| session.commits("feature", false, cx));
         read.await.unwrap();
         assert_eq!(reads_of("feature"), 3);
+
+        // Studio made or deleted feature: its list is read again, main's is not, whatever the
+        // branch list shows (deleted and made again under its name, it has another history).
+        session.update(cx, |session, cx| {
+            session.reload_branches_after("feature".into(), cx)
+        });
+        cx.run_until_parked();
+        for branch in ["main", "feature"] {
+            let read = session.update(cx, |session, cx| session.commits(branch, false, cx));
+            read.await.unwrap();
+        }
+        assert_eq!((reads_of("main"), reads_of("feature")), (3, 4));
     }
 
     /// The reads the history, the commit view, the review and the storage inspector ask for
@@ -4163,6 +4325,53 @@ mod tests {
 
     /// A write that answers after the watch saw a newer commit on top of it does not leave the
     /// head on the older one: the head is read again at once.
+    /// A carry leaves out the commits whose answer is no longer held, so no walk goes back for
+    /// them again; the commit carried to stays.
+    #[test]
+    fn a_carry_forgets_commits_whose_answer_is_gone() {
+        let mut kept = vec!["c1".to_owned(), "c2".to_owned(), "c3".to_owned()];
+        let found: Option<()> =
+            carry_back(None, "c3", &mut kept, |commit| commit == "c2", |_, _| None);
+        assert!(found.is_none());
+        assert_eq!(kept, ["c2", "c3"]);
+    }
+
+    /// A branch Studio deleted takes its unsaved values with it; a delete that did not go
+    /// through leaves them.
+    #[gpui::test]
+    async fn a_deleted_branch_takes_its_drafts(cx: &mut TestAppContext) {
+        use crate::test_server::followed_session;
+        use serde_json::json;
+
+        const SCHEMA: &str = "node Person {\n  slug: String @key\n  name: String?\n}\n";
+        let (session, _served) = followed_session(SCHEMA, |_| json!([]), cx);
+        cx.run_until_parked();
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        let entry = DraftEntry {
+            old: json!("Ada"),
+            text: "Grace".into(),
+        };
+        for branch in ["feature", "kept"] {
+            session.update(cx, |session, cx| {
+                session.set_draft_on(branch, key.clone(), entry.clone(), cx)
+            });
+        }
+        let delete = session.update(cx, |session, cx| {
+            session.delete_branch("feature".into(), cx)
+        });
+        assert!(matches!(delete.await, WriteOutcome::Committed(_)));
+        cx.run_until_parked();
+        let drafts = |branch: &str, cx: &mut TestAppContext| {
+            session.read_with(cx, |session, _| session.drafts_on(branch).count())
+        };
+        assert_eq!(drafts("feature", cx), 0);
+        assert_eq!(drafts("kept", cx), 1);
+    }
+
     #[gpui::test]
     async fn a_late_answer_of_studios_own_write_does_not_leave_an_older_head(
         cx: &mut TestAppContext,
@@ -4181,6 +4390,15 @@ mod tests {
             session.saw_head("main".into(), "n".into(), false, None, cx)
         });
         cx.run_until_parked();
+        let moves = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let heard = moves.clone();
+        let _moves = cx.update(|cx| {
+            cx.subscribe(&session, move |_, event: &SessionEvent, _| {
+                if let SessionEvent::HeadMoved { head, .. } = event {
+                    heard.lock().unwrap().push(head.clone());
+                }
+            })
+        });
         session.update(cx, |session, cx| {
             session.committed("main".into(), "m".into(), Some("c1".into()), cx)
         });
@@ -4188,6 +4406,13 @@ mod tests {
         assert_eq!(
             session.read_with(cx, |session, _| session.head("main").map(str::to_owned)),
             Some("n".into())
+        );
+        // Views never heard of a move back to m: one pinned at n would find m unrelated and
+        // offer newer data that never clears.
+        assert!(
+            moves.lock().unwrap().is_empty(),
+            "{:?}",
+            moves.lock().unwrap()
         );
     }
 
@@ -4437,6 +4662,24 @@ mod tests {
         cx.run_until_parked();
         read_at_c1(cx).await.unwrap();
         assert_eq!(reads(), 2, "read again under the new schema");
+
+        // A schema read again that cannot be read leaves the one held, and is not news; while
+        // it is read, the one held is still there.
+        served.lock().unwrap().schema_fails = true;
+        let held_before = session.read_with(cx, |session, _| session.schema_model());
+        session.update(cx, |session, cx| session.reload_schema(cx));
+        assert!(
+            session
+                .read_with(cx, |session, _| session.schema_model())
+                .is_some()
+        );
+        cx.run_until_parked();
+        let held_after = session.read_with(cx, |session, _| session.schema_model());
+        assert!(
+            held_after.is_some_and(|after| held_before.is_some_and(|before| Arc::ptr_eq(&after, &before))),
+            "the schema held stays"
+        );
+        served.lock().unwrap().schema_fails = false;
 
         // Another writer changes the schema; the head move's feed read finds it and the session
         // takes it, telling views it moved rather than changing them.

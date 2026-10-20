@@ -921,11 +921,13 @@ impl ExploreState {
     }
 
     /// The reads the visible entries still need, each once, in tree order.
+    #[cfg(test)]
     pub fn missing_loads(&self, schema: &SchemaModel) -> Vec<LoadTarget> {
         self.missing_in(&self.entries(schema))
     }
 
-    /// [`Self::missing_loads`] of the state flattened as `entries`.
+    /// The reads the visible entries still need, each once, in tree order, of the state
+    /// flattened as `entries`.
     fn missing_in(&self, entries: &[Entry]) -> Vec<LoadTarget> {
         if self.root.is_none() {
             return Vec::new();
@@ -963,6 +965,7 @@ impl ExploreState {
     }
 
     /// The shallowest visible path at which `node` appears.
+    #[cfg(test)]
     pub fn path_of(&self, schema: &SchemaModel, node: &NodeRef) -> Option<ExplorePath> {
         path_in(&self.entries(schema), node)
     }

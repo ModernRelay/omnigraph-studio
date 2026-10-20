@@ -219,11 +219,9 @@ impl ChangeFold {
         self.raw_changes
     }
 
+    /// Adds every change in `block`.
     pub fn add_block(&mut self, block: ChangeBlockOutput) {
-        let ChangeBlockOutput { cause, changes } = block;
-        for change in changes {
-            self.add(&cause, change);
-        }
+        self.add_block_capped(block, usize::MAX);
     }
 
     /// Adds every change in `block` until `cap` feed entries have been folded. Returns `false`
