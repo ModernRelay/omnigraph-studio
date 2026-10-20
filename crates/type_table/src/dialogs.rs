@@ -11,7 +11,7 @@ use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, Subscription,
     Task, WeakEntity, Window,
 };
-use gq_language::{Property, ScalarKind, SchemaModel, builder};
+use gq_language::{BuiltQuery, Property, ScalarKind, SchemaModel, builder};
 use graph_store::deletes::{self, DeletePlan};
 use graph_store::{DraftKey, FollowUp, GraphSession, Loadable};
 use serde_json::{Map, Value};
@@ -32,6 +32,145 @@ struct Field {
     property: Property,
     editor: Entity<Editor>,
     error: Option<String>,
+}
+
+/// What the insert dialogs share: property fields that let go of their error as they are
+/// edited, and a write whose outcome closes the dialog or says why nothing landed.
+trait InsertForm: EventEmitter<DismissEvent> + Sized + 'static {
+    fn fields_mut(&mut self) -> &mut Vec<Field>;
+    /// Whether its write is under way, and why the last one did not land.
+    fn outcome_mut(&mut self) -> (&mut bool, &mut Option<Notice>);
+
+    /// The write is in: with no notice the dialog closes, else it says why.
+    fn finish_insert(&mut self, notice: Option<Notice>, cx: &mut Context<Self>) {
+        let (saving, shown) = self.outcome_mut();
+        *saving = false;
+        match notice {
+            None => cx.emit(DismissEvent),
+            Some(notice) => *shown = Some(notice),
+        }
+        cx.notify();
+    }
+}
+
+/// The properties of `owner` a dialog takes (a Blob or a Vector is not typed in), the key
+/// first then required ones when `key_first`, and why it cannot insert at all when a required
+/// one is among those left out.
+fn form_properties(
+    owner: &str,
+    mut properties: Vec<Property>,
+    key_first: bool,
+) -> (Vec<Property>, Option<String>) {
+    let blocked = properties
+        .iter()
+        .find(|p| !p.nullable && !p.projectable())
+        .map(|p| {
+            format!(
+                "{owner} needs a {} value for {}; insert it with a query.",
+                p.base_type, p.name
+            )
+        });
+    properties.retain(Property::projectable);
+    properties.sort_by_key(|p| (key_first && !p.is_key, p.nullable));
+    (properties, blocked)
+}
+
+/// A field for each of `properties`, which lets go of its error as it is edited.
+fn property_fields<T: InsertForm>(
+    properties: Vec<Property>,
+    subscriptions: &mut Vec<Subscription>,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) -> Vec<Field> {
+    properties
+        .into_iter()
+        .map(|property| {
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text(&placeholder(&property), window, cx);
+                editor
+            });
+            subscriptions.push(cx.subscribe(
+                &editor,
+                |this: &mut T, editor, event: &EditorEvent, cx| {
+                    if let EditorEvent::BufferEdited = event {
+                        for field in this.fields_mut() {
+                            if field.editor == editor {
+                                field.error = None;
+                            }
+                        }
+                        cx.notify();
+                    }
+                },
+            ));
+            Field {
+                property,
+                editor,
+                error: None,
+            }
+        })
+        .collect()
+}
+
+/// The fields' values, parsed for their types, an empty one left out; `None` when one does
+/// not parse, which then shows why.
+fn field_values(fields: &mut [Field], cx: &App) -> Option<Vec<(String, Value)>> {
+    let mut values = Vec::new();
+    let mut valid = true;
+    for field in fields {
+        let text = field.editor.read(cx).text(cx);
+        match parse_input(&field.property, &text) {
+            Ok(Value::Null) => {}
+            Ok(value) => values.push((field.property.name.clone(), value)),
+            Err(error) => {
+                field.error = Some(error);
+                valid = false;
+            }
+        }
+    }
+    valid.then_some(values)
+}
+
+/// Sends an insert on `branch`, the branch the dialog was opened on, which its checks read,
+/// and shows its outcome; `no_match` says why one that matched nothing inserted nothing. The
+/// write is never cancelled with the dialog: the table hears the outcome even when the dialog
+/// was closed meanwhile, and keeps the row (`key`, `values`) it inserted.
+#[allow(clippy::too_many_arguments)]
+fn send_insert<T: InsertForm>(
+    session: &Entity<GraphSession>,
+    table: WeakEntity<TypeTable>,
+    branch: String,
+    query: &BuiltQuery,
+    description: String,
+    (key, values): (Option<String>, Map<String, Value>),
+    no_match: &'static str,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) {
+    let write = session.update(cx, |session, cx| {
+        session.write_on(&branch, query, None, description, None, cx)
+    });
+    table.update(cx, |table, _| table.save_started()).ok();
+    cx.spawn_in(window, async move |this, cx| {
+        let outcome = write.await;
+        let result = save_result(&outcome, &branch);
+        table
+            .update(cx, |table, cx| {
+                if let SaveResult::Saved { commit, parent } = &result {
+                    table.row_inserted(&branch, key, values, commit, parent.as_deref(), cx);
+                }
+                table.save_finished(cx);
+            })
+            .ok();
+        let notice = match result {
+            SaveResult::Saved { .. } => None,
+            SaveResult::NoMatch => Some(Notice::new(Tone::Refused, no_match)),
+            SaveResult::Refused(notice) | SaveResult::Unknown(notice) => Some(notice),
+        };
+        this.update(cx, |this, cx| this.finish_insert(notice, cx))
+            .ok();
+    })
+    .detach();
 }
 
 fn field_box(editor: &Entity<Editor>, invalid: bool, cx: &App) -> impl IntoElement {
@@ -55,6 +194,16 @@ pub struct InsertRowModal {
 }
 
 impl EventEmitter<DismissEvent> for InsertRowModal {}
+
+impl InsertForm for InsertRowModal {
+    fn fields_mut(&mut self) -> &mut Vec<Field> {
+        &mut self.fields
+    }
+
+    fn outcome_mut(&mut self) -> (&mut bool, &mut Option<Notice>) {
+        (&mut self.saving, &mut self.notice)
+    }
+}
 
 impl ModalView for InsertRowModal {
     /// A write still running keeps the dialog open: its outcome shows here.
@@ -82,50 +231,13 @@ impl InsertRowModal {
         cx: &mut Context<Self>,
     ) -> Self {
         let branch = session.read(cx).branch.clone();
-        let mut properties: Vec<Property> = schema
+        let properties: Vec<Property> = schema
             .node(&type_name)
             .map(|node| node.properties.clone())
             .unwrap_or_default();
-        let blocked = properties
-            .iter()
-            .find(|p| !p.nullable && !p.projectable())
-            .map(|p| {
-                format!(
-                    "{type_name} needs a {} value for {}; insert it with a query.",
-                    p.base_type, p.name
-                )
-            });
-        properties.retain(Property::projectable);
-        properties.sort_by_key(|p| (!p.is_key, p.nullable));
+        let (properties, blocked) = form_properties(&type_name, properties, true);
         let mut subscriptions = Vec::new();
-        let fields = properties
-            .into_iter()
-            .map(|property| {
-                let editor = cx.new(|cx| {
-                    let mut editor = Editor::single_line(window, cx);
-                    editor.set_placeholder_text(&placeholder(&property), window, cx);
-                    editor
-                });
-                subscriptions.push(cx.subscribe(
-                    &editor,
-                    |this: &mut Self, editor, event: &EditorEvent, cx| {
-                        if let EditorEvent::BufferEdited = event {
-                            for field in &mut this.fields {
-                                if field.editor == editor {
-                                    field.error = None;
-                                }
-                            }
-                            cx.notify();
-                        }
-                    },
-                ));
-                Field {
-                    property,
-                    editor,
-                    error: None,
-                }
-            })
-            .collect();
+        let fields = property_fields(properties, &mut subscriptions, window, cx);
         Self {
             table,
             session,
@@ -145,23 +257,10 @@ impl InsertRowModal {
         if self.saving || self.blocked.is_some() {
             return;
         }
-        let mut values: Vec<(String, Value)> = Vec::new();
-        let mut valid = true;
-        for field in &mut self.fields {
-            let text = field.editor.read(cx).text(cx);
-            match parse_input(&field.property, &text) {
-                Ok(Value::Null) => {}
-                Ok(value) => values.push((field.property.name.clone(), value)),
-                Err(error) => {
-                    field.error = Some(error);
-                    valid = false;
-                }
-            }
-        }
-        if !valid {
+        let Some(values) = field_values(&mut self.fields, cx) else {
             cx.notify();
             return;
-        }
+        };
         let query = match builder::insert_node(&self.schema, &self.type_name, &values) {
             Ok(query) => query,
             Err(error) => {
@@ -183,50 +282,18 @@ impl InsertRowModal {
         self.saving = true;
         self.notice = None;
         cx.notify();
-        // On the branch the dialog was opened on, which its checks read.
-        let branch = self.branch.clone();
-        let write = self.session.update(cx, |session, cx| {
-            session.write_on(&branch, &query, None, description, None, cx)
-        });
-        let table = self.table.clone();
-        table.update(cx, |table, _| table.save_started()).ok();
         let values: Map<String, Value> = values.into_iter().collect();
-        // The write is never cancelled with the dialog: the table hears the outcome even when the
-        // dialog was closed meanwhile.
-        cx.spawn_in(window, async move |this, cx| {
-            let outcome = write.await;
-            let result = save_result(&outcome, &branch);
-            table
-                .update(cx, |table, cx| {
-                    if let SaveResult::Saved { commit, parent } = &result {
-                        table.row_inserted(
-                            &branch,
-                            key.clone(),
-                            values,
-                            commit,
-                            parent.as_deref(),
-                            cx,
-                        );
-                    }
-                    table.save_finished(cx);
-                })
-                .ok();
-            this.update(cx, |this, cx| {
-                this.saving = false;
-                match result {
-                    SaveResult::Saved { .. } => cx.emit(DismissEvent),
-                    SaveResult::NoMatch => {
-                        this.notice = Some(Notice::new(Tone::Refused, "Nothing was inserted."));
-                    }
-                    SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
-                        this.notice = Some(notice)
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        send_insert(
+            &self.session,
+            self.table.clone(),
+            self.branch.clone(),
+            &query,
+            description,
+            (key, values),
+            "Nothing was inserted.",
+            window,
+            cx,
+        );
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {
@@ -387,6 +454,16 @@ pub struct InsertEdgeModal {
 
 impl EventEmitter<DismissEvent> for InsertEdgeModal {}
 
+impl InsertForm for InsertEdgeModal {
+    fn fields_mut(&mut self) -> &mut Vec<Field> {
+        &mut self.fields
+    }
+
+    fn outcome_mut(&mut self) -> (&mut bool, &mut Option<Notice>) {
+        (&mut self.saving, &mut self.notice)
+    }
+}
+
 impl ModalView for InsertEdgeModal {
     /// A write still running keeps the dialog open: its outcome shows here.
     fn on_before_dismiss(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
@@ -416,18 +493,8 @@ impl InsertEdgeModal {
             .as_ref()
             .map(|edge| (edge.from.clone(), edge.to.clone()))
             .unwrap_or_default();
-        let mut properties: Vec<Property> = edge.map(|edge| edge.properties).unwrap_or_default();
-        let blocked = properties
-            .iter()
-            .find(|p| !p.nullable && !p.projectable())
-            .map(|p| {
-                format!(
-                    "{edge_name} needs a {} value for {}; insert it with a query.",
-                    p.base_type, p.name
-                )
-            });
-        properties.retain(Property::projectable);
-        properties.sort_by_key(|p| p.nullable);
+        let properties: Vec<Property> = edge.map(|edge| edge.properties).unwrap_or_default();
+        let (properties, blocked) = form_properties(&edge_name, properties, false);
         let mut subscriptions = Vec::new();
         let mut endpoint = |end: End, type_name: String, cx: &mut Context<Self>| {
             let editor = cx.new(|cx| {
@@ -458,34 +525,7 @@ impl InsertEdgeModal {
         };
         let from = endpoint(End::From, from_type, cx);
         let to = endpoint(End::To, to_type, cx);
-        let fields = properties
-            .into_iter()
-            .map(|property| {
-                let editor = cx.new(|cx| {
-                    let mut editor = Editor::single_line(window, cx);
-                    editor.set_placeholder_text(&placeholder(&property), window, cx);
-                    editor
-                });
-                subscriptions.push(cx.subscribe(
-                    &editor,
-                    |this: &mut Self, editor, event: &EditorEvent, cx| {
-                        if let EditorEvent::BufferEdited = event {
-                            for field in &mut this.fields {
-                                if field.editor == editor {
-                                    field.error = None;
-                                }
-                            }
-                            cx.notify();
-                        }
-                    },
-                ));
-                Field {
-                    property,
-                    editor,
-                    error: None,
-                }
-            })
-            .collect();
+        let fields = property_fields(properties, &mut subscriptions, window, cx);
         Self {
             table,
             session,
@@ -629,22 +669,11 @@ impl InsertEdgeModal {
             }
             ends.push(id);
         }
-        let mut values: Vec<(String, Value)> = Vec::new();
-        for field in &mut self.fields {
-            let text = field.editor.read(cx).text(cx);
-            match parse_input(&field.property, &text) {
-                Ok(Value::Null) => {}
-                Ok(value) => values.push((field.property.name.clone(), value)),
-                Err(error) => {
-                    field.error = Some(error);
-                    valid = false;
-                }
-            }
-        }
-        if !valid {
+        let values = field_values(&mut self.fields, cx);
+        let Some(values) = values.filter(|_| valid) else {
             cx.notify();
             return;
-        }
+        };
         let (from, to) = (ends[0].clone(), ends[1].clone());
         let query = match builder::insert_edge(&self.schema, &self.edge_name, &from, &to, &values) {
             Ok(query) => query,
@@ -658,52 +687,17 @@ impl InsertEdgeModal {
         self.notice = None;
         cx.notify();
         let description = format!("Insert {} {from} → {to}", self.edge_name);
-        // On the branch the dialog was opened on, which its checks read.
-        let branch = self.branch.clone();
-        let write = self.session.update(cx, |session, cx| {
-            session.write_on(&branch, &query, None, description, None, cx)
-        });
-        let table = self.table.clone();
-        table.update(cx, |table, _| table.save_started()).ok();
-        // The write is never cancelled with the dialog: the table hears the outcome even when the
-        // dialog was closed meanwhile.
-        cx.spawn_in(window, async move |this, cx| {
-            let outcome = write.await;
-            let result = save_result(&outcome, &branch);
-            table
-                .update(cx, |table, cx| {
-                    if let SaveResult::Saved { commit, parent } = &result {
-                        table.row_inserted(
-                            &branch,
-                            None,
-                            Map::new(),
-                            commit,
-                            parent.as_deref(),
-                            cx,
-                        );
-                    }
-                    table.save_finished(cx);
-                })
-                .ok();
-            this.update(cx, |this, cx| {
-                this.saving = false;
-                match result {
-                    SaveResult::Saved { .. } => cx.emit(DismissEvent),
-                    SaveResult::NoMatch => {
-                        this.notice = Some(Notice::new(
-                            Tone::Refused,
-                            "Nothing was inserted: check that both nodes exist on this branch.",
-                        ));
-                    }
-                    SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
-                        this.notice = Some(notice)
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        send_insert(
+            &self.session,
+            self.table.clone(),
+            self.branch.clone(),
+            &query,
+            description,
+            (None, Map::new()),
+            "Nothing was inserted: check that both nodes exist on this branch.",
+            window,
+            cx,
+        );
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {

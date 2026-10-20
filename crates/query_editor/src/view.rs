@@ -1812,11 +1812,22 @@ impl QueryEditor {
         if count == 0 {
             return;
         }
-        let (row, column) = self.selected.unwrap_or((0, 0));
-        let row = (row as isize + delta).clamp(0, count as isize - 1) as usize;
+        let first = self.selected.is_none();
+        let (row, column) = match self.selected {
+            // Nothing selected yet: the first step lands on the first row, not the second.
+            None => (0, 0),
+            Some((row, column)) => (
+                (row as isize + delta).clamp(0, count as isize - 1) as usize,
+                column,
+            ),
+        };
         self.selected = Some((row, column));
         self.results_scroll
             .scroll_to_item(row, ScrollStrategy::Nearest);
+        if first {
+            // The footer offers copying once a cell is selected.
+            cx.emit(ItemEvent::UpdateTab);
+        }
         cx.notify();
     }
 
@@ -2314,9 +2325,10 @@ impl QueryEditor {
                     .map(|c| {
                         GridColumn::new(c.name.clone(), c.name.clone())
                             .detail(type_label(c))
-                            .width(px(((c.name.len().max(type_label(c).len())) as f32 * 7.5
-                                + 32.)
-                                .clamp(96., 240.)))
+                            .width(px(crate::results::header_width(
+                                &c.name,
+                                Some(&type_label(c)),
+                            )))
                     })
                     .collect();
                 v_flex()
@@ -3263,6 +3275,31 @@ mod tests {
                 editor.resize_column(1, None, cx);
                 assert_eq!(widths(editor), vec![fitted[1], fitted[0]]);
                 assert!(editor.column_widths.is_empty());
+
+                // With nothing selected, ↓ lands on the first row, not the second.
+                let output: ReadOutput = serde_json::from_value(json!({
+                    "query_name": "people",
+                    "target": {"branch": "main"},
+                    "row_count": 2,
+                    "columns": ["name"],
+                    "rows": [{"name": "Ada"}, {"name": "Grace"}],
+                }))
+                .unwrap();
+                let prepared = Prepared {
+                    text: String::new(),
+                    name: Some("people".into()),
+                    label: "people".into(),
+                    write: false,
+                    statement: false,
+                    params: None,
+                    columns: None,
+                    map: SourceMap::default(),
+                    stored: None,
+                };
+                editor.finish_read(prepared, "main".into(), Ok(output), Duration::ZERO, None);
+                editor.selected = None;
+                editor.move_selection(1, cx);
+                assert_eq!(editor.selected, Some((0, 0)));
             });
         }
 

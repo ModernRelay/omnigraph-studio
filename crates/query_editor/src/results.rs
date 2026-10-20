@@ -121,20 +121,12 @@ impl ResultTable {
         serde_json::to_string_pretty(&Value::Object(object)).ok()
     }
 
-    /// A column's width in pixels: wide enough for its header (the title, then its type beside
-    /// it in smaller text) and the first rows' values, within bounds, so wide values do not push
-    /// every other column off screen.
+    /// A column's width in pixels: wide enough for its header ([`header_width`]) and the
+    /// first rows' values, within bounds, so wide values do not push every other column off
+    /// screen.
     pub fn column_width(&self, column: usize) -> f32 {
-        const CHAR: f32 = 7.5;
-        const TYPE_CHAR: f32 = 6.6;
-        // The header's gap between name and type, and a cell's inset on both sides.
-        const GAP: f32 = studio_ui::ds::space::SM;
-        const PADDING: f32 = 2. * studio_ui::ds::space::LG;
-        let title = self.columns[column].chars().count() as f32 * CHAR;
-        let header = match self.types.get(column) {
-            Some(Some(ty)) => title + GAP + ty.chars().count() as f32 * TYPE_CHAR,
-            _ => title,
-        };
+        let ty = self.types.get(column).and_then(Option::as_deref);
+        let header = header_text_width(&self.columns[column], ty);
         let values = self
             .rows
             .iter()
@@ -143,7 +135,31 @@ impl ResultTable {
             .max()
             .unwrap_or(0) as f32
             * CHAR;
-        (header.max(values) + PADDING).clamp(72., 360.)
+        (header.max(values) + PADDING).clamp(MIN_WIDTH, MAX_WIDTH)
+    }
+}
+
+/// A character of a cell's text, and of a header's type, in pixels.
+const CHAR: f32 = 7.5;
+const TYPE_CHAR: f32 = 6.6;
+/// The header's gap between name and type, and a cell's inset on both sides.
+const GAP: f32 = studio_ui::ds::space::SM;
+const PADDING: f32 = 2. * studio_ui::ds::space::LG;
+const MIN_WIDTH: f32 = 72.;
+const MAX_WIDTH: f32 = 360.;
+
+/// A column's width for its header alone: the title, then its type beside it in smaller text,
+/// within the bounds every column keeps. The columns a query will return are this wide before
+/// it runs, so a run whose values fit leaves them as they were.
+pub fn header_width(title: &str, ty: Option<&str>) -> f32 {
+    (header_text_width(title, ty) + PADDING).clamp(MIN_WIDTH, MAX_WIDTH)
+}
+
+fn header_text_width(title: &str, ty: Option<&str>) -> f32 {
+    let title = title.chars().count() as f32 * CHAR;
+    match ty {
+        Some(ty) => title + GAP + ty.chars().count() as f32 * TYPE_CHAR,
+        None => title,
     }
 }
 
