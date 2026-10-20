@@ -669,7 +669,8 @@ pub fn parse_filter_list(property: &Property, text: &str) -> Result<Value, Strin
 
 /// The days a date preset takes at `now`, as `[start, end)`: today; this week, from Monday;
 /// the last 30 days, through today. A `Date` as `YYYY-MM-DD`, a `DateTime` as that local
-/// midnight in UTC.
+/// midnight in UTC, spelled as the engine writes a time (no zone), so a row's value compared
+/// with it here as text orders as the engine orders them.
 pub fn preset_range(
     op: FilterOp,
     kind: Option<ScalarKind>,
@@ -696,7 +697,7 @@ pub fn preset_range(
             Value::String(
                 local
                     .with_timezone(&chrono::Utc)
-                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .format("%Y-%m-%dT%H:%M:%S")
                     .to_string(),
             )
         }
@@ -1540,7 +1541,22 @@ mod tests {
         );
         let instant = preset_range(FilterOp::Today, Some(ScalarKind::DateTime), now);
         let text = instant[0].as_str().unwrap();
-        assert!(text.ends_with('Z') && text.len() == 20, "{text}");
+        assert!(text.ends_with(":00") && text.len() == 19, "{text}");
+        // A value at the bound, and one a quarter second past it, as the engine writes them,
+        // are in the day; the one before it is not.
+        let filter = |value: Value| Filter {
+            property: "at".into(),
+            op: FilterOp::Today,
+            value,
+        };
+        let at = |value: &str| -> Map<String, Value> {
+            serde_json::from_value(json!({ "at": value })).unwrap()
+        };
+        let quarter = format!("{text}.250");
+        assert!(row_matches(&[filter(instant.clone())], &at(text)));
+        assert!(row_matches(&[filter(instant.clone())], &at(&quarter)));
+        let end = instant[1].as_str().unwrap();
+        assert!(!row_matches(&[filter(instant.clone())], &at(end)));
     }
 
     #[test]

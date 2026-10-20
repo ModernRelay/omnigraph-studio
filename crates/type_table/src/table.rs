@@ -703,6 +703,8 @@ impl TypeTable {
                 if self.at_commit.is_some() => {}
             SessionEvent::BranchChanged => {
                 self.branch = self.session.read(cx).branch.clone();
+                // A Refresh asked for on the branch left reads nothing here.
+                self._refresh = None;
                 // The branch's own drafts show; the other's wait in the session.
                 self.cells.clear();
                 self.draft_notices.clear();
@@ -2030,7 +2032,11 @@ impl TypeTable {
         // Picked rows stay picked by id; the row a range starts from is a place in the old
         // order.
         self.selection_anchor = None;
-        self.editing = None;
+        // An edit open over the rows read before is kept as its cell's draft, as leaving the
+        // cell keeps it: a Refresh that lands while the person types loses nothing.
+        if let Some(editing) = self.editing.take() {
+            self.keep_edit(editing, cx);
+        }
         self.loading_more = false;
         self.more_error = None;
         self.first_page = Loadable::Loading;
@@ -4061,27 +4067,6 @@ impl TypeTable {
         notice: Option<Notice>,
         cx: &mut Context<Self>,
     ) {
-        self.note_draft(row_id, column, old, text, notice, cx);
-        self.sync_drafts(cx);
-    }
-
-    /// Lets a cell's draft go: saved, or typed back to what the cell holds.
-    fn drop_draft(&mut self, row_id: &str, column: &str, cx: &mut Context<Self>) {
-        self.forget_draft(row_id, column, cx);
-        self.sync_drafts(cx);
-    }
-
-    /// [`Self::put_draft`] without showing it: a batch of drafts is shown once, by one
-    /// [`Self::sync_drafts`] after the last.
-    fn note_draft(
-        &mut self,
-        row_id: &str,
-        column: &str,
-        old: Value,
-        text: String,
-        notice: Option<Notice>,
-        cx: &mut Context<Self>,
-    ) {
         let cell = (row_id.to_owned(), column.to_owned());
         match notice {
             Some(notice) => self.draft_notices.insert(cell, notice),
@@ -4091,13 +4076,21 @@ impl TypeTable {
         self.session.update(cx, |session, cx| {
             session.set_draft(key, DraftEntry { old, text }, cx)
         });
+        self.sync_drafts(cx);
+    }
+
+    /// Lets a cell's draft go: saved, or typed back to what the cell holds.
+    fn drop_draft(&mut self, row_id: &str, column: &str, cx: &mut Context<Self>) {
+        self.forget_draft(row_id, column, cx);
+        self.sync_drafts(cx);
     }
 
     /// Settles a cell's draft once the write or read it waited on is in
     /// ([`GraphSession::settle_draft_on`]): `keep` it, with why its save did not land, or let it
     /// go, unless it is no longer `sent`, the draft as that went out. One retyped or let go
-    /// elsewhere meanwhile (on a node's page, in the peek) stands. Whether it was settled; it
-    /// shows with the next [`Self::sync_drafts`].
+    /// elsewhere meanwhile (on a node's page, in the peek) stands, without the cell's notice,
+    /// which spoke of the save sent. Whether it was settled; it shows with the next
+    /// [`Self::sync_drafts`].
     fn settle_draft(
         &mut self,
         row_id: &str,
@@ -4115,17 +4108,16 @@ impl TypeTable {
         let settled = self.session.update(cx, |session, cx| {
             session.settle_draft_on(&branch, key, sent, entry, cx)
         });
-        if settled {
-            let cell = (row_id.to_owned(), column.to_owned());
-            match notice {
-                Some(notice) => self.draft_notices.insert(cell, notice),
-                None => self.draft_notices.remove(&cell),
-            };
-        }
+        let cell = (row_id.to_owned(), column.to_owned());
+        match notice.filter(|_| settled) {
+            Some(notice) => self.draft_notices.insert(cell, notice),
+            None => self.draft_notices.remove(&cell),
+        };
         settled
     }
 
-    /// [`Self::drop_draft`] without showing it, as [`Self::note_draft`].
+    /// [`Self::drop_draft`] without showing it: drafts let go together are shown once, by one
+    /// [`Self::sync_drafts`] after the last.
     fn forget_draft(&mut self, row_id: &str, column: &str, cx: &mut Context<Self>) {
         self.draft_notices
             .remove(&(row_id.to_owned(), column.to_owned()));

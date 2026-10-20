@@ -365,6 +365,9 @@ impl TextEditor {
             id: self.id.clone(),
             property: self.property.clone(),
         };
+        // The property's draft as the save goes out: one retyped or let go elsewhere while it
+        // is out stands (`GraphSession::settle_draft_on`).
+        let sent = session.read(cx).draft_on(&branch, &key).cloned();
         // Detached: closing the tab never cancels a write.
         cx.spawn_in(window, async move |this, cx| {
             let result = write.await;
@@ -376,8 +379,10 @@ impl TextEditor {
                         this.unsaved = this.differs(cx);
                         // A draft kept for the property elsewhere on the branch written is now
                         // saved too, though the window moved to another branch meanwhile.
-                        this.session
-                            .update(cx, |session, cx| session.remove_draft_on(&branch, &key, cx));
+                        let key = key.clone();
+                        this.session.update(cx, |session, cx| {
+                            session.settle_draft_on(&branch, key, sent.as_ref(), None, cx)
+                        });
                         State::Saved
                     }
                     SaveResult::NoMatch => State::Conflict,
@@ -391,11 +396,10 @@ impl TextEditor {
             // The tab closed while the text was written: a draft of the property on the branch
             // written is let go when it landed, and holds the text when it did not.
             if shown.is_err() {
-                session.update(cx, |session, cx| match result {
-                    SaveResult::Saved { .. } => {
-                        session.remove_draft_on(&branch, &key, cx);
-                    }
-                    _ => session.set_draft_on(&branch, key, DraftEntry { old, text }, cx),
+                let keep = (!matches!(result, SaveResult::Saved { .. }))
+                    .then_some(DraftEntry { old, text });
+                session.update(cx, |session, cx| {
+                    session.settle_draft_on(&branch, key, sent.as_ref(), keep, cx)
                 });
             }
         })

@@ -23,6 +23,7 @@ graph_client = { workspace = true }
 graph_store = { workspace = true }
 gq_language = { workspace = true }
 chrono = { workspace = true }
+futures = { workspace = true }
 serde_json = { workspace = true }
 image = { workspace = true }
 
@@ -31,7 +32,6 @@ objc2-core-foundation = { workspace = true }
 objc2-core-graphics = { workspace = true }
 
 [dev-dependencies]
-futures = { workspace = true }
 gpui = { workspace = true, features = ["test-support"] }
 http_client = { workspace = true }
 studio_theme = { workspace = true, features = ["test-support"] }

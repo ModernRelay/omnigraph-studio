@@ -346,6 +346,9 @@ pub struct NodePeek {
     /// read is the newest, so a write's read of the node that comes back after the view was
     /// read again is dropped.
     node_reads: u64,
+    /// Conflicts whose read of the node gave way to a newer one, waiting for what that one
+    /// finds ([`Self::landed_or_newer`]).
+    node_waiters: Vec<futures::channel::oneshot::Sender<Held>>,
     /// Refresh asking after the branch's head before it reads the node again.
     _refresh: Option<Task<()>>,
     /// Takes the copied mark down; a refresh keeps it, and a second copy starts it again.
@@ -526,6 +529,7 @@ impl NodePeek {
             awaiting_changes: false,
             _node_read: None,
             node_reads: 0,
+            node_waiters: Vec::new(),
             _refresh: None,
             _copied: None,
             _subscription: subscription,
@@ -710,6 +714,7 @@ impl NodePeek {
         };
         let Some(schema) = self.schema.clone() else {
             self.values = Loadable::Failed("The schema is still loading.".into());
+            self.wake_node_waiters(None);
             return None;
         };
         // At a commit made before a property was added or renamed, the whole node is refused:
@@ -725,6 +730,7 @@ impl NodePeek {
             Ok(query) => query,
             Err(error) => {
                 self.values = Loadable::Failed(error.to_string());
+                self.wake_node_waiters(None);
                 return None;
             }
         };
@@ -820,8 +826,36 @@ impl NodePeek {
             },
             Err(error) => self.values = Loadable::Failed(error.to_string()),
         }
+        // Read again for a property the commit did not have: what waits hears that read.
+        if !matches!(self.values, Loadable::Loading) {
+            self.wake_node_waiters(found.clone());
+        }
         cx.notify();
         found
+    }
+
+    /// Hands what the view's newest read of the node found to the conflicts waiting for it.
+    fn wake_node_waiters(&mut self, found: Held) {
+        for waiter in self.node_waiters.drain(..) {
+            waiter.send(found.clone()).ok();
+        }
+    }
+
+    /// Lands a conflict's read of the node at the head ([`Self::reread_at_head`]): what it
+    /// found, or, when a newer read of the view's took its place and is still out (another
+    /// conflict's, a Refresh), what that one finds once it lands.
+    fn landed_or_newer(
+        &mut self,
+        landed: Option<(Result<ReadOutput, ReadError>, NodeRead)>,
+        cx: &mut Context<Self>,
+    ) -> Result<Held, futures::channel::oneshot::Receiver<Held>> {
+        let found = landed.and_then(|(result, read)| self.node_read_landed(result, read, cx));
+        if found.is_none() && matches!(self.values, Loadable::Loading) {
+            let (waiter, newer) = futures::channel::oneshot::channel();
+            self.node_waiters.push(waiter);
+            return Err(newer);
+        }
+        Ok(found)
     }
 
     /// The subject's Blob properties.
@@ -2030,13 +2064,15 @@ impl NodePeek {
                 Some((read, sent)) => Some((read.await, sent)),
                 None => None,
             };
+            let found = match this.update(cx, |this, cx| this.landed_or_newer(landed, cx)) {
+                Ok(Ok(found)) => found,
+                Ok(Err(newer)) => newer.await.ok().flatten(),
+                Err(_) => None,
+            };
             let shown = this.update_in(cx, |this, window, cx| {
-                let found =
-                    landed.and_then(|(result, sent)| this.node_read_landed(result, sent, cx));
                 this.saving.remove(&name);
                 if this.branch == branch {
-                    // Dropped for a newer read of the view's, it settles against what the view
-                    // shows.
+                    // Without a read of its own, it settles against what the view shows.
                     let now = found.or_else(|| this.values.loaded().cloned().map(Some));
                     let (bound, notice) = match &now {
                         Some(Some(values)) => {
@@ -2105,16 +2141,18 @@ impl NodePeek {
                 Some((read, node)) => Some((read.await, node)),
                 None => None,
             };
+            let found = match this.update(cx, |this, cx| this.landed_or_newer(landed, cx)) {
+                Ok(Ok(found)) => found,
+                Ok(Err(newer)) => newer.await.ok().flatten(),
+                Err(_) => None,
+            };
             this.update(cx, |this, cx| {
-                let found =
-                    landed.and_then(|(result, node)| this.node_read_landed(result, node, cx));
                 for draft in &sent {
                     this.saving.remove(&draft.name);
                 }
                 // The view reads another branch now: the drafts stay as they were typed there.
                 if this.branch == branch {
-                    // Dropped for a newer read of the view's, it settles against what the view
-                    // shows.
+                    // Without a read of its own, they settle against what the view shows.
                     let now = found.or_else(|| this.values.loaded().cloned().map(Some));
                     this.drafts_read(sent, now.as_ref(), cx);
                 }
@@ -5557,7 +5595,8 @@ mod tests {
 
     /// Refresh wants the newest, which the session may not hold yet: it asks after the head,
     /// and reads the node at it. A read of the node that lands after the view was read again
-    /// since it was sent is dropped, and puts nothing older back.
+    /// since it was sent is dropped, and puts nothing older back; a conflict that sent it
+    /// settles against what the newer read finds.
     #[gpui::test]
     async fn refresh_asks_after_the_head_and_an_older_read_lands_nothing(cx: &mut TestAppContext) {
         let (session, writer) = session_followed(
@@ -5596,6 +5635,25 @@ mod tests {
         let found = view.update(cx, |view, cx| view.node_read_landed(answer, sent, cx));
         assert_eq!(found, None, "dropped");
         at_head(cx);
+
+        let (first, first_sent) = view.update(cx, |view, cx| view.send_node_read(cx)).unwrap();
+        let (second, second_sent) = view.update(cx, |view, cx| view.send_node_read(cx)).unwrap();
+        let first = first.await;
+        let waited = view.update(cx, |view, cx| {
+            view.landed_or_newer(Some((first, first_sent)), cx)
+        });
+        let Err(newer) = waited else {
+            panic!("the newer read is still out");
+        };
+        let second = second.await;
+        view.update(cx, |view, cx| {
+            view.node_read_landed(second, second_sent, cx)
+        });
+        let found = newer.await.unwrap();
+        let name = found
+            .flatten()
+            .and_then(|values| values.get("name").cloned());
+        assert_eq!(name, Some(json!("Ada B")), "what the newer read found");
     }
 
     /// ↵ on a field typed back to the value its draft was typed over lets the draft go, and
