@@ -1345,13 +1345,10 @@ mod end_to_end {
             "no omnigraph CLI speaks the graph's contract: {chosen:?}"
         );
 
-        let target = ["--server", "studio", "--graph", graph.as_str()];
-        let with = |args: &[&str]| -> Vec<String> {
-            args.iter()
-                .chain(target.iter())
-                .map(|arg| (*arg).to_owned())
-                .collect()
-        };
+        // As the agent is told: no destination flags, since the home's config makes the gateway
+        // and the graph the default, as a target or as a server.
+        let with =
+            |args: &[&str]| -> Vec<String> { args.iter().map(|arg| (*arg).to_owned()).collect() };
         let call = |args: Vec<String>| {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             run(&home, &args)
@@ -1366,7 +1363,7 @@ mod end_to_end {
             "--json",
         ]
         .map(str::to_owned);
-        let mut plan = cli_home::check_run_args(&read, &cwd, &graph).unwrap();
+        let mut plan = cli_home::check_run_args(&read, &cwd, &graph, home.form()).unwrap();
         let (text, failed) = smol::block_on(cli_home::run(&home, &cwd, plan.clone()));
         assert!(
             !failed && text.starts_with("exit 0") && text.contains("\"rows\""),
