@@ -44,6 +44,12 @@ const SEARCH_DELAY: Duration = Duration::from_millis(80);
 /// after the last change returned, so fewer, larger pages cost fewer reads; the server's byte
 /// budget still bounds what one page holds.
 const FEED_PAGE: usize = 8_192;
+/// Commits asked for per page of a branch's history when its commits since the fork are read
+/// ([`commits_since_fork`]); a page costs only the commits it returns. The server's most is
+/// 1,000.
+const FORK_PAGE: u32 = 500;
+/// Pages of a branch's history read for its fork before both whole lists are read instead.
+const FORK_PAGES: usize = 20;
 
 #[derive(Debug, Clone, PartialEq)]
 enum FixState {
@@ -2771,9 +2777,69 @@ async fn fold_pages(
 }
 
 /// The branch's commits since it forked from `target`, newest first, up to `head` when the
-/// branch holds it, with the fork: read now, not from the session's shared lists, since a
-/// review shows what the branches hold.
+/// branch holds it, with the fork.
+///
+/// The fork is the merge base the server names, and the branch's history is read a page at a
+/// time down to it: a page costs only the commits it returns, where the two branches' whole
+/// lists cost every commit either holds. A merge base off the branch's own chain (the target
+/// was merged into the branch: a commit there names it as its merged parent), or one not
+/// reached within [`FORK_PAGES`], is found from both whole lists instead.
 async fn commits_since_fork(
+    session: &Entity<GraphSession>,
+    branch: &str,
+    target: &str,
+    head: Option<&str>,
+    cx: &mut AsyncApp,
+) -> Result<(Option<String>, Option<String>, Vec<ReviewCommit>), String> {
+    let base = session
+        .update(cx, |session, cx| session.merge_base(branch, target, cx))
+        .await
+        .map_err(|e| e.to_string())?;
+    let fork = base.merge_base.graph_commit_id;
+    let mut chain: Vec<CommitOutput> = Vec::new();
+    let mut token = None;
+    let mut reached = false;
+    'pages: for _ in 0..FORK_PAGES {
+        let page = session
+            .update(cx, |session, cx| {
+                session.commit_page(branch, FORK_PAGE, token.take(), cx)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        for commit in page.commits {
+            if commit.graph_commit_id == fork {
+                reached = true;
+                break 'pages;
+            }
+            if commit.merged_parent_commit_id.as_deref() == Some(fork.as_str()) {
+                break 'pages;
+            }
+            chain.push(commit);
+        }
+        match page.next_page_token {
+            Some(next) => token = Some(next),
+            None => break,
+        }
+    }
+    if !reached {
+        return commits_since_fork_by_lists(session, branch, target, head, cx).await;
+    }
+    // Commits made after the reviewed head are not the review's.
+    let from_head = head
+        .and_then(|head| chain.iter().position(|c| c.graph_commit_id == head))
+        .unwrap_or(0);
+    let since = &chain[from_head..];
+    let head = since
+        .first()
+        .map(|c| c.graph_commit_id.clone())
+        .unwrap_or_else(|| fork.clone());
+    let since = since.iter().map(ReviewCommit::from).collect();
+    Ok((Some(fork), Some(head), since))
+}
+
+/// [`commits_since_fork`] from both branches' whole lists, the session's: the fork is the
+/// branch's newest commit the target's list reaches.
+async fn commits_since_fork_by_lists(
     session: &Entity<GraphSession>,
     branch: &str,
     target: &str,
@@ -2828,7 +2894,10 @@ async fn read_review_since_merge(
     this: WeakEntity<ReviewView>,
     cx: &mut AsyncApp,
 ) -> Result<ReviewData, String> {
-    let (_, _, since) = commits_since_fork(&session, &branch, &target, Some(&head), cx).await?;
+    // The target was merged into the branch, so the merge base is off the branch's own chain,
+    // and the fork is found from both lists.
+    let (_, _, since) =
+        commits_since_fork_by_lists(&session, &branch, &target, Some(&head), cx).await?;
     // A range has no single commit: each change is the reviewed head's.
     let cause = ChangeCauseOutput {
         graph_commit_id: head.clone(),
@@ -2941,12 +3010,29 @@ async fn merge_shown(
     {
         return Some(true);
     }
+    let shows = |list: &[CommitOutput]| {
+        commit.is_some_and(|c| list.iter().any(|t| t.graph_commit_id == c))
+            || source_head.is_some_and(|head| contains_merge_of(list, head))
+    };
+    // The target's history a page at a time from its head, where a merge just made is: a page
+    // costs only the commits it returns. Past [`FORK_PAGES`] pages, the whole list says.
+    let mut token = None;
+    for _ in 0..FORK_PAGES {
+        let read = session.update(cx, |session, cx| {
+            session.commit_page(target, FORK_PAGE, token.take(), cx)
+        });
+        let page = read.await.ok()?;
+        if shows(&page.commits) {
+            return Some(true);
+        }
+        match page.next_page_token {
+            Some(next) => token = Some(next),
+            None => return Some(false),
+        }
+    }
     let read = session.update(cx, |session, cx| session.commits(target, true, cx));
     let list = read.await.ok()?;
-    Some(
-        commit.is_some_and(|c| list.iter().any(|t| t.graph_commit_id == c))
-            || source_head.is_some_and(|head| contains_merge_of(&list, head)),
-    )
+    Some(shows(&list))
 }
 
 impl Render for ReviewView {
@@ -3939,9 +4025,10 @@ pub(crate) mod tests {
     }
 
     /// A review reads the merge base and the branch's feed after it, never the two commit
-    /// lists. A branch main was merged into has a feed that refuses the base as a start, and
-    /// whose merge block carries main's own changes: the review reads the net diff from the
-    /// base instead, and the lists for the branch's commits.
+    /// lists; a review of one commit reads the branch's history a page at a time down to the
+    /// merge base, and never main's. A branch main was merged into has a feed that refuses the
+    /// base as a start, and whose merge block carries main's own changes: the review reads the
+    /// net diff from the base instead, and the lists for the branch's commits.
     #[gpui::test]
     async fn a_review_reads_the_merge_base_and_the_feed_after_it(cx: &mut gpui::TestAppContext) {
         let (session, asked) = reviewed_server(false, cx);
@@ -3973,6 +4060,27 @@ pub(crate) mod tests {
                 .iter()
                 .any(|request| request.contains("start=after%3Am1"))
         );
+
+        let (session, asked) = reviewed_server(false, cx);
+        asked.lock().unwrap().clear();
+        let mut async_cx = cx.to_async();
+        let data = read_review(
+            session,
+            "feature".into(),
+            "main".into(),
+            Some("f1".into()),
+            WeakEntity::new_invalid(),
+            &mut async_cx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(data.fork.as_deref(), Some("m1"));
+        let commits: Vec<&str> = data.commits.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(commits, ["f2", "f1"], "newest first");
+        let asked = asked.lock().unwrap().clone();
+        let lists: Vec<&String> = asked.iter().filter(|r| r.contains("/commits?")).collect();
+        assert_eq!(lists.len(), 1, "{asked:?}");
+        assert!(lists[0].contains("branch=feature&limit=500"), "{asked:?}");
 
         let (session, asked) = reviewed_server(true, cx);
         asked.lock().unwrap().clear();

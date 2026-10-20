@@ -648,19 +648,20 @@ impl QueryEditor {
         }
     }
 
-    /// The branch's latest commits for the snapshot picker, from the session's commit list
-    /// (shared with every query tab, the history and the branches panel, and read again after a
-    /// commit lands on the branch).
+    /// The branch's latest commits for the snapshot picker: one page of its history, which
+    /// costs only the commits it holds, where the whole list costs every commit the branch has.
     fn load_commits(&mut self, cx: &mut Context<Self>) {
         let read = self.session.update(cx, |session, cx| {
             let branch = session.branch.clone();
-            session.commits(&branch, false, cx)
+            session.commit_page(&branch, PICKER_COMMITS as u32, None, cx)
         });
         self.commits_task = Some(cx.spawn(async move |this, cx| {
-            let Ok(list) = read.await else {
+            let Ok(page) = read.await else {
                 return;
             };
-            let mut commits: Vec<(String, i64, Option<String>)> = list
+            // A server that pages no history answers it whole; the newest are kept.
+            let mut commits: Vec<(String, i64, Option<String>)> = page
+                .commits
                 .iter()
                 .map(|c| (c.graph_commit_id.clone(), c.created_at, c.actor_id.clone()))
                 .collect();

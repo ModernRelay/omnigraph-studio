@@ -2488,6 +2488,29 @@ impl GraphSession {
         )
     }
 
+    /// A page of `branch`'s history, newest first ([`GraphClient::commit_page`]): its newest
+    /// `limit` commits, or the next ones from `page_token`. Not kept: each page is one read, which
+    /// costs only the history it returns.
+    pub fn commit_page(
+        &mut self,
+        branch: &str,
+        limit: u32,
+        page_token: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<graph_client::api::CommitListOutput, ReadError>> {
+        let client = self.client(cx);
+        let graph = self.graph_id.clone();
+        let branch = branch.to_owned();
+        self.counted_read(
+            async move {
+                client
+                    .commit_page(&graph, &branch, limit, page_token.as_deref())
+                    .await
+            },
+            cx,
+        )
+    }
+
     /// `branch`'s newest commit, as a list of branches shows it: from its commit list when one
     /// is held or being read, else read alone and kept until a commit lands on the branch. A
     /// branch with no commit has none.
@@ -2516,7 +2539,7 @@ impl GraphSession {
                 let read = session.counted_read(
                     {
                         let branch = branch.clone();
-                        async move { client.newest_commits(&graph, &branch, 1).await }
+                        async move { client.commit_page(&graph, &branch, 1, None).await }
                     },
                     cx,
                 );

@@ -367,10 +367,18 @@ pub enum BranchMergeOutcome {
     Other,
 }
 
-/// `GET /graphs/{id}/commits?branch=`.
+/// `GET /graphs/{id}/commits?branch=`: the whole history, or with `limit` or `page_token` a
+/// page of it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CommitListOutput {
     pub commits: Vec<CommitOutput>,
+    /// The head a paged listing resolved: later pages answer for its history.
+    #[serde(default)]
+    pub head_commit_id: Option<String>,
+    /// Where a paged listing goes on, sent back as `page_token`; none on its last page and on
+    /// a whole history.
+    #[serde(default)]
+    pub next_page_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -693,7 +701,10 @@ mod contract_tests {
                 "branch_delete_error_details",
             ],
         ),
-        ("CommitListOutput", &["commits"]),
+        (
+            "CommitListOutput",
+            &["commits", "head_commit_id", "next_page_token"],
+        ),
         (
             "CommitOutput",
             &[

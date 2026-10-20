@@ -868,22 +868,24 @@ impl GraphClient {
         .await
     }
 
-    /// `branch`'s newest `limit` commits, newest first: a page, where the server pages a
-    /// history; one that does not (an older 0.14) ignores `limit` and answers the whole list.
-    pub async fn newest_commits(
+    /// A page of `branch`'s history, newest first: its newest `limit` commits, or from
+    /// `page_token` the next ones. The page names the head it resolved and where it goes on; a
+    /// server that pages no history (a 0.14 build before `edge-20261018-0a62bb7`) ignores both
+    /// and answers the whole list, with no token.
+    pub async fn commit_page(
         &self,
         graph: &str,
         branch: &str,
         limit: u32,
+        page_token: Option<&str>,
     ) -> Result<CommitListOutput, ReadError> {
         let limit = limit.to_string();
-        self.read(
-            Method::GET,
-            &["graphs", graph, "commits"],
-            &[("branch", branch), ("limit", limit.as_str())],
-            None,
-        )
-        .await
+        let mut query = vec![("branch", branch), ("limit", limit.as_str())];
+        if let Some(token) = page_token {
+            query.push(("page_token", token));
+        }
+        self.read(Method::GET, &["graphs", graph, "commits"], &query, None)
+            .await
     }
 
     /// One page of a commit's changes against its first parent.
