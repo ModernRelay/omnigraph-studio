@@ -6,7 +6,6 @@ use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, Hsla, Render, SharedString, Window,
 };
 use studio_actions::agent::{Allow, AllowAlways, Reject};
-use studio_actions::table::{DeleteRow, EditCell, InsertRow, PeekRow};
 use studio_ui::ds::{
     self, ActivityRow, Dotted as _, SidebarRow, radii, size, space, surface, text,
 };
@@ -241,50 +240,6 @@ impl Render for DesignGallery {
                     .child(div().flex_1())
                     .child(studio_ui::ds::icon::meta(IconName::ChevronUpDown)),
             );
-        // The right and bottom docks' tabs: title tabs, the active one on a pill.
-        let dock_tabs = h_flex()
-            .h(px(size::HEADER_STRIP))
-            .px(px(space::SM))
-            .gap(px(space::XS))
-            .items_center()
-            .rounded(px(radii(cx).md))
-            .border_1()
-            .border_color(surface::rule(cx))
-            .child(ds::title_tab(
-                "g-inspector",
-                IconName::Info,
-                "Inspector",
-                true,
-                true,
-                cx,
-            ))
-            .child(ds::title_tab(
-                "g-activity",
-                IconName::BoltOutlined,
-                "Activity",
-                false,
-                true,
-                cx,
-            ))
-            .child(div().flex_1())
-            .child(studio_ui::ds::row_icon_button(
-                "g-close-dock",
-                IconName::Close,
-            ));
-        // The document footer, after Delta: graph / branch, the tab's facts, its controls.
-        let footer_context = || {
-            h_flex()
-                .gap(px(space::SM))
-                .items_center()
-                .flex_none()
-                .child(studio_ui::ds::icon::meta(IconName::DatabaseZap))
-                .child(text::body("knowledge"))
-                .child(studio_ui::ds::text::body("/").color(Color::Disabled))
-                .child(studio_ui::ds::icon::meta(IconName::GitBranch))
-                .child(text::body("main"))
-                .child(studio_ui::ds::icon::meta(IconName::ChevronUpDown))
-        };
-
         let columns = [
             GridColumn::new("slug", "slug")
                 .detail("String · key")
@@ -324,20 +279,7 @@ impl Render for DesignGallery {
                         .child(studio_ui::grid_cell(px(200.), false).child(text::body(*title))),
                     cx,
                 )
-            }))
-            .child(
-                ds::footer(cx)
-                    .gap(px(space::LG))
-                    .child(footer_context())
-                    .child(ds::rule_v(cx))
-                    .child(ds::meta(IconName::Hash, "100 of 200"))
-                    .child(ds::meta_code(IconName::GitCommit, "EP12CTBE", cx))
-                    .child(div().flex_1())
-                    .child(ds::key_hint(&EditCell, "Edit", &focus, cx))
-                    .child(ds::key_hint(&PeekRow, "Peek", &focus, cx))
-                    .child(ds::key_hint(&InsertRow, "Row", &focus, cx))
-                    .child(ds::key_hint(&DeleteRow, "Delete", &focus, cx)),
-            );
+            }));
 
         let card = ds::card(cx)
             .child(
@@ -459,133 +401,8 @@ impl Render for DesignGallery {
                 ),
             );
 
-        // Cards, after the reference: a tile, a title, a muted line, a run strip, a meta row.
-        let tick_colors = [
-            Some(ds::Status::Done),
-            Some(ds::Status::Done),
-            None,
-            Some(ds::Status::Failed),
-            Some(ds::Status::Done),
-            Some(ds::Status::Done),
-            Some(ds::Status::Done),
-            None,
-            Some(ds::Status::Done),
-            Some(ds::Status::Failed),
-            Some(ds::Status::Done),
-            Some(ds::Status::Done),
-        ];
-        let ticks = h_flex()
-            .gap(px(space::MD))
-            .children(tick_colors.into_iter().map(|status| {
-                div()
-                    .w(px(size::DRAG_LINE))
-                    .h(px(space::MD))
-                    .bg(match status {
-                        Some(status) => surface::status(status),
-                        None => surface::rule(cx),
-                    })
-            }));
-        let card_a = ds::card(cx)
-            .p(px(space::LG))
-            .gap(px(space::MD))
-            .child(ds::tile(IconName::Folder, cx))
-            .child(div().h(px(space::XL)))
-            .child(text::body("Saved queries").weight(studio_ui::ds::text::weight::HEADING))
-            .child(ds::meta_row([
-                text::meta("4 queries").into_any_element(),
-                h_flex()
-                    .gap(px(space::XS))
-                    .child(text::meta("By"))
-                    .child(studio_ui::ds::icon::meta(IconName::Person))
-                    .child(text::meta("act-dev"))
-                    .into_any_element(),
-            ]));
-        let card_b = ds::card(cx)
-            .p(px(space::LG))
-            .gap(px(space::MD))
-            .child(ds::tile(IconName::Code, cx))
-            .child(
-                v_flex()
-                    .child(
-                        text::body("People without a company")
-                            .weight(studio_ui::ds::text::weight::HEADING),
-                    )
-                    .child(text::muted("Every Person with no WorksAt edge").single_line()),
-            )
-            .child(ticks)
-            .child(ds::meta_row([
-                text::meta("123 runs").into_any_element(),
-                text::meta("Last run 2m ago").into_any_element(),
-                text::meta("main").into_any_element(),
-            ]));
-
-        // A timeline, after the reference: grouped by day, a dotted rail, one bold count each.
-        let changes = ds::card(cx).children(
-            [
-                (1, "Radia Knuth", "title", "Chief Scientist", 0.58),
-                (2, "Grace Allen", "email", "grace@example.com", 0.0),
-                (3, "Allen Labs", "founded", "1998", 0.38),
-            ]
-            .into_iter()
-            .enumerate()
-            .map(|(index, (n, subject, property, value, hue))| {
-                let row = h_flex()
-                    .h(px(size::ROW))
-                    .px(px(space::LG))
-                    .gap(px(space::LG))
-                    .child(ds::number_badge(n.to_string(), hue))
-                    .child(
-                        div()
-                            .w(px(size::FIELD_LABEL_WIDE))
-                            .child(text::body(subject)),
-                    )
-                    .child(div().w(px(size::FIELD_LABEL)).child(text::muted(property)))
-                    .child(text::body(value));
-                if index < 2 {
-                    ds::row_rule(row, cx)
-                } else {
-                    row
-                }
-            }),
-        );
-        let timeline = v_flex()
-            .gap(px(space::MD))
-            .child(ds::section_rule("Today", cx))
-            .child(
-                h_flex()
-                    .h(px(size::FEED_ROW))
-                    .px(px(space::LG))
-                    .gap(px(space::SM))
-                    .rounded(px(radii(cx).md))
-                    .border_1()
-                    .border_color(surface::raised_border(cx))
-                    .bg(surface::document(cx))
-                    .child(studio_ui::ds::icon::meta(IconName::Plus))
-                    .child(text::muted("Add note")),
-            )
-            .child(
-                v_flex()
-                    .child(
-                        ds::TimelineEntry::new("t1", "4 new people", "added to Person", "1h ago")
-                            .disclosure(false)
-                            .source(IconName::GitCommit, "EP12CTBE"),
-                    )
-                    .child(
-                        ds::TimelineEntry::new("t2", "3 properties", "changed", "3 Jun")
-                            .disclosure(true)
-                            .source(IconName::GitBranch, "agent/20261012-084228")
-                            .nested(changes),
-                    )
-                    .child(
-                        ds::TimelineEntry::new("t3", "review", "merged into main", "24 May")
-                            .lead(studio_ui::ds::icon::lead(IconName::GitBranch))
-                            .source(IconName::GitCommit, "4S3Y6CKK")
-                            .last(true),
-                    ),
-            );
-
         // The agent's prompt, after Delta: the next message's gutter row under the thread, and
-        // the agent and send at the end of the footer.
+        // the agent and send in the row under it.
         let composer = ds::card(cx)
             .child(
                 h_flex()
@@ -605,9 +422,11 @@ impl Render for DesignGallery {
                     .child(text::muted("Ask about the graph, or ask for a change…")),
             )
             .child(
-                ds::footer(cx)
+                h_flex()
+                    .px(px(space::MD))
+                    .pb(px(space::MD))
                     .gap(px(space::SM))
-                    .child(footer_context())
+                    .items_center()
                     .child(div().flex_1())
                     .child(studio_ui::ds::icon_button("g-restart", IconName::RotateCw))
                     .child(
@@ -798,18 +617,10 @@ impl Render for DesignGallery {
                     .gap(px(space::XXXL))
                     .items_start()
                     .child(section("Left dock", sidebar))
-                    .child(
-                        v_flex()
-                            .gap(px(space::XXXL))
-                            .child(section(
-                                "Table and footer",
-                                div().w(px(size::READING_WIDTH)).child(table),
-                            ))
-                            .child(section(
-                                "Dock tabs",
-                                div().w(px(size::INSPECTOR_WIDTH)).child(dock_tabs),
-                            )),
-                    ),
+                    .child(section(
+                        "Table",
+                        div().w(px(size::READING_WIDTH)).child(table),
+                    )),
             )
             .child(
                 h_flex()
@@ -834,26 +645,9 @@ impl Render for DesignGallery {
                 "Settings rows · segmented control",
                 div().w(px(size::READING_WIDTH)).child(settings_rows),
             ))
-            .child(
-                h_flex()
-                    .gap(px(space::XXXL))
-                    .items_start()
-                    .child(section(
-                        "Card · folder",
-                        div().w(px(size::SIDEBAR_WIDTH)).child(card_a),
-                    ))
-                    .child(section(
-                        "Card · saved query",
-                        div().w(px(size::SIDEBAR_WIDTH)).child(card_b),
-                    ))
-                    .child(section(
-                        "Agent prompt",
-                        div().w(px(size::MODAL_WIDTH)).child(composer),
-                    )),
-            )
             .child(section(
-                "Timeline",
-                div().w(px(size::READING_WIDTH)).child(timeline),
+                "Agent prompt",
+                div().w(px(size::MODAL_WIDTH)).child(composer),
             ))
             .child(section(
                 "Activity",

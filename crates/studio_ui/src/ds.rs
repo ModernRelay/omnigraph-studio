@@ -1250,15 +1250,6 @@ pub fn rule_h(cx: &App) -> Div {
     div().flex_1().h(px(size::HAIRLINE)).bg(surface::rule(cx))
 }
 
-/// A short vertical hairline between groups in a strip (Delta's footer: context | facts).
-pub fn rule_v(cx: &App) -> Div {
-    div()
-        .w(px(size::HAIRLINE))
-        .h(px(size::SHORT_RULE))
-        .flex_none()
-        .bg(surface::rule(cx))
-}
-
 /// The divider between groups of the status bar, as Zed's: a short vertical line in the border
 /// colour, which a hairline's lighter colour would lose against the bar.
 pub fn divider_v(cx: &App) -> Div {
@@ -1267,45 +1258,6 @@ pub fn divider_v(cx: &App) -> Div {
         .h(px(size::SHORT_RULE))
         .flex_none()
         .bg(cx.theme().colors().border)
-}
-
-/// A panel's tab in a dock's header strip: its icon and title, the active one dark and, when
-/// the dock has a choice of panels, on a pill.
-pub fn title_tab(
-    id: impl Into<ElementId>,
-    icon: IconName,
-    title: impl Into<SharedString>,
-    selected: bool,
-    pill: bool,
-    cx: &App,
-) -> Stateful<Div> {
-    h_flex()
-        .id(id.into())
-        .h(px(size::PILL))
-        .px(px(space::MD))
-        .gap(px(space::SM))
-        .items_center()
-        .rounded(px(radii(cx).sm))
-        .when(selected && pill, |tab| tab.bg(surface::selected_chrome(cx)))
-        .cursor_pointer()
-        .child(icon::meta(icon))
-        .child(Label::new(title).size(LabelSize::Small).color(if selected {
-            Color::Default
-        } else {
-            Color::Muted
-        }))
-}
-
-/// A document's footer strip.
-pub fn footer(cx: &App) -> Div {
-    h_flex()
-        .h(px(size::STRIP))
-        .flex_none()
-        .px(px(space::EDGE))
-        .gap(px(space::XL))
-        .items_center()
-        .border_t_1()
-        .border_color(surface::rule(cx))
 }
 
 /// Metadata as an icon and a short value (a count, a commit, a branch), instead of a sentence.
@@ -2276,19 +2228,6 @@ impl RenderOnce for ActivityRow {
 
 // ---- components from the reference frames ----
 
-/// An icon on a small tile, as a card or entry leads with one.
-pub fn tile(icon: IconName, cx: &App) -> Div {
-    div()
-        .size(px(size::CONTROL))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(radii(cx).sm))
-        .bg(surface::highlight(cx))
-        .child(icon::lead(icon))
-}
-
 /// Metadata items joined by a middle dot: "123 runs · last run 2m ago · by act-dev".
 pub fn meta_row(items: impl IntoIterator<Item = AnyElement>) -> Div {
     let mut row = h_flex().gap(px(space::SM)).items_center().min_w_0();
@@ -2303,38 +2242,6 @@ pub fn meta_row(items: impl IntoIterator<Item = AnyElement>) -> Div {
         row = row.child(item);
     }
     row
-}
-
-/// A section label with a dotted rule running to the edge, as a feed groups by date.
-pub fn section_rule(title: impl Into<SharedString>, cx: &App) -> Div {
-    h_flex()
-        .w_full()
-        .gap(px(space::LG))
-        .items_center()
-        .child(text::meta(title))
-        .child(dotted(
-            div().flex_1().h(px(size::HAIRLINE)).border_t_1(),
-            cx,
-        ))
-}
-
-/// A count in a soft tinted pill: pale status tints, keyed by a hue so the same type
-/// gets the same colour everywhere.
-pub fn number_badge(value: impl Into<SharedString>, hue: f32) -> Div {
-    div()
-        .h(px(size::TAG))
-        .min_w(px(size::TAG))
-        .px(px(space::SM))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_full()
-        .bg(gpui::hsla(hue, 0.70, 0.92, 1.))
-        .child(
-            Label::new(value.into())
-                .size(LabelSize::XSmall)
-                .color(Color::Custom(gpui::hsla(hue, 0.55, 0.40, 1.))),
-        )
 }
 
 /// A rounded-full control with a hairline: a picker in a composer ("Claude ▾").
@@ -2387,160 +2294,6 @@ pub fn composer_button(
                     .child(icon::lead(icon))
             }
         })
-}
-
-/// One entry of a timeline: a hollow dot on a dotted rail, an optional disclosure, a bold
-/// subject and a muted verb, then where it came from and when, right-aligned. Nested content
-/// (an expanded group) goes under it, on the rail.
-#[derive(IntoElement)]
-pub struct TimelineEntry {
-    id: ElementId,
-    subject: SharedString,
-    verb: SharedString,
-    expanded: Option<bool>,
-    source_icon: Option<IconName>,
-    source: Option<SharedString>,
-    when: SharedString,
-    lead: Option<AnyElement>,
-    nested: Option<AnyElement>,
-    last: bool,
-}
-
-impl TimelineEntry {
-    pub fn new(
-        id: impl Into<ElementId>,
-        subject: impl Into<SharedString>,
-        verb: impl Into<SharedString>,
-        when: impl Into<SharedString>,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            subject: subject.into(),
-            verb: verb.into(),
-            expanded: None,
-            source_icon: None,
-            source: None,
-            when: when.into(),
-            lead: None,
-            nested: None,
-            last: false,
-        }
-    }
-
-    /// Show a disclosure: `true` expanded, `false` collapsed.
-    pub fn disclosure(mut self, expanded: bool) -> Self {
-        self.expanded = Some(expanded);
-        self
-    }
-
-    pub fn source(mut self, icon: IconName, source: impl Into<SharedString>) -> Self {
-        self.source_icon = Some(icon);
-        self.source = Some(source.into());
-        self
-    }
-
-    /// An icon or logo before the subject, in place of a disclosure.
-    pub fn lead(mut self, lead: impl IntoElement) -> Self {
-        self.lead = Some(lead.into_any_element());
-        self
-    }
-
-    pub fn nested(mut self, nested: impl IntoElement) -> Self {
-        self.nested = Some(nested.into_any_element());
-        self
-    }
-
-    pub fn last(mut self, last: bool) -> Self {
-        self.last = last;
-        self
-    }
-}
-
-impl RenderOnce for TimelineEntry {
-    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let rule = surface::rule(cx);
-        // The dot sits centred on the header's line; the rail runs from under it.
-        let dot_top = (size::HEADER - size::DOT) / 2.;
-        let rail = div()
-            .w(px(size::GUTTER))
-            .flex_none()
-            .relative()
-            .flex()
-            .justify_center()
-            // The dotted rail runs the entry's height, except below the last entry.
-            .when(!self.last, |rail| {
-                rail.child(
-                    div()
-                        .absolute()
-                        .top(px(dot_top + size::DOT))
-                        .bottom_0()
-                        .w(px(size::HAIRLINE))
-                        .border_l_1()
-                        .border_dashed()
-                        .border_color(rule),
-                )
-            })
-            .child(
-                div()
-                    .mt(px(dot_top))
-                    .size(px(size::DOT))
-                    .rounded_full()
-                    .border_1()
-                    .border_color(rule)
-                    .bg(surface::document(cx)),
-            );
-        let header = h_flex()
-            .h(px(size::HEADER))
-            .gap(px(space::SM))
-            .items_center()
-            .children(self.expanded.map(|expanded| {
-                Icon::new(if expanded {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                })
-                .size(IconSize::XSmall)
-                .color(Color::Muted)
-            }))
-            .children(self.lead)
-            .child(
-                text::body(self.subject)
-                    .weight(text::weight::HEADING)
-                    .single_line(),
-            )
-            .child(text::muted(self.verb).single_line())
-            .child(div().flex_1())
-            .child(meta_row(
-                self.source
-                    .map(|source| {
-                        h_flex()
-                            .gap(px(space::XS))
-                            .child(text::meta("From"))
-                            .children(self.source_icon.map(icon::meta))
-                            .child(text::meta(source).single_line())
-                            .into_any_element()
-                    })
-                    .into_iter()
-                    .chain(std::iter::once(text::meta(self.when).into_any_element())),
-            ));
-        h_flex()
-            .id(self.id)
-            .w_full()
-            // Stretch, so the rail spans the whole entry, nested content included.
-            .items_stretch()
-            .child(rail)
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .pb(px(space::XS))
-                    .child(header)
-                    .children(
-                        self.nested
-                            .map(|nested| div().pb(px(space::MD)).child(nested)),
-                    ),
-            )
-    }
 }
 
 #[cfg(test)]
