@@ -29,8 +29,9 @@ pub fn load(cx: &mut App) {
         modified: modified(),
     });
     bind_defaults(cx);
-    // A file that does not parse at launch leaves Studio's bindings alone.
-    let user = read_user(cx).unwrap_or_default();
+    // A file that does not parse at launch leaves Studio's bindings alone. Read here, before
+    // the first window: its keys are bound when it opens.
+    let user = user_bindings(read_user(), cx).unwrap_or_default();
     cx.bind_keys(user);
     watch(cx);
 }
@@ -57,13 +58,24 @@ fn modified() -> Option<SystemTime> {
         .ok()
 }
 
-/// The person's bindings, recording what did not load; `None` when the file cannot be read or
-/// does not parse, so the bindings in effect stay. A missing file binds nothing.
-fn read_user(cx: &mut App) -> Option<Vec<KeyBinding>> {
+/// `keymap.json`'s text, `None` when there is no file. A plain read, so the watch makes it off
+/// the main thread.
+fn read_user() -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(studio_settings::keymap_path()) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The person's bindings from the file as read, recording what did not load; `None` when the
+/// file cannot be read or does not parse, so the bindings in effect stay. A missing file binds
+/// nothing.
+fn user_bindings(read: std::io::Result<Option<String>>, cx: &mut App) -> Option<Vec<KeyBinding>> {
     let path = studio_settings::keymap_path();
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let text = match read {
+        Ok(Some(text)) => text,
+        Ok(None) => {
             studio_settings::set_keymap_problems(Vec::new(), cx);
             return Some(Vec::new());
         }
@@ -168,13 +180,15 @@ fn watch(cx: &mut App) {
     cx.spawn(async move |cx| {
         loop {
             cx.background_executor().timer(Duration::from_secs(2)).await;
-            // Off the main thread: a slow or network home would hold up frames.
+            // Off the main thread, as the read below: a slow or network home would hold up
+            // frames.
             let modified = cx.background_executor().spawn(async { modified() }).await;
             let changed = cx.update(|cx| cx.global::<UserKeymap>().modified != modified);
             if changed {
+                let read = cx.background_executor().spawn(async { read_user() }).await;
                 cx.update(|cx| {
                     cx.global_mut::<UserKeymap>().modified = modified;
-                    reload(cx);
+                    reload(read, cx);
                 });
             }
         }
@@ -182,9 +196,9 @@ fn watch(cx: &mut App) {
     .detach();
 }
 
-/// Reads `keymap.json` and, when it parses, rebinds every key from the defaults up.
-pub(crate) fn reload(cx: &mut App) {
-    let Some(user) = read_user(cx) else {
+/// Rebinds every key from the defaults up with `keymap.json` as read, when it parses.
+fn reload(read: std::io::Result<Option<String>>, cx: &mut App) {
+    let Some(user) = user_bindings(read, cx) else {
         return;
     };
     cx.clear_key_bindings();

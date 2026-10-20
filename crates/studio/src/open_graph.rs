@@ -8,7 +8,6 @@ use gpui::{
 };
 use graph_store::{
     Connection, ConnectionEvent, ConnectionRegistry, ConnectionState, GraphListing, ServerSource,
-    open_session,
 };
 use studio_ui::ds::{self, MenuRow, size, space};
 use studio_workspace::ModalView;
@@ -163,9 +162,16 @@ impl OpenGraphModal {
             return;
         }
         let graph_id = graph_id.trim().to_owned();
-        // A graph id typed in is kept with its server, for a token that cannot list graphs.
-        connection.update(cx, |connection, _| connection.remember_graph(&graph_id));
-        ConnectionRegistry::global(cx).read(cx).save(cx);
+        // A graph id typed in is kept with its server, for a token that cannot list graphs. One
+        // the server lists needs no keeping, and kept would be offered after its deletion.
+        let listed = matches!(
+            &connection.read(cx).graphs,
+            GraphListing::Listed(graphs) if graphs.iter().any(|g| g.graph_id == graph_id)
+        );
+        if !listed {
+            connection.update(cx, |connection, _| connection.remember_graph(&graph_id));
+            ConnectionRegistry::global(cx).read(cx).save(cx);
+        }
         if let Some(workspace) = self.workspace.upgrade() {
             // A graph the window has open is shown as it is, on its own branch.
             let url = &connection.read(cx).server.url;
@@ -180,9 +186,6 @@ impl OpenGraphModal {
                 .then(|| crate::window_holding(&connection, &graph_id, cx))
                 .flatten();
             match (open, elsewhere) {
-                (Some(open), _) => {
-                    workspace.update(cx, |workspace, cx| workspace.show_graph(open, window, cx))
-                }
                 (None, Some((handle, session))) => cx.defer(move |cx| {
                     handle
                         .update(cx, |workspace, window, cx| {
@@ -191,10 +194,8 @@ impl OpenGraphModal {
                         })
                         .ok();
                 }),
-                (None, None) => workspace.update(cx, |workspace, cx| {
-                    let session = open_session(connection, graph_id, "main".into(), cx);
-                    workspace.set_session(session, window, cx)
-                }),
+                // Open here already, shown on its own branch; else opened here on main.
+                _ => crate::show_graph_in(&workspace, connection, graph_id, None, window, cx),
             }
         }
         cx.emit(DismissEvent);
@@ -211,10 +212,24 @@ impl OpenGraphModal {
         };
         let token = (!token.trim().is_empty()).then(|| token.trim().to_owned());
         let registry = ConnectionRegistry::global(cx);
+        let listed: Vec<_> = registry
+            .read(cx)
+            .connections
+            .iter()
+            .map(|connection| connection.entity_id())
+            .collect();
         let result = registry.update(cx, |registry, cx| {
             registry.add_server(name, url, token, Vec::new(), cx)
         });
         match result {
+            // An address listed already is that server, which a new token reconnects itself:
+            // it is selected, followed and connected once, as it was.
+            Ok(connection) if listed.contains(&connection.entity_id()) => {
+                let name = connection.read(cx).server.name.clone();
+                self.select(connection, cx);
+                self.error = Some(format!("{name} has that address already.").into());
+                cx.notify();
+            }
             Ok(connection) => {
                 self._subscriptions
                     .push(cx.subscribe(&connection, |_, _, _: &ConnectionEvent, cx| cx.notify()));
@@ -311,9 +326,18 @@ impl OpenGraphModal {
         let status = match &c.state {
             ConnectionState::Unreachable(error) => format!("Could not reach the server: {error}"),
             ConnectionState::Unauthorized => "The server refused the token.".into(),
+            ConnectionState::TokenUnreadable(reason) => {
+                format!("Studio could not read the token from the keychain: {reason}")
+            }
             state => state.label(),
         };
         let state = c.state.clone();
+        // A token typed in replaces one the server refused or the keychain would not give.
+        let asks_token = matches!(
+            state,
+            ConnectionState::Unauthorized | ConnectionState::TokenUnreadable(_)
+        );
+        let unsaved = c.token_unsaved.clone();
         let cli = c.server.source == ServerSource::Cli;
         let selected = connection.clone();
         let listing_note = match &c.graphs {
@@ -360,7 +384,15 @@ impl OpenGraphModal {
                         _ => row,
                     }),
             )
-            .when(state == ConnectionState::Unauthorized, |pane| {
+            .children(unsaved.map(|reason| {
+                div()
+                    .px(px(space::MD))
+                    .child(studio_ui::ds::text::muted(format!(
+                        "The token could not be saved to the keychain: {reason}. It lasts until \
+                     Studio quits."
+                    )))
+            }))
+            .when(asks_token, |pane| {
                 pane.child(
                     h_flex()
                         .py(px(space::XS))

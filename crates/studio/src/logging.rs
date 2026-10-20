@@ -56,23 +56,30 @@ pub fn init() {
 }
 
 /// `message` with the text inside quotes and backticks replaced by `…`, cut to 300 characters.
+/// An apostrophe inside a word (`can't`, `Ada's`) neither opens nor closes a quote, and a quote
+/// left open hides the rest.
 fn without_quotes(message: &str) -> String {
     let mut out = String::new();
     let mut open: Option<char> = None;
-    for c in message.chars() {
+    let mut before: Option<char> = None;
+    let mut chars = message.chars().peekable();
+    while let Some(c) = chars.next() {
+        let after = chars.peek().copied();
+        let in_word = |side: Option<char>| side.is_some_and(char::is_alphanumeric);
         match open {
-            Some(quote) if c == quote => {
+            Some(quote) if c == quote && !(c == '\'' && in_word(after)) => {
                 out.push(c);
                 open = None;
             }
             Some(_) => {}
-            None if matches!(c, '`' | '\'' | '"') => {
+            None if matches!(c, '`' | '"') || (c == '\'' && !in_word(before)) => {
                 out.push(c);
                 out.push('…');
                 open = Some(c);
             }
             None => out.push(c),
         }
+        before = Some(c);
     }
     if out.chars().count() > 300 {
         out = out.chars().take(299).collect();
@@ -98,6 +105,13 @@ mod tests {
             "called `…` on a `…` value"
         );
         assert_eq!(without_quotes("plain"), "plain");
+        // An apostrophe is no quote: the quoted name after it is still hidden.
+        assert_eq!(without_quotes("can't open 'secret.json'"), "can't open '…'");
+        assert_eq!(
+            without_quotes("no row for 'Ada's notes' here"),
+            "no row for '…' here"
+        );
+        assert_eq!(without_quotes("left open: 'secret"), "left open: '…");
         assert_eq!(without_quotes(&"x".repeat(400)).chars().count(), 300);
     }
 }

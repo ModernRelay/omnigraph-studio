@@ -22,7 +22,7 @@ use gpui::{
     Action, AnyView, App, Bounds, ClickEvent, Context, DismissEvent, Div, DragMoveEvent, ElementId,
     Entity, EntityId, EventEmitter, FocusHandle, Focusable, MouseButton, Pixels, Point, Render,
     ScrollHandle, SharedString, Stateful, Subscription, Task, WeakEntity, Window,
-    WindowControlArea, deferred, div, point,
+    WindowControlArea, WindowHandle, deferred, div, point,
 };
 use graph_store::{ConnectionRegistry, ConnectionState, GraphSession, OutcomeKind, SessionEvent};
 use studio_actions::graph::{OpenCommit, OpenHistory};
@@ -106,6 +106,8 @@ struct Toast {
 /// How long a success or info toast stays (spec 002); hovering pauses it.
 const TOAST_DURATION: Duration = Duration::from_secs(10);
 const TOAST_TICK: Duration = Duration::from_millis(250);
+/// Toasts shown at once.
+const TOASTS_SHOWN: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceEvent {
@@ -207,7 +209,12 @@ pub struct Workspace {
     _quit_subscription: Subscription,
     _activation_subscription: Subscription,
     _registry_subscription: Option<Subscription>,
-    _session_subscription: Option<Subscription>,
+    /// Each open graph's session, shown or parked: a write's outcome is toasted whichever
+    /// graph is shown when it lands.
+    _graph_subscriptions: HashMap<EntityId, Subscription>,
+    /// How many of each open graph's outcomes ([`GraphSession::outcomes_logged`]) have been
+    /// toasted or passed over.
+    outcomes_toasted: HashMap<EntityId, u64>,
     _item_subscriptions: Vec<(gpui::EntityId, Subscription)>,
 }
 
@@ -301,13 +308,19 @@ impl Workspace {
         let performance_subscription =
             cx.observe_global::<StudioSettings>(|this, cx| this.watch_performance(cx));
         let window_slot = persistence::window_opened(window, cx);
-        // A window with a write still running stays open until the write ends.
+        // A window with a write still running stays open until the write ends; one with unsaved
+        // tabs asks first.
         let this = cx.entity().downgrade();
-        window.on_window_should_close(cx, move |_, cx| {
+        window.on_window_should_close(cx, move |window, cx| {
             this.update(cx, |workspace, cx| match workspace.running_write(cx) {
-                // Closing drops the save waiting for its delay: written now, in turn on the
-                // write thread; only a quit waits for the disk.
                 None => {
+                    let unsaved = workspace.unsaved_tabs(cx);
+                    if !unsaved.is_empty() {
+                        workspace.confirm_close(Closing::Window, unsaved, window, cx);
+                        return false;
+                    }
+                    // Closing drops the save waiting for its delay: written now, in turn on
+                    // the write thread; only a quit waits for the disk.
                     workspace.flush_saves(cx);
                     true
                 }
@@ -407,7 +420,8 @@ impl Workspace {
             }),
             _activation_subscription: activation_subscription,
             _registry_subscription: registry_subscription,
-            _session_subscription: None,
+            _graph_subscriptions: HashMap::new(),
+            outcomes_toasted: HashMap::new(),
             _item_subscriptions: Vec::new(),
         };
         if let Some(registry) = registry {
@@ -571,8 +585,8 @@ impl Workspace {
         }
     }
 
-    /// Writes the workspace's state shortly after it stops changing.
-    fn save_if_changed(&mut self, cx: &mut Context<Self>) {
+    /// Records the graphs the window has open, for the next start, when they changed.
+    fn save_open_graphs(&mut self, cx: &mut Context<Self>) {
         if persistence::restore_enabled() {
             let open = self.session_snapshot(cx);
             if self.saved_session.as_ref() != Some(&open) {
@@ -580,6 +594,11 @@ impl Workspace {
                 self.saved_session = Some(open);
             }
         }
+    }
+
+    /// Writes the workspace's state shortly after it stops changing.
+    fn save_if_changed(&mut self, cx: &mut Context<Self>) {
+        self.save_open_graphs(cx);
         let Some((url, graph)) = self.graph_key(cx) else {
             return;
         };
@@ -664,12 +683,14 @@ impl Workspace {
         self.next_pane = panes.len();
         self.dedupe_across_panes = false;
         for (id, saved_pane) in panes.iter().enumerate() {
-            self.active_pane = id;
             // A saved tab can decline to open (a type the schema dropped, a kind removed): the
             // pins and the active tab are counted over the tabs that opened, not by position.
             let mut pinned = 0;
             let mut active = 0;
             for (index, item) in saved_pane.items.iter().enumerate() {
+                // Set for each tab: one that opens once (a conversation) shows the tab another
+                // pane holds, which makes that pane the active one.
+                self.active_pane = id;
                 let before = self.pane(id).map_or(0, |pane| pane.items.len());
                 if let Some(open) = persistence::opener(cx, &item.kind) {
                     open(&item.data, self, window, cx);
@@ -734,7 +755,7 @@ impl Workspace {
             self.parked.push(current);
         }
         self.graph_order.push(session.entity_id());
-        self.subscribe_session(session, window, cx);
+        self.subscribe_session(session, cx);
         if persistence::restore_enabled() {
             self.saved = None;
             self.restore(window, cx);
@@ -771,6 +792,7 @@ impl Workspace {
             return;
         }
         self.graph_order.push(session.entity_id());
+        self.watch_graph(&session, cx);
         self.parked.push(ParkedGraph {
             session,
             panes: vec![Pane::new(0)],
@@ -784,41 +806,44 @@ impl Workspace {
         cx.notify();
     }
 
-    fn subscribe_session(
-        &mut self,
-        session: Entity<GraphSession>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self._session_subscription = Some(cx.subscribe_in(
-            &session,
-            window,
-            |this, _session, event: &SessionEvent, _window, cx| {
-                match event {
-                    SessionEvent::ActivityChanged => this.toast_for_latest_outcome(cx),
-                    SessionEvent::BranchMissing { branch } => this.show_toast(
-                        ToastKind::Info,
-                        format!("The branch {branch} is gone, so main is shown."),
-                        cx,
-                    ),
-                    _ => {}
-                }
-                cx.notify();
-            },
-        ));
+    /// Shows `session`'s graph as the window's.
+    fn subscribe_session(&mut self, session: Entity<GraphSession>, cx: &mut Context<Self>) {
+        self.watch_graph(&session, cx);
         self.session = Some(session);
+    }
+
+    /// Follows an open graph's session for as long as the window has it open: its writes'
+    /// outcomes are toasted, and the shown one's other events drawn.
+    fn watch_graph(&mut self, session: &Entity<GraphSession>, cx: &mut Context<Self>) {
+        let id = session.entity_id();
+        if self._graph_subscriptions.contains_key(&id) {
+            return;
+        }
+        // Outcomes from before the graph opened here are the activity log's, not toasts.
+        self.outcomes_toasted
+            .insert(id, session.read(cx).outcomes_logged);
+        let subscription = cx.subscribe(session, |this, session, event: &SessionEvent, cx| {
+            let shown = this.session.as_ref() == Some(&session);
+            match event {
+                SessionEvent::ActivityChanged => this.toast_outcomes(&session, cx),
+                SessionEvent::BranchMissing { branch } if shown => this.show_toast(
+                    ToastKind::Info,
+                    format!("The branch {branch} is gone, so main is shown."),
+                    cx,
+                ),
+                _ => {}
+            }
+            if shown {
+                cx.notify();
+            }
+        });
+        self._graph_subscriptions.insert(id, subscription);
     }
 
     /// Writes what is waiting for the save delay now, and waits for the writes: the window or
     /// the app is going.
     fn flush_saves(&mut self, cx: &mut Context<Self>) {
-        if persistence::restore_enabled() {
-            let open = self.session_snapshot(cx);
-            if self.saved_session.as_ref() != Some(&open) {
-                persistence::window_graphs_changed(self.window_slot, &open, cx);
-                self.saved_session = Some(open);
-            }
-        }
+        self.save_open_graphs(cx);
         self.save_now(cx);
         // A move or resize just before the window closes or Studio quits is kept too.
         self._save_bounds = None;
@@ -851,10 +876,8 @@ impl Workspace {
     fn park(&mut self, cx: &mut Context<Self>) -> Option<ParkedGraph> {
         self.save_now(cx);
         let session = self.session.take()?;
-        self._session_subscription = None;
-        if let Some(position) = self.dock_of(INSPECTOR_PANEL) {
-            self.dock_mut(position).remove(INSPECTOR_PANEL);
-        }
+        // The inspector shows the graph's rows, and holds its session.
+        self.remove_panel(INSPECTOR_PANEL);
         self.zoomed = None;
         // A modal open now must not hand the focus back to a tab of this graph.
         if let Some(modal) = &mut self.modal {
@@ -889,7 +912,7 @@ impl Workspace {
         self.center = parked.center;
         self.active_pane = parked.active_pane;
         self.next_pane = parked.next_pane;
-        self.subscribe_session(parked.session, window, cx);
+        self.subscribe_session(parked.session, cx);
         if parked.restored {
             // Its docks as it left them, not the docks of the graph shown before.
             if let Some(saved) = &parked.saved {
@@ -908,7 +931,6 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The graphs open in this window, in the order they were opened, and which is shown.
     /// The session this window has open for `graph` on the server at `url`. A graph is matched
     /// by its server's address, as its saved state is kept, so one open under another name the
     /// CLI gives that server is the same graph.
@@ -928,6 +950,7 @@ impl Workspace {
             .cloned()
     }
 
+    /// The graphs open in this window, in the order they were opened, and which is shown.
     pub fn open_graphs(&self) -> Vec<(Entity<GraphSession>, bool)> {
         self.graph_order
             .iter()
@@ -979,6 +1002,50 @@ impl Workspace {
         self.show_graph(next, window, cx);
     }
 
+    /// The titles of this window's tabs with unsaved work, the shown graph's and each parked
+    /// graph's: closing the window or quitting drops it.
+    pub fn unsaved_tabs(&self, cx: &App) -> Vec<SharedString> {
+        let parked = self.parked.iter().flat_map(|parked| {
+            parked
+                .panes
+                .iter()
+                .flat_map(|pane| pane.items.iter().map(|item| item.as_ref()))
+        });
+        self.all_items()
+            .chain(parked)
+            .filter(|item| item.is_dirty(cx))
+            .map(|item| item.tab_title(cx))
+            .collect()
+    }
+
+    /// Asks before `closing` drops the unsaved work of the tabs named. A close asked while
+    /// another waits for its answer asks the wider of the two (Quit over the window, the
+    /// window over the graph, the graph over a tab): ⌘Q over a tab's question asks about
+    /// quitting, where ⌘W over the window's question leaves it.
+    fn confirm_close(
+        &mut self,
+        closing: Closing,
+        unsaved: Vec<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let asked = self
+            .modal
+            .as_ref()
+            .and_then(|modal| modal.view.clone().downcast::<ConfirmClose>().ok())
+            .map(|dialog| dialog.read(cx).closing);
+        if asked.is_some_and(|asked| asked.reach() > closing.reach()) {
+            return;
+        }
+        let workspace = cx.entity().downgrade();
+        self.show_modal(window, cx, move |_, cx| ConfirmClose {
+            workspace,
+            closing,
+            unsaved,
+            focus_handle: cx.focus_handle(),
+        });
+    }
+
     /// A graph of this window, shown or parked, with a write still running: closing the window
     /// or quitting would drop the write's outcome.
     pub fn running_write(&self, cx: &App) -> Option<SharedString> {
@@ -992,8 +1059,13 @@ impl Workspace {
 
     /// Closes the shown graph's tabs in this window and shows the graph opened before it. Its
     /// tabs are saved first, so opening it again brings them back. A graph with a write still
-    /// running stays open: closing it could drop the write's outcome.
+    /// running stays open: closing it could drop the write's outcome. Tabs with unsaved work
+    /// are named first, in a dialog that closes the graph once confirmed.
     pub fn close_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_graph_asking(true, window, cx);
+    }
+
+    fn close_graph_asking(&mut self, ask: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.session.clone() else {
             return;
         };
@@ -1006,11 +1078,22 @@ impl Workspace {
             );
             return;
         }
+        let unsaved: Vec<SharedString> = self
+            .all_items()
+            .filter(|item| item.is_dirty(cx))
+            .map(|item| item.tab_title(cx))
+            .collect();
+        if ask && !unsaved.is_empty() {
+            self.confirm_close(Closing::Graph, unsaved, window, cx);
+            return;
+        }
         let id = session.entity_id();
         if let Some(closed) = self.park(cx) {
             self.forget_items(&closed.panes);
         }
         self.graph_order.retain(|open| *open != id);
+        self._graph_subscriptions.remove(&id);
+        self.outcomes_toasted.remove(&id);
         let next = self.graph_order.last().copied().and_then(|next| {
             let index = self
                 .parked
@@ -1028,27 +1111,41 @@ impl Workspace {
         }
     }
 
-    fn toast_for_latest_outcome(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = &self.session else { return };
-        let session = session.read(cx);
-        if session.writes_in_flight > 0 {
-            return;
+    /// Toasts the outcomes `session` logged since the last asked: each refusal and each
+    /// outcome nobody knows, and a commit once no write of its graph is out, so a run of fixes
+    /// toasts its last. A graph not shown names itself.
+    fn toast_outcomes(&mut self, session: &Entity<GraphSession>, cx: &mut Context<Self>) {
+        let id = session.entity_id();
+        let read = session.read(cx);
+        let logged = read.outcomes_logged;
+        let seen = self.outcomes_toasted.insert(id, logged).unwrap_or(logged);
+        let new = (logged.saturating_sub(seen) as usize).min(read.outcomes.len());
+        let writing = read.writes_in_flight > 0;
+        let fresh = read.outcomes[read.outcomes.len() - new..].to_vec();
+        let graph = (self.session.as_ref() != Some(session)).then(|| read.graph_id.clone());
+        for (ix, entry) in fresh.iter().enumerate() {
+            if matches!(entry.outcome, OutcomeKind::Committed { .. })
+                && (writing || ix + 1 < fresh.len())
+            {
+                continue;
+            }
+            self.toast_outcome(entry, graph.as_deref(), cx);
         }
-        let Some(latest) = session.outcomes.last() else {
-            return;
+    }
+
+    fn toast_outcome(
+        &mut self,
+        latest: &graph_store::OutcomeEntry,
+        graph: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let text = match graph {
+            Some(graph) => format!("{graph}: {}", toast_text(latest)),
+            None => toast_text(latest),
         };
-        let shown = self
-            .toasts
-            .iter()
-            .any(|t| t.message.as_ref() == toast_text(latest).as_str());
-        if shown {
+        if self.toasts.iter().any(|t| t.message.as_ref() == text) {
             return;
         }
-        let elapsed = latest.at.elapsed().unwrap_or_default();
-        if elapsed > Duration::from_secs(2) {
-            return;
-        }
-        let text = toast_text(latest);
         match &latest.outcome {
             // No publish, no toast (constitution VII); the surface that wrote explains it.
             OutcomeKind::Committed { commit: None } => {}
@@ -1135,6 +1232,28 @@ impl Workspace {
             self.activate_in(pane, index, true, window, cx);
             return view.downcast::<T>().ok();
         }
+        Some(self.add_new(preview, window, cx, build))
+    }
+
+    /// Opens an item of type `T` in a new tab whatever is open: one that has no key yet, as a
+    /// new conversation before the agent names it.
+    pub fn add_item<T: Item>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(&mut Window, &mut Context<T>) -> T,
+    ) -> Entity<T> {
+        self.add_new(false, window, cx, build)
+    }
+
+    /// Makes an item, follows its events and puts it in the active pane.
+    fn add_new<T: Item>(
+        &mut self,
+        preview: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(&mut Window, &mut Context<T>) -> T,
+    ) -> Entity<T> {
         let item = cx.new(|cx| build(window, cx));
         let subscription = cx.subscribe_in(
             &item,
@@ -1162,7 +1281,7 @@ impl Workspace {
         self._item_subscriptions
             .push((item.entity_id(), subscription));
         self.insert(Box::new(item.clone()), preview, window, cx);
-        Some(item)
+        item
     }
 
     /// Puts an item in the active pane and activates it.
@@ -1311,15 +1430,9 @@ impl Workspace {
             self.force_close(pane, index, window, cx);
             return;
         }
-        let item_id = item.item_id();
+        let closing = Closing::Tab(item.item_id());
         let title = item.tab_title(cx);
-        let workspace = cx.entity().downgrade();
-        self.toggle_modal(window, cx, move |_, cx| ConfirmClose {
-            workspace,
-            item_id,
-            title,
-            focus_handle: cx.focus_handle(),
-        });
+        self.confirm_close(closing, vec![title], window, cx);
     }
 
     /// Closes the tabs with these ids that have nothing unsaved; the others stay open, with
@@ -1383,7 +1496,8 @@ impl Workspace {
     }
 
     /// Splits the active pane; the new pane opens a copy of the active tab, when the tab can
-    /// be reopened, and becomes active.
+    /// be reopened, and becomes active. A tab that opens once in a window (a conversation)
+    /// stays where it is, and the new pane opens empty.
     pub fn split(
         &mut self,
         direction: SplitDirection,
@@ -1550,6 +1664,8 @@ impl Workspace {
             actions: None,
             focus: None,
         });
+        // The view it replaced goes with its host.
+        self.drop_stale_hosts();
         cx.notify();
     }
 
@@ -1624,15 +1740,8 @@ impl Workspace {
         });
     }
 
-    /// Makes sure a dock panel has its cached host, dropping hosts of panels gone from the
-    /// docks.
+    /// Makes sure a dock panel has its cached host.
     fn host_for(&mut self, view: &AnyView, cx: &mut Context<Self>) {
-        let live: HashSet<EntityId> = [&self.left, &self.right, &self.bottom]
-            .iter()
-            .flat_map(|dock| dock.panels.iter().map(|panel| panel.view.entity_id()))
-            .chain([view.entity_id()])
-            .collect();
-        self.dock_hosts.retain(|id, _| live.contains(id));
         let view = view.clone();
         self.dock_hosts.entry(view.entity_id()).or_insert_with(|| {
             cx.new(|_| DockHost {
@@ -1640,6 +1749,25 @@ impl Workspace {
                 scrolls_itself: false,
             })
         });
+    }
+
+    /// Drops the hosts of panels gone from the docks, whenever a panel goes or is replaced. A
+    /// host holds its panel's view and what the view holds: an inspector holds its graph's
+    /// session, whose poll of the server runs for as long as the session lives.
+    fn drop_stale_hosts(&mut self) {
+        let live: HashSet<EntityId> = [&self.left, &self.right, &self.bottom]
+            .iter()
+            .flat_map(|dock| dock.panels.iter().map(|panel| panel.view.entity_id()))
+            .collect();
+        self.dock_hosts.retain(|id, _| live.contains(id));
+    }
+
+    /// Takes a panel out of its dock, with its host.
+    fn remove_panel(&mut self, id: &str) {
+        if let Some(position) = self.dock_of(id) {
+            self.dock_mut(position).remove(id);
+        }
+        self.drop_stale_hosts();
     }
 
     /// Lets a side panel scroll itself, as a list that draws only the rows in view does: its
@@ -1734,12 +1862,10 @@ impl Workspace {
                 let open = dock.open;
                 dock.activate(INSPECTOR_PANEL);
                 dock.open = open;
+                // The inspector it replaced goes with its host.
+                self.drop_stale_hosts();
             }
-            None => {
-                if let Some(position) = self.dock_of(INSPECTOR_PANEL) {
-                    self.dock_mut(position).remove(INSPECTOR_PANEL);
-                }
-            }
+            None => self.remove_panel(INSPECTOR_PANEL),
         }
         cx.notify();
     }
@@ -1779,15 +1905,31 @@ impl Workspace {
         cx: &mut Context<Self>,
         build: impl FnOnce(&mut Window, &mut Context<V>) -> V,
     ) {
-        // As Zed's modal layer: the open modal is asked first, whether this command closes it
-        // or another replaces it; a modal that says no stays, and the replacement is not shown.
+        let same = self
+            .modal
+            .as_ref()
+            .is_some_and(|active| active.view.clone().downcast::<V>().is_ok());
+        if same {
+            self.hide_modal(window, cx);
+        } else {
+            self.show_modal(window, cx, build);
+        }
+    }
+
+    /// Shows a modal in place of the one open, of whatever type.
+    pub fn show_modal<V: ModalView>(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(&mut Window, &mut Context<V>) -> V,
+    ) {
+        // As Zed's modal layer: the open modal is asked first, whether a command closes it or
+        // another replaces it; a modal that says no stays, and the replacement is not shown.
         // The focus to return to is the one before the first modal, not the modal's own.
         let mut previous_focus = window.focused(cx);
         if let Some(active) = &self.modal {
-            let same = active.view.clone().downcast::<V>().is_ok();
             previous_focus = active.previous_focus.clone();
-            let closed = self.hide_modal(window, cx);
-            if same || !closed {
+            if !self.hide_modal(window, cx) {
                 return;
             }
         }
@@ -1910,6 +2052,11 @@ impl Workspace {
     ) {
         let id = self.next_toast;
         self.next_toast += 1;
+        // A few at a time, the oldest going first: an error stays until closed, and many
+        // would cover the window.
+        if self.toasts.len() >= TOASTS_SHOWN {
+            self.toasts.remove(0);
+        }
         let remaining = match kind {
             ToastKind::Error => None,
             ToastKind::Info | ToastKind::Success => Some(TOAST_DURATION),
@@ -2224,14 +2371,23 @@ impl Workspace {
     ) {
         let dock = self.dock_mut(position);
         if dock.open && dock.active_id().as_deref() == Some(id) {
-            self.set_dock_open(position, false, cx);
+            self.set_dock_open(position, false, window, cx);
         } else {
             self.show_panel(id, window, cx);
         }
     }
 
     /// Opens or hides a dock; hiding the zoomed one ends the zoom.
-    fn set_dock_open(&mut self, position: PanelPosition, open: bool, cx: &mut Context<Self>) {
+    fn set_dock_open(
+        &mut self,
+        position: PanelPosition,
+        open: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !open && self.dock_has_focus(position, window, cx) {
+            self.focus_active_tab(window, cx);
+        }
         self.dock_mut(position).open = open;
         if !open && self.zoomed == Some(Zoomed::Dock(position)) {
             self.zoomed = None;
@@ -2240,12 +2396,44 @@ impl Workspace {
     }
 
     /// ⇧⎋: zooms the active pane over the document area, or ends any zoom.
-    fn toggle_zoom(&mut self, cx: &mut Context<Self>) {
+    fn toggle_zoom(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.zoomed = match self.zoomed {
             Some(_) => None,
             None => Some(Zoomed::Pane(self.active_pane)),
         };
+        // The docks are under the zoomed pane now.
+        if self.zoomed.is_some()
+            && [
+                PanelPosition::Left,
+                PanelPosition::Right,
+                PanelPosition::Bottom,
+            ]
+            .into_iter()
+            .any(|position| self.dock_has_focus(position, window, cx))
+        {
+            self.focus_active_tab(window, cx);
+        }
         cx.notify();
+    }
+
+    /// Whether the keyboard is in a panel of the dock at `position`.
+    fn dock_has_focus(&self, position: PanelPosition, window: &Window, cx: &App) -> bool {
+        let dock = match position {
+            PanelPosition::Left => &self.left,
+            PanelPosition::Right => &self.right,
+            PanelPosition::Bottom => &self.bottom,
+        };
+        dock.panels
+            .iter()
+            .filter_map(|panel| panel.focus.as_ref()?(cx))
+            .any(|focus| focus.contains_focused(window, cx))
+    }
+
+    /// Gives the keyboard to the active tab: the dock that had it is hidden or covered, and the
+    /// keys would go on driving a panel nobody sees.
+    fn focus_active_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.pane(self.active_pane).map_or(0, |p| p.active);
+        self.activate_in(self.active_pane, index, false, window, cx);
     }
 
     /// The server this window is connected to: a status dot, the server and its state, as
@@ -3040,7 +3228,6 @@ impl Workspace {
         let graph = s.graph_id.clone();
         let branch = s.branch.clone();
         let unavailable = s.unavailable.clone();
-        let branches = s.branches.loaded().cloned().unwrap_or_default();
         let session_for_menu = session.clone();
         Some(
             h_flex()
@@ -3100,7 +3287,13 @@ impl Workspace {
                         )
                         .menu(move |window, cx| {
                             let session = session_for_menu.clone();
-                            let branches = branches.clone();
+                            // Read when the menu opens, not copied at every frame drawn.
+                            let branches = session
+                                .read(cx)
+                                .branches
+                                .loaded()
+                                .cloned()
+                                .unwrap_or_default();
                             Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                                 menu = menu.header("Branches");
                                 for branch in branches {
@@ -3256,7 +3449,9 @@ impl Workspace {
             .tooltip(move |_, cx| {
                 Tooltip::for_action(hide_label, toggle_action(position).as_ref(), cx)
             })
-            .on_click(cx.listener(move |this, _, _, cx| this.set_dock_open(position, false, cx))),
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.set_dock_open(position, false, window, cx)
+            })),
         )
     }
 
@@ -3675,16 +3870,16 @@ impl Render for Workspace {
                 this.navigate(this.active_pane, false, window, cx)
             }))
             .on_drag_move(cx.listener(Self::resize_dock))
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
-                this.set_dock_open(PanelPosition::Left, !this.left.open, cx)
+            .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
+                this.set_dock_open(PanelPosition::Left, !this.left.open, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| {
-                this.set_dock_open(PanelPosition::Right, !this.right.open, cx)
+            .on_action(cx.listener(|this, _: &ToggleInspector, window, cx| {
+                this.set_dock_open(PanelPosition::Right, !this.right.open, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ToggleActivity, _, cx| {
-                this.set_dock_open(PanelPosition::Bottom, !this.bottom.open, cx)
+            .on_action(cx.listener(|this, _: &ToggleActivity, window, cx| {
+                this.set_dock_open(PanelPosition::Bottom, !this.bottom.open, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ToggleZoom, _, cx| this.toggle_zoom(cx)))
+            .on_action(cx.listener(|this, _: &ToggleZoom, window, cx| this.toggle_zoom(window, cx)))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| {
                 if let Some(session) = &this.session {
                     session.update(cx, |s, cx| s.reload(cx));
@@ -4221,13 +4416,38 @@ fn resize_handle(position: PanelPosition) -> impl IntoElement {
     })
 }
 
-/// Asks before closing a tab that has unsaved work or a write in flight.
+/// What a close asked about closes: a tab, the shown graph, the window, or Studio.
+#[derive(Debug, Clone, Copy)]
+enum Closing {
+    Tab(EntityId),
+    Graph,
+    Window,
+    Quit,
+}
+
+impl Closing {
+    /// How much it closes: each holds the ones before it.
+    fn reach(self) -> u8 {
+        match self {
+            Closing::Tab(_) => 0,
+            Closing::Graph => 1,
+            Closing::Window => 2,
+            Closing::Quit => 3,
+        }
+    }
+}
+
+/// Asks before a close drops unsaved work (constitution IV), naming the tabs that hold it.
 struct ConfirmClose {
     workspace: WeakEntity<Workspace>,
-    item_id: EntityId,
-    title: SharedString,
+    closing: Closing,
+    /// The tabs with unsaved work: a tab's own close names the tab.
+    unsaved: Vec<SharedString>,
     focus_handle: FocusHandle,
 }
+
+/// Tabs a close dialog names before "and N more".
+const UNSAVED_NAMED: usize = 8;
 
 impl EventEmitter<DismissEvent> for ConfirmClose {}
 
@@ -4241,21 +4461,116 @@ impl Focusable for ConfirmClose {
 
 impl ConfirmClose {
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let item_id = self.item_id;
+        let closing = self.closing;
         cx.emit(DismissEvent);
         self.workspace
-            .update(cx, |workspace, cx| {
-                if let Some((pane, index)) = workspace.find_item(item_id) {
-                    // The focus had been the closed tab's: the tab shown next takes it, not a
-                    // handle of the closed one the modal would hand it back to.
+            .update(cx, |workspace, cx| match closing {
+                Closing::Tab(item_id) => {
+                    if let Some((pane, index)) = workspace.find_item(item_id) {
+                        // The focus had been the closed tab's: the tab shown next takes it, not
+                        // a handle of the closed one the modal would hand it back to.
+                        if let Some(modal) = &mut workspace.modal {
+                            modal.previous_focus = None;
+                        }
+                        workspace.force_close(pane, index, window, cx);
+                    }
+                }
+                Closing::Graph => {
                     if let Some(modal) = &mut workspace.modal {
                         modal.previous_focus = None;
                     }
-                    workspace.force_close(pane, index, window, cx);
+                    workspace.close_graph_asking(false, window, cx);
                 }
+                // Asked again for a write started since; the unsaved tabs were.
+                Closing::Window => match workspace.running_write(cx) {
+                    Some(graph) => workspace.show_toast(
+                        ToastKind::Error,
+                        format!(
+                            "A write to {graph} is still running. Close the window when it finishes."
+                        ),
+                        cx,
+                    ),
+                    None => {
+                        workspace.flush_saves(cx);
+                        window.remove_window();
+                    }
+                },
+                Closing::Quit => cx.defer(|cx| quit(true, cx)),
             })
             .ok();
     }
+
+    fn header(&self) -> (SharedString, &'static str) {
+        let lost = "Their unsaved changes are lost. A write in flight still finishes; the \
+                    activity log keeps its outcome.";
+        match self.closing {
+            Closing::Tab(_) => (
+                format!(
+                    "Close {}?",
+                    self.unsaved.first().cloned().unwrap_or_default()
+                )
+                .into(),
+                "It has unsaved changes or a write still running. A write in flight still \
+                 finishes; the activity log keeps its outcome.",
+            ),
+            Closing::Graph => ("Close the graph?".into(), lost),
+            Closing::Window => ("Close this window?".into(), lost),
+            Closing::Quit => ("Quit OmniGraph Studio?".into(), lost),
+        }
+    }
+}
+
+/// Quits Studio, unless a window holds a write still running: quitting would lose its outcome
+/// (spec 002), so that window comes forward with a toast saying so. Unless `confirmed`, tabs
+/// with unsaved work in any window are named first, in a dialog that quits once confirmed.
+pub fn quit(confirmed: bool, cx: &mut App) {
+    let windows: Vec<WindowHandle<Workspace>> = cx
+        .windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<Workspace>())
+        .collect();
+    for handle in &windows {
+        let running = handle
+            .update(cx, |workspace, window, cx| {
+                let graph = workspace.running_write(cx)?;
+                workspace.show_toast(
+                    ToastKind::Error,
+                    format!("A write to {graph} is still running. Quit when it finishes."),
+                    cx,
+                );
+                window.activate_window();
+                Some(())
+            })
+            .ok()
+            .flatten();
+        if running.is_some() {
+            return;
+        }
+    }
+    if !confirmed {
+        let unsaved: Vec<SharedString> = windows
+            .iter()
+            .filter_map(|handle| handle.read(cx).ok())
+            .flat_map(|workspace| workspace.unsaved_tabs(cx))
+            .collect();
+        // Asked in the window in front.
+        let ask = cx
+            .active_window()
+            .and_then(|window| window.downcast::<Workspace>())
+            .or_else(|| windows.first().copied());
+        if !unsaved.is_empty()
+            && let Some(handle) = ask
+        {
+            handle
+                .update(cx, |workspace, window, cx| {
+                    workspace.confirm_close(Closing::Quit, unsaved, window, cx);
+                    window.activate_window();
+                })
+                .ok();
+            return;
+        }
+    }
+    cx.quit();
 }
 
 impl Render for ConfirmClose {
@@ -4266,14 +4581,27 @@ impl Render for ConfirmClose {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| this.close(window, cx)))
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
-            .child(
-                studio_ui::ds::ModalHeader::new(format!("Close {}?", self.title))
-                    .description(SharedString::from(
-                        "It has unsaved changes or a write still running. A write in flight \
-                         still finishes; the activity log keeps its outcome.",
-                    ))
-                    .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
-            )
+            .child({
+                let (title, description) = self.header();
+                studio_ui::ds::ModalHeader::new(title)
+                    .description(SharedString::from(description))
+                    .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent)))
+            })
+            .when(!matches!(self.closing, Closing::Tab(_)), |modal| {
+                let more = self.unsaved.len().saturating_sub(UNSAVED_NAMED);
+                modal.child(
+                    studio_ui::ds::modal_body()
+                        .children(
+                            self.unsaved
+                                .iter()
+                                .take(UNSAVED_NAMED)
+                                .map(|title| studio_ui::ds::text::body(title.clone())),
+                        )
+                        .when(more > 0, |body| {
+                            body.child(studio_ui::ds::text::muted(format!("and {more} more")))
+                        }),
+                )
+            })
             .child(
                 studio_ui::ds::modal_footer(cx)
                     .child(
@@ -4283,9 +4611,15 @@ impl Render for ConfirmClose {
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
                     )
                     .child(
-                        studio_ui::ds::action_button("close-anyway", "Close")
-                            .key_binding(ui::KeyBinding::for_action_in(&menu::Confirm, &focus, cx))
-                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                        studio_ui::ds::action_button(
+                            "close-anyway",
+                            match self.closing {
+                                Closing::Quit => "Quit",
+                                _ => "Close",
+                            },
+                        )
+                        .key_binding(ui::KeyBinding::for_action_in(&menu::Confirm, &focus, cx))
+                        .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
                     ),
             )
     }
@@ -4298,7 +4632,9 @@ pub fn connection_color(state: &ConnectionState) -> Color {
         ConnectionState::Ready => Color::Success,
         ConnectionState::Connecting | ConnectionState::Idle => Color::Muted,
         ConnectionState::ContractMismatch { .. } | ConnectionState::TooOld { .. } => Color::Warning,
-        ConnectionState::Unauthorized | ConnectionState::Unreachable(_) => Color::Error,
+        ConnectionState::Unauthorized
+        | ConnectionState::Unreachable(_)
+        | ConnectionState::TokenUnreadable(_) => Color::Error,
     }
 }
 
@@ -4441,6 +4777,103 @@ mod tests {
         }
     }
 
+    /// A tab holding unsaved work.
+    struct Unsaved {
+        focus_handle: FocusHandle,
+    }
+
+    impl EventEmitter<ItemEvent> for Unsaved {}
+
+    impl Focusable for Unsaved {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for Unsaved {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    impl Item for Unsaved {
+        fn tab_title(&self, _: &App) -> SharedString {
+            "Draft".into()
+        }
+
+        fn is_dirty(&self, _: &App) -> bool {
+            true
+        }
+    }
+
+    /// Close Graph with a tab holding unsaved work names it and waits: the graph closes once
+    /// that is confirmed, not before. The window and Quit ask the same, of every graph's tabs.
+    /// A second close asked meanwhile asks the wider question, never takes the dialog away.
+    #[gpui::test]
+    fn closing_a_graph_with_unsaved_work_asks_first(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let http = http_client::FakeHttpClient::create(|_| async {
+            Ok(http_client::http::Response::builder()
+                .status(404)
+                .body(http_client::AsyncBody::default())
+                .unwrap())
+        });
+        let server = graph_store::ServerEntry {
+            name: "test".into(),
+            url: "http://studio.test".into(),
+            source: graph_store::ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| graph_store::Connection::new(server, None, http).unwrap());
+        let session = cx.new(|cx| GraphSession::new(connection, "notes".into(), "main".into(), cx));
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let asked = |workspace: &Workspace, cx: &App| {
+            workspace
+                .modal
+                .as_ref()
+                .and_then(|modal| modal.view.clone().downcast::<ConfirmClose>().ok())
+                .map(|dialog| dialog.read(cx).closing)
+        };
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.graph_order.push(session.entity_id());
+            workspace.subscribe_session(session.clone(), cx);
+            workspace.open_item("draft".to_owned(), window, cx, |_, cx| Unsaved {
+                focus_handle: cx.focus_handle(),
+            });
+            assert_eq!(workspace.unsaved_tabs(cx), [SharedString::from("Draft")]);
+            // The tab's own close asks about the tab; Close Graph then asks about the graph.
+            workspace.close_item(0, window, cx);
+            assert!(matches!(asked(workspace, cx), Some(Closing::Tab(_))));
+            workspace.close_graph(window, cx);
+            assert!(
+                matches!(asked(workspace, cx), Some(Closing::Graph)),
+                "asked"
+            );
+            // Asked again, or for the tab alone, the graph's question stays.
+            workspace.close_graph(window, cx);
+            workspace.close_item(0, window, cx);
+            assert!(
+                matches!(asked(workspace, cx), Some(Closing::Graph)),
+                "still asked"
+            );
+            assert!(workspace.session().is_some(), "not closed yet");
+        });
+        let dialog = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .modal
+                .as_ref()
+                .and_then(|modal| modal.view.clone().downcast::<ConfirmClose>().ok())
+                .expect("the close dialog")
+        });
+        dialog.update_in(cx, |dialog, window, cx| dialog.close(window, cx));
+        workspace.read_with(cx, |workspace, _| {
+            assert!(workspace.session().is_none(), "closed once confirmed");
+        });
+    }
+
     struct Split {
         field: Entity<Field>,
         part: Entity<Part>,
@@ -4509,10 +4942,9 @@ mod tests {
         assert_eq!(height(cx, "status-bar"), studio_ui::ds::size::STATUS_BAR);
     }
 
-    /// As Zed's panel buttons: a button shows its panel and opens the dock; pressed again while
-    /// its panel shows, it hides the dock, which keeps that panel for the next time.
     /// Selection fills the inspector without reopening a dock the person hid; a peek asked for
-    /// (Space, a click) shows it.
+    /// (Space, a click) shows it. An inspector replaced or taken away goes with its host, which
+    /// would otherwise keep the view, and the graph session it holds, alive.
     #[gpui::test]
     fn an_asked_for_peek_shows_the_inspector_that_selection_leaves_hidden(
         cx: &mut gpui::TestAppContext,
@@ -4522,10 +4954,13 @@ mod tests {
             cx.set_global(StudioSettings::default());
         });
         let (workspace, cx) = cx.add_window_view(Workspace::new);
-        workspace.update_in(cx, |workspace, _, cx| {
-            workspace.set_dock_open(PanelPosition::Right, false, cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            let hosted = |workspace: &Workspace, view: &Entity<Field>| {
+                workspace.dock_hosts.contains_key(&view.entity_id())
+            };
+            workspace.set_dock_open(PanelPosition::Right, false, window, cx);
             let view = cx.new(|_| Field);
-            workspace.set_inspector(Some(view.into()), cx);
+            workspace.set_inspector(Some(view.clone().into()), cx);
             assert!(!workspace.right.open, "selection leaves the dock hidden");
             assert_eq!(
                 workspace.right.active_id().as_deref(),
@@ -4533,9 +4968,18 @@ mod tests {
             );
             workspace.reveal_inspector(cx);
             assert!(workspace.right.open, "an asked-for peek shows it");
+            assert!(hosted(workspace, &view));
+            let next = cx.new(|_| Field);
+            workspace.set_inspector(Some(next.clone().into()), cx);
+            assert!(!hosted(workspace, &view), "the replaced one's host goes");
+            assert!(hosted(workspace, &next));
+            workspace.set_inspector(None, cx);
+            assert!(!hosted(workspace, &next), "and the removed one's");
         });
     }
 
+    /// As Zed's panel buttons: a button shows its panel and opens the dock; pressed again while
+    /// its panel shows, it hides the dock, which keeps that panel for the next time.
     #[gpui::test]
     fn panel_buttons_show_their_panel_and_hide_the_dock_it_shows(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -4662,17 +5106,17 @@ mod tests {
                 caches: false,
                 focus_handle: cx.focus_handle(),
             });
-            workspace.toggle_zoom(cx);
+            workspace.toggle_zoom(window, cx);
             assert_eq!(workspace.zoomed, Some(Zoomed::Pane(workspace.active_pane)));
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("zoomed").is_some(), "drawn over the panes");
-        workspace.update_in(cx, |workspace, _, cx| {
-            workspace.toggle_zoom(cx);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_zoom(window, cx);
             assert_eq!(workspace.zoomed, None);
             workspace.activate_panel("history", cx);
             workspace.zoomed = Some(Zoomed::Dock(PanelPosition::Bottom));
-            workspace.set_dock_open(PanelPosition::Bottom, false, cx);
+            workspace.set_dock_open(PanelPosition::Bottom, false, window, cx);
             assert_eq!(
                 workspace.zoomed, None,
                 "hiding the zoomed dock ends the zoom"
@@ -4785,7 +5229,7 @@ mod tests {
                 workspace.panes.iter().map(|pane| pane.items.len()).sum()
             };
             workspace.graph_order.push(shown.entity_id());
-            workspace.subscribe_session(shown.clone(), window, cx);
+            workspace.subscribe_session(shown.clone(), cx);
             open_tab(workspace, "notes", window, cx);
             let item = |key: &str| SavedItem {
                 kind: "split".into(),
@@ -4815,7 +5259,13 @@ mod tests {
             workspace.add_behind(behind_again.clone(), None, cx);
             assert_eq!(workspace.open_graphs().len(), 2);
 
+            // The shown graph's inspector goes with it, host and all: the host would keep the
+            // inspector, and the session it holds polling, after the graph is put away.
+            let inspector = cx.new(|_| Field);
+            workspace.set_inspector(Some(inspector.clone().into()), cx);
             workspace.show_graph(behind.entity_id(), window, cx);
+            assert_eq!(workspace.dock_of(INSPECTOR_PANEL), None);
+            assert!(!workspace.dock_hosts.contains_key(&inspector.entity_id()));
             let pane = workspace.pane(workspace.active_pane).unwrap();
             assert_eq!((pane.items.len(), pane.active), (2, 1));
 
@@ -4840,6 +5290,13 @@ mod tests {
                 let key = data.as_str().unwrap_or_default();
                 if key != "gone" {
                     open_tab(workspace, key, window, cx);
+                }
+            });
+            // As a conversation another pane holds: shown there, opening nothing here.
+            persistence::register_item_kind(cx, "elsewhere", |_, workspace, window, cx| {
+                let shown = workspace.all_items().next().map(|item| item.item_id());
+                if let Some(id) = shown {
+                    workspace.activate_item_by_id(id, window, cx);
                 }
             });
         });
@@ -4875,6 +5332,37 @@ mod tests {
                 pinned: 0,
             };
             assert_eq!(restored(workspace, pane, window, cx), (2, 0, 0));
+            // A tab shown in another pane instead (a conversation has one tab) leaves the tabs
+            // after it in their own pane.
+            let mut layout = Member::Pane(0);
+            layout.split(0, 1, SplitDirection::Right);
+            let elsewhere = SavedItem {
+                kind: "elsewhere".into(),
+                data: serde_json::Value::Null,
+            };
+            let saved = SavedWorkspace {
+                panes: vec![
+                    SavedPane {
+                        items: vec![item("a")],
+                        active: 0,
+                        pinned: 0,
+                    },
+                    SavedPane {
+                        items: vec![elsewhere, item("b")],
+                        active: 1,
+                        pinned: 0,
+                    },
+                ],
+                layout: Some(layout),
+                ..workspace.snapshot(cx)
+            };
+            workspace.restore_saved(saved, window, cx);
+            let tabs: Vec<usize> = workspace
+                .panes
+                .iter()
+                .map(|pane| pane.items.len())
+                .collect();
+            assert_eq!(tabs, [1, 1]);
         });
     }
 

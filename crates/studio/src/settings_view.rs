@@ -12,23 +12,25 @@ use std::sync::Arc;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle, Render,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Global, HighlightStyle, Render,
     SharedString, StyledText, Subscription, WeakEntity, Window,
 };
 use gq_language::SchemaModel;
-use graph_store::GraphSession;
+use graph_store::{GraphSession, SessionEvent};
 use serde_json::Value;
 use studio_settings::{FieldKind, Scope, SettingField, SettingsValues, StudioSettings, TypeNaming};
 use studio_ui::ds::{self, Dotted as _, space};
 use studio_ui::menu::ContextMenu;
-use studio_workspace::{Item, ItemEvent, SavedItem};
+use studio_workspace::{Item, ItemEvent, SavedItem, Workspace, WorkspaceEvent};
 use theme::ThemeRegistry;
 use ui::prelude::*;
 use ui::{PopoverMenu, Severity, Tooltip};
 
 pub struct SettingsView {
     search: Entity<Editor>,
-    section: usize,
+    /// The section chosen, by name: the sections listed change with the scope and with "Node
+    /// names". `None` is the first.
+    section: Option<&'static str>,
     /// The open graph's settings key and name, when there is one.
     graph: Option<(String, String)>,
     /// That graph's session, whose schema lists the types "Node names" offers.
@@ -40,7 +42,17 @@ pub struct SettingsView {
     fonts: Option<Options>,
     /// The settings as values, read again when they change rather than at every frame.
     values: SettingsValues,
+    /// The window's graph changing, which the tab follows.
+    _workspace_subscription: Option<Subscription>,
+    /// The session's schema changing, which "Node names" lists the types of.
+    _session_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The settings key and name a graph is offered as a scope by.
+pub fn graph_scope(session: &Entity<GraphSession>, cx: &App) -> (String, String) {
+    let session = session.read(cx);
+    (session.settings_key(cx), session.graph_id.clone())
 }
 
 /// A dropdown's choices: each label and the value it sets.
@@ -158,13 +170,15 @@ impl SettingsView {
         }
         let mut this = Self {
             search,
-            section: 0,
+            section: None,
             graph,
             session: None,
             scope: Scope::All,
             text_inputs,
             fonts: None,
             values: StudioSettings::get(cx).values(),
+            _workspace_subscription: None,
+            _session_subscription: None,
             _subscriptions: subscriptions,
         };
         this.show_text_values(window, cx);
@@ -208,14 +222,50 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// The open graph's session, whose types "Node names" lists.
+    /// The open graph's session, whose types "Node names" lists: drawn again when its schema
+    /// loads or changes, as the tab is drawn cached.
     pub fn set_session(
         &mut self,
         session: Option<WeakEntity<GraphSession>>,
         cx: &mut Context<Self>,
     ) {
+        self._session_subscription =
+            session
+                .as_ref()
+                .and_then(WeakEntity::upgrade)
+                .map(|session| {
+                    cx.subscribe(&session, |_, _, event: &SessionEvent, cx| {
+                        if matches!(
+                            event,
+                            SessionEvent::SchemaChanged | SessionEvent::SchemaMoved
+                        ) {
+                            cx.notify();
+                        }
+                    })
+                });
         self.session = session;
         cx.notify();
+    }
+
+    /// Follows the graph `workspace` shows: a tab opened with no graph, or before another was
+    /// shown, offers the one shown now.
+    pub fn follow(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self._workspace_subscription = Some(cx.subscribe_in(
+            workspace,
+            window,
+            |this, workspace, event: &WorkspaceEvent, window, cx| {
+                let WorkspaceEvent::SessionChanged = event;
+                let session = workspace.read(cx).session().cloned();
+                let graph = session.as_ref().map(|session| graph_scope(session, cx));
+                this.set_graph(graph, window, cx);
+                this.set_session(session.map(|session| session.downgrade()), cx);
+            },
+        ));
     }
 
     /// The open graph's session and schema, when its schema is read.
@@ -459,19 +509,29 @@ fn node_name_dropdown(names: TypeNaming) -> AnyElement {
         .into_any_element()
 }
 
+/// The font choices, read from the system once for every Settings tab.
+struct FontChoices(Options);
+
+impl Global for FontChoices {}
+
 /// "Default", then every font the system has, by name.
-fn font_options(cx: &App) -> Options {
+fn font_options(cx: &mut App) -> Options {
+    if let Some(FontChoices(options)) = cx.try_global::<FontChoices>() {
+        return options.clone();
+    }
     let mut fonts = cx.text_system().all_font_names();
     fonts.sort();
     fonts.dedup();
-    std::iter::once(("Default".into(), Value::Null))
+    let options: Options = std::iter::once(("Default".into(), Value::Null))
         .chain(
             fonts
                 .into_iter()
                 .filter(|name| !name.starts_with('.'))
                 .map(|name| (name.clone().into(), Value::from(name))),
         )
-        .collect()
+        .collect();
+    cx.set_global(FontChoices(options.clone()));
+    options
 }
 
 /// The agent's presets as a segmented choice, with the command it runs underneath.
@@ -635,7 +695,7 @@ impl Render for SettingsView {
         let searching = !query.is_empty();
         let scope = self.scope.clone();
         let in_scope = |field: &&'static SettingField| scope == Scope::All || field.per_graph;
-        let mut sections: Vec<&str> = studio_settings::sections()
+        let mut sections: Vec<&'static str> = studio_settings::sections()
             .into_iter()
             .filter(|section| {
                 studio_settings::fields()
@@ -648,8 +708,11 @@ impl Render for SettingsView {
         if named.is_some() {
             sections.push(NODE_NAMES);
         }
-        self.section = self.section.min(sections.len().saturating_sub(1));
-        let chosen = sections.get(self.section).copied().unwrap_or_default();
+        let chosen = self
+            .section
+            .filter(|section| sections.contains(section))
+            .or_else(|| sections.first().copied())
+            .unwrap_or_default();
         let shown: Vec<&'static SettingField> = studio_settings::fields()
             .iter()
             .filter(in_scope)
@@ -689,27 +752,35 @@ impl Render for SettingsView {
             .gap(px(space::WITHIN))
             .border_r_1()
             .border_color(rule)
-            .children(sections.iter().enumerate().map(|(index, section)| {
-                let count = match (&self.graph, *section == NODE_NAMES) {
-                    (Some((key, _)), true) => StudioSettings::get(cx).labels_for(key).len(),
-                    _ => studio_settings::fields()
-                        .iter()
-                        .filter(in_scope)
-                        .filter(|f| f.section == *section && !values.is_default_in(&scope, f))
-                        .count(),
-                };
-                ds::SidebarRow::new(("settings-section", index), *section)
-                    .selected(!searching && index == self.section)
-                    .when(count > 0, |row| {
-                        row.end(ds::sidebar_count(format!("{count} {changed_word}")))
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.section = index;
-                        this.search
-                            .update(cx, |search, cx| search.clear(window, cx));
-                        cx.notify();
-                    }))
-            }));
+            .children(
+                sections
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(index, section)| {
+                        let count = match (&self.graph, section == NODE_NAMES) {
+                            (Some((key, _)), true) => StudioSettings::get(cx).labels_for(key).len(),
+                            _ => studio_settings::fields()
+                                .iter()
+                                .filter(in_scope)
+                                .filter(|f| {
+                                    f.section == section && !values.is_default_in(&scope, f)
+                                })
+                                .count(),
+                        };
+                        ds::SidebarRow::new(("settings-section", index), section)
+                            .selected(!searching && section == chosen)
+                            .when(count > 0, |row| {
+                                row.end(ds::sidebar_count(format!("{count} {changed_word}")))
+                            })
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.section = Some(section);
+                                this.search
+                                    .update(cx, |search, cx| search.clear(window, cx));
+                                cx.notify();
+                            }))
+                    }),
+            );
 
         // While searching, the matches are grouped by section under a label each.
         let mut groups: Vec<(&str, Vec<&'static SettingField>)> = Vec::new();
@@ -971,10 +1042,7 @@ mod tests {
         // come and go.
         cx.update(|window, _| window.activate_window());
         view.update(cx, |view, cx| {
-            view.section = studio_settings::sections()
-                .iter()
-                .position(|section| *section == "Agent")
-                .unwrap();
+            view.section = Some("Agent");
             cx.notify();
         });
         cx.run_until_parked();

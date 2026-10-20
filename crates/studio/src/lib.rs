@@ -41,20 +41,15 @@ pub fn init(cx: &mut App) {
     agent_panel::init(cx);
 
     studio_workspace::register_item_kind(cx, "design-system", |_, workspace, window, cx| {
-        workspace.open_item(
-            "design-system",
-            window,
-            cx,
-            design_gallery::DesignGallery::new,
-        );
+        open_design_system(workspace, window, cx);
     });
     studio_workspace::register_item_kind(cx, "settings", |_, workspace, window, cx| {
         open_settings(workspace, window, cx);
     });
-    // A write still running keeps Studio open: quitting would lose its outcome (spec 002). The
-    // window that holds it comes forward with a toast saying so. Deferred, as `OpenLink` is
-    // below: the window the action came from is held for dispatch, and could not be asked.
-    cx.on_action(|_: &Quit, cx| cx.defer(quit_unless_writing));
+    // A write still running keeps Studio open: quitting would lose its outcome (spec 002), and
+    // unsaved tabs are asked about first. Deferred, as `OpenLink` is below: the window the
+    // action came from is held for dispatch, and could not be asked.
+    cx.on_action(|_: &Quit, cx| cx.defer(|cx| studio_workspace::quit(false, cx)));
     // The file when it exists; a run from a terminal logs to its output, so then the folder.
     cx.on_action(|_: &RevealLog, cx| {
         let file = logging::log_file();
@@ -89,12 +84,7 @@ pub fn init(cx: &mut App) {
         workspace.set_activity_view(activity.into(), cx);
         workspace.register_action(
             |workspace, _: &studio_actions::workspace::OpenDesignSystem, window, cx| {
-                workspace.open_item(
-                    "design-system",
-                    window,
-                    cx,
-                    design_gallery::DesignGallery::new,
-                );
+                open_design_system(workspace, window, cx);
             },
         );
         workspace.register_action(|workspace, _: &OpenSettings, window, cx| {
@@ -131,22 +121,34 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+/// Opens the design system's gallery tab, or shows the one open.
+fn open_design_system(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    workspace.open_item(
+        "design-system",
+        window,
+        cx,
+        design_gallery::DesignGallery::new,
+    );
+}
+
 /// Opens the settings tab, offering the workspace's graph as a scope.
 fn open_settings(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let session = workspace.session().cloned();
-    let graph = session.as_ref().map(|session| {
-        let session = session.read(cx);
-        (session.settings_key(cx), session.graph_id.clone())
-    });
+    let graph = session
+        .as_ref()
+        .map(|session| settings_view::graph_scope(session, cx));
     let made = graph.clone();
     let view = workspace.open_item("settings", window, cx, move |window, cx| {
         settings_view::SettingsView::new(made, window, cx)
     });
-    // A tab open from before offers the graph shown now, and its types for "Node names".
+    // A tab open from before offers the graph shown now, and its types for "Node names"; and
+    // it follows the window's graph from now on.
     if let Some(view) = view {
+        let workspace = cx.entity();
         view.update(cx, |view, cx| {
             view.set_graph(graph, window, cx);
             view.set_session(session.map(|session| session.downgrade()), cx);
+            view.follow(&workspace, window, cx);
         });
     }
 }
@@ -217,32 +219,6 @@ pub fn build_workspace(window: &mut Window, cx: &mut App) -> Entity<Workspace> {
     let workspace = new_workspace(window, cx);
     open_initial_graph(&workspace, window, cx);
     workspace
-}
-
-/// Quits, unless a window holds a write still running: that window comes forward with a toast.
-fn quit_unless_writing(cx: &mut App) {
-    for handle in cx.windows() {
-        let Some(handle) = handle.downcast::<Workspace>() else {
-            continue;
-        };
-        let running = handle
-            .update(cx, |workspace, window, cx| {
-                let graph = workspace.running_write(cx)?;
-                workspace.show_toast(
-                    ToastKind::Error,
-                    format!("A write to {graph} is still running. Quit when it finishes."),
-                    cx,
-                );
-                window.activate_window();
-                Some(())
-            })
-            .ok()
-            .flatten();
-        if running.is_some() {
-            return;
-        }
-    }
-    cx.quit();
 }
 
 fn new_workspace(window: &mut Window, cx: &mut App) -> Entity<Workspace> {
@@ -409,35 +385,29 @@ pub fn open_link(link: &str, cx: &mut App) {
     // A link that names no branch opens a graph on main, and leaves one the window has open on
     // its own branch, as "Open a graph" does.
     let named_branch = target.branch.clone();
-    let branch = named_branch.clone().unwrap_or_else(|| "main".into());
     // The window that has the graph open, else the active one.
     let window = window_holding(&connection, &target.graph, cx)
         .map(|(handle, _)| handle.into())
         .or_else(|| link_window(cx));
     let open_in = move |workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App| {
+        // The link is what the person asked for now: a dialog in the window ("Open a graph",
+        // shown at a start with no graph) gives way to it. One that cannot close yet (a write
+        // running) keeps the focus, with the link opened under it.
+        let dialog_stays = !workspace.update(cx, |workspace, cx| workspace.hide_modal(window, cx));
         // The graph, if the window has it open, moved to the branch the link names; else opened
         // here.
-        let url = &connection.read(cx).server.url;
-        match workspace.read(cx).open_session_for(url, &target.graph, cx) {
-            Some(session) => {
-                if let Some(branch) = named_branch.clone() {
-                    session.update(cx, |session, cx| session.set_branch(branch, cx));
-                }
-                workspace.update(cx, |workspace, cx| {
-                    workspace.show_graph(session.entity_id(), window, cx)
-                })
-            }
-            None => {
-                connection.update(cx, |connection, cx| connection.connect_if_idle(cx));
-                let session =
-                    open_session(connection.clone(), target.graph.clone(), branch.clone(), cx);
-                workspace.update(cx, |workspace, cx| {
-                    workspace.set_session(session, window, cx)
-                });
-            }
+        show_graph_in(
+            workspace,
+            connection.clone(),
+            target.graph.clone(),
+            named_branch.clone(),
+            window,
+            cx,
+        );
+        if !dialog_stays {
+            let focus = workspace.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
         }
-        let focus = workspace.read(cx).focus_handle(cx);
-        window.focus(&focus, cx);
         match &link {
             DeepLink::Node { type_name, id, .. } => window.dispatch_action(
                 Box::new(studio_actions::graph::OpenNode {
@@ -494,6 +464,38 @@ pub(crate) fn window_holding(
             let session = handle.read(cx).ok()?.open_session_for(url, graph, cx)?;
             Some((handle, session))
         })
+}
+
+/// Shows `graph` in `workspace`'s window: the session the window has open, moved to `branch`
+/// when one is named, else a new one on `branch` (main when none is). A link and the "Open a
+/// graph" dialog show a graph this way.
+pub(crate) fn show_graph_in(
+    workspace: &Entity<Workspace>,
+    connection: Entity<graph_store::Connection>,
+    graph: String,
+    branch: Option<String>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let url = connection.read(cx).server.url.clone();
+    match workspace.read(cx).open_session_for(&url, &graph, cx) {
+        Some(session) => {
+            if let Some(branch) = branch {
+                session.update(cx, |session, cx| session.set_branch(branch, cx));
+            }
+            workspace.update(cx, |workspace, cx| {
+                workspace.show_graph(session.entity_id(), window, cx)
+            });
+        }
+        None => {
+            connection.update(cx, |connection, cx| connection.connect_if_idle(cx));
+            let branch = branch.unwrap_or_else(|| "main".into());
+            let session = open_session(connection, graph, branch, cx);
+            workspace.update(cx, |workspace, cx| {
+                workspace.set_session(session, window, cx)
+            });
+        }
+    }
 }
 
 /// The workspace window a link opens in: the active one, else any.
