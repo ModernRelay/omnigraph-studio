@@ -142,8 +142,10 @@ place), X (designed on 0.13; the better routes are deferred).
     was merged into, whose base the feed refuses as a start, folds the net diff from the merge
     base to the reviewed head instead (both pinned), capped at 20,000 changes either way.
   - E7 merge base: `GET /branches/merge-base` since 0.14 (fork, head, and a merge's
-    confirmation); walking `GET /commits` parents remains for a review of one commit and for
-    the commit list of a branch its target was merged into.
+    confirmation). A review of one commit reads the branch's history a page at a time down to
+    the merge base; both whole lists are read only for a branch its target was merged into,
+    whose merge base is off its own chain, or one not reached within 20 pages. A lost merge
+    response reads the target's history a page at a time from its head.
   - E8 merge preview with no effects: merge on request and show the 409 conflicts until then.
   - E9 branch details: derived from `GET /commits?branch=` until then.
   - E21 a branch from a commit: landed as `from_commit` (OmniGraph #1016), adopted with the next

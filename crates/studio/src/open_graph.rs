@@ -353,11 +353,16 @@ impl OpenGraphModal {
             _ => None,
         };
         let graphs = c.graph_ids();
+        // What each id's row says: a listed graph's state, nothing more for one the server
+        // named by discovery, and "remembered" for one only typed in before.
+        let discovered =
+            |id: &String| matches!(&c.graphs, GraphListing::Discovered(ids) if ids.contains(id));
         let infos: Vec<_> = graphs
             .iter()
-            .map(|id| {
-                c.graph_info(id)
-                    .map(|info| (info.state, info.write_available))
+            .map(|id| match c.graph_info(id) {
+                Some(info) => Some(Some((info.state, info.write_available))),
+                None if discovered(id) => Some(None),
+                None => None,
             })
             .collect();
         v_flex()
@@ -445,11 +450,12 @@ impl OpenGraphModal {
                     .enumerate()
                     .map(|(index, (graph, info))| {
                         let detail = match info {
-                            Some((state, writable)) => format!(
+                            Some(Some((state, writable))) => format!(
                                 "{}{}",
                                 format!("{state:?}").to_lowercase(),
                                 if writable { "" } else { " · read only" }
                             ),
+                            Some(None) => String::new(),
                             None => "remembered".into(),
                         };
                         let id = graph.clone();

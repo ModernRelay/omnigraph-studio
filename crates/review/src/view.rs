@@ -2776,8 +2776,8 @@ async fn fold_pages(
     }
 }
 
-/// The branch's commits since it forked from `target`, newest first, up to `head` when the
-/// branch holds it, with the fork.
+/// The branch's commits since it forked from `target`, newest first, with the fork and the
+/// head.
 ///
 /// The fork is the merge base the server names, and the branch's history is read a page at a
 /// time down to it: a page costs only the commits it returns, where the two branches' whole
@@ -2788,7 +2788,6 @@ async fn commits_since_fork(
     session: &Entity<GraphSession>,
     branch: &str,
     target: &str,
-    head: Option<&str>,
     cx: &mut AsyncApp,
 ) -> Result<(Option<String>, Option<String>, Vec<ReviewCommit>), String> {
     let base = session
@@ -2822,18 +2821,13 @@ async fn commits_since_fork(
         }
     }
     if !reached {
-        return commits_since_fork_by_lists(session, branch, target, head, cx).await;
+        return commits_since_fork_by_lists(session, branch, target, None, cx).await;
     }
-    // Commits made after the reviewed head are not the review's.
-    let from_head = head
-        .and_then(|head| chain.iter().position(|c| c.graph_commit_id == head))
-        .unwrap_or(0);
-    let since = &chain[from_head..];
-    let head = since
+    let head = chain
         .first()
         .map(|c| c.graph_commit_id.clone())
         .unwrap_or_else(|| fork.clone());
-    let since = since.iter().map(ReviewCommit::from).collect();
+    let since = chain.iter().map(ReviewCommit::from).collect();
     Ok((Some(fork), Some(head), since))
 }
 
@@ -2948,7 +2942,7 @@ async fn read_commit_review(
     this: WeakEntity<ReviewView>,
     cx: &mut AsyncApp,
 ) -> Result<ReviewData, String> {
-    let (fork, head, since) = commits_since_fork(&session, &branch, &target, None, cx).await?;
+    let (fork, head, since) = commits_since_fork(&session, &branch, &target, cx).await?;
     let Some(commit) = scope else {
         return Err("A review of one commit names the commit.".into());
     };
@@ -3003,10 +2997,14 @@ async fn merge_shown(
     source_head: Option<&str>,
     cx: &mut AsyncApp,
 ) -> Option<bool> {
+    // The source head being the merge base, or the target at the merge commit, proves it. So
+    // does the source's head now being the merge base: the merge took a newer head than the
+    // one asked about, and that one's history with it.
     let read = session.update(cx, |session, cx| session.merge_base(source, target, cx));
     if let Ok(base) = read.await
         && (source_head == Some(base.merge_base.graph_commit_id.as_str())
-            || commit == Some(base.target_commit_id.as_str()))
+            || commit == Some(base.target_commit_id.as_str())
+            || (source_head.is_some() && base.source_commit_id == base.merge_base.graph_commit_id))
     {
         return Some(true);
     }
@@ -4121,6 +4119,7 @@ pub(crate) mod tests {
 
     /// A merge is confirmed by its source head being the merge base; when more of the source
     /// was merged since, the merge base has moved past it, and the target's history shows it.
+    /// A source merged whole holds every head it had; one that moved on since does not say.
     #[gpui::test]
     async fn a_merge_is_confirmed_after_more_of_the_source_was_merged(
         cx: &mut gpui::TestAppContext,
@@ -4159,6 +4158,29 @@ pub(crate) mod tests {
             Some(true),
             "f2 was merged, though the merge base is f3 now"
         );
+        assert_eq!(
+            merge_landed(&session, "feature", "main", Some("f9"), &mut async_cx).await,
+            Some(true),
+            "the source is merged whole, and its heads with it"
+        );
+
+        // The source moved on to f4 since main merged f3: a head main's history does not
+        // show was not merged.
+        let moved = json!({ "merge_base": commit("f3", None), "source": "feature", "source_commit_id": "f4", "target": "main", "target_commit_id": "m4" });
+        let main = json!({ "commits": [commit("m4", Some("f3")), commit("m3", Some("f2")), commit("m1", None)] });
+        let (session, _) = fake_server(
+            move |path, _, _| {
+                if path.ends_with("/branches/merge-base") {
+                    (200, moved.clone())
+                } else if path.ends_with("/commits") {
+                    (200, main.clone())
+                } else {
+                    (200, json!({ "branches": ["main", "feature"] }))
+                }
+            },
+            cx,
+        );
+        let mut async_cx = cx.to_async();
         assert_eq!(
             merge_landed(&session, "feature", "main", Some("f9"), &mut async_cx).await,
             Some(false)

@@ -419,7 +419,11 @@ async fn probe(client: &GraphClient) -> Probe {
                 Ok(found) => {
                     GraphListing::Discovered(found.graphs.into_iter().map(|g| g.graph_id).collect())
                 }
-                Err(_) => GraphListing::NotAllowed,
+                // A static token is refused discovery too; any other failure is a failed read.
+                Err(ReadError::Refused(summary)) if summary.status == 403 => {
+                    GraphListing::NotAllowed
+                }
+                Err(error) => GraphListing::Failed(error.to_string()),
             }
         }
         Err(error) => GraphListing::Failed(error.to_string()),

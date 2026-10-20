@@ -93,9 +93,11 @@ from the served document).
    an entry saved before it (`localhost:8080`) loads as `http://localhost:8080`, its token
    copied to the new address. `GraphClient::new` refuses an unusable root rather than
    building URLs on it.
-3. Graph ids for a server come from, in order: `GET /graphs` when allowed; its targets'
-   `default_graph`s; graph ids the person typed before. A 403 on `/graphs` is not an
-   error state; Studio says "This server does not list graphs for your token. Enter a graph id."
+3. Graph ids for a server come from, in order: `GET /graphs` when allowed; else
+   `GET /graphs/discovery`, which names the graphs an identity credential (managed or OIDC)
+   may know of, with no state; its targets' `default_graph`s; graph ids the person typed
+   before. A 403 on both is not an error state; Studio says "This token may not list graphs.
+   Enter a graph id." A discovery that fails otherwise says the list could not be read.
 
 ### Connecting
 
