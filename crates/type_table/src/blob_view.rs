@@ -38,6 +38,8 @@ const PDF_PAGES: usize = 20;
 const PDF_DRAW_WIDTH: u32 = 1600;
 /// How much of a binary value the hex dump shows.
 const HEX_MAX: usize = 64 * 1024;
+/// The first bytes of a value kept to say what it is, which Save and Open name the file by.
+const HEAD_BYTES: u64 = 1024;
 /// How much of a text value the tab shows: an editor of a whole 64 MiB value would take seconds
 /// to make on the main thread.
 const TEXT_SHOWN: usize = 4 * 1024 * 1024;
@@ -191,7 +193,17 @@ impl BlobView {
             })
             .ok();
             if size > VIEW_MAX {
+                // Too large to show, it is still saved and opened under a name that says what
+                // it is: its first bytes alone are read.
+                let head = session.update(cx, |session, cx| {
+                    session.blob_bytes(cell.clone(), snapshot.clone(), 0..HEAD_BYTES, cx)
+                });
+                let head = match head {
+                    Ok(read) => read.await.unwrap_or_default(),
+                    Err(_) => return,
+                };
                 this.update(cx, |this, cx| {
+                    this.head = head;
                     this.content = Loadable::Loaded(Content::TooLarge);
                     cx.notify();
                 })
@@ -222,7 +234,7 @@ impl BlobView {
             };
             this.update_in(cx, |this, window, cx| {
                 this.release_images(cx);
-                this.head = bytes[..bytes.len().min(1024)].to_vec();
+                this.head = bytes[..bytes.len().min(HEAD_BYTES as usize)].to_vec();
                 this.content = Loadable::Loaded(match kind {
                     Kind::Image { image, size, name } => Content::Image {
                         image,
@@ -994,6 +1006,68 @@ mod tests {
     /// A renderer for decoding in tests; no asset is ever read.
     fn svg() -> SvgRenderer {
         SvgRenderer::new(Arc::new(()))
+    }
+
+    /// A value too large to show still saves and opens under a name that says what it is:
+    /// its first bytes alone are read for it.
+    #[gpui::test]
+    async fn a_value_too_large_to_show_is_named_by_its_first_bytes(cx: &mut gpui::TestAppContext) {
+        use http_client::{AsyncBody, FakeHttpClient, Response, http::Method};
+
+        cx.update(studio_theme::init_test);
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = ranges.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let seen = seen.clone();
+            async move {
+                let ok = || Response::builder().header(graph_client::CONTRACT_HEADER, "0.13");
+                let response = if !request.uri().path().ends_with("/blob") {
+                    ok().status(404).body(AsyncBody::empty())
+                } else if request.method() == Method::HEAD {
+                    ok().status(200)
+                        .header("content-length", "100000000")
+                        .body(AsyncBody::empty())
+                } else {
+                    let range = request
+                        .headers()
+                        .get("range")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned();
+                    seen.lock().unwrap().push(range);
+                    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+                    png.resize(1024, 0);
+                    ok().status(206)
+                        .header("content-range", "bytes 0-1023/100000000")
+                        .body(AsyncBody::from(png))
+                };
+                Ok(response.unwrap())
+            }
+        });
+        let server = graph_store::ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: graph_store::ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection =
+            cx.new(|_| graph_store::Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        let cell = BlobCell {
+            edge: false,
+            type_name: "Note".into(),
+            id: "n1".into(),
+            property: "scan".into(),
+        };
+        let (view, cx) =
+            cx.add_window_view(|window, cx| BlobView::new(session, cell, None, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.content, Loadable::Loaded(Content::TooLarge)));
+            assert!(view.file_name().ends_with(".png"), "{}", view.file_name());
+        });
+        assert_eq!(*ranges.lock().unwrap(), ["bytes=0-1023"]);
     }
 
     #[test]

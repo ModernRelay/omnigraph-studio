@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use editor::{CurrentLineHighlight, Editor, EditorEvent, MultiBufferOffset};
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Subscription,
-    Task, Window,
+    AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    StyleRefinement, Subscription, Task, Window,
 };
 use gq_language::input::{edit_text, parse_input};
 use gq_language::{SchemaModel, builder};
@@ -67,6 +67,7 @@ pub struct TextEditor {
     label: Option<String>,
     editor: Entity<Editor>,
     preview: Entity<Markdown>,
+    preview_view: Entity<Preview>,
     /// The preview shows older text: typed while it was hidden, it catches up when shown.
     preview_behind: bool,
     _preview: Option<Task<()>>,
@@ -103,6 +104,10 @@ impl TextEditor {
             editor
         });
         let preview = cx.new(|cx| Markdown::new(SharedString::default(), None, None, cx));
+        let preview_view = cx.new(|cx| Preview {
+            markdown: preview.clone(),
+            _changed: cx.observe(&preview, |_, _, cx| cx.notify()),
+        });
         let mut subscriptions = vec![
             // The preview follows the text once typing pauses; the tab's dot follows whether
             // it differs from the saved value.
@@ -123,7 +128,16 @@ impl TextEditor {
         // On another branch, an editor with nothing unsaved reads the property there; one
         // with unsaved text keeps writing to the branch it was read on, and says so.
         let follow = cx.subscribe_in(&session, window, |this, _, event, window, cx| {
-            if let SessionEvent::BranchChanged = event
+            // The schema in at last (a tab restored as Studio starts): the node is read now.
+            if let SessionEvent::SchemaChanged = event {
+                let schema = this.session.read(cx).schema_model();
+                let waited = this.schema.is_none() && schema.is_some();
+                this.schema = schema;
+                if waited {
+                    this.read(window, cx);
+                }
+                cx.notify();
+            } else if let SessionEvent::BranchChanged = event
                 && !this.unsaved
                 && this.typed.is_none()
                 && this.read_at.is_none()
@@ -152,6 +166,7 @@ impl TextEditor {
             label: None,
             editor,
             preview,
+            preview_view,
             preview_behind: false,
             _preview: None,
             mode: Mode::Split,
@@ -527,8 +542,30 @@ fn preview_style(window: &Window, cx: &App) -> MarkdownStyle {
     MarkdownStyle::themed(MarkdownFont::Preview, window, cx)
 }
 
-impl Render for TextEditor {
+/// The rendered markdown as a view of its own, drawn again only when its text changes: drawn
+/// with the editor, the whole document would be laid out again at every key and cursor blink.
+struct Preview {
+    markdown: Entity<Markdown>,
+    _changed: Subscription,
+}
+
+impl Render for Preview {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("text-preview")
+            .size_full()
+            .overflow_y_scroll()
+            .px(px(studio_ui::ds::space::PAGE))
+            .py(px(studio_ui::ds::space::XL))
+            .child(MarkdownElement::new(
+                self.markdown.clone(),
+                preview_style(window, cx),
+            ))
+    }
+}
+
+impl Render for TextEditor {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rule = studio_ui::ds::surface::rule(cx);
         let body = match &self.old {
             Loadable::Failed(error) => {
@@ -546,18 +583,10 @@ impl Render for TextEditor {
                     .pl(px(studio_ui::ds::space::PAGE))
                     .pt(px(studio_ui::ds::space::XL))
                     .child(self.editor.clone());
-                let preview = div()
-                    .id("text-preview")
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .overflow_y_scroll()
-                    .px(px(studio_ui::ds::space::PAGE))
-                    .py(px(studio_ui::ds::space::XL))
-                    .child(MarkdownElement::new(
-                        self.preview.clone(),
-                        preview_style(window, cx),
-                    ));
+                let preview = div().flex_1().min_w_0().h_full().child(
+                    AnyView::from(self.preview_view.clone())
+                        .cached(StyleRefinement::default().size_full()),
+                );
                 match self.mode {
                     Mode::Edit => editor.into_any_element(),
                     Mode::Preview => preview.into_any_element(),
@@ -639,6 +668,42 @@ mod tests {
         view.read_with(cx, |view, cx| {
             assert!(matches!(view.state, State::Saved));
             assert!(!view.is_dirty(cx), "saved");
+        });
+    }
+
+    /// A tab restored as Studio starts opens before the schema is in; it reads its node once
+    /// the schema arrives, rather than saying the schema is loading for good.
+    #[gpui::test]
+    async fn a_tab_opened_before_the_schema_reads_its_node_once_it_is_in(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session_answering(PEOPLE, 200, committed("c2", "c1"), cx);
+        let reloaded = session.clone();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            TextEditor::new(
+                session,
+                "Person".into(),
+                "p1".into(),
+                "name".into(),
+                Some("c1".into()),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        // As the tab was when it opened with no schema in.
+        view.update_in(cx, |view, window, cx| {
+            view.schema = None;
+            view.read(window, cx);
+            assert!(matches!(view.old, Loadable::Failed(_)), "no schema yet");
+        });
+        reloaded.update(cx, |session, cx| session.reload_schema(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(&view.old, Loadable::Loaded(old) if old == "Ada"));
         });
     }
 
