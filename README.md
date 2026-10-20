@@ -29,10 +29,11 @@ Requirements:
 - macOS: the Command Line Tools (GPUI compiles its Metal shaders when Studio starts); full
   Xcode to compile them into a release build (`script/bundle-mac`). Linux: the Wayland, X11 and
   Vulkan development packages listed in `.github/workflows/ci.yml`.
-- An OmniGraph 0.14 server or later; Studio refuses an older one. For the sample graph, the
-  `omnigraph` and `omnigraph-server` 0.14 binaries: until 0.14 is released, the edge build
-  `edge-20261017-d883c49` (`VERSION=edge-20261017-d883c49` with OmniGraph's `scripts/install.sh`),
-  on `PATH` or named by `OMNIGRAPH_BIN` and `OMNIGRAPH_SERVER_BIN`.
+- An OmniGraph 0.14 server or later; Studio refuses an older one. Its query checks follow
+  `edge-20261018-0a62bb7`, and commit lists page from that build on. For the sample graph, the
+  `omnigraph` and `omnigraph-server` binaries of an edge build whose CLI reads target files,
+  `edge-20261020-b692610` or later (`VERSION=edge-20261020-b692610` with OmniGraph's
+  `scripts/install.sh`), on `PATH` or named by `OMNIGRAPH_BIN` and `OMNIGRAPH_SERVER_BIN`.
 
 Run against the sample graph (200 people, 25 companies, 40 projects):
 
@@ -172,7 +173,7 @@ what is deferred, and a dated validation log of the checks behind each claim.
 
 ## Status
 
-Built against OmniGraph 0.14 (`edge-20261017-d883c49`); macOS is the primary platform, and Linux and Windows build and
+Built against OmniGraph 0.14 (`edge-20261018-0a62bb7`); macOS is the primary platform, and Linux and Windows build and
 test in CI. Not implemented:
 
 - Signed and notarized releases, a Windows installer, auto-update.

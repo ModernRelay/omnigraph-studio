@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use omnigraph_compiler::catalog::Catalog;
 use omnigraph_compiler::schema::ast::{Constraint, SchemaDecl, SchemaFile};
-use omnigraph_compiler::schema::parser::parse_schema;
+use omnigraph_compiler::schema::parser::parse_persisted_schema_contract;
 use omnigraph_compiler::types::{PropType, ScalarType};
 use omnigraph_compiler::{
     PropertyConstraintShape, PropertyShape, build_catalog, compile_schema_shape,
@@ -200,9 +200,14 @@ impl std::fmt::Debug for SchemaModel {
 }
 
 impl SchemaModel {
-    /// Compiles `.pg` source. The error is the compiler's message.
+    /// Compiles `.pg` source the server accepted. The error is the compiler's message.
+    ///
+    /// Read as the engine reads an accepted schema (`parse_persisted_schema_contract`, its
+    /// compatibility parser for stored contracts): a graph admitted before a rule tightened
+    /// (an integer `@range` bound past I64, a body-level `@unique` on a Blob) still opens, where
+    /// the admission parser would refuse it and leave the graph blank.
     pub fn parse(source: &str) -> Result<Self, String> {
-        let file = parse_schema(source).map_err(|e| e.to_string())?;
+        let file = parse_persisted_schema_contract(source).map_err(|e| e.to_string())?;
         let shape = compile_schema_shape(&file).map_err(|e| e.to_string())?;
         let catalog = build_catalog(&file).map_err(|e| e.to_string())?;
 
@@ -464,6 +469,17 @@ pub(crate) mod tests {
 
     pub fn dev() -> SchemaModel {
         SchemaModel::parse(DEV_SCHEMA).expect("dev schema compiles")
+    }
+
+    /// A graph admitted before a rule tightened opens: the server keeps its schema, which the
+    /// admission parser would now refuse.
+    #[test]
+    fn a_schema_admitted_before_a_rule_tightened_still_opens() {
+        let historical =
+            "node Document {\n  slug: String @key\n  payload: Blob?\n  @unique(payload)\n}\n";
+        assert!(omnigraph_compiler::schema::parser::parse_schema(historical).is_err());
+        let schema = SchemaModel::parse(historical).expect("an accepted schema opens");
+        assert!(schema.node("Document").is_some());
     }
 
     /// Every member of a composite key is a key the server will not let change; the node has

@@ -3,7 +3,8 @@
 Status: open · 2026-10-11, updated 2026-10-20. Landed on OmniGraph main: E6, E7, E8, E23 and E24
 by 2026-10-15, then E10, E15 (as the access route), E21 and E22 by 2026-10-20 (see "On OmniGraph
 main, 2026-10-20"). Studio's oldest supported server is 0.14, the edge build
-`edge-20261017-d883c49` until 0.14 is released (2026-10-17, `911a885`), whose HTTP contract header
+`edge-20261018-0a62bb7` until 0.14 is released (`edge-20261017-d883c49` from 2026-10-17, `911a885`,
+until 2026-10-20), whose HTTP contract header
 is still `0.13` (constitution X). When a change is picked up it becomes an OmniGraph RFC and issue
 in `ModernRelay/omnigraph`, follows that repository's invariants and test ownership, and Studio
 adopts it once its minimum server serves it, or before then only when a server's OpenAPI
@@ -71,7 +72,7 @@ not know.
 ## On OmniGraph main, 2026-10-20
 
 Checked at main `4ba904d3` by diffing its `openapi.json` with the contract Studio carries
-(`crates/graph_client/openapi/omnigraph-0.14.0-edge.json`, from `edge-20261017-d883c49`) and
+(`crates/graph_client/openapi/omnigraph-0.14.0-edge.json`, then from `edge-20261017-d883c49`) and
 reading the `changelog.d` notes added since. The contract header is still `0.13` and every HTTP
 change is additive; the CLI's is not.
 

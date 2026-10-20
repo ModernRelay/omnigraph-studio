@@ -6962,7 +6962,7 @@ dependencies = [
 [[package]]
 name = "omnigraph-compiler"
 version = "0.14.0"
-source = "git+https://github.com/ModernRelay/omnigraph?tag=edge-20261017-d883c49#d883c49e741f0c2d2b863c1d500601c023bd41f5"
+source = "git+https://github.com/ModernRelay/omnigraph?tag=edge-20261018-0a62bb7#0a62bb7b2aa5b99b012f413807c216277f7f9596"
 dependencies = [
  "ahash",
  "arrow-array",

@@ -1,5 +1,5 @@
 /**
- * Tree-sitter grammar for OmniGraph queries (`.gq`), GQ at OmniGraph `edge-20261017-d883c49`.
+ * Tree-sitter grammar for OmniGraph queries (`.gq`), GQ at OmniGraph `edge-20261018-0a62bb7`.
  *
  * Written from `crates/omnigraph-compiler/src/query/query.pest` at that tag. It is for
  * highlighting, folding and outline in Studio's query editor: it accepts what the pest grammar

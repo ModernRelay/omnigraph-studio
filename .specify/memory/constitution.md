@@ -73,7 +73,7 @@ thread. A frame does no I/O.
 
 ## X. The engine moves at its own pace
 
-Studio targets OmniGraph 0.14 and later (the edge build `edge-20261017-d883c49` until 0.14 is
+Studio targets OmniGraph 0.14 and later (the edge build `edge-20261018-0a62bb7` until 0.14 is
 released; its HTTP contract header is still `0.13`) and refuses an older server. A feature that would be better
 with an engine change is designed against today's API, and the change is recorded in
 `docs/deferred-engine-changes.md`. Studio never works around a missing route by keeping its own
