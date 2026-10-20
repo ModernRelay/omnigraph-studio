@@ -135,13 +135,25 @@ pub fn operator_parts(parts: &[QueryPart], node: &str, detail: &str) -> Vec<Rang
         }
         // One operator serves every correlated block, told apart by its predicate: one asking
         // that nothing match is a `not`; `exists`, `count` and the column aggregates are not.
+        // A `count { … } = 0` written out reads as a `not` too, so the other kind's blocks
+        // naming the operator's variable stand in when none of the first kind does.
         n if n.starts_with("AntiJoin") => {
-            let kind = if negates(json.as_ref(), detail) {
-                PartKind::Negation
+            let (first, then) = if negates(json.as_ref(), detail) {
+                (PartKind::Negation, PartKind::Subquery)
             } else {
-                PartKind::Subquery
+                (PartKind::Subquery, PartKind::Negation)
             };
-            blocks(parts, kind, &vars)
+            let naming = blocks_naming(parts, first.clone(), &vars);
+            if !naming.is_empty() {
+                naming
+            } else {
+                let other = blocks_naming(parts, then, &vars);
+                if other.is_empty() {
+                    blocks(parts, first, &vars)
+                } else {
+                    other
+                }
+            }
         }
         n if n.contains("Expand") || n.contains("Travers") => traversals(parts, &vars),
         n if n.contains("Filter") => matching_filters(parts, &filters),
@@ -339,6 +351,15 @@ fn has_search_call(part: &QueryPart) -> bool {
     ]
     .iter()
     .any(|call| part.compact.contains(call))
+}
+
+/// The blocks of `kind` that name one of `vars`.
+fn blocks_naming(parts: &[QueryPart], kind: PartKind, vars: &[String]) -> Vec<Range<usize>> {
+    parts
+        .iter()
+        .filter(|part| part.kind == kind && part.vars.iter().any(|var| vars.contains(var)))
+        .map(|part| part.range.clone())
+        .collect()
 }
 
 /// The blocks of `kind` that name one of `vars`, else every block of that kind.
@@ -829,6 +850,11 @@ mod tests {
         // The same operator for a counted block, which is no `not`.
         assert_eq!(
             at("AntiJoin", r#"{"outer_var":"p","predicate":"count > 2"}"#),
+            ["count { $p contributes $j } > 2"]
+        );
+        // A count written to ask for none reads as a `not`: its own block stands in.
+        assert_eq!(
+            at("AntiJoin", r#"{"outer_var":"p","predicate":"count = 0"}"#),
             ["count { $p contributes $j } > 2"]
         );
         assert_eq!(

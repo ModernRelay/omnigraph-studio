@@ -241,9 +241,20 @@ pub fn tokenize(source: &str) -> Vec<Token> {
                 })
             };
             let after_query = after_keyword(previous, "query");
-            // How a declaration publishes: `as commit`, `as unattached branch on …`.
+            // How a declaration publishes: `as commit`, `as unattached branch on …`, after its
+            // parameters' `)`; an alias named `commit` follows the value it names.
+            let after_signature = || {
+                let before = tokens
+                    .iter()
+                    .rev()
+                    .filter(|t| t.kind != TokenKind::Comment)
+                    .nth(1);
+                before.is_some_and(|t| {
+                    t.kind == TokenKind::Punctuation && &source[t.range.clone()] == ")"
+                })
+            };
             let publishes = match word {
-                "commit" | "unattached" => after_keyword(previous, "as"),
+                "commit" | "unattached" => after_keyword(previous, "as") && after_signature(),
                 "on" => {
                     let before = tokens
                         .iter()
@@ -687,6 +698,9 @@ mod tests {
                 "where"
             ]
         );
+        // An alias named `commit` is a name.
+        let tokens = kinds("query q() { match { $p: Person } return { $p.name as commit } }");
+        assert!(tokens.contains(&(TokenKind::Identifier, "commit")));
         // Outside a statement they are names: a property `load`, an edge `commit`, a variable's
         // edge `on`.
         let tokens =

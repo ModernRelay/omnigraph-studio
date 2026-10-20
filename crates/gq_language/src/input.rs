@@ -222,12 +222,15 @@ pub(crate) fn begins_a_date(text: &str) -> bool {
     digits.starts_with(|c: char| c.is_ascii_digit())
 }
 
-/// A time typed in a spelling the engine reads (a space or a `t` before the time, a zone or
-/// an offset, a date alone) spelled as the engine writes it: in UTC with no zone, and with
-/// milliseconds only when they are not zero (`2024-01-02T08:00:00` for `2024-01-02 10:00:00+02:00`).
-/// The engine reads both alike, and values compared here as text then order as the engine
-/// orders them. Text it cannot read as a time, or with digits past the millisecond, which the
-/// engine refuses when they are not zero, goes as typed, for the server to judge.
+/// A time typed in one of the engine's spellings spelled as the engine writes it: in UTC with
+/// no zone, and with milliseconds only when they are not zero (`2024-01-02T08:00:00` for
+/// `2024-01-02 10:00:00+02:00`). The spellings rewritten are `YYYY-MM-DD`, alone or followed
+/// by `T`, `t` or a space and `HH:MM:SS`, a fraction, and `Z` or an offset `±HH:MM`. The
+/// engine reads both alike, and values compared here as text then order as the engine orders
+/// them. Any other text goes as typed, for the server to judge: one with a digit missing
+/// (`24-01-02`), which a lenient reading would take for the year 24; a leap second; digits
+/// past the millisecond, which the engine refuses when they are not zero; and spellings the
+/// engine reads that are not rewritten here (`20240102`, `+0200`).
 pub(crate) fn date_time(text: &str) -> String {
     let bytes = text.as_bytes();
     let dated = bytes.len() > 10
@@ -241,9 +244,13 @@ pub(crate) fn date_time(text: &str) -> String {
     engine_date_time(&spaced).unwrap_or(spaced)
 }
 
-/// `text` as the engine writes the instant it names, when it names one to the millisecond.
+/// `text` as the engine writes the instant it names, when it is one of the shapes
+/// [`date_time`] rewrites and names an instant to the millisecond.
 fn engine_date_time(text: &str) -> Option<String> {
-    use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+    use chrono::{DateTime, NaiveDate, NaiveDateTime, Timelike as _, Utc};
+    if !engine_shape(text) {
+        return None;
+    }
     if let Some((_, fraction)) = text.split_once('.') {
         let past_millis = fraction
             .bytes()
@@ -263,11 +270,72 @@ fn engine_date_time(text: &str) -> Option<String> {
             .ok()?
             .and_hms_opt(0, 0, 0)?
     };
+    // A leap second names its instant past the second's end, which this spelling cannot.
+    if at.nanosecond() >= 1_000_000_000 {
+        return None;
+    }
     let seconds = at.format("%Y-%m-%dT%H:%M:%S");
     Some(match at.and_utc().timestamp_subsec_millis() {
         0 => seconds.to_string(),
         millis => format!("{seconds}.{millis:03}"),
     })
+}
+
+/// Whether `text` is `YYYY-MM-DD`, alone or with `THH:MM:SS` (after `T`, `t` or a space,
+/// already spelled `T` by [`date_time`]), a fraction, and `Z`, `z` or `±HH:MM`: every field its
+/// full width, as the engine's own parser takes them.
+fn engine_shape(text: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let width = |s: &str, n: usize| s.len() == n && digits(s);
+    let Some(date) = text.get(..10) else {
+        return false;
+    };
+    let [year, month, day] = date.splitn(3, '-').collect::<Vec<_>>()[..] else {
+        return false;
+    };
+    if !(width(year, 4) && width(month, 2) && width(day, 2)) {
+        return false;
+    }
+    let Some(rest) = text.get(10..) else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    let Some(rest) = rest.strip_prefix('T') else {
+        return false;
+    };
+    let Some(clock) = rest.get(..8) else {
+        return false;
+    };
+    let [hour, minute, second] = clock.splitn(3, ':').collect::<Vec<_>>()[..] else {
+        return false;
+    };
+    if !(width(hour, 2) && width(minute, 2) && width(second, 2)) {
+        return false;
+    }
+    let mut rest = &rest[8..];
+    if let Some(after_point) = rest.strip_prefix('.') {
+        let end = after_point
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after_point.len());
+        if end == 0 {
+            return false;
+        }
+        rest = &after_point[end..];
+    }
+    match rest {
+        "" | "Z" | "z" => true,
+        offset => {
+            let Some(offset) = offset.strip_prefix(['+', '-']) else {
+                return false;
+            };
+            let [hours, minutes] = offset.splitn(2, ':').collect::<Vec<_>>()[..] else {
+                return false;
+            };
+            width(hours, 2) && width(minutes, 2)
+        }
+    }
 }
 
 /// `true`, `yes` or `1`, and `false`, `no` or `0`, in any case.
@@ -398,6 +466,13 @@ mod tests {
             // does not read: as typed.
             ("2024-01-02T10:00:00.1234", "2024-01-02T10:00:00.1234"),
             ("2024-01-02T10:00", "2024-01-02T10:00"),
+            // A digit missing is no year 24 or 202, nor hour 1; a leap second keeps its
+            // spelling; one the engine reads but this does not rewrite goes as typed.
+            ("24-01-02", "24-01-02"),
+            ("202-01-02T10:00:00", "202-01-02T10:00:00"),
+            ("2024-01-02T1:00:00", "2024-01-02T1:00:00"),
+            ("2024-06-30T23:59:60", "2024-06-30T23:59:60"),
+            ("2024-01-02T10:00:00+0200", "2024-01-02T10:00:00+0200"),
         ] {
             assert_eq!(parse_scalar(&at, typed), Ok(json!(written)), "{typed}");
         }
