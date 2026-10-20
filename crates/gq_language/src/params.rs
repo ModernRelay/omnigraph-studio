@@ -3,9 +3,9 @@
 //! A parameter's type is its `.gq` spelling: `String`, `I32`, `Bool`, `Date`, `[String]`,
 //! `Vector(3)`. Values always travel as parameters, never spliced into query text.
 
-use serde_json::{Number, Value};
+use serde_json::Value;
 
-use crate::input::IntegerError;
+use crate::input::{FloatError, IntegerError};
 
 /// Reads `text` as a value of the parameter type `type_name`. An empty text is `None` (the
 /// parameter is sent as null) when the parameter is nullable, and an error otherwise.
@@ -45,7 +45,8 @@ fn scalar_or_list(name: &str, type_name: &str, text: &str) -> Result<Value, Stri
     scalar(name, type_name, text)
 }
 
-/// A list is JSON (`["a", "b"]`) or comma-separated items (`a, b`).
+/// A list is JSON (`["a", "b"]`) or comma-separated items (`a, b`), quoted as a cell's are
+/// when one holds a comma (`"Smith, John", x`).
 fn list(name: &str, item_type: &str, text: &str) -> Result<Value, String> {
     let trimmed = text.trim();
     if trimmed.starts_with('[') {
@@ -64,10 +65,9 @@ fn list(name: &str, item_type: &str, text: &str) -> Result<Value, String> {
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array);
     }
-    trimmed
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
+    crate::input::list_items(trimmed)
+        .map_err(|error| format!("${name}: {error}"))?
+        .iter()
         .map(|item| scalar(name, item_type, item))
         .collect::<Result<Vec<_>, _>>()
         .map(Value::Array)
@@ -77,7 +77,14 @@ fn scalar(name: &str, type_name: &str, text: &str) -> Result<Value, String> {
     let trimmed = text.trim();
     match type_name {
         "String" | "Blob" => Ok(Value::String(text.to_owned())),
-        "Date" | "DateTime" => Ok(Value::String(trimmed.to_owned())),
+        // As a cell's: the engine reads a date or a time in more spellings than one.
+        "Date" | "DateTime" if crate::input::begins_a_date(trimmed) => {
+            Ok(Value::String(trimmed.to_owned()))
+        }
+        "Date" => Err(format!("${name} must be a date as YYYY-MM-DD")),
+        "DateTime" => Err(format!(
+            "${name} must be a date and time as YYYY-MM-DD HH:MM:SS"
+        )),
         "Bool" => {
             crate::input::boolean(trimmed).ok_or_else(|| format!("${name} must be true or false"))
         }
@@ -88,14 +95,10 @@ fn scalar(name: &str, type_name: &str, text: &str) -> Result<Value, String> {
                 IntegerError::OutOfRange => format!("${name} does not fit in {type_name}"),
             })
         }
-        "F32" | "F64" => {
-            let value: f64 = trimmed
-                .parse()
-                .map_err(|_| format!("${name} must be a number"))?;
-            Number::from_f64(value)
-                .map(Value::Number)
-                .ok_or_else(|| format!("${name} must be a finite number"))
-        }
+        "F32" | "F64" => crate::input::float(type_name, trimmed).map_err(|error| match error {
+            FloatError::NotANumber => format!("${name} must be a finite number"),
+            FloatError::OutOfRange => format!("${name} does not fit in {type_name}"),
+        }),
         // An unknown spelling: send the text and let the server decide.
         _ => Ok(Value::String(text.to_owned())),
     }
@@ -125,6 +128,17 @@ mod tests {
         assert_eq!(
             param_value("d", "Date", false, "2024-01-02"),
             Ok(Some(json!("2024-01-02")))
+        );
+        assert_eq!(
+            param_value("t", "DateTime", false, "2024-01-02 10:00:00"),
+            Ok(Some(json!("2024-01-02 10:00:00")))
+        );
+        // As the engine takes them: U64 up to i64's maximum, and an F32 that stays finite.
+        assert!(param_value("n", "U64", false, &u64::MAX.to_string()).is_err());
+        assert!(param_value("f", "F32", false, "1e39").is_err());
+        assert_eq!(
+            param_value("f", "F64", false, "1e39"),
+            Ok(Some(json!(1e39)))
         );
         assert_eq!(
             param_value("s", "String", false, " Ada "),
@@ -160,6 +174,11 @@ mod tests {
             Ok(Some(json!([0.5, 1.0, 2.0])))
         );
         assert!(param_value("t", "[I32]", false, "[1, \"x\"]").is_err());
+        // Quoted as a cell's list is: a comma inside an item stays in it.
+        assert_eq!(
+            param_value("t", "[String]", false, "\"Smith, John\", x"),
+            Ok(Some(json!(["Smith, John", "x"])))
+        );
         // A list parameter holds no null: the item is refused, not sent as the text "null".
         assert!(param_value("t", "[String]", false, "[\"a\", null]").is_err());
     }

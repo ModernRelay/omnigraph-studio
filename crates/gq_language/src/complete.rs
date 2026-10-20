@@ -10,20 +10,9 @@ use std::ops::Range;
 use crate::lex::{KEYWORDS, TokenKind, outline, tokenize};
 use crate::schema::{SchemaModel, traversal_name};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionKind {
-    Keyword,
-    Type,
-    Relationship,
-    Property,
-    /// A parameter or a `match` binding, offered after `$`.
-    Variable,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
     pub label: String,
-    pub kind: CompletionKind,
     pub detail: Option<String>,
 }
 
@@ -38,13 +27,19 @@ const PARAMETER_TYPES: &[&str] = &[
 pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize, Vec<Completion>) {
     let offset = offset.min(source.len());
     let before = &source[..offset];
-    let start = before
+    let word = before
         .char_indices()
         .rev()
         .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
         .last()
         .map(|(i, _)| i)
         .unwrap_or(offset);
+    // After `$var.`, a field's name begins with `@` (`@src`): it is part of the word.
+    let start = if before[..word].ends_with(".@") {
+        word - 1
+    } else {
+        word
+    };
     let prefix = &source[start..offset];
     let lower = prefix.to_lowercase();
     let matches = |label: &str| label.to_lowercase().starts_with(&lower);
@@ -71,7 +66,6 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
             if matches(&name) && name != prefix && !items.iter().any(|i| i.label == name) {
                 items.push(Completion {
                     label: name,
-                    kind: CompletionKind::Variable,
                     detail: Some(detail),
                 });
             }
@@ -86,7 +80,6 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
             .filter(|t| matches(t))
             .map(|t| Completion {
                 label: (*t).into(),
-                kind: CompletionKind::Type,
                 detail: Some("parameter type".into()),
             })
             .collect();
@@ -123,7 +116,6 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
                     if matches(&property.name) {
                         items.push(Completion {
                             label: property.name.clone(),
-                            kind: CompletionKind::Property,
                             detail: Some(property.display_type()),
                         });
                     }
@@ -136,10 +128,9 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
                 &["@id"]
             };
             for meta in metas {
-                if prefix.is_empty() {
+                if matches(meta) {
                     items.push(Completion {
                         label: (*meta).into(),
-                        kind: CompletionKind::Property,
                         detail: Some("String".into()),
                     });
                 }
@@ -153,7 +144,6 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
         if matches(&node.name) {
             items.push(Completion {
                 label: node.name.clone(),
-                kind: CompletionKind::Type,
                 detail: Some("node".into()),
             });
         }
@@ -164,7 +154,6 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
             // What is inserted: a reserved word is quoted, as a traversal spells it.
             items.push(Completion {
                 label: edge.traversal(),
-                kind: CompletionKind::Relationship,
                 detail: Some(format!("{} → {}", edge.from, edge.to)),
             });
         }
@@ -173,7 +162,6 @@ pub fn completions(schema: &SchemaModel, source: &str, offset: usize) -> (usize,
         if !prefix.is_empty() && matches(keyword) {
             items.push(Completion {
                 label: (*keyword).into(),
-                kind: CompletionKind::Keyword,
                 detail: None,
             });
         }
@@ -438,6 +426,12 @@ mod tests {
         let node = labels("query q() { match { $p: Person } return { $p.");
         assert!(node.iter().any(|label| label == "@id"));
         assert!(!node.iter().any(|label| label == "@src"), "{node:?}");
+        // Begun with `@`, the field is completed from its name, the `@` replaced with it.
+        let source = "query q() { match { $a $e:worksAt $b } return { $e.@s";
+        let (start, items) = completions(&dev(), source, source.len());
+        assert_eq!(&source[start..], "@s");
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, ["@src"]);
     }
 
     #[test]
@@ -475,7 +469,6 @@ mod tests {
         let ends = "query q() { match { $p: Person  $p worksAt $c } return { $c.na";
         let (_, properties) = completions(&schema, ends, ends.len());
         assert_eq!(properties[0].label, "name");
-        assert!(items.iter().all(|i| i.kind == CompletionKind::Variable));
         let typed = format!("{source}i");
         let (_, items) = completions(&schema, &typed, typed.len());
         assert_eq!(items.len(), 1);

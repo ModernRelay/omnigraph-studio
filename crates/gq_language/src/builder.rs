@@ -545,6 +545,8 @@ pub enum BuildError {
     NotEditable(String),
     /// The property is named by a reserved word, so a write cannot be bound to its value.
     Unbindable(String),
+    /// An insert with no value: GQ's insert names at least one.
+    NoValues(String),
 }
 
 impl std::fmt::Display for BuildError {
@@ -562,6 +564,9 @@ impl std::fmt::Display for BuildError {
                 "`{name}` is a GQ reserved word, so a change to it cannot be bound to the value \
                  shown; rename the property in the schema (`@rename_from`) to edit it"
             ),
+            BuildError::NoValues(type_name) => {
+                write!(f, "Enter at least one value for the new {type_name}")
+            }
         }
     }
 }
@@ -771,10 +776,7 @@ fn relationship_clause(
     };
     let edge = edge(schema, edge_name)?;
     let other = format!("$r{i}");
-    let (other_type, hop) = match direction {
-        Direction::Outgoing => (&edge.to, format!("${var} {} {other}", edge.traversal())),
-        Direction::Incoming => (&edge.from, format!("{other} {} ${var}", edge.traversal())),
-    };
+    let (_, other_type, hop) = hop(edge, direction, &format!("${var}"), &other);
     let mut body = vec![format!("{other}: {other_type}"), hop];
     if filter.op == FilterOp::RelatedTo {
         let id = params.add(&format!("f{i}"), "String", filter.value.clone());
@@ -808,10 +810,7 @@ fn neighbour_property_clause(
 ) -> Result<String, BuildError> {
     let edge = edge(schema, edge_name)?;
     let other = format!("$r{i}");
-    let (other_type, hop) = match direction {
-        Direction::Outgoing => (&edge.to, format!("${var} {} {other}", edge.traversal())),
-        Direction::Incoming => (&edge.from, format!("{other} {} ${var}", edge.traversal())),
-    };
+    let (_, other_type, hop) = hop(edge, direction, &format!("${var}"), &other);
     let other_node = node(schema, other_type)?;
     let property = other_node
         .properties
@@ -1092,14 +1091,37 @@ fn edge<'a>(schema: &'a SchemaModel, name: &str) -> Result<&'a EdgeType, BuildEr
         .ok_or_else(|| BuildError::UnknownEdge(name.to_owned()))
 }
 
-/// The column an edge property is returned under by [`edge_page`].
+/// Along `edge` in `direction` from the node bound to `near` to the one bound to `far`: the
+/// near end's type, the far end's, and the hop between them.
+fn hop<'a>(
+    edge: &'a EdgeType,
+    direction: Direction,
+    near: &str,
+    far: &str,
+) -> (&'a str, &'a str, String) {
+    let (from, to) = match direction {
+        Direction::Outgoing => (&edge.from, &edge.to),
+        Direction::Incoming => (&edge.to, &edge.from),
+    };
+    (from, to, oriented(direction, near, &edge.traversal(), far))
+}
+
+/// A traversal from `near` to `far` along `edge` (its token, with any `$e:` binding), written
+/// in the edge's own direction.
+fn oriented(direction: Direction, near: &str, edge: &str, far: &str) -> String {
+    match direction {
+        Direction::Outgoing => format!("{near} {edge} {far}"),
+        Direction::Incoming => format!("{far} {edge} {near}"),
+    }
+}
+
+/// The column an edge property is returned under by [`edge_page_without`] and [`neighbours`].
 pub fn edge_property_column(property: &str) -> String {
     format!("e_{property}")
 }
 
-/// One page of an edge type, keyset-paged by the edge's `@id` (spec 004). Columns: `edge_id`,
-/// `from_id`, `to_id`, then `e_<property>` for each projectable edge property. The engine needs
-/// a typed source binding to traverse, so the source is bound to the edge's `from` type.
+/// [`edge_page_without`] leaving nothing out.
+#[cfg(test)]
 pub fn edge_page(
     schema: &SchemaModel,
     edge_name: &str,
@@ -1111,8 +1133,8 @@ pub fn edge_page(
     edge_page_without(schema, edge_name, filters, sort, start, limit, &[])
 }
 
-/// [`edge_page`] without the properties in `without`: for a commit made before they were added
-/// or renamed.
+/// A page of an edge type's rows, without the properties in `without`: for a commit made before
+/// they were added or renamed.
 pub fn edge_page_without(
     schema: &SchemaModel,
     edge_name: &str,
@@ -1286,10 +1308,7 @@ pub fn neighbour_counts(
     let (direction, edge_name) =
         parse_relationship_key(key).ok_or_else(|| BuildError::UnknownEdge(key.to_owned()))?;
     let edge = edge(schema, edge_name)?;
-    let (other_type, hop) = match direction {
-        Direction::Outgoing => (&edge.to, format!("$n {} $g", edge.traversal())),
-        Direction::Incoming => (&edge.from, format!("$g {} $n", edge.traversal())),
-    };
+    let (_, other_type, hop) = hop(edge, direction, "$n", "$g");
     let other = self::node(schema, other_type)?;
     let mut params = Params::new();
     let mut clauses = vec![format!("$n: {}", node.name)];
@@ -1329,10 +1348,9 @@ pub fn neighbour_counts(
 
 /// How many filtered rows of a node type have a neighbour with each value of one of its
 /// properties (spec 004, grouping by a neighbour's property: "people by the city of their
-/// company"). A row counts once per value, however many of its neighbours hold it: of a
-/// row's neighbours with one value, only the one with the least `@id` is matched, since GQ's
-/// `count` counts matches. Neighbours without a value are left out; the rows with no value at
-/// all are an "is empty" count. Columns: `value`, `n`.
+/// company"). A row counts once per value, however many of its neighbours hold it (`count`
+/// of distinct rows). Neighbours without a value are left out; the rows with no value at all
+/// are an "is empty" count. Columns: `value`, `n`.
 pub fn neighbour_value_counts(
     schema: &SchemaModel,
     type_name: &str,
@@ -1350,18 +1368,7 @@ pub fn neighbour_value_counts(
     };
     let node = node(schema, type_name)?;
     let edge = edge(schema, edge_name)?;
-    let (other_type, hop, other_hop) = match direction {
-        Direction::Outgoing => (
-            &edge.to,
-            format!("$n {} $g", edge.traversal()),
-            format!("$n {} $d", edge.traversal()),
-        ),
-        Direction::Incoming => (
-            &edge.from,
-            format!("$g {} $n", edge.traversal()),
-            format!("$d {} $n", edge.traversal()),
-        ),
-    };
+    let (_, other_type, hop) = hop(edge, direction, "$n", "$g");
     let other = self::node(schema, other_type)?;
     let property = other
         .properties
@@ -1385,12 +1392,8 @@ pub fn neighbour_value_counts(
     clauses.push(format!("$g: {}", other.name));
     clauses.push(hop);
     clauses.push(format!("$g.{prop} is not null"));
-    clauses.push(format!(
-        "not {{\n      $d: {}\n      {other_hop}\n      $d.{prop} = $g.{prop}\n      $d.@id < $g.@id\n    }}",
-        other.name
-    ));
     let text = format!(
-        "query studio_value_counts({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ $g.{prop} as value, count($n) as n }}\n  order {{ value asc }}\n  limit {limit}\n}}\n",
+        "query studio_value_counts({sig}) {{\n  match {{\n    {clauses}\n  }}\n  return {{ $g.{prop} as value, count(distinct $n) as n }}\n  order {{ value asc }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         clauses = clauses.join("\n    "),
     );
@@ -1470,10 +1473,7 @@ fn traversal_clause(group: &RelationshipGroup, edge_var: Option<&str>) -> String
         Some(var) => format!("${var}:{}", traversal_token(&group.edge)),
         None => traversal_token(&group.edge),
     };
-    match group.direction {
-        Direction::Outgoing => format!("$n {edge} $m"),
-        Direction::Incoming => format!("$m {edge} $n"),
-    }
+    oriented(group.direction, "$n", &edge, "$m")
 }
 
 /// How many neighbours a node has through one relationship group (spec 005).
@@ -1502,6 +1502,41 @@ pub fn degree(
     );
     Ok(BuiltQuery {
         name: "studio_degree".into(),
+        text,
+        params: params.values,
+        depends,
+        seeds: None,
+    })
+}
+
+/// How many edges a node has through one relationship group: more than [`degree`]'s
+/// neighbours when two edges reach one of them (a person rehired by one company). The peek
+/// lists every edge, so each can be removed, and counts them so. Column: `n`.
+pub fn edge_degree(
+    schema: &SchemaModel,
+    node_type: &str,
+    group: &RelationshipGroup,
+    id: &str,
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, node_type)?;
+    schema
+        .edge(&group.edge)
+        .ok_or_else(|| BuildError::UnknownEdge(group.edge.clone()))?;
+    let depends = Depends::EdgesAt {
+        edge: group.edge.clone(),
+        nodes: vec![id.to_owned()],
+        listed: None,
+    };
+    let mut params = Params::new();
+    let id = params.add("id", "String", Value::String(id.to_owned()));
+    let text = format!(
+        "query studio_edge_degree({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n    {traversal}\n  }}\n  return {{ count($e.@id) as n }}\n}}\n",
+        sig = params.signature(),
+        ty = node.name,
+        traversal = traversal_clause(group, Some("e")),
+    );
+    Ok(BuiltQuery {
+        name: "studio_edge_degree".into(),
         text,
         params: params.values,
         depends,
@@ -1641,8 +1676,6 @@ impl GroupBy {
         }
     }
 
-    /// What a group's neighbours can be grouped by: the other type's properties, then the
-    /// edge's, in schema order, then the other type's relationships.
     /// Whether [`GroupBy::choices`] offers anything, without building them.
     pub fn has_choices(schema: &SchemaModel, group: &RelationshipGroup) -> bool {
         let node = schema
@@ -1657,6 +1690,8 @@ impl GroupBy {
             || !schema.relationships_of(&group.other_type).is_empty()
     }
 
+    /// What a group's neighbours can be grouped by: the other type's properties, then the
+    /// edge's, in schema order, then the other type's relationships.
     pub fn choices(schema: &SchemaModel, group: &RelationshipGroup) -> Vec<GroupBy> {
         let node = schema
             .node(&group.other_type)
@@ -1700,11 +1735,8 @@ impl GroupBy {
         let unknown = || BuildError::UnknownEdge(self.property.clone());
         let (direction, edge_name) = parse_relationship_key(&self.property).ok_or_else(unknown)?;
         let edge = edge(schema, edge_name)?;
-        let (from, other, hop) = match direction {
-            Direction::Outgoing => (&edge.from, &edge.to, format!("$m {} $v", edge.traversal())),
-            Direction::Incoming => (&edge.to, &edge.from, format!("$v {} $m", edge.traversal())),
-        };
-        if *from != group.other_type {
+        let (from, other, hop) = self::hop(edge, direction, "$m", "$v");
+        if from != group.other_type {
             return Err(unknown());
         }
         Ok((self::node(schema, other)?, hop))
@@ -1761,15 +1793,25 @@ pub struct Narrow<'a> {
     pub value: Option<(&'a GroupBy, &'a Value)>,
 }
 
+/// Where a page of neighbours starts: after a neighbour and every edge to it, as the tree reads
+/// a neighbour once however many edges reach it; or after one edge, as the peek reads every
+/// edge, so a second edge to the same neighbour is not skipped.
+#[derive(Debug, Clone, Copy)]
+pub enum After<'a> {
+    Neighbour(&'a str),
+    Edge { neighbour: &'a str, edge: &'a str },
+}
+
 /// One page of a node's neighbours through a relationship group, with the neighbour's label
-/// and the edge's properties (spec 005). Columns: `id`, `edge_id` (the edge's own id), `label`
-/// (when the other type has one), then `e_<property>` for each projectable edge property.
+/// and the edge's properties (spec 005), one row an edge, by neighbour and then edge. Columns:
+/// `id`, `edge_id` (the edge's own id), `label` (when the other type has one), then
+/// `e_<property>` for each projectable edge property.
 pub fn neighbours(
     schema: &SchemaModel,
     node_type: &str,
     group: &RelationshipGroup,
     id: &str,
-    after: Option<&str>,
+    after: Option<After<'_>>,
     narrow: Narrow<'_>,
     limit: u32,
 ) -> Result<BuiltQuery, BuildError> {
@@ -1785,7 +1827,7 @@ pub fn neighbours_without_properties(
     node_type: &str,
     group: &RelationshipGroup,
     id: &str,
-    after: Option<&str>,
+    after: Option<After<'_>>,
     narrow: Narrow<'_>,
     limit: u32,
     without: &[(String, String)],
@@ -1809,11 +1851,21 @@ pub fn neighbours_without_properties(
     };
     let mut params = Params::new();
     let id = params.add("id", "String", Value::String(id.to_owned()));
-    let after = params.add(
-        "after",
-        "String",
-        Value::String(after.unwrap_or("").to_owned()),
-    );
+    let after = match after {
+        None => {
+            let after = params.add("after", "String", Value::String(String::new()));
+            format!("$m.@id > {after}")
+        }
+        Some(After::Neighbour(neighbour)) => {
+            let after = params.add("after", "String", Value::String(neighbour.to_owned()));
+            format!("$m.@id > {after}")
+        }
+        Some(After::Edge { neighbour, edge }) => {
+            let after = params.add("after", "String", Value::String(neighbour.to_owned()));
+            let edge = params.add("after_edge", "String", Value::String(edge.to_owned()));
+            format!("($m.@id > {after} or ($m.@id = {after} and $e.@id > {edge}))")
+        }
+    };
     // The edge's own id too, which removing one relationship names.
     let mut columns = vec!["$m.@id as id".to_owned(), "$e.@id as edge_id".to_owned()];
     if let Some(label) = other.label_property()
@@ -1827,7 +1879,11 @@ pub fn neighbours_without_properties(
         .iter()
         .filter(|p| p.projectable() && !left_out(&edge.name, &p.name))
     {
-        columns.push(format!("$e.{0} as e_{0}", property.name));
+        columns.push(format!(
+            "$e.{} as {}",
+            property.name,
+            edge_property_column(&property.name)
+        ));
     }
     let mut extra = String::new();
     // A search narrows the neighbours to ids starting with, or labels containing, the text.
@@ -1866,7 +1922,7 @@ pub fn neighbours_without_properties(
         extra.push_str(&format!("\n    {clause}"));
     }
     let text = format!(
-        "query studio_neighbours({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n    {traversal}\n    $m.@id > {after}{extra}\n  }}\n  return {{ {columns} }}\n  order {{ $m.@id asc }}\n  limit {limit}\n}}\n",
+        "query studio_neighbours({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n    {traversal}\n    {after}{extra}\n  }}\n  return {{ {columns} }}\n  order {{ $m.@id asc, $e.@id asc }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         ty = node.name,
         traversal = traversal_clause(group, Some("e")),
@@ -1909,11 +1965,14 @@ pub fn neighbour_values(
     };
     let mut params = Params::new();
     let id = params.add("id", "String", Value::String(id.to_owned()));
+    // Neighbours, each once however many edges reach it (as the tree lists them); the edge is
+    // bound only when its property is what is counted by.
+    let edge = (by.on == GroupOn::Edge).then_some("e");
     let text = format!(
-        "query studio_neighbour_values({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n    {traversal}{hop}\n  }}\n  return {{ {target} as value{label}, count($m) as n }}\n  order {{ n desc, value asc }}\n  limit {limit}\n}}\n",
+        "query studio_neighbour_values({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n    {traversal}{hop}\n  }}\n  return {{ {target} as value{label}, count(distinct $m) as n }}\n  order {{ n desc, value asc }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         ty = node.name,
-        traversal = traversal_clause(group, Some("e")),
+        traversal = traversal_clause(group, edge),
         target = by.target(),
     );
     Ok(BuiltQuery {
@@ -1943,7 +2002,8 @@ pub fn neighbours_without(
         "query studio_neighbours_without({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n    {traversal}\n    not {{\n      $v: {other}\n      {hop}\n    }}\n  }}\n  return {{ count($m) as n }}\n}}\n",
         sig = params.signature(),
         ty = node.name,
-        traversal = traversal_clause(group, Some("e")),
+        // Unbound, the hop finds each neighbour once, however many edges reach it.
+        traversal = traversal_clause(group, None),
         other = other.name,
     );
     Ok(BuiltQuery {
@@ -2306,6 +2366,9 @@ pub fn insert_node(
     values: &[(String, Value)],
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
+    if values.is_empty() {
+        return Err(BuildError::NoValues(node.name.clone()));
+    }
     let mut params = Params::new();
     let mut assignments = Vec::new();
     for (i, (name, value)) in values.iter().enumerate() {
@@ -2428,7 +2491,9 @@ pub fn required_dependents(
     }
     let hop = edge.traversal();
     let text = format!(
-        "query studio_required_dependents({sig}) {{\n  match {{\n    $m: {from}\n    not ($m.@id in {done})\n    exists {{ $t: {to}  $m {hop} $t  $t.@id in {gone} }}\n    count {{ $o: {to}  $m {hop} $o  not ($o.@id in {gone}) }} < {least}\n  }}\n  return {{ {columns} }}\n  order {{ $m.@id asc }}\n  limit {limit}\n}}\n",
+        // The edges a source keeps are counted, each once, as the engine's `@card` check does:
+        // two edges to one kept node are two.
+        "query studio_required_dependents({sig}) {{\n  match {{\n    $m: {from}\n    not ($m.@id in {done})\n    exists {{ $t: {to}  $m {hop} $t  $t.@id in {gone} }}\n    count {{ $o: {to}  $m $x:{hop} $o  not ($o.@id in {gone}) }} < {least}\n  }}\n  return {{ {columns} }}\n  order {{ $m.@id asc }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         from = source.name,
         to = target.name,
@@ -2890,7 +2955,12 @@ mod tests {
                     )
                     .unwrap();
                     assert_compiles(&counts);
-                    assert!(counts.text.contains("$d.@id < $g.@id"), "{}", counts.text);
+                    // A row once per value, however many of its neighbours hold it.
+                    assert!(
+                        counts.text.contains("count(distinct $n) as n"),
+                        "{}",
+                        counts.text
+                    );
                     for (op, value) in [
                         (FilterOp::Eq, sample_property_value(property)),
                         (FilterOp::IsEmpty, Value::Null),
@@ -3452,6 +3522,28 @@ mod tests {
             assert_compiles(&page);
             // Each neighbour comes with the edge that relates it, which removing it names.
             assert!(page.text.contains("$e.@id as edge_id"), "{}", page.text);
+            // The pages after a neighbour, or after one edge of it, and the edges counted.
+            for after in [
+                After::Neighbour("person-000001"),
+                After::Edge {
+                    neighbour: "person-000001",
+                    edge: "e-1",
+                },
+            ] {
+                assert_compiles(
+                    &neighbours(
+                        &schema,
+                        "Person",
+                        group,
+                        "person-000000",
+                        Some(after),
+                        Narrow::default(),
+                        50,
+                    )
+                    .unwrap(),
+                );
+            }
+            assert_compiles(&edge_degree(&schema, "Person", group, "person-000000").unwrap());
         }
         for group in schema.relationships_of("Company") {
             let search = Narrow {

@@ -16,10 +16,10 @@ pub mod schema;
 
 pub use builder::{BuildError, BuiltQuery, Filter, FilterOp, PageStart, Sort, example_read};
 pub use check::{Diagnostic, QueryCheck, QueryInfo, ResultColumn, check};
-pub use complete::{Completion, CompletionKind, completions, hover};
+pub use complete::{Completion, completions, hover};
 pub use lex::{
-    Declaration, Outline, Statement, Token, TokenKind, looks_like_mutation, offset_of, outline,
-    problem_range, tokenize,
+    Declaration, Outline, Statement, Token, TokenKind, looks_like_mutation, outline, problem_range,
+    tokenize,
 };
 pub use params::param_value;
 pub use parts::{PartKind, QueryPart, operator_parts, query_parts};

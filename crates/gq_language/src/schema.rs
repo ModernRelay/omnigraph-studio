@@ -376,7 +376,6 @@ pub fn traversal_name(edge: &str) -> String {
     }
 }
 
-/// The words a query reserves, which a bare traversal may not be.
 /// GQ's reserved words, which cannot name a property or an edge bare.
 pub(crate) const RESERVED: [&str; 6] = ["and", "or", "not", "is", "null", "in"];
 

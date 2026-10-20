@@ -104,7 +104,7 @@ pub(crate) const KEYWORDS: &[&str] = &[
 ];
 
 /// Words that are keywords only inside a statement: one whose first word is `branch`, `commit`,
-/// `load`, `show` or `reset`, or `explain load`.
+/// `load` or `show`, or `explain load`.
 const STATEMENT_KEYWORDS: &[&str] = &[
     "create",
     "from",
@@ -138,12 +138,18 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Whether the only token so far is `explain`, so a `load` after it starts a statement.
-fn after_explain(tokens: &[Token], source: &str) -> bool {
-    match tokens {
-        [only] => only.kind == TokenKind::Keyword && &source[only.range.clone()] == "explain",
-        _ => false,
-    }
+/// Where the tokenizer is against a file's settings prefix: the `set …;` and `reset …;` lines
+/// and comments [`outline`] reads before the first statement. A word that starts a statement
+/// (`branch`, `show`, `commit`, `load`) does so only as the first word after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prefix {
+    /// At the first word after the prefix.
+    Start,
+    /// Inside a `set` or `reset`, to its `;`.
+    Setting,
+    /// After an `explain` that is the first word: a `load` still starts a statement.
+    Explain,
+    Past,
 }
 
 /// Splits `.gq` source into tokens. Whitespace is skipped; anything the lexer does not know is
@@ -153,6 +159,7 @@ pub fn tokenize(source: &str) -> Vec<Token> {
     let len = bytes.len();
     let mut tokens: Vec<Token> = Vec::new();
     let mut in_statement = false;
+    let mut prefix = Prefix::Start;
     let mut i = 0;
     while i < len {
         let b = bytes[i];
@@ -236,12 +243,12 @@ pub fn tokenize(source: &str) -> Vec<Token> {
             } else if b.is_ascii_uppercase() {
                 TokenKind::Type
             } else if KEYWORDS.contains(&word) {
-                if matches!(word, "branch" | "show" | "reset") && tokens.is_empty() {
+                if matches!(word, "branch" | "show") && prefix == Prefix::Start {
                     in_statement = true;
                 }
                 TokenKind::Keyword
-            } else if (word == "commit" && tokens.is_empty())
-                || (word == "load" && (tokens.is_empty() || after_explain(&tokens, source)))
+            } else if (word == "commit" && prefix == Prefix::Start)
+                || (word == "load" && matches!(prefix, Prefix::Start | Prefix::Explain))
             {
                 in_statement = true;
                 TokenKind::Keyword
@@ -253,6 +260,17 @@ pub fn tokenize(source: &str) -> Vec<Token> {
         } else {
             i += source[i..].chars().next().map_or(1, char::len_utf8);
             TokenKind::Punctuation
+        };
+        let text = &source[start..i];
+        prefix = match (prefix, kind) {
+            (_, TokenKind::Comment) => prefix,
+            (Prefix::Start, TokenKind::Keyword) if matches!(text, "set" | "reset") => {
+                Prefix::Setting
+            }
+            (Prefix::Start, TokenKind::Keyword) if text == "explain" => Prefix::Explain,
+            (Prefix::Setting, TokenKind::Punctuation) if text == ";" => Prefix::Start,
+            (Prefix::Setting, _) => Prefix::Setting,
+            _ => Prefix::Past,
         };
         tokens.push(Token {
             kind,
@@ -280,7 +298,7 @@ pub struct Outline {
     /// Settings lines and comments before the first statement or declaration.
     pub prefix: Range<usize>,
     pub declarations: Vec<Declaration>,
-    /// The source is a `branch`, `show` or `reset` statement rather than declarations.
+    /// The source is a `branch`, `commit`, `load` or `show` statement rather than declarations.
     pub statement: Option<Statement>,
 }
 
@@ -326,14 +344,7 @@ pub fn outline(source: &str) -> Outline {
             index += 1;
             continue;
         }
-        if token.kind == TokenKind::Keyword && text(token) == "set" {
-            while index < tokens.len() && text(&tokens[index]) != ";" {
-                index += 1;
-            }
-            index += 1;
-            continue;
-        }
-        if token.kind == TokenKind::Keyword && text(token) == "reset" {
+        if token.kind == TokenKind::Keyword && matches!(text(token), "set" | "reset") {
             while index < tokens.len() && text(&tokens[index]) != ";" {
                 index += 1;
             }
@@ -386,6 +397,16 @@ pub fn outline(source: &str) -> Outline {
         _ => {}
     }
 
+    // `query` and its name begin a declaration even inside one left unclosed: a missing `}`
+    // ends that one there rather than swallowing every declaration after it.
+    let declares = |at: usize| {
+        tokens
+            .get(at)
+            .is_some_and(|t| t.kind == TokenKind::Keyword && text(t) == "query")
+            && tokens
+                .get(at + 1)
+                .is_some_and(|t| t.kind == TokenKind::QueryName)
+    };
     let mut depth = 0usize;
     let mut current: Option<(usize, bool, String)> = None;
     let mut opened = false;
@@ -393,8 +414,7 @@ pub fn outline(source: &str) -> Outline {
     for (index, token) in tokens.iter().enumerate().skip(first) {
         let word = text(token);
         match token.kind {
-            TokenKind::Keyword if depth == 0 && word == "explain" => explain_pending = true,
-            TokenKind::Keyword if depth == 0 && word == "query" => {
+            TokenKind::Keyword if word == "explain" && (depth == 0 || declares(index + 1)) => {
                 if let Some((start, explained, name)) = current.take() {
                     outline.declarations.push(Declaration {
                         name,
@@ -402,6 +422,18 @@ pub fn outline(source: &str) -> Outline {
                         explained,
                     });
                 }
+                depth = 0;
+                explain_pending = true;
+            }
+            TokenKind::Keyword if word == "query" && (depth == 0 || declares(index)) => {
+                if let Some((start, explained, name)) = current.take() {
+                    outline.declarations.push(Declaration {
+                        name,
+                        range: start..token.range.start,
+                        explained,
+                    });
+                }
+                depth = 0;
                 let name = tokens
                     .get(index + 1)
                     .filter(|t| t.kind == TokenKind::QueryName)
@@ -512,24 +544,6 @@ pub fn problem_range(source: &str, byte: usize) -> Range<usize> {
             .map_or(start, |c| start - c.len_utf8());
         previous..start
     }
-}
-
-/// The byte offset of a 1-based line and column, clamped to the source.
-pub fn offset_of(source: &str, line: u32, column: u32) -> usize {
-    let mut offset = 0;
-    for (index, text) in source.split_inclusive('\n').enumerate() {
-        if index + 1 == line as usize {
-            let column = column.saturating_sub(1) as usize;
-            let line_text = text.trim_end_matches('\n');
-            let mut at = column.min(line_text.len());
-            while at > 0 && !line_text.is_char_boundary(at) {
-                at -= 1;
-            }
-            return offset + at;
-        }
-        offset += text.len();
-    }
-    source.len()
 }
 
 #[cfg(test)]
@@ -669,6 +683,21 @@ mod tests {
         let outline = outline(source);
         assert_eq!(outline.declarations[0].range, 0..source.len());
         assert_eq!(outline.declaration_at(source.len()).unwrap().name, "a");
+        // ...or to the next declaration, which it does not swallow.
+        let source = "query a() { match { $p: Person } return { $p.name
+
+            query b() { match { $p: Person } return { $p } }
+            explain query c() { match { $p: Person } return { $p } }";
+        let declarations = super::outline(source).declarations;
+        let names: Vec<&str> = declarations.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c"]);
+        assert_eq!(declarations[0].range.end, source.find("query b").unwrap());
+        assert!(declarations[2].explained);
+        let unclosed = "query a() { match {
+explain query b() { match { $p: Person } return { $p } }";
+        let declarations = super::outline(unclosed).declarations;
+        assert_eq!(declarations[0].range.end, unclosed.find("explain").unwrap());
+        assert!(declarations[1].explained);
     }
 
     #[test]
@@ -732,12 +761,21 @@ mod tests {
         assert_eq!(problem_range(source, at + 4), at + 4..at + 5);
     }
 
+    /// A statement starts at the first word after the settings prefix, as `outline` reads it:
+    /// a comment or a `set` before it leaves `branch merge-base` a statement, and a leading
+    /// `reset` (a setting) makes no statement of the queries after it.
     #[test]
-    fn line_and_column_map_to_offsets() {
-        let source = "ab\ncdé\nf";
-        assert_eq!(offset_of(source, 1, 1), 0);
-        assert_eq!(offset_of(source, 2, 2), 4);
-        assert_eq!(offset_of(source, 3, 1), source.len() - 1);
-        assert_eq!(offset_of(source, 9, 1), source.len());
+    fn statements_start_after_the_settings_prefix() {
+        let words = |source: &str, kind: TokenKind| -> Vec<String> {
+            tokenize(source)
+                .into_iter()
+                .filter(|token| token.kind == kind)
+                .map(|token| source[token.range].to_owned())
+                .collect()
+        };
+        let merge = "// first\nset engine = v2;\nbranch merge-base x into main";
+        assert!(words(merge, TokenKind::Keyword).contains(&"merge-base".to_owned()));
+        let reset = "reset engine;\nquery q() { match { $p: Person } return { $p.mode } }";
+        assert!(!words(reset, TokenKind::Keyword).contains(&"mode".to_owned()));
     }
 }

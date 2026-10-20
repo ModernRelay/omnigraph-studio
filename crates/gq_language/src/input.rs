@@ -1,9 +1,45 @@
 //! What a person typed into a cell or form field, as a property's JSON value, and back (spec
 //! 004 cell editing, spec 008 review edits). No GPUI.
 
+use std::cmp::Ordering;
+
 use serde_json::Value;
 
 use crate::schema::{Property, ScalarKind};
+
+/// How two values of a property order, as the engine compares them; `None` for values of
+/// different kinds, or not ordered.
+pub fn compare_values(a: &Value, b: &Value) -> Option<Ordering> {
+    match (a, b) {
+        // Whole numbers exactly: an I64 or U64 past 2^53 has no exact f64, so two that differ
+        // would compare equal and an edit between them would read as no change.
+        (Value::Number(a), Value::Number(b)) => match (whole(a), whole(b)) {
+            (Some(a), Some(b)) => Some(a.cmp(&b)),
+            _ => a.as_f64()?.partial_cmp(&b.as_f64()?),
+        },
+        (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
+        (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+        _ => None,
+    }
+}
+
+/// A whole number exactly, as an I64 or a U64 holds it; `None` for one with a fraction.
+fn whole(number: &serde_json::Number) -> Option<i128> {
+    number
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| number.as_u64().map(i128::from))
+}
+
+/// Whether two values of a property are the same value (`1` and `1.0` are).
+pub fn same_value(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_value(a, b))
+        }
+        _ => a == b || compare_values(a, b) == Some(Ordering::Equal),
+    }
+}
 
 /// The text an editor starts with for a value. A list is its items separated by commas, an item
 /// that holds a comma or a quote, starts or ends with a space, or is empty or `[]` quoted as in
@@ -38,8 +74,8 @@ const EMPTY_LIST: &str = "[]";
 
 /// The items of a list as typed: separated by commas, each trimmed unless quoted; a quoted item
 /// keeps its text, a doubled quote standing for one. Items left empty between commas are
-/// dropped.
-fn list_items(text: &str) -> Result<Vec<String>, String> {
+/// dropped. A cell and a list parameter read one alike.
+pub(crate) fn list_items(text: &str) -> Result<Vec<String>, String> {
     let mut items = Vec::new();
     let mut chars = text.chars().peekable();
     loop {
@@ -102,31 +138,15 @@ pub fn parse_scalar(property: &Property, text: &str) -> Result<Value, String> {
                 format!("Enter a whole number that fits in {}", property.base_type)
             }
         }),
-        ScalarKind::Float => trimmed
-            .parse::<f64>()
-            .ok()
-            .and_then(serde_json::Number::from_f64)
-            .map(Value::Number)
-            .ok_or_else(|| "Enter a number".into()),
+        ScalarKind::Float => float(&property.base_type, trimmed).map_err(|error| match error {
+            FloatError::NotANumber => "Enter a number".to_owned(),
+            FloatError::OutOfRange => format!("Enter a number that fits in {}", property.base_type),
+        }),
         ScalarKind::Bool => boolean(trimmed).ok_or_else(|| "Enter true or false".into()),
-        ScalarKind::Date => {
-            if is_date(trimmed) {
-                Ok(Value::String(trimmed.to_owned()))
-            } else {
-                Err("Enter a date as YYYY-MM-DD".into())
-            }
-        }
-        ScalarKind::DateTime => {
-            // `get`, not slicing: a wide character may straddle the tenth byte.
-            if trimmed.len() >= 16
-                && trimmed.get(..10).is_some_and(is_date)
-                && trimmed.as_bytes().get(10) == Some(&b'T')
-            {
-                Ok(Value::String(trimmed.to_owned()))
-            } else {
-                Err("Enter a date and time as YYYY-MM-DDTHH:MM:SSZ".into())
-            }
-        }
+        ScalarKind::Date if begins_a_date(trimmed) => Ok(Value::String(trimmed.to_owned())),
+        ScalarKind::Date => Err("Enter a date as YYYY-MM-DD".into()),
+        ScalarKind::DateTime if begins_a_date(trimmed) => Ok(Value::String(trimmed.to_owned())),
+        ScalarKind::DateTime => Err("Enter a date and time as YYYY-MM-DD HH:MM:SS".into()),
         ScalarKind::Vector | ScalarKind::Blob => {
             Err(format!("{} cannot be edited here", property.name))
         }
@@ -143,14 +163,18 @@ pub(crate) enum IntegerError {
 }
 
 /// A whole number in its type's range (`I32`, `I64`, `U32`, `U64`), as a cell and a query
-/// parameter both read one.
+/// parameter both read one, and as the engine takes it: its `U64` stops at `i64::MAX` for now.
 pub(crate) fn integer(base_type: &str, text: &str) -> Result<Value, IntegerError> {
     if base_type.starts_with('U') {
         if text.starts_with('-') && text.parse::<i64>().is_ok() {
             return Err(IntegerError::Negative);
         }
         let value: u64 = text.parse().map_err(|_| IntegerError::NotWhole)?;
-        if base_type == "U32" && u32::try_from(value).is_err() {
+        let fits = match base_type {
+            "U32" => u32::try_from(value).is_ok(),
+            _ => i64::try_from(value).is_ok(),
+        };
+        if !fits {
             return Err(IntegerError::OutOfRange);
         }
         return Ok(Value::from(value));
@@ -162,6 +186,34 @@ pub(crate) fn integer(base_type: &str, text: &str) -> Result<Value, IntegerError
     Ok(Value::from(value))
 }
 
+/// Why text is not a number of a float type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FloatError {
+    NotANumber,
+    /// Infinite as an `F32`, which the engine refuses.
+    OutOfRange,
+}
+
+/// A finite number of a float type (`F32`, `F64`), as a cell and a query parameter both read
+/// one: an `F32` must stay finite once narrowed.
+pub(crate) fn float(base_type: &str, text: &str) -> Result<Value, FloatError> {
+    let value: f64 = text.parse().map_err(|_| FloatError::NotANumber)?;
+    if base_type == "F32" && !(value as f32).is_finite() {
+        return Err(FloatError::OutOfRange);
+    }
+    serde_json::Number::from_f64(value)
+        .map(Value::Number)
+        .ok_or(FloatError::NotANumber)
+}
+
+/// Whether text can be a date or a time the engine reads: every spelling it takes
+/// (`2024-01-02`, `20240102`, `2024-01-02 10:00:00`, `+10000-01-01T…`) begins with a digit, or
+/// a sign and a digit. Which of those it takes is the engine's to say; a word is refused here.
+pub(crate) fn begins_a_date(text: &str) -> bool {
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    digits.starts_with(|c: char| c.is_ascii_digit())
+}
+
 /// `true`, `yes` or `1`, and `false`, `no` or `0`, in any case.
 pub(crate) fn boolean(text: &str) -> Option<Value> {
     match text.to_ascii_lowercase().as_str() {
@@ -169,19 +221,6 @@ pub(crate) fn boolean(text: &str) -> Option<Value> {
         "false" | "no" | "0" => Some(Value::Bool(false)),
         _ => None,
     }
-}
-
-pub(crate) fn is_date(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    bytes.len() == 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit())
-        && (1..=12).contains(&text[5..7].parse::<u32>().unwrap_or(0))
-        && (1..=31).contains(&text[8..10].parse::<u32>().unwrap_or(0))
 }
 
 /// Parses what someone typed into a cell or form field into the property's JSON value, as
@@ -274,15 +313,29 @@ mod tests {
     }
 
     #[test]
-    fn a_date_time_with_a_wide_character_is_refused_not_a_panic() {
+    fn values_compare_exactly() {
+        assert!(same_value(&json!(1), &json!(1.0)));
+        assert!(!same_value(&json!(["a"]), &json!(["b"])));
+        // Whole numbers past 2^53 compare exactly: an edit between two of them is a change.
+        assert!(!same_value(
+            &json!(9_007_199_254_740_993_i64),
+            &json!(9_007_199_254_740_992_i64)
+        ));
+        assert!(!same_value(&json!(u64::MAX), &json!(u64::MAX - 1)));
+    }
+
+    /// Every spelling the engine reads a time in goes to it, which refuses the rest.
+    #[test]
+    fn dates_and_times_go_as_typed() {
         let at = property(ScalarKind::DateTime, "DateTime");
-        assert_eq!(
-            parse_scalar(&at, "2024-01-02T10:00:00Z"),
-            Ok(Value::String("2024-01-02T10:00:00Z".into()))
-        );
-        // A full-width digit, as an input method types it, puts the tenth byte inside it.
-        assert!(parse_scalar(&at, "2024-01-0１T10:00:00Z").is_err());
-        assert!(parse_scalar(&at, "日付日付日付日付").is_err());
+        for typed in ["2024-01-02T10:00:00Z", "2024-01-02 10:00:00", "2024-01-02"] {
+            assert_eq!(parse_scalar(&at, typed), Ok(Value::String(typed.into())));
+        }
+        let on = property(ScalarKind::Date, "Date");
+        assert_eq!(parse_scalar(&on, " 2024-01-02 "), Ok(json!("2024-01-02")));
+        // A word is no date in any spelling.
+        assert!(parse_scalar(&on, "yesterday").is_err());
+        assert!(parse_scalar(&at, "soon").is_err());
     }
 
     /// A cell takes a whole number in its type's range, as a query parameter does.
@@ -295,10 +348,15 @@ mod tests {
             Ok(json!(3_000_000_000_i64))
         );
         assert!(parse_scalar(&of("U32"), "-1").is_err());
+        // The engine's U64 stops at i64's maximum for now.
         assert_eq!(
-            parse_scalar(&of("U64"), "18446744073709551615"),
-            Ok(json!(u64::MAX))
+            parse_scalar(&of("U64"), &i64::MAX.to_string()),
+            Ok(json!(i64::MAX))
         );
+        assert!(parse_scalar(&of("U64"), "18446744073709551615").is_err());
+        let float = |base_type: &str| property(ScalarKind::Float, base_type);
+        assert!(parse_scalar(&float("F32"), "1e39").is_err());
+        assert_eq!(parse_scalar(&float("F64"), "1e39"), Ok(json!(1e39)));
         let on = property(ScalarKind::Bool, "Bool");
         assert_eq!(parse_scalar(&on, "1"), Ok(json!(true)));
     }
