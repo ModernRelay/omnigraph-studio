@@ -229,7 +229,8 @@ pub fn tokenize(source: &str) -> Vec<Token> {
                 i += 5;
             }
             let word = &source[start..i];
-            let previous = tokens.last();
+            // The word before, a comment between them aside (`query /* … */ q(`).
+            let previous = tokens.iter().rev().find(|t| t.kind != TokenKind::Comment);
             let after_dot = previous.is_some_and(|t| {
                 t.kind == TokenKind::Punctuation && &source[t.range.clone()] == "."
             });
@@ -406,13 +407,16 @@ pub fn outline(source: &str) -> Outline {
     // ends that one there rather than swallowing every declaration after it. Inside a body,
     // `query` can be a property (`order { query asc }`), which no `(` follows.
     let declares = |at: usize| {
-        tokens
-            .get(at)
+        let mut words = tokens
+            .get(at..)
+            .unwrap_or_default()
+            .iter()
+            .filter(|t| t.kind != TokenKind::Comment);
+        words
+            .next()
             .is_some_and(|t| t.kind == TokenKind::Keyword && text(t) == "query")
-            && tokens
-                .get(at + 1)
-                .is_some_and(|t| t.kind == TokenKind::QueryName)
-            && tokens.get(at + 2).is_some_and(|t| text(t) == "(")
+            && words.next().is_some_and(|t| t.kind == TokenKind::QueryName)
+            && words.next().is_some_and(|t| text(t) == "(")
     };
     let mut depth = 0usize;
     let mut current: Option<(usize, bool, String)> = None;
@@ -441,8 +445,9 @@ pub fn outline(source: &str) -> Outline {
                     });
                 }
                 depth = 0;
-                let name = tokens
-                    .get(index + 1)
+                let name = tokens[index + 1..]
+                    .iter()
+                    .find(|t| t.kind != TokenKind::Comment)
                     .filter(|t| t.kind == TokenKind::QueryName)
                     .map(|t| text(t).to_owned())
                     .unwrap_or_default();
@@ -704,9 +709,16 @@ mod tests {
         let declarations = super::outline(unclosed).declarations;
         assert_eq!(declarations[0].range.end, unclosed.find("explain").unwrap());
         assert!(declarations[1].explained);
-        // A property named `query` is no declaration.
+        // A property named `query` is no declaration; a comment does not hide one.
         let ordered = "query a() { match { $s: Search } return { $s.query } order { query asc }";
         assert_eq!(super::outline(ordered).declarations.len(), 1);
+        let commented = "query a() { match {\nquery /* the next */ b() { match { $p: Person } }";
+        let names: Vec<String> = super::outline(commented)
+            .declarations
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(names, ["a", "b"]);
     }
 
     #[test]

@@ -1019,14 +1019,25 @@ pub fn node_by_id(
     })
 }
 
-/// Nodes of one type by `@id`, in one read: a row each, as [`node_by_id`] gives one, for those
-/// that exist.
-pub fn nodes_by_id(
+/// Nodes of one type by `@id`, in one read, with only `properties`: a row for each that exists,
+/// its `id` and each property in its [`field_column`]. A bulk edit compares the values it was
+/// read at without the nodes' other properties.
+pub fn nodes_fields_by_id(
     schema: &SchemaModel,
     type_name: &str,
     ids: &[String],
+    properties: &[String],
 ) -> Result<BuiltQuery, BuildError> {
     let node = node(schema, type_name)?;
+    let mut columns = vec!["$n.@id as id".to_owned()];
+    for name in properties {
+        let property = property(node, name)?;
+        columns.push(format!(
+            "$n.{} as {}",
+            property.name,
+            field_column(&property.name)
+        ));
+    }
     let depends = Depends::Types {
         nodes: vec![node.name.clone()],
         edges: Vec::new(),
@@ -1034,13 +1045,14 @@ pub fn nodes_by_id(
     let mut params = Params::new();
     let wanted = params.add("ids", "[String]", Value::from(ids.to_vec()));
     let text = format!(
-        "query studio_nodes({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id in {wanted}\n  }}\n  return {{ $n }}\n  limit {limit}\n}}\n",
+        "query studio_nodes_fields({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id in {wanted}\n  }}\n  return {{ {columns} }}\n  limit {limit}\n}}\n",
         sig = params.signature(),
         ty = node.name,
+        columns = columns.join(", "),
         limit = ids.len().max(1),
     );
     Ok(BuiltQuery {
-        name: "studio_nodes".into(),
+        name: "studio_nodes_fields".into(),
         text,
         params: params.values,
         depends,
@@ -3359,10 +3371,12 @@ mod tests {
         assert_compiles(&query);
         assert_eq!(query.params["id"], json!("person-000000"));
         let ids = ["person-000000".to_owned(), "person-000001".to_owned()];
-        let query = nodes_by_id(&schema, "Person", &ids).unwrap();
+        let query = nodes_fields_by_id(&schema, "Person", &ids, &["name".to_owned()]).unwrap();
         assert_compiles(&query);
         assert_eq!(query.params["ids"], json!(ids));
+        assert!(query.text.contains("$n.name as v_name"), "{}", query.text);
         assert!(query.text.contains("limit 2"), "{}", query.text);
+        assert!(nodes_fields_by_id(&schema, "Person", &ids, &["nope".to_owned()]).is_err());
     }
 
     #[test]
