@@ -1,6 +1,7 @@
 //! One commit's changes against its first parent (spec 009), with the same entity cards as the
 //! review. Shown in History's detail split, or as its own tab through `OpenCommit`.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use change_cards::{CardLines, CardRows};
@@ -450,22 +451,10 @@ impl CommitView {
 
     /// Opens the graph as it was at this commit, read-only: a type's table, or a query (spec
     /// 009).
-    fn render_open_at(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_open_at(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         let commit = self.commit_id.clone();
-        // The types changed in this commit first, then the rest of the schema.
-        let mut types: Vec<String> = self.counts.iter().map(|c| c.type_name.clone()).collect();
-        if let Some(schema) = self.session.read(cx).schema_model() {
-            for name in schema
-                .nodes
-                .iter()
-                .map(|n| &n.name)
-                .chain(schema.edges.iter().map(|e| &e.name))
-            {
-                if !types.contains(name) {
-                    types.push(name.clone());
-                }
-            }
-        }
+        let changed: Vec<String> = self.counts.iter().map(|c| c.type_name.clone()).collect();
+        let session = self.session.clone();
         let table_commit = commit.clone();
         h_flex()
             .gap(px(studio_ui::ds::space::XS))
@@ -480,7 +469,22 @@ impl CommitView {
                             )),
                     )
                     .menu(move |window, cx| {
-                        let types = types.clone();
+                        // The types changed in this commit first, then the rest of the schema,
+                        // listed as the menu opens.
+                        let mut types = changed.clone();
+                        let mut listed: HashSet<String> = types.iter().cloned().collect();
+                        if let Some(schema) = session.read(cx).schema_model() {
+                            for name in schema
+                                .nodes
+                                .iter()
+                                .map(|n| &n.name)
+                                .chain(schema.edges.iter().map(|e| &e.name))
+                            {
+                                if listed.insert(name.clone()) {
+                                    types.push(name.clone());
+                                }
+                            }
+                        }
                         let commit = table_commit.clone();
                         Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                             for name in types {

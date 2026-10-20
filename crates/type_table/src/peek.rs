@@ -383,7 +383,7 @@ impl NodePeek {
                 this.compare_head(cx);
             }
         });
-        cx.on_release(|this: &mut Self, cx| this.release_images(cx))
+        cx.on_release(|this: &mut Self, cx| this.release(cx))
             .detach();
         let branch = session.read(cx).branch.clone();
         let scope = session.update(cx, |session, _| session.read_scope(&branch));
@@ -652,6 +652,32 @@ impl NodePeek {
     }
 
     /// Frees the images this peek decoded; GPUI would keep them otherwise.
+    /// The peek goes, as when the table's cursor moves on: what its open fields hold is kept
+    /// as drafts on its branch, a refused field's too, and a Blob being saved to a file still
+    /// lands there.
+    fn release(&mut self, cx: &mut App) {
+        self.release_images(cx);
+        for slot in &mut self.blobs {
+            if let Some(save) = slot._save.take() {
+                save.detach();
+            }
+        }
+        for (name, edit) in std::mem::take(&mut self.edits) {
+            let text = edit.editor.read(cx).text(cx);
+            let unchanged =
+                parse_input(&edit.property, &text).is_ok_and(|value| same_value(&value, &edit.old));
+            if let Some(key) = self.draft_key(&name).filter(|_| !unchanged) {
+                let entry = DraftEntry {
+                    old: edit.old,
+                    text,
+                };
+                self.session.update(cx, |session, cx| {
+                    session.set_draft_on(&self.branch, key, entry, cx)
+                });
+            }
+        }
+    }
+
     fn release_images(&self, cx: &mut App) {
         for slot in &self.blobs {
             if let Loadable::Loaded(Preview::Image(image)) = &slot.preview {
@@ -1500,11 +1526,20 @@ impl NodePeek {
         let PeekSubject::Node { type_name, id } = self.subject.clone() else {
             return;
         };
-        let typed = self
-            .edits
-            .remove(name)
-            .map(|edit| edit.editor.read(cx).text(cx))
-            .or_else(|| self.draft_of(name, cx).map(|draft| draft.text));
+        // A changed field is kept as a draft first: an editor of the property already open only
+        // comes forward, and one whose read fails holds the text where nothing shows it.
+        let typed = match self.edits.remove(name) {
+            Some(edit) => {
+                let text = edit.editor.read(cx).text(cx);
+                let unchanged = parse_input(&edit.property, &text)
+                    .is_ok_and(|value| same_value(&value, &edit.old));
+                if !unchanged {
+                    self.put_draft(name, edit.old, text.clone(), cx);
+                }
+                Some(text)
+            }
+            None => self.draft_of(name, cx).map(|draft| draft.text),
+        };
         window.dispatch_action(
             Box::new(studio_actions::graph::OpenTextEditor {
                 type_name,
@@ -2084,6 +2119,11 @@ impl NodePeek {
         };
         let mut cells = Vec::new();
         for (name, draft) in self.node_drafts(cx) {
+            // A field's own save under way keeps its draft until it lands; sent again, the two
+            // writes would race on one value.
+            if self.saving.contains(&name) {
+                continue;
+            }
             let Some(property) = schema
                 .node(&type_name)
                 .and_then(|node| node.property(&name))
@@ -4479,7 +4519,8 @@ mod tests {
     #[gpui::test]
     async fn a_refused_field_opens_again_with_its_text_and_reason(cx: &mut TestAppContext) {
         let refused = json!({ "error": "policy denied", "code": "forbidden" });
-        let (view, cx) = page(session_answering(PEOPLE, 403, refused, cx), cx);
+        let session = session_answering(PEOPLE, 403, refused, cx);
+        let (view, cx) = page(session.clone(), cx);
         edit_name(&view, "Ada Lovelace", cx);
         view.read_with(cx, |view, cx| {
             assert_eq!(view.value_of("name"), json!("Ada"), "nothing was written");
@@ -4487,5 +4528,20 @@ mod tests {
             assert_eq!(edit.editor.read(cx).text(cx), "Ada Lovelace");
             assert_eq!(edit.notice.as_ref().map(|n| n.tone), Some(Tone::Refused));
         });
+
+        // The peek goes (the table's cursor moved on): the text it held is kept as a draft.
+        drop(view);
+        cx.update(|window, _| window.remove_window());
+        cx.run_until_parked();
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        let draft = session.read_with(cx, |session, _| session.draft(&key).cloned());
+        assert_eq!(
+            draft.map(|draft| draft.text).as_deref(),
+            Some("Ada Lovelace")
+        );
     }
 }

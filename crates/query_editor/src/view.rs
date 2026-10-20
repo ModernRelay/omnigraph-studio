@@ -911,9 +911,13 @@ impl QueryEditor {
             cx.notify();
         }
         if self.saved_text.is_some() {
-            // The tab's changed-since-saved dot follows the text.
+            // The tab's changed-since-saved dot follows the text: the tab and the window
+            // around it draw again when it comes or goes, not at every key.
+            let was = self.unsaved;
             self.sync_unsaved(cx);
-            cx.emit(ItemEvent::UpdateTab);
+            if self.unsaved != was {
+                cx.emit(ItemEvent::UpdateTab);
+            }
         }
         self.schedule_check(window, cx);
         self.cursor_moved(window, cx);
@@ -1469,6 +1473,9 @@ impl QueryEditor {
         if self.writing {
             return;
         }
+        // A read still out from an earlier run would land over what this one shows; a read
+        // this one sends replaces it.
+        self.run_task = None;
         match self.prepare(false, cx) {
             Err(message) => self.output = Output::Failed(Failure::new(message)),
             Ok(prepared) if prepared.write && self.at_commit.is_some() => {
@@ -1482,6 +1489,10 @@ impl QueryEditor {
                 )));
             }
             Ok(prepared) if prepared.write => {
+                // A read stopped for it says nothing more.
+                if matches!(self.output, Output::Running { .. }) {
+                    self.output = Output::Empty;
+                }
                 // Never on ⌘↵ alone: the person confirms the branch first.
                 let branch = self.branch(cx);
                 self.pending_write = Some(PendingWrite { prepared, branch });
@@ -1502,6 +1513,7 @@ impl QueryEditor {
         if self.writing {
             return;
         }
+        self.run_task = None;
         match self.prepare(true, cx) {
             Err(message) => self.output = Output::Failed(Failure::new(message)),
             Ok(prepared) => self.send_read(prepared, cx),

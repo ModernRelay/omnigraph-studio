@@ -113,13 +113,19 @@ impl TextEditor {
             // it differs from the saved value.
             cx.subscribe_in(&editor, window, |this, _, event: &EditorEvent, _, cx| {
                 if let EditorEvent::BufferEdited = event {
+                    let was = this.unsaved;
                     this.unsaved = this.differs(cx);
                     this.preview_later(cx);
-                    if matches!(this.state, State::Saved) {
+                    let saved = matches!(this.state, State::Saved);
+                    if saved {
                         this.state = State::Idle;
                     }
-                    cx.emit(ItemEvent::UpdateTab);
-                    cx.notify();
+                    // The tab and the window around it draw again when the dot or the state
+                    // changes, not at every key: the editor draws its own text.
+                    if saved || this.unsaved != was {
+                        cx.emit(ItemEvent::UpdateTab);
+                        cx.notify();
+                    }
                 }
             }),
         ];

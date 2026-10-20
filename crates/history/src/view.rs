@@ -12,7 +12,7 @@ use gpui::{
     Task, UniformListScrollHandle, Window, canvas, point, px, uniform_list,
 };
 use graph_client::api::CommitOutput;
-use graph_store::{GraphSession, SessionEvent};
+use graph_store::{GraphSession, HeadWatch, SessionEvent};
 use studio_actions::graph::OpenCommit;
 use studio_actions::history::{NextMatch, PreviousMatch};
 use studio_ui::menu::ContextMenu;
@@ -89,6 +89,9 @@ pub struct HistoryView {
     _detail_subscription: Option<Subscription>,
     _search_subscription: Subscription,
     _session_subscription: Option<Subscription>,
+    /// A tab's own branch asked after while it is open, so another writer's commits to it
+    /// arrive; the panel's is the session's, always asked after.
+    _head_watch: Option<HeadWatch>,
 }
 
 impl EventEmitter<ItemEvent> for HistoryView {}
@@ -132,6 +135,8 @@ impl HistoryView {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self::build(session.clone(), branch, false, window, cx);
+        view._head_watch =
+            Some(session.update(cx, |session, cx| session.watch_head(&view.branch, cx)));
         // Its own branch's commits, and the other branches whose heads and merges it shows: a
         // tab restored before the branch list was read draws them once it is.
         view._session_subscription =
@@ -195,6 +200,7 @@ impl HistoryView {
             match_at: None,
             _search_subscription: search_subscription,
             _session_subscription: None,
+            _head_watch: None,
             focus_handle: cx.focus_handle(),
             state: State::Loading,
             commits: Vec::new(),
