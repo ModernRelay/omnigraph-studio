@@ -12,6 +12,7 @@ use futures::channel::oneshot;
 use futures::future::{Either, WeakShared, select};
 use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 use gq_language::builder::{Depends, Seeds};
+use gq_language::input::same_value;
 use gq_language::{BuiltQuery, RelationshipGroup, SchemaModel, builder};
 use graph_client::api::{
     BranchCreateOutput, BranchCreateRequest, BranchMergeOutput, BranchMergeRequest,
@@ -1244,7 +1245,7 @@ impl GraphSession {
 
     /// The unsaved value of one property on the session's branch.
     pub fn draft(&self, key: &DraftKey) -> Option<&DraftEntry> {
-        self.drafts.get(&self.branch)?.get(key)
+        self.draft_on(&self.branch, key)
     }
 
     /// Every unsaved value on the session's branch, by type, id and property.
@@ -1255,6 +1256,46 @@ impl GraphSession {
     /// Every unsaved value on `branch`.
     pub fn drafts_on(&self, branch: &str) -> impl Iterator<Item = (&DraftKey, &DraftEntry)> {
         self.drafts.get(branch).into_iter().flatten()
+    }
+
+    /// The unsaved value of one property on `branch`.
+    pub fn draft_on(&self, branch: &str, key: &DraftKey) -> Option<&DraftEntry> {
+        self.drafts.get(branch)?.get(key)
+    }
+
+    /// Whether a property's draft on `branch` is still `sent`, what the session held when a
+    /// write or read went out with it: bound to the same value, with the same text, or still
+    /// none.
+    pub fn draft_as_sent(&self, branch: &str, key: &DraftKey, sent: Option<&DraftEntry>) -> bool {
+        match (self.draft_on(branch, key), sent) {
+            (None, None) => true,
+            (Some(held), Some(sent)) => same_value(&held.old, &sent.old) && held.text == sent.text,
+            _ => false,
+        }
+    }
+
+    /// Settles a property's draft on `branch` once the write or read it waited on is in: `keep`
+    /// replaces it, or `None` lets it go, unless the draft is no longer `sent`
+    /// ([`Self::draft_as_sent`]). A draft retyped, rebound or let go elsewhere meanwhile (in a
+    /// table cell, on a node's page) stands. Whether it was settled.
+    pub fn settle_draft_on(
+        &mut self,
+        branch: &str,
+        key: DraftKey,
+        sent: Option<&DraftEntry>,
+        keep: Option<DraftEntry>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let as_sent = self.draft_as_sent(branch, &key, sent);
+        if as_sent {
+            match keep {
+                Some(entry) => self.set_draft_on(branch, key, entry, cx),
+                None => {
+                    self.remove_draft_on(branch, &key, cx);
+                }
+            }
+        }
+        as_sent
     }
 
     /// Keeps a property's unsaved value on the session's branch, replacing the one there.
@@ -3598,8 +3639,28 @@ mod tests {
             assert_eq!(session.drafts().count(), 0);
             session.set_branch("main".into(), cx);
             assert_eq!(session.draft(&key), Some(&entry), "it waited");
-            assert_eq!(session.remove_draft(&key, cx), Some(entry));
+            assert_eq!(session.remove_draft(&key, cx), Some(entry.clone()));
             assert_eq!(session.drafts().count(), 0);
+        });
+
+        // A write or read settles a draft only while it is as it went out: one retyped, or let
+        // go, meanwhile stands.
+        let retyped = DraftEntry {
+            old: Value::from("Ada"),
+            text: "Ada King".into(),
+        };
+        session.update(cx, |session, cx| {
+            assert!(session.settle_draft_on("main", key.clone(), None, Some(entry.clone()), cx));
+            assert_eq!(session.draft(&key), Some(&entry), "kept as it went out");
+            session.set_draft(key.clone(), retyped.clone(), cx);
+            assert!(!session.settle_draft_on("main", key.clone(), Some(&entry), None, cx));
+            assert_eq!(session.draft(&key), Some(&retyped), "retyped meanwhile");
+            assert!(session.settle_draft_on("main", key.clone(), Some(&retyped), None, cx));
+            assert_eq!(session.draft(&key), None, "let go as it went out");
+            let kept = Some(retyped.clone());
+            assert!(!session.settle_draft_on("main", key.clone(), Some(&entry), kept, cx));
+            assert_eq!(session.draft(&key), None, "let go meanwhile");
+            assert_eq!(session.draft_on("fix", &key), None);
         });
     }
 
