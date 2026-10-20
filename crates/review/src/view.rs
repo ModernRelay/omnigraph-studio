@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use change_cards::CardRows;
+use change_cards::{CardLines, CardRows};
 use editor::{Editor, EditorEvent};
 use gpui::{
     AnyElement, App, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
@@ -267,9 +267,8 @@ pub struct ReviewView {
     /// Names of the nodes the review knows only by id, read at the reviewed head after it
     /// loads; until then, and for a node without a name, its id shows.
     names: NodeNames,
-    /// Cards showing every relationship line, by entity `(type, id)`; the others show
-    /// [`change_cards::CARD_LINES`].
-    open_cards: HashSet<(String, String)>,
+    /// How many relationship lines each card shows.
+    card_lines: CardLines,
     list_state: ListState,
     /// The head fixes and the merge bind to: the reviewed head, then each fix's own commit.
     bound_head: Option<String>,
@@ -405,7 +404,7 @@ impl ReviewView {
             headers: Vec::new(),
             selected: None,
             names: NodeNames::default(),
-            open_cards: HashSet::new(),
+            card_lines: CardLines::default(),
             list_state: ListState::new(0, ListAlignment::Top, px(800.)),
             bound_head: None,
             summary: String::new(),
@@ -1977,14 +1976,13 @@ impl ReviewView {
             );
         }
 
-        // A card of many relationships shows its first few until opened, and opens by itself
-        // for a relationship selected below them (from a mirror, or a change of a fix). Only the
-        // lines it shows are made.
+        // A card of many relationships shows its first few and more as they are asked for, and
+        // grows by itself through a relationship selected below them (from a mirror, or a
+        // change of a fix). Only the lines it shows are made.
         let card_key = (group.type_name.clone(), group.id.clone());
         let total = data.groups.line_count(ix);
         let selected_at = self.selected.and_then(|s| data.groups.line_of(ix, s));
-        let shown =
-            change_cards::lines_shown(total, self.open_cards.contains(&card_key), selected_at);
+        let shown = self.card_lines.shown(&card_key, total, selected_at);
         let left_out = total - shown;
         let card_lines = data
             .groups
@@ -2067,7 +2065,7 @@ impl ReviewView {
                 )
                 .style(ButtonStyle::Subtle)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.open_cards.insert(card_key.clone());
+                    this.card_lines.show_more(card_key.clone(), shown);
                     cx.notify();
                 })),
             );

@@ -22,17 +22,37 @@ use studio_ui::{
 };
 use ui::prelude::*;
 
-/// Relationship lines a card shows until it is opened: a node that gained hundreds of
+/// Relationship lines a card shows until more are asked for: a node that gained hundreds of
 /// relationships stays one readable card, and one row its list lays out quickly.
 pub const CARD_LINES: usize = 20;
 
-/// How many of a card's `total` relationship lines show: all once the card is opened or when
-/// the selected one (`selected_at`) is past the first [`CARD_LINES`], else at most those.
-pub fn lines_shown(total: usize, open: bool, selected_at: Option<usize>) -> usize {
-    if open || selected_at.is_some_and(|at| at >= CARD_LINES) {
-        total
-    } else {
-        total.min(CARD_LINES)
+/// Relationship lines a card adds each time more are asked for. A card is one row of its
+/// list, laid out whole at every frame, so it grows by this many rather than to every line.
+pub const MORE_LINES: usize = 200;
+
+/// How many relationship lines each card shows, by entity `(type, id)`: [`CARD_LINES`] until
+/// more are asked for, then [`MORE_LINES`] more each time.
+#[derive(Default)]
+pub struct CardLines(HashMap<(String, String), usize>);
+
+impl CardLines {
+    /// How many of `card`'s `total` lines show: those asked for, and every line through the
+    /// selected one (`selected_at`).
+    pub fn shown(
+        &self,
+        card: &(String, String),
+        total: usize,
+        selected_at: Option<usize>,
+    ) -> usize {
+        let asked = self.0.get(card).copied().unwrap_or(CARD_LINES);
+        let through_selected = selected_at.map_or(0, |at| at + 1);
+        total.min(asked.max(through_selected))
+    }
+
+    /// Shows [`MORE_LINES`] more of `card`'s lines, past those it shows now (`shown`).
+    pub fn show_more(&mut self, card: (String, String), shown: usize) {
+        let asked = self.0.entry(card).or_insert(CARD_LINES);
+        *asked = (*asked).max(shown) + MORE_LINES;
     }
 }
 
@@ -54,11 +74,15 @@ impl CardRows {
     }
 }
 
-/// What the button below a card's first lines says.
+/// What the button below a card's lines says, with `left_out` of them not shown.
 pub fn more_lines_label(left_out: usize) -> String {
     match left_out {
         1 => "Show 1 more relationship".to_owned(),
-        n => format!("Show {} more relationships", group_digits(n)),
+        n if n <= MORE_LINES => format!("Show {} more relationships", group_digits(n)),
+        n => format!(
+            "Show {MORE_LINES} more of the {} relationships not shown",
+            group_digits(n)
+        ),
     }
 }
 
@@ -211,17 +235,30 @@ fn property_rows(change: &FoldedChange, schema: Option<&SchemaModel>) -> Vec<Pro
 mod tests {
     use super::*;
 
-    /// A card of many relationships shows its first few until opened, or until the one selected
-    /// is past them.
+    /// A card of many relationships shows its first few, more each time they are asked for,
+    /// and always every line through the one selected.
     #[test]
-    fn a_card_shows_its_first_relationships_until_opened() {
-        assert_eq!(lines_shown(5, false, None), 5);
-        assert_eq!(lines_shown(400, false, None), CARD_LINES);
-        assert_eq!(lines_shown(400, false, Some(3)), CARD_LINES);
-        assert_eq!(lines_shown(400, false, Some(CARD_LINES)), 400);
-        assert_eq!(lines_shown(400, true, None), 400);
+    fn a_card_shows_its_first_relationships_and_more_when_asked() {
+        let mut lines = CardLines::default();
+        let card = ("Person".to_owned(), "ada".to_owned());
+        assert_eq!(lines.shown(&card, 5, None), 5);
+        assert_eq!(lines.shown(&card, 1_400, None), CARD_LINES);
+        assert_eq!(lines.shown(&card, 1_400, Some(3)), CARD_LINES);
+        assert_eq!(lines.shown(&card, 1_400, Some(CARD_LINES)), CARD_LINES + 1);
+        lines.show_more(card.clone(), CARD_LINES);
+        assert_eq!(lines.shown(&card, 1_400, None), CARD_LINES + MORE_LINES);
+        // Asked for while the selection showed more: more past those.
+        lines.show_more(card.clone(), 600);
+        assert_eq!(lines.shown(&card, 1_400, None), 600 + MORE_LINES);
+        assert_eq!(lines.shown(&card, 700, None), 700);
+        let other = ("Person".to_owned(), "grace".to_owned());
+        assert_eq!(lines.shown(&other, 1_400, None), CARD_LINES);
         assert_eq!(more_lines_label(1), "Show 1 more relationship");
-        assert_eq!(more_lines_label(1_380), "Show 1,380 more relationships");
+        assert_eq!(more_lines_label(150), "Show 150 more relationships");
+        assert_eq!(
+            more_lines_label(1_380),
+            "Show 200 more of the 1,380 relationships not shown"
+        );
     }
 
     /// A change's rows are made the first time they are asked for and shared after.

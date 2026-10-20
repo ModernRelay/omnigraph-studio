@@ -1,10 +1,9 @@
 //! One commit's changes against its first parent (spec 009), with the same entity cards as the
 //! review. Shown in History's detail split, or as its own tab through `OpenCommit`.
 
-use std::collections::HashSet;
 use std::time::Duration;
 
-use change_cards::CardRows;
+use change_cards::{CardLines, CardRows};
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
     ListState, Render, SharedString, Task, Window, list,
@@ -69,9 +68,8 @@ pub struct CommitView {
     runs: Vec<GroupRun>,
     /// Names of the nodes known here only by id, read at the commit.
     names: NodeNames,
-    /// Cards showing every relationship line, by entity `(type, id)`; the others show
-    /// [`change_cards::CARD_LINES`].
-    open_cards: HashSet<(String, String)>,
+    /// How many relationship lines each card shows.
+    card_lines: CardLines,
     _names_task: Option<Task<()>>,
     counts: Vec<TypeCounts>,
     rows: Vec<Row>,
@@ -168,7 +166,7 @@ impl CommitView {
             card_rows: CardRows::default(),
             runs: Vec::new(),
             names: NodeNames::default(),
-            open_cards: HashSet::new(),
+            card_lines: CardLines::default(),
             _names_task: None,
             counts: Vec::new(),
             rows: Vec::new(),
@@ -551,8 +549,7 @@ impl CommitView {
                 let group = &self.groups.groups[ix];
                 let card_key = (group.type_name.clone(), group.id.clone());
                 let total = self.groups.line_count(ix);
-                let shown =
-                    change_cards::lines_shown(total, self.open_cards.contains(&card_key), None);
+                let shown = self.card_lines.shown(&card_key, total, None);
                 let left_out = total - shown;
                 // Only the lines the card shows are made.
                 let card_lines = self
@@ -582,7 +579,7 @@ impl CommitView {
                         )
                         .style(ButtonStyle::Subtle)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_cards.insert(card_key.clone());
+                            this.card_lines.show_more(card_key.clone(), shown);
                             cx.notify();
                         })),
                     );
