@@ -36,6 +36,7 @@ every surface and nothing drifts. This refuses, outside the design system and te
   `ds::inline_icon_button`), whose size gives the icon its size;
 - a border wider than a hairline written as a GPUI utility (`.border_l_2()`): views take
   `ds::size::ACCENT_LINE` or `DRAG_LINE`;
+- a turning icon (`.with_rotate_animation(..)`): work under way is `ds::spinner()`;
 - any icon or type size named in a view (`IconSize::XSmall`, `LabelSize::Small`,
   `ui::TextSize::Small.rems(cx)`, `.text_ui_sm(cx)`): icons take `ds::icon::lead` or `meta`,
   labels a `ds::text` role, and other text `ds::text::plain_size`, `body_size` or
@@ -89,6 +90,7 @@ RULES = [
     ("button size outside a ds role", re.compile(r"\bButtonSize::[A-Z]|\.icon_size\(")),
     ("icon size outside ds::icon", re.compile(r"\bIconSize::[A-Z]")),
     ("border wider than a hairline", re.compile(r"\.border_([tblrxy]_)?([2-9]|[1-9][0-9])\(\)")),
+    ("spinner outside ds::spinner", re.compile(r"\.with_rotate_animation\(")),
     ("type size outside ds::text",
      re.compile(r"\b(TextSize|LabelSize)::[A-Z]|\.text_ui(_xs|_sm|_lg)?\(")),
 ]

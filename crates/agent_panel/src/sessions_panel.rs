@@ -25,7 +25,7 @@ use studio_ui::ds::Prose as _;
 use studio_ui::menu::ContextMenu;
 use studio_workspace::{ToastKind, Workspace};
 use ui::prelude::*;
-use ui::{CommonAnimationExt as _, Indicator, PopoverMenu, Tooltip, right_click_menu};
+use ui::{Indicator, PopoverMenu, Tooltip, right_click_menu};
 
 use crate::connection::{self, AgentConnection};
 use crate::host::AgentLaunch;
@@ -422,13 +422,7 @@ fn conversation_row(
 ) -> ds::SidebarRow {
     let id = record.session.clone();
     let (end, state_text): (AnyElement, Option<&str>) = match state {
-        RowState::Running => (
-            studio_ui::ds::icon::meta(IconName::LoadCircle)
-                .color(Color::Accent)
-                .with_rotate_animation(2)
-                .into_any_element(),
-            Some("Running"),
-        ),
+        RowState::Running => (studio_ui::ds::spinner().into_any_element(), Some("Running")),
         RowState::Waiting => (
             studio_ui::ds::icon::meta(IconName::Warning)
                 .color(Color::Warning)

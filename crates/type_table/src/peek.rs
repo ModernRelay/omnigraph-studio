@@ -2335,7 +2335,7 @@ impl NodePeek {
                 return studio_ui::ds::text::muted("Reading…").into_any_element();
             }
         };
-        let hover = studio_ui::ds::surface::highlight(cx);
+        let hover = studio_ui::ds::surface::hover(cx);
         let properties = self
             .schema
             .as_deref()
@@ -2748,7 +2748,7 @@ impl NodePeek {
 
     /// The row the groups with no neighbours fold into, with how many; a click shows them.
     fn render_empty_row(&self, cx: &mut Context<Self>) -> AnyElement {
-        let hover = studio_ui::ds::surface::highlight(cx);
+        let hover = studio_ui::ds::surface::hover(cx);
         let folded = (0..self.groups.len())
             .filter(|&index| self.place(index) == Place::Folded)
             .count();
@@ -2784,7 +2784,7 @@ impl NodePeek {
     /// One relationship group: its header (direction, name, the other type, "+", the count),
     /// then an open search, its notice and, when open, its neighbours.
     fn render_group(&self, index: usize, cx: &mut Context<Self>) -> Div {
-        let hover = studio_ui::ds::surface::highlight(cx);
+        let hover = studio_ui::ds::surface::hover(cx);
         let group = &self.groups[index];
         let icon = match group.group.direction {
             Direction::Outgoing => IconName::ArrowRight,
@@ -3020,7 +3020,7 @@ impl NodePeek {
     }
 
     fn render_neighbours(&self, index: usize, group: &Group, cx: &mut Context<Self>) -> AnyElement {
-        let hover = studio_ui::ds::surface::highlight(cx);
+        let hover = studio_ui::ds::surface::hover(cx);
         match &group.neighbours {
             Loadable::Loaded(neighbours) if neighbours.is_empty() => div()
                 .pl(px(CHILD_INDENT))
@@ -3139,7 +3139,7 @@ impl NodePeek {
             return None;
         };
         let values = self.values.loaded()?;
-        let hover = studio_ui::ds::surface::highlight(cx);
+        let hover = studio_ui::ds::surface::hover(cx);
         let at_commit = self.held_commit();
         let endpoint = |label: &'static str, ty: &String, key: &str| {
             let id = values.get(key).and_then(Value::as_str)?.to_owned();

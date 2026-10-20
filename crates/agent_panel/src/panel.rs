@@ -29,10 +29,7 @@ use studio_ui::ds::{Dotted as _, Prose as _};
 use studio_ui::menu::ContextMenu;
 use studio_workspace::{Item, ItemEvent, SavedItem, Workspace};
 use ui::prelude::*;
-use ui::{
-    CircularProgress, CommonAnimationExt as _, Indicator, KeyBinding, PopoverMenu, Severity,
-    Tooltip,
-};
+use ui::{CircularProgress, Indicator, KeyBinding, PopoverMenu, Severity, Tooltip};
 
 use crate::cli_home::{self, CliHome};
 use crate::gateway::{Gateway, GatewayEvent, OnOutcome, Seen};
@@ -663,7 +660,11 @@ impl AgentPanel {
         });
         let custom_command = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
-            editor.set_placeholder_text("program and arguments, e.g. my-agent --acp", window, cx);
+            editor.set_placeholder_text(
+                "Program and arguments, for example my-agent --acp",
+                window,
+                cx,
+            );
             editor
         });
         cx.observe_global::<StudioSettings>(|this, cx| {
@@ -2630,9 +2631,7 @@ impl AgentPanel {
                 h_flex()
                     .gap(px(ds::space::XS))
                     .items_center()
-                    .child(
-                        studio_ui::ds::icon::meta(IconName::ArrowCircle).with_rotate_animation(2),
-                    )
+                    .child(studio_ui::ds::spinner())
                     .child(ds::text::meta("Working"))
                     .into_any_element(),
             );
@@ -3127,9 +3126,7 @@ impl AgentPanel {
                 row.child(studio_ui::ds::text::error("· failed"))
             })
             .child(if running {
-                studio_ui::ds::icon::meta(IconName::ArrowCircle)
-                    .with_rotate_animation(2)
-                    .into_any_element()
+                studio_ui::ds::spinner().into_any_element()
             } else {
                 studio_ui::ds::icon::meta(if folded {
                     IconName::ChevronRight
@@ -3209,9 +3206,7 @@ impl AgentPanel {
                 row.child(studio_ui::ds::text::error(format!("· {failed} failed")))
             })
             .child(if running {
-                studio_ui::ds::icon::meta(IconName::ArrowCircle)
-                    .with_rotate_animation(2)
-                    .into_any_element()
+                studio_ui::ds::spinner().into_any_element()
             } else {
                 studio_ui::ds::icon::meta(if expanded {
                     IconName::ChevronDown
@@ -3283,12 +3278,7 @@ impl AgentPanel {
                         .single_line()
                         .truncate(),
                     )
-                    .when(running, |row| {
-                        row.child(
-                            studio_ui::ds::icon::meta(IconName::ArrowCircle)
-                                .with_rotate_animation(2),
-                        )
-                    })
+                    .when(running, |row| row.child(studio_ui::ds::spinner()))
                     .into_any_element()
             }
             _ => div().into_any_element(),
@@ -3429,40 +3419,43 @@ impl AgentPanel {
                         })),
                 ),
             state => {
-                let (icon, color, label, tooltip): (IconName, Color, String, Option<String>) =
-                    match state {
-                        ProposalState::Running => {
-                            (IconName::ArrowCircle, Color::Accent, "Running".into(), None)
-                        }
-                        ProposalState::Committed {
-                            commit,
-                            nodes,
-                            edges,
-                        } => (
-                            IconName::Check,
-                            Color::Success,
-                            "Committed".into(),
-                            Some(format!(
-                                "Commit {commit}: {nodes} nodes and {edges} edges changed"
-                            )),
-                        ),
-                        ProposalState::Refused(message) => (
-                            IconName::XCircle,
-                            Color::Error,
-                            "Refused".into(),
-                            Some(message.clone()),
-                        ),
-                        ProposalState::Unknown => (
-                            IconName::Warning,
-                            Color::Warning,
-                            "Outcome unknown".into(),
-                            Some(UNKNOWN_OUTCOME.into()),
-                        ),
-                        ProposalState::Done(label) => {
-                            (IconName::Check, Color::Success, label.clone(), None)
-                        }
-                        _ => (IconName::Close, Color::Muted, "Rejected".into(), None),
-                    };
+                // A running proposal turns the spinner; the others name their outcome's icon.
+                let (icon, color, label, tooltip): (
+                    Option<IconName>,
+                    Color,
+                    String,
+                    Option<String>,
+                ) = match state {
+                    ProposalState::Running => (None, Color::Accent, "Running".into(), None),
+                    ProposalState::Committed {
+                        commit,
+                        nodes,
+                        edges,
+                    } => (
+                        Some(IconName::Check),
+                        Color::Success,
+                        "Committed".into(),
+                        Some(format!(
+                            "Commit {commit}: {nodes} nodes and {edges} edges changed"
+                        )),
+                    ),
+                    ProposalState::Refused(message) => (
+                        Some(IconName::XCircle),
+                        Color::Error,
+                        "Refused".into(),
+                        Some(message.clone()),
+                    ),
+                    ProposalState::Unknown => (
+                        Some(IconName::Warning),
+                        Color::Warning,
+                        "Outcome unknown".into(),
+                        Some(UNKNOWN_OUTCOME.into()),
+                    ),
+                    ProposalState::Done(label) => {
+                        (Some(IconName::Check), Color::Success, label.clone(), None)
+                    }
+                    _ => (Some(IconName::Close), Color::Muted, "Rejected".into(), None),
+                };
                 let commit = match state {
                     ProposalState::Committed {
                         commit,
@@ -3479,7 +3472,12 @@ impl AgentPanel {
                             .id(("outcome", index))
                             .gap(px(ds::space::XS))
                             .when_some(tooltip, |d, tooltip| d.tooltip(Tooltip::text(tooltip)))
-                            .child(studio_ui::ds::icon::meta(icon).color(color))
+                            .child(match icon {
+                                Some(icon) => studio_ui::ds::icon::meta(icon)
+                                    .color(color)
+                                    .into_any_element(),
+                                None => studio_ui::ds::spinner().into_any_element(),
+                            })
                             .child(studio_ui::ds::text::body(label).color(color)),
                     )
                     .when_some(commit, |d, (commit, changed)| {

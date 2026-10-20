@@ -2051,7 +2051,7 @@ impl QueryEditor {
         }
         let (border, hover) = (
             studio_ui::ds::surface::rule(cx),
-            studio_ui::ds::surface::highlight(cx),
+            studio_ui::ds::surface::hover(cx),
         );
         Some(
             v_flex()

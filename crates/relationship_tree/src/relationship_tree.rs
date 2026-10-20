@@ -916,7 +916,7 @@ impl RelationshipTree {
                     .single_line()
                     .into_any_element()
             }
-            EntryKind::Loading { .. } => studio_ui::ds::text::meta("Loading…")
+            EntryKind::Loading { .. } => studio_ui::ds::text::meta("Reading…")
                 .single_line()
                 .into_any_element(),
             EntryKind::Error { target, message } => {

@@ -929,10 +929,9 @@ impl Render for HistoryView {
                     .child(studio_ui::ds::icon::lead(IconName::HistoryRerun))
                     .child(studio_ui::ds::text::title("History"))
             })
-            .child(studio_ui::ds::meta_row([
-                studio_ui::ds::meta(IconName::GitBranch, self.branch.clone()).into_any_element(),
-                studio_ui::ds::text::meta(summary).into_any_element(),
-            ]))
+            // One quiet fact after the title, as the table's row count: the tab already names
+            // the branch.
+            .child(studio_ui::ds::text::muted(summary))
             .child(div().flex_1())
             .child(search)
             .child(

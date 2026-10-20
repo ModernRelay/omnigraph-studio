@@ -948,15 +948,11 @@ pub fn section_disclosure(
         .cursor_pointer()
         .child(text::meta(title))
         .child(text::meta(count.to_string()))
-        .child(
-            Icon::new(if open {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            })
-            .size(IconSize::XSmall)
-            .color(Color::Muted),
-        )
+        .child(icon::meta(if open {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        }))
 }
 
 /// A panel's title line: its quiet label, and its actions on the right (search, new) when it

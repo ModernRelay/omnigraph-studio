@@ -1737,7 +1737,7 @@ impl TypeTable {
                     menu = menu.separator();
                     let save_table = table.clone();
                     menu = menu.item(
-                        ContextMenuEntry::new("Save View…")
+                        ContextMenuEntry::new("Save view…")
                             .disabled(!can_save)
                             .handler(move |window, cx| {
                                 save_table
@@ -5729,7 +5729,7 @@ impl TypeTable {
         };
         let page = self.page_size(cx);
         let content: AnyElement = if section.loading {
-            studio_ui::ds::text::meta("Loading…").into_any_element()
+            studio_ui::ds::text::meta("Reading…").into_any_element()
         } else if let Some(error) = &section.error {
             h_flex()
                 .gap(px(space::XS))
