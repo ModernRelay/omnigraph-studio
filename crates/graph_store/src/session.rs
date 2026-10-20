@@ -156,6 +156,9 @@ const PINNED_BLOBS: usize = 2_048;
 
 /// How many branches' commit lists a session keeps.
 const COMMIT_LISTS: usize = 64;
+/// Pages of commits' changes kept, and what they may weigh together.
+const COMMIT_CHANGE_PAGES: usize = 256;
+const COMMIT_CHANGE_BYTES: usize = 32 * 1024 * 1024;
 /// The most the commit lists kept may weigh together: a list holds a branch's whole history,
 /// main's commits before its fork included, so a few long ones would otherwise take the 64.
 const COMMIT_LIST_BYTES: usize = 32 * 1024 * 1024;
@@ -338,22 +341,43 @@ fn node_answers(
         .collect()
 }
 
-/// About what an answer takes in memory: its rows' text and numbers, and their containers.
-fn read_bytes(output: &ReadOutput) -> usize {
-    fn weight(value: &Value) -> usize {
-        match value {
-            Value::Null | Value::Bool(_) | Value::Number(_) => 16,
-            Value::String(text) => 24 + text.len(),
-            Value::Array(items) => 24 + items.iter().map(weight).sum::<usize>(),
-            Value::Object(map) => {
-                48 + map
-                    .iter()
-                    .map(|(key, item)| 24 + key.len() + weight(item))
-                    .sum::<usize>()
-            }
+/// About what a JSON value takes in memory: its text and numbers, and their containers.
+fn value_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => 16,
+        Value::String(text) => 24 + text.len(),
+        Value::Array(items) => 24 + items.iter().map(value_bytes).sum::<usize>(),
+        Value::Object(map) => {
+            48 + map
+                .iter()
+                .map(|(key, item)| 24 + key.len() + value_bytes(item))
+                .sum::<usize>()
         }
     }
-    256 + weight(&output.rows) + output.columns.iter().map(|c| 24 + c.len()).sum::<usize>()
+}
+
+/// About what an answer takes in memory: its rows, and its columns' names.
+fn read_bytes(output: &ReadOutput) -> usize {
+    256 + value_bytes(&output.rows) + output.columns.iter().map(|c| 24 + c.len()).sum::<usize>()
+}
+
+/// About what a page of a commit's changes takes: each change's id and its images' values.
+fn commit_changes_bytes(page: &CommitChanges) -> usize {
+    let image = |image: &Option<graph_client::api::ChangeImageOutput>| {
+        image.as_ref().map_or(0, |image| {
+            image
+                .properties
+                .iter()
+                .map(|(key, value)| 24 + key.len() + value_bytes(value))
+                .sum::<usize>()
+                + image.endpoints.as_ref().map_or(0, value_bytes)
+        })
+    };
+    256 + page
+        .changes
+        .iter()
+        .map(|change| 128 + change.id.len() + image(&change.before) + image(&change.after))
+        .sum::<usize>()
 }
 
 /// What a kept commit list weighs, about: each commit's strings and fixed fields.
@@ -453,6 +477,9 @@ pub struct GraphSession {
     /// Branches' newest commits, read alone for a list of branches: forgotten with their
     /// commit lists.
     head_commits: ReadMemo<String, Option<CommitOutput>>,
+    /// Pages of commits' changes, by commit, page token and size: a commit never changes, so
+    /// the views that show one (History's panel and tab, its detail) read each page once.
+    commit_change_pages: ReadMemo<(String, Option<String>, u32), CommitChanges>,
     /// The branch list has been read once; reading it again forgets the commit lists.
     branches_read: bool,
     /// How many times the session has moved to another branch: a branch list asked for before
@@ -536,6 +563,11 @@ impl GraphSession {
             schema_text: None,
             commit_lists: Memo::weighed(COMMIT_LISTS, COMMIT_LIST_BYTES, commit_list_bytes),
             head_commits: Memo::new(COMMIT_LISTS),
+            commit_change_pages: Memo::weighed(
+                COMMIT_CHANGE_PAGES,
+                COMMIT_CHANGE_BYTES,
+                commit_changes_bytes,
+            ),
             branches_read: false,
             branch_moves: 0,
             degrees: DegreeBatches::default(),
@@ -869,6 +901,8 @@ impl GraphSession {
         self.schema_text = Some(model.source.clone());
         self.pinned_reads.clear();
         self.pinned_blobs.clear();
+        // A change names its type as the schema does now.
+        self.commit_change_pages.clear();
         self.degree_counts.clear();
         self.pinned_commits.clear();
         self.degree_commits.clear();
@@ -2252,14 +2286,23 @@ impl GraphSession {
         limit: u32,
         cx: &mut Context<Self>,
     ) -> Task<Result<CommitChanges, ReadError>> {
-        let (client, graph, commit) =
-            (self.client(cx), self.graph_id.clone(), commit_id.to_owned());
-        self.counted_read(
-            async move {
-                client
-                    .commit_changes(&graph, &commit, page_token.as_deref(), limit)
-                    .await
+        let key = (commit_id.to_owned(), page_token.clone(), limit);
+        let commit = commit_id.to_owned();
+        self.share(
+            |session| &mut session.commit_change_pages,
+            key,
+            move |session, cx| {
+                let (client, graph) = (session.client(cx), session.graph_id.clone());
+                session.counted_read(
+                    async move {
+                        client
+                            .commit_changes(&graph, &commit, page_token.as_deref(), limit)
+                            .await
+                    },
+                    cx,
+                )
             },
+            |_, _| {},
             cx,
         )
     }
@@ -4402,6 +4445,53 @@ mod tests {
             carry_back(None, "c3", &mut kept, |commit| commit == "c2", |_, _| None);
         assert!(found.is_none());
         assert_eq!(kept, ["c2", "c3"]);
+    }
+
+    /// A page of a commit's changes is read once, for every view that asks: a commit never
+    /// changes.
+    #[gpui::test]
+    async fn a_commits_changes_are_read_once(cx: &mut TestAppContext) {
+        let pages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = pages.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let counted = counted.clone();
+            async move {
+                let body = if request.uri().path().ends_with("/changes") {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    r#"{"cause":{"graph_commit_id":"c1","authored_branch":"main","authored_at":1},"changes":[]}"#
+                } else {
+                    r#"{"branches":["main"]}"#
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        let at_start = pages.load(Ordering::SeqCst);
+        let (panel, tab) = session.update(cx, |session, cx| {
+            (
+                session.commit_changes("c1", None, 500, cx),
+                session.commit_changes("c1", None, 500, cx),
+            )
+        });
+        assert!(panel.await.is_ok() && tab.await.is_ok());
+        let again = session.update(cx, |session, cx| {
+            session.commit_changes("c1", None, 500, cx)
+        });
+        assert!(again.await.is_ok());
+        assert_eq!(pages.load(Ordering::SeqCst) - at_start, 1);
     }
 
     /// A branch Studio deleted takes its unsaved values with it; a delete that did not go
