@@ -54,6 +54,8 @@ pub struct GraphDiscoveryResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct GraphDiscoveryEntry {
     pub graph_id: String,
+    /// The graph's id for now: the server configures no separate display name.
+    pub display_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -714,7 +716,7 @@ mod contract_tests {
             ],
         ),
         ("GraphDiscoveryResponse", &["graphs"]),
-        ("GraphDiscoveryEntry", &["graph_id"]),
+        ("GraphDiscoveryEntry", &["graph_id", "display_name"]),
         (
             "CommitListOutput",
             &["commits", "head_commit_id", "next_page_token"],
