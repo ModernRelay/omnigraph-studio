@@ -5,7 +5,7 @@
 use std::cmp::Ordering;
 
 use gq_language::builder::edge_property_column;
-use gq_language::input::parse_scalar;
+use gq_language::input::{compare_values as compare, parse_scalar, same_value};
 pub use gq_language::input::{edit_text, parse_input};
 use gq_language::{
     EdgeType, Filter, FilterOp, NodeType, PageStart, Property, RelationshipGroup, ScalarKind,
@@ -175,7 +175,12 @@ pub fn edge_columns(edge: &EdgeType) -> Vec<ColumnSpec> {
             align_right: false,
         },
     ];
-    for property in edge.properties.iter().filter(|p| p.projectable()) {
+    // As a node table's: a Blob shows as a cell, read on its own; a vector does not show.
+    for property in edge
+        .properties
+        .iter()
+        .filter(|p| p.kind != ScalarKind::Vector)
+    {
         columns.push(property_column(property, property.name.clone()));
     }
     columns
@@ -344,6 +349,15 @@ impl Row {
     pub fn value(&self, column: &str) -> &Value {
         self.values.get(column).unwrap_or(&Value::Null)
     }
+}
+
+/// What names a node of `node`'s type holding `values`: its label property's text, unless the
+/// label is the key, which names it already.
+pub fn node_label(node: &NodeType, values: &Map<String, Value>) -> Option<String> {
+    let label = node.label_property()?;
+    (Some(label) != node.key.as_deref())
+        .then(|| values.get(label)?.as_str().map(str::to_owned))
+        .flatten()
 }
 
 /// Rows of `node_page` / `node_by_id`: each result row is `{"n": {"@id": …, props…}}`.
@@ -681,37 +695,6 @@ pub fn preset_range(
     Value::Array(vec![day(start), day(end)])
 }
 
-fn compare(a: &Value, b: &Value) -> Option<Ordering> {
-    match (a, b) {
-        // Whole numbers exactly: an I64 or U64 past 2^53 has no exact f64, so two that differ
-        // would compare equal and an edit between them would read as no change.
-        (Value::Number(a), Value::Number(b)) => match (whole(a), whole(b)) {
-            (Some(a), Some(b)) => Some(a.cmp(&b)),
-            _ => a.as_f64()?.partial_cmp(&b.as_f64()?),
-        },
-        (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
-        (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
-        _ => None,
-    }
-}
-
-/// Whether two cell values are the same value (`1` and `1.0` are).
-fn whole(number: &serde_json::Number) -> Option<i128> {
-    number
-        .as_i64()
-        .map(i128::from)
-        .or_else(|| number.as_u64().map(i128::from))
-}
-
-pub fn same_value(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Array(a), Value::Array(b)) => {
-            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_value(a, b))
-        }
-        _ => a == b || compare(a, b) == Some(Ordering::Equal),
-    }
-}
-
 /// Whether a row's values satisfy every filter, with the engine's semantics: a comparison with
 /// a null is false; `contains` is a substring test on text and membership on lists.
 /// Relationship filters are not checked here: a row's relationships are not in the row.
@@ -883,19 +866,6 @@ pub fn changed_elsewhere(property: Option<&Property>, now: Option<&Value>) -> No
             "This row was deleted elsewhere while you were editing. Nothing was written.",
         ),
     }
-}
-
-/// `12480` → `12 480`, with a no-break space.
-pub fn format_count(n: i64) -> String {
-    let digits = n.unsigned_abs().to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push('\u{a0}');
-        }
-        out.push(c);
-    }
-    if n < 0 { format!("-{out}") } else { out }
 }
 
 /// The most chips a relationship cell shows: two names say what a row links to; more crowd
@@ -1296,7 +1266,7 @@ mod tests {
             parse_input(&prop("Person", "born"), "1980-02-30"),
             Ok(json!("1980-02-30"))
         );
-        assert!(parse_input(&prop("Person", "born"), "1980-13-01").is_err());
+        // The engine says which spellings of a date it takes; a word is none.
         assert!(parse_input(&prop("Person", "born"), "yesterday").is_err());
         assert_eq!(
             parse_input(&prop("Person", "tags"), "a, b,,c "),
@@ -1463,18 +1433,7 @@ mod tests {
     }
 
     #[test]
-    fn formats_counts_and_commits() {
-        assert_eq!(format_count(12480), "12\u{a0}480");
-        assert_eq!(format_count(200), "200");
-        assert_eq!(format_count(1_000_000), "1\u{a0}000\u{a0}000");
-        assert!(same_value(&json!(1), &json!(1.0)));
-        assert!(!same_value(&json!(["a"]), &json!(["b"])));
-        // Whole numbers past 2^53 compare exactly: an edit between two of them is a change.
-        assert!(!same_value(
-            &json!(9_007_199_254_740_993_i64),
-            &json!(9_007_199_254_740_992_i64)
-        ));
-        assert!(!same_value(&json!(u64::MAX), &json!(u64::MAX - 1)));
+    fn an_empty_value_reads_as_a_dash() {
         assert_eq!(display_value(None, &Value::Null), "—");
     }
 

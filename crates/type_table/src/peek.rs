@@ -4,6 +4,7 @@
 //! was read at, or to the first read when the node was opened by id (constitution II).
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,10 +33,11 @@ use crate::blob::{
     suggested_file_name,
 };
 use crate::model::{
-    FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, display_value, field_rows, format_count,
-    node_rows, reads_as_markdown, same_value, save_result,
+    FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, display_value, field_rows, node_label,
+    node_rows, reads_as_markdown, save_result,
 };
 use crate::suggest;
+use gq_language::input::same_value;
 use graph_client::api::ReadOutput;
 use graph_client::{BlobCell, BlobMeta, HistoricalGap, PropertyThen, ReadError};
 
@@ -44,10 +46,11 @@ pub const NEIGHBOUR_LIMIT: u32 = 8;
 
 /// Neighbours a page reads at a time under each relationship group, with "Show more" for the
 /// next (constitution IX).
+const PAGE_NEIGHBOURS: u32 = 50;
+
 /// Where a relationship group's children start: under the group's arrow, past its inset and
 /// disclosure chevron.
 const CHILD_INDENT: f32 = space::XS + studio_ui::ds::size::DISCLOSURE + space::SM;
-const PAGE_NEIGHBOURS: u32 = 50;
 
 /// The widest a page's text runs: the design system's reading width, as settings' is.
 const PAGE_WIDTH: f32 = studio_ui::ds::size::READING_WIDTH;
@@ -120,8 +123,8 @@ impl PeekSubject {
 pub struct Neighbour {
     pub id: String,
     pub label: Option<String>,
-    /// The edge that relates it, which removing the relationship names; `None` when it was
-    /// read without it (a table's chips).
+    /// The edge that relates it, which removing or replacing the relationship names; `None`
+    /// when it was read without it (a table's chips).
     pub edge_id: Option<String>,
 }
 
@@ -132,7 +135,8 @@ pub struct Neighbour {
 pub struct KnownRelation {
     pub count: i64,
     /// The first `min(count, NEIGHBOUR_LIMIT)` neighbours by id, as the peek's own read
-    /// orders them; `None` when the table did not read them all.
+    /// orders them; `None` when the table did not read them all. A table reads them without
+    /// their edges, so only a peek that writes no relationship is given them.
     pub first: Option<Vec<Neighbour>>,
 }
 
@@ -256,6 +260,8 @@ pub struct NodePeek {
     /// a node with dozens of groups neither draws nor reads them all.
     list: ListState,
     list_items: Vec<Item>,
+    /// The list's items the last frame laid out, first to last: those in view and just past it.
+    items_drawn: Option<Range<usize>>,
     /// Properties the commit shown does not hold under their current name, and what they were
     /// then. The node is read without them.
     absent: HashMap<String, PropertyThen>,
@@ -437,6 +443,7 @@ impl NodePeek {
             scope: Some(scope),
             list: ListState::new(0, ListAlignment::Top, px(DRAW_AHEAD)),
             list_items: Vec::new(),
+            items_drawn: None,
             absent: HashMap::new(),
             groups_absent: Vec::new(),
             awaiting_changes: false,
@@ -516,12 +523,10 @@ impl NodePeek {
             let to = values.get(TO_COLUMN)?.as_str()?;
             return Some(format!("{from} → {to}"));
         }
-        let schema = self.schema.as_ref()?;
-        let node = schema.node(self.subject.type_name())?;
-        let label = node.label_property()?;
-        (Some(label) != node.key.as_deref())
-            .then(|| values.get(label)?.as_str().map(str::to_owned))
-            .flatten()
+        node_label(
+            self.schema.as_ref()?.node(self.subject.type_name())?,
+            values,
+        )
     }
 
     /// The peek shows the commit it was given whatever the branch does: no Refresh is offered.
@@ -592,6 +597,9 @@ impl NodePeek {
             let session = self.session.read(cx);
             session.head(&session.branch).map(str::to_owned)
         });
+        // Read at the head the session holds, the read pins the view there: a head the session
+        // sees move while it is out finds no pin to compare, and is compared once it lands.
+        let asked = self.snapshot.is_none().then(|| snapshot.clone()).flatten();
         let read = self.read_shown(&query, snapshot, cx);
         self._node_read = Some(cx.spawn(async move |this, cx| {
             let result = read.await;
@@ -600,6 +608,13 @@ impl NodePeek {
                     Ok(output) => {
                         if this.snapshot.is_none() {
                             this.snapshot = output.graph_commit_id.clone();
+                            if asked.is_some()
+                                && this.snapshot == asked
+                                && this.saving.is_empty()
+                                && this.edge_writes.is_empty()
+                            {
+                                this.compare_head(cx);
+                            }
                         }
                         let rows = if fields {
                             field_rows(&output.rows)
@@ -671,7 +686,6 @@ impl NodePeek {
             .collect()
     }
 
-    /// Frees the images this peek decoded; GPUI would keep them otherwise.
     /// The peek goes, as when the table's cursor moves on: what its open fields hold is kept
     /// as drafts on its branch, a refused field's too, and a Blob being saved to a file still
     /// lands there.
@@ -698,6 +712,7 @@ impl NodePeek {
         }
     }
 
+    /// Frees the images this peek decoded; GPUI would keep them otherwise.
     fn release_images(&self, cx: &mut App) {
         for slot in &self.blobs {
             if let Loadable::Loaded(Preview::Image(image)) = &slot.preview {
@@ -713,19 +728,35 @@ impl NodePeek {
         let edge = matches!(self.subject, PeekSubject::Edge { .. });
         let type_name = self.subject.type_name().to_owned();
         let id = self.subject.id().to_owned();
+        // A value being saved to a file goes on, shown on its property's new slot; one whose
+        // property the view no longer lists still lands in its file.
+        let mut saves: HashMap<String, (Option<SaveState>, Option<Task<()>>)> =
+            std::mem::take(&mut self.blobs)
+                .into_iter()
+                .filter(|slot| slot._save.is_some())
+                .map(|slot| (slot.property, (slot.save, slot._save)))
+                .collect();
         self.blobs = self
             .blob_properties()
             .into_iter()
-            .map(|property| BlobSlot {
-                property,
-                meta: Loadable::Loading,
-                preview: Loadable::NotLoaded,
-                head: Vec::new(),
-                save: None,
-                _task: None,
-                _save: None,
+            .map(|property| {
+                let (save, task) = saves.remove(&property).unwrap_or_default();
+                BlobSlot {
+                    property,
+                    meta: Loadable::Loading,
+                    preview: Loadable::NotLoaded,
+                    head: Vec::new(),
+                    save,
+                    _task: None,
+                    _save: task,
+                }
             })
             .collect();
+        for (_, (_, task)) in saves {
+            if let Some(task) = task {
+                task.detach();
+            }
+        }
         for index in 0..self.blobs.len() {
             let cell = BlobCell {
                 edge,
@@ -812,11 +843,12 @@ impl NodePeek {
         let id = self.subject.id().to_owned();
         let name = suggested_file_name(&id, &slot.property, &slot.head);
         let chosen = cx.prompt_for_new_path(&save_folder(), Some(&name));
+        let property = slot.property.clone();
         let cell = BlobCell {
             edge: matches!(self.subject, PeekSubject::Edge { .. }),
             type_name: self.subject.type_name().to_owned(),
             id,
-            property: slot.property.clone(),
+            property: property.clone(),
         };
         let session = self.session.downgrade();
         let snapshot = self.snapshot.clone();
@@ -824,9 +856,11 @@ impl NodePeek {
             let Ok(Ok(Some(path))) = chosen.await else {
                 return;
             };
+            // By property: the view's Blobs are read again on a refresh, the save going on.
             let set = |state: SaveState, cx: &mut gpui::AsyncApp| {
                 this.update(cx, |this, cx| {
-                    if let Some(slot) = this.blobs.get_mut(index) {
+                    let slot = this.blobs.iter_mut().find(|slot| slot.property == property);
+                    if let Some(slot) = slot {
                         slot.save = Some(state);
                     }
                     cx.notify();
@@ -1080,7 +1114,11 @@ impl NodePeek {
                         && matches!(group.neighbours, Loadable::NotLoaded)
                         && this.opens_by_itself(n) =>
                 {
-                    this.toggle_group(index, cx)
+                    if let Some(group) = this.groups.get_mut(index) {
+                        group.expanded = true;
+                    }
+                    this.read_neighbours(index, this.debounce, cx);
+                    cx.notify();
                 }
                 _ => {}
             }
@@ -1089,11 +1127,25 @@ impl NodePeek {
 
     /// Reads a group's first neighbours, one more than the view shows: when they fit, that read
     /// is also the group's exact count, so most groups cost one read rather than a count and
-    /// then a page (spec 015). A group past the page shows its first neighbours and reads its
-    /// count through the session's batched counts. `debounce` delays the read, for a peek that
+    /// then a page (spec 015). A group past the page shows its first neighbours and reads how
+    /// many edges it has: the peek lists each edge, two to one neighbour (a person rehired by
+    /// one company) as two rows, so each can be removed. `debounce` delays the read, for a peek that
     /// follows a moving cursor; `open` opens the group when it has any neighbours, as after the
     /// person's own write to it, where otherwise only a small one opens by itself.
     fn load_group(&mut self, index: usize, debounce: bool, open: bool, cx: &mut Context<Self>) {
+        let snapshot = self.snapshot.clone();
+        self.load_group_at(index, snapshot, debounce, open, cx);
+    }
+
+    /// [`Self::load_group`] at `snapshot` rather than the view's commit.
+    fn load_group_at(
+        &mut self,
+        index: usize,
+        snapshot: Option<String>,
+        debounce: bool,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) {
         let PeekSubject::Node { type_name, id } = self.subject.clone() else {
             return;
         };
@@ -1126,8 +1178,9 @@ impl NodePeek {
                 return;
             }
         };
+        let edge_count = builder::edge_degree(&schema, &type_name, &group.group, &id)
+            .map_err(|error| error.to_string());
         let session = self.session.downgrade();
-        let snapshot = self.snapshot.clone();
         let relationship = group.group.clone();
         let read_without = without;
         let scope = self.scope.clone();
@@ -1135,9 +1188,8 @@ impl NodePeek {
             if debounce {
                 cx.background_executor().timer(COUNT_DELAY).await;
             }
-            let Ok(read) = session.update(cx, |session, cx| match &scope {
-                Some(scope) => session.read_in(scope, &query, snapshot.clone(), cx),
-                None => session.read(&query, snapshot.clone(), cx),
+            let Ok(read) = session.update(cx, |session, cx| {
+                session.read_scoped(scope.as_ref(), &query, snapshot.clone(), cx)
             }) else {
                 return;
             };
@@ -1145,7 +1197,15 @@ impl NodePeek {
                 Ok(output) => neighbours_from(&output.rows),
                 Err(error) => {
                     this.update(cx, |this, cx| {
-                        this.group_refused(index, &relationship, &read_without, error, open, cx);
+                        this.group_refused(
+                            index,
+                            &relationship,
+                            &read_without,
+                            error,
+                            snapshot,
+                            open,
+                            cx,
+                        );
                         cx.notify();
                     })
                     .ok();
@@ -1158,16 +1218,25 @@ impl NodePeek {
             let count = if fits {
                 Ok(shown.len() as u64)
             } else {
-                // More than a page: the exact count, batched with every other one asked now.
-                let Ok(count) = session.update(cx, |session, cx| match &scope {
-                    Some(scope) => {
-                        session.degree_in(scope, &type_name, &relationship, &id, snapshot, cx)
+                // More than a page: the edges counted, at the same commit.
+                match edge_count {
+                    Ok(query) => {
+                        let Ok(read) = session.update(cx, |session, cx| {
+                            session.read_scoped(scope.as_ref(), &query, snapshot, cx)
+                        }) else {
+                            return;
+                        };
+                        read.await.map_err(|error| error.to_string()).map(|output| {
+                            output
+                                .rows
+                                .get(0)
+                                .and_then(|row| row.get("n"))
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0)
+                        })
                     }
-                    None => session.degree(&type_name, &relationship, &id, snapshot, cx),
-                }) else {
-                    return;
-                };
-                count.await
+                    Err(error) => Err(error),
+                }
             };
             this.update(cx, |this, cx| {
                 let count = match count {
@@ -1192,14 +1261,17 @@ impl NodePeek {
 
     /// A group's read was refused. At a commit made before its edge type or the type at its
     /// other end existed, it had no neighbours; one made before a property it reads (the
-    /// neighbour's label, an edge property) was added or renamed is read again without it, once
-    /// per property: `read_without` is what this read left out already.
+    /// neighbour's label, an edge property) was added or renamed is read again without it at
+    /// the same commit (`snapshot`), once per property: `read_without` is what this read left
+    /// out already.
+    #[allow(clippy::too_many_arguments)]
     fn group_refused(
         &mut self,
         index: usize,
         relationship: &RelationshipGroup,
         read_without: &[(String, String)],
         error: ReadError,
+        snapshot: Option<String>,
         open: bool,
         cx: &mut Context<Self>,
     ) {
@@ -1231,7 +1303,7 @@ impl NodePeek {
                 {
                     self.groups_absent.push((owner, property));
                 }
-                self.load_group(index, false, open, cx);
+                self.load_group_at(index, snapshot, false, open, cx);
             }
             _ => {
                 if let Some(group) = self.groups.get_mut(index) {
@@ -1243,6 +1315,20 @@ impl NodePeek {
     }
 
     fn toggle_group(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(group) = self.groups.get_mut(index) else {
+            return;
+        };
+        group.expanded = !group.expanded;
+        if group.expanded && matches!(group.neighbours, Loadable::NotLoaded) {
+            self.read_neighbours(index, false, cx);
+        }
+        cx.notify();
+    }
+
+    /// Reads the first neighbours of a group whose count is known, at the view's commit.
+    /// `debounce` waits first, for a peek that follows a moving cursor: the rows it passes read
+    /// nothing.
+    fn read_neighbours(&mut self, index: usize, debounce: bool, cx: &mut Context<Self>) {
         let PeekSubject::Node { type_name, id } = self.subject.clone() else {
             return;
         };
@@ -1251,14 +1337,11 @@ impl NodePeek {
         };
         let limit = self.neighbour_limit();
         let without = self.groups_absent.clone();
+        let session = self.session.downgrade();
+        let (snapshot, scope) = (self.snapshot.clone(), self.scope.clone());
         let Some(group) = self.groups.get_mut(index) else {
             return;
         };
-        group.expanded = !group.expanded;
-        if !group.expanded || !matches!(group.neighbours, Loadable::NotLoaded) {
-            cx.notify();
-            return;
-        }
         let query = match builder::neighbours_without_properties(
             &schema,
             &type_name,
@@ -1272,14 +1355,19 @@ impl NodePeek {
             Ok(query) => query,
             Err(error) => {
                 group.neighbours = Loadable::Failed(error.to_string());
-                cx.notify();
                 return;
             }
         };
         group.neighbours = Loadable::Loading;
-        let snapshot = self.snapshot.clone();
-        let read = self.read_shown(&query, snapshot, cx);
-        let task = cx.spawn(async move |this, cx| {
+        group._task = Some(cx.spawn(async move |this, cx| {
+            if debounce {
+                cx.background_executor().timer(COUNT_DELAY).await;
+            }
+            let Ok(read) = session.update(cx, |session, cx| {
+                session.read_scoped(scope.as_ref(), &query, snapshot, cx)
+            }) else {
+                return;
+            };
             let result = read.await;
             this.update(cx, |this, cx| {
                 if let Some(group) = this.groups.get_mut(index) {
@@ -1291,11 +1379,7 @@ impl NodePeek {
                 cx.notify();
             })
             .ok();
-        });
-        if let Some(group) = self.groups.get_mut(index) {
-            group._task = Some(task);
-        }
-        cx.notify();
+        }));
     }
 
     /// Reads a group's next page of neighbours, after the last one shown.
@@ -1310,13 +1394,21 @@ impl NodePeek {
         let Some(group) = self.groups.get(index) else {
             return;
         };
-        let Some(after) = group
+        // After the last edge shown: a second edge to the same neighbour comes next.
+        let Some((after, after_edge)) = group
             .neighbours
             .loaded()
             .and_then(|shown| shown.last())
-            .map(|last| last.id.clone())
+            .map(|last| (last.id.clone(), last.edge_id.clone()))
         else {
             return;
+        };
+        let after = match &after_edge {
+            Some(edge) => builder::After::Edge {
+                neighbour: &after,
+                edge,
+            },
+            None => builder::After::Neighbour(&after),
         };
         if group.more.is_some() {
             return;
@@ -1326,7 +1418,7 @@ impl NodePeek {
             &type_name,
             &group.group,
             &id,
-            Some(&after),
+            Some(after),
             builder::Narrow::default(),
             PAGE_NEIGHBOURS,
             &without,
@@ -1571,7 +1663,8 @@ impl NodePeek {
         }
     }
 
-    /// ↵: writes the field's text, parsed for its type; an unchanged value sends nothing.
+    /// ↵: writes the field's text, parsed for its type; an unchanged value sends nothing, and
+    /// a draft typed back to it goes.
     fn save_field(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(edit) = self.edits.get_mut(name) else {
             return;
@@ -1589,6 +1682,7 @@ impl NodePeek {
             return;
         };
         if same_value(&new, &edit.old) {
+            self.drop_draft(name, cx);
             cx.notify();
             return;
         }
@@ -1622,6 +1716,7 @@ impl NodePeek {
             &name,
             &old,
             &new,
+            None,
             cx,
         ) {
             Ok(write) => write,
@@ -1635,14 +1730,16 @@ impl NodePeek {
         if let Loadable::Loaded(values) = &mut self.values {
             values.insert(name.clone(), new);
         }
+        let (session, key) = (self.session.clone(), self.draft_key(&name));
         self.saving.insert(name);
         let branch = self.branch.clone();
         // Detached: closing the page or moving the peek never cancels a write.
         cx.spawn_in(window, async move |this, cx| {
             let result = write.await;
-            this.update_in(cx, |this, window, cx| {
+            let shown = this.update_in(cx, |this, window, cx| {
                 if this.branch == branch {
-                    this.finish_write(property, old, text, result, window, cx);
+                    let (property, old) = (property.clone(), old.clone());
+                    this.finish_write(property, old, text.clone(), result.clone(), window, cx);
                     return;
                 }
                 // The view reads another branch now; the property's draft was the branch left's.
@@ -1651,8 +1748,20 @@ impl NodePeek {
                     this.drop_draft_on(&branch, &property.name, cx);
                 }
                 cx.notify();
-            })
-            .ok();
+            });
+            // The view went first (the table's cursor moved on, the page closed): the
+            // property's draft is settled where it was typed, and the text of a write that did
+            // not land is kept in it.
+            if shown.is_err()
+                && let Some(key) = key
+            {
+                session.update(cx, |session, cx| match result {
+                    SaveResult::Saved { .. } => {
+                        session.remove_draft_on(&branch, &key, cx);
+                    }
+                    _ => session.set_draft_on(&branch, key, DraftEntry { old, text }, cx),
+                });
+            }
         })
         .detach();
         cx.notify();
@@ -1734,9 +1843,8 @@ impl NodePeek {
         cx: &mut Context<Self>,
     ) -> Task<Result<ReadOutput, ReadError>> {
         let scope = self.scope.clone();
-        self.session.update(cx, |session, cx| match &scope {
-            Some(scope) => session.read_in(scope, query, snapshot, cx),
-            None => session.read(query, snapshot, cx),
+        self.session.update(cx, |session, cx| {
+            session.read_scoped(scope.as_ref(), query, snapshot, cx)
         })
     }
 
@@ -1903,9 +2011,6 @@ impl NodePeek {
         cx.notify();
     }
 
-    /// Adds the relationship to the highlighted node; on a group that holds one, it replaces
-    /// the one there, which is removed first so the limit holds (rule D2 makes that two
-    /// commits).
     /// ↵ in the search: the highlighted node of the results for what is typed now. While those
     /// are being read it does nothing, so a node found for earlier text is never written to.
     fn confirm_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1918,6 +2023,10 @@ impl NodePeek {
         }
     }
 
+    /// Adds the relationship to the highlighted node; on a group that holds one, it replaces
+    /// the one there, which is removed first so the limit holds (rule D2 makes that two
+    /// commits). Until the edge it replaces is known, nothing is written and the group is read
+    /// with its edges: a lone addition would be refused for the limit.
     fn add_highlighted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(adding) = self.adding.as_ref() else {
             return;
@@ -1931,18 +2040,36 @@ impl NodePeek {
             return;
         };
         let index = adding.index;
+        let replaced = if self.holds_one(index) {
+            match self.replaced_edge(index) {
+                Some(replaced) => replaced,
+                None => {
+                    if !matches!(self.groups[index].neighbours, Loadable::Loading) {
+                        self.reload_group(index, None, cx);
+                    }
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         self.adding = None;
-        let replaced = self
-            .holds_one(index)
-            .then(|| {
-                self.groups[index]
-                    .neighbours
-                    .loaded()
-                    .and_then(|shown| shown.first())
-                    .and_then(|first| first.edge_id.clone())
-            })
-            .flatten();
         self.write_edge(index, EdgeChange::Add(picked.id), replaced, window, cx);
+    }
+
+    /// The edge a new relationship of a group that holds one replaces: `Some(None)` when the
+    /// group has none, and `None` while it is not known (its neighbours not read yet, read
+    /// without their edges, or not readable).
+    fn replaced_edge(&self, index: usize) -> Option<Option<String>> {
+        let group = self.groups.get(index)?;
+        if matches!(group.count, Loadable::Loaded(0)) {
+            return Some(None);
+        }
+        match group.neighbours.loaded()?.first() {
+            Some(first) => first.edge_id.clone().map(Some),
+            None => Some(None),
+        }
     }
 
     /// The first click on a neighbour's × asks; the second removes the relationship.
@@ -1963,8 +2090,8 @@ impl NodePeek {
     }
 
     /// Writes one relationship change, after removing `first` when it is given, each as its
-    /// own commit; the group is read again at the view's commit, which follows its own
-    /// commits.
+    /// own commit; the group is read again where the writes landed, at the view's commit when
+    /// it follows them.
     fn write_edge(
         &mut self,
         index: usize,
@@ -2068,11 +2195,16 @@ impl NodePeek {
                     cx.notify();
                     return;
                 }
+                // The group is read again at the view's commit when the view followed its writes
+                // there. Behind them, it is read at the commit they reached, where it holds what
+                // was written, and the view offers Refresh for the rest.
+                let mut read_at = None;
                 if landed > 0 {
                     if chained && first_parent.is_some() && this.snapshot == first_parent {
                         this.snapshot = reached;
                     } else {
                         this.newer = true;
+                        read_at = reached;
                     }
                 }
                 // After the removal landed, a failed addition leaves the group without the
@@ -2102,7 +2234,7 @@ impl NodePeek {
                         this.group_notices.insert(index, notice);
                     }
                 }
-                this.reload_group(index, cx);
+                this.reload_group(index, read_at, cx);
                 if this.saving.is_empty() && this.edge_writes.is_empty() {
                     this.compare_head(cx);
                 }
@@ -2114,9 +2246,11 @@ impl NodePeek {
         cx.notify();
     }
 
-    /// Reads a group's count and neighbours again at the view's commit.
-    fn reload_group(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.load_group(index, false, true, cx);
+    /// Reads a group's count and neighbours again, at `at` or else the view's commit, and opens
+    /// it when it has any.
+    fn reload_group(&mut self, index: usize, at: Option<String>, cx: &mut Context<Self>) {
+        let snapshot = at.or_else(|| self.snapshot.clone());
+        self.load_group_at(index, snapshot, false, true, cx);
     }
 
     /// ⌘S: the node's drafts as one mutation, bound to the values the view shows, so one commit.
@@ -2189,9 +2323,15 @@ impl NodePeek {
         for (name, _, _) in &cells {
             self.saving.insert(name.clone());
         }
+        let session = self.session.clone();
+        let keys: Vec<DraftKey> = cells
+            .iter()
+            .filter_map(|(name, _, _)| self.draft_key(name))
+            .collect();
         cx.spawn_in(window, async move |this, cx| {
             let result = write.await;
-            this.update(cx, |this, cx| {
+            let saved = matches!(result, SaveResult::Saved { .. });
+            let shown = this.update(cx, |this, cx| {
                 this.saving_drafts = false;
                 for (name, _, _) in &cells {
                     this.saving.remove(name);
@@ -2234,8 +2374,16 @@ impl NodePeek {
                     this.compare_head(cx);
                 }
                 cx.notify();
-            })
-            .ok();
+            });
+            // The view went first: drafts that landed are let go, as it would have; the others
+            // stay for the next view of the node.
+            if shown.is_err() && saved {
+                session.update(cx, |session, cx| {
+                    for key in &keys {
+                        session.remove_draft_on(&branch, key, cx);
+                    }
+                });
+            }
         })
         .detach();
         cx.notify();
@@ -2835,7 +2983,9 @@ impl NodePeek {
             }))
             .child(studio_ui::ds::text::muted("Empty"))
             .child(div().flex_1())
-            .child(studio_ui::ds::text::muted(format_count(folded as i64)).buffer_font(cx))
+            .child(
+                studio_ui::ds::text::muted(studio_ui::group_count(folded as i64)).buffer_font(cx),
+            )
             .into_any_element()
     }
 
@@ -2850,7 +3000,7 @@ impl NodePeek {
         };
         // Until its count is read a group says nothing about what it holds.
         let count = match &group.count {
-            Loadable::Loaded(n) => format_count(*n),
+            Loadable::Loaded(n) => studio_ui::group_count(*n),
             Loadable::Failed(_) => "?".into(),
             Loadable::NotLoaded | Loadable::Loading => "…".into(),
         };
@@ -3094,7 +3244,7 @@ impl NodePeek {
                 let other = group.group.other_type.clone();
                 let at_commit = self.held_commit();
                 let show_more = more.map(|more| {
-                    let label = format!("+{} more", format_count(more));
+                    let label = format!("+{} more", studio_ui::group_count(more));
                     if self.page {
                         let reading = group.more.is_some();
                         studio_ui::ds::row_button(
@@ -3385,8 +3535,15 @@ impl NodePeek {
             self.list_items = items;
         }
         // What an item holds may have changed (a group's neighbours came in, a field opened):
-        // those drawn are measured again, the others keep the height they had.
-        self.list.remeasure();
+        // those the last frame laid out are measured again, the others keep the height they
+        // had. This frame's are noted as they are laid out.
+        let count = self.list_items.len();
+        if let Some(drawn) = self.items_drawn.take() {
+            let drawn = drawn.start.min(count)..drawn.end.min(count);
+            if !drawn.is_empty() {
+                self.list.remeasure_items(drawn);
+            }
+        }
         div()
             .id("node-peek")
             .key_context("NodeView")
@@ -3414,6 +3571,10 @@ impl NodePeek {
     ) -> AnyElement {
         let page = self.page;
         let last = ix + 1 == self.list_items.len();
+        self.items_drawn = Some(match self.items_drawn.take() {
+            Some(drawn) => drawn.start.min(ix)..drawn.end.max(ix + 1),
+            None => ix..ix + 1,
+        });
         let item = match self.list_items.get(ix).copied() {
             Some(Item::Head) => {
                 let head = self.render_head(window, cx);
@@ -3771,7 +3932,8 @@ mod tests {
         "node Person {\n  slug: String @key\n  name: String\n}\nedge Knows: Person -> Person\n";
 
     /// A page reads each relationship group once: its first neighbours and one more, which is
-    /// the group's exact count when they fit. Only a group past the page reads its count.
+    /// the group's exact count when they fit. Only a group past the page reads its count, of
+    /// edges, as the peek lists one row an edge.
     #[gpui::test]
     async fn a_group_that_fits_its_page_is_read_once(cx: &mut TestAppContext) {
         let neighbours = |n: usize| {
@@ -3791,7 +3953,7 @@ mod tests {
                     }
                     Some("studio_neighbours") if query.contains("$n $e:knows $m") => neighbours(3),
                     Some("studio_neighbours") => neighbours(PAGE_NEIGHBOURS as usize + 1),
-                    Some("studio_page_degrees") => json!([{ "id": "p1", "n": 120 }]),
+                    Some("studio_edge_degree") => json!([{ "n": 120 }]),
                     _ => json!([]),
                 }
             },
@@ -3825,7 +3987,7 @@ mod tests {
             "one read per group: {asked:?}"
         );
         assert_eq!(
-            reads("studio_page_degrees"),
+            reads("studio_edge_degree"),
             1,
             "a count only past the page: {asked:?}"
         );
@@ -4585,5 +4747,289 @@ mod tests {
             draft.map(|draft| draft.text).as_deref(),
             Some("Ada Lovelace")
         );
+    }
+
+    /// A write out when the peek goes (the table's cursor moved on) is settled where it was
+    /// typed: refused, its text is kept as the property's draft.
+    #[gpui::test]
+    async fn a_refused_write_whose_peek_went_keeps_its_text(cx: &mut TestAppContext) {
+        let refused = json!({ "error": "policy denied", "code": "forbidden" });
+        let session = session_answering(PEOPLE, 403, refused, cx);
+        let (view, cx) = page(session.clone(), cx);
+        view.update_in(cx, |view, window, cx| {
+            let person = view.schema.as_ref().unwrap().node("Person").unwrap();
+            let property = person.property("name").unwrap().clone();
+            view.start_edit(property, window, cx);
+            let editor = view.edits["name"].editor.clone();
+            editor.update(cx, |editor, cx| editor.set_text("Ada Lovelace", window, cx));
+            view.save_field("name", window, cx);
+            assert!(view.saving.contains("name"), "the write is out");
+        });
+        drop(view);
+        cx.update(|window, _| window.remove_window());
+        cx.run_until_parked();
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        let draft = session.read_with(cx, |session, _| session.draft(&key).cloned());
+        assert_eq!(
+            draft,
+            Some(DraftEntry {
+                old: json!("Ada"),
+                text: "Ada Lovelace".into(),
+            })
+        );
+    }
+
+    /// ↵ on a field typed back to the value its draft was typed over lets the draft go, and
+    /// writes nothing.
+    #[gpui::test]
+    async fn a_field_typed_back_and_saved_lets_its_draft_go(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (view, cx) = page(session.clone(), cx);
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        session.update(cx, |session, cx| {
+            let draft = DraftEntry {
+                old: json!("Ada"),
+                text: "Ada King".into(),
+            };
+            session.set_draft(key.clone(), draft, cx);
+        });
+        edit_name(&view, "Ada", cx);
+        session.read_with(cx, |session, _| assert_eq!(session.draft(&key), None));
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.saving.is_empty() && view.edits.is_empty(),
+                "nothing written"
+            );
+        });
+    }
+
+    /// A table reads its rows' neighbours without the edges relating them. The peek of a row
+    /// at the head, which removes and replaces relationships, reads its own with their edges;
+    /// the peek of a table held at a commit shows the table's.
+    #[gpui::test]
+    async fn a_peek_of_a_tables_row_at_the_head_reads_the_edges_it_writes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        for at_commit in [None, Some("c1".to_owned())] {
+            let (session, _) = session_routing(
+                KNOWS,
+                |request| match request["name"].as_str() {
+                    Some("studio_page_degrees") => json!([{ "id": "p1", "n": 1 }]),
+                    Some("studio_page_neighbours") => json!([{ "id": "p1", "other": "p2" }]),
+                    Some("studio_neighbours") => json!([{ "id": "p2", "edge_id": "e1" }]),
+                    _ => json!([
+                        { "n": { "@id": "p1", "slug": "p1", "name": "Ada" } },
+                        { "n": { "@id": "p2", "slug": "p2", "name": "Grace" } },
+                    ]),
+                },
+                cx,
+            );
+            let held = at_commit.is_some();
+            let (table, cx) = cx.add_window_view(move |window, cx| {
+                crate::TypeTable::new(
+                    gpui::WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    at_commit,
+                    window,
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            let peek = table.update(cx, |table, cx| table.peek_row(0, cx));
+            let index = peek.read_with(cx, |peek, _| {
+                let index = peek
+                    .groups
+                    .iter()
+                    .position(|group| group.group.direction == Direction::Outgoing)
+                    .unwrap();
+                let group = &peek.groups[index];
+                assert_eq!(group.count, Loadable::Loaded(1), "as the table counted");
+                let first = group.neighbours.loaded().map(|shown| shown[0].clone());
+                if held {
+                    assert_eq!(first.map(|n| n.id).as_deref(), Some("p2"), "the table's");
+                } else {
+                    assert!(first.is_none(), "not the table's, which have no edges");
+                }
+                index
+            });
+            if held {
+                continue;
+            }
+            cx.update(|window, cx| peek.update(cx, |peek, cx| peek.drawn(index, window, cx)));
+            cx.run_until_parked();
+            peek.read_with(cx, |peek, _| {
+                let group = &peek.groups[index];
+                let shown = group.neighbours.loaded().expect("read once drawn");
+                assert_eq!(shown[0].edge_id.as_deref(), Some("e1"), "with its edge");
+                assert!(group.expanded);
+            });
+        }
+    }
+
+    /// On a relationship that holds one neighbour, adding one replaces the one there: until the
+    /// edge it replaces is known, nothing is written, so the addition is never sent alone.
+    #[gpui::test]
+    async fn a_replace_waits_for_the_edge_it_replaces(cx: &mut TestAppContext) {
+        const MENTOR: &str = "node Person {\n  slug: String @key\n  name: String\n}\nedge Mentor: Person -> Person @card(0..1)\n";
+        let (session, _) = session_routing(
+            MENTOR,
+            |request| match request["name"].as_str() {
+                Some("studio_node") => {
+                    json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }])
+                }
+                Some("studio_neighbours") => json!([{ "id": "p2", "edge_id": "e1" }]),
+                _ => json!([]),
+            },
+            cx,
+        );
+        let (view, cx) = page(session, cx);
+        let found = || {
+            Loadable::Loaded(vec![Neighbour {
+                id: "p3".into(),
+                label: None,
+                edge_id: None,
+            }])
+        };
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.holds_one(0), "a person has one mentor");
+            // As a table hands its chips: the neighbour, not its edge.
+            view.groups[0].neighbours = Loadable::Loaded(vec![Neighbour {
+                id: "p2".into(),
+                label: None,
+                edge_id: None,
+            }]);
+            view.start_add(0, window, cx);
+            view.adding.as_mut().unwrap().found = found();
+            view.add_highlighted(window, cx);
+            assert!(view.adding.is_some(), "the search stays open");
+            assert!(view.edge_writes.is_empty(), "nothing is written");
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            assert_eq!(view.replaced_edge(0), Some(Some("e1".to_owned())));
+            view.adding.as_mut().unwrap().found = found();
+            view.add_highlighted(window, cx);
+            assert!(view.adding.is_none());
+            assert!(view.edge_writes.contains(&0), "the replace is written");
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.edge_writes.is_empty()));
+    }
+
+    /// An edge written from a page behind the head shows on the page: its group is read at the
+    /// commit the write reached, while the page stays at its own and offers Refresh.
+    #[gpui::test]
+    async fn an_edge_written_from_a_page_behind_shows_at_its_commit(cx: &mut TestAppContext) {
+        let snapshots = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let seen = snapshots.clone();
+        let (session, _) = session_routing(
+            KNOWS,
+            move |request| match request["name"].as_str() {
+                Some("studio_node") => {
+                    json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }])
+                }
+                Some("studio_neighbours") => {
+                    seen.lock().unwrap().push(request["snapshot"].clone());
+                    json!([])
+                }
+                _ => json!([]),
+            },
+            cx,
+        );
+        let (view, cx) = page(session, cx);
+        let before = snapshots.lock().unwrap().len();
+        view.update_in(cx, |view, window, cx| {
+            // As if another writer committed after the page read c0.
+            view.snapshot = Some("c0".into());
+            view.write_edge(0, EdgeChange::Add("p9".into()), None, window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.newer, "behind the head");
+            assert_eq!(view.snapshot.as_deref(), Some("c0"), "at its own commit");
+        });
+        let after = snapshots.lock().unwrap()[before..].to_vec();
+        assert!(
+            after.contains(&json!("c2")),
+            "read where it was written: {after:?}"
+        );
+        assert!(!after.contains(&json!("c0")), "{after:?}");
+    }
+
+    /// A head the session sees move while a page's node is read is compared once the read pins
+    /// the page: whichever lands first, another view's write to the node offers Refresh.
+    #[gpui::test(iterations = 10)]
+    async fn a_head_moved_while_a_page_is_read_is_compared_once_it_lands(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (view, cx) = page(session.clone(), cx);
+        let schema = session.read_with(cx, |session, _| {
+            assert_eq!(session.head("main"), Some("c1"));
+            session.schema_model().unwrap()
+        });
+        let (ada, ida) = (json!("Ada"), json!("Ida"));
+        let query = builder::update_cell(&schema, "Person", "name", "p1", &ada, &ida).unwrap();
+        view.update(cx, |view, cx| view.refresh(cx));
+        session
+            .update(cx, |session, cx| {
+                session.write(&query, None, "Set name of p1".into(), cx)
+            })
+            .detach();
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.as_deref(), Some("c1"));
+            assert!(view.newer, "its node changed");
+        });
+    }
+
+    /// Reading a page's Blobs again (a refresh) leaves a save to a file going: its slot keeps
+    /// it, and it ends as it would have.
+    #[gpui::test]
+    async fn a_blob_being_saved_goes_on_through_a_refresh(cx: &mut TestAppContext) {
+        const DOCS: &str = "node Person {\n  slug: String @key\n  name: String\n  doc: Blob?\n}\n";
+        let (session, _) = session_routing(
+            DOCS,
+            |request| match request["name"].as_str() {
+                Some("studio_node") => {
+                    json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }])
+                }
+                _ => json!([]),
+            },
+            cx,
+        );
+        let (view, cx) = page(session, cx);
+        let ended = std::rc::Rc::new(std::cell::Cell::new(false));
+        view.update(cx, |view, cx| {
+            assert_eq!(view.blobs.len(), 1, "doc");
+            let done = ended.clone();
+            view.blobs[0].save = Some(SaveState::Saving { done: 0, of: 10 });
+            view.blobs[0]._save = Some(cx.spawn(async move |_, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(10))
+                    .await;
+                done.set(true);
+            }));
+            view.refresh(cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                matches!(view.blobs[0].save, Some(SaveState::Saving { .. })),
+                "its slot shows it"
+            );
+        });
+        cx.executor().advance_clock(Duration::from_millis(10));
+        cx.run_until_parked();
+        assert!(ended.get(), "the save went on");
     }
 }

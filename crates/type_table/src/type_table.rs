@@ -33,7 +33,7 @@ use ui::IconName;
 use blob_view::BlobView;
 use node_page::NodePage;
 use peek::{NodePeek, PeekSubject};
-use table::TypeTable;
+use table::{Opening, TypeTable};
 use text_editor::TextEditor;
 use types_list::TypesList;
 
@@ -119,20 +119,14 @@ pub fn init(cx: &mut App) {
                     }
                 }
             }
-            let table = open_type(workspace, type_name, at_commit, false, window, cx);
-            if let Some(table) = table {
-                table.update(cx, |table, cx| {
-                    if layout != model::ColumnLayout::default() {
-                        table.set_layout(layout, cx);
-                    }
-                    if sort.is_some() {
-                        table.set_sort(sort, cx);
-                    }
-                    if group_by.is_some() {
-                        table.set_grouping(group_by, cx);
-                    }
-                });
-            }
+            // Its first read is the one its order and grouping make.
+            let opening = Opening {
+                filters: Vec::new(),
+                sort,
+                group_by,
+                layout,
+            };
+            open_type(workspace, type_name, at_commit, opening, false, window, cx);
         }
     });
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
@@ -158,27 +152,33 @@ pub fn init(cx: &mut App) {
             open_blob(workspace, action, window, cx);
         });
         workspace.register_action(|workspace, action: &OpenType, window, cx| {
+            let filter = action.filter_id.clone().map(|id| match &action.via {
+                Some(via) => Filter {
+                    property: via.clone(),
+                    op: FilterOp::RelatedTo,
+                    value: Value::String(id),
+                },
+                None => Filter {
+                    property: gq_language::builder::ID_FILTER.into(),
+                    op: FilterOp::Eq,
+                    value: Value::String(id),
+                },
+            });
+            let opening = Opening {
+                filters: filter.clone().into_iter().collect(),
+                ..Opening::default()
+            };
             let table = open_type(
                 workspace,
                 &action.type_name,
                 action.at_commit.clone(),
+                opening,
                 action.preview,
                 window,
                 cx,
             );
-            if let (Some(table), Some(id)) = (table, action.filter_id.clone()) {
-                let filter = match &action.via {
-                    Some(via) => Filter {
-                        property: via.clone(),
-                        op: FilterOp::RelatedTo,
-                        value: Value::String(id),
-                    },
-                    None => Filter {
-                        property: gq_language::builder::ID_FILTER.into(),
-                        op: FilterOp::Eq,
-                        value: Value::String(id),
-                    },
-                };
+            // A tab open already shows only it now; a new one opened with it.
+            if let (Some(table), Some(filter)) = (table, filter) {
                 table.update(cx, |table, cx| table.show_only(filter, cx));
             }
         });
@@ -231,12 +231,13 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-/// Opens a type's table, at the branch head or read-only at a commit, or activates it when it
-/// is open.
+/// Opens a type's table, at the branch head or read-only at a commit, showing what `opening`
+/// says, or activates it when it is open.
 fn open_type(
     workspace: &mut Workspace,
     type_name: &str,
     at_commit: Option<String>,
+    opening: Opening,
     preview: bool,
     window: &mut Window,
     cx: &mut Context<Workspace>,
@@ -260,7 +261,7 @@ fn open_type(
         preview,
         window,
         cx,
-        move |window, cx| TypeTable::new(handle, session, name, at_commit, window, cx),
+        move |window, cx| TypeTable::opening(handle, session, name, at_commit, opening, window, cx),
     )
 }
 
@@ -310,13 +311,15 @@ fn peek_node(
 }
 
 /// Opens a text property in its editor, or shows the tab it is in.
-pub fn open_text_editor(
+fn open_text_editor(
     workspace: &mut Workspace,
     action: &OpenTextEditor,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) -> Option<Entity<TextEditor>> {
-    let session = workspace.session().cloned()?;
+) {
+    let Some(session) = workspace.session().cloned() else {
+        return;
+    };
     let key = TextEditor::key(&action.type_name, &action.id, &action.property);
     let action = action.clone();
     workspace.open_item(key, window, cx, move |window, cx| {
@@ -330,17 +333,19 @@ pub fn open_text_editor(
             window,
             cx,
         )
-    })
+    });
 }
 
 /// Opens a node's page in a tab, or shows the tab it is in.
-pub fn open_node_page(
+fn open_node_page(
     workspace: &mut Workspace,
     action: &OpenNodePage,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) -> Option<Entity<NodePage>> {
-    let session = workspace.session().cloned()?;
+) {
+    let Some(session) = workspace.session().cloned() else {
+        return;
+    };
     let key = NodePage::key(&action.type_name, &action.id, action.at_commit.as_deref());
     let (type_name, id, at_commit) = (
         action.type_name.clone(),
@@ -349,17 +354,19 @@ pub fn open_node_page(
     );
     workspace.open_item(key, window, cx, move |_window, cx| {
         NodePage::new(session, type_name, id, at_commit, cx)
-    })
+    });
 }
 
 /// Opens a Blob value in a tab of its own, or shows the tab it is in.
-pub fn open_blob(
+fn open_blob(
     workspace: &mut Workspace,
     action: &OpenBlob,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) -> Option<Entity<BlobView>> {
-    let session = workspace.session()?.clone();
+) {
+    let Some(session) = workspace.session().cloned() else {
+        return;
+    };
     let cell = graph_client::BlobCell {
         edge: action.edge,
         type_name: action.type_name.clone(),
@@ -370,7 +377,7 @@ pub fn open_blob(
     let key = BlobView::key(&cell, snapshot.as_deref());
     workspace.open_item(key, window, cx, move |window, cx| {
         BlobView::new(session, cell, snapshot, window, cx)
-    })
+    });
 }
 
 /// Undo on a delete's toast (spec 004): reads what the delete commit removed and inserts it

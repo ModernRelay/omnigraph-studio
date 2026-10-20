@@ -118,9 +118,11 @@ pub fn complete(text: &str, value: &str, list: bool) -> String {
     format!("{}, ", parts.join(", "))
 }
 
-/// Whether an offered value is no more than what is typed, so ↵ needs no pick.
+/// Whether an offered value is no more than what is typed, so ↵ needs no pick. Exactly as
+/// typed: an enum's members and a node's id are matched as written, so `active` typed with
+/// `Active` offered takes the offer.
 pub fn already_typed(text: &str, value: &str, list: bool) -> bool {
-    needle(text, list).eq_ignore_ascii_case(value)
+    needle(text, list) == value
 }
 
 #[cfg(test)]
@@ -187,7 +189,11 @@ mod tests {
         assert_eq!(complete("active, pa", "paused", true), "active, paused, ");
         assert_eq!(complete("", "done", true), "done, ");
         assert_eq!(complete("ac", "active", false), "active");
-        assert!(already_typed("active, done", "Done", true));
+        assert!(already_typed("active, done", "done", true));
+        assert!(
+            !already_typed("active, done", "Done", true),
+            "another case is a pick"
+        );
         assert!(!already_typed("do", "done", false));
     }
 }

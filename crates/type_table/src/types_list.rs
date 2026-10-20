@@ -13,8 +13,6 @@ use studio_workspace::{Workspace, WorkspaceEvent};
 use ui::Tooltip;
 use ui::prelude::*;
 
-use crate::model::format_count;
-
 /// One row of the sidebar's list.
 enum Row {
     Ontology,
@@ -224,7 +222,7 @@ impl TypesList {
                     graph_store::EntityKind::Node
                 };
                 let count = match s.count_of(entity, name) {
-                    Some(n) => format_count(n),
+                    Some(n) => studio_ui::group_count(n),
                     None if matches!(s.datasets, Loadable::Loading | Loadable::NotLoaded) => {
                         "…".into()
                     }

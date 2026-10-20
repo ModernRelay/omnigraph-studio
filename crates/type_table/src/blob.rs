@@ -215,9 +215,6 @@ impl RangeSave {
         self.placed = true;
         Ok(self.path.clone())
     }
-
-    /// Stops the save; its part file goes.
-    pub fn abandon(self) {}
 }
 
 impl Drop for RangeSave {
@@ -283,7 +280,8 @@ pub async fn read_value(
 }
 
 /// Saves a managed value to `path` without holding it whole: each range read at `snapshot` is
-/// written off the main thread to a [`RangeSave`], moved into place when complete.
+/// written off the main thread to a [`RangeSave`], moved into place when complete. A save that
+/// stops drops its [`RangeSave`], and its part file goes.
 pub async fn save_value(
     session: WeakEntity<GraphSession>,
     cell: BlobCell,
@@ -302,10 +300,7 @@ pub async fn save_value(
         let chunk = match read_range(&session, &cell, &snapshot, from, size, cx).await {
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
-            Err(error) => {
-                save.abandon();
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let (returned, written) = cx
             .background_spawn(async move {
@@ -315,7 +310,6 @@ pub async fn save_value(
             .await;
         save = returned;
         if let Err(error) = written {
-            save.abandon();
             return Err(format!("Could not write: {error}"));
         }
         progress(save.written(), cx);
@@ -457,7 +451,7 @@ mod tests {
         short.append(b"abc").unwrap();
         assert!(short.finish().is_err());
         assert!(!path.exists() && parts() == 0);
-        RangeSave::begin(path.clone(), 6).unwrap().abandon();
+        drop(RangeSave::begin(path.clone(), 6).unwrap());
         assert_eq!(parts(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }

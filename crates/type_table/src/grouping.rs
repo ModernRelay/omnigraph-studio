@@ -18,12 +18,13 @@
 use std::ops::Range;
 
 use gq_language::builder::{self, GroupKey};
+use gq_language::input::same_value;
 use gq_language::{Filter, FilterOp};
 use graph_client::api::ReadOutput;
 use graph_store::Loadable;
 use serde_json::{Map, Value};
 
-use crate::model::{Paging, same_value};
+use crate::model::Paging;
 
 /// How many values one grouped read returns.
 pub const GROUP_LIMIT: u32 = 200;

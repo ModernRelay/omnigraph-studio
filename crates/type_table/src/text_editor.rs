@@ -10,9 +10,9 @@ use gpui::{
     AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
     StyleRefinement, Subscription, Task, Window,
 };
-use gq_language::input::{edit_text, parse_input};
+use gq_language::input::{edit_text, parse_input, same_value};
 use gq_language::{SchemaModel, builder};
-use graph_store::{DraftKey, GraphSession, Loadable, SessionEvent};
+use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use serde_json::{Value, json};
 use studio_actions::node::SaveText;
@@ -20,7 +20,7 @@ use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 use ui::{Indicator, Tooltip};
 
-use crate::model::{Notice, SaveResult, Tone, node_rows, same_value};
+use crate::model::{Notice, SaveResult, Tone, node_label, node_rows};
 
 /// How long typing must pause before the preview shows the text: each update copies all of
 /// it, and Zed's own markdown preview waits longer.
@@ -300,11 +300,7 @@ impl TextEditor {
     }
 
     fn label_from(&self, values: &serde_json::Map<String, Value>) -> Option<String> {
-        let node = self.schema.as_ref()?.node(&self.type_name)?;
-        let label = node.label_property()?;
-        (Some(label) != node.key.as_deref())
-            .then(|| values.get(label)?.as_str().map(str::to_owned))
-            .flatten()
+        node_label(self.schema.as_ref()?.node(&self.type_name)?, values)
     }
 
     fn text(&self, cx: &App) -> String {
@@ -330,7 +326,8 @@ impl TextEditor {
             return;
         }
         let old = old.clone();
-        let new = match parse_input(&property, &self.text(cx)) {
+        let text = self.text(cx);
+        let new = match parse_input(&property, &text) {
             Ok(value) => value,
             Err(message) => {
                 self.state = State::Failed(Notice::new(Tone::Invalid, message));
@@ -350,6 +347,7 @@ impl TextEditor {
             &self.property,
             &old,
             &new,
+            None,
             cx,
         ) {
             Ok(write) => write,
@@ -361,35 +359,45 @@ impl TextEditor {
         };
         self.state = State::Saving;
         let branch = self.branch.clone();
+        let session = self.session.clone();
+        let key = DraftKey {
+            type_name: self.type_name.clone(),
+            id: self.id.clone(),
+            property: self.property.clone(),
+        };
         // Detached: closing the tab never cancels a write.
         cx.spawn_in(window, async move |this, cx| {
             let result = write.await;
-            this.update(cx, |this, cx| {
-                this.state = match result {
+            let shown = this.update(cx, |this, cx| {
+                this.state = match &result {
                     SaveResult::Saved { .. } => {
                         // Typing while it was written stays unsaved.
                         this.set_old(Loadable::Loaded(new));
                         this.unsaved = this.differs(cx);
                         // A draft kept for the property elsewhere on the branch written is now
                         // saved too, though the window moved to another branch meanwhile.
-                        let key = DraftKey {
-                            type_name: this.type_name.clone(),
-                            id: this.id.clone(),
-                            property: this.property.clone(),
-                        };
                         this.session
                             .update(cx, |session, cx| session.remove_draft_on(&branch, &key, cx));
                         State::Saved
                     }
                     SaveResult::NoMatch => State::Conflict,
                     SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
-                        State::Failed(notice)
+                        State::Failed(notice.clone())
                     }
                 };
                 cx.emit(ItemEvent::UpdateTab);
                 cx.notify();
-            })
-            .ok();
+            });
+            // The tab closed while the text was written: a draft of the property on the branch
+            // written is let go when it landed, and holds the text when it did not.
+            if shown.is_err() {
+                session.update(cx, |session, cx| match result {
+                    SaveResult::Saved { .. } => {
+                        session.remove_draft_on(&branch, &key, cx);
+                    }
+                    _ => session.set_draft_on(&branch, key, DraftEntry { old, text }, cx),
+                });
+            }
         })
         .detach();
         cx.notify();
@@ -876,5 +884,31 @@ mod tests {
             assert_eq!(view.text(cx), "Ada Lovelace");
             assert!(view.is_dirty(cx));
         });
+    }
+
+    /// The tab closed while its text was written: refused, the text is kept as the property's
+    /// draft, bound to the value it was read at, which a table of the type shows.
+    #[gpui::test]
+    async fn a_refused_text_whose_tab_closed_is_kept_as_a_draft(cx: &mut TestAppContext) {
+        let refused = json!({ "error": "policy denied", "code": "forbidden" });
+        let (view, cx) = editor_answering(403, refused, cx);
+        let session = view.read_with(cx, |view, _| view.session.clone());
+        view.update_in(cx, |view, window, cx| view.save(&SaveText, window, cx));
+        drop(view);
+        cx.update(|window, _| window.remove_window());
+        cx.run_until_parked();
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        let draft = session.read_with(cx, |session, _| session.draft(&key).cloned());
+        assert_eq!(
+            draft,
+            Some(DraftEntry {
+                old: json!("Ada"),
+                text: "Ada Lovelace".into(),
+            })
+        );
     }
 }

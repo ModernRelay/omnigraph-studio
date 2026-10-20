@@ -17,6 +17,8 @@ pub struct NodePage {
     type_name: String,
     id: String,
     at_commit: Option<String>,
+    /// The tab as it was last told: its title, and whether it says newer data.
+    tab: (String, bool),
     focus_handle: FocusHandle,
     _subscription: Subscription,
 }
@@ -33,16 +35,27 @@ impl NodePage {
             let (type_name, id, at_commit) = (type_name.clone(), id.clone(), at_commit.clone());
             cx.new(|cx| NodePeek::page(session, type_name, id, at_commit, cx))
         };
-        // The tab's title is the node's label once it is read, and its dot says newer data.
-        let subscription = cx.observe(&view, |_, _, cx| {
-            cx.emit(ItemEvent::UpdateTab);
-            cx.notify();
+        // The tab's title is the node's label once it is read, and its dot says newer data:
+        // the tab is told when either changes, not at each change of the view, which draws
+        // itself.
+        let subscription = cx.observe(&view, |this, view, cx| {
+            let view = view.read(cx);
+            let tab = (view.title(), view.is_newer());
+            if tab != this.tab {
+                this.tab = tab;
+                cx.emit(ItemEvent::UpdateTab);
+            }
         });
+        let tab = {
+            let view = view.read(cx);
+            (view.title(), view.is_newer())
+        };
         Self {
             view,
             type_name,
             id,
             at_commit,
+            tab,
             focus_handle: cx.focus_handle(),
             _subscription: subscription,
         }
