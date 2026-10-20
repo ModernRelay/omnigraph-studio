@@ -206,7 +206,7 @@ impl SchemaModel {
         let shape = compile_schema_shape(&file).map_err(|e| e.to_string())?;
         let catalog = build_catalog(&file).map_err(|e| e.to_string())?;
 
-        let nodes = shape
+        let nodes: Vec<NodeType> = shape
             .nodes
             .iter()
             .map(|node| {
@@ -228,7 +228,7 @@ impl SchemaModel {
                 }
             })
             .collect();
-        let edges = shape
+        let edges: Vec<EdgeType> = shape
             .edges
             .iter()
             .map(|edge| {
@@ -246,8 +246,6 @@ impl SchemaModel {
                 }
             })
             .collect();
-        let nodes: Vec<NodeType> = nodes;
-        let edges: Vec<EdgeType> = edges;
         let node_index = nodes
             .iter()
             .enumerate()

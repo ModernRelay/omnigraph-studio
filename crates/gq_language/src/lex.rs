@@ -360,18 +360,23 @@ pub fn outline(source: &str) -> Outline {
     };
     outline.prefix = 0..tokens[first].range.start;
 
-    match text(&tokens[first]) {
+    // A statement is told by its words, whatever comments sit between them.
+    let words: Vec<&Token> = tokens[first..]
+        .iter()
+        .filter(|token| token.kind != TokenKind::Comment)
+        .collect();
+    match text(words[0]) {
         "show" => {
             outline.statement = Some(Statement::Read);
             return outline;
         }
         "branch" => {
-            let verb = tokens.get(first + 1);
+            let verb = words.get(1).copied();
             let rest = verb.map_or("", |verb| &source[verb.range.start..]);
             // `merge-base` is one word to the server; `dry run` ends a merge that writes nothing.
-            let dry_run = tokens[first..]
+            let dry_run = words
                 .windows(2)
-                .any(|pair| text(&pair[0]) == "dry" && text(&pair[1]) == "run");
+                .any(|pair| text(pair[0]) == "dry" && text(pair[1]) == "run");
             let reads = rest.starts_with("merge-base")
                 || matches!(verb.map(text), Some("list" | "diff"))
                 || (verb.map(text) == Some("merge") && dry_run);
@@ -390,15 +395,16 @@ pub fn outline(source: &str) -> Outline {
             outline.statement = Some(Statement::Load);
             return outline;
         }
-        "explain" if tokens.get(first + 1).map(text) == Some("load") => {
+        "explain" if words.get(1).map(|word| text(word)) == Some("load") => {
             outline.statement = Some(Statement::ExplainLoad);
             return outline;
         }
         _ => {}
     }
 
-    // `query` and its name begin a declaration even inside one left unclosed: a missing `}`
-    // ends that one there rather than swallowing every declaration after it.
+    // `query`, a name and `(` begin a declaration even inside one left unclosed: a missing `}`
+    // ends that one there rather than swallowing every declaration after it. Inside a body,
+    // `query` can be a property (`order { query asc }`), which no `(` follows.
     let declares = |at: usize| {
         tokens
             .get(at)
@@ -406,6 +412,7 @@ pub fn outline(source: &str) -> Outline {
             && tokens
                 .get(at + 1)
                 .is_some_and(|t| t.kind == TokenKind::QueryName)
+            && tokens.get(at + 2).is_some_and(|t| text(t) == "(")
     };
     let mut depth = 0usize;
     let mut current: Option<(usize, bool, String)> = None;
@@ -684,20 +691,22 @@ mod tests {
         assert_eq!(outline.declarations[0].range, 0..source.len());
         assert_eq!(outline.declaration_at(source.len()).unwrap().name, "a");
         // ...or to the next declaration, which it does not swallow.
-        let source = "query a() { match { $p: Person } return { $p.name
-
-            query b() { match { $p: Person } return { $p } }
+        let source = "query a() { match { $p: Person } return { $p.name\n\n\
+            query b() { match { $p: Person } return { $p } }\n\
             explain query c() { match { $p: Person } return { $p } }";
         let declarations = super::outline(source).declarations;
         let names: Vec<&str> = declarations.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, ["a", "b", "c"]);
         assert_eq!(declarations[0].range.end, source.find("query b").unwrap());
         assert!(declarations[2].explained);
-        let unclosed = "query a() { match {
-explain query b() { match { $p: Person } return { $p } }";
+        let unclosed =
+            "query a() { match {\nexplain query b() { match { $p: Person } return { $p } }";
         let declarations = super::outline(unclosed).declarations;
         assert_eq!(declarations[0].range.end, unclosed.find("explain").unwrap());
         assert!(declarations[1].explained);
+        // A property named `query` is no declaration.
+        let ordered = "query a() { match { $s: Search } return { $s.query } order { query asc }";
+        assert_eq!(super::outline(ordered).declarations.len(), 1);
     }
 
     #[test]
@@ -736,6 +745,16 @@ explain query b() { match { $p: Person } return { $p } }";
             Some(Statement::Write)
         );
         assert!(outline("").declarations.is_empty());
+        // Comments between a statement's words do not change what it is.
+        assert_eq!(
+            outline("branch /* all of them */ list").statement,
+            Some(Statement::Read)
+        );
+        assert_eq!(
+            outline("explain // the plan\nload csv \"s3://b/p.csv\" into node:Person mode append")
+                .statement,
+            Some(Statement::ExplainLoad)
+        );
     }
 
     #[test]

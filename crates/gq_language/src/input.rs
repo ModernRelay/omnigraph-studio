@@ -74,8 +74,8 @@ const EMPTY_LIST: &str = "[]";
 
 /// The items of a list as typed: separated by commas, each trimmed unless quoted; a quoted item
 /// keeps its text, a doubled quote standing for one. Items left empty between commas are
-/// dropped. A cell and a list parameter read one alike.
-pub(crate) fn list_items(text: &str) -> Result<Vec<String>, String> {
+/// dropped. A cell, a list parameter and a list filter read one alike.
+pub fn list_items(text: &str) -> Result<Vec<String>, String> {
     let mut items = Vec::new();
     let mut chars = text.chars().peekable();
     loop {
@@ -145,7 +145,7 @@ pub fn parse_scalar(property: &Property, text: &str) -> Result<Value, String> {
         ScalarKind::Bool => boolean(trimmed).ok_or_else(|| "Enter true or false".into()),
         ScalarKind::Date if begins_a_date(trimmed) => Ok(Value::String(trimmed.to_owned())),
         ScalarKind::Date => Err("Enter a date as YYYY-MM-DD".into()),
-        ScalarKind::DateTime if begins_a_date(trimmed) => Ok(Value::String(trimmed.to_owned())),
+        ScalarKind::DateTime if begins_a_date(trimmed) => Ok(Value::String(date_time(trimmed))),
         ScalarKind::DateTime => Err("Enter a date and time as YYYY-MM-DD HH:MM:SS".into()),
         ScalarKind::Vector | ScalarKind::Blob => {
             Err(format!("{} cannot be edited here", property.name))
@@ -198,12 +198,20 @@ pub(crate) enum FloatError {
 /// one: an `F32` must stay finite once narrowed.
 pub(crate) fn float(base_type: &str, text: &str) -> Result<Value, FloatError> {
     let value: f64 = text.parse().map_err(|_| FloatError::NotANumber)?;
+    // `NaN` and `inf` parse, but are no number JSON holds.
+    let number = serde_json::Number::from_f64(value).ok_or(FloatError::NotANumber)?;
     if base_type == "F32" && !(value as f32).is_finite() {
         return Err(FloatError::OutOfRange);
     }
-    serde_json::Number::from_f64(value)
-        .map(Value::Number)
-        .ok_or(FloatError::NotANumber)
+    Ok(Value::Number(number))
+}
+
+/// What a cell's or field's text asks for: nothing while it is the text its editor was filled
+/// with ([`edit_text`] of `old`), so a value left alone stays as it is, even one its text cannot
+/// say again (an empty text, a null in a list, a number past what an input parses); else the
+/// value typed, or why the text is not one.
+pub fn typed(property: &Property, old: &Value, text: &str) -> Option<Result<Value, String>> {
+    (text != edit_text(old)).then(|| parse_input(property, text))
 }
 
 /// Whether text can be a date or a time the engine reads: every spelling it takes
@@ -212,6 +220,21 @@ pub(crate) fn float(base_type: &str, text: &str) -> Result<Value, FloatError> {
 pub(crate) fn begins_a_date(text: &str) -> bool {
     let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
     digits.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// A time typed with a space or a `t` between its date and its time (`2024-01-02 10:00:00`)
+/// spelled with the `T` the engine writes: the engine reads both alike, and values compared
+/// here as text then order as the engine orders them.
+pub(crate) fn date_time(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let dated = bytes.len() > 10
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[7] == b'-';
+    match bytes.get(10) {
+        Some(b' ' | b't') if dated => format!("{}T{}", &text[..10], text[11..].trim_start()),
+        _ => text.to_owned(),
+    }
 }
 
 /// `true`, `yes` or `1`, and `false`, `no` or `0`, in any case.
@@ -328,7 +351,11 @@ mod tests {
     #[test]
     fn dates_and_times_go_as_typed() {
         let at = property(ScalarKind::DateTime, "DateTime");
-        for typed in ["2024-01-02T10:00:00Z", "2024-01-02 10:00:00", "2024-01-02"] {
+        for typed in [
+            "2024-01-02T10:00:00Z",
+            "2024-01-02T10:00:00+02:00",
+            "2024-01-02",
+        ] {
             assert_eq!(parse_scalar(&at, typed), Ok(Value::String(typed.into())));
         }
         let on = property(ScalarKind::Date, "Date");
@@ -336,6 +363,11 @@ mod tests {
         // A word is no date in any spelling.
         assert!(parse_scalar(&on, "yesterday").is_err());
         assert!(parse_scalar(&at, "soon").is_err());
+        // A space before the time is spelled as the engine writes it, so text orders as times.
+        assert_eq!(
+            parse_scalar(&at, "2024-01-02 10:00:00"),
+            Ok(json!("2024-01-02T10:00:00"))
+        );
     }
 
     /// A cell takes a whole number in its type's range, as a query parameter does.

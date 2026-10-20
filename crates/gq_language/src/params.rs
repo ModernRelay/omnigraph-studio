@@ -78,8 +78,9 @@ fn scalar(name: &str, type_name: &str, text: &str) -> Result<Value, String> {
     match type_name {
         "String" | "Blob" => Ok(Value::String(text.to_owned())),
         // As a cell's: the engine reads a date or a time in more spellings than one.
-        "Date" | "DateTime" if crate::input::begins_a_date(trimmed) => {
-            Ok(Value::String(trimmed.to_owned()))
+        "Date" if crate::input::begins_a_date(trimmed) => Ok(Value::String(trimmed.to_owned())),
+        "DateTime" if crate::input::begins_a_date(trimmed) => {
+            Ok(Value::String(crate::input::date_time(trimmed)))
         }
         "Date" => Err(format!("${name} must be a date as YYYY-MM-DD")),
         "DateTime" => Err(format!(
@@ -131,7 +132,7 @@ mod tests {
         );
         assert_eq!(
             param_value("t", "DateTime", false, "2024-01-02 10:00:00"),
-            Ok(Some(json!("2024-01-02 10:00:00")))
+            Ok(Some(json!("2024-01-02T10:00:00")))
         );
         // As the engine takes them: U64 up to i64's maximum, and an F32 that stays finite.
         assert!(param_value("n", "U64", false, &u64::MAX.to_string()).is_err());

@@ -1019,6 +1019,35 @@ pub fn node_by_id(
     })
 }
 
+/// Nodes of one type by `@id`, in one read: a row each, as [`node_by_id`] gives one, for those
+/// that exist.
+pub fn nodes_by_id(
+    schema: &SchemaModel,
+    type_name: &str,
+    ids: &[String],
+) -> Result<BuiltQuery, BuildError> {
+    let node = node(schema, type_name)?;
+    let depends = Depends::Types {
+        nodes: vec![node.name.clone()],
+        edges: Vec::new(),
+    };
+    let mut params = Params::new();
+    let wanted = params.add("ids", "[String]", Value::from(ids.to_vec()));
+    let text = format!(
+        "query studio_nodes({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id in {wanted}\n  }}\n  return {{ $n }}\n  limit {limit}\n}}\n",
+        sig = params.signature(),
+        ty = node.name,
+        limit = ids.len().max(1),
+    );
+    Ok(BuiltQuery {
+        name: "studio_nodes".into(),
+        text,
+        params: params.values,
+        depends,
+        seeds: None,
+    })
+}
+
 /// The column a property is read into by [`node_fields_by_id`] and [`node_page_fields`].
 pub fn field_column(property: &str) -> String {
     format!("v_{property}")
@@ -1099,11 +1128,15 @@ fn hop<'a>(
     near: &str,
     far: &str,
 ) -> (&'a str, &'a str, String) {
-    let (from, to) = match direction {
+    let (near_type, far_type) = match direction {
         Direction::Outgoing => (&edge.from, &edge.to),
         Direction::Incoming => (&edge.to, &edge.from),
     };
-    (from, to, oriented(direction, near, &edge.traversal(), far))
+    (
+        near_type,
+        far_type,
+        oriented(direction, near, &edge.traversal(), far),
+    )
 }
 
 /// A traversal from `near` to `far` along `edge` (its token, with any `$e:` binding), written
@@ -3325,6 +3358,11 @@ mod tests {
         let query = node_by_id(&schema, "Person", "person-000000").unwrap();
         assert_compiles(&query);
         assert_eq!(query.params["id"], json!("person-000000"));
+        let ids = ["person-000000".to_owned(), "person-000001".to_owned()];
+        let query = nodes_by_id(&schema, "Person", &ids).unwrap();
+        assert_compiles(&query);
+        assert_eq!(query.params["ids"], json!(ids));
+        assert!(query.text.contains("limit 2"), "{}", query.text);
     }
 
     #[test]

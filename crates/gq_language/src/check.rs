@@ -1,5 +1,6 @@
 //! Diagnostics and result types for `.gq` source, from `omnigraph-compiler` (spec 007).
 
+use omnigraph_compiler::error::CompilerError;
 use omnigraph_compiler::query::ast::Expr;
 use omnigraph_compiler::query::ast::FileBody;
 use omnigraph_compiler::query::diagnostic::QueryDiagnostic;
@@ -129,6 +130,20 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
         | FileBody::Load(_)
         | FileBody::ExplainLoad(_) => return result,
     };
+    // A compiler error as a problem of the declaration it is in.
+    let problem = |error: &CompilerError, name: &str| match error.diagnostic() {
+        Some(diagnostic) => Diagnostic::from_compiler(diagnostic, Some(name)),
+        None => Diagnostic {
+            code: "error".into(),
+            message: error.to_string(),
+            fix: None,
+            line: None,
+            column: None,
+            byte: None,
+            query: Some(name.to_owned()),
+            edits: Vec::new(),
+        },
+    };
     for decl in &decls {
         let info = QueryInfo {
             name: decl.name.clone(),
@@ -163,43 +178,35 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
                         .collect(),
                     CheckedQuery::Mutation(_) => Vec::new(),
                 };
-                if !info.is_mutation
-                    && let Ok(operation) = describe_query_operation(&schema.catalog, decl)
-                {
-                    info.columns = operation
-                        .result
-                        .iter()
-                        .map(|field| {
-                            let node_type = node_types
+                if !info.is_mutation {
+                    match describe_query_operation(&schema.catalog, decl) {
+                        Ok(operation) => {
+                            info.columns = operation
+                                .result
                                 .iter()
-                                .find(|(name, _)| *name == field.name)
-                                .map(|(_, ty)| ty.clone());
-                            ResultColumn {
-                                name: field.name.clone(),
-                                kind: kind_label(field, node_type.as_deref()),
-                                nullable: field.nullable,
-                                node_type,
-                            }
-                        })
-                        .collect();
+                                .map(|field| {
+                                    let node_type = node_types
+                                        .iter()
+                                        .find(|(name, _)| *name == field.name)
+                                        .map(|(_, ty)| ty.clone());
+                                    ResultColumn {
+                                        name: field.name.clone(),
+                                        kind: kind_label(field, node_type.as_deref()),
+                                        nullable: field.nullable,
+                                        node_type,
+                                    }
+                                })
+                                .collect();
+                        }
+                        // Checked, but the compiler cannot describe what it returns (a traversal
+                        // no binding starts, a list nested in a list): it would fail when run.
+                        Err(error) => result.diagnostics.push(problem(&error, &decl.name)),
+                    }
                 }
                 result.queries.push(info);
             }
             Err(error) => {
-                let diagnostic = match error.diagnostic() {
-                    Some(diagnostic) => Diagnostic::from_compiler(diagnostic, Some(&decl.name)),
-                    None => Diagnostic {
-                        code: "error".into(),
-                        message: error.to_string(),
-                        fix: None,
-                        line: None,
-                        column: None,
-                        byte: None,
-                        query: Some(decl.name.clone()),
-                        edits: Vec::new(),
-                    },
-                };
-                result.diagnostics.push(diagnostic);
+                result.diagnostics.push(problem(&error, &decl.name));
                 result.queries.push(info);
             }
         }

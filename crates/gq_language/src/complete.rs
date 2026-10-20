@@ -254,7 +254,8 @@ fn bindings(
             continue;
         };
         let name = &text[token.range.start + 1..token.range.end];
-        let target = &text[target.range.clone()];
+        // A reserved word is quoted as a binding's edge (`$e:"in"`).
+        let target = text[target.range.clone()].trim_matches('"');
         let type_name = if schema.node(target).is_some() || schema.edge(target).is_some() {
             target.to_owned()
         } else if let Some(edge) = schema
@@ -369,7 +370,16 @@ pub fn hover(schema: &SchemaModel, source: &str, offset: usize) -> Option<(Range
             match properties.iter().find(|p| p.name == word) {
                 Some(property) => format!("{ty}.{word}: {}", property.display_type()),
                 None if word == "@id" => format!("{ty}.@id: String · the row's id"),
-                None => return None,
+                None => match (schema.edge(&ty), word) {
+                    (Some(edge), "@src") => {
+                        format!("{ty}.@src: String · the id of the {} it leaves", edge.from)
+                    }
+                    (Some(edge), "@dst") => {
+                        format!("{ty}.@dst: String · the id of the {} it reaches", edge.to)
+                    }
+                    (Some(_), "@type") => format!("{ty}.@type: String · the edge's type"),
+                    _ => return None,
+                },
             }
         }
         TokenKind::Type => {
@@ -426,6 +436,19 @@ mod tests {
         let node = labels("query q() { match { $p: Person } return { $p.");
         assert!(node.iter().any(|label| label == "@id"));
         assert!(!node.iter().any(|label| label == "@src"), "{node:?}");
+        // An edge named by a reserved word is bound in quotes, and is still an edge.
+        let schema = SchemaModel::parse(
+            "node Team {\n  slug: String @key\n}\nnode Person {\n  slug: String @key\n}\n\
+             edge In: Person -> Team {\n  since: Date?\n}\n",
+        )
+        .unwrap();
+        let source = "query q() { match { $p: Person  $p $e:\"in\" $t } return { $e.";
+        let (_, items) = completions(&schema, source, source.len());
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert!(
+            labels.contains(&"since") && labels.contains(&"@src"),
+            "{labels:?}"
+        );
         // Begun with `@`, the field is completed from its name, the `@` replaced with it.
         let source = "query q() { match { $a $e:worksAt $b } return { $e.@s";
         let (start, items) = completions(&dev(), source, source.len());
