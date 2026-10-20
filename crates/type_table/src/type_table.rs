@@ -37,8 +37,11 @@ use table::{Opening, TypeTable};
 use text_editor::TextEditor;
 use types_list::TypesList;
 
-/// Registers this surface with every new workspace: the left dock's Types panel, `OpenType`,
-/// and `OpenNode`. Its keys are in `assets/keymaps/` (`TypeTable`, `TypeTable && editing`).
+/// Registers this surface: the tabs it restores (a type's table, a node's page, a Blob, a long
+/// text), and with every new workspace the left dock's Graph panel, the bottom dock's Nodes
+/// panel, and the actions that open what it shows (`OpenType`, `OpenNode`, `OpenNodePage`,
+/// `PeekNode`, `OpenBlob`, `OpenTextEditor`, `UndoDelete`). Its keys are in `assets/keymaps/`
+/// (`TypeTable`, `TypeTable && editing`).
 pub fn init(cx: &mut App) {
     // A Blob tab comes back with the value it showed, at the same commit.
     studio_workspace::register_item_kind(cx, "blob", |data, workspace, window, cx| {

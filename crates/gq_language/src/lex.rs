@@ -33,7 +33,8 @@ pub enum TokenKind {
 
 impl TokenKind {
     /// The theme's syntax style a token takes, by the names Zed's themes define; `None` for
-    /// plain text. The query editor and every read-only view of a query share it.
+    /// plain text. A read-only view of a query, which holds no buffer to parse (the agent
+    /// panel's query cards), is coloured by it; the query editor colours from its syntax tree.
     pub fn syntax_name(self) -> Option<&'static str> {
         Some(match self {
             TokenKind::Keyword => "keyword",

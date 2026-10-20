@@ -1,4 +1,4 @@
-//! One OmniGraph server: its client, contract check, capabilities and graphs (spec 003).
+//! One OmniGraph server: its client, contract and version check, and graphs (spec 003).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

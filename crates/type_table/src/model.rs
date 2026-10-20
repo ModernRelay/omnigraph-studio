@@ -413,7 +413,8 @@ pub fn field_rows(rows: &Value) -> Vec<Row> {
         .collect()
 }
 
-/// Rows of `edge_page`: `edge_id`, `from_id`, `to_id` and `e_<property>` columns.
+/// Rows of an edge page (`builder::edge_page_without`): `edge_id`, `from_id`, `to_id` and
+/// `e_<property>` columns.
 pub fn edge_rows(edge: &EdgeType, rows: &Value) -> Vec<Row> {
     let Some(rows) = rows.as_array() else {
         return Vec::new();

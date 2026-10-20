@@ -2702,7 +2702,8 @@ impl NodePeek {
         self.load_group_at(index, snapshot, false, true, cx);
     }
 
-    /// ⌘S: the node's drafts as one mutation, bound to the values the view shows, so one commit.
+    /// ⌘S: the node's drafts as one mutation, each bound to the value it was typed over, so one
+    /// commit.
     /// A draft that does not parse opens instead, and nothing is sent.
     fn save_drafts(&mut self, _: &SaveNodeDrafts, window: &mut Window, cx: &mut Context<Self>) {
         if self.saving_drafts || !self.edits_relationships() {

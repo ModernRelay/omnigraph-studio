@@ -166,7 +166,7 @@ fn open_schema(
     }
 }
 
-/// Registers `NewQuery` with every new workspace and binds the editor's keys.
+/// Registers `NewQuery` with every new workspace. The editor's keys are in `assets/keymaps/`.
 pub fn init(cx: &mut App) {
     studio_workspace::register_item_kind(cx, "query", |data, workspace, window, cx| {
         let Some(session) = workspace.session().cloned() else {

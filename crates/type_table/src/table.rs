@@ -89,7 +89,8 @@ enum CellState {
 struct Editing {
     row_id: String,
     column: String,
-    /// The value the cell showed: the save is bound to it.
+    /// The value the edit is bound to: the cell's draft's, the value it was typed over, else
+    /// what the cell showed.
     old: Value,
     notice: Option<Notice>,
 }
@@ -3705,13 +3706,19 @@ impl TypeTable {
     }
 
     /// An edit closed without being saved: its text is kept as the cell's draft when it
-    /// changed anything, and the draft goes when it was typed back to what the cell holds.
+    /// changed anything, and the draft goes when it was typed back to what the cell holds. A
+    /// change is one of value, as the peek and a save judge it: `1.50` typed over `1.5` asks
+    /// for nothing; text that does not parse is kept, to be corrected.
     fn keep_edit(&mut self, editing: Editing, cx: &mut Context<Self>) {
         let text = self.cell_editor.read(cx).text(cx);
+        let changes = match self.property_of(&editing.column) {
+            Some(property) => edited(&property, &editing.old, &text).is_some(),
+            None => text != edit_text(&editing.old),
+        };
         // Typed back to the value it is bound to, over another the row shows since, it asks
         // for that value back: a change.
         let shows_old = self.row_shows(&editing.row_id, &editing.column, &editing.old);
-        if text != edit_text(&editing.old) || editing.notice.is_some() || !shows_old {
+        if changes || editing.notice.is_some() || !shows_old {
             self.put_draft(
                 &editing.row_id,
                 &editing.column,
@@ -4667,7 +4674,7 @@ impl TypeTable {
         let saving = self.drafts.saving;
         let focus = self.focus_handle.clone();
         let save_tooltip = format!(
-            "One commit to {}; each row is bound to the values it shows",
+            "One commit to {}; each draft is bound to the value it was typed over",
             self.branch
         );
         // The canvas's floating bar: its text at a control's inset, its buttons the bar's.

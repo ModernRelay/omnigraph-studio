@@ -331,7 +331,7 @@ pub struct QueryEditor {
     at_commit: Option<String>,
     editor: Entity<Editor>,
     /// The buffer parses as GQ (`syntax`): colours, brackets, indents and folds follow the
-    /// syntax tree. Without it, words are coloured lexically.
+    /// syntax tree. Until then the text is plain.
     parsed: bool,
     /// The latest check; it lags the text by `CHECK_DELAY`.
     analysis: Option<Arc<Analysis>>,

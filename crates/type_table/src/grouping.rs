@@ -68,7 +68,7 @@ impl Section {
     }
 }
 
-/// A grouped grid's lines, as [`Grouping::lines`] lists them, held per section rather than per
+/// A grouped grid's lines, as [`Grouping::line_map`] lays them out, held per section rather than per
 /// row: the grid lays them out each frame, and an open section can hold thousands of rows.
 #[derive(Debug, Clone, Default)]
 pub struct Lines {
@@ -358,8 +358,8 @@ impl Grouping {
         lines
     }
 
-    /// The line showing a row, while its section is open: counted as [`Self::lines`] lays them
-    /// out, without making them.
+    /// The line showing a row, while its section is open: counted as [`Self::line_map`] lays
+    /// them out, without making them.
     pub fn line_of_row(&self, row: usize) -> Option<usize> {
         let mut line = 0;
         for section in self.sections() {

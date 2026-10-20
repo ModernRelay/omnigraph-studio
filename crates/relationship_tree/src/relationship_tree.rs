@@ -51,7 +51,7 @@ const INDENT: f32 = studio_ui::ds::space::LG;
 const LEFT_PAD: f32 = studio_ui::ds::space::MD;
 const DISCLOSURE: f32 = studio_ui::ds::size::DISCLOSURE;
 
-/// Registers the tree's keys and adds the "Explore" panel to every workspace.
+/// Adds the "Explore" panel to every workspace. The tree's keys are in `assets/keymaps/`.
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else {
