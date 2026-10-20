@@ -7919,11 +7919,11 @@ mod tests {
         table.read_with(cx, |table, _| assert_eq!(table.saves_in_flight, 0));
     }
 
-    /// A short batch reads its rows again at the head in one read: a draft whose value is there
-    /// landed and goes; one whose row holds another value now is kept, bound to it, which the
-    /// cell shows. A draft retyped elsewhere while the read was out stands as it is.
+    /// A batch reads its rows again at the head in one read: a draft whose value is there landed
+    /// and goes; one whose row holds another value now is kept, bound to it, which the cell
+    /// shows. A draft retyped elsewhere while the read was out stands as it is.
     #[gpui::test]
-    async fn a_short_batch_reads_its_rows_again_in_one_read(cx: &mut TestAppContext) {
+    async fn a_batch_reads_its_rows_again_in_one_read(cx: &mut TestAppContext) {
         cx.update(|cx| {
             studio_theme::init_test(cx);
             editor::init(cx);

@@ -1556,7 +1556,8 @@ impl ReviewView {
                     let commit = commit.map(|c| c.graph_commit_id);
                     this.update(cx, |this, cx| {
                         // Known gone as soon as the merge says so, while what it took is
-                        // checked: a fix asked for meanwhile is refused for that reason.
+                        // checked: a fix asked for meanwhile is refused for that reason. It has
+                        // no head to watch, and its review is not opened again with the window.
                         if matches!(deleted, Some(Ok(()))) {
                             this._head_watch = None;
                             this.branch_deleted = true;
@@ -1616,18 +1617,6 @@ impl ReviewView {
                 // outcome nobody knows, the branch may be gone too.
                 if matches!(state, MergeState::Unknown { .. }) {
                     this.session.update(cx, |s, cx| s.reload_branches(cx));
-                }
-                // A branch deleted by the merge has no head to watch, and its review is not
-                // opened again with the window.
-                if matches!(
-                    state,
-                    MergeState::Merged {
-                        deleted: Some(Ok(())),
-                        ..
-                    }
-                ) {
-                    this._head_watch = None;
-                    this.branch_deleted = true;
                 }
                 this.merge = state;
                 this.writes_settled(cx);

@@ -126,7 +126,10 @@ Four parts, built in this order; each lands on its own.
   commit, bound to the values it shows; Discard asks once). A table's cells read the same
   drafts, through a view it rebuilds from the session when they change, so a draft typed on a
   page shows in the type's table and the reverse, and saving it anywhere lets it go everywhere;
-  the text editor's save lets the property's draft go too. Opening a cell or a field no longer
+  the text editor's save lets the property's draft go too. A save, or the read after one that
+  matched nothing, settles a draft only while it is as the save sent it: one retyped or let go
+  in another view during the round trip stands, and nothing reopens over it
+  (`GraphSession::settle_draft_on`). Opening a cell or a field no longer
   takes its draft, so Esc ends the edit and keeps it; switching branch keeps each branch's
   drafts for when it is shown again (they were dropped before).
 - **One draft per branch**, the `graph_store::Draft` that `docs/architecture.md` describes:
@@ -253,6 +256,7 @@ Four parts, built in this order; each lands on its own.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-20 | A draft retyped elsewhere while its save is out stands | `graph_store` `drafts_wait_with_their_branch` (settled only as it went out); `type_table` `a_save_that_lands_after_a_branch_switch_keeps_the_new_branchs_draft` (a landed and a refused cell save over a retyped draft), `a_batch_reads_its_rows_again_in_one_read` and `peek` `a_conflict_is_bound_to_the_value_read_at_the_head` (a batch's and a node's drafts read again) | The retyped draft keeps its text after the save lands or is refused, and no editor reopens over it; a draft unchanged since the save settles as before |
 | 2026-10-18 | A node's relationship groups are read as their rows are drawn | `type_table` `only_the_groups_drawn_are_read_and_scrolling_reads_the_rest_once` (60 groups on a 480 × 360 page, then scrolled to the end), `a_peek_reads_only_what_the_table_did_not`, `relationships_with_none_fold_away_until_asked_for`; offscreen snapshots against a local server holding a made-up graph whose Person takes part in 72 relationship groups, with the server's read requests counted | The table alone took 13 requests and the table with a row's peek 37, where the peek used to read all 72 groups and the node. Opening the page took 31 requests; scrolled to its end, 79, each group read once. Groups read as empty kept their rows, and small ones opened once read |
 | 2026-10-17 | A node lists only the relationships it has | `type_table` `relationships_with_none_fold_away_until_asked_for` (not counted, with neighbours, with none, a failed count, a write out, the row open, adding with it closed); offscreen snapshots of Leslie Wirth's page, then with Empty opened | Three groups with neighbours, then "Empty 1"; opened, `contributes Project` with "+" and 0 appeared under it and the rows above stayed where they were |
 | 2026-10-16 | One draft per branch, shared by tables and pages | `graph_store` `drafts_wait_with_their_branch`; `type_table` `a_field_left_changed_is_a_draft_the_table_shows_and_save_lands` (a page's draft in the type's table, ⌘S on the page: one commit, gone from both), and the table's own tests unchanged; an offscreen snapshot of Project Fable 36 with name left changed | "Project Fable 36 (draft)" with a dot and "1 change not saved · Discard · Save" under the title |
