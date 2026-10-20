@@ -979,7 +979,7 @@ impl TypeTable {
         let known: HashSet<String> = self
             .filter_choices()
             .into_iter()
-            .map(|(key, _)| key)
+            .map(|(key, _, _)| key)
             .collect();
         self.filters = view
             .filters
@@ -2397,10 +2397,23 @@ impl TypeTable {
     }
 
     fn toggle_section(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Some(section) = self.grouping.as_mut().and_then(|g| g.section_mut(index)) {
-            section.expanded = !section.expanded;
-            cx.notify();
+        let Some(grouping) = self.grouping.as_mut() else {
+            return;
+        };
+        let Some(section) = grouping.section_mut(index) else {
+            return;
+        };
+        section.expanded = !section.expanded;
+        // A row folded away is not edited, deleted or stepped from.
+        let folded = !section.expanded;
+        if folded
+            && self
+                .cursor
+                .is_some_and(|cursor| grouping.section_of(cursor.row) == Some(index))
+        {
+            self.cursor = None;
         }
+        cx.notify();
     }
 
     /// Sets a cell of the row at `ix`, and of every other copy of that row: grouped by a
@@ -2986,6 +2999,11 @@ impl TypeTable {
             cx.emit(ItemEvent::UpdateTab);
         }
         self.remove_rows(ids, cx);
+        // A deleted node took its relationships with it: the rows still shown read their
+        // relationship chips again at the new commit, rather than listing it.
+        self.relations.clear();
+        self.relation_tasks.clear();
+        self.relations_asked.clear();
         cx.notify();
     }
 
@@ -3538,11 +3556,19 @@ impl TypeTable {
             session.write(&query, bound, description, cx)
         });
         let (session, branch) = (self.session.clone(), self.branch.clone());
+        let draft = (
+            self.draft_key(&row_id, &column),
+            DraftEntry {
+                old: old.clone(),
+                text: text.clone(),
+            },
+        );
         // Detached: a write is never cancelled by closing the tab.
         cx.spawn_in(window, async move |this, cx| {
             let outcome = write.await;
             let result = save_result(&outcome, &branch);
-            this.update_in(cx, |this, window, cx| {
+            let saved = matches!(result, SaveResult::Saved { .. });
+            let shown = this.update_in(cx, |this, window, cx| {
                 let cell = SavedCell {
                     row_id,
                     column,
@@ -3551,8 +3577,19 @@ impl TypeTable {
                     text,
                 };
                 this.finish_save(cell, &session, &branch, result, window, cx)
-            })
-            .ok();
+            });
+            // The tab closed while the write was out: the cell's draft is still the session's
+            // to settle, its text kept when it did not land.
+            if shown.is_err() {
+                let (key, entry) = draft;
+                session.update(cx, |session, cx| {
+                    if saved {
+                        session.remove_draft_on(&branch, &key, cx);
+                    } else {
+                        session.set_draft_on(&branch, key, entry, cx);
+                    }
+                });
+            }
         })
         .detach();
     }
@@ -3906,13 +3943,30 @@ impl TypeTable {
         cx.notify();
         let (session, branch) = (self.session.clone(), self.branch.clone());
         let row_count = rows.len();
+        let keys: Vec<DraftKey> = edits
+            .iter()
+            .map(|edit| self.draft_key(&edit.row_id, &edit.column))
+            .collect();
         // Detached: a write is never cancelled by closing the tab.
         cx.spawn_in(window, async move |this, cx| {
             let outcome = write.await;
-            this.update_in(cx, |this, window, cx| {
+            let landed = matches!(
+                &outcome,
+                graph_client::WriteOutcome::Committed(output)
+                    if output.commit.is_some() && output.affected_nodes as usize == row_count
+            );
+            let shown = this.update_in(cx, |this, window, cx| {
                 this.finish_drafts(outcome, row_count, edits, &session, &branch, window, cx)
-            })
-            .ok();
+            });
+            // The tab closed while the write was out: drafts that all landed are let go, as
+            // the tab would have; the others stay for the next one.
+            if shown.is_err() && landed {
+                session.update(cx, |session, cx| {
+                    for key in &keys {
+                        session.remove_draft_on(&branch, key, cx);
+                    }
+                });
+            }
         })
         .detach();
     }
@@ -4609,8 +4663,6 @@ impl TypeTable {
         cx.notify();
     }
 
-    /// What a filter can test: each filterable property, then (in a node table) each
-    /// relationship group, as `(key, label)`.
     /// The icon of a filter key: the property's kind, or the relationship's direction.
     fn key_icon(&self, key: &str) -> IconName {
         if let Some((direction, _)) = builder::parse_relationship_key(key) {
@@ -4621,10 +4673,12 @@ impl TypeTable {
             .map_or(IconName::CaseSensitive, property_icon)
     }
 
-    fn filter_choices(&self) -> Vec<(String, String)> {
-        let mut choices: Vec<(String, String)> = self
+    /// What a filter can test: each filterable property, then (in a node table) each
+    /// relationship group, as `(key, label, icon)`.
+    fn filter_choices(&self) -> Vec<(String, String, IconName)> {
+        let mut choices: Vec<(String, String, IconName)> = self
             .filterable()
-            .map(|p| (p.name.clone(), p.name.clone()))
+            .map(|p| (p.name.clone(), p.name.clone(), property_icon(p)))
             .collect();
         if self.kind == TableKind::Node
             && let Some(schema) = &self.schema
@@ -4637,7 +4691,7 @@ impl TypeTable {
                     gq_language::traversal_name(&group.edge),
                     group.other_type
                 );
-                choices.push((key, label));
+                choices.push((key, label, direction_icon(group.direction)));
             }
         }
         choices
@@ -5095,14 +5149,7 @@ impl TypeTable {
         }
         if let Some(draft) = &self.filter_draft {
             let table = cx.entity().downgrade();
-            let choices: Vec<(String, String, IconName)> = self
-                .filter_choices()
-                .into_iter()
-                .map(|(key, label)| {
-                    let icon = self.key_icon(&key);
-                    (key, label, icon)
-                })
-                .collect();
+            let choices = self.filter_choices();
             let chosen = choices
                 .iter()
                 .find(|(key, _, _)| *key == draft.property)
@@ -6521,8 +6568,11 @@ fn set_value(row: &mut Row, column: &str, value: Value) {
 
 impl Render for TypeTable {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let typing =
-            self.editing.is_some() || self.filter_editor.focus_handle(cx).is_focused(window);
+        // Keys typed into a field are text, not the table's: the cell editor, the filter
+        // value and the bulk value alike.
+        let typing = self.editing.is_some()
+            || self.filter_editor.focus_handle(cx).is_focused(window)
+            || self.bulk_editor.focus_handle(cx).is_focused(window);
         let mut context = KeyContext::new_with_defaults();
         context.add("TypeTable");
         if typing {
@@ -6803,6 +6853,97 @@ mod tests {
             assert!(!table.newer);
             assert_eq!(&*table.schema.as_ref().unwrap().source, grown.as_str());
             assert_eq!(table.rows.len(), 2);
+        });
+    }
+
+    /// A section folded away takes the cursor out of it, so no key acts on a row not drawn;
+    /// another section folding leaves it.
+    #[gpui::test]
+    async fn a_folded_section_takes_the_cursor_out_of_it(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session(PEOPLE, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        table.update(cx, |table, cx| {
+            let mut grouping = Grouping::new("name");
+            grouping.restart();
+            let counts: ReadOutput = serde_json::from_value(serde_json::json!({
+                "query_name": "studio_value_counts",
+                "target": {"branch": "main"},
+                "row_count": 2,
+                "columns": ["value", "n"],
+                "rows": [{"value": "Ada", "n": 1}, {"value": "Grace", "n": 1}],
+            }))
+            .unwrap();
+            grouping.accept_counts(&counts, GROUP_LIMIT);
+            for (index, range) in [0..1, 1..2].into_iter().enumerate() {
+                let section = grouping.section_mut(index).unwrap();
+                section.range = range;
+                section.expanded = true;
+            }
+            table.grouping = Some(grouping);
+            table.cursor = Some(Cursor { row: 1, col: 0 });
+            table.toggle_section(0, cx);
+            assert_eq!(
+                table.cursor,
+                Some(Cursor { row: 1, col: 0 }),
+                "another section"
+            );
+            table.toggle_section(1, cx);
+            assert_eq!(table.cursor, None);
+        });
+    }
+
+    /// Keys typed into the bulk value are its text: `j` there is a letter, not a step down.
+    #[gpui::test]
+    async fn keys_typed_in_the_bulk_value_are_its_text(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+            cx.bind_keys([gpui::KeyBinding::new(
+                "j",
+                MoveDown,
+                Some("TypeTable && !editing"),
+            )]);
+        });
+        let session = session(PEOPLE, cx);
+        let (table, cx) = cx.add_window_view(|window, cx| {
+            TypeTable::new(
+                WeakEntity::new_invalid(),
+                session,
+                "Person".into(),
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            let ids: Vec<String> = table.rows.iter().map(|row| row.id.clone()).collect();
+            table.selection.extend(ids);
+            table.cursor = Some(Cursor { row: 0, col: 0 });
+            table.bulk.property = Some("name".into());
+            window.focus(&table.bulk_editor.focus_handle(cx), cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("j");
+        cx.run_until_parked();
+        table.read_with(cx, |table, cx| {
+            assert_eq!(table.bulk_editor.read(cx).text(cx), "j");
+            assert_eq!(table.cursor, Some(Cursor { row: 0, col: 0 }));
         });
     }
 
