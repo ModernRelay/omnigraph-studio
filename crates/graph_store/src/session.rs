@@ -1,7 +1,7 @@
 //! One open graph on one server and branch: schema, branches, type counts, and every read and
 //! write Studio sends for it (spec 003, 004, 008).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -525,9 +525,10 @@ pub struct GraphSession {
     next_scope: u64,
     /// Each followed branch's commits as the change feed described them.
     change_logs: HashMap<String, ChangeLog>,
-    /// Change-feed reads under way, by branch, and the branches whose head moved meanwhile.
+    /// Change-feed reads under way, by branch, and the branches whose head moved meanwhile,
+    /// with whether only Studio's own commits moved it (`read_changes`' `own`).
     change_reads: HashMap<String, Task<()>>,
-    change_reads_again: HashSet<String>,
+    change_reads_again: HashMap<String, bool>,
     /// The branch list read again by the head watch, while under way.
     branch_recheck: Option<Task<()>>,
     /// A poll came while no window was active; the next activation asks at once.
@@ -611,7 +612,7 @@ impl GraphSession {
             next_scope: 0,
             change_logs: HashMap::new(),
             change_reads: HashMap::new(),
-            change_reads_again: HashSet::new(),
+            change_reads_again: HashMap::new(),
             branch_recheck: None,
             head_check_missed: false,
             _head_poll: None,
@@ -851,7 +852,11 @@ impl GraphSession {
             };
             this.update(cx, |this, cx| {
                 this.reloading_schema = false;
-                this.install_schema(result, cx)
+                this.install_schema(result, cx);
+                // A reason to check that came while the read was out may postdate its answer.
+                if std::mem::take(&mut this.recheck_schema_again) {
+                    this.recheck_schema(None, cx);
+                }
             })
             .ok();
         }));
@@ -960,9 +965,10 @@ impl GraphSession {
         read: Option<graph_client::api::SchemaOutput>,
         cx: &mut Context<Self>,
     ) {
-        // A reload under way reads the newest schema anyway, and views take it at once; a
-        // recheck in its place would cancel it.
+        // A reload under way reads the schema too, and views take it at once; a recheck in its
+        // place would cancel it. The reason is checked once it lands, as for a recheck sent.
         if self.reloading_schema {
+            self.recheck_schema_again = true;
             return;
         }
         // One at a time. A read not yet sent answers for this reason too; one sent may have
@@ -1490,10 +1496,14 @@ impl GraphSession {
     /// Reads `branch`'s change feed after the newest commit its log holds, up to the feed's
     /// head, asked only about the types views read: every change carries its images, so an
     /// unfiltered read costs what every type wrote. `own` is a head that one of Studio's own
-    /// commits moved.
+    /// data commits moved, on top of the head held: no other writer's commit is in between,
+    /// so the schema is as it was.
     fn read_changes(&mut self, branch: &str, own: bool, cx: &mut Context<Self>) {
         if self.change_reads.contains_key(branch) {
-            self.change_reads_again.insert(branch.to_owned());
+            self.change_reads_again
+                .entry(branch.to_owned())
+                .and_modify(|again| *again &= own)
+                .or_insert(own);
             return;
         }
         let Some(head) = self.heads.get(branch).cloned() else {
@@ -1560,7 +1570,8 @@ impl GraphSession {
             let commits = fold.complete();
             // The feed filters by type name, so a schema change in between (a rename) could
             // hide a view's changes: what it says counts only under the schema views read with.
-            let schema_read = if commits.is_empty() {
+            // Studio's own commit on top of the head held changed none.
+            let schema_read = if commits.is_empty() || own {
                 None
             } else {
                 Some(client.schema(&graph).await)
@@ -1611,8 +1622,8 @@ impl GraphSession {
                     };
                     this.recheck_schema(read, cx);
                 }
-                if this.change_reads_again.remove(&branch) {
-                    this.read_changes(&branch, false, cx);
+                if let Some(own) = this.change_reads_again.remove(&branch) {
+                    this.read_changes(&branch, own, cx);
                 }
             })
             .ok();
@@ -1780,8 +1791,11 @@ impl GraphSession {
             return;
         }
         self.heads.insert(branch.clone(), head.clone());
-        // Before views hear of the move, so they find the read under way.
-        self.read_changes(&branch, own || placed, cx);
+        // Before views hear of the move, so they find the read under way. Only Studio's own
+        // commit on top of the head held leaves the schema as it was: one placed by a head read
+        // sits on another writer's.
+        let on_top = own && previous.is_some() && parent == previous.as_deref();
+        self.read_changes(&branch, on_top, cx);
         if previous.is_some() && !own && !placed {
             self.commit_lists.forget(&branch);
             self.head_commits.forget(&branch);
