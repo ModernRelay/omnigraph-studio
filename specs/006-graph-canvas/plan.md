@@ -53,9 +53,21 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 ## Ontology, explorer and placed nodes
 
 - The canvas has two faces, named for what they show: the **Ontology** (the schema's types
-  and relationships, `studio_graph::OpenOntology`, ⌘⇧O) and the **Explorer** (the nodes walked
-  from a root, `studio_graph::OpenCanvas`, ⌘⇧E). Both are rows at the top of the sidebar's
-  Graph panel, above Types, and items of the Graph menu; the tab is titled by the face shown.
+  and relationships, `studio_graph::OpenOntology`, ⌘⇧O) and the **Canvas** (the nodes walked
+  from a root, `studio_graph::OpenCanvas`, ⌘⇧E; "Explorer" until 2026-10-19). Both are rows at
+  the top of the sidebar's Graph panel, above Types, and items of the Graph menu; the tab and
+  the mode switch are titled by the face shown.
+- **Opened chips** (2026-10-19). A node's chip shows 32 characters of its name, then "…"
+  (`CHIP_LABEL_CHARS`); layout always measures that, so opening a chip never moves another.
+  Pointing at a cut chip for a moment opens it: its whole name, wrapped at 320 px at zoom 1
+  (`OPEN_CHIP_MAX_WIDTH`) in lines of even length, drawn over its neighbours from where the
+  chip starts, never narrower than it, with its mark and the pointed or selected border;
+  selecting it keeps it open until another chip is selected, and the opened chip is hit where
+  it is drawn. A node chip's menu offers "Show as ▸"
+  with its type's single text properties and "Automatic": the graph's node name for the type
+  (spec 002, "Node names"), so the whole graph, not only the canvas, takes it.
+- Chips and relationship labels take the radius scale's `sm` corner, fill, border, shadow and
+  ring alike (the fill was drawn round until 2026-10-19 while its shadow took `sm`).
 - Dragging a type, a node or a relationship pill places it: it stays where it was dropped
   through every later layout, and the canvas tab saves the placed chips with the graph's tabs
   (`{"pinned": {key: [x, y]}}`, keys `type:Name`, `node:Type/id` and
@@ -129,6 +141,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 | 2026-10-12 | Placed nodes persist per graph | `graph_canvas` `placed_nodes_round_trip_and_bad_data_reads_as_none`; offscreen snapshot: drag Company on the ontology, then reopen the data directory with restore | The saved canvas holds `{"pinned": {"type:Company": [-174, -275]}}`; after restore Company is where it was dropped, the rest laid out around it, and ↺ (Reset layout, R) shows |
 | 2026-10-12 | The ontology and the explorer are found without the menu | offscreen snapshot of `OpenOntology` (⌘⇧O) | The sidebar's Graph panel opens with Ontology (selected) and Explorer above Types; the tab and the mode switch read Ontology / Explorer |
 | 2026-10-12 | Query results as a canvas | `gq_language` `whole_node_columns_carry_their_type`; `query_editor` `node_columns_become_a_graph_of_distinct_nodes_linked_by_row`; snapshot of `return { $p, $c }` | The result offers Canvas; a results canvas draws each node once and links the nodes of a row; it is a tab of its own and is not restored |
+| 2026-10-19 | The canvas is named Canvas; a cut chip opens; a node is named by the property its graph chose | `graph_canvas` `an_opened_name_wraps_into_even_lines`; `gq_language` `reads_types_keys_and_properties` (a chosen text property names a node, a list, a date or a missing one does not); `graph_store` `answers_kept_under_one_schema_are_not_given_under_another` (a choice in the settings renames at once with one `SchemaChanged`, a schema read again keeps it, none goes back to the key); `studio_settings` `views_and_node_names_are_saved_per_graph_and_type`; workspace clippy `-D warnings` and suite; offscreen glass snapshots on a scratch dev server with Person named by `email`: a person explored, a hub opened, a 35-character email at rest and pointed at, the chip menu, the table's Views menu, the settings tab searched for "node" | The sidebar row, mode switch and tab read Canvas. Neighbours with an email showed it, the rest their key. The 35-character email opened on one line over its neighbours from the chip's top left; an earlier wrap at 280 px left "m" alone on a second line, so lines are now of even length and the width 320 px. "Show as ›" in the chip menu, "Name rows by ›" in Views, and "Node names · 1 changed" in settings with Person's dropdown on "email" and Reset. Chips and hubs now take the `sm` corner rather than round ends |
 
 ## Corrections
 

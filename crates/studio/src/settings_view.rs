@@ -1,19 +1,24 @@
 //! The settings tab (spec 002): a left nav of sections and, for the chosen one, a row per
 //! setting with a title, a one-line description, a control and Reset. Rows and controls are
 //! generated from the settings schema (`studio_settings::fields`); nothing here names a
-//! setting. A search across every section replaces the section while it has text. With a
-//! graph open, a scope switch shows that graph's own values for the settings a graph may
-//! override (`graphs` in `settings.json`). Changes write `settings.json` and apply at once.
+//! setting but one: with a graph open, "Node names" lists that graph's types and the property
+//! each one's nodes are named by, which only its schema can offer. A search across every
+//! section replaces the section while it has text. With a graph open, a scope switch shows
+//! that graph's own values for the settings a graph may override (`graphs` in
+//! `settings.json`). Changes write `settings.json` and apply at once.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, HighlightStyle, Render,
-    SharedString, StyledText, Subscription, Window,
+    SharedString, StyledText, Subscription, WeakEntity, Window,
 };
+use gq_language::SchemaModel;
+use graph_store::GraphSession;
 use serde_json::Value;
-use studio_settings::{FieldKind, Scope, SettingField, SettingsValues, StudioSettings};
+use studio_settings::{FieldKind, Scope, SettingField, SettingsValues, StudioSettings, TypeNaming};
 use studio_ui::ds::{self, Dotted as _, space};
 use studio_ui::menu::ContextMenu;
 use studio_workspace::{Item, ItemEvent, SavedItem};
@@ -26,6 +31,8 @@ pub struct SettingsView {
     section: usize,
     /// The open graph's settings key and name, when there is one.
     graph: Option<(String, String)>,
+    /// That graph's session, whose schema lists the types "Node names" offers.
+    session: Option<WeakEntity<GraphSession>>,
     scope: Scope,
     /// A field for each text setting, made with the tab.
     text_inputs: Vec<TextInput>,
@@ -38,6 +45,9 @@ pub struct SettingsView {
 
 /// A dropdown's choices: each label and the value it sets.
 type Options = Rc<[(SharedString, Value)]>;
+
+/// The section naming each type's nodes (spec 002, "Node names"), offered with a graph open.
+const NODE_NAMES: &str = "Node names";
 
 /// A text setting's field. It writes when the person presses Enter or leaves it, not on every
 /// key, and when the tab closes or Studio quits with typing in it; it shows the setting's value
@@ -150,6 +160,7 @@ impl SettingsView {
             search,
             section: 0,
             graph,
+            session: None,
             scope: Scope::All,
             text_inputs,
             fonts: None,
@@ -195,6 +206,67 @@ impl SettingsView {
             self.set_scope(Scope::All, window, cx);
         }
         cx.notify();
+    }
+
+    /// The open graph's session, whose types "Node names" lists.
+    pub fn set_session(
+        &mut self,
+        session: Option<WeakEntity<GraphSession>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.session = session;
+        cx.notify();
+    }
+
+    /// The open graph's session and schema, when its schema is read.
+    fn named_graph(&self, cx: &App) -> Option<(Entity<GraphSession>, Arc<SchemaModel>)> {
+        self.graph.as_ref()?;
+        let session = self.session.as_ref()?.upgrade()?;
+        let schema = session.read(cx).schema_model()?;
+        Some((session, schema))
+    }
+
+    /// The rows of "Node names" for the types `query` finds (all of them without one): each
+    /// type, what names its nodes now, and the properties that can.
+    fn node_name_rows(
+        &self,
+        session: &Entity<GraphSession>,
+        schema: &SchemaModel,
+        query: &str,
+        cx: &App,
+    ) -> Vec<AnyElement> {
+        let section_found = NODE_NAMES.to_lowercase().contains(query);
+        let names: Vec<TypeNaming> = schema
+            .nodes
+            .iter()
+            .filter(|node| section_found || node.name.to_lowercase().contains(query))
+            .filter_map(|node| session.read(cx).type_naming(&node.name, cx))
+            .collect();
+        let count = names.len();
+        names
+            .into_iter()
+            .enumerate()
+            .map(|(index, names)| {
+                let reset = names.chosen.is_some().then(|| {
+                    let names = names.clone();
+                    Box::new(move |_: &gpui::ClickEvent, _: &mut Window, cx: &mut App| {
+                        names.choose(None, cx)
+                    }) as _
+                });
+                let row = ds::setting_row(
+                    SharedString::from(format!("node-name-{}", names.type_name)),
+                    names.type_name.clone(),
+                    format!("Automatically its {}", names.default),
+                    node_name_dropdown(names),
+                    reset,
+                );
+                if index + 1 < count {
+                    row.border_b_1().dotted(cx).into_any_element()
+                } else {
+                    row.into_any_element()
+                }
+            })
+            .collect()
     }
 
     /// Shows another scope's values, after writing any typing to the scope it was typed in.
@@ -359,6 +431,28 @@ fn dropdown(target: &Target, current: Value, options: Options) -> AnyElement {
                         });
                 }
                 menu
+            }))
+        })
+        .anchor(gpui::Anchor::TopRight)
+        .into_any_element()
+}
+
+/// The choice of the property that names a type's nodes, as the canvas and the table offer it.
+fn node_name_dropdown(names: TypeNaming) -> AnyElement {
+    let id = names.type_name.clone();
+    PopoverMenu::new(SharedString::from(format!("node-name-menu-{id}")))
+        .trigger(
+            studio_ui::ds::button(
+                SharedString::from(format!("node-name-trigger-{id}")),
+                studio_ui::node_names::shown(&names),
+            )
+            .style(ButtonStyle::Outlined)
+            .end_icon(Icon::new(IconName::ChevronDown)),
+        )
+        .menu(move |window, cx| {
+            let names = names.clone();
+            Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                studio_ui::node_names::add_to(menu, &names)
             }))
         })
         .anchor(gpui::Anchor::TopRight)
@@ -541,7 +635,7 @@ impl Render for SettingsView {
         let searching = !query.is_empty();
         let scope = self.scope.clone();
         let in_scope = |field: &&'static SettingField| scope == Scope::All || field.per_graph;
-        let sections: Vec<&str> = studio_settings::sections()
+        let mut sections: Vec<&str> = studio_settings::sections()
             .into_iter()
             .filter(|section| {
                 studio_settings::fields()
@@ -550,6 +644,10 @@ impl Render for SettingsView {
                     .any(|f| f.section == *section)
             })
             .collect();
+        let named = self.named_graph(cx);
+        if named.is_some() {
+            sections.push(NODE_NAMES);
+        }
         self.section = self.section.min(sections.len().saturating_sub(1));
         let chosen = sections.get(self.section).copied().unwrap_or_default();
         let shown: Vec<&'static SettingField> = studio_settings::fields()
@@ -592,11 +690,14 @@ impl Render for SettingsView {
             .border_r_1()
             .border_color(rule)
             .children(sections.iter().enumerate().map(|(index, section)| {
-                let count = studio_settings::fields()
-                    .iter()
-                    .filter(in_scope)
-                    .filter(|f| f.section == *section && !values.is_default_in(&scope, f))
-                    .count();
+                let count = match (&self.graph, *section == NODE_NAMES) {
+                    (Some((key, _)), true) => StudioSettings::get(cx).labels_for(key).len(),
+                    _ => studio_settings::fields()
+                        .iter()
+                        .filter(in_scope)
+                        .filter(|f| f.section == *section && !values.is_default_in(&scope, f))
+                        .count(),
+                };
                 ds::SidebarRow::new(("settings-section", index), *section)
                     .selected(!searching && index == self.section)
                     .when(count > 0, |row| {
@@ -618,7 +719,20 @@ impl Render for SettingsView {
                 _ => groups.push((&field.section, vec![field])),
             }
         }
-        let empty = groups.is_empty();
+        // The graph's types, for "Node names" or a search that finds them.
+        let node_names = named
+            .as_ref()
+            .filter(|_| searching || chosen == NODE_NAMES)
+            .map(|(session, schema)| {
+                let rows =
+                    self.node_name_rows(session, schema, if searching { query } else { "" }, cx);
+                (
+                    self.graph.clone().map(|(_, name)| name).unwrap_or_default(),
+                    rows,
+                )
+            })
+            .filter(|(_, rows)| !rows.is_empty());
+        let empty = groups.is_empty() && node_names.is_none();
         let body = v_flex()
             .w_full()
             .max_w(px(ds::size::READING_WIDTH))
@@ -677,6 +791,16 @@ impl Render for SettingsView {
                             }
                         }),
                     ))
+            }))
+            .children(node_names.map(|(graph, rows)| {
+                v_flex()
+                    .gap(px(space::SM))
+                    .when(searching, |group| group.child(ds::text::meta(NODE_NAMES)))
+                    .child(ds::text::muted(format!(
+                        "The property that names each type's nodes in {graph}: on the canvas, in \
+                         the tree, the inspector and tables."
+                    )))
+                    .child(ds::card(cx).px(px(space::XL)).children(rows))
             }))
             .when(empty, |body| {
                 body.child(

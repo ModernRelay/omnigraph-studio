@@ -663,8 +663,20 @@ impl TypeTable {
         if self
             .schema
             .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &schema) || current.source == schema.source)
+            .is_some_and(|current| Arc::ptr_eq(current, &schema) || current.same_as(&schema))
         {
+            return;
+        }
+        // The same text naming some type's nodes otherwise (spec 002, "Node names"): the table
+        // keeps its columns, filters, order and grouping, and reads its rows again for the names
+        // its relationship cells show.
+        if self
+            .schema
+            .as_ref()
+            .is_some_and(|current| current.source == schema.source)
+        {
+            self.schema = Some(schema);
+            self.reload(false, cx);
             return;
         }
         let columns = if let Some(node) = schema.node(&self.type_name) {
@@ -1689,6 +1701,10 @@ impl TypeTable {
         let table = cx.entity().downgrade();
         let graph = self.session.read(cx).settings_key(cx);
         let type_name = self.type_name.clone();
+        let names = match self.kind {
+            TableKind::Node => self.session.read(cx).type_naming(&self.type_name, cx),
+            TableKind::Edge => None,
+        };
         let open = self.toolbar_menus[0].is_deployed();
         PopoverMenu::new("views-menu")
             .anchor(gpui::Anchor::TopRight)
@@ -1712,6 +1728,7 @@ impl TypeTable {
                 let table = table.clone();
                 let graph = graph.clone();
                 let type_name = type_name.clone();
+                let names = names.clone();
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                     if views.is_empty() {
                         menu = menu.header("No saved views");
@@ -1753,6 +1770,11 @@ impl TypeTable {
                             studio_settings::update(cx, move |settings| {
                                 settings.delete_view(&graph, &type_name, &name)
                             });
+                        });
+                    }
+                    if let Some(names) = names.clone() {
+                        menu = menu.separator().submenu("Name rows by", move |menu, _, _| {
+                            studio_ui::node_names::add_to(menu, &names)
                         });
                     }
                     menu

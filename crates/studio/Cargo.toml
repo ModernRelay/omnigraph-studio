@@ -42,6 +42,7 @@ studio_workspace = { workspace = true }
 graph_client = { workspace = true }
 url = { workspace = true }
 smol = { workspace = true }
+gq_language = { workspace = true }
 graph_store = { workspace = true }
 command_palette = { workspace = true }
 type_table = { workspace = true }

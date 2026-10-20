@@ -133,7 +133,8 @@ pub fn init(cx: &mut App) {
 
 /// Opens the settings tab, offering the workspace's graph as a scope.
 fn open_settings(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
-    let graph = workspace.session().map(|session| {
+    let session = workspace.session().cloned();
+    let graph = session.as_ref().map(|session| {
         let session = session.read(cx);
         (session.settings_key(cx), session.graph_id.clone())
     });
@@ -141,9 +142,12 @@ fn open_settings(workspace: &mut Workspace, window: &mut Window, cx: &mut Contex
     let view = workspace.open_item("settings", window, cx, move |window, cx| {
         settings_view::SettingsView::new(made, window, cx)
     });
-    // A tab open from before offers the graph shown now.
+    // A tab open from before offers the graph shown now, and its types for "Node names".
     if let Some(view) = view {
-        view.update(cx, |view, cx| view.set_graph(graph, window, cx));
+        view.update(cx, |view, cx| {
+            view.set_graph(graph, window, cx);
+            view.set_session(session.map(|session| session.downgrade()), cx);
+        });
     }
 }
 

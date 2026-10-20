@@ -186,8 +186,8 @@ impl Default for StudioOptions {
 }
 
 /// One graph's own values for the settings marked `x-per-graph`, over `studio` (spec 002),
-/// and its saved table views (spec 004). Each value is unset unless the person chose it for
-/// this graph.
+/// its saved table views (spec 004) and the property each type's nodes are named by. Each
+/// value is unset unless the person chose it for this graph.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct GraphOverrides {
@@ -199,6 +199,10 @@ pub struct GraphOverrides {
     pub canvas_max_nodes: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub views: Vec<SavedView>,
+    /// The property that names each type's nodes, by type, where the person chose one; other
+    /// types are named by their `name`, `title` or key (spec 002, "Node names").
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 /// A named filter, order, grouping and set of columns for one type's table (spec 004).
@@ -251,6 +255,36 @@ pub struct GraphOptions {
     pub type_table_page_size: u32,
     pub tree_page_size: u32,
     pub canvas_max_nodes: u32,
+}
+
+/// The property that names one type's nodes in a graph, and the ones that can (spec 002, "Node
+/// names"): what a chip's "Show as", a table's "Name rows by" and the settings tab offer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeNaming {
+    /// The graph's `graphs` key ([`graph_key`]).
+    pub graph: String,
+    pub type_name: String,
+    /// The property chosen for this graph, when one is and it can name a node.
+    pub chosen: Option<String>,
+    /// What names the nodes when none is chosen.
+    pub default: String,
+    /// Every property that can name the nodes, in schema order.
+    pub candidates: Vec<String>,
+}
+
+impl TypeNaming {
+    /// What names the nodes now.
+    pub fn in_effect(&self) -> &str {
+        self.chosen.as_deref().unwrap_or(&self.default)
+    }
+
+    /// Names the type's nodes by `choice` in this graph, or by its default when `None`.
+    pub fn choose(&self, choice: Option<String>, cx: &mut App) {
+        let (graph, type_name) = (self.graph.clone(), self.type_name.clone());
+        update(cx, move |settings| {
+            settings.set_label(&graph, &type_name, choice)
+        });
+    }
 }
 
 /// The `graphs` key for a graph on a server: `<server name>/<graph id>`, as the settings tab
@@ -542,6 +576,28 @@ impl StudioSettings {
             Some(existing) => *existing = view,
             None => views.push(view),
         }
+    }
+
+    /// The property chosen to name each type's nodes in a graph, by type.
+    pub fn labels_for(&self, graph: &str) -> BTreeMap<String, String> {
+        self.graphs
+            .get(graph)
+            .map(|overrides| overrides.labels.clone())
+            .unwrap_or_default()
+    }
+
+    /// Names a type's nodes in a graph by `property`, or by its default when `None`.
+    pub fn set_label(&mut self, graph: &str, type_name: &str, property: Option<String>) {
+        let labels = &mut self.graphs.entry(graph.to_owned()).or_default().labels;
+        match property {
+            Some(property) => {
+                labels.insert(type_name.to_owned(), property);
+            }
+            None => {
+                labels.remove(type_name);
+            }
+        }
+        self.graphs.retain(|_, overrides| !overrides.is_empty());
     }
 
     /// Removes a graph's view of a type by name.
@@ -1138,7 +1194,7 @@ mod tests {
     }
 
     #[test]
-    fn views_are_saved_per_graph_and_type_and_replaced_by_name() {
+    fn views_and_node_names_are_saved_per_graph_and_type() {
         let mut settings = StudioSettings::default();
         let view = |name: &str, op: &str| SavedView {
             name: name.into(),
@@ -1169,6 +1225,15 @@ mod tests {
         assert_eq!(StudioSettings::parse(&text).unwrap(), settings);
         settings.delete_view("dev/knowledge", "Person", "Founders");
         assert!(settings.graphs.is_empty(), "an empty entry is dropped");
+        // A type's node name is kept per graph, and choosing the default drops it.
+        settings.set_label("dev/knowledge", "Person", Some("title".into()));
+        assert_eq!(settings.labels_for("dev/knowledge")["Person"], "title");
+        assert!(settings.labels_for("prod/knowledge").is_empty());
+        let text = serde_json::to_string(&settings).unwrap();
+        assert!(text.contains(r#""labels":{"Person":"title"}"#), "{text}");
+        assert_eq!(StudioSettings::parse(&text).unwrap(), settings);
+        settings.set_label("dev/knowledge", "Person", None);
+        assert!(settings.graphs.is_empty(), "the default is no entry");
     }
 
     #[test]

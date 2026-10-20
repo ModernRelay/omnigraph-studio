@@ -2,7 +2,7 @@
 //! relationship groups a node type takes part in. Built from `.pg` source with
 //! `omnigraph-compiler`, so Studio reads the schema exactly as the engine does.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use omnigraph_compiler::catalog::Catalog;
@@ -65,6 +65,11 @@ impl Property {
         !self.is_key && !matches!(self.kind, ScalarKind::Vector | ScalarKind::Blob)
     }
 
+    /// Whether the property can name a node: one text value.
+    pub fn can_name(&self) -> bool {
+        matches!(self.kind, ScalarKind::Text) && !self.list
+    }
+
     /// Whether a query can return this property (Blob and Vector values are read separately).
     pub fn projectable(&self) -> bool {
         !matches!(self.kind, ScalarKind::Vector | ScalarKind::Blob)
@@ -77,6 +82,9 @@ pub struct NodeType {
     pub properties: Vec<Property>,
     /// The `@key` property, if the type declares a single one.
     pub key: Option<String>,
+    /// The property the person chose to name this type's nodes by, for this graph (spec 002,
+    /// "Node names"); [`NodeType::label_property`] takes it when it can name a node.
+    pub label: Option<String>,
 }
 
 impl NodeType {
@@ -84,18 +92,32 @@ impl NodeType {
         self.properties.iter().find(|p| p.name == name)
     }
 
-    /// The property shown as a row's label: `name`, `title` or `display_name` when present,
-    /// else the key.
+    /// The property that names a node wherever Studio shows one (a canvas chip, a tree row,
+    /// the inspector's title, a relationship cell): the one chosen for this graph when it can
+    /// name a node, else [`NodeType::default_label_property`].
     pub fn label_property(&self) -> Option<&str> {
+        match self.label.as_deref() {
+            Some(chosen) if self.property(chosen).is_some_and(Property::can_name) => Some(chosen),
+            _ => self.default_label_property(),
+        }
+    }
+
+    /// The property that names a node when none is chosen: `name`, `title`, `display_name`
+    /// or `label` when present, else the key.
+    pub fn default_label_property(&self) -> Option<&str> {
         for candidate in ["name", "title", "display_name", "label"] {
             if let Some(property) = self.property(candidate)
-                && matches!(property.kind, ScalarKind::Text)
-                && !property.list
+                && property.can_name()
             {
                 return Some(&property.name);
             }
         }
         self.key.as_deref()
+    }
+
+    /// The properties a node can be named by, in schema order: its single text values.
+    pub fn label_candidates(&self) -> impl Iterator<Item = &Property> {
+        self.properties.iter().filter(|p| p.can_name())
     }
 }
 
@@ -202,6 +224,7 @@ impl SchemaModel {
                     name: node.name.clone(),
                     properties,
                     key,
+                    label: None,
                 }
             })
             .collect();
@@ -252,6 +275,28 @@ impl SchemaModel {
 
     pub fn node(&self, name: &str) -> Option<&NodeType> {
         self.nodes.get(*self.node_index.get(name)?)
+    }
+
+    /// This schema with each type's nodes named by the property `labels` chooses for it, and
+    /// every other type by its default: a graph's choices (spec 002, "Node names"). A choice for
+    /// a type or a property the schema does not hold is kept and has no effect.
+    pub fn with_labels(&self, labels: &BTreeMap<String, String>) -> Self {
+        let mut labelled = self.clone();
+        for node in &mut labelled.nodes {
+            node.label = labels.get(&node.name).cloned();
+        }
+        labelled
+    }
+
+    /// Whether `other` is this schema with the same node names chosen: what a view built under
+    /// one would show under the other.
+    pub fn same_as(&self, other: &SchemaModel) -> bool {
+        self.source == other.source
+            && self
+                .nodes
+                .iter()
+                .map(NodeType::label_property)
+                .eq(other.nodes.iter().map(NodeType::label_property))
     }
 
     pub fn edge(&self, name: &str) -> Option<&EdgeType> {
@@ -447,6 +492,36 @@ pub(crate) mod tests {
         let person = schema.node("Person").unwrap();
         assert_eq!(person.key.as_deref(), Some("slug"));
         assert_eq!(person.label_property(), Some("name"));
+        // A chosen name holds when it is one text value; otherwise the default does.
+        let names = |choice: &str| {
+            let labelled = schema.with_labels(&BTreeMap::from([("Person".into(), choice.into())]));
+            let person = labelled
+                .node("Person")
+                .unwrap()
+                .label_property()
+                .map(str::to_owned);
+            (person, labelled.same_as(&schema))
+        };
+        assert_eq!(names("title"), (Some("title".into()), false));
+        assert_eq!(names("slug"), (Some("slug".into()), false));
+        assert_eq!(
+            names("tags"),
+            (Some("name".into()), true),
+            "a list cannot name a node"
+        );
+        assert_eq!(
+            names("born"),
+            (Some("name".into()), true),
+            "a date cannot name a node"
+        );
+        assert_eq!(
+            names("nickname"),
+            (Some("name".into()), true),
+            "no such property"
+        );
+        assert_eq!(person.default_label_property(), Some("name"));
+        let candidates: Vec<_> = person.label_candidates().map(|p| p.name.as_str()).collect();
+        assert_eq!(candidates, ["slug", "name", "title", "email"]);
         let tags = person.property("tags").unwrap();
         assert!(tags.list && tags.nullable);
         assert_eq!(tags.display_type(), "[String]?");

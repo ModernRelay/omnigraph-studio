@@ -9814,6 +9814,7 @@ dependencies = [
  "editor",
  "gpui",
  "gpui_platform",
+ "gq_language",
  "graph_canvas",
  "graph_client",
  "graph_store",

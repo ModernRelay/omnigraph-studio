@@ -135,7 +135,8 @@ stay put), IX (paged, virtualized).
   (`FilterOp::key` names), sort, grouping, hidden columns and column order. The toolbar's
   Views menu lists the type's views with the shown one checked, saves the table's state under
   a name (the same name replaces), and deletes the shown one; the button reads the view's
-  name while the table matches it. Filters, a sort or a grouping the schema no longer has are
+  name while the table matches it. Its "Name rows by ▸" submenu picks the property that names
+  the type's nodes across the graph (spec 002, "Node names"), "Automatic" first. Filters, a sort or a grouping the schema no longer has are
   left out; a hidden or ordered column the schema no longer has is ignored.
 
 ### Columns

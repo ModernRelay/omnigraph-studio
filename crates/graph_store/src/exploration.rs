@@ -1160,6 +1160,9 @@ pub struct Exploration {
     pin: Option<String>,
     newer_available: bool,
     generation: u64,
+    /// The schema the names shown were read under: one that names a type's nodes otherwise
+    /// (spec 002, "Node names") reads them again.
+    named_by: Option<Arc<SchemaModel>>,
     tasks: HashMap<LoadTarget, Task<()>>,
     /// What the exploration has read at its pin: a head move that changed none of it moves the
     /// pin without reading again (spec 015).
@@ -1203,8 +1206,21 @@ impl Exploration {
             let branch = session.branch.clone();
             session.read_scope(&branch)
         });
+        let named_by = session.read(cx).schema_model();
         let subscription = cx.subscribe(&session, |this, session, event, cx| match event {
-            SessionEvent::SchemaChanged => this.request_missing(cx),
+            SessionEvent::SchemaChanged => {
+                let schema = session.read(cx).schema_model();
+                let renamed = matches!(
+                    (&this.named_by, &schema),
+                    (Some(was), Some(now)) if was.source == now.source && !was.same_as(now)
+                );
+                this.named_by = schema;
+                if renamed {
+                    this.rename(cx);
+                } else {
+                    this.request_missing(cx);
+                }
+            }
             // Another writer changed the schema: what is shown stays until Refresh.
             SessionEvent::SchemaMoved if this.pin.is_some() && !this.newer_available => {
                 this.newer_available = true;
@@ -1231,6 +1247,7 @@ impl Exploration {
             pin: None,
             newer_available: false,
             generation: 0,
+            named_by,
             tasks: HashMap::new(),
             scope,
             awaiting_changes: false,
@@ -1536,6 +1553,16 @@ impl Exploration {
     /// Drops the pin and everything read, and reads what is visible again at the branch head.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.reset_reads(cx);
+        self.state.clear_loaded();
+        self.request_missing(cx);
+        self.changed(cx);
+    }
+
+    /// The schema now names some type's nodes otherwise: what is shown is read again under the
+    /// new names, at the same commit, with every path left open or closed as it was.
+    fn rename(&mut self, cx: &mut Context<Self>) {
+        self.generation += 1;
+        self.tasks.clear();
         self.state.clear_loaded();
         self.request_missing(cx);
         self.changed(cx);

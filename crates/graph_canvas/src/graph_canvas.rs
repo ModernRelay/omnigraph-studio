@@ -299,6 +299,8 @@ pub struct GraphCanvas {
     /// Nodes stepped back from with `[`, most recent last, for `]`.
     walked: Vec<SceneId>,
     hovered: Option<usize>,
+    /// The cut chip the pointer rested on, shown open (spec 006, "Opened chips").
+    opened: Option<SceneId>,
     drag: Option<Drag>,
     /// Chips marked together: by an area drawn with ⇧-drag, ⇧-click, or ⌘A.
     marked: HashSet<SceneId>,
@@ -308,6 +310,8 @@ pub struct GraphCanvas {
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     /// The read ahead for the chip the pointer rests on, once it has rested.
     _prefetch: Option<Task<()>>,
+    /// The wait before the chip the pointer rests on opens.
+    _open: Option<Task<()>>,
     /// A rebuild waiting for reads that finish together.
     _loaded: Option<Task<()>>,
     char_widths: CharWidths,
@@ -329,7 +333,7 @@ impl Item for GraphCanvas {
     fn tab_title(&self, _cx: &App) -> SharedString {
         match &self.results {
             Some((_, results)) => results.title.clone().into(),
-            None if self.mode == Mode::Explore => "Explorer".into(),
+            None if self.mode == Mode::Explore => "Canvas".into(),
             None => "Ontology".into(),
         }
     }
@@ -461,11 +465,13 @@ impl GraphCanvas {
             selected: None,
             walked: Vec::new(),
             hovered: None,
+            opened: None,
             drag: None,
             marked: HashSet::new(),
             area: None,
             context_menu: None,
             _prefetch: None,
+            _open: None,
             _loaded: None,
             char_widths: CharWidths::default(),
             bounds: Rc::new(Cell::new(None)),
@@ -904,6 +910,14 @@ impl GraphCanvas {
     /// The node whose chip is under `position`, topmost first, by the chips as last painted.
     fn hit(&self, position: Point<Pixels>, _window: &Window) -> Option<usize> {
         let chips = self.chips.borrow();
+        // An opened chip lies over its neighbours.
+        if let Some(index) = self.opened_index()
+            && chips
+                .get(index)
+                .is_some_and(|rect| rect.dilate(px(3.)).contains(&position))
+        {
+            return Some(index);
+        }
         chips
             .iter()
             .enumerate()
@@ -939,6 +953,43 @@ impl GraphCanvas {
 
     fn selected_index(&self) -> Option<usize> {
         self.scene.index_of(self.selected.as_ref()?)
+    }
+
+    /// A cut chip the pointer rests on opens after a moment; one it leaves closes at once.
+    fn open_after_rest(&mut self, cx: &mut Context<Self>) {
+        self.opened = None;
+        self._open = None;
+        let Some(node) = self.hovered.and_then(|index| self.scene.nodes.get(index)) else {
+            return;
+        };
+        if paint::whole_label(node).is_none() {
+            return;
+        }
+        let id = node.id.clone();
+        self._open = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(OPEN_AFTER).await;
+            this.update(cx, |this, cx| {
+                this.opened = Some(id);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The chip shown open: the one the pointer rested on, else the selected one, when its name
+    /// is cut (spec 006, "Opened chips").
+    fn opened_index(&self) -> Option<usize> {
+        let cut = |index: &usize| {
+            self.scene
+                .nodes
+                .get(*index)
+                .is_some_and(|node| paint::whole_label(node).is_some())
+        };
+        self.opened
+            .as_ref()
+            .and_then(|id| self.scene.index_of(id))
+            .filter(cut)
+            .or_else(|| self.selected_index().filter(cut))
     }
 
     /// Double click and ↵: expand a node or open a hub, show more, or open a type's table.
@@ -1171,6 +1222,7 @@ impl GraphCanvas {
         if hovered != self.hovered {
             self.hovered = hovered;
             self.prefetch_hovered(cx);
+            self.open_after_rest(cx);
             cx.notify();
         }
     }
@@ -1395,6 +1447,11 @@ impl GraphCanvas {
             SceneKind::Hub { key, .. } => self.exploration.read(cx).grouping(&key.group).cloned(),
             _ => None,
         };
+        let names = match &node.kind {
+            SceneKind::Node { node, .. } => self.session.read(cx).type_naming(&node.type_name, cx),
+            SceneKind::Type { .. } => self.session.read(cx).type_naming(&node.label, cx),
+            _ => None,
+        };
         ContextMenu::build(window, cx, move |mut menu, _, _| {
             let id = node.id.clone();
             match &node.kind {
@@ -1458,6 +1515,11 @@ impl GraphCanvas {
                                 preview: false,
                             }),
                         )
+                        .when_some(names.clone(), |menu, names| {
+                            menu.submenu("Show as", move |menu, _, _| {
+                                studio_ui::node_names::add_to(menu, &names)
+                            })
+                        })
                         .separator()
                         .entry("Copy key", None, move |_, cx| {
                             cx.write_to_clipboard(gpui::ClipboardItem::new_string(key.clone()));
@@ -1559,7 +1621,12 @@ impl GraphCanvas {
                                 via: None,
                                 preview: false,
                             }),
-                        );
+                        )
+                        .when_some(names.clone(), |menu, names| {
+                            menu.submenu("Name nodes by", move |menu, _, _| {
+                                studio_ui::node_names::add_to(menu, &names)
+                            })
+                        });
                 }
             }
             if pinned {
@@ -1929,6 +1996,7 @@ impl GraphCanvas {
         let selected = self.selected_index();
         let marked: HashSet<usize> = self.marked_indices().into_iter().collect();
         let hovered = self.hovered;
+        let opened = self.opened_index();
         let bounds_cell = self.bounds.clone();
         let chips = self.chips.clone();
         canvas(
@@ -1950,8 +2018,8 @@ impl GraphCanvas {
                         .map(|world| to_screen(*world, bounds, center, zoom))
                         .collect();
                     paint::paint(
-                        &scene, &screen, bounds, zoom, selected, &marked, hovered, &palette,
-                        &chips, window, cx,
+                        &scene, &screen, bounds, zoom, selected, &marked, hovered, opened,
+                        &palette, &chips, window, cx,
                     );
                 });
             },
@@ -2122,7 +2190,7 @@ impl GraphCanvas {
                                 .child(
                                     studio_ui::ds::segment(
                                         "mode-explore",
-                                        "Explorer",
+                                        "Canvas",
                                         mode == Mode::Explore,
                                         cx,
                                     )
@@ -2337,6 +2405,9 @@ const COALESCE_LOADS: std::time::Duration = std::time::Duration::from_millis(8);
 
 /// How long the pointer rests on a chip before what it opens is read ahead.
 const PREFETCH_AFTER: std::time::Duration = std::time::Duration::from_millis(120);
+/// How long the pointer rests on a cut chip before it opens to its whole name: long enough
+/// that passing over chips opens none.
+const OPEN_AFTER: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// A menu entry that dispatches `action` from the window.
 fn open_action<A: gpui::Action + Clone>(action: A) -> impl Fn(&mut Window, &mut App) + 'static {

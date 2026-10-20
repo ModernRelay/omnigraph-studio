@@ -87,13 +87,14 @@ impl TypesList {
         workspace.read(cx).active_item()?.dedupe_key(cx)
     }
 
-    /// Whether the active tab is the canvas showing an exploration rather than the ontology.
+    /// Whether the active tab is the canvas showing an exploration rather than the ontology:
+    /// the canvas names its tab "Canvas" then (`graph_canvas`).
     fn exploring(&self, cx: &App) -> bool {
         self.workspace.upgrade().is_some_and(|workspace| {
             workspace
                 .read(cx)
                 .active_item()
-                .is_some_and(|item| item.tab_title(cx) == "Explorer")
+                .is_some_and(|item| item.tab_title(cx) == "Canvas")
         })
     }
 }
@@ -188,7 +189,7 @@ impl TypesList {
                 })
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenOntology), cx))
                 .into_any_element(),
-            Row::Explorer => view_row("view-explorer", "Explorer", IconName::Crosshair)
+            Row::Explorer => view_row("view-explorer", "Canvas", IconName::Crosshair)
                 .selected(canvas_open && self.exploring(cx))
                 .tooltip_fn(|_, cx| {
                     Tooltip::for_action(

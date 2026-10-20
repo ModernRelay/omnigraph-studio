@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime};
 use futures::FutureExt as _;
 use futures::channel::oneshot;
 use futures::future::{Either, WeakShared, select};
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Task};
+use gpui::{App, AppContext as _, Context, Entity, EventEmitter, Subscription, Task};
 use gq_language::builder::{Depends, Seeds};
 use gq_language::{BuiltQuery, RelationshipGroup, SchemaModel, builder};
 use graph_client::api::{
@@ -490,6 +490,10 @@ pub struct GraphSession {
     /// A read of the schema the person asked for is under way: a recheck in its place would
     /// cancel it, and it reads the newest schema anyway.
     reloading_schema: bool,
+    /// The property chosen to name each type's nodes in this graph (spec 002, "Node names"),
+    /// as the settings held it when the schema was last named by it.
+    labels: BTreeMap<String, String>,
+    _settings: Option<Subscription>,
     _schema_task: Option<Task<()>>,
     _branches_task: Option<Task<()>>,
     _datasets_task: Option<Task<()>>,
@@ -550,6 +554,8 @@ impl GraphSession {
             _recheck: None,
             watched: Vec::new(),
             reloading_schema: false,
+            labels: BTreeMap::new(),
+            _settings: None,
             _schema_task: None,
             _branches_task: None,
             _datasets_task: None,
@@ -557,6 +563,12 @@ impl GraphSession {
             counts_again: false,
             _stored_queries_task: None,
         };
+        session.labels = session.chosen_labels(cx);
+        session._settings = Some(
+            cx.observe_global::<studio_settings::StudioSettings>(|this, cx| {
+                this.labels_changed(cx)
+            }),
+        );
         session._head_poll = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(HEAD_POLL).await;
@@ -776,9 +788,65 @@ impl GraphSession {
         }));
     }
 
+    /// What names `type_name`'s nodes in this graph, and what can (spec 002, "Node names").
+    pub fn type_naming(&self, type_name: &str, cx: &App) -> Option<studio_settings::TypeNaming> {
+        let schema = self.schema_model()?;
+        let node = schema.node(type_name)?;
+        Some(studio_settings::TypeNaming {
+            graph: self.settings_key(cx),
+            type_name: type_name.to_owned(),
+            chosen: node
+                .label
+                .clone()
+                .filter(|property| node.property(property).is_some_and(|p| p.can_name())),
+            default: node.default_label_property().unwrap_or_default().to_owned(),
+            candidates: node.label_candidates().map(|p| p.name.clone()).collect(),
+        })
+    }
+
+    /// The property chosen to name each type's nodes in this graph, in the settings.
+    fn chosen_labels(&self, cx: &App) -> BTreeMap<String, String> {
+        match cx.try_global::<studio_settings::StudioSettings>() {
+            Some(settings) => settings.labels_for(&self.settings_key(cx)),
+            None => BTreeMap::new(),
+        }
+    }
+
+    /// `model` naming each type's nodes as this graph chose.
+    fn named(&self, model: Arc<SchemaModel>) -> Arc<SchemaModel> {
+        if model
+            .nodes
+            .iter()
+            .all(|node| node.label.as_ref() == self.labels.get(&node.name))
+        {
+            model
+        } else {
+            Arc::new(model.with_labels(&self.labels))
+        }
+    }
+
+    /// The settings changed. When they name this graph's nodes otherwise, views take the schema
+    /// again at once ([`SessionEvent::SchemaChanged`]), so a node has one name everywhere.
+    fn labels_changed(&mut self, cx: &mut Context<Self>) {
+        let labels = self.chosen_labels(cx);
+        if labels == self.labels {
+            return;
+        }
+        self.labels = labels;
+        if let Loadable::Loaded(model) = &self.schema {
+            self.schema = Loadable::Loaded(self.named(model.clone()));
+            cx.emit(SessionEvent::SchemaChanged);
+            cx.notify();
+        }
+    }
+
     /// Takes a schema read from the server at the person's asking, or the first: views take it
     /// at once ([`SessionEvent::SchemaChanged`]).
     fn install_schema(&mut self, schema: Loadable<Arc<SchemaModel>>, cx: &mut Context<Self>) {
+        let schema = match schema {
+            Loadable::Loaded(model) => Loadable::Loaded(self.named(model)),
+            other => other,
+        };
         match &schema {
             Loadable::Loaded(model) => self.start_schema_epoch(model),
             // The schema held is still the graph's.
@@ -849,7 +917,7 @@ impl GraphSession {
                 {
                     // The session reads under it from now; views take it on Refresh.
                     this.start_schema_epoch(&model);
-                    this.schema = Loadable::Loaded(model);
+                    this.schema = Loadable::Loaded(this.named(model));
                     cx.emit(SessionEvent::SchemaMoved);
                     cx.notify();
                 }
@@ -4716,6 +4784,48 @@ mod tests {
         );
         read_at_c1(cx).await.unwrap();
         assert_eq!(reads(), 3, "read again under the renamed schema");
+
+        // A graph's node names (spec 002, "Node names"): a choice in the settings names the
+        // type's nodes by it at once, announced as a change of the same text; none goes back.
+        events.lock().unwrap().clear();
+        let key = session.read_with(cx, |session, cx| session.settings_key(cx));
+        let named = |cx: &mut TestAppContext| {
+            session.read_with(cx, |session, _| {
+                let schema = session.schema_model().unwrap();
+                let name = schema.node("Person").unwrap().label_property();
+                name.map(str::to_owned)
+            })
+        };
+        let choose = |choice: Option<&str>, cx: &mut TestAppContext| {
+            let choice = choice.map(str::to_owned);
+            cx.update(|cx| {
+                let mut settings = cx
+                    .try_global::<studio_settings::StudioSettings>()
+                    .cloned()
+                    .unwrap_or_default();
+                settings.set_label(&key, "Person", choice);
+                cx.set_global(settings);
+            });
+            cx.run_until_parked();
+        };
+        assert_eq!(
+            named(cx).as_deref(),
+            Some("slug"),
+            "no name or title: the key"
+        );
+        choose(Some("full_name"), cx);
+        assert_eq!(named(cx).as_deref(), Some("full_name"));
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["changed"],
+            "views take the names at once"
+        );
+        // A schema read again keeps the names chosen.
+        session.update(cx, |session, cx| session.reload_schema(cx));
+        cx.run_until_parked();
+        assert_eq!(named(cx).as_deref(), Some("full_name"));
+        choose(None, cx);
+        assert_eq!(named(cx).as_deref(), Some("slug"));
     }
 
     /// What a read's rows also answer is kept: a page's whole nodes answer their node reads,

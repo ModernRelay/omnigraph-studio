@@ -75,7 +75,7 @@ pub fn set(cx: &mut App) {
             MenuItem::action("History", OpenHistory),
             MenuItem::action("Ontology", OpenOntology),
             MenuItem::action("Schema", OpenSchema::default()),
-            MenuItem::action("Graph Explorer", OpenCanvas),
+            MenuItem::action("Canvas", OpenCanvas),
             MenuItem::action("Storage Inspector", OpenInspector),
             MenuItem::action("Agent", OpenAgent),
             MenuItem::separator(),

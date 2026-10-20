@@ -53,6 +53,11 @@ const LABEL_TEXT: f32 = 11.;
 const PILL_GAP: f32 = studio_ui::ds::space::SM;
 const PILL_PAD_X: f32 = studio_ui::ds::space::CONTROL_INSET;
 const PILL_MARK: f32 = studio_ui::ds::size::ROW_ICON;
+/// The characters a node's chip shows of its name before it cuts it with "…".
+pub(crate) const CHIP_LABEL_CHARS: usize = 32;
+/// The widest an opened chip grows at zoom 1 before its name wraps: an email or an id of 40
+/// characters stays on one line.
+const OPEN_CHIP_MAX_WIDTH: f32 = 320.;
 /// Below this text size a node is drawn as its mark alone, unless it is selected or pointed at.
 const MARK_ONLY_BELOW: f32 = 8.5;
 const TYPE_MARK_ONLY_BELOW: f32 = 6.;
@@ -223,7 +228,7 @@ pub(crate) fn chip_text(node: &SceneNode) -> ChipText {
         SceneKind::Node { root, .. } => ChipText {
             mark: true,
             pieces: vec![(
-                truncate(&label, 32),
+                truncate(&label, CHIP_LABEL_CHARS),
                 if *root { Role::RootName } else { Role::Name },
             )],
             size: CHIP_TEXT,
@@ -247,6 +252,17 @@ pub(crate) fn chip_text(node: &SceneNode) -> ChipText {
             size: HUB_TEXT,
         },
     }
+}
+
+/// A node's whole name when its chip cuts it: what the chip shows opened (spec 006, "Opened
+/// chips").
+pub(crate) fn whole_label(node: &SceneNode) -> Option<String> {
+    if !matches!(node.kind, SceneKind::Node { .. })
+        || node.label.chars().count() <= CHIP_LABEL_CHARS
+    {
+        return None;
+    }
+    Some(ui::utils::replace_control_characters(&node.label).into_owned())
 }
 
 /// A chip's width at zoom 1, as [`paint_pill`] draws it, given the width of a text at a size
@@ -291,6 +307,7 @@ pub(crate) fn paint(
     selected: Option<usize>,
     marked: &HashSet<usize>,
     hovered: Option<usize>,
+    opened: Option<usize>,
     palette: &Palette,
     chips: &RefCell<Vec<Bounds<Pixels>>>,
     window: &mut Window,
@@ -575,6 +592,33 @@ pub(crate) fn paint(
             cx,
         );
     }
+    // An opened chip shows its whole name over its neighbours, from where its chip starts, and
+    // is hit where it is drawn.
+    if let Some(index) = opened
+        && let Some(label) = scene.nodes.get(index).and_then(whole_label)
+        && rects[index].size.width > px(0.)
+    {
+        let node = &scene.nodes[index];
+        let focus = selected == Some(index) || marked.contains(&index);
+        rects[index] = paint_open_chip(
+            rects[index],
+            &label,
+            (
+                type_color(&node.color_key),
+                initial(&node.label, &node.color_key),
+            ),
+            text_size,
+            PillStyle {
+                fill: palette.card,
+                border: if focus { palette.here } else { palette.pointed },
+                shadow: true,
+                ring: focus.then_some(palette.here_halo),
+            },
+            palette,
+            window,
+            cx,
+        );
+    }
     drop(rects);
     if schema && !label_all {
         paint_labels(window, cx);
@@ -794,7 +838,7 @@ fn paint_pill(
     }
     window.paint_quad(quad(
         rect,
-        px(height / 2.),
+        radius,
         style.fill,
         px(1.),
         style.border,
@@ -821,6 +865,128 @@ fn paint_pill(
         x += f32::from(line.width) + gap;
     }
     rect
+}
+
+/// A chip opened to its whole name: its mark, then the name wrapped at
+/// [`OPEN_CHIP_MAX_WIDTH`], drawn from the top left of the chip it opens and never narrower
+/// than it. Returns its bounds.
+#[allow(clippy::too_many_arguments)]
+fn paint_open_chip(
+    chip: Bounds<Pixels>,
+    label: &str,
+    (tint, letter): (Hsla, String),
+    text_size: f32,
+    style: PillStyle,
+    palette: &Palette,
+    window: &mut Window,
+    cx: &mut App,
+) -> Bounds<Pixels> {
+    let s = text_size / CHIP_TEXT;
+    let (gap, pad_x, mark_size) = (PILL_GAP * s, PILL_PAD_X * s, PILL_MARK * s);
+    let line_height = text_size * 1.4;
+    // The pill's padding above and below its one line.
+    let pad_y = 4. * s;
+    let widest = OPEN_CHIP_MAX_WIDTH * s - pad_x * 2. - mark_size - gap;
+    let run = TextRun {
+        len: label.len(),
+        font: Font {
+            weight: Role::Name.weight(),
+            ..palette.font.clone()
+        },
+        color: palette.text,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let text = SharedString::from(label.to_owned());
+    let whole = f32::from(
+        window
+            .text_system()
+            .shape_line(
+                text.clone(),
+                px(text_size),
+                std::slice::from_ref(&run),
+                None,
+            )
+            .width,
+    );
+    let wrap = wrap_width(whole, widest, text_size);
+    let lines = window
+        .text_system()
+        .shape_text(text, px(text_size), &[run], Some(px(wrap)), None)
+        .unwrap_or_default();
+    let text_width = lines
+        .iter()
+        .map(|line| f32::from(line.width()))
+        .fold(0., f32::max);
+    let text_height: f32 = lines
+        .iter()
+        .map(|line| f32::from(line.size(px(line_height)).height))
+        .sum();
+    let width = (pad_x * 2. + mark_size + gap + text_width).max(f32::from(chip.size.width));
+    let height = (text_height + pad_y * 2.).max(f32::from(chip.size.height));
+    let rect = Bounds::new(chip.origin, size(px(width), px(height)));
+    let radius = Corners::all(px(studio_ui::ds::radii(cx).sm * s));
+    if let Some(ring) = style.ring {
+        window.paint_drop_shadows(
+            rect,
+            radius,
+            &[BoxShadow {
+                color: ring,
+                offset: point(px(0.), px(0.)),
+                blur_radius: px(0.),
+                spread_radius: px(3.),
+                inset: false,
+            }],
+        );
+    }
+    if style.shadow {
+        window.paint_drop_shadows(rect, radius, &palette.shadow);
+    }
+    window.paint_quad(quad(
+        rect,
+        radius,
+        style.fill,
+        px(1.),
+        style.border,
+        BorderStyle::Solid,
+    ));
+    // The mark stays where the chip had it, beside the first line.
+    let left = f32::from(rect.left()) + pad_x;
+    let first_middle = rect.top() + px(pad_y + line_height / 2.);
+    let mark = shape_letter(&letter, mark_size, 1., palette, window);
+    paint_letter_mark(
+        point(px(left + mark_size / 2.), first_middle),
+        tint,
+        &mark,
+        mark_size,
+        1.,
+        window,
+        cx,
+    );
+    let mut y = rect.top() + px(pad_y);
+    for line in &lines {
+        line.paint(
+            point(px(left + mark_size + gap), y),
+            px(line_height),
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        )
+        .ok();
+        y += line.size(px(line_height)).height;
+    }
+    rect
+}
+
+/// Where an opened chip's name of `whole` width wraps, at most `widest`: in lines of even
+/// length rather than a full line and a scrap, since a name with no spaces (an email, an id)
+/// breaks where its room ends and its last line would hold a letter or two. A character's
+/// width (`text_size`) of slack keeps a line from wrapping again at its last letter.
+fn wrap_width(whole: f32, widest: f32, text_size: f32) -> f32 {
+    let lines = (whole / widest).ceil().max(1.);
+    (whole / lines + text_size).min(widest)
 }
 
 /// A mark's letter, shaped for a mark `size_px` across.
@@ -963,6 +1129,27 @@ fn crosses(a: Point<Pixels>, b: Point<Pixels>, bounds: Bounds<Pixels>, margin: f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An opened chip's name wraps into lines of even length, and one that fits stays whole.
+    #[test]
+    fn an_opened_name_wraps_into_even_lines() {
+        assert_eq!(
+            wrap_width(200., 280., 13.),
+            213.,
+            "fits: one line, with its slack"
+        );
+        assert_eq!(
+            wrap_width(275., 280., 13.),
+            280.,
+            "nearly full: the whole room"
+        );
+        // A little more than the room: two half lines, not a full line and a scrap.
+        let half = wrap_width(300., 280., 13.);
+        assert!((150. ..170.).contains(&half), "{half}");
+        // Long text: as many lines as it needs, each under the room.
+        let third = wrap_width(700., 280., 13.);
+        assert!(third <= 280. && 700. / third <= 3., "{third}");
+    }
 
     /// A line is drawn when it crosses the view, though both its ends are outside it.
     #[test]

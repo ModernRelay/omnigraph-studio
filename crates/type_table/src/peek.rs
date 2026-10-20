@@ -345,6 +345,25 @@ impl NodePeek {
                 cx.notify();
                 return;
             }
+            // The schema names some type's nodes otherwise (spec 002, "Node names"): the title
+            // takes its new name from the values held, and the neighbours shown are read again
+            // under theirs; a group not read yet waits to be drawn, as before.
+            if let SessionEvent::SchemaChanged = event
+                && let Some(now) = session.read(cx).schema_model()
+                && this
+                    .schema
+                    .as_ref()
+                    .is_some_and(|was| was.source == now.source && !was.same_as(&now))
+            {
+                this.schema = Some(now);
+                for index in 0..this.groups.len() {
+                    if matches!(this.groups[index].neighbours, Loadable::Loaded(_)) {
+                        this.load_group(index, false, false, cx);
+                    }
+                }
+                cx.notify();
+                return;
+            }
             // Another branch: the node is read there, as a table reads its rows again. What was
             // being edited was the branch left's; its drafts wait for it in the session.
             if let SessionEvent::BranchChanged = event

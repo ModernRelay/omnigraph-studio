@@ -17,6 +17,7 @@ mod grid_places;
 pub mod menu;
 mod modal;
 pub mod motion;
+pub mod node_names;
 mod overlay_slot;
 mod resize;
 pub mod rows;
