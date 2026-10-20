@@ -53,8 +53,8 @@ use crate::grouping::{GROUP_LIMIT, Grouping, Line, Lines, SECTION_FIRST_PAGE};
 use crate::model::{
     ColumnLayout, ColumnRole, ColumnSpec, Notice, Paging, RELATION_CHIPS_SHOWN, Row, SaveResult,
     TableKind, Tone, changed_elsewhere, chips_that_fit, count_of, display_value, edge_columns,
-    edge_rows, edit_text, field_rows, filter_parts, insert_position, node_columns, node_rows,
-    parse_filter_list, parse_filter_value, parse_input, preset_range, reads_as_markdown,
+    edge_rows, edit_text, edited, field_rows, filter_parts, insert_position, node_columns,
+    node_rows, parse_filter_list, parse_filter_value, parse_input, preset_range, reads_as_markdown,
     relation_sample, row_matches,
 };
 use crate::offers::Offers;
@@ -134,17 +134,20 @@ struct RowLook {
 /// How long scrolling must pause before the drawn rows' Blob cells are read.
 const BLOB_READ_AFTER: Duration = Duration::from_millis(120);
 
-/// A cell's save as sent: the value it was bound to, the one written and the text typed.
+/// A cell's save as sent: the value it was bound to, the one written, the text typed, and what
+/// the row showed before the new value was put in it.
 struct SavedCell {
     row_id: String,
     column: String,
     old: Value,
     new: Value,
     text: String,
+    shown: Value,
 }
 
-/// One draft being saved: the cell, the value it showed (the save is bound to it), the new
-/// value, and the text to put back if the save does not land.
+/// One draft being saved: the cell, the value it was typed over (the save is bound to it), the
+/// new value, the text to put back if the save does not land, and what the row showed before
+/// the new value was put in it.
 #[derive(Debug, Clone)]
 struct DraftEdit {
     row_id: String,
@@ -152,6 +155,7 @@ struct DraftEdit {
     old: Value,
     new: Value,
     text: String,
+    shown: Value,
 }
 
 /// A bulk set being written: the property, and what came of the last try.
@@ -2027,8 +2031,10 @@ impl TypeTable {
                 return;
             }
         };
-        let snapshot = self.paging.pinned.clone();
+        // A first read goes to the head the session holds, as the groups' read does, so the pin
+        // is a commit the session compares its next head with.
         let asked = self.head_asked(cx);
+        let snapshot = self.paging.pinned.clone().or_else(|| asked.clone());
         let read = self.read_shown(&query, snapshot, cx);
         self.page_task = Some(cx.spawn(async move |this, cx| {
             let result = read.await;
@@ -2052,8 +2058,8 @@ impl TypeTable {
 
     /// A first read pinned the table. A head move the session saw while the read was out found
     /// no pin to compare, so a pin at the head the session held when it asked (`asked`) is
-    /// compared now. One elsewhere was read at a head the session has not seen, newer than the
-    /// one it holds, and is compared once the session sees it.
+    /// compared now. A read sent before the session held a head pinned the server's, and is
+    /// compared once the session sees one.
     fn pinned_at(&mut self, asked: Option<String>, cx: &mut Context<Self>) {
         if asked.is_some() && self.paging.pinned == asked {
             self.compare_head(cx);
@@ -2551,13 +2557,17 @@ impl TypeTable {
 
     /// Where the row at `ix` shows: there, and at each of its copies.
     fn places_of(&self, ix: usize) -> Vec<usize> {
-        let Some(id) = self.rows.get(ix).map(|row| &row.id) else {
-            return Vec::new();
-        };
+        self.rows
+            .get(ix)
+            .map_or_else(Vec::new, |row| self.places_of_id(&row.id))
+    }
+
+    /// Where the row with `id` shows, at each of its copies; nowhere when it is not loaded.
+    fn places_of_id(&self, id: &str) -> Vec<usize> {
         self.rows
             .iter()
             .enumerate()
-            .filter(|(_, row)| row.id == *id)
+            .filter(|(_, row)| row.id == id)
             .map(|(ix, _)| ix)
             .collect()
     }
@@ -2582,6 +2592,19 @@ impl TypeTable {
         }
         if let Some(row) = self.cell_text.borrow_mut().get_mut(&self.rows[first].id) {
             row.remove(column);
+        }
+    }
+
+    /// Puts back what a row showed (`shown`) before a save that did not land put `new` in its
+    /// cell (`places`): a value the table read, where the value the save was bound to may not
+    /// be (a draft typed before a Refresh), so a list's next save is not bound to the pin for
+    /// it. A row read again while the save was out shows what was read, and keeps it.
+    fn put_back(&mut self, places: &[usize], column: &str, new: &Value, shown: Value) {
+        if places
+            .first()
+            .is_some_and(|&ix| same_value(self.rows[ix].value(column), new))
+        {
+            self.set_cell_at(places, column, shown);
         }
     }
 
@@ -3018,8 +3041,8 @@ impl TypeTable {
     // ---- own writes from the dialogs ----
 
     /// A row this table inserted committed. It is shown where it sorts when that place is
-    /// loaded; the pin follows when nothing else committed in between, and the counts are read
-    /// there again.
+    /// loaded; the pin follows when nothing else committed in between, and the counts follow
+    /// it ([`Self::recount`]).
     pub fn row_inserted(
         &mut self,
         branch: &str,
@@ -3033,10 +3056,12 @@ impl TypeTable {
         if branch != self.branch {
             return;
         }
-        if self.paging.advance_for_own_commit(parent, commit) {
+        let behind = self.paging.advance_for_own_commit(parent, commit);
+        if behind {
             self.newer = true;
             cx.emit(ItemEvent::UpdateTab);
         }
+        let matching = i64::from(row_matches(&self.filters, &values));
         match key {
             Some(id) => {
                 values.insert(crate::model::ID_COLUMN.into(), Value::String(id.clone()));
@@ -3098,22 +3123,33 @@ impl TypeTable {
                 cx.emit(ItemEvent::UpdateTab);
             }
         }
-        self.recount(cx);
+        self.recount(behind, 1, matching, cx);
         cx.notify();
     }
 
-    /// Reads the counts again at the pin after the table's own insert or delete: the rows it
-    /// changed are counted as the commit counts them, those not loaded and those a filter on a
-    /// relationship keeps included.
-    fn recount(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.first_page, Loadable::Loaded(())) {
-            self.load_counts(cx);
+    /// Brings the counts up to the table's own insert or delete of `rows` rows, `matching` of
+    /// them through its filters (negative for a delete). With the pin moved to the commit, they
+    /// are read again there: the rows changed are counted as the commit counts them, those not
+    /// loaded and those a filter on a relationship keeps included. Behind it, a read at the pin
+    /// would not hold the change, so they are adjusted here until Refresh.
+    fn recount(&mut self, behind: bool, rows: i64, matching: i64, cx: &mut Context<Self>) {
+        if !behind {
+            if matches!(self.first_page, Loadable::Loaded(())) {
+                self.load_counts(cx);
+            }
+            return;
+        }
+        if let Loadable::Loaded(n) = &mut self.count {
+            *n += matching;
+        }
+        if let Loadable::Loaded(n) = &mut self.total {
+            *n += rows;
         }
     }
 
     /// Rows the table's own delete removed in `commit`: they leave the list, with their drafts
-    /// and the pick. The table follows the commit, which moves its pin once, and its counts are
-    /// read there again.
+    /// and the pick. The table follows the commit, which moves its pin once, and its counts
+    /// follow it ([`Self::recount`]).
     pub fn rows_deleted(
         &mut self,
         branch: &str,
@@ -3126,10 +3162,24 @@ impl TypeTable {
         if branch != self.branch {
             return;
         }
-        if self.paging.advance_for_own_commit(parent, commit) {
+        let behind = self.paging.advance_for_own_commit(parent, commit);
+        if behind {
             self.newer = true;
             cx.emit(ItemEvent::UpdateTab);
         }
+        // Counted before they go, for counts adjusted here: each row once, however many places
+        // it shows in.
+        let (rows, matching) = {
+            let going: HashSet<&str> = ids.iter().map(String::as_str).collect();
+            let mut counted = HashSet::new();
+            self.rows
+                .iter()
+                .filter(|row| going.contains(row.id.as_str()) && counted.insert(row.id.as_str()))
+                .fold((0, 0), |(rows, matching), row| {
+                    let shown = row_matches(&self.filters, &row.values);
+                    (rows + 1, matching + i64::from(shown))
+                })
+        };
         self.remove_rows(ids, cx);
         // A deleted node took its relationships with it: the rows still shown read their
         // relationship chips again at the new commit, rather than listing it.
@@ -3138,7 +3188,7 @@ impl TypeTable {
         self.relations_asked.clear();
         self.relation_rows = None;
         self.load_shown_relations(cx);
-        self.recount(cx);
+        self.recount(behind, -rows, -matching, cx);
         cx.notify();
     }
 
@@ -3566,7 +3616,10 @@ impl TypeTable {
     /// changed anything, and the draft goes when it was typed back to what the cell holds.
     fn keep_edit(&mut self, editing: Editing, cx: &mut Context<Self>) {
         let text = self.cell_editor.read(cx).text(cx);
-        if text != edit_text(&editing.old) || editing.notice.is_some() {
+        // Typed back to the value it is bound to, over another the row shows since, it asks
+        // for that value back: a change.
+        let shows_old = self.row_shows(&editing.row_id, &editing.column, &editing.old);
+        if text != edit_text(&editing.old) || editing.notice.is_some() || !shows_old {
             self.put_draft(
                 &editing.row_id,
                 &editing.column,
@@ -3639,30 +3692,34 @@ impl TypeTable {
             return;
         };
         let text = self.cell_editor.read(cx).text(cx);
-        let new = match parse_input(&property, &text) {
-            Ok(value) => value,
-            Err(message) => {
+        let shown = self.rows[row_ix].value(&column).clone();
+        let new = match edited(&property, &old, &text) {
+            Some(Ok(value)) => value,
+            Some(Err(message)) => {
                 if let Some(editing) = &mut self.editing {
                     editing.notice = Some(Notice::new(Tone::Invalid, message));
                 }
                 cx.notify();
                 return;
             }
+            // Asks for the value the edit is bound to, which the row still shows: nothing to
+            // save, and a draft the cell held goes.
+            None if same_value(&old, &shown) => {
+                self.drop_draft(&row_id, &column, cx);
+                self.finish_editing(window, cx);
+                return;
+            }
+            // The row shows another value since the draft was typed (a Refresh): the bound
+            // write goes, and finds the change.
+            None => old.clone(),
         };
-        // Typed back to the value the edit is bound to: nothing to save, and a draft the cell
-        // held goes.
-        if same_value(&new, &old) {
-            self.drop_draft(&row_id, &column, cx);
-            self.finish_editing(window, cx);
-            return;
-        }
         // Bound to the value the edit found; a list, which the write's `where` cannot compare,
         // is bound to the commit the table read it at while the row shows that value there.
         let read_at = self
             .paging
             .pinned
             .clone()
-            .filter(|_| same_value(&old, self.rows[row_ix].value(&column)));
+            .filter(|_| same_value(&old, &shown));
         let write = match write::write_property(
             &self.session,
             &self.branch,
@@ -3702,19 +3759,20 @@ impl TypeTable {
         cx.spawn_in(window, async move |this, cx| {
             let result = write.await;
             let saved = matches!(result, SaveResult::Saved { .. });
-            let shown = this.update_in(cx, |this, window, cx| {
+            let settled = this.update_in(cx, |this, window, cx| {
                 let cell = SavedCell {
                     row_id,
                     column,
                     old,
                     new,
                     text,
+                    shown,
                 };
                 this.finish_save(cell, &session, &branch, result, window, cx)
             });
             // The tab closed while the write was out: the cell's draft is still the session's
             // to settle, its text kept when it did not land.
-            if shown.is_err() {
+            if settled.is_err() {
                 let (key, entry) = draft;
                 session.update(cx, |session, cx| {
                     if saved {
@@ -3737,35 +3795,34 @@ impl TypeTable {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let SavedCell {
-            row_id,
-            column,
-            old,
-            new,
-            text,
-        } = cell;
         self.saves_in_flight = self.saves_in_flight.saturating_sub(1);
         // The table moved to another branch or graph meanwhile and shows what it read there;
         // the write's outcome is told by its toast. A saved cell's draft was the branch left's,
         // and the text of one that did not land stays a draft there.
         if !self.shows(session, branch) {
-            let key = self.draft_key(&row_id, &column);
+            let key = self.draft_key(&cell.row_id, &cell.column);
             session.update(cx, |session, cx| match result {
                 SaveResult::Saved { .. } => {
                     session.remove_draft_on(branch, &key, cx);
                 }
-                _ => session.set_draft_on(branch, key, DraftEntry { old, text }, cx),
+                _ => {
+                    let entry = DraftEntry {
+                        old: cell.old,
+                        text: cell.text,
+                    };
+                    session.set_draft_on(branch, key, entry, cx)
+                }
             });
             self.saves_settled(cx);
             cx.emit(ItemEvent::UpdateTab);
             cx.notify();
             return;
         }
-        let key = (row_id.clone(), column.clone());
         match result {
             SaveResult::Saved { commit, parent } => {
-                self.cells.remove(&key);
-                self.drop_draft(&row_id, &column, cx);
+                self.cells
+                    .remove(&(cell.row_id.clone(), cell.column.clone()));
+                self.drop_draft(&cell.row_id, &cell.column, cx);
                 if self
                     .paging
                     .advance_for_own_commit(parent.as_deref(), &commit)
@@ -3774,21 +3831,28 @@ impl TypeTable {
                 }
                 // Shown again: the rows may have been read again, at the commit before, while
                 // the write was out.
-                if let Some(ix) = self.row_index(&row_id) {
-                    self.set_cell(ix, &column, new);
+                if let Some(ix) = self.row_index(&cell.row_id) {
+                    self.set_cell(ix, &cell.column, cell.new);
                     self.set_dimmed(ix, !self.row_fits(ix));
                 }
             }
             SaveResult::NoMatch => {
                 // The bound value changed elsewhere. Read the row at the head to say what it is
                 // now; the reopened save binds to that value.
-                self.reread_conflict(row_id, column, old, text, window, cx);
+                self.reread_conflict(cell, window, cx);
             }
             SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
-                if let Some(ix) = self.row_index(&row_id) {
-                    self.set_cell(ix, &column, old);
-                }
-                self.reopen(row_id, column, text, notice, window, cx);
+                let places = self.places_of_id(&cell.row_id);
+                self.put_back(&places, &cell.column, &cell.new, cell.shown);
+                self.reopen(
+                    cell.row_id,
+                    cell.column,
+                    cell.old,
+                    cell.text,
+                    notice,
+                    window,
+                    cx,
+                );
             }
         }
         self.saves_settled(cx);
@@ -3809,24 +3873,33 @@ impl TypeTable {
             return true;
         };
         let text = self.cell_editor.read(cx).text(cx);
-        match parse_input(&property, &text) {
-            Err(message) => {
+        // Text asking for the value the edit is bound to lets the draft go while the row shows
+        // that value; over another, shown since, it stays, so its save finds the change.
+        let shows_old = self.row_shows(&key.0, &key.1, &old);
+        match edited(&property, &old, &text) {
+            Some(Err(message)) => {
                 if let Some(editing) = &mut self.editing {
                     editing.notice = Some(Notice::new(Tone::Invalid, message));
                 }
                 cx.notify();
                 return false;
             }
-            Ok(new) if same_value(&new, &old) => {
+            None if shows_old => {
                 self.drop_draft(&key.0, &key.1, cx);
             }
-            Ok(_) => {
+            _ => {
                 self.put_draft(&key.0, &key.1, old, text, None, cx);
                 self.drafts.confirm_discard = false;
             }
         }
         self.finish_editing(window, cx);
         true
+    }
+
+    /// Whether the row with `row_id` shows `value` in `column`; a row not loaded is taken to.
+    fn row_shows(&self, row_id: &str, column: &str, value: &Value) -> bool {
+        self.row_index(row_id)
+            .is_none_or(|ix| same_value(value, self.rows[ix].value(column)))
     }
 
     /// The value a cell's draft was typed over, which its save is bound to.
@@ -4035,11 +4108,12 @@ impl TypeTable {
                 unseen += 1;
                 continue;
             };
+            let shown = self.rows[row].value(&key.1).clone();
             let old = self
                 .draft_old(&key.0, &key.1, cx)
-                .unwrap_or_else(|| self.rows[row].value(&key.1).clone());
-            match parse_input(&property, &text) {
-                Err(message) => {
+                .unwrap_or_else(|| shown.clone());
+            let new = match edited(&property, &old, &text) {
+                Some(Err(message)) => {
                     for (row_id, column) in &unchanged {
                         self.forget_draft(row_id, column, cx);
                     }
@@ -4067,20 +4141,27 @@ impl TypeTable {
                     }
                     return;
                 }
-                Ok(new) if same_value(&new, &old) => unchanged.push(key),
-                Ok(new) => {
-                    if property.list && !same_value(&old, self.rows[row].value(&key.1)) {
-                        lists_shown = false;
-                    }
-                    edits.push(DraftEdit {
-                        row_id: key.0,
-                        column: key.1,
-                        old,
-                        new,
-                        text,
-                    });
+                Some(Ok(new)) => new,
+                // Asks for the value it was typed over, which the row still shows.
+                None if same_value(&old, &shown) => {
+                    unchanged.push(key);
+                    continue;
                 }
+                // Over another value, shown since: saved as typed, so the bound write finds the
+                // change.
+                None => old.clone(),
+            };
+            if property.list && !same_value(&old, &shown) {
+                lists_shown = false;
             }
+            edits.push(DraftEdit {
+                row_id: key.0,
+                column: key.1,
+                old,
+                new,
+                text,
+                shown,
+            });
         }
         for (row_id, column) in &unchanged {
             self.forget_draft(row_id, column, cx);
@@ -4269,7 +4350,7 @@ impl TypeTable {
                     let places = self.row_places();
                     for edit in edits {
                         if let Some(at) = places.get(&edit.row_id) {
-                            self.set_cell_at(at, &edit.column, edit.old.clone());
+                            self.put_back(at, &edit.column, &edit.new, edit.shown);
                         }
                         self.cells
                             .remove(&(edit.row_id.clone(), edit.column.clone()));
@@ -4352,26 +4433,25 @@ impl TypeTable {
                     true
                 });
                 // The table moved on, or its tab closed: each draft is settled where it was
-                // typed, and nothing here changes.
+                // typed, and nothing here changes. One that did not land stays bound to the
+                // value it was typed over: what the head holds was never shown, and why it
+                // changed went with the table, so its next save finds the change again rather
+                // than writing over it.
                 if !shown.unwrap_or(false) {
                     session.update(cx, |session, cx| {
                         for (edit, key) in row_edits.into_iter().zip(keys) {
-                            let value = match &now {
-                                Some(Some(row)) => Some(row.value(&edit.column).clone()),
-                                _ => None,
-                            };
-                            match value {
-                                Some(value) if same_value(&value, &edit.new) => {
-                                    session.remove_draft_on(&branch, &key, cx);
-                                }
-                                value => {
-                                    let old = value.unwrap_or(edit.old);
-                                    let entry = DraftEntry {
-                                        old,
-                                        text: edit.text,
-                                    };
-                                    session.set_draft_on(&branch, key, entry, cx);
-                                }
+                            let landed = matches!(
+                                &now,
+                                Some(Some(row)) if same_value(row.value(&edit.column), &edit.new)
+                            );
+                            if landed {
+                                session.remove_draft_on(&branch, &key, cx);
+                            } else {
+                                let entry = DraftEntry {
+                                    old: edit.old,
+                                    text: edit.text,
+                                };
+                                session.set_draft_on(&branch, key, entry, cx);
                             }
                         }
                     });
@@ -4391,10 +4471,14 @@ impl TypeTable {
         now: Option<&Option<Row>>,
         cx: &mut Context<Self>,
     ) {
+        let places = self.row_places();
         for edit in edits {
             let key = (edit.row_id.clone(), edit.column.clone());
             let property = self.property_of(&edit.column);
-            let ix = self.row_index(&edit.row_id);
+            let at = places
+                .get(&edit.row_id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             self.cells.remove(&key);
             let (old, notice) = match now {
                 Some(Some(row)) => {
@@ -4403,24 +4487,18 @@ impl TypeTable {
                         self.forget_draft(&edit.row_id, &edit.column, cx);
                         continue;
                     }
-                    if let Some(ix) = ix {
-                        self.set_cell(ix, &edit.column, value.clone());
-                    }
+                    self.set_cell_at(at, &edit.column, value.clone());
                     let notice = (!same_value(&value, &edit.old))
                         .then(|| changed_elsewhere(property.as_ref(), Some(&value)));
                     (value, notice)
                 }
                 Some(None) => {
-                    if let Some(ix) = ix {
-                        self.set_cell(ix, &edit.column, edit.old.clone());
-                        self.set_dimmed(ix, true);
-                    }
+                    self.put_back(at, &edit.column, &edit.new, edit.shown);
+                    self.set_dimmed_at(at, true);
                     (edit.old, Some(changed_elsewhere(property.as_ref(), None)))
                 }
                 None => {
-                    if let Some(ix) = ix {
-                        self.set_cell(ix, &edit.column, edit.old.clone());
-                    }
+                    self.put_back(at, &edit.column, &edit.new, edit.shown);
                     let notice = Notice::new(
                         Tone::Unknown,
                         "The row could not be read to check this change. Check History \
@@ -4544,15 +4622,17 @@ impl TypeTable {
         )
     }
 
-    fn reread_conflict(
-        &mut self,
-        row_id: String,
-        column: String,
-        old: Value,
-        text: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// A cell's save matched nothing: the value it was bound to changed elsewhere. Reads the row
+    /// at the head to say what the cell holds now, and opens the edit again bound to that.
+    fn reread_conflict(&mut self, cell: SavedCell, window: &mut Window, cx: &mut Context<Self>) {
+        let SavedCell {
+            row_id,
+            column,
+            old,
+            new,
+            text,
+            shown,
+        } = cell;
         let Some(schema) = self.schema.clone() else {
             return;
         };
@@ -4560,8 +4640,10 @@ impl TypeTable {
         let query = match builder::node_by_id(&schema, &self.type_name, &row_id) {
             Ok(query) => query,
             Err(error) => {
+                let places = self.places_of_id(&row_id);
+                self.put_back(&places, &column, &new, shown);
                 let notice = Notice::new(Tone::Conflict, error.to_string());
-                self.reopen(row_id, column, text, notice, window, cx);
+                self.reopen(row_id, column, old, text, notice, window, cx);
                 return;
             }
         };
@@ -4580,54 +4662,50 @@ impl TypeTable {
                 .await
                 .ok()
                 .map(|output| node_rows(&output.rows).into_iter().next());
-            let shown = this.update_in(cx, |this, window, cx| {
+            let shown_here = this.update_in(cx, |this, window, cx| {
                 this.saves_in_flight = this.saves_in_flight.saturating_sub(1);
                 if !this.shows(&session, &branch) {
                     this.saves_settled(cx);
                     return false;
                 }
-                let ix = this.row_index(&row_id);
-                let notice = match &now {
+                let places = this.places_of_id(&row_id);
+                // The edit opens again with why, bound to the value read, which the cell now
+                // shows; without one, still to the value it was bound to.
+                let (bound, notice) = match &now {
                     Some(Some(row)) => {
                         let value = row.value(&column).clone();
-                        if let Some(ix) = ix {
-                            this.set_cell(ix, &column, value.clone());
-                        }
-                        changed_elsewhere(property.as_ref(), Some(&value))
+                        this.set_cell_at(&places, &column, value.clone());
+                        let notice = changed_elsewhere(property.as_ref(), Some(&value));
+                        (value, notice)
                     }
                     Some(None) => {
-                        if let Some(ix) = ix {
-                            this.set_cell(ix, &column, old.clone());
-                            this.set_dimmed(ix, true);
-                        }
-                        changed_elsewhere(property.as_ref(), None)
+                        this.put_back(&places, &column, &new, shown.clone());
+                        this.set_dimmed_at(&places, true);
+                        (old.clone(), changed_elsewhere(property.as_ref(), None))
                     }
                     None => {
-                        if let Some(ix) = ix {
-                            this.set_cell(ix, &column, old.clone());
-                        }
-                        Notice::new(
+                        this.put_back(&places, &column, &new, shown.clone());
+                        let notice = Notice::new(
                             Tone::Conflict,
                             "The value changed elsewhere while you were editing. Nothing was written.",
-                        )
+                        );
+                        (old.clone(), notice)
                     }
                 };
                 // The table now shows a value newer than its pin.
                 this.newer = true;
                 this.saves_settled(cx);
                 cx.emit(ItemEvent::UpdateTab);
-                this.reopen(row_id.clone(), column.clone(), text.clone(), notice, window, cx);
+                let (row_id, column, text) = (row_id.clone(), column.clone(), text.clone());
+                this.reopen(row_id, column, bound, text, notice, window, cx);
                 true
             });
-            // The table moved on, or its tab closed: the text stays a draft where it was
-            // typed, bound to the value just read there, and nothing here changes.
-            if !shown.unwrap_or(false) {
-                let read = match now {
-                    Some(Some(row)) => Some(row.value(&column).clone()),
-                    _ => None,
-                };
+            // The table moved on, or its tab closed: the text stays a draft where it was typed,
+            // and nothing here changes. It stays bound to the value it was typed over: what
+            // the head holds was never shown, and why it changed went with the table, so its
+            // next save finds the change again rather than writing over it.
+            if !shown_here.unwrap_or(false) {
                 session.update(cx, |session, cx| {
-                    let old = read.unwrap_or(old);
                     session.set_draft_on(&branch, key, DraftEntry { old, text }, cx)
                 });
             }
@@ -4635,12 +4713,15 @@ impl TypeTable {
         .detach();
     }
 
-    /// Puts an edit that did not land back in front of the person: the editor reopens on the
-    /// cell when they are not busy elsewhere, otherwise the cell keeps the draft and the notice.
+    /// Puts an edit that did not land back in front of the person, bound to `old`: the editor
+    /// reopens on the cell when they are not busy elsewhere, otherwise the cell keeps the draft
+    /// and the notice.
+    #[allow(clippy::too_many_arguments)]
     fn reopen(
         &mut self,
         row_id: String,
         column: String,
+        old: Value,
         text: String,
         notice: Notice,
         window: &mut Window,
@@ -4651,10 +4732,6 @@ impl TypeTable {
         let free = self.editing.is_none()
             && self.filter_draft.is_none()
             && self.focus_handle.contains_focused(window, cx);
-        let old = self
-            .row_index(&row_id)
-            .map(|ix| self.rows[ix].value(&column).clone())
-            .unwrap_or(Value::Null);
         self.cells.remove(&key);
         self.put_draft(&row_id, &column, old, text, Some(notice), cx);
         if let (true, Some((row, col))) = (free, position) {
@@ -7590,8 +7667,10 @@ mod tests {
     }
 
     /// A conflict's re-read that comes back after the table moved to another branch keeps the
-    /// typed text as a draft on the branch it was typed on, bound to the value read there, and
-    /// leaves the new branch alone.
+    /// typed text as a draft on the branch it was typed on, still bound to the value it was
+    /// typed over: the value read there was never shown, so the next save finds the change
+    /// rather than writing over it. A batch's drafts read again alike; the new branch is left
+    /// alone.
     #[gpui::test]
     async fn a_conflict_read_again_after_a_branch_switch_stays_on_its_branch(
         cx: &mut TestAppContext,
@@ -7601,9 +7680,9 @@ mod tests {
             editor::init(cx);
         });
         let session = session(PEOPLE, cx);
-        let key = DraftKey {
+        let key = |id: &str| DraftKey {
             type_name: "Person".into(),
-            id: "p1".into(),
+            id: id.into(),
             property: "name".into(),
         };
         let (table, cx) = cx.add_window_view({
@@ -7620,34 +7699,116 @@ mod tests {
             }
         });
         cx.run_until_parked();
+        // Each row is read as holding neither the value typed over nor the one typed.
         table.update_in(cx, |table, window, cx| {
-            table.reread_conflict(
-                "p1".into(),
-                "name".into(),
-                "Ada B".into(),
-                "Ada Lovelace".into(),
-                window,
-                cx,
-            );
+            let cell = SavedCell {
+                row_id: "p1".into(),
+                column: "name".into(),
+                old: "Ada B".into(),
+                new: "Ada Lovelace".into(),
+                text: "Ada Lovelace".into(),
+                shown: "Ada".into(),
+            };
+            table.reread_conflict(cell, window, cx);
+            let edit = DraftEdit {
+                row_id: "p2".into(),
+                column: "name".into(),
+                old: "Grace B".into(),
+                new: "Grace Hopper".into(),
+                text: "Grace Hopper".into(),
+                shown: "Grace".into(),
+            };
+            table.reread_drafts(vec![edit], window, cx);
         });
         session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
         cx.run_until_parked();
         session.read_with(cx, |session, _| {
             let on_main: Vec<_> = session.drafts_on("main").collect();
+            let entry = |old: &str, text: &str| graph_store::DraftEntry {
+                old: old.into(),
+                text: text.into(),
+            };
             assert_eq!(
                 on_main,
-                vec![(
-                    &key,
-                    &graph_store::DraftEntry {
-                        old: "Ada".into(),
-                        text: "Ada Lovelace".into(),
-                    }
-                )],
-                "bound to the value read on main"
+                vec![
+                    (&key("p1"), &entry("Ada B", "Ada Lovelace")),
+                    (&key("p2"), &entry("Grace B", "Grace Hopper")),
+                ],
+                "bound to the values they were typed over"
             );
-            assert!(session.draft(&key).is_none(), "nothing on fix");
+            assert!(session.draft(&key("p1")).is_none(), "nothing on fix");
         });
         table.read_with(cx, |table, _| assert_eq!(table.saves_in_flight, 0));
+    }
+
+    /// A save that does not land puts back what the row showed, not the value a draft was typed
+    /// over before a Refresh: shown as read at the pin, that value would bind a list's next save
+    /// to the pin, over the newer one. The draft stays bound to the value it was typed over.
+    #[gpui::test]
+    async fn a_refused_save_puts_back_what_the_row_showed(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let refused = serde_json::json!({ "error": "policy denied", "code": "forbidden" });
+        let session = crate::test_support::session_answering(PEOPLE, 403, refused, cx);
+        let (table, cx) = cx.add_window_view({
+            let session = session.clone();
+            |window, cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            }
+        });
+        cx.run_until_parked();
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        // Typed over "Ada B"; the row shows "Ada", read since.
+        session.update(cx, |session, cx| {
+            let draft = DraftEntry {
+                old: "Ada B".into(),
+                text: "Ada King".into(),
+            };
+            session.set_draft(key.clone(), draft, cx);
+        });
+        cx.run_until_parked();
+        let settled = |cx: &mut VisualTestContext| {
+            table.read_with(cx, |table, _| {
+                assert_eq!(table.rows[0].value("name"), "Ada", "what the row showed");
+                assert_eq!(table.saves_in_flight, 0);
+            });
+            let old =
+                session.read_with(cx, |session, _| session.draft(&key).map(|d| d.old.clone()));
+            assert_eq!(
+                old,
+                Some("Ada B".into()),
+                "still bound to what it was typed over"
+            );
+        };
+        table.update_in(cx, |table, window, cx| {
+            let col = table.column_index("name").unwrap();
+            table.start_edit(Cursor { row: 0, col }, window, cx);
+            table.confirm_edit(window, cx);
+            assert_eq!(
+                table.rows[0].value("name"),
+                "Ada King",
+                "while the save is out"
+            );
+        });
+        cx.run_until_parked();
+        settled(cx);
+        // ⌘S alike.
+        table.update_in(cx, |table, window, cx| table.save_drafts(window, cx));
+        cx.run_until_parked();
+        settled(cx);
     }
 
     /// Grouped by a relationship, a row shows under each of its neighbours; a bulk set writes
@@ -8255,6 +8416,27 @@ mod tests {
             assert_eq!(table.paging.pinned.as_deref(), Some("c3"));
             assert_eq!(table.count, Loadable::Loaded(1));
         });
+
+        // Made on a commit past the pin, a read at the pin would not hold them: the counts
+        // follow them here rather than being read again there.
+        count.store(99, Ordering::SeqCst);
+        let values = serde_json::from_value(serde_json::json!({"name": "Ida"})).unwrap();
+        table.update(cx, |table, cx| {
+            table.row_inserted("main", None, values, "c5", Some("c4"), cx)
+        });
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.paging.pinned.as_deref(), Some("c3"), "behind");
+            assert_eq!(table.count, Loadable::Loaded(2), "counted here");
+        });
+        table.update(cx, |table, cx| {
+            table.rows_deleted("main", &["p2".to_owned()], "c6", Some("c5"), cx)
+        });
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert!(table.newer);
+            assert_eq!(table.count, Loadable::Loaded(1), "counted here");
+        });
     }
 
     /// A head the session sees move while the table's first read is out is compared once the
@@ -8307,15 +8489,78 @@ mod tests {
         });
     }
 
+    /// A first read goes to the head the session holds, not to a newer one only the server has
+    /// seen: the pin is a commit the session compares its next head with, so a write to a
+    /// person the table shows offers Refresh once the session sees it.
+    #[gpui::test]
+    async fn a_first_read_pins_the_head_the_session_holds(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let pages = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let seen = pages.clone();
+        let (session, writer) = session_followed(
+            PEOPLE,
+            move |request| {
+                if request["name"] == "studio_head" {
+                    return serde_json::json!([]);
+                }
+                if request["name"] == "studio_page" {
+                    seen.lock().unwrap().push(request["snapshot"].clone());
+                }
+                serde_json::json!([
+                    {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
+                    {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
+                ])
+            },
+            cx,
+        );
+        let (table, cx) = cx.add_window_view({
+            let session = session.clone();
+            |window, cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            }
+        });
+        cx.run_until_parked();
+        let held = session.read_with(cx, |session, _| session.head("main").map(str::to_owned));
+        assert_eq!(held.as_deref(), Some("c1"));
+        // Another writer's commit, which only the server has seen.
+        writer.commit("c2", vec![changed("node", "Person", "p1", None)]);
+        table.update_in(cx, |table, window, cx| table.refresh(window, cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.paging.pinned.as_deref(), Some("c1"));
+            assert!(!table.newer);
+        });
+        assert_eq!(
+            pages.lock().unwrap().last(),
+            Some(&serde_json::json!("c1")),
+            "read at the head the session holds"
+        );
+        session.update(cx, |session, cx| session.check_heads(cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert!(table.newer, "a person it shows changed")
+        });
+    }
+
     /// ↵ on a draft typed back to the value it was typed over lets the draft go, as leaving the
-    /// cell does.
+    /// cell does, while the row still shows that value.
     #[gpui::test]
     async fn a_draft_typed_back_and_confirmed_goes(cx: &mut TestAppContext) {
         cx.update(|cx| {
             studio_theme::init_test(cx);
             editor::init(cx);
         });
-        let session = session(PEOPLE, cx);
+        let (session, sent) = crate::test_support::session_recording_writes(PEOPLE, cx);
         let (table, cx) = cx.add_window_view({
             let session = session.clone();
             |window, cx| {
@@ -8335,29 +8580,48 @@ mod tests {
             id: "p1".into(),
             property: "name".into(),
         };
-        session.update(cx, |session, cx| {
-            let draft = DraftEntry {
-                old: "Ada".into(),
-                text: "Ada King".into(),
-            };
-            session.set_draft(key.clone(), draft, cx);
-        });
-        cx.run_until_parked();
-        table.update_in(cx, |table, window, cx| {
-            let col = table.column_index("name").unwrap();
-            table.start_edit(Cursor { row: 0, col }, window, cx);
-            assert_eq!(table.cell_editor.read(cx).text(cx), "Ada King");
-            table
-                .cell_editor
-                .update(cx, |editor, cx| editor.set_text("Ada", window, cx));
-            table.confirm_edit(window, cx);
-            assert!(table.editing.is_none() && table.saves_in_flight == 0);
-        });
-        cx.run_until_parked();
+        let typed_back = |old: &str, cx: &mut VisualTestContext| {
+            session.update(cx, |session, cx| {
+                let draft = DraftEntry {
+                    old: old.into(),
+                    text: "Ada King".into(),
+                };
+                session.set_draft(key.clone(), draft, cx);
+            });
+            cx.run_until_parked();
+            let out = table.update_in(cx, |table, window, cx| {
+                let col = table.column_index("name").unwrap();
+                table.start_edit(Cursor { row: 0, col }, window, cx);
+                assert_eq!(table.cell_editor.read(cx).text(cx), "Ada King");
+                table
+                    .cell_editor
+                    .update(cx, |editor, cx| editor.set_text(old, window, cx));
+                table.confirm_edit(window, cx);
+                assert!(table.editing.is_none());
+                table.saves_in_flight
+            });
+            cx.run_until_parked();
+            out
+        };
+        assert_eq!(typed_back("Ada", cx), 0, "nothing to save");
         session.read_with(cx, |session, _| assert!(session.draft(&key).is_none()));
         table.read_with(cx, |table, _| {
             assert_eq!(table.draft_text("p1", "name"), None)
         });
+        assert!(sent.lock().unwrap().is_empty());
+
+        // Typed over a value the row no longer shows: asking for it back is a change, sent
+        // bound to it, so the change made since is found rather than the draft going unseen.
+        assert_eq!(typed_back("Ada B", cx), 1, "the bound write goes");
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let params: Vec<&str> = sent[0]["params"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(params.contains(&"Ada B"), "{params:?}");
     }
 
     /// Naming a type's nodes otherwise keeps a table where it is, at its commit with a cell

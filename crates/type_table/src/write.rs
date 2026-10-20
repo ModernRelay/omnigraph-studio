@@ -2,13 +2,15 @@
 //! its text editor (spec 014): bound to the values they were read at, so a write changes
 //! nothing if a value changed elsewhere meanwhile.
 
+use std::collections::HashMap;
+
 use gpui::{App, Entity, Task};
 use gq_language::input::same_value;
-use gq_language::{BuildError, BuiltQuery, SchemaModel, builder};
+use gq_language::{BuiltQuery, SchemaModel, builder};
 use graph_client::WriteOutcome;
 use graph_client::api::ChangeOutput;
 use graph_store::GraphSession;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::model::{Notice, SaveResult, Tone, node_rows, save_result};
 
@@ -190,10 +192,9 @@ pub(crate) fn write_cells(
 /// value it was read at), to `branch`. Its `where` binds the scalars; a `where` cannot compare a
 /// list, so with lists among them the write is bound to a commit holding the values read. That
 /// is `read_at` when the caller read every value there and it is the head the session holds;
-/// otherwise each node holding a list is read, the first at the branch's head and the others at
-/// the commit it was found at, and the write is bound to that commit. A change made elsewhere
-/// since the values were read is found by the comparison, and one made after it by the head
-/// having moved.
+/// otherwise the nodes holding a list are read together at the branch's head, and the write is
+/// bound to the commit they were found at. A change made elsewhere since the values were read
+/// is found by the comparison, and one made after it by the head having moved.
 #[allow(clippy::too_many_arguments)]
 fn send_bound(
     session: &Entity<GraphSession>,
@@ -238,48 +239,27 @@ fn send_bound(
         });
         return Ok(cx.spawn(async move |_| Bound::Sent(write.await)));
     }
-    let reads = lists
-        .into_iter()
-        .map(|(id, read)| Ok((builder::node_by_id(schema, type_name, &id)?, read)))
-        .collect::<Result<Vec<_>, BuildError>>()
-        .map_err(|error| error.to_string())?;
+    let ids: Vec<String> = lists.iter().map(|(id, _)| id.clone()).collect();
+    let nodes = builder::nodes_by_id(schema, type_name, &ids).map_err(|error| error.to_string())?;
     let session = session.clone();
     Ok(cx.spawn(async move |cx| {
-        let unread = |error: graph_client::ReadError| {
-            Bound::Unread(Notice::new(
-                Tone::Refused,
-                format!("Nothing was written. {error}"),
-            ))
-        };
-        let mut reads = reads.into_iter();
-        let Some((first, first_read)) = reads.next() else {
-            return Bound::Changed;
-        };
         let output = match session
-            .update(cx, |session, cx| session.read_on(&branch, &first, cx))
+            .update(cx, |session, cx| session.read_on(&branch, &nodes, cx))
             .await
         {
             Ok(output) => output,
-            Err(error) => return unread(error),
+            Err(error) => {
+                return Bound::Unread(Notice::new(
+                    Tone::Refused,
+                    format!("Nothing was written. {error}"),
+                ));
+            }
         };
         let Some(head) = output.graph_commit_id.clone() else {
             return Bound::Changed;
         };
-        if !holds(&output.rows, &first_read) {
+        if !holds(&output.rows, &lists) {
             return Bound::Changed;
-        }
-        // The other nodes at the head the first was found at, read together.
-        let rest: Vec<_> = session.update(cx, |session, cx| {
-            reads
-                .map(|(query, read)| (session.read(&query, Some(head.clone()), cx), read))
-                .collect()
-        });
-        for (output, read) in rest {
-            match output.await {
-                Ok(output) if holds(&output.rows, &read) => {}
-                Ok(_) => return Bound::Changed,
-                Err(error) => return unread(error),
-            }
         }
         let write = session.update(cx, |session, cx| {
             session.write_on(&branch, &query, Some(head), description, None, cx)
@@ -288,11 +268,18 @@ fn send_bound(
     }))
 }
 
-/// Whether the node a `node_by_id` read found holds each property's value as `read` says.
-fn holds(rows: &Value, read: &[(String, Value)]) -> bool {
-    node_rows(rows).pop().is_some_and(|row| {
-        read.iter().all(|(property, old)| {
-            same_value(row.values.get(property).unwrap_or(&Value::Null), old)
+/// Whether the nodes a `nodes_by_id` read found hold each value as `read` says, every node
+/// there.
+fn holds(rows: &Value, read: &[Read]) -> bool {
+    let found: HashMap<String, Map<String, Value>> = node_rows(rows)
+        .into_iter()
+        .map(|row| (row.id, row.values))
+        .collect();
+    read.iter().all(|(id, values)| {
+        found.get(id).is_some_and(|row| {
+            values
+                .iter()
+                .all(|(property, old)| same_value(row.get(property).unwrap_or(&Value::Null), old))
         })
     })
 }
@@ -311,30 +298,46 @@ mod tests {
     const TAGGED: &str = "node Person {\n  slug: String @key\n  tags: [String]?\n}\n";
 
     /// A list cannot be compared in a write's `where`: its write is sent only when the value
-    /// at the branch's head is the one read, and bound to that head.
+    /// at the branch's head is the one read, and bound to that head. A bulk set reads every
+    /// row there in one read before it is sent.
     #[gpui::test]
     async fn a_list_write_is_bound_to_the_head_it_found_the_value_at(cx: &mut TestAppContext) {
+        use futures::AsyncReadExt as _;
         let writes = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
-        let sent = writes.clone();
+        let reads = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let (sent, read) = (writes.clone(), reads.clone());
         let http = FakeHttpClient::create(move |request| {
-            let sent = sent.clone();
+            let (sent, read) = (sent.clone(), read.clone());
             async move {
                 let path = request.uri().path().to_owned();
+                let header = request
+                    .headers()
+                    .get(graph_client::IF_GRAPH_COMMIT_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
                 let body = if path.ends_with("/query") {
+                    let mut bytes = Vec::new();
+                    request.into_body().read_to_end(&mut bytes).await.ok();
+                    let asked: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                    read.lock().unwrap().push(asked["snapshot"].clone());
+                    // Each node asked for, holding `a, b`.
+                    let ids = asked["params"]["ids"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    let rows: Vec<Value> = ids
+                        .iter()
+                        .map(|id| json!({ "n": { "@id": id, "slug": id, "tags": ["a", "b"] } }))
+                        .collect();
                     json!({
-                        "query_name": "studio_node",
+                        "query_name": "studio_nodes",
                         "target": { "branch": "main", "snapshot": null },
-                        "row_count": 1,
+                        "row_count": rows.len(),
                         "columns": ["n"],
-                        "rows": [{ "n": { "@id": "p1", "slug": "p1", "tags": ["a", "b"] } }],
+                        "rows": rows,
                         "graph_commit_id": "c5",
                     })
                 } else if path.contains("/mutate") {
-                    let header = request
-                        .headers()
-                        .get(graph_client::IF_GRAPH_COMMIT_HEADER)
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::to_owned);
                     sent.lock().unwrap().push((path, header));
                     crate::test_support::committed("c6", "c5")
                 } else {
@@ -385,9 +388,39 @@ mod tests {
             save(json!(["a", "b"]), cx),
             SaveResult::Saved { .. }
         ));
+        {
+            let writes = writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            assert!(writes[0].0.ends_with("/if-graph-commit"), "{}", writes[0].0);
+            assert_eq!(writes[0].1.as_deref(), Some("c5"));
+        }
+
+        reads.lock().unwrap().clear();
+        let rows: Vec<(String, Value)> = (0..20)
+            .map(|i| (format!("q{i}"), json!(["a", "b"])))
+            .collect();
+        let task = cx.update(|cx| {
+            write_cells(
+                &session,
+                "main",
+                &schema,
+                "Person",
+                "tags",
+                &rows,
+                &json!(["c"]),
+                None,
+                "Set tags".into(),
+                cx,
+            )
+            .unwrap()
+        });
+        cx.run_until_parked();
+        let bound = cx.foreground_executor().block_on(task);
+        assert!(matches!(bound, Bound::Sent(WriteOutcome::Committed(_))));
+        let reads = reads.lock().unwrap();
+        assert_eq!(*reads, vec![Value::Null], "one read, at the branch's head");
         let writes = writes.lock().unwrap();
-        assert_eq!(writes.len(), 1);
-        assert!(writes[0].0.ends_with("/if-graph-commit"), "{}", writes[0].0);
-        assert_eq!(writes[0].1.as_deref(), Some("c5"));
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[1].1.as_deref(), Some("c5"));
     }
 }

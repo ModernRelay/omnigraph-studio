@@ -5,7 +5,7 @@
 use std::cmp::Ordering;
 
 use gq_language::builder::edge_property_column;
-use gq_language::input::{compare_values as compare, parse_scalar, same_value};
+use gq_language::input::{compare_values as compare, list_items, parse_scalar, same_value, typed};
 pub use gq_language::input::{edit_text, parse_input};
 use gq_language::{
     EdgeType, Filter, FilterOp, NodeType, PageStart, Property, RelationshipGroup, ScalarKind,
@@ -625,6 +625,16 @@ pub fn relative_value(
     }
 }
 
+/// What an edit's text asks for, its editor filled with `old`: `None` while it asks for `old`
+/// (the text as it was filled, or the same value spelled otherwise), else the value typed, or
+/// why the text is not one.
+pub fn edited(property: &Property, old: &Value, text: &str) -> Option<Result<Value, String>> {
+    match typed(property, old, text)? {
+        Ok(new) if same_value(&new, old) => None,
+        new => Some(new),
+    }
+}
+
 /// Parses a filter's value: one element for a list's membership test.
 pub fn parse_filter_value(property: &Property, text: &str) -> Result<Value, String> {
     let element = Property {
@@ -638,18 +648,17 @@ pub fn parse_filter_value(property: &Property, text: &str) -> Result<Value, Stri
     parse_scalar(&element, text)
 }
 
-/// The values of an "is one of" filter, separated by commas: `Founder, Engineer`.
+/// The values of an "is one of" filter, read as a list cell's items are: separated by commas,
+/// one holding a comma quoted (`Founder, "Smith, John"`).
 pub fn parse_filter_list(property: &Property, text: &str) -> Result<Value, String> {
     let element = Property {
         list: false,
         nullable: false,
         ..property.clone()
     };
-    let values = text
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(|part| parse_scalar(&element, part))
+    let values = list_items(text)?
+        .iter()
+        .map(|item| parse_scalar(&element, item))
         .collect::<Result<Vec<_>, _>>()?;
     if values.is_empty() {
         return Err("Enter values separated by commas".into());
@@ -1289,6 +1298,31 @@ mod tests {
         assert_eq!(edit_text(&json!(42)), "42");
     }
 
+    /// An edit asks for nothing while its text is the one its editor was filled with, even
+    /// text that would not read back as the value: a blank kept in an optional text, an empty
+    /// one in a required text.
+    #[test]
+    fn an_untouched_edit_asks_for_nothing() {
+        let (title, name, founded) = (
+            prop("Person", "title"),
+            prop("Person", "name"),
+            prop("Company", "founded"),
+        );
+        assert_eq!(edited(&title, &json!(" "), " "), None);
+        assert_eq!(edited(&name, &json!(""), ""), None);
+        assert_eq!(
+            edited(&founded, &json!(1999), " 1999 "),
+            None,
+            "the same value"
+        );
+        assert_eq!(edited(&title, &json!(" "), ""), Some(Ok(Value::Null)));
+        assert_eq!(
+            edited(&founded, &json!(1999), "2000"),
+            Some(Ok(json!(2000)))
+        );
+        assert!(matches!(edited(&founded, &json!(1999), "x"), Some(Err(_))));
+    }
+
     fn filter(property: &str, op: FilterOp, value: Value) -> Filter {
         Filter {
             property: property.into(),
@@ -1472,6 +1506,13 @@ mod tests {
             parse_filter_list(&prop("Person", "title"), "Founder, Engineer,").unwrap(),
             json!(["Founder", "Engineer"])
         );
+        // A value holding a comma is quoted, as in a list cell, and the pill writes it so.
+        let names = json!(["Smith, John", "Doe"]);
+        assert_eq!(
+            parse_filter_list(&prop("Person", "title"), &edit_text(&names)),
+            Ok(names)
+        );
+        assert!(parse_filter_list(&prop("Person", "title"), "\"Smith, John").is_err());
         assert!(parse_filter_list(&prop("Person", "born"), "2020-01-01, soon").is_err());
         assert!(parse_filter_list(&prop("Person", "title"), " , ").is_err());
     }

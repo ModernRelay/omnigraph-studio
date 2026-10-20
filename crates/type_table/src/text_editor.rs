@@ -10,7 +10,7 @@ use gpui::{
     AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
     StyleRefinement, Subscription, Task, Window,
 };
-use gq_language::input::{edit_text, parse_input, same_value};
+use gq_language::input::edit_text;
 use gq_language::{SchemaModel, builder};
 use graph_store::{DraftEntry, DraftKey, GraphSession, Loadable, SessionEvent};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -20,7 +20,7 @@ use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 use ui::{Indicator, Tooltip};
 
-use crate::model::{Notice, SaveResult, Tone, node_label, node_rows};
+use crate::model::{Notice, SaveResult, Tone, edited, node_label, node_rows};
 
 /// How long typing must pause before the preview shows the text: each update copies all of
 /// it, and Zed's own markdown preview waits longer.
@@ -327,17 +327,17 @@ impl TextEditor {
         }
         let old = old.clone();
         let text = self.text(cx);
-        let new = match parse_input(&property, &text) {
-            Ok(value) => value,
-            Err(message) => {
+        // Text asking for the value read sends nothing: the text the editor was filled with, or
+        // that value spelled otherwise.
+        let new = match edited(&property, &old, &text) {
+            Some(Ok(value)) => value,
+            Some(Err(message)) => {
                 self.state = State::Failed(Notice::new(Tone::Invalid, message));
                 cx.notify();
                 return;
             }
+            None => return,
         };
-        if same_value(&new, &old) {
-            return;
-        }
         let write = match crate::write::write_property(
             &self.session,
             &self.branch,
