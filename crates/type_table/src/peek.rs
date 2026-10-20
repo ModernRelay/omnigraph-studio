@@ -203,14 +203,16 @@ struct FieldEdit {
     _blur: Subscription,
 }
 
-/// A property's write as sent: the value it was bound to, the one written, the text typed, and
-/// what the view showed before the new value was put in.
+/// A property's write as sent: the value it was bound to, the one written, the text typed, what
+/// the view showed before the new value was put in, and the property's draft as the session held
+/// it then, which the write settles only while it still is.
 struct FieldWrite {
     property: gq_language::Property,
     old: Value,
     new: Value,
     text: String,
     shown: Value,
+    sent: Option<DraftEntry>,
 }
 
 /// A draft as ⌘S sent it: the value it was bound to, the one it asks for, and the text typed.
@@ -219,6 +221,16 @@ struct SentDraft {
     old: Value,
     new: Value,
     text: String,
+}
+
+impl SentDraft {
+    /// The draft as ⌘S sent it, which was the session's then.
+    fn entry(&self) -> DraftEntry {
+        DraftEntry {
+            old: self.old.clone(),
+            text: self.text.clone(),
+        }
+    }
 }
 
 /// A read of the node sent ([`NodePeek::send_node_read`]): what its answer is landed with.
@@ -1618,6 +1630,41 @@ impl NodePeek {
             .collect()
     }
 
+    /// The property's draft on the branch the view reads.
+    fn held_draft(&self, name: &str, cx: &App) -> Option<DraftEntry> {
+        let key = self.draft_key(name)?;
+        self.session.read(cx).draft_on(&self.branch, &key).cloned()
+    }
+
+    /// Whether the property's draft on the branch the view reads is still `sent`
+    /// ([`GraphSession::draft_as_sent`]). A property with no draft (an edge's) always is.
+    fn draft_as_sent(&self, name: &str, sent: Option<&DraftEntry>, cx: &App) -> bool {
+        self.draft_key(name).is_none_or(|key| {
+            self.session
+                .read(cx)
+                .draft_as_sent(&self.branch, &key, sent)
+        })
+    }
+
+    /// Settles the property's draft on `branch` once the write or read it waited on is in
+    /// ([`GraphSession::settle_draft_on`]): `keep` it, or let it go, unless it is no longer
+    /// `sent`, the draft as that went out. One retyped or let go elsewhere meanwhile (in a table
+    /// cell, on another page) stands.
+    fn settle_draft_on(
+        &mut self,
+        branch: &str,
+        name: &str,
+        sent: Option<&DraftEntry>,
+        keep: Option<DraftEntry>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(key) = self.draft_key(name) {
+            self.session.update(cx, |session, cx| {
+                session.settle_draft_on(branch, key, sent, keep, cx)
+            });
+        }
+    }
+
     fn put_draft(&mut self, name: &str, old: Value, text: String, cx: &mut Context<Self>) {
         if let Some(key) = self.draft_key(name) {
             self.session.update(cx, |session, cx| {
@@ -1626,31 +1673,11 @@ impl NodePeek {
         }
     }
 
-    /// [`Self::put_draft`] on `branch`, which the view may have left.
-    fn put_draft_on(
-        &mut self,
-        branch: &str,
-        name: &str,
-        old: Value,
-        text: String,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(key) = self.draft_key(name) {
-            self.session.update(cx, |session, cx| {
-                session.set_draft_on(branch, key, DraftEntry { old, text }, cx)
-            });
-        }
-    }
-
     fn drop_draft(&mut self, name: &str, cx: &mut Context<Self>) {
-        let branch = self.branch.clone();
-        self.drop_draft_on(&branch, name, cx);
-    }
-
-    fn drop_draft_on(&mut self, branch: &str, name: &str, cx: &mut Context<Self>) {
         if let Some(key) = self.draft_key(name) {
+            let branch = self.branch.clone();
             self.session
-                .update(cx, |session, cx| session.remove_draft_on(branch, &key, cx));
+                .update(cx, |session, cx| session.remove_draft_on(&branch, &key, cx));
         }
     }
 
@@ -1868,7 +1895,8 @@ impl NodePeek {
             Ok(write) => write,
             Err(error) => {
                 let notice = Notice::new(Tone::Invalid, error);
-                self.reopen(property, old, text, notice, window, cx);
+                let held = self.held_draft(&name, cx);
+                self.reopen(property, (old, text, notice), held.as_ref(), window, cx);
                 return;
             }
         };
@@ -1878,11 +1906,17 @@ impl NodePeek {
             values.insert(name.clone(), new.clone());
         }
         let (session, key) = (self.session.clone(), self.draft_key(&name));
+        let sent = self.held_draft(&name, cx);
         self.saving.insert(name);
         let branch = self.branch.clone();
         // Detached: closing the page or moving the peek never cancels a write.
         cx.spawn_in(window, async move |this, cx| {
             let result = write.await;
+            // The text of a write that did not land is kept in its draft.
+            let keep = (!matches!(result, SaveResult::Saved { .. })).then(|| DraftEntry {
+                old: old.clone(),
+                text: text.clone(),
+            });
             let settled = this.update_in(cx, |this, window, cx| {
                 if this.branch == branch {
                     let field = FieldWrite {
@@ -1891,33 +1925,23 @@ impl NodePeek {
                         new,
                         text: text.clone(),
                         shown,
+                        sent: sent.clone(),
                     };
-                    this.finish_write(field, result.clone(), window, cx);
+                    this.finish_write(field, result, window, cx);
                     return;
                 }
-                // The view reads another branch now; the property's draft was the branch left's,
-                // and the text of a write that did not land is kept in it.
+                // The view reads another branch now; the property's draft was the branch left's.
                 this.saving.remove(&property.name);
-                match result {
-                    SaveResult::Saved { .. } => this.drop_draft_on(&branch, &property.name, cx),
-                    _ => {
-                        let (old, text) = (old.clone(), text.clone());
-                        this.put_draft_on(&branch, &property.name, old, text, cx);
-                    }
-                }
+                this.settle_draft_on(&branch, &property.name, sent.as_ref(), keep.clone(), cx);
                 cx.notify();
             });
             // The view went first (the table's cursor moved on, the page closed): the
-            // property's draft is settled where it was typed, and the text of a write that did
-            // not land is kept in it.
+            // property's draft is settled where it was typed.
             if settled.is_err()
                 && let Some(key) = key
             {
-                session.update(cx, |session, cx| match result {
-                    SaveResult::Saved { .. } => {
-                        session.remove_draft_on(&branch, &key, cx);
-                    }
-                    _ => session.set_draft_on(&branch, key, DraftEntry { old, text }, cx),
+                session.update(cx, |session, cx| {
+                    session.settle_draft_on(&branch, key, sent.as_ref(), keep, cx)
                 });
             }
         })
@@ -1938,12 +1962,14 @@ impl NodePeek {
             new,
             text,
             shown,
+            sent,
         } = field;
         let name = property.name.clone();
         self.saving.remove(&name);
         match result {
             SaveResult::Saved { commit, parent } => {
-                self.drop_draft(&name, cx);
+                let branch = self.branch.clone();
+                self.settle_draft_on(&branch, &name, sent.as_ref(), None, cx);
                 // Made on the commit shown, the view holds the new commit's state; otherwise
                 // someone else committed in between and the view is behind.
                 if parent.is_some() && parent == self.snapshot {
@@ -1955,11 +1981,11 @@ impl NodePeek {
             SaveResult::NoMatch => {
                 self.put_back(&name, &new, shown);
                 self.newer = true;
-                self.reread_conflict(property, old, text, window, cx);
+                self.reread_conflict(property, (old, text), sent, window, cx);
             }
             SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
                 self.put_back(&name, &new, shown);
-                self.reopen(property, old, text, notice, window, cx);
+                self.reopen(property, (old, text, notice), sent.as_ref(), window, cx);
             }
         }
         if self.saving.is_empty() {
@@ -1973,15 +1999,18 @@ impl NodePeek {
     /// the session then holds ([`Self::reread_at_head`]). The field opens again bound to the
     /// value the view then shows, which the notice names. When the node could not be read, or
     /// the read still finds the value the field was typed over, it stays bound to that value.
-    /// The field shows as saving until the read lands.
+    /// The field shows as saving until the read lands. `edit` is the value the field was bound
+    /// to and its text; `sent` the property's draft as the write went out, which a draft
+    /// retyped or let go elsewhere meanwhile no longer is, and stands.
     fn reread_conflict(
         &mut self,
         property: gq_language::Property,
-        old: Value,
-        text: String,
+        edit: (Value, String),
+        sent: Option<DraftEntry>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let (old, text) = edit;
         let name = property.name.clone();
         self.saving.insert(name.clone());
         let (session, branch, key) = (
@@ -2023,11 +2052,16 @@ impl NodePeek {
                         Some(None) => (old.clone(), Notice::new(Tone::Conflict, NODE_GONE)),
                         None => (old.clone(), Notice::new(Tone::Conflict, CHANGED_UNREAD)),
                     };
-                    this.reopen(property.clone(), bound, text.clone(), notice, window, cx);
+                    let edit = (bound, text.clone(), notice);
+                    this.reopen(property.clone(), edit, sent.as_ref(), window, cx);
                 } else {
                     // The view reads another branch now: the text stays a draft where it was
                     // typed.
-                    this.put_draft_on(&branch, &name, old.clone(), text.clone(), cx);
+                    let keep = Some(DraftEntry {
+                        old: old.clone(),
+                        text: text.clone(),
+                    });
+                    this.settle_draft_on(&branch, &name, sent.as_ref(), keep, cx);
                 }
                 if this.saving.is_empty() && this.edge_writes.is_empty() {
                     this.compare_head(cx);
@@ -2039,8 +2073,9 @@ impl NodePeek {
             if shown.is_err()
                 && let Some(key) = key
             {
+                let keep = Some(DraftEntry { old, text });
                 session.update(cx, |session, cx| {
-                    session.set_draft_on(&branch, key, DraftEntry { old, text }, cx)
+                    session.settle_draft_on(&branch, key, sent.as_ref(), keep, cx)
                 });
             }
         })
@@ -2113,11 +2148,11 @@ impl NodePeek {
                     new,
                     text,
                 } = draft;
-                // Still as it was sent: bound to the same value, with the same text.
-                let as_sent = self
-                    .draft_of(&name, cx)
-                    .is_some_and(|held| same_value(&held.old, &old) && held.text == text);
-                if !as_sent {
+                let entry = DraftEntry {
+                    old: old.clone(),
+                    text: text.clone(),
+                };
+                if !self.draft_as_sent(&name, Some(&entry), cx) {
                     continue;
                 }
                 let value = values.get(&name).cloned().unwrap_or(Value::Null);
@@ -2178,18 +2213,23 @@ impl NodePeek {
     }
 
     /// Opens the field again with what was typed and why it did not land (constitution III),
-    /// bound to `old`. A field that cannot open now (the node is being read again) keeps the
-    /// text as its draft, bound alike, and the node's drafts say why.
+    /// `edit`: bound to the value it holds, with the text and the notice. A field that cannot
+    /// open now (the node is being read again) keeps the text as its draft, bound alike, and the
+    /// node's drafts say why. A draft retyped or let go elsewhere while the write was out (no
+    /// longer `sent`) stands, and nothing reopens over it.
     fn reopen(
         &mut self,
         property: gq_language::Property,
-        old: Value,
-        text: String,
-        notice: Notice,
+        edit: (Value, String, Notice),
+        sent: Option<&DraftEntry>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let (old, text, notice) = edit;
         let name = property.name.clone();
+        if !self.draft_as_sent(&name, sent, cx) {
+            return;
+        }
         self.start_edit(property, window, cx);
         match self.edits.get_mut(&name) {
             Some(edit) => {
@@ -2660,7 +2700,14 @@ impl NodePeek {
                 Some(Ok(new)) => new,
                 Some(Err(message)) => {
                     let notice = Notice::new(Tone::Invalid, message);
-                    self.reopen(property, old, draft.text, notice, window, cx);
+                    let held = self.held_draft(&name, cx);
+                    self.reopen(
+                        property,
+                        (old, draft.text, notice),
+                        held.as_ref(),
+                        window,
+                        cx,
+                    );
                     return;
                 }
                 // Asks for the value it was typed over, which the node still holds.
@@ -2712,9 +2759,9 @@ impl NodePeek {
             self.saving.insert(draft.name.clone());
         }
         let session = self.session.clone();
-        let keys: Vec<DraftKey> = sent
+        let keys: Vec<(DraftKey, DraftEntry)> = sent
             .iter()
-            .filter_map(|draft| self.draft_key(&draft.name))
+            .filter_map(|draft| Some((self.draft_key(&draft.name)?, draft.entry())))
             .collect();
         cx.spawn_in(window, async move |this, cx| {
             let result = write.await;
@@ -2728,7 +2775,8 @@ impl NodePeek {
                 if this.branch != branch {
                     if let SaveResult::Saved { .. } = result {
                         for draft in &sent {
-                            this.drop_draft_on(&branch, &draft.name, cx);
+                            let entry = draft.entry();
+                            this.settle_draft_on(&branch, &draft.name, Some(&entry), None, cx);
                         }
                     }
                     cx.notify();
@@ -2737,8 +2785,9 @@ impl NodePeek {
                 match result {
                     SaveResult::Saved { commit, parent } => {
                         for draft in sent {
+                            let entry = draft.entry();
+                            this.settle_draft_on(&branch, &draft.name, Some(&entry), None, cx);
                             this.restore(&draft.name, draft.new);
-                            this.drop_draft(&draft.name, cx);
                         }
                         if parent.is_some() && parent == this.snapshot {
                             this.snapshot = Some(commit);
@@ -2765,8 +2814,8 @@ impl NodePeek {
             // stay for the next view of the node.
             if shown.is_err() && saved {
                 session.update(cx, |session, cx| {
-                    for key in &keys {
-                        session.remove_draft_on(&branch, key, cx);
+                    for (key, sent) in keys {
+                        session.settle_draft_on(&branch, key, Some(&sent), None, cx);
                     }
                 });
             }
@@ -5359,6 +5408,7 @@ mod tests {
                 new: json!("Ada Lovelace"),
                 text: "Ada Lovelace".into(),
                 shown: json!("Ada"),
+                sent: None,
             };
             let notice = Notice::new(Tone::Refused, "Nothing was written.");
             view.finish_write(field, SaveResult::Refused(notice), window, cx);

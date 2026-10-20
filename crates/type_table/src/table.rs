@@ -134,8 +134,9 @@ struct RowLook {
 /// How long scrolling must pause before the drawn rows' Blob cells are read.
 const BLOB_READ_AFTER: Duration = Duration::from_millis(120);
 
-/// A cell's save as sent: the value it was bound to, the one written, the text typed, and what
-/// the row showed before the new value was put in it.
+/// A cell's save as sent: the value it was bound to, the one written, the text typed, what the
+/// row showed before the new value was put in it, and the cell's draft as the session held it
+/// then, which the save settles only while it still is.
 struct SavedCell {
     row_id: String,
     column: String,
@@ -143,6 +144,7 @@ struct SavedCell {
     new: Value,
     text: String,
     shown: Value,
+    sent: Option<DraftEntry>,
 }
 
 /// One draft being saved: the cell, the value it was typed over (the save is bound to it), the
@@ -156,6 +158,16 @@ struct DraftEdit {
     new: Value,
     text: String,
     shown: Value,
+}
+
+impl DraftEdit {
+    /// The draft as the batch sent it, which was the session's then.
+    fn sent(&self) -> DraftEntry {
+        DraftEntry {
+            old: self.old.clone(),
+            text: self.text.clone(),
+        }
+    }
 }
 
 /// The table's own inserts and deletes made on commits past its pin, which a count read at the
@@ -3822,17 +3834,17 @@ impl TypeTable {
         self.saves_in_flight += 1;
         self.finish_editing(window, cx);
         let (session, branch) = (self.session.clone(), self.branch.clone());
-        let draft = (
-            self.draft_key(&row_id, &column),
-            DraftEntry {
-                old: old.clone(),
-                text: text.clone(),
-            },
-        );
+        let key = self.draft_key(&row_id, &column);
+        let sent = session.read(cx).draft_on(&branch, &key).cloned();
+        let entry = DraftEntry {
+            old: old.clone(),
+            text: text.clone(),
+        };
         // Detached: a write is never cancelled by closing the tab.
         cx.spawn_in(window, async move |this, cx| {
             let result = write.await;
             let saved = matches!(result, SaveResult::Saved { .. });
+            let held = sent.clone();
             let settled = this.update_in(cx, |this, window, cx| {
                 let cell = SavedCell {
                     row_id,
@@ -3841,19 +3853,16 @@ impl TypeTable {
                     new,
                     text,
                     shown,
+                    sent: held,
                 };
                 this.finish_save(cell, &session, &branch, result, window, cx)
             });
             // The tab closed while the write was out: the cell's draft is still the session's
             // to settle, its text kept when it did not land.
             if settled.is_err() {
-                let (key, entry) = draft;
+                let keep = (!saved).then_some(entry);
                 session.update(cx, |session, cx| {
-                    if saved {
-                        session.remove_draft_on(&branch, &key, cx);
-                    } else {
-                        session.set_draft_on(&branch, key, entry, cx);
-                    }
+                    session.settle_draft_on(&branch, key, sent.as_ref(), keep, cx)
                 });
             }
         })
@@ -3875,17 +3884,12 @@ impl TypeTable {
         // and the text of one that did not land stays a draft there.
         if !self.shows(session, branch) {
             let key = self.draft_key(&cell.row_id, &cell.column);
-            session.update(cx, |session, cx| match result {
-                SaveResult::Saved { .. } => {
-                    session.remove_draft_on(branch, &key, cx);
-                }
-                _ => {
-                    let entry = DraftEntry {
-                        old: cell.old,
-                        text: cell.text,
-                    };
-                    session.set_draft_on(branch, key, entry, cx)
-                }
+            let keep = (!matches!(result, SaveResult::Saved { .. })).then(|| DraftEntry {
+                old: cell.old,
+                text: cell.text,
+            });
+            session.update(cx, |session, cx| {
+                session.settle_draft_on(branch, key, cell.sent.as_ref(), keep, cx)
             });
             self.saves_settled(cx);
             cx.emit(ItemEvent::UpdateTab);
@@ -3896,7 +3900,8 @@ impl TypeTable {
             SaveResult::Saved { commit, parent } => {
                 self.cells
                     .remove(&(cell.row_id.clone(), cell.column.clone()));
-                self.drop_draft(&cell.row_id, &cell.column, cx);
+                self.settle_draft(&cell.row_id, &cell.column, cell.sent.as_ref(), None, cx);
+                self.sync_drafts(cx);
                 if self
                     .paging
                     .advance_for_own_commit(parent.as_deref(), &commit)
@@ -3918,12 +3923,12 @@ impl TypeTable {
             SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
                 let places = self.places_of_id(&cell.row_id);
                 self.put_back(&places, &cell.column, &cell.new, cell.shown);
+                let edit = (cell.old, cell.text, notice);
                 self.reopen(
                     cell.row_id,
                     cell.column,
-                    cell.old,
-                    cell.text,
-                    notice,
+                    edit,
+                    cell.sent.as_ref(),
                     window,
                     cx,
                 );
@@ -4086,6 +4091,38 @@ impl TypeTable {
         self.session.update(cx, |session, cx| {
             session.set_draft(key, DraftEntry { old, text }, cx)
         });
+    }
+
+    /// Settles a cell's draft once the write or read it waited on is in
+    /// ([`GraphSession::settle_draft_on`]): `keep` it, with why its save did not land, or let it
+    /// go, unless it is no longer `sent`, the draft as that went out. One retyped or let go
+    /// elsewhere meanwhile (on a node's page, in the peek) stands. Whether it was settled; it
+    /// shows with the next [`Self::sync_drafts`].
+    fn settle_draft(
+        &mut self,
+        row_id: &str,
+        column: &str,
+        sent: Option<&DraftEntry>,
+        keep: Option<(DraftEntry, Option<Notice>)>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let key = self.draft_key(row_id, column);
+        let branch = self.branch.clone();
+        let (entry, notice) = match keep {
+            Some((entry, notice)) => (Some(entry), notice),
+            None => (None, None),
+        };
+        let settled = self.session.update(cx, |session, cx| {
+            session.settle_draft_on(&branch, key, sent, entry, cx)
+        });
+        if settled {
+            let cell = (row_id.to_owned(), column.to_owned());
+            match notice {
+                Some(notice) => self.draft_notices.insert(cell, notice),
+                None => self.draft_notices.remove(&cell),
+            };
+        }
+        settled
     }
 
     /// [`Self::drop_draft`] without showing it, as [`Self::note_draft`].
@@ -4310,9 +4347,9 @@ impl TypeTable {
         cx.notify();
         let (session, branch) = (self.session.clone(), self.branch.clone());
         let row_count = rows.len();
-        let keys: Vec<DraftKey> = edits
+        let sent: Vec<(DraftKey, DraftEntry)> = edits
             .iter()
-            .map(|edit| self.draft_key(&edit.row_id, &edit.column))
+            .map(|edit| (self.draft_key(&edit.row_id, &edit.column), edit.sent()))
             .collect();
         // Detached: a write is never cancelled by closing the tab.
         cx.spawn_in(window, async move |this, cx| {
@@ -4325,8 +4362,8 @@ impl TypeTable {
             // the tab would have; the others stay for the next one.
             if shown.is_err() && landed {
                 session.update(cx, |session, cx| {
-                    for key in &keys {
-                        session.remove_draft_on(&branch, key, cx);
+                    for (key, sent) in sent {
+                        session.settle_draft_on(&branch, key, Some(&sent), None, cx);
                     }
                 });
             }
@@ -4350,13 +4387,13 @@ impl TypeTable {
         if !self.shows(session, branch) {
             // As for one cell: the drafts saved were the branch left's, and the rest wait there.
             if bound.landed(row_count) {
-                let keys: Vec<DraftKey> = edits
+                let sent: Vec<(DraftKey, DraftEntry)> = edits
                     .iter()
-                    .map(|edit| self.draft_key(&edit.row_id, &edit.column))
+                    .map(|edit| (self.draft_key(&edit.row_id, &edit.column), edit.sent()))
                     .collect();
                 session.update(cx, |session, cx| {
-                    for key in &keys {
-                        session.remove_draft_on(branch, key, cx);
+                    for (key, sent) in sent {
+                        session.settle_draft_on(branch, key, Some(&sent), None, cx);
                     }
                 });
             }
@@ -4394,7 +4431,8 @@ impl TypeTable {
                         }
                         self.cells
                             .remove(&(edit.row_id.clone(), edit.column.clone()));
-                        self.forget_draft(&edit.row_id, &edit.column, cx);
+                        let sent = edit.sent();
+                        self.settle_draft(&edit.row_id, &edit.column, Some(&sent), None, cx);
                     }
                     self.sync_drafts(cx);
                     self.refresh_dimmed(&edits);
@@ -4423,19 +4461,14 @@ impl TypeTable {
                 {
                     let places = self.row_places();
                     for edit in edits {
+                        let sent = edit.sent();
                         if let Some(at) = places.get(&edit.row_id) {
                             self.put_back(at, &edit.column, &edit.new, edit.shown);
                         }
                         self.cells
                             .remove(&(edit.row_id.clone(), edit.column.clone()));
-                        self.note_draft(
-                            &edit.row_id,
-                            &edit.column,
-                            edit.old,
-                            edit.text,
-                            Some(notice.clone()),
-                            cx,
-                        );
+                        let keep = (sent.clone(), Some(notice.clone()));
+                        self.settle_draft(&edit.row_id, &edit.column, Some(&sent), Some(keep), cx);
                     }
                     self.sync_drafts(cx);
                     self.drafts.notice = Some(notice);
@@ -4457,9 +4490,9 @@ impl TypeTable {
         }
     }
 
-    /// Reads the rows of a short batch at the head, together in one read of the properties
-    /// their drafts set: a draft whose value is there landed; any other is kept, with what the
-    /// cell holds now, and why when that changed elsewhere.
+    /// Reads a batch's rows at the head, together in one read of the properties their drafts
+    /// set: a draft whose value is there landed; any other is kept, with what the cell holds
+    /// now, and why when that changed elsewhere.
     fn reread_drafts(
         &mut self,
         edits: Vec<DraftEdit>,
@@ -4492,7 +4525,8 @@ impl TypeTable {
             .collect();
         cx.spawn_in(window, async move |this, cx| {
             // The rows at the head, by id: `None` when they could not be read; a row missing
-            // from them is gone.
+            // from them is gone. A draft retyped or let go elsewhere meanwhile stands, here
+            // and in `drafts_read`.
             let now: Option<HashMap<String, Row>> = read.await.ok().map(|output| {
                 field_rows(&output.rows)
                     .into_iter()
@@ -4520,15 +4554,9 @@ impl TypeTable {
                             .as_ref()
                             .and_then(|rows| rows.get(&edit.row_id))
                             .is_some_and(|row| same_value(row.value(&edit.column), &edit.new));
-                        if landed {
-                            session.remove_draft_on(&branch, &key, cx);
-                        } else {
-                            let entry = DraftEntry {
-                                old: edit.old,
-                                text: edit.text,
-                            };
-                            session.set_draft_on(&branch, key, entry, cx);
-                        }
+                        let sent = edit.sent();
+                        let keep = (!landed).then(|| sent.clone());
+                        session.settle_draft_on(&branch, key, Some(&sent), keep, cx);
                     }
                 });
             }
@@ -4557,14 +4585,12 @@ impl TypeTable {
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             self.cells.remove(&key);
-            let as_sent = self.draft_as_sent(&edit, cx);
+            let sent = edit.sent();
             let (old, notice) = match now.map(|rows| rows.get(&edit.row_id)) {
                 Some(Some(row)) => {
                     let value = row.value(&edit.column).clone();
                     if same_value(&value, &edit.new) {
-                        if as_sent {
-                            self.forget_draft(&edit.row_id, &edit.column, cx);
-                        }
+                        self.settle_draft(&edit.row_id, &edit.column, Some(&sent), None, cx);
                         continue;
                     }
                     self.set_cell_at(at, &edit.column, value.clone());
@@ -4587,25 +4613,23 @@ impl TypeTable {
                     (edit.old, Some(notice))
                 }
             };
-            if as_sent {
-                self.note_draft(&edit.row_id, &edit.column, old, edit.text, notice, cx);
-            }
+            let keep = DraftEntry {
+                old,
+                text: edit.text,
+            };
+            self.settle_draft(
+                &edit.row_id,
+                &edit.column,
+                Some(&sent),
+                Some((keep, notice)),
+                cx,
+            );
         }
         self.sync_drafts(cx);
         // The table now shows values newer than its pin.
         self.newer = true;
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
-    }
-
-    /// Whether the session still holds `edit`'s draft as the batch sent it: bound to the same
-    /// value, with the same text.
-    fn draft_as_sent(&self, edit: &DraftEdit, cx: &App) -> bool {
-        let key = self.draft_key(&edit.row_id, &edit.column);
-        self.session
-            .read(cx)
-            .draft(&key)
-            .is_some_and(|draft| same_value(&draft.old, &edit.old) && draft.text == edit.text)
     }
 
     /// Drops every draft, on the second click of Discard.
@@ -4724,6 +4748,7 @@ impl TypeTable {
             new,
             text,
             shown,
+            sent,
         } = cell;
         let Some(schema) = self.schema.clone() else {
             return;
@@ -4735,7 +4760,8 @@ impl TypeTable {
                 let places = self.places_of_id(&row_id);
                 self.put_back(&places, &column, &new, shown);
                 let notice = Notice::new(Tone::Conflict, error.to_string());
-                self.reopen(row_id, column, old, text, notice, window, cx);
+                let edit = (old, text, notice);
+                self.reopen(row_id, column, edit, sent.as_ref(), window, cx);
                 return;
             }
         };
@@ -4788,8 +4814,9 @@ impl TypeTable {
                 this.newer = true;
                 this.saves_settled(cx);
                 cx.emit(ItemEvent::UpdateTab);
-                let (row_id, column, text) = (row_id.clone(), column.clone(), text.clone());
-                this.reopen(row_id, column, bound, text, notice, window, cx);
+                let (row_id, column) = (row_id.clone(), column.clone());
+                let edit = (bound, text.clone(), notice);
+                this.reopen(row_id, column, edit, sent.as_ref(), window, cx);
                 true
             });
             // The table moved on, or its tab closed: the text stays a draft where it was typed,
@@ -4797,35 +4824,42 @@ impl TypeTable {
             // the head holds was never shown, and why it changed went with the table, so its
             // next save finds the change again rather than writing over it.
             if !shown_here.unwrap_or(false) {
+                let keep = Some(DraftEntry { old, text });
                 session.update(cx, |session, cx| {
-                    session.set_draft_on(&branch, key, DraftEntry { old, text }, cx)
+                    session.settle_draft_on(&branch, key, sent.as_ref(), keep, cx)
                 });
             }
         })
         .detach();
     }
 
-    /// Puts an edit that did not land back in front of the person, bound to `old`: the editor
-    /// reopens on the cell when they are not busy elsewhere, otherwise the cell keeps the draft
-    /// and the notice.
-    #[allow(clippy::too_many_arguments)]
+    /// Puts an edit that did not land (`edit`: the value it is bound to now, its text, why)
+    /// back in front of the person: the editor reopens on the cell when they are not busy
+    /// elsewhere, otherwise the cell keeps the draft and the notice. A draft retyped or let go
+    /// elsewhere while the save was out (no longer `sent`) stands, and nothing reopens.
     fn reopen(
         &mut self,
         row_id: String,
         column: String,
-        old: Value,
-        text: String,
-        notice: Notice,
+        edit: (Value, String, Notice),
+        sent: Option<&DraftEntry>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let (old, text, notice) = edit;
         let key = (row_id.clone(), column.clone());
         let position = self.row_index(&row_id).zip(self.column_index(&column));
         let free = self.editing.is_none()
             && self.filter_draft.is_none()
             && self.focus_handle.contains_focused(window, cx);
         self.cells.remove(&key);
-        self.put_draft(&row_id, &column, old, text, Some(notice), cx);
+        let keep = (DraftEntry { old, text }, Some(notice));
+        let settled = self.settle_draft(&row_id, &column, sent, Some(keep), cx);
+        self.sync_drafts(cx);
+        if !settled {
+            cx.notify();
+            return;
+        }
         if let (true, Some((row, col))) = (free, position) {
             let cursor = Cursor { row, col };
             self.set_cursor(cursor, cx);
@@ -7700,7 +7734,9 @@ mod tests {
     }
 
     /// A cell saved on one branch lands after the window moved to another: it lets go of the
-    /// draft of the branch it was saved on, never that of the branch shown, which stays.
+    /// draft of the branch it was saved on, never that of the branch shown, which stays. A save
+    /// that lands, or is refused, after its draft was retyped elsewhere (on a node's page)
+    /// leaves that draft as it is, and opens nothing over it.
     #[gpui::test]
     async fn a_save_that_lands_after_a_branch_switch_keeps_the_new_branchs_draft(
         cx: &mut TestAppContext,
@@ -7756,6 +7792,47 @@ mod tests {
             );
         });
         table.read_with(cx, |table, _| assert_eq!(table.saves_in_flight, 0));
+
+        session.update(cx, |session, cx| session.set_branch("main".into(), cx));
+        cx.run_until_parked();
+        let typed = graph_store::DraftEntry {
+            old: "Ada".into(),
+            text: "Ada Lovelace".into(),
+        };
+        let retyped = graph_store::DraftEntry {
+            old: "Ada".into(),
+            text: "Ada K.".into(),
+        };
+        let results = [
+            SaveResult::Saved {
+                commit: "c9".into(),
+                parent: Some("c8".into()),
+            },
+            SaveResult::Refused(Notice::new(Tone::Refused, "Nothing was written.")),
+        ];
+        for result in results {
+            session.update(cx, |session, cx| {
+                session.set_draft(key.clone(), retyped.clone(), cx)
+            });
+            table.update_in(cx, |table, window, cx| {
+                let cell = SavedCell {
+                    row_id: "p1".into(),
+                    column: "name".into(),
+                    old: "Ada".into(),
+                    new: "Ada Lovelace".into(),
+                    text: "Ada Lovelace".into(),
+                    shown: "Ada".into(),
+                    sent: Some(typed.clone()),
+                };
+                table.saves_in_flight += 1;
+                let session = table.session.clone();
+                table.finish_save(cell, &session, "main", result, window, cx);
+                assert!(table.editing.is_none(), "nothing opens over it");
+            });
+            session.read_with(cx, |session, _| {
+                assert_eq!(session.draft(&key), Some(&retyped), "retyped meanwhile")
+            });
+        }
     }
 
     /// A conflict's re-read that comes back after the table moved to another branch keeps the
@@ -7791,6 +7868,14 @@ mod tests {
             }
         });
         cx.run_until_parked();
+        // The batch's draft, as the session held it when the batch went out; the cell had none.
+        session.update(cx, |session, cx| {
+            let draft = graph_store::DraftEntry {
+                old: "Grace B".into(),
+                text: "Grace Hopper".into(),
+            };
+            session.set_draft(key("p2"), draft, cx);
+        });
         // Each row is read as holding neither the value typed over nor the one typed.
         table.update_in(cx, |table, window, cx| {
             let cell = SavedCell {
@@ -7800,6 +7885,7 @@ mod tests {
                 new: "Ada Lovelace".into(),
                 text: "Ada Lovelace".into(),
                 shown: "Ada".into(),
+                sent: None,
             };
             table.reread_conflict(cell, window, cx);
             let edit = DraftEdit {
