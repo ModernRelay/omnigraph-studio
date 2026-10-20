@@ -7,10 +7,12 @@ use std::time::Duration;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    Hsla, KeyContext, PathBuilder, Pixels, Render, ScrollStrategy, SharedString, Subscription,
-    Task, UniformListScrollHandle, Window, canvas, point, px, uniform_list,
+    AnyElement, AnyView, App, Bounds, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, Hsla, KeyContext, PathBuilder, Pixels, Render, ScrollStrategy, SharedString,
+    StyleRefinement, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas,
+    point, px, uniform_list,
 };
+use graph_client::ReadError;
 use graph_client::api::CommitOutput;
 use graph_store::{GraphSession, HeadWatch, SessionEvent};
 use studio_actions::graph::OpenCommit;
@@ -25,12 +27,15 @@ use crate::commit_view::{CommitCounts, CommitView};
 use crate::lanes::{Graph, GraphCommit, assign_lanes};
 use crate::merged::{branch_heads, with_merged_commits};
 
-/// Above this many commits the list warns that it loads in full (E10).
+/// Above this many commits the list warns that it is read and laid out whole: History asks
+/// for a branch's whole commit list, not a page of it.
 pub const LONG_HISTORY: usize = 5_000;
 
 /// How long scrolling must pause before the drawn rows' change counts are read, and stepping
 /// through commits before the selected one's changes are.
 const COUNTS_AFTER: Duration = Duration::from_millis(120);
+/// How long typing in the search pauses before the commits are matched.
+const SEARCH_DELAY: Duration = Duration::from_millis(80);
 /// Other branches whose lists History reads for heads and merged-in commits.
 const OTHER_BRANCHES: usize = 20;
 
@@ -62,12 +67,20 @@ pub struct HistoryView {
     search: Entity<Editor>,
     matches: Vec<usize>,
     match_at: Option<usize>,
+    /// The search text the matches were found for, lowercase: typing finds them once it pauses.
+    match_query: String,
+    _search_task: Option<Task<()>>,
     focus_handle: FocusHandle,
     state: State,
     commits: Vec<CommitOutput>,
+    /// What the search finds each commit by, made with the list.
+    commit_texts: Vec<CommitText>,
     graph: Graph,
     selected: Option<usize>,
     detail: Option<Entity<CommitView>>,
+    /// The commit list, drawn cached on its own: the commit beside it scrolls and reads
+    /// without the list drawing again.
+    rows: Entity<HistoryRows>,
     counts: HashMap<String, (usize, usize, usize)>,
     /// Commits whose counts come from a first page only, and those asked for already.
     partial_counts: HashSet<String>,
@@ -92,6 +105,9 @@ pub struct HistoryView {
     /// A tab's own branch asked after while it is open, so another writer's commits to it
     /// arrive; the panel's is the session's, always asked after.
     _head_watch: Option<HeadWatch>,
+    /// The other branches whose lists the history read: a commit to one shows here too, as
+    /// its head or a merge from it.
+    others: Vec<String>,
 }
 
 impl EventEmitter<ItemEvent> for HistoryView {}
@@ -103,6 +119,11 @@ impl Focusable for HistoryView {
 }
 
 impl Item for HistoryView {
+    /// The commit list is drawn cached on its own (`HistoryRows`).
+    fn caches_its_parts(&self) -> bool {
+        true
+    }
+
     fn tab_title(&self, _cx: &App) -> SharedString {
         format!("History · {}", self.branch).into()
     }
@@ -141,7 +162,7 @@ impl HistoryView {
         // tab restored before the branch list was read draws them once it is.
         view._session_subscription =
             Some(cx.subscribe(&session, |this, _, event, cx| match event {
-                SessionEvent::Committed { branch } if *branch == this.branch => this.reload(cx),
+                SessionEvent::Committed { branch } if this.shows(branch) => this.reload(cx),
                 SessionEvent::BranchesChanged => this.reload(cx),
                 _ => {}
             }));
@@ -164,7 +185,7 @@ impl HistoryView {
                         this.forget_branch();
                         this.reload(cx);
                     }
-                    SessionEvent::Committed { branch } if *branch == this.branch => this.reload(cx),
+                    SessionEvent::Committed { branch } if this.shows(branch) => this.reload(cx),
                     // The list of other branches, whose heads and merges the history shows.
                     SessionEvent::BranchesChanged => this.reload(cx),
                     _ => {}
@@ -188,7 +209,12 @@ impl HistoryView {
         });
         let search_subscription = cx.subscribe(&search, |this, _, event: &EditorEvent, cx| {
             if let EditorEvent::BufferEdited = event {
-                this.find(cx);
+                // Once typing pauses: each search goes through every commit and selects the
+                // first it finds.
+                this._search_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(SEARCH_DELAY).await;
+                    this.update(cx, |this, cx| this.find(cx)).ok();
+                }));
             }
         });
         let mut view = Self {
@@ -198,15 +224,20 @@ impl HistoryView {
             search,
             matches: Vec::new(),
             match_at: None,
+            match_query: String::new(),
+            _search_task: None,
             _search_subscription: search_subscription,
             _session_subscription: None,
             _head_watch: None,
+            others: Vec::new(),
             focus_handle: cx.focus_handle(),
             state: State::Loading,
             commits: Vec::new(),
+            commit_texts: Vec::new(),
             graph: Graph::default(),
             selected: None,
             detail: None,
+            rows: HistoryRows::new(cx),
             counts: HashMap::new(),
             partial_counts: HashSet::new(),
             asked_counts: HashSet::new(),
@@ -229,6 +260,7 @@ impl HistoryView {
     /// one's name while that is read.
     fn forget_branch(&mut self) {
         self.commits.clear();
+        self.commit_texts.clear();
         self.graph = Graph::default();
         self.selected = None;
         self.detail = None;
@@ -246,15 +278,22 @@ impl HistoryView {
         self.load(false, cx);
     }
 
-    /// Refresh: reads the branch's own commits again, to see commits made elsewhere.
+    /// Refresh: reads every branch's commits again, the other branches' too, to see commits
+    /// made elsewhere: another branch's head, and a merge from it, show from its list.
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.load(true, cx);
+    }
+
+    /// Whether a commit to `branch` changes what the history shows: its own branch's, or one
+    /// of the others it read.
+    fn shows(&self, branch: &str) -> bool {
+        self.branch == branch || self.others.iter().any(|other| other == branch)
     }
 
     fn load(&mut self, fresh: bool, cx: &mut Context<Self>) {
         self.state = State::Loading;
         let branch = self.branch.clone();
-        // Other live branches: their heads, and the commits merged in from them (E9). All the
+        // Other live branches: their heads, and the commits merged in from them. All the
         // lists are asked for at once, and come from the session's lists where it has them.
         let others: Vec<String> = self
             .session
@@ -273,12 +312,13 @@ impl HistoryView {
         let own_read = self
             .session
             .update(cx, |session, cx| session.commits(&branch, fresh, cx));
+        self.others = others.clone();
         let other_reads: Vec<_> = others
             .into_iter()
             .map(|name| {
                 let read = self
                     .session
-                    .update(cx, |session, cx| session.commits(&name, false, cx));
+                    .update(cx, |session, cx| session.commits(&name, fresh, cx));
                 (name, read)
             })
             .collect();
@@ -302,9 +342,9 @@ impl HistoryView {
                     others.push((name, list));
                 }
             }
-            // Lay out off the main thread; long histories load in full (E10).
+            // Laid out off the main thread; a long history is laid out whole.
             let own_count = own.len();
-            let (commits, layout, heads) = cx
+            let (commits, commit_texts, layout, heads) = cx
                 .background_executor()
                 .spawn(async move {
                     let own: Vec<CommitOutput> = own.as_ref().clone();
@@ -333,7 +373,9 @@ impl HistoryView {
                         })
                         .collect();
                     let layout = assign_lanes(&nodes);
-                    (commits, layout, heads)
+                    let commit_texts: Vec<CommitText> =
+                        commits.iter().map(CommitText::of).collect();
+                    (commits, commit_texts, layout, heads)
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -342,6 +384,7 @@ impl HistoryView {
                     .and_then(|ix| this.commits.get(ix))
                     .map(|c| c.graph_commit_id.clone());
                 this.commits = commits;
+                this.commit_texts = commit_texts;
                 this.graph = layout;
                 this.heads = heads;
                 this.own_count = own_count;
@@ -363,7 +406,7 @@ impl HistoryView {
         cx.notify();
     }
 
-    /// The commits the search text finds ([`commit_matches`]); the first is selected.
+    /// The commits the search text finds ([`CommitText::matches`]); the first is selected.
     fn find(&mut self, cx: &mut Context<Self>) {
         self.match_commits(cx);
         self.match_at = (!self.matches.is_empty()).then_some(0);
@@ -379,13 +422,14 @@ impl HistoryView {
         self.matches = if query.is_empty() {
             Vec::new()
         } else {
-            self.commits
+            self.commit_texts
                 .iter()
                 .enumerate()
-                .filter(|(_, commit)| commit_matches(commit, &query))
+                .filter(|(_, text)| text.matches(&query))
                 .map(|(ix, _)| ix)
                 .collect()
         };
+        self.match_query = query;
         self.match_at = self
             .match_at
             .filter(|_| !self.matches.is_empty())
@@ -569,9 +613,25 @@ impl HistoryView {
                 session.commit_changes(&id, None, ROW_COUNT_PAGE, cx)
             });
             let task = cx.spawn(async move |this, cx| {
-                // A parentless commit or one past cleanup cannot be compared: no count.
-                let Ok(page) = read.await else {
-                    return;
+                let page = match read.await {
+                    Ok(page) => page,
+                    Err(error) => {
+                        // A commit that cannot be compared (a schema change: 409) or is past
+                        // cleanup (410) has no count, now or later: it stays asked, so a row
+                        // scrolled back to does not ask again. Another failure may pass.
+                        let lasting = matches!(
+                            &error,
+                            ReadError::Refused(refusal) if matches!(refusal.status, 409 | 410)
+                        );
+                        this.update(cx, |this, _| {
+                            this.count_tasks.remove(&id);
+                            if !lasting {
+                                this.asked_counts.remove(&id);
+                            }
+                        })
+                        .ok();
+                        return;
+                    }
                 };
                 let more = page.next_page_token.is_some();
                 let folded = cx
@@ -812,18 +872,33 @@ impl HistoryView {
     }
 }
 
-/// Whether a commit's id starts with, or its actor contains, `query` (lowercase).
-/// Whether the search text begins the commit's id, either as stored or as a row shows it (its
-/// last eight characters), or is in its actor.
-fn commit_matches(commit: &CommitOutput, query: &str) -> bool {
-    commit.graph_commit_id.to_lowercase().starts_with(query)
-        || short_commit_id(&commit.graph_commit_id)
-            .to_lowercase()
-            .starts_with(query)
-        || commit
-            .actor_id
-            .as_ref()
-            .is_some_and(|actor| actor.to_lowercase().contains(query))
+/// What the search finds a commit by, lowercase, made once with the list rather than at each
+/// key: its id as stored and as a row shows it (its last eight characters), and its actor.
+struct CommitText {
+    id: String,
+    short: String,
+    actor: Option<String>,
+}
+
+impl CommitText {
+    fn of(commit: &CommitOutput) -> Self {
+        Self {
+            id: commit.graph_commit_id.to_lowercase(),
+            short: short_commit_id(&commit.graph_commit_id).to_lowercase(),
+            actor: commit.actor_id.as_ref().map(|actor| actor.to_lowercase()),
+        }
+    }
+
+    /// Whether the search text `query` (lowercase) begins the commit's id, either way, or is
+    /// in its actor.
+    fn matches(&self, query: &str) -> bool {
+        self.id.starts_with(query)
+            || self.short.starts_with(query)
+            || self
+                .actor
+                .as_deref()
+                .is_some_and(|actor| actor.contains(query))
+    }
 }
 
 /// One row's lines, resolved to colors, painted into the row's graph cell.
@@ -909,10 +984,55 @@ impl RowPaint {
     }
 }
 
+/// The commit list as a view of its own, drawn again when the history changes (it observes
+/// it), not when the commit shown beside it scrolls or reads (`docs/drawing.md`).
+struct HistoryRows {
+    history: WeakEntity<HistoryView>,
+    _history_changed: Subscription,
+    /// How often the rows were drawn, for the test that the commit beside them leaves them.
+    #[cfg(test)]
+    renders: usize,
+}
+
+impl HistoryRows {
+    /// Made with the view, not on its first draw.
+    fn new(cx: &mut Context<HistoryView>) -> Entity<Self> {
+        let history = cx.entity();
+        cx.new(|cx| HistoryRows {
+            history: history.downgrade(),
+            _history_changed: cx.observe(&history, |_, _, cx| cx.notify()),
+            #[cfg(test)]
+            renders: 0,
+        })
+    }
+}
+
+impl Render for HistoryRows {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        let list = self
+            .history
+            .update(cx, |history, cx| history.render_list(cx))
+            .unwrap_or_else(|_| gpui::Empty.into_any_element());
+        v_flex().size_full().child(list)
+    }
+}
+
+impl HistoryView {
+    fn cached_rows(&self) -> AnyElement {
+        AnyView::from(self.rows.clone())
+            .cached(StyleRefinement::default().size_full())
+            .into_any_element()
+    }
+}
+
 impl Render for HistoryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.commits.len();
-        let searched = !self.search.read(cx).text(cx).trim().is_empty();
+        let searched = !self.match_query.is_empty();
         let counter = match (searched, self.match_at) {
             (false, _) => None,
             (true, Some(at)) => Some(format!("{}/{}", at + 1, self.matches.len())),
@@ -951,7 +1071,7 @@ impl Render for HistoryView {
                 studio_ui::ds::banner(Severity::Warning)
                     .child(
                         studio_ui::ds::text::body(format!(
-                            "{count} commits. The list loads in full until the server pages history (E10)."
+                            "{count} commits. History reads the whole list at once, which takes a while for a history this long."
                         )),
                     ),
             )
@@ -964,9 +1084,9 @@ impl Render for HistoryView {
             State::Loading if self.commits.is_empty() => {
                 studio_ui::ds::loading_state("Reading commits…").into_any_element()
             }
-            _ if self.compact => self.render_list(cx),
+            _ if self.compact => self.cached_rows(),
             _ => {
-                let list = self.render_list(cx);
+                let list = self.cached_rows();
                 let detail = match &self.detail {
                     Some(detail) => detail.clone().into_any_element(),
                     None => studio_ui::ds::empty_state(IconName::HistoryRerun, "Select a commit")
@@ -1071,6 +1191,101 @@ mod tests {
         );
     }
 
+    /// A session on a graph whose `main` holds one commit, `c1`, which changed nothing.
+    fn one_commit_session(cx: &mut TestAppContext) -> Entity<GraphSession> {
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            async move {
+                let body = if path.ends_with("/branches") {
+                    json!({ "branches": ["main"] })
+                } else if path.ends_with("/changes") {
+                    json!({
+                        "cause": {"graph_commit_id": "c1", "authored_branch": "main", "authored_at": 1},
+                        "changes": [],
+                    })
+                } else if path.ends_with("/commits") {
+                    json!({ "commits": [{
+                        "graph_commit_id": "c1", "graph_manifest_version": 1, "created_at": 1,
+                    }] })
+                } else {
+                    json!({})
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx))
+    }
+
+    /// The commit shown beside the list draws on its own: a change there (a scroll, a page of
+    /// changes read) leaves the list as it was drawn; a change of the history draws it again.
+    #[gpui::test]
+    async fn the_commit_beside_the_list_leaves_the_list_drawn(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = one_commit_session(cx);
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            HistoryView::new(session, "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| view.select(0, cx));
+        cx.run_until_parked();
+        let renders = |cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, cx| view.rows.read(cx).renders)
+        };
+        let detail = view.read_with(cx, |view, _| view.detail.clone().expect("a commit shown"));
+        let before = renders(cx);
+        detail.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(renders(cx), before, "the commit drew the list again");
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(renders(cx), before + 1);
+    }
+
+    /// Typing searches once it pauses, not at each key, and the counter speaks of the text the
+    /// matches were found for.
+    #[gpui::test]
+    async fn a_search_matches_the_commits_once_typing_pauses(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = one_commit_session(cx);
+        let (view, cx) = cx.add_window_view(move |window, cx| {
+            HistoryView::new(session, "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.update_in(cx, |view, window, cx| {
+            view.search
+                .update(cx, |editor, cx| editor.set_text("C1", window, cx))
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.matches.is_empty(), "matched before typing paused");
+            assert!(view.match_query.is_empty());
+        });
+        cx.executor().advance_clock(SEARCH_DELAY);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.matches, [0]);
+            assert_eq!(view.match_at, Some(0));
+            assert_eq!(view.match_query, "c1");
+        });
+    }
+
     #[test]
     fn search_finds_commits_by_the_start_of_their_id_or_their_actor() {
         let commit = CommitOutput {
@@ -1083,17 +1298,12 @@ mod tests {
             actor_id: Some("act-Dev".into()),
             kind: Default::default(),
         };
-        assert!(commit_matches(&commit, "hb1.01m4r"));
-        assert!(commit_matches(&commit, "dev"));
-        assert!(
-            commit_matches(&commit, "ep12ctbe"),
-            "the id as a row shows it"
-        );
-        assert!(commit_matches(&commit, "ep12"));
-        assert!(
-            !commit_matches(&commit, "12ctbe"),
-            "an id matches by its start only"
-        );
-        assert!(!commit_matches(&commit, "alice"));
+        let text = CommitText::of(&commit);
+        assert!(text.matches("hb1.01m4r"));
+        assert!(text.matches("dev"));
+        assert!(text.matches("ep12ctbe"), "the id as a row shows it");
+        assert!(text.matches("ep12"));
+        assert!(!text.matches("12ctbe"), "an id matches by its start only");
+        assert!(!text.matches("alice"));
     }
 }

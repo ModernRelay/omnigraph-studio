@@ -19,6 +19,7 @@ studio_actions = { workspace = true }
 studio_workspace = { workspace = true }
 graph_client = { workspace = true }
 graph_store = { workspace = true }
+gq_language = { workspace = true }
 change_cards = { workspace = true }
 
 [dev-dependencies]

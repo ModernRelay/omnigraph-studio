@@ -26,7 +26,7 @@ use studio_workspace::ModalView;
 /// Branches whose last commit is read for the list.
 const DETAIL_LIMIT: usize = 20;
 
-/// The branch every review and merge targets until branch details exist (E9).
+/// The branch every review and merge targets.
 pub const TARGET: &str = "main";
 
 #[derive(Debug, Clone)]
@@ -79,6 +79,10 @@ impl BranchList {
     }
 
     fn watch(&mut self, session: Option<Entity<GraphSession>>, cx: &mut Context<Self>) {
+        // The same graph shown again (another opened behind it): its details hold.
+        if self.session.as_ref().map(Entity::entity_id) == session.as_ref().map(Entity::entity_id) {
+            return;
+        }
         self._session_subscription = session.as_ref().map(|session| {
             cx.subscribe(session, |this, _, event: &SessionEvent, cx| match event {
                 SessionEvent::BranchesChanged | SessionEvent::Committed { .. } => {
@@ -569,22 +573,32 @@ impl DeleteBranchModal {
         self._task =
             Some(cx.spawn(async move |this, cx| {
                 if let Some(read) = recheck {
-                    let merged = matches!(
-                        read.await,
-                        Ok(base) if base.merge_base.graph_commit_id == base.source_commit_id
-                    );
-                    if !merged {
+                    let holds = match read.await {
+                        Ok(base) if base.merge_base.graph_commit_id == base.source_commit_id => {
+                            Holds::Merged
+                        }
+                        Ok(_) => Holds::Unmerged,
+                        Err(error) => Holds::Unknown(error.to_string()),
+                    };
+                    if !matches!(holds, Holds::Merged) {
                         this.update(cx, |this, cx| {
                             this.running = false;
-                            this.holds = Holds::Unmerged;
                             this.error = Some(
-                                format!(
-                                    "{} has a commit {TARGET} does not since this opened; type \
-                                     its name to delete it.",
-                                    this.branch
-                                )
+                                match &holds {
+                                    Holds::Unknown(error) => format!(
+                                        "Studio could not check {} again: {error}. Type its \
+                                         name to delete it.",
+                                        this.branch
+                                    ),
+                                    _ => format!(
+                                        "{} has a commit {TARGET} does not since this opened; \
+                                         type its name to delete it.",
+                                        this.branch
+                                    ),
+                                }
                                 .into(),
                             );
+                            this.holds = holds;
                             cx.notify();
                         })
                         .ok();

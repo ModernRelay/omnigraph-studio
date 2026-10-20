@@ -1,10 +1,13 @@
 //! Fixes made from a review (spec 008): the mutation that restores an entity's before image.
 //!
-//! Every statement comes from `gq_language::builder` (`update_cell`, `insert_node`,
-//! `delete_node`). A revert that needs several statements joins them into one mutation with
-//! [`compose`], so it publishes once. Values stay parameters; only parameter names are renamed.
+//! Every statement comes from `gq_language::builder` (`update_rows`, `insert_node`,
+//! `delete_node`, `insert_edge`, `delete_edge`), and a revert is one statement. Several
+//! mutations join into one with [`compose`], so they publish once. Values stay parameters; only
+//! parameter names are renamed.
 
-use gq_language::builder::{delete_edge, delete_node, insert_edge, insert_node, update_cell};
+use gq_language::builder::{
+    RowEdit, delete_edge, delete_node, insert_edge, insert_node, update_rows,
+};
 use gq_language::{BuiltQuery, SchemaModel};
 use serde_json::{Map, Value};
 
@@ -25,8 +28,9 @@ impl std::fmt::Display for RevertUnavailable {
 /// - Added node: delete it (its relationships go with it).
 /// - Removed node: insert it again with its before values. A node without a key cannot be:
 ///   it would come back under a new id, and its relationships' reverts would miss it.
-/// - Changed node: set each changed property back, each bound to the value the review saw, so
-///   a value changed since then is left alone (zero affected rows).
+/// - Changed node: set every changed property back in one statement, bound to every value the
+///   review saw, so a node with any of them changed since is left alone whole (zero affected
+///   rows), never set back in part.
 ///
 /// - Added relationship: delete it.
 /// - Removed relationship: insert it again between its before endpoints with its before
@@ -80,7 +84,7 @@ pub fn revert_query(
         }
         Some(NetChange::Changed) => {
             let order: Vec<String> = node.properties.iter().map(|p| p.name.clone()).collect();
-            let mut parts = Vec::new();
+            let mut cells = Vec::new();
             for diff in change.property_diffs(&order) {
                 // A property the before image lacks was outside that commit's schema.
                 let Some(before) = diff.before else { continue };
@@ -94,24 +98,25 @@ pub fn revert_query(
                     )));
                 }
                 let after = diff.after.unwrap_or(Value::Null);
-                parts.push(
-                    update_cell(
-                        schema,
-                        &node.name,
-                        &property.name,
-                        &change.id,
-                        &after,
-                        &before,
-                    )
-                    .map_err(unavailable)?,
-                );
+                cells.push((property.name.clone(), after, before));
             }
-            if parts.is_empty() {
+            if cells.is_empty() {
                 return Err(RevertUnavailable("No property can be set back.".into()));
             }
-            Ok(compose("studio_revert", parts))
+            let row = RowEdit {
+                id: change.id.clone(),
+                cells,
+            };
+            update_rows(schema, &node.name, &[row]).map_err(unavailable)
         }
     }
+}
+
+/// Whether `change`'s revert deletes the entity: an addition's. The delete is bound to the
+/// entity's id alone, so it takes whatever later commits changed with it; only a review that
+/// shows what the branch holds now, whose fixes are bound to that head, sends one.
+pub fn revert_deletes(change: &FoldedChange) -> bool {
+    change.net() == Some(NetChange::Added)
 }
 
 fn revert_edge(
@@ -298,8 +303,11 @@ mod tests {
         }
     }
 
+    /// A changed node is set back by one statement bound to every value the review saw: with
+    /// any of them changed since, the statement matches nothing and nothing is set back, rather
+    /// than the properties still as seen being set back alone.
     #[test]
-    fn a_changed_node_sets_every_property_back_in_one_mutation() {
+    fn a_changed_node_sets_every_property_back_in_one_statement_bound_to_every_value() {
         let c = change(
             EntityKind::Node,
             "Person",
@@ -312,35 +320,47 @@ mod tests {
         );
         let query = revert_query(&schema(), &c).unwrap();
         assert_compiles(&query);
-        assert_eq!(query.text.matches("update Person").count(), 3);
-        // The bound value is the after image; the new value the before image.
-        let pairs: Vec<(Value, Option<Value>)> = (0..3)
-            .map(|i| {
-                (
-                    query.params[&format!("new_{i}")].clone(),
-                    query.params.get(&format!("old_{i}")).cloned(),
-                )
-            })
-            .collect();
-        assert!(pairs.contains(&(json!("Researcher"), Some(json!("Principal")))));
-        assert!(pairs.contains(&(Value::Null, Some(json!("x@y")))));
+        assert_eq!(
+            query.text.matches("update Person").count(),
+            1,
+            "{}",
+            query.text
+        );
         assert!(
-            pairs.contains(&(json!(["a"]), None)),
+            query
+                .text
+                .contains("where @id = $id0 and title = $old0_0 and email = $old0_1\n"),
+            "{}",
+            query.text
+        );
+        // The bound value is the after image; the new value the before image.
+        assert_eq!(query.params["new0_0"], json!("Researcher"));
+        assert_eq!(query.params["old0_0"], json!("Principal"));
+        assert_eq!(query.params["new0_1"], Value::Null);
+        assert_eq!(query.params["old0_1"], json!("x@y"));
+        assert_eq!(query.params["new0_2"], json!(["a"]));
+        assert!(
+            !query.params.contains_key("old0_2"),
             "lists bind to the row only"
         );
-    }
 
-    #[test]
-    fn a_single_property_revert_is_the_builders_query() {
-        let c = change(
+        let one = change(
             EntityKind::Node,
             "Person",
             Some(json!({"title": "A"})),
             Some(json!({"title": "B"})),
         );
-        let query = revert_query(&schema(), &c).unwrap();
+        let query = revert_query(&schema(), &one).unwrap();
         assert_compiles(&query);
-        assert_eq!(query.name, "studio_set");
+        assert!(
+            query
+                .text
+                .contains("where @id = $id0 and title = $old0_0\n"),
+            "{}",
+            query.text
+        );
+        assert!(!revert_deletes(&c));
+        assert!(!revert_deletes(&one));
     }
 
     #[test]
@@ -354,6 +374,7 @@ mod tests {
         let query = revert_query(&schema(), &added).unwrap();
         assert_compiles(&query);
         assert!(query.text.contains("delete Person"));
+        assert!(revert_deletes(&added), "a delete is bound to the id alone");
 
         let removed = change(
             EntityKind::Node,
@@ -365,6 +386,7 @@ mod tests {
         assert_compiles(&query);
         assert!(query.text.contains("insert Person"));
         assert_eq!(query.params.len(), 3, "nulls are left out");
+        assert!(!revert_deletes(&removed));
     }
 
     #[test]
@@ -379,6 +401,7 @@ mod tests {
         assert_compiles(&query);
         assert!(query.text.contains("delete WorksAt where @id"));
         assert_eq!(query.params["id"], json!("person-000001"));
+        assert!(revert_deletes(&added));
 
         let removed = change(
             EntityKind::Edge,

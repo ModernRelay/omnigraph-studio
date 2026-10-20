@@ -1,8 +1,8 @@
 //! The commits History draws (spec 009).
 //!
 //! OmniGraph's `GET /commits?branch=` lists one branch's first-parent chain: a merged
-//! branch's commits appear only as a `merged_parent_commit_id`. Until a lineage route exists
-//! (E9, E10), History reads the other live branches' lists too and adds every commit reachable
+//! branch's commits appear only as a `merged_parent_commit_id`. Without a lineage route,
+//! History reads the other live branches' lists too and adds every commit reachable
 //! through a merged parent, so merges draw as lanes. Commits of deleted branches stay unknown.
 
 use std::collections::{HashMap, HashSet};

@@ -2,18 +2,20 @@
 //! review. Shown in History's detail split, or as its own tab through `OpenCommit`.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
-use change_cards::{CardLines, CardRows};
+use change_cards::{CardLines, CardRows, Row};
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, ListAlignment,
-    ListState, Render, SharedString, Task, Window, list,
+    ListState, Render, SharedString, Subscription, Task, Window, list,
 };
+use gq_language::SchemaModel;
 use graph_client::ReadError;
 use graph_client::api::{ChangeCauseOutput, CommitOutput};
 use graph_store::{
     ChangeFold, EntityGroups, FoldedChanges, GraphSession, GroupRun, GroupSection, NodeNames,
-    TypeCounts,
+    SessionEvent, TypeCounts,
 };
 use studio_actions::graph::{OpenCommit, OpenQueryAt, OpenType};
 use studio_ui::menu::ContextMenu;
@@ -39,14 +41,6 @@ pub struct CommitCounts {
     pub partial: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Row {
-    /// The header of a run of one type's cards, by its index in `runs`.
-    Header(usize),
-    /// An entity's card, by its group.
-    Entity(usize),
-}
-
 enum State {
     Loading,
     Ready,
@@ -60,10 +54,14 @@ pub struct CommitView {
     cause: Option<ChangeCauseOutput>,
     state: State,
     fold: ChangeFold,
-    folded: FoldedChanges,
+    /// Shared with the work done off the main thread: grouping again under another schema.
+    folded: Arc<FoldedChanges>,
     /// The changes by entity, each node with its relationship changes, as the review shows
     /// them.
     groups: EntityGroups,
+    /// The schema the groups and the cards' rows were made with: another, loaded since,
+    /// applied, or naming nodes otherwise, groups the changes again.
+    schema: Option<Arc<SchemaModel>>,
     /// The cards' property rows, made as they are first drawn; new with each fold.
     card_rows: CardRows,
     runs: Vec<GroupRun>,
@@ -83,6 +81,8 @@ pub struct CommitView {
     _task: Option<Task<()>>,
     /// The wait before a stepped-to commit's first read; dropped with the view.
     _pause: Option<Task<()>>,
+    _regroup_task: Option<Task<()>>,
+    _schema_subscription: Subscription,
 }
 
 impl EventEmitter<ItemEvent> for CommitView {}
@@ -155,6 +155,11 @@ impl CommitView {
         commit: Option<CommitOutput>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let schema_subscription = cx.subscribe(&session, |this, _, event: &SessionEvent, cx| {
+            if let SessionEvent::SchemaChanged = event {
+                this.regroup(cx);
+            }
+        });
         Self {
             session,
             commit_id,
@@ -162,8 +167,9 @@ impl CommitView {
             cause: None,
             state: State::Loading,
             fold: ChangeFold::new(),
-            folded: FoldedChanges::default(),
+            folded: Arc::default(),
             groups: EntityGroups::default(),
+            schema: None,
             card_rows: CardRows::default(),
             runs: Vec::new(),
             names: NodeNames::default(),
@@ -177,6 +183,8 @@ impl CommitView {
             focus_handle: cx.focus_handle(),
             _task: None,
             _pause: None,
+            _regroup_task: None,
+            _schema_subscription: schema_subscription,
         }
     }
 
@@ -232,14 +240,15 @@ impl CommitView {
             // Finished, counted and laid out off the main thread; the fold is kept for the
             // next pages.
             let schema = session.read_with(cx, |session, _| session.schema_model());
+            let made_with = schema.clone();
             let (fold, folded, groups, runs, counts, rows) = cx
                 .background_executor()
                 .spawn(async move {
                     let folded = fold.clone().finish();
                     let counts = folded.counts();
                     let groups = EntityGroups::new(&folded, schema.as_deref());
-                    let (rows, runs) = build_rows(&folded, &groups);
-                    (fold, folded, groups, runs, counts, rows)
+                    let (rows, runs) = change_cards::rows(&folded, &groups, |_| true);
+                    (fold, Arc::new(folded), groups, runs, counts, rows)
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -258,35 +267,17 @@ impl CommitView {
                         this.counts = counts;
                         this.rows = rows;
                         this.runs = runs;
-                        let ends: Vec<_> = groups
-                            .unnamed_ends()
-                            .into_iter()
-                            .filter(|end| !this.names.contains_key(end))
-                            .collect();
                         this.groups = groups;
                         this.folded = folded;
+                        this.schema = made_with;
                         this.card_rows = CardRows::default();
-                        if !ends.is_empty() {
-                            let commit = Some(this.commit_id.clone());
-                            let names = this
-                                .session
-                                .update(cx, |session, cx| session.node_names(ends, commit, cx));
-                            this._names_task = Some(cx.spawn(async move |this, cx| {
-                                let names = names.await;
-                                this.update(cx, |this, cx| {
-                                    this.names.extend(names);
-                                    cx.notify();
-                                })
-                                .ok();
-                            }));
-                        }
+                        this.read_names(cx);
                         this.next_page_token = token;
                         // Rows read further down keep the place the person scrolled to.
-                        let top = this.list_state.logical_scroll_top();
-                        let more = usize::from(this.next_page_token.is_some());
-                        this.list_state.reset(this.rows.len() + more);
-                        this.list_state.scroll_to(top);
+                        this.reset_list();
                         this.state = State::Ready;
+                        // A schema that arrived while these were grouped groups them again.
+                        this.regroup(cx);
                         let (added, changed, removed) =
                             this.counts.iter().fold((0, 0, 0), |(a, c, r), t| {
                                 (a + t.added, c + t.changed, r + t.removed)
@@ -306,6 +297,81 @@ impl CommitView {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Reads the names of the nodes known here only by id, at the commit, those not known yet.
+    fn read_names(&mut self, cx: &mut Context<Self>) {
+        let ends: Vec<_> = self
+            .groups
+            .unnamed_ends()
+            .into_iter()
+            .filter(|end| !self.names.contains_key(end))
+            .collect();
+        if ends.is_empty() {
+            return;
+        }
+        let commit = Some(self.commit_id.clone());
+        let names = self
+            .session
+            .update(cx, |session, cx| session.node_names(ends, commit, cx));
+        self._names_task = Some(cx.spawn(async move |this, cx| {
+            let names = names.await;
+            this.update(cx, |this, cx| {
+                this.names.extend(names);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Lays the list out for its rows again, keeping the place the person scrolled to.
+    fn reset_list(&mut self) {
+        let top = self.list_state.logical_scroll_top();
+        let more = usize::from(self.next_page_token.is_some());
+        self.list_state.reset(self.rows.len() + more);
+        self.list_state.scroll_to(top);
+    }
+
+    /// Groups the changes read again when they were grouped under another schema than the
+    /// session's, off the main thread: one loaded after they were read, applied, or naming
+    /// nodes otherwise. The changes stay as read; a read under way groups its own.
+    fn regroup(&mut self, cx: &mut Context<Self>) {
+        let schema = self.session.read(cx).schema_model();
+        let same = match (&self.schema, &schema) {
+            (Some(made), Some(current)) => Arc::ptr_eq(made, current),
+            (None, None) => true,
+            _ => false,
+        };
+        if same || matches!(self.state, State::Loading) {
+            return;
+        }
+        let folded = self.folded.clone();
+        self._regroup_task = Some(cx.spawn(async move |this, cx| {
+            let (grouping, made_with) = (folded.clone(), schema.clone());
+            let (groups, rows, runs) = cx
+                .background_executor()
+                .spawn(async move {
+                    let groups = EntityGroups::new(&grouping, schema.as_deref());
+                    let (rows, runs) = change_cards::rows(&grouping, &groups, |_| true);
+                    (groups, rows, runs)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                // Grouped for changes read since: those were grouped as they came.
+                if !Arc::ptr_eq(&this.folded, &folded) {
+                    return;
+                }
+                this.groups = groups;
+                this.rows = rows;
+                this.runs = runs;
+                this.schema = made_with;
+                this.card_rows = CardRows::default();
+                this.read_names(cx);
+                this.reset_list();
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -539,8 +605,8 @@ impl CommitView {
                 ))
                 .into_any_element(),
             Some(Row::Entity(ix)) => {
-                let schema = self.session.read(cx).schema_model();
-                let schema = schema.as_deref();
+                // The schema the groups were made with, which the cards' rows agree with.
+                let schema = self.schema.as_deref();
                 let card = change_cards::entity_card(
                     &self.groups,
                     &self.folded,
@@ -636,16 +702,6 @@ fn describe(error: &ReadError) -> String {
 }
 
 /// The list's rows: a header for each run of one type, then its cards.
-fn build_rows(folded: &FoldedChanges, groups: &EntityGroups) -> (Vec<Row>, Vec<GroupRun>) {
-    let runs = groups.runs(folded, |_| true);
-    let mut rows = Vec::new();
-    for (ix, run) in runs.iter().enumerate() {
-        rows.push(Row::Header(ix));
-        rows.extend(run.groups.iter().map(|&group| Row::Entity(group)));
-    }
-    (rows, runs)
-}
-
 impl Render for CommitView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let header = self.render_header(cx);
@@ -759,6 +815,82 @@ mod tests {
             assert!(view.more_error.is_none());
         });
         assert_eq!(*partial.lock().unwrap(), [true, false]);
+    }
+
+    /// A schema that arrives after the changes were grouped groups them again from what was
+    /// read, without reading the commit again: a relationship stands alone until a schema says
+    /// which nodes it joins, then shows on its node's card.
+    #[gpui::test]
+    async fn a_schema_that_arrives_after_the_read_groups_the_changes_again(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(studio_theme::init_test);
+        let schema_served = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (served, counted) = (schema_served.clone(), reads.clone());
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let (served, counted) = (served.clone(), counted.clone());
+            async move {
+                let (status, body) = if path.ends_with("/schema") && served.load(Ordering::SeqCst) {
+                    (
+                        200,
+                        json!({ "schema_source": "node Person {\n  slug: String @key\n}\nnode Company {\n  slug: String @key\n}\nedge WorksAt: Person -> Company\n" }),
+                    )
+                } else if path.ends_with("/changes") {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let cause = json!({ "graph_commit_id": "c9", "parent_commit_id": "c8", "authored_branch": "main", "authored_at": 0 });
+                    let person = json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": "p1", "op": "insert", "before": null, "after": { "properties": { "slug": "p1" } } });
+                    let works = json!({ "kind": "edge", "type": { "id": "WorksAt", "name": "WorksAt" }, "id": "e1", "op": "insert", "before": null, "after": { "properties": {}, "endpoints": { "from": "p1", "to": "c1" } } });
+                    (200, json!({ "cause": cause, "changes": [person, works] }))
+                } else {
+                    (404, json!({ "error": "not here" }))
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        let view = cx.new(|cx| CommitView::new(session.clone(), "c9".into(), None, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.schema.is_none());
+            assert!(
+                view.groups.groups.iter().any(|group| group.is_edge),
+                "a relationship stands alone without a schema"
+            );
+        });
+        schema_served.store(true, Ordering::SeqCst);
+        session.update(cx, |session, cx| session.reload_schema(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            let current = view
+                .session
+                .read(cx)
+                .schema_model()
+                .expect("the schema loaded");
+            assert!(
+                view.schema
+                    .as_ref()
+                    .is_some_and(|made| Arc::ptr_eq(made, &current))
+            );
+            assert!(
+                view.groups.groups.iter().all(|group| !group.is_edge),
+                "the relationship shows on its node's card"
+            );
+        });
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "the commit was read again");
     }
 
     /// A commit stepped past reads nothing; the one the steps stop on reads once they pause.

@@ -13,14 +13,38 @@ use std::rc::Rc;
 use gpui::{App, Div, ElementId};
 use gq_language::SchemaModel;
 use graph_store::{
-    EntityGroups, FoldedChange, FoldedChanges, GroupRun, GroupSection, NetChange, NodeNames,
-    RelationshipEntry, entity_name,
+    EntityGroup, EntityGroups, FoldedChange, FoldedChanges, GroupRun, GroupSection, NetChange,
+    NodeNames, RelationshipEntry, entity_name,
 };
 use studio_ui::ds::space;
 use studio_ui::{
     ChangeCard, ChangeKind, PropertyRow, RelationshipLine, change_group_header, group_digits,
 };
 use ui::prelude::*;
+
+/// One row of a list of cards: the header of a run of one type's cards, by its index in the
+/// runs [`rows`] returns, or an entity's card, by its group.
+#[derive(Debug, Clone, Copy)]
+pub enum Row {
+    Header(usize),
+    Entity(usize),
+}
+
+/// The rows of the cards of the groups `keep` leaves, each run of one type under its header,
+/// and the runs.
+pub fn rows(
+    folded: &FoldedChanges,
+    groups: &EntityGroups,
+    keep: impl FnMut(&EntityGroup) -> bool,
+) -> (Vec<Row>, Vec<GroupRun>) {
+    let runs = groups.runs(folded, keep);
+    let mut rows = Vec::new();
+    for (ix, run) in runs.iter().enumerate() {
+        rows.push(Row::Header(ix));
+        rows.extend(run.groups.iter().map(|&group| Row::Entity(group)));
+    }
+    (rows, runs)
+}
 
 /// Relationship lines a card shows until more are asked for: a node that gained hundreds of
 /// relationships stays one readable card, and one row its list lays out quickly.
@@ -88,7 +112,7 @@ pub fn more_lines_label(left_out: usize) -> String {
 
 /// The card for change `ix` of `folded`: its kind, id and changed property rows, and a lone
 /// relationship's ends.
-pub fn change_card(
+fn change_card(
     folded: &FoldedChanges,
     ix: usize,
     schema: Option<&SchemaModel>,

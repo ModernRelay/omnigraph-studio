@@ -2,8 +2,10 @@
 //! entity, with fixes bound to the reviewed head and a merge that checks the head first.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use std::time::Duration;
 
-use change_cards::{CardLines, CardRows};
+use change_cards::{CardLines, CardRows, Row};
 use editor::{Editor, EditorEvent};
 use gpui::{
     AnyElement, App, AsyncApp, Context, Entity, EventEmitter, FocusHandle, Focusable,
@@ -15,7 +17,7 @@ use graph_client::api::{
     ChangeRequest, CommitOutput, MergeConflictOutput,
 };
 use graph_client::{ReadError, WriteOutcome};
-use graph_store::fixes::compose;
+use graph_store::fixes::revert_deletes;
 use graph_store::{
     ChangeFold, EntityGroup, EntityGroups, FoldedChange, FoldedChanges, GraphSession, GroupRun,
     GroupSection, HeadWatch, NodeNames, REVIEW_CHANGE_CAP, SessionEvent, TypeCounts, commits_since,
@@ -35,22 +37,13 @@ use ui::{KeyBinding, PopoverMenu, Severity, Tooltip};
 use crate::conflicts::{conflict_wording, resolution_hint};
 
 /// How long typing in the search pauses before the cards are filtered.
-const SEARCH_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
+const SEARCH_DELAY: Duration = Duration::from_millis(80);
 
 /// Changes asked for per change-feed page: the server's most (`COMMIT_CHANGES_MAX_CHANGES`),
 /// as the CLI asks when it follows every page. Each page restarts the server's comparison
 /// after the last change returned, so fewer, larger pages cost fewer reads; the server's byte
 /// budget still bounds what one page holds.
 const FEED_PAGE: usize = 8_192;
-
-/// One row of the review's list.
-#[derive(Debug, Clone, Copy)]
-enum Row {
-    /// The header of a run of one type's cards, by its index in the view's runs.
-    Header(usize),
-    /// An entity's card, by its group in [`ReviewData::groups`].
-    Entity(usize),
-}
 
 #[derive(Debug, Clone, PartialEq)]
 enum FixState {
@@ -163,12 +156,13 @@ struct ReviewData {
     head: Option<String>,
     /// The branch's commits since the fork, newest first.
     commits: Vec<ReviewCommit>,
-    folded: FoldedChanges,
+    /// Shared with the work done off the main thread: grouping again under another schema.
+    folded: Arc<FoldedChanges>,
     /// The changes by entity: each node with the relationship changes reviewed on its card.
     groups: EntityGroups,
     /// Each change's search text, lowercase, made when it was folded: a search goes through
-    /// these, not through every value of every change on each key.
-    search: Vec<String>,
+    /// these off the main thread, not through every value of every change on each key.
+    search: Arc<[String]>,
     counts: Vec<TypeCounts>,
     /// Why each change cannot be reverted, when it cannot: worked out with the fold, off the
     /// main thread, since a review holds up to 20,000 changes.
@@ -176,8 +170,16 @@ struct ReviewData {
     /// The changes' indexes in order of type and id, sorted with the fold: a conflict finds its
     /// entity's change by a search, not a walk of every change at each frame.
     by_entity: Vec<usize>,
+    /// Each change's index by its key ([`FoldedChange::key`]), made with the fold: a fix's
+    /// outcome finds its card without a walk of every change.
+    by_key: HashMap<String, usize>,
     /// The cards' property rows, made as they are first drawn.
     card_rows: CardRows,
+    /// Each change's reviewed mark ([`mark_of`]), made with the fold.
+    marks: Vec<u64>,
+    /// The schema the groups, the revert checks and the cards' rows were made with: another,
+    /// loaded since, applied, or naming nodes otherwise, makes them again.
+    schema: Option<Arc<SchemaModel>>,
     partial: bool,
     /// The feed went past the reviewed head while reading: the branch moved.
     moved_while_reading: bool,
@@ -193,16 +195,38 @@ struct Fix {
     request: ChangeRequest,
     description: String,
     edited: bool,
+    /// The fix this one is the second half of: it is sent only once that one lands.
+    after: Option<String>,
 }
+
+/// Why a fix is not sent while a merge is out.
+const MERGE_RUNNING: &str = "A merge is running: a fix now could land on either side of it.";
 
 /// What a reviewed mark is kept by: the entity and what its change does, so the mark holds
 /// until the entity changes again, whichever commits the review reads the change from. A review
-/// since a merge reads every change at the reviewed head, which a fix moves.
-fn mark_key(change: &FoldedChange) -> String {
-    use std::hash::{Hash as _, Hasher as _};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    format!("{:?}{:?}", change.before, change.after).hash(&mut hasher);
-    format!("{}@{:016x}", change.key(), hasher.finish())
+/// since a merge reads every change at the reviewed head, which a fix moves. Made with the fold,
+/// off the main thread: a review holds up to 20,000 changes, and their values can be long.
+fn mark_of(change: &FoldedChange) -> u64 {
+    use std::fmt::Write as _;
+    use std::hash::{DefaultHasher, Hash as _, Hasher};
+    /// Hashes what is written to it, without making the text.
+    struct Hashing<'a>(&'a mut DefaultHasher);
+    impl std::fmt::Write for Hashing<'_> {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            self.0.write(text.as_bytes());
+            Ok(())
+        }
+    }
+    let mut hasher = DefaultHasher::new();
+    change.key().hash(&mut hasher);
+    write!(
+        Hashing(&mut hasher),
+        "{:?}{:?}",
+        change.before,
+        change.after
+    )
+    .ok();
+    hasher.finish()
 }
 
 /// A commit under review: from the commit list, or the cause of its change-feed block.
@@ -245,6 +269,58 @@ enum LoadState {
 const LIST_NEEDS_HEAD: &str = "A list is checked only against what the branch holds now, which \
      this review does not show: fix it from the review of all the branch's changes.";
 
+/// Why an addition is not reverted from a review that does not show what the branch holds now
+/// ([`revert_deletes`]).
+const ADDITION_NEEDS_HEAD: &str = "Reverting an addition deletes it with whatever later commits \
+     changed, and this review does not show what the branch holds now: revert it from the \
+     review of all the branch's changes.";
+
+/// The changes a search leaves, found off the main thread: each change's match for `query`,
+/// none for an empty search, which leaves every card.
+#[derive(Debug, Default)]
+struct Searched {
+    query: String,
+    matched: Option<Vec<bool>>,
+}
+
+/// Each change's match for `query` (lowercase) in its search text; `None` for an empty query.
+fn search_matches(texts: &[String], query: &str) -> Option<Vec<bool>> {
+    (!query.is_empty()).then(|| texts.iter().map(|text| text.contains(query)).collect())
+}
+
+/// Why each change cannot be reverted under `schema`, when it cannot; nothing is said without
+/// a schema, since a revert is made under the one loaded when it is asked for. A review that
+/// does not show what the branch holds now (`shows_head`) reverts no addition.
+fn revert_checks(
+    folded: &FoldedChanges,
+    schema: Option<&SchemaModel>,
+    shows_head: bool,
+) -> Vec<Option<String>> {
+    folded
+        .changes
+        .iter()
+        .map(|change| {
+            let schema = schema?;
+            match revert_query(schema, change) {
+                Err(reason) => Some(reason.0),
+                Ok(_) if !shows_head && revert_deletes(change) => {
+                    Some(ADDITION_NEEDS_HEAD.to_owned())
+                }
+                Ok(_) => None,
+            }
+        })
+        .collect()
+}
+
+/// Whether two schemas are the same one, by identity: a schema read or named again is another.
+fn same_schema(a: Option<&Arc<SchemaModel>>, b: Option<&Arc<SchemaModel>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 pub struct ReviewView {
     session: Entity<GraphSession>,
     branch: String,
@@ -253,6 +329,8 @@ pub struct ReviewView {
     scope: Option<String>,
     /// Narrows the cards to those whose id, type or values contain the text.
     search: Entity<Editor>,
+    /// What the search left of the review shown.
+    searched: Searched,
     focus_handle: FocusHandle,
     load: LoadState,
     data: Option<ReviewData>,
@@ -270,14 +348,19 @@ pub struct ReviewView {
     /// How many relationship lines each card shows.
     card_lines: CardLines,
     list_state: ListState,
+    /// The conflicts list, drawn a screen at a time: the server's list has no bound.
+    conflict_list: ListState,
     /// The head fixes and the merge bind to: the reviewed head, then each fix's own commit.
     bound_head: Option<String>,
     /// What the review holds, in a sentence, made when it loads: the header draws at every frame.
     summary: String,
-    /// Reviewed marks, by entity and the last commit that changed it, kept across Refresh: a
-    /// change made again since is reviewed again.
-    reviewed_keys: HashSet<String>,
+    /// Reviewed marks, by entity and what its change does ([`mark_of`]), kept across Refresh:
+    /// an entity changed again since is reviewed again.
+    reviewed_keys: HashSet<u64>,
     merge: MergeState,
+    /// The merge deleted the branch: the tab is not opened again with the window, whatever a
+    /// Refresh since reads.
+    branch_deleted: bool,
     /// What a merge would do now, read with the review by a dry run.
     preview: Preview,
     /// Whether the merge deletes the branch once it lands; on unless the person turns it off.
@@ -297,7 +380,7 @@ pub struct ReviewView {
     /// they are back, since each moves the bound head itself.
     head_moved_while_writing: bool,
     /// The session asks after the reviewed branch's head while the review is open.
-    _head_watch: HeadWatch,
+    _head_watch: Option<HeadWatch>,
     _target_watch: HeadWatch,
     /// The dry run is for heads that moved (a fix landed, the target moved) and is read again
     /// once no fix or merge is out.
@@ -309,7 +392,10 @@ pub struct ReviewView {
     _preview_task: Option<Task<()>>,
     _merge_task: Option<Task<()>>,
     _search_task: Option<Task<()>>,
-    _fix_tasks: Vec<Task<()>>,
+    /// The review grouped again under a schema that arrived since it was grouped.
+    _regroup_task: Option<Task<()>>,
+    /// The fix out: they go one at a time.
+    _fix_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -335,7 +421,7 @@ impl Item for ReviewView {
     }
 
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
-        Some(SavedItem {
+        (!self.branch_deleted).then(|| SavedItem {
             kind: "review".into(),
             data: serde_json::json!({ "branch": self.branch, "target": self.target }),
         })
@@ -367,10 +453,7 @@ impl ReviewView {
         let search_subscription = cx.subscribe(&search, |this, _, event: &EditorEvent, cx| {
             if let EditorEvent::BufferEdited = event {
                 // Once typing pauses: each search goes through every change.
-                this._search_task = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor().timer(SEARCH_DELAY).await;
-                    this.update(cx, |this, cx| this.apply_search(cx)).ok();
-                }));
+                this.search_after(Some(SEARCH_DELAY), cx);
             }
         });
         let subscription =
@@ -385,7 +468,9 @@ impl ReviewView {
                 {
                     this.preview_moved(cx)
                 }
-                SessionEvent::SchemaChanged => cx.notify(),
+                SessionEvent::SchemaChanged => this.schema_changed(cx),
+                // Another writer's schema: the cards were made under the one before.
+                SessionEvent::SchemaMoved if !this.newer => this.mark_newer(cx),
                 _ => {}
             });
         let head_watch = session.update(cx, |session, cx| session.watch_head(&branch, cx));
@@ -396,6 +481,7 @@ impl ReviewView {
             target,
             scope: None,
             search,
+            searched: Searched::default(),
             focus_handle: cx.focus_handle(),
             load: LoadState::Loading { folded: 0 },
             data: None,
@@ -406,10 +492,12 @@ impl ReviewView {
             names: NodeNames::default(),
             card_lines: CardLines::default(),
             list_state: ListState::new(0, ListAlignment::Top, px(800.)),
+            conflict_list: ListState::new(0, ListAlignment::Top, px(800.)),
             bound_head: None,
             summary: String::new(),
             reviewed_keys: HashSet::new(),
             merge: MergeState::Idle,
+            branch_deleted: false,
             preview: Preview::Unread,
             delete_branch: true,
             show_conflicts: false,
@@ -419,7 +507,7 @@ impl ReviewView {
             fix_out: false,
             fixes_in_flight: HashMap::new(),
             head_moved_while_writing: false,
-            _head_watch: head_watch,
+            _head_watch: Some(head_watch),
             _target_watch: target_watch,
             preview_again: false,
             preview_target: None,
@@ -428,11 +516,70 @@ impl ReviewView {
             _preview_task: None,
             _merge_task: None,
             _search_task: None,
-            _fix_tasks: Vec::new(),
+            _regroup_task: None,
+            _fix_task: None,
             _subscriptions: vec![subscription, search_subscription],
         };
         view.reload(cx);
         view
+    }
+
+    /// The session's schema was loaded, applied, or names nodes otherwise: the review shown is
+    /// grouped again under it. One being read compares its schema once it is in.
+    fn schema_changed(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.load, LoadState::Ready) {
+            self.regroup(cx);
+        }
+        cx.notify();
+    }
+
+    /// Groups the review again when it was grouped under another schema than the session's,
+    /// off the main thread: its cards pair moved relationships, say what cannot be reverted and
+    /// show their rows by the schema they are drawn with. A tab opened again with the window can
+    /// finish reading before the schema loads. The changes stay as read: a schema changes how
+    /// they are grouped, not what the branch changed.
+    fn regroup(&mut self, cx: &mut Context<Self>) {
+        let schema = self.session.read(cx).schema_model();
+        let shows_head = self.shows_head();
+        let Some(data) = &self.data else { return };
+        if same_schema(data.schema.as_ref(), schema.as_ref()) {
+            return;
+        }
+        let folded = data.folded.clone();
+        self._regroup_task = Some(cx.spawn(async move |this, cx| {
+            let (grouping, made_with) = (folded.clone(), schema.clone());
+            let (groups, revert_blocked) = cx
+                .background_executor()
+                .spawn(async move {
+                    let groups = EntityGroups::new(&grouping, schema.as_deref());
+                    let blocked = revert_checks(&grouping, schema.as_deref(), shows_head);
+                    (groups, blocked)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                // Grouped for a review read again since: that one compares its own schema.
+                let Some(data) = this
+                    .data
+                    .as_mut()
+                    .filter(|data| Arc::ptr_eq(&data.folded, &folded))
+                else {
+                    return;
+                };
+                data.groups = groups;
+                data.schema = made_with;
+                data.card_rows = CardRows::default();
+                for (card, blocked) in this.cards.iter_mut().zip(&revert_blocked) {
+                    card.revert_blocked = blocked.clone();
+                }
+                data.revert_blocked = revert_blocked;
+                let ends = data.groups.unnamed_ends();
+                let head = data.head.clone();
+                this.lay_out();
+                this.read_names(ends, head, cx);
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn reviewed_head(&self) -> Option<String> {
@@ -441,15 +588,15 @@ impl ReviewView {
 
     /// Reads the review again from the branch head. Reviewed marks are kept.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        for (state, change) in self
+        for (state, mark) in self
             .cards
             .iter()
-            .zip(self.data.iter().flat_map(|d| d.folded.changes.iter()))
+            .zip(self.data.iter().flat_map(|d| d.marks.iter()))
         {
             if state.reviewed {
-                self.reviewed_keys.insert(mark_key(change));
+                self.reviewed_keys.insert(*mark);
             } else {
-                self.reviewed_keys.remove(&mark_key(change));
+                self.reviewed_keys.remove(mark);
             }
         }
         self.load = LoadState::Loading { folded: 0 };
@@ -464,55 +611,80 @@ impl ReviewView {
         let scope = self.scope.clone();
         self._load_task = Some(cx.spawn(async move |this, cx| {
             let result = read_review(session, branch, target, scope, this.clone(), cx).await;
-            this.update(cx, |this, cx| this.finish_load(result, cx))
+            // The search's matches among the changes read, found off the main thread too.
+            let searched = match &result {
+                Ok(data) => {
+                    let query = this
+                        .update(cx, |this, cx| this.search_text(cx))
+                        .unwrap_or_default();
+                    let (texts, text) = (data.search.clone(), query.clone());
+                    let matched = cx
+                        .background_executor()
+                        .spawn(async move { search_matches(&texts, &text) })
+                        .await;
+                    Searched { query, matched }
+                }
+                Err(_) => Searched::default(),
+            };
+            this.update(cx, |this, cx| this.finish_load(result, searched, cx))
                 .ok();
         }));
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
 
-    fn finish_load(&mut self, result: Result<ReviewData, String>, cx: &mut Context<Self>) {
+    fn finish_load(
+        &mut self,
+        result: Result<ReviewData, String>,
+        searched: Searched,
+        cx: &mut Context<Self>,
+    ) {
         match result {
             Ok(data) => {
                 self.cards = data
-                    .folded
-                    .changes
+                    .revert_blocked
                     .iter()
-                    .zip(&data.revert_blocked)
-                    .map(|(change, blocked)| CardState {
-                        reviewed: self.reviewed_keys.contains(&mark_key(change)),
-                        fix: self
-                            .fixes_in_flight
-                            .get(&change.key())
-                            .cloned()
-                            .unwrap_or(FixState::Idle),
+                    .zip(&data.marks)
+                    .map(|(blocked, mark)| CardState {
+                        reviewed: self.reviewed_keys.contains(mark),
+                        fix: FixState::Idle,
                         revert_blocked: blocked.clone(),
                     })
                     .collect();
-                (self.rows, self.headers) = build_rows(&data, &self.search_text(cx));
-                self.list_state.reset(self.rows.len());
-                self.selected = self
-                    .visible_groups()
-                    .first()
-                    .and_then(|&group| data.groups.groups[group].primary());
+                // A fix still out keeps its card showing it, so it is not asked for again.
+                for (key, fix) in &self.fixes_in_flight {
+                    if let Some(&ix) = data.by_key.get(key) {
+                        self.cards[ix].fix = fix.clone();
+                    }
+                }
                 self.bound_head = data.head.clone();
                 self.newer = data.moved_while_reading;
                 self.summary = self.summary_of(&data);
                 let ends = data.groups.unnamed_ends();
                 let head = data.head.clone();
                 let changed = !data.folded.changes.is_empty();
+                // Typed while the changes were gone through: gone through again for the text.
+                let typed_since = searched.query != self.search_text(cx);
+                self.searched = searched;
                 self.data = Some(data);
                 self.load = LoadState::Ready;
+                self.selected = None;
+                self.lay_out();
+                if typed_since {
+                    self.search_after(None, cx);
+                }
                 self.read_names(ends, head, cx);
-                if self.scope.is_none() && changed {
-                    self.read_preview(cx);
-                } else {
-                    self.preview = Preview::Unread;
-                    self._preview_task = None;
+                // Read now, or once the fix or merge out is back.
+                self.preview = Preview::Unread;
+                self._preview_task = None;
+                if changed {
+                    self.preview_moved(cx);
                 }
                 // A head that moved while this was read, a fix of this review's included, is
                 // offered as newer: the cards show the head read.
                 self.compare_head(cx);
+                // A schema that arrived while this was read groups it again.
+                self.regroup(cx);
             }
             Err(error) => self.load = LoadState::Failed(error.into()),
         }
@@ -578,6 +750,14 @@ impl ReviewView {
     /// out; a review being read reads its own.
     fn preview_moved(&mut self, cx: &mut Context<Self>) {
         if !matches!(self.load, LoadState::Ready) {
+            return;
+        }
+        // The cards show a head another writer has moved past: a dry run now would merge
+        // changes they do not show. Refresh reads it with the review.
+        if self.newer {
+            self.preview_again = false;
+            self.preview = Preview::Unread;
+            self._preview_task = None;
             return;
         }
         if self.fixes_running > 0 || self.merging() {
@@ -680,11 +860,45 @@ impl ReviewView {
         self.search.read(cx).text(cx).trim().to_lowercase()
     }
 
-    /// Shows only the cards matching the search, keeping the selection when its card still
-    /// shows.
-    fn apply_search(&mut self, cx: &mut Context<Self>) {
+    /// Shows only the cards matching the search, once typing has paused for `delay`: the
+    /// changes' texts are gone through off the main thread, since a review holds up to 20,000
+    /// changes. The latest search wins, and one made for a review read again since is let go.
+    fn search_after(&mut self, delay: Option<Duration>, cx: &mut Context<Self>) {
+        self._search_task = Some(cx.spawn(async move |this, cx| {
+            if let Some(delay) = delay {
+                cx.background_executor().timer(delay).await;
+            }
+            let Ok(Some((texts, query))) = this.update(cx, |this, cx| {
+                let texts = this.data.as_ref()?.search.clone();
+                Some((texts, this.search_text(cx)))
+            }) else {
+                return;
+            };
+            let (scanned, text) = (texts.clone(), query.clone());
+            let matched = cx
+                .background_executor()
+                .spawn(async move { search_matches(&scanned, &text) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| Arc::ptr_eq(&data.search, &texts))
+                {
+                    this.searched = Searched { query, matched };
+                    this.lay_out();
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Lays the cards out as the search leaves them, keeping the selection while its card
+    /// shows, else selecting the first card shown.
+    fn lay_out(&mut self) {
         let Some(data) = &self.data else { return };
-        (self.rows, self.headers) = build_rows(data, &self.search_text(cx));
+        (self.rows, self.headers) = build_rows(data, self.searched.matched.as_deref());
         self.list_state.reset(self.rows.len());
         let visible = self.visible_groups();
         let shown = self
@@ -696,7 +910,6 @@ impl ReviewView {
                 .first()
                 .and_then(|&group| data.groups.groups[group].primary());
         }
-        cx.notify();
     }
 
     /// Reviews everything since the fork (`None`) or one commit, reading again.
@@ -707,8 +920,18 @@ impl ReviewView {
         }
     }
 
+    /// Whether the keys may act on the cards: they are on screen. A review being read again
+    /// keeps the cards it read before, under "Reading changes…", an error or the conflicts list,
+    /// and a key there would revert or mark a card nobody sees.
+    fn cards_shown(&self) -> bool {
+        matches!(self.load, LoadState::Ready) && !self.show_conflicts
+    }
+
     /// Marks the selected entity's card reviewed, every change on it, and moves to the next.
     fn accept_and_next(&mut self, _: &AcceptAndNext, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.cards_shown() {
+            return;
+        }
         if let Some(group) = self.selected.and_then(|s| self.group_of(s)) {
             self.set_group_reviewed(group, true);
             self.select_next(&NextChange, window, cx);
@@ -716,6 +939,9 @@ impl ReviewView {
     }
 
     fn revert_and_next(&mut self, _: &RevertAndNext, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.cards_shown() {
+            return;
+        }
         if let Some(ix) = self.selected {
             self.revert_line(ix, cx);
             self.select_next(&NextChange, window, cx);
@@ -725,7 +951,9 @@ impl ReviewView {
     /// Reverts a change as its card shows it: a relationship moved to another end
     /// ([`EntityGroup::repoints`]) moves back, the new edge removed before the old one returns,
     /// since an edge type with one target per source holds one at a time. Fixes go one at a
-    /// time, so the second waits for the first.
+    /// time, so the second waits for the first, and is sent only once the first lands: both are
+    /// made before either is sent, so the new edge is never removed with the old one not coming
+    /// back.
     fn revert_line(&mut self, change: usize, cx: &mut Context<Self>) {
         let pair = self.group_of(change).and_then(|group| {
             let data = self.data.as_ref()?;
@@ -737,8 +965,16 @@ impl ReviewView {
         });
         match pair {
             Some((removed, added)) => {
-                self.revert(added, cx);
-                self.revert(removed, cx);
+                let (Some(remove), Some(mut restore)) =
+                    (self.revert_fix(added, cx), self.revert_fix(removed, cx))
+                else {
+                    return;
+                };
+                restore.after = Some(remove.key.clone());
+                for (ix, fix) in [(added, remove), (removed, restore)] {
+                    self.cards[ix].fix = FixState::Running;
+                    self.queue_fix(fix, cx);
+                }
             }
             None => self.revert(change, cx),
         }
@@ -772,31 +1008,36 @@ impl ReviewView {
     /// Restores a change's before image on the branch, bound to the head this review holds.
     /// Never retried; the card shows the outcome.
     fn revert(&mut self, ix: usize, cx: &mut Context<Self>) {
-        // A fix during a merge could land on either side of it.
-        if self.merging() {
-            return;
+        if let Some(fix) = self.revert_fix(ix, cx) {
+            self.cards[ix].fix = FixState::Running;
+            self.queue_fix(fix, cx);
         }
-        let Some(data) = &self.data else { return };
-        let Some(change) = data.folded.changes.get(ix) else {
-            return;
-        };
-        let Some(card) = self.cards.get(ix) else {
-            return;
-        };
-        if card.fix.done() {
-            return;
+    }
+
+    /// The fix that restores change `ix`'s before image, not sent yet; `None` when it cannot be
+    /// made, with the card saying why.
+    fn revert_fix(&mut self, ix: usize, cx: &mut Context<Self>) -> Option<Fix> {
+        let data = self.data.as_ref()?;
+        let change = data.folded.changes.get(ix)?;
+        if self.cards.get(ix)?.fix.done() {
+            return None;
+        }
+        if self.merging() {
+            self.cards[ix].fix = FixState::Refused(MERGE_RUNNING.into());
+            cx.notify();
+            return None;
         }
         let Some(schema) = self.session.read(cx).schema_model() else {
             self.cards[ix].fix = FixState::Refused("The schema has not loaded yet.".into());
             cx.notify();
-            return;
+            return None;
         };
         let query = match revert_query(&schema, change) {
             Ok(query) => query,
             Err(reason) => {
                 self.cards[ix].revert_blocked = Some(reason.0);
                 cx.notify();
-                return;
+                return None;
             }
         };
         let lists = change.after.as_ref().is_some_and(|after| {
@@ -814,7 +1055,12 @@ impl ReviewView {
         if lists && !self.shows_head() {
             self.cards[ix].revert_blocked = Some(LIST_NEEDS_HEAD.into());
             cx.notify();
-            return;
+            return None;
+        }
+        if revert_deletes(change) && !self.shows_head() {
+            self.cards[ix].revert_blocked = Some(ADDITION_NEEDS_HEAD.into());
+            cx.notify();
+            return None;
         }
         let request = ChangeRequest {
             query: query.text.clone(),
@@ -822,14 +1068,13 @@ impl ReviewView {
             params: query.params_value(),
             branch: Some(self.branch.clone()),
         };
-        let fix = Fix {
+        Some(Fix {
             key: change.key(),
             request,
             description: format!("Revert {} {}", change.type_name, change.id),
             edited: false,
-        };
-        self.cards[ix].fix = FixState::Running;
-        self.queue_fix(fix, cx);
+            after: None,
+        })
     }
 
     fn merging(&self) -> bool {
@@ -837,8 +1082,9 @@ impl ReviewView {
     }
 
     /// Whether every card shows its entity as the reviewed head holds it: not so for one commit
-    /// of the branch, nor for a review cut short. A fix is bound to that head, and a list,
-    /// which a write's `where` cannot compare, is safe to fix only from what it holds.
+    /// of the branch, nor for a review cut short. A fix is bound to that head; a list, which a
+    /// write's `where` cannot compare, and a delete, bound to no value, are safe to send only
+    /// from what it holds.
     fn shows_head(&self) -> bool {
         self.scope.is_none() && self.data.as_ref().is_some_and(|data| !data.partial)
     }
@@ -867,6 +1113,7 @@ impl ReviewView {
             request,
             description,
             edited,
+            ..
         }) = self.fix_queue.pop_front()
         else {
             return;
@@ -876,7 +1123,7 @@ impl ReviewView {
         let task = self.session.update(cx, |session, cx| {
             session.write_request(request, if_commit, description, cx)
         });
-        self._fix_tasks.push(cx.spawn(async move |this, cx| {
+        self._fix_task = Some(cx.spawn(async move |this, cx| {
             let outcome = task.await;
             this.update(cx, |this, cx| this.finish_fix(&key, outcome, edited, cx))
                 .ok();
@@ -933,8 +1180,9 @@ impl ReviewView {
     }
 
     fn open_edit(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        // As the button is: a card fixed already shows values its fix replaced.
-        if self.cards.get(ix).is_none_or(|card| card.fix.done()) {
+        // As the button is: a card fixed already shows values its fix replaced, and an edit
+        // during a merge could land on either side of it.
+        if self.merging() || self.cards.get(ix).is_none_or(|card| card.fix.done()) {
             return;
         }
         let Some(values) = self.edit_values(ix, cx) else {
@@ -957,31 +1205,36 @@ impl ReviewView {
         });
     }
 
-    /// Writes edited fields on the reviewed branch, each bound to the value the review showed,
-    /// in one mutation bound to the head this review holds. Never retried.
+    /// Writes edited fields on the reviewed branch: one statement bound to every value the
+    /// review showed for them, so a node with any of them changed since is left alone whole,
+    /// sent bound to the head this review holds. Never retried. An edit that cannot be sent
+    /// says why, for the form to show while it stays open.
     pub(crate) fn save_edit(
         &mut self,
         key: &str,
         changes: Vec<(String, Value, Value)>,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Result<(), String> {
+        if self.merging() {
+            return Err(MERGE_RUNNING.into());
+        }
         // The form was filled from the change with this key; the review may have been read
         // again since, and its cards moved.
-        if self.merging() {
-            return;
-        }
-        let Some(ix) = self.card_of(key) else {
-            return;
-        };
+        const GONE: &str = "The review was read again and no longer shows this change.";
+        let ix = self.card_of(key).ok_or(GONE)?;
         if self.cards.get(ix).is_none_or(|card| card.fix.done()) {
-            return;
+            return Err("This card was fixed already: Refresh to edit it again.".into());
         }
-        let Some(change) = self.data.as_ref().and_then(|d| d.folded.changes.get(ix)) else {
-            return;
-        };
-        let Some(schema) = self.session.read(cx).schema_model() else {
-            return;
-        };
+        let change = self
+            .data
+            .as_ref()
+            .and_then(|d| d.folded.changes.get(ix))
+            .ok_or(GONE)?;
+        let schema = self
+            .session
+            .read(cx)
+            .schema_model()
+            .ok_or("The schema has not loaded yet.")?;
         let lists = changes.iter().any(|(property, ..)| {
             schema
                 .node(&change.type_name)
@@ -989,31 +1242,14 @@ impl ReviewView {
                 .is_some_and(|property| property.list)
         });
         if lists && !self.shows_head() {
-            self.cards[ix].fix = FixState::Refused(LIST_NEEDS_HEAD.into());
-            cx.notify();
-            return;
+            return Err(LIST_NEEDS_HEAD.into());
         }
-        let parts: Result<Vec<_>, _> = changes
-            .iter()
-            .map(|(property, old, new)| {
-                gq_language::builder::update_cell(
-                    &schema,
-                    &change.type_name,
-                    property,
-                    &change.id,
-                    old,
-                    new,
-                )
-            })
-            .collect();
-        let query = match parts {
-            Ok(parts) => compose("studio_edit", parts),
-            Err(error) => {
-                self.cards[ix].fix = FixState::Refused(error.to_string());
-                cx.notify();
-                return;
-            }
+        let row = gq_language::builder::RowEdit {
+            id: change.id.clone(),
+            cells: changes,
         };
+        let query = gq_language::builder::update_rows(&schema, &change.type_name, &[row])
+            .map_err(|error| error.to_string())?;
         let request = ChangeRequest {
             query: query.text.clone(),
             name: Some(query.name.clone()),
@@ -1025,19 +1261,16 @@ impl ReviewView {
             request,
             description: format!("Edit {} {}", change.type_name, change.id),
             edited: true,
+            after: None,
         };
         self.cards[ix].fix = FixState::Saving;
         self.queue_fix(fix, cx);
+        Ok(())
     }
 
     /// The card of the change with `key` in the review as it is now.
     fn card_of(&self, key: &str) -> Option<usize> {
-        self.data
-            .as_ref()?
-            .folded
-            .changes
-            .iter()
-            .position(|change| change.key() == key)
+        self.data.as_ref()?.by_key.get(key).copied()
     }
 
     fn finish_fix(
@@ -1051,23 +1284,33 @@ impl ReviewView {
         self.fix_out = false;
         self.fixes_in_flight.remove(key);
         let fix = match outcome {
-            WriteOutcome::Committed(output) => match output.commit {
-                Some(commit) => {
+            WriteOutcome::Committed(output) => {
+                // A commit moves the branch's head even when its statement matched nothing.
+                if let Some(commit) = &output.commit {
                     self.bound_head = Some(commit.graph_commit_id.clone());
                     self.preview_again = true;
-                    let commit = commit.graph_commit_id;
-                    if edited {
-                        FixState::Edited { commit }
-                    } else {
-                        FixState::Reverted { commit }
-                    }
                 }
-                None => FixState::Unchanged,
-            },
+                match output.commit {
+                    // A statement bound to values changed since matches nothing: not a fix.
+                    Some(commit) if output.affected_nodes + output.affected_edges > 0 => {
+                        let commit = commit.graph_commit_id;
+                        if edited {
+                            FixState::Edited { commit }
+                        } else {
+                            FixState::Reverted { commit }
+                        }
+                    }
+                    _ => FixState::Unchanged,
+                }
+            }
             WriteOutcome::Refused(error) if error.status == 412 => FixState::Moved,
             WriteOutcome::Refused(error) => FixState::Refused(error.body.error),
             WriteOutcome::Unknown { .. } => FixState::Unknown,
         };
+        let landed = matches!(
+            fix,
+            FixState::Reverted { .. } | FixState::Edited { .. } | FixState::Unchanged
+        );
         // Found by the change's key: a Refresh while the fix was out may have moved its card.
         if let Some(card) = self.card_of(key).and_then(|ix| self.cards.get_mut(ix)) {
             if matches!(fix, FixState::Reverted { .. }) {
@@ -1075,15 +1318,33 @@ impl ReviewView {
             }
             card.fix = fix;
         }
+        if !landed {
+            self.drop_fixes_after(key);
+        }
         self.send_next_fix(cx);
         self.writes_settled(cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
 
-    /// Offers Refresh when the session saw the branch's head at another commit than the one
-    /// fixes and the merge bind to. Studio's own fixes move that head themselves, so a head seen
-    /// while a fix or the merge is out is compared once they are back.
+    /// Drops the queued fixes that wait for the fix with `key`, which did not land: the old
+    /// relationship of a move is not restored with the new one still there.
+    fn drop_fixes_after(&mut self, key: &str) {
+        let (dropped, kept): (Vec<Fix>, Vec<Fix>) = std::mem::take(&mut self.fix_queue)
+            .into_iter()
+            .partition(|fix| fix.after.as_deref() == Some(key));
+        self.fix_queue = kept.into();
+        for fix in dropped {
+            self.fixes_running = self.fixes_running.saturating_sub(1);
+            self.fixes_in_flight.remove(&fix.key);
+            if let Some(card) = self.card_of(&fix.key).and_then(|ix| self.cards.get_mut(ix)) {
+                card.fix = FixState::Refused(
+                    "Not sent: the relationship that replaced it was not removed first.".into(),
+                );
+            }
+        }
+    }
+
     /// The review in a sentence: what changed, in how many commits, by whom.
     fn summary_of(&self, data: &ReviewData) -> String {
         // The commits in scope: all since the fork, or the one chosen.
@@ -1103,6 +1364,9 @@ impl ReviewView {
         )
     }
 
+    /// Offers Refresh when the session saw the branch's head at another commit than the one
+    /// fixes and the merge bind to. Studio's own fixes move that head themselves, so a head seen
+    /// while a fix or the merge is out is compared once they are back.
     fn compare_head(&mut self, cx: &mut Context<Self>) {
         if self.fixes_running > 0 || matches!(self.merge, MergeState::Merging) {
             self.head_moved_while_writing = true;
@@ -1120,12 +1384,19 @@ impl ReviewView {
             .head(&self.branch)
             .is_some_and(|head| head != bound)
         {
-            self.newer = true;
-            // The dry run merged the head reviewed, which another writer has moved past.
-            self.preview = Preview::Unread;
-            cx.emit(ItemEvent::UpdateTab);
-            cx.notify();
+            self.mark_newer(cx);
         }
+    }
+
+    /// Someone else wrote to the branch, or its schema, after this review was read: Refresh is
+    /// offered. The dry run merged the head reviewed, which the writer has moved past: its
+    /// answer, shown or still to come, is not shown.
+    fn mark_newer(&mut self, cx: &mut Context<Self>) {
+        self.newer = true;
+        self.preview = Preview::Unread;
+        self._preview_task = None;
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
     }
 
     fn writes_settled(&mut self, cx: &mut Context<Self>) {
@@ -1146,6 +1417,7 @@ impl ReviewView {
     fn mergeable(&self) -> bool {
         matches!(self.load, LoadState::Ready)
             && !self.merging()
+            && !matches!(self.merge, MergeState::Merged { .. })
             && self.fixes_running == 0
             && self.scope.is_none()
     }
@@ -1186,9 +1458,7 @@ impl ReviewView {
             if head != bound {
                 this.update(cx, |this, cx| {
                     this.merge = MergeState::Moved { head };
-                    this.newer = true;
-                    cx.emit(ItemEvent::UpdateTab);
-                    cx.notify();
+                    this.mark_newer(cx);
                 })
                 .ok();
                 return;
@@ -1288,9 +1558,25 @@ impl ReviewView {
             };
             this.update(cx, |this, cx| {
                 this.show_conflicts = matches!(state, MergeState::Conflicts(_));
+                // The session reads the branches again after a deletion it saw; after an
+                // outcome nobody knows, the branch may be gone too.
+                if matches!(state, MergeState::Unknown { .. }) {
+                    this.session.update(cx, |s, cx| s.reload_branches(cx));
+                }
+                // A branch deleted by the merge has no head to watch, and its review is not
+                // opened again with the window.
+                if matches!(
+                    state,
+                    MergeState::Merged {
+                        deleted: Some(Ok(())),
+                        ..
+                    }
+                ) {
+                    this._head_watch = None;
+                    this.branch_deleted = true;
+                }
                 this.merge = state;
                 this.writes_settled(cx);
-                this.session.update(cx, |s, cx| s.reload_branches(cx));
                 cx.emit(ItemEvent::UpdateTab);
                 cx.notify();
             })
@@ -1298,15 +1584,31 @@ impl ReviewView {
         }));
     }
 
-    fn open_conflict(&mut self, conflict: &MergeConflictOutput, cx: &mut Context<Self>) {
-        let Some(id) = &conflict.entity_id else {
+    /// Shows the change of the conflict at `at` in the list, on its card.
+    fn open_conflict(&mut self, at: usize, cx: &mut Context<Self>) {
+        let Some(MergeConflictOutput {
+            type_name,
+            entity_id: Some(id),
+            ..
+        }) = self.conflicts().and_then(|conflicts| conflicts.get(at))
+        else {
             return;
         };
         let Some(data) = &self.data else { return };
-        if let Some(ix) = data.change_to(&conflict.type_name, id) {
+        if let Some(ix) = data.change_to(type_name, id) {
             self.show_conflicts = false;
             self.select(ix, cx);
         }
+    }
+
+    /// Shows the conflicts list, from its top, or the cards again.
+    fn toggle_conflicts(&mut self, cx: &mut Context<Self>) {
+        self.show_conflicts = !self.show_conflicts;
+        if self.show_conflicts {
+            self.conflict_list
+                .reset(self.conflicts().map_or(0, <[_]>::len));
+        }
+        cx.notify();
     }
 
     // ---- rendering ----
@@ -1598,10 +1900,7 @@ impl ReviewView {
                                 "Show conflicts"
                             },
                         )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_conflicts = !this.show_conflicts;
-                            cx.notify();
-                        }))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_conflicts(cx)))
                         .into_any_element(),
                     ),
                 ),
@@ -1716,10 +2015,7 @@ impl ReviewView {
                             "Show conflicts"
                         },
                     )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_conflicts = !this.show_conflicts;
-                        cx.notify();
-                    }))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_conflicts(cx)))
                     .into_any_element(),
                 ),
             ),
@@ -1761,24 +2057,17 @@ impl ReviewView {
     }
 
     fn render_conflicts(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(conflicts) = self.conflicts() else {
-            return div().into_any_element();
-        };
-        let surface = studio_ui::ds::surface::document(cx);
-        let border = studio_ui::ds::surface::rule(cx);
-        // What the branch did to a conflict's entity.
-        let net = |type_name: &str, id: &str| {
-            let data = self.data.as_ref()?;
-            data.folded.changes[data.change_to(type_name, id)?].net()
-        };
+        let count = self.conflicts().map_or(0, <[_]>::len);
+        // A merge's own conflicts, or a dry run's read again, replace the list shown.
+        if self.conflict_list.item_count() != count {
+            self.conflict_list.reset(count);
+        }
         v_flex()
-            .id("conflicts")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .p(px(space::XL))
+            .pt(px(space::XL))
             .gap(px(space::MD))
-            .child(studio_ui::ds::text::muted(
+            .child(div().px(px(space::XL)).child(studio_ui::ds::text::muted(
                 if matches!(self.merge, MergeState::Conflicts(_)) {
                     format!("Conflicts merging {} into {}", self.branch, self.target)
                 } else {
@@ -1787,16 +2076,34 @@ impl ReviewView {
                         self.branch, self.target
                     )
                 },
-            ))
-            .children(conflicts.iter().enumerate().map(|(ix, conflict)| {
-                let here = conflict
-                    .entity_id
-                    .as_deref()
-                    .and_then(|id| net(&conflict.type_name, id));
-                let words = conflict_wording(conflict.kind, here, &self.target);
-                let entity = conflict.entity_id.clone().unwrap_or_else(|| "—".into());
-                let conflict_for_click = conflict.clone();
-                let reviewable = here.is_some();
+            )))
+            .child(
+                list(
+                    self.conflict_list.clone(),
+                    cx.processor(|this, ix, _, cx| this.render_conflict(ix, cx)),
+                )
+                .flex_1()
+                .min_h_0(),
+            )
+            .into_any_element()
+    }
+
+    /// One conflict of the list, made only while it is on screen.
+    fn render_conflict(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(conflict) = self.conflicts().and_then(|conflicts| conflicts.get(ix)) else {
+            return div().into_any_element();
+        };
+        // What the branch did to the conflict's entity.
+        let here = conflict.entity_id.as_deref().and_then(|id| {
+            let data = self.data.as_ref()?;
+            data.folded.changes[data.change_to(&conflict.type_name, id)?].net()
+        });
+        let words = conflict_wording(conflict.kind, here, &self.target);
+        let entity = conflict.entity_id.clone().unwrap_or_else(|| "—".into());
+        div()
+            .px(px(space::XL))
+            .pb(px(space::MD))
+            .child(
                 h_flex()
                     .id(("conflict", ix))
                     .w_full()
@@ -1805,8 +2112,8 @@ impl ReviewView {
                     .py(px(space::MD))
                     .rounded(px(radii(cx).md))
                     .border_1()
-                    .border_color(border)
-                    .bg(surface)
+                    .border_color(studio_ui::ds::surface::rule(cx))
+                    .bg(studio_ui::ds::surface::document(cx))
                     .child(Icon::new(IconName::GitMergeConflict).color(Color::Conflict))
                     .child(
                         v_flex()
@@ -1822,14 +2129,12 @@ impl ReviewView {
                             )
                             .child(studio_ui::ds::text::meta(conflict.message.clone())),
                     )
-                    .when(reviewable, |d| {
+                    .when(here.is_some(), |d| {
                         d.cursor_pointer()
                             .child(studio_ui::ds::text::meta("Show change").color(Color::Accent))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_conflict(&conflict_for_click, cx)
-                            }))
-                    })
-            }))
+                            .on_click(cx.listener(move |this, _, _, cx| this.open_conflict(ix, cx)))
+                    }),
+            )
             .into_any_element()
     }
 
@@ -1855,8 +2160,8 @@ impl ReviewView {
                 ))
                 .into_any_element(),
             Some(Row::Entity(group)) => {
-                let schema = self.session.read(cx).schema_model();
-                let card = self.entity_card(data, group, schema.as_deref(), cx);
+                // The schema the groups were made with, which the cards' rows agree with.
+                let card = self.entity_card(data, group, data.schema.as_deref(), cx);
                 div()
                     .px(px(space::XL))
                     .py(px(space::XS))
@@ -1881,7 +2186,7 @@ impl ReviewView {
         let focus = self.focus_handle.clone();
         let selected_group = self.selected.and_then(|s| data.groups.home.get(s).copied());
         let unreviewed = self.group_unreviewed(group);
-        let total = group.changes().count();
+        let total = usize::from(group.change.is_some()) + group.relationships.len();
         let reviewed = unreviewed == 0;
 
         let mut card = change_cards::entity_card(
@@ -1934,7 +2239,7 @@ impl ReviewView {
 
         if let Some(own) = group.change {
             let state = &self.cards[own];
-            let done = state.fix.done();
+            let done = state.fix.done() || self.merging();
             if self.editable(own, cx) {
                 let branch = self.branch.clone();
                 let focus = focus.clone();
@@ -1981,7 +2286,12 @@ impl ReviewView {
         // change of a fix). Only the lines it shows are made.
         let card_key = (group.type_name.clone(), group.id.clone());
         let total = data.groups.line_count(ix);
-        let selected_at = self.selected.and_then(|s| data.groups.line_of(ix, s));
+        // Looked for on the card the selection is reviewed on only, not through every card's
+        // lines at every frame.
+        let selected_at = self
+            .selected
+            .filter(|_| selected_group == Some(ix))
+            .and_then(|s| data.groups.line_of(ix, s));
         let shown = self.card_lines.shown(&card_key, total, selected_at);
         let left_out = total - shown;
         let card_lines = data
@@ -2014,7 +2324,8 @@ impl ReviewView {
                     .revert_blocked
                     .clone()
                     .or_else(|| was.and_then(|was| was.revert_blocked.clone()));
-                let done = state.fix.done() || was.is_some_and(|was| was.fix.done());
+                let done =
+                    state.fix.done() || was.is_some_and(|was| was.fix.done()) || self.merging();
                 let reviewed = state.reviewed && was.is_none_or(|was| was.reviewed);
                 let fix = match was {
                     Some(was) if state.fix == FixState::Idle => was.fix.clone(),
@@ -2133,26 +2444,16 @@ fn search_text_of(change: &FoldedChange) -> String {
     text.to_lowercase()
 }
 
-/// The list's rows: each card the search leaves, under a header for each run of one type, the
-/// first of a section carrying its title. A card matches when its own change or a
-/// relationship reviewed on it does. The headers count what the run shows.
-fn build_rows(data: &ReviewData, query: &str) -> (Vec<Row>, Vec<GroupRun>) {
-    let matches = |change: usize| {
-        query.is_empty()
-            || data
-                .search
-                .get(change)
-                .is_some_and(|text| text.contains(query))
-    };
-    let runs = data
-        .groups
-        .runs(&data.folded, |group| group.changes().any(matches));
-    let mut rows = Vec::new();
-    for (ix, run) in runs.iter().enumerate() {
-        rows.push(Row::Header(ix));
-        rows.extend(run.groups.iter().map(|&group| Row::Entity(group)));
-    }
-    (rows, runs)
+/// The list's rows: each card the search leaves (`matched`, each change's match; every card
+/// without one), under a header for each run of one type, the first of a section carrying its
+/// title. A card matches when its own change or a relationship reviewed on it does. The headers
+/// count what the run shows.
+fn build_rows(data: &ReviewData, matched: Option<&[bool]>) -> (Vec<Row>, Vec<GroupRun>) {
+    let matches =
+        |change: usize| matched.is_none_or(|matched| matched.get(change).copied().unwrap_or(false));
+    change_cards::rows(&data.folded, &data.groups, |group| {
+        group.changes().any(matches)
+    })
 }
 
 /// Reads what the branch changed since its merge base with the target: the base and the head
@@ -2180,13 +2481,16 @@ async fn read_review(
                 fork: Some(fork),
                 head: Some(head),
                 commits: Vec::new(),
-                folded: ChangeFold::new().finish(),
+                folded: Arc::new(ChangeFold::new().finish()),
                 groups: EntityGroups::default(),
-                search: Vec::new(),
+                search: Vec::new().into(),
                 counts: Vec::new(),
                 revert_blocked: Vec::new(),
                 by_entity: Vec::new(),
+                by_key: HashMap::new(),
                 card_rows: CardRows::default(),
+                marks: Vec::new(),
+                schema: session.read_with(cx, |session, _| session.schema_model()),
                 partial: false,
                 moved_while_reading: false,
                 merged_in: false,
@@ -2194,7 +2498,9 @@ async fn read_review(
         }
         let start = format!("after:{fork}");
         return match fold_feed(&session, &branch, start, &head, &this, cx).await {
-            Ok(fed) => Ok(fed.into_review(&session, Some(fork), Some(head), cx).await),
+            Ok(fed) => Ok(fed
+                .into_review(&session, Some(fork), Some(head), false, cx)
+                .await),
             Err(FeedError::Refused) => {
                 read_review_since_merge(session, branch, target, fork, head, this, cx).await
             }
@@ -2214,31 +2520,44 @@ struct Fed {
 }
 
 impl Fed {
+    /// The review of what was folded. A review of one commit (`one_commit`), like one the
+    /// change cap cut short, does not show what the branch holds now.
     async fn into_review(
         self,
         session: &Entity<GraphSession>,
         fork: Option<String>,
         head: Option<String>,
+        one_commit: bool,
         cx: &mut AsyncApp,
     ) -> ReviewData {
         let fold = self.fold;
+        let shows_head = !one_commit && !self.partial;
         let schema = session.read_with(cx, |session, _| session.schema_model());
-        let (folded, groups, search, revert_blocked, by_entity) = cx
+        let made_with = schema.clone();
+        let (folded, groups, search, revert_blocked, by_entity, by_key, marks) = cx
             .background_executor()
             .spawn(async move {
                 let folded = fold.finish();
                 let groups = EntityGroups::new(&folded, schema.as_deref());
-                let search = folded.changes.iter().map(search_text_of).collect();
-                let revert_blocked = folded
+                let search: Arc<[String]> = folded.changes.iter().map(search_text_of).collect();
+                let marks = folded.changes.iter().map(mark_of).collect();
+                let revert_blocked = revert_checks(&folded, schema.as_deref(), shows_head);
+                let by_entity = entity_order(&folded.changes);
+                let by_key: HashMap<String, usize> = folded
                     .changes
                     .iter()
-                    .map(|change| {
-                        let schema = schema.as_ref()?;
-                        revert_query(schema, change).err().map(|e| e.0)
-                    })
+                    .enumerate()
+                    .map(|(ix, change)| (change.key(), ix))
                     .collect();
-                let by_entity = entity_order(&folded.changes);
-                (folded, groups, search, revert_blocked, by_entity)
+                (
+                    Arc::new(folded),
+                    groups,
+                    search,
+                    revert_blocked,
+                    by_entity,
+                    by_key,
+                    marks,
+                )
             })
             .await;
         let counts = folded.counts();
@@ -2254,7 +2573,10 @@ impl Fed {
             counts,
             revert_blocked,
             by_entity,
+            by_key,
             card_rows: CardRows::default(),
+            marks,
+            schema: made_with,
             partial: self.partial,
             moved_while_reading: self.moved_while_reading,
             merged_in: false,
@@ -2497,7 +2819,9 @@ async fn read_review_since_merge(
         partial,
         moved_while_reading: false,
     };
-    let mut data = fed.into_review(&session, Some(base), Some(head), cx).await;
+    let mut data = fed
+        .into_review(&session, Some(base), Some(head), false, cx)
+        .await;
     data.merged_in = true;
     Ok(data)
 }
@@ -2540,7 +2864,7 @@ async fn read_commit_review(
         partial,
         moved_while_reading: false,
     };
-    Ok(fed.into_review(&session, fork, head, cx).await)
+    Ok(fed.into_review(&session, fork, head, true, cx).await)
 }
 
 /// After a lost merge response: whether the target holds the source head.
@@ -2628,7 +2952,9 @@ impl Render for ReviewView {
             .on_action(cx.listener(Self::accept_and_next))
             .on_action(cx.listener(Self::revert_and_next))
             .on_action(cx.listener(|this, _: &EditChange, window, cx| {
-                if let Some(ix) = this.selected {
+                if this.cards_shown()
+                    && let Some(ix) = this.selected
+                {
                     this.open_edit(ix, window, cx);
                 }
             }))
@@ -2734,15 +3060,19 @@ pub(crate) mod tests {
             counts: folded.counts(),
             revert_blocked: vec![None; 3],
             by_entity: entity_order(&folded.changes),
+            by_key: HashMap::new(),
             card_rows: CardRows::default(),
-            folded,
+            marks: folded.changes.iter().map(mark_of).collect(),
+            schema: None,
+            folded: Arc::new(folded),
             groups,
             partial: false,
             moved_while_reading: false,
             merged_in: false,
         };
         let shown = |query: &str| {
-            let (rows, headers) = build_rows(&data, query);
+            let matched = search_matches(&data.search, query);
+            let (rows, headers) = build_rows(&data, matched.as_deref());
             rows.iter()
                 .map(|row| match row {
                     Row::Header(ix) => {
@@ -2783,12 +3113,17 @@ pub(crate) mod tests {
         let mut read_again = reviewed.clone();
         read_again.commits = vec!["r1".into()];
         assert_eq!(
-            mark_key(&reviewed),
-            mark_key(&read_again),
+            mark_of(&reviewed),
+            mark_of(&read_again),
             "another head, same change"
         );
         let again = change("p1", json!({"name": "Ada Lovelace"}));
-        assert_ne!(mark_key(&reviewed), mark_key(&again), "changed again");
+        assert_ne!(mark_of(&reviewed), mark_of(&again), "changed again");
+        assert_ne!(
+            mark_of(&reviewed),
+            mark_of(&change("p2", json!({"name": "Ada"}))),
+            "another entity"
+        );
     }
 
     /// Fixes asked for one after the other go one at a time, each bound to the commit the one
@@ -2850,6 +3185,119 @@ pub(crate) mod tests {
         });
     }
 
+    /// The keys act on cards on screen only: not under "Reading changes…" while a Refresh
+    /// reads, nor under the conflicts list, where ⌥⌘Z would revert a card nobody sees.
+    #[gpui::test]
+    async fn keys_act_only_on_the_cards_shown(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, asked) = reviewed_server_writing(false, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        asked.lock().unwrap().clear();
+        for hide in [
+            |view: &mut ReviewView| view.load = LoadState::Loading { folded: 0 },
+            |view: &mut ReviewView| view.show_conflicts = true,
+        ] {
+            view.update_in(cx, |view, window, cx| {
+                hide(view);
+                view.revert_and_next(&RevertAndNext, window, cx);
+                view.accept_and_next(&AcceptAndNext, window, cx);
+                assert_eq!(view.fixes_running, 0);
+                assert!(view.cards.iter().all(|card| !card.reviewed));
+                view.load = LoadState::Ready;
+                view.show_conflicts = false;
+            });
+        }
+        cx.run_until_parked();
+        assert!(
+            !asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.contains("/mutate"))
+        );
+    }
+
+    /// The second half of a moved relationship waits for the first and is not sent when the
+    /// first does not land: the old relationship is not restored with the new one still there.
+    #[gpui::test]
+    async fn the_second_half_of_a_move_is_not_sent_when_the_first_does_not_land(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, asked) = reviewed_server_writing(false, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        asked.lock().unwrap().clear();
+        view.update(cx, |view, cx| {
+            let first = view.revert_fix(0, cx).unwrap();
+            let mut second = view.revert_fix(1, cx).unwrap();
+            second.after = Some(first.key.clone());
+            // The first is out, the second waits for it.
+            view.fixes_running = 2;
+            view.fix_out = true;
+            view.cards[0].fix = FixState::Running;
+            view.cards[1].fix = FixState::Running;
+            view.fixes_in_flight
+                .insert(second.key.clone(), FixState::Running);
+            view.fix_queue.push_back(second);
+            view.finish_fix(
+                &first.key,
+                WriteOutcome::Unknown {
+                    reason: "the response was lost".into(),
+                },
+                false,
+                cx,
+            );
+            assert!(view.fix_queue.is_empty());
+            assert_eq!(view.fixes_running, 0);
+            assert!(view.fixes_in_flight.is_empty());
+            assert!(matches!(view.cards[1].fix, FixState::Refused(_)));
+        });
+        cx.run_until_parked();
+        assert!(
+            !asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.contains("/mutate"))
+        );
+    }
+
+    /// An edit that cannot be sent says why, for the form to show, rather than closing with
+    /// nothing written: during a merge, or once the review no longer shows the change.
+    #[gpui::test]
+    async fn an_edit_not_sent_says_why(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = reviewed_server_writing(false, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            let key = view.data.as_ref().unwrap().folded.changes[0].key();
+            let edit = || vec![("name".to_owned(), json!("x"), json!("y"))];
+            view.merge = MergeState::Merging;
+            assert_eq!(view.save_edit(&key, edit(), cx), Err(MERGE_RUNNING.into()));
+            view.merge = MergeState::Idle;
+            assert!(view.save_edit("Person/gone", edit(), cx).is_err());
+            assert_eq!(view.fixes_running, 0);
+        });
+    }
+
     /// A Refresh that lands while a fix is out keeps the fix's card showing it: Revert is not
     /// offered again, and the fix is sent once.
     #[gpui::test]
@@ -2868,7 +3316,7 @@ pub(crate) mod tests {
             view.revert(0, cx);
             // The review read again lands before the fix is back.
             let data = view.data.take().unwrap();
-            view.finish_load(Ok(data), cx);
+            view.finish_load(Ok(data), Searched::default(), cx);
             assert!(view.cards[0].fix.done(), "{:?}", view.cards[0].fix);
             view.revert(0, cx);
             assert_eq!(view.fixes_running, 1, "not asked for again");
@@ -2949,8 +3397,179 @@ pub(crate) mod tests {
                 // A session on the deleted branch moves to the branch it was merged into.
                 let branch = view.session.read(cx).branch.clone();
                 assert_eq!(branch, if delete { "main" } else { "feature" });
+                // The merge is the end: Merge is not offered again, and a deleted branch's
+                // review is neither watched nor opened again with the window.
+                assert!(!view.mergeable());
+                assert_eq!(view._head_watch.is_none(), delete);
+                assert_eq!(view.serialize(cx).is_none(), delete);
+            });
+            // A Refresh after the merge does not bring the deleted branch's tab back.
+            view.update(cx, |view, cx| view.reload(cx));
+            cx.run_until_parked();
+            view.read_with(cx, |view, cx| {
+                assert!(matches!(view.merge, MergeState::Idle));
+                assert_eq!(view.serialize(cx).is_none(), delete);
             });
         }
+    }
+
+    /// A revert or an edit binds one statement to every value it read: the server's answer
+    /// that it matched nothing (a value changed since) leaves the card unfixed and unreviewed,
+    /// though a commit came back and the head the next fix binds to moved to it.
+    #[gpui::test]
+    async fn a_fix_that_matched_nothing_is_not_shown_as_done(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, _) = reviewed_server_writing_affecting(false, 0, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| view.revert(0, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.cards[0].fix, FixState::Unchanged);
+            assert!(!view.cards[0].reviewed);
+            assert_eq!(view.bound_head.as_deref(), Some("r1"));
+        });
+    }
+
+    /// A review of one commit does not show what the branch holds now: an addition is not
+    /// reverted from it, since its delete is bound to no value and would take what later
+    /// commits changed with it. The button says why, and the key sends nothing.
+    #[gpui::test]
+    async fn a_review_of_one_commit_reverts_no_addition(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, asked) = reviewed_server_writing(false, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| view.set_scope(Some("f1".into()), cx));
+        cx.run_until_parked();
+        asked.lock().unwrap().clear();
+        view.update(cx, |view, cx| {
+            assert!(matches!(view.load, LoadState::Ready));
+            assert_eq!(view.change_count(), 1);
+            assert_eq!(
+                view.cards[0].revert_blocked.as_deref(),
+                Some(ADDITION_NEEDS_HEAD)
+            );
+            view.revert(0, cx);
+            assert_eq!(view.fixes_running, 0);
+        });
+        cx.run_until_parked();
+        assert!(
+            !asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.contains("/mutate"))
+        );
+    }
+
+    /// The dry run is for the head the cards show: a review whose branch moved while it was
+    /// read shows none, and neither a target that moves nor fixes that settle read one, until
+    /// a Refresh shows the new head.
+    #[gpui::test]
+    async fn a_review_newer_than_its_cards_shows_no_dry_run(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, asked) = reviewed_server(false, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                matches!(view.preview, Preview::Merges(_)),
+                "{:?}",
+                view.preview
+            )
+        });
+        asked.lock().unwrap().clear();
+        view.update(cx, |view, cx| {
+            let mut data = view.data.take().unwrap();
+            data.moved_while_reading = true;
+            view.finish_load(Ok(data), Searched::default(), cx);
+            assert!(view.newer);
+            assert!(matches!(view.preview, Preview::Unread));
+            view.preview_moved(cx);
+            view.preview_again = true;
+            view.writes_settled(cx);
+            assert!(matches!(view.preview, Preview::Unread));
+        });
+        cx.run_until_parked();
+        assert!(
+            !asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.contains("\"dry_run\":true")),
+            "{:?}",
+            asked.lock().unwrap()
+        );
+    }
+
+    /// A schema that arrives after the review was grouped (one loaded after a tab restored
+    /// with the window read, or one naming nodes otherwise in the settings) groups the cards
+    /// again from the changes read, without reading the branch again.
+    #[gpui::test]
+    async fn a_schema_that_arrives_after_the_read_groups_the_cards_again(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, asked) = reviewed_server(false, cx);
+        let (view, cx) = cx.add_window_view({
+            let session = session.clone();
+            |window, cx| ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let loaded = session
+            .read_with(cx, |session, _| session.schema_model())
+            .expect("the schema loaded");
+        view.update(cx, |view, cx| {
+            // Read while the schema had not loaded: grouped without it.
+            let mut data = view.data.take().unwrap();
+            data.schema = None;
+            data.groups = EntityGroups::new(&data.folded, None);
+            view.finish_load(Ok(data), Searched::default(), cx);
+        });
+        asked.lock().unwrap().clear();
+        cx.run_until_parked();
+        let grouped_with = |view: &ReviewView| view.data.as_ref().unwrap().schema.clone();
+        view.read_with(cx, |view, _| {
+            assert!(same_schema(grouped_with(view).as_ref(), Some(&loaded)));
+            let data = view.data.as_ref().unwrap();
+            assert_eq!(data.groups, EntityGroups::new(&data.folded, Some(&*loaded)));
+        });
+        // A schema read again is another, as one naming nodes otherwise is.
+        session.update(cx, |session, cx| session.reload_schema(cx));
+        cx.run_until_parked();
+        let again = session
+            .read_with(cx, |session, _| session.schema_model())
+            .unwrap();
+        assert!(!Arc::ptr_eq(&again, &loaded));
+        view.read_with(cx, |view, _| {
+            assert!(same_schema(grouped_with(view).as_ref(), Some(&again)));
+        });
+        let asked = asked.lock().unwrap();
+        assert!(
+            !asked
+                .iter()
+                .any(|request| request.contains("/changes") || request.contains("/merge-base")),
+            "read again: {asked:?}"
+        );
     }
 
     /// A server for a review of `feature` against `main`: `feature` forked at m1 and committed
@@ -2975,6 +3594,18 @@ pub(crate) mod tests {
         Entity<GraphSession>,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
+        reviewed_server_writing_affecting(merged_in, 1, cx)
+    }
+
+    /// As [`reviewed_server_writing`], each write saying it changed `affected` nodes.
+    fn reviewed_server_writing_affecting(
+        merged_in: bool,
+        affected: i64,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         // Two people added: each revert deletes one.
         let added = |id: &str| json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": id, "op": "insert", "before": null, "after": { "properties": { "slug": id, "name": "x" } } });
         let block = |id: &str, parent: &str, change: Value| json!({ "cause": { "graph_commit_id": id, "parent_commit_id": parent, "authored_branch": "feature", "authored_at": 0, "actor_id": "act-dev" }, "changes": [change] });
@@ -2983,7 +3614,7 @@ pub(crate) mod tests {
             merged_in,
             Some(feed),
             "f2",
-            |n| {
+            move |n| {
                 let parent = if n == 0 {
                     "f2".to_owned()
                 } else {
@@ -2991,7 +3622,7 @@ pub(crate) mod tests {
                 };
                 (
                     200,
-                    json!({ "branch": "feature", "query_name": "q", "affected_nodes": 1, "affected_edges": 0,
+                    json!({ "branch": "feature", "query_name": "q", "affected_nodes": affected, "affected_edges": 0,
                         "commit": { "graph_commit_id": format!("r{}", n + 1), "graph_manifest_version": 3, "created_at": 0, "parent_commit_id": parent } }),
                 )
             },
@@ -3057,6 +3688,25 @@ pub(crate) mod tests {
                     )
                 } else if path.ends_with("/branches/merge-base") {
                     (200, base.clone())
+                } else if let Some((_, id)) = path
+                    .strip_suffix("/changes")
+                    .and_then(|commit| commit.rsplit_once("/commits/"))
+                {
+                    // One commit's own changes: its block of the feed.
+                    let blocks = feed["blocks"].as_array().cloned().unwrap_or_default();
+                    match blocks
+                        .iter()
+                        .find(|block| block["cause"]["graph_commit_id"] == id)
+                    {
+                        Some(block) => (
+                            200,
+                            json!({ "cause": block["cause"], "changes": block["changes"] }),
+                        ),
+                        None => (
+                            404,
+                            json!({ "error": "no such commit", "code": "not_found" }),
+                        ),
+                    }
                 } else if path.ends_with("/changes") && query.contains("start=after%3Am2") {
                     (
                         400,
