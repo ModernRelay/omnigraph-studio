@@ -1,7 +1,7 @@
 //! One open graph on one server and branch: schema, branches, type counts, and every read and
 //! write Studio sends for it (spec 003, 004, 008).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -520,15 +520,19 @@ pub struct GraphSession {
     head_watches: Vec<(String, Weak<()>)>,
     /// Head reads under way, by branch.
     head_reads: HashMap<String, Task<()>>,
+    /// Views waiting for a branch's head read to land ([`Self::head_now`]).
+    head_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
+    /// Studio's own data commits on top of the head held, by branch, until a feed read went
+    /// past them: the schema is read after a feed read unless every commit it read is one.
+    own_heads: HashMap<String, HashSet<String>>,
     /// What each view has read at the commit it shows ([`ReadScope`]), while it holds its scope.
     scopes: HashMap<u64, Scope>,
     next_scope: u64,
     /// Each followed branch's commits as the change feed described them.
     change_logs: HashMap<String, ChangeLog>,
-    /// Change-feed reads under way, by branch, and the branches whose head moved meanwhile,
-    /// with whether only Studio's own commits moved it (`read_changes`' `own`).
+    /// Change-feed reads under way, by branch, and the branches whose head moved meanwhile.
     change_reads: HashMap<String, Task<()>>,
-    change_reads_again: HashMap<String, bool>,
+    change_reads_again: HashSet<String>,
     /// The branch list read again by the head watch, while under way.
     branch_recheck: Option<Task<()>>,
     /// A poll came while no window was active; the next activation asks at once.
@@ -539,7 +543,8 @@ pub struct GraphSession {
     /// unseen from then, so its commit list and head commit are read again when next asked for.
     watched: Vec<String>,
     /// A read of the schema the person asked for is under way: a recheck in its place would
-    /// cancel it, and it reads the newest schema anyway.
+    /// cancel it. A reason to check that comes meanwhile is checked once it lands
+    /// (`recheck_schema_again`).
     reloading_schema: bool,
     /// A recheck of the schema under way ([`Self::recheck_schema`]), and whether its read has
     /// left: one at a time, so a reason to check met meanwhile neither cancels it nor sends
@@ -608,11 +613,13 @@ impl GraphSession {
             drafts: HashMap::new(),
             head_watches: Vec::new(),
             head_reads: HashMap::new(),
+            head_waiters: HashMap::new(),
+            own_heads: HashMap::new(),
             scopes: HashMap::new(),
             next_scope: 0,
             change_logs: HashMap::new(),
             change_reads: HashMap::new(),
-            change_reads_again: HashMap::new(),
+            change_reads_again: HashSet::new(),
             branch_recheck: None,
             head_check_missed: false,
             _head_poll: None,
@@ -1495,17 +1502,15 @@ impl GraphSession {
 
     /// Reads `branch`'s change feed after the newest commit its log holds, up to the feed's
     /// head, asked only about the types views read: every change carries its images, so an
-    /// unfiltered read costs what every type wrote. `own` is a head that one of Studio's own
-    /// data commits moved, on top of the head held: no other writer's commit is in between,
-    /// so the schema is as it was.
-    fn read_changes(&mut self, branch: &str, own: bool, cx: &mut Context<Self>) {
+    /// unfiltered read costs what every type wrote. The schema is compared afterwards unless
+    /// every commit read is one of Studio's own data commits on top of the head held
+    /// (`own_heads`), which leave it as it was.
+    fn read_changes(&mut self, branch: &str, cx: &mut Context<Self>) {
         if self.change_reads.contains_key(branch) {
-            self.change_reads_again
-                .entry(branch.to_owned())
-                .and_modify(|again| *again &= own)
-                .or_insert(own);
+            self.change_reads_again.insert(branch.to_owned());
             return;
         }
+        let own: HashSet<String> = self.own_heads.get(branch).cloned().unwrap_or_default();
         let Some(head) = self.heads.get(branch).cloned() else {
             return;
         };
@@ -1524,8 +1529,10 @@ impl GraphSession {
             // commit may have changed the schema, which a query editor or History open on the
             // graph reads under: it is compared, as the feed read would. Studio's own data
             // commit changes no schema.
+            let own_head = own.contains(&head);
             log.last = Some(head);
-            if !own {
+            self.own_heads.remove(branch);
+            if !own_head {
                 self.recheck_schema(None, cx);
             }
             return;
@@ -1570,8 +1577,9 @@ impl GraphSession {
             let commits = fold.complete();
             // The feed filters by type name, so a schema change in between (a rename) could
             // hide a view's changes: what it says counts only under the schema views read with.
-            // Studio's own commit on top of the head held changed none.
-            let schema_read = if commits.is_empty() || own {
+            // Studio's own commits on top of the heads held changed none.
+            let all_own = commits.iter().all(|(commit, _)| own.contains(commit));
+            let schema_read = if commits.is_empty() || all_own {
                 None
             } else {
                 Some(client.schema(&graph).await)
@@ -1596,6 +1604,12 @@ impl GraphSession {
                 let schema_moved = matches!(&failed, Some(ReadError::Refused(refusal)) if refusal.status == 409)
                     || matches!(&schema_read, Some(Ok(output)) if *output.schema_source != *schema);
                 let stopped = failed.is_some() || next.is_some() || !same_schema;
+                // Studio's own commits read now are past.
+                if let Some(own) = this.own_heads.get_mut(&branch) {
+                    for (commit, _) in &commits {
+                        own.remove(commit);
+                    }
+                }
                 let head = this.heads.get(&branch).cloned();
                 let log = this.change_logs.entry(branch.clone()).or_default();
                 if same_schema {
@@ -1622,8 +1636,8 @@ impl GraphSession {
                     };
                     this.recheck_schema(read, cx);
                 }
-                if let Some(own) = this.change_reads_again.remove(&branch) {
-                    this.read_changes(&branch, own, cx);
+                if this.change_reads_again.remove(&branch) {
+                    this.read_changes(&branch, cx);
                 }
             })
             .ok();
@@ -1657,6 +1671,7 @@ impl GraphSession {
         let watched = self.watched_branches();
         self.heads.retain(|branch, _| watched.contains(branch));
         self.placing.retain(|branch, _| watched.contains(branch));
+        self.own_heads.retain(|branch, _| watched.contains(branch));
         self.change_logs
             .retain(|branch, _| watched.contains(branch));
         for branch in std::mem::replace(&mut self.watched, watched.clone()) {
@@ -1673,6 +1688,31 @@ impl GraphSession {
             if !self.head_reads.contains_key(&branch) {
                 self.read_head(branch, cx);
             }
+        }
+    }
+
+    /// Reads `branch`'s head now, and resolves once the session holds what it answered, or no
+    /// read could be sent: a Refresh reads at the newest head, which the next poll would only
+    /// find later, and a view pinned at it still compares the heads after it.
+    pub fn head_now(&mut self, branch: &str, cx: &mut Context<Self>) -> Task<()> {
+        self.read_head(branch.to_owned(), cx);
+        if !self.head_reads.contains_key(branch) {
+            return Task::ready(());
+        }
+        let (landed, waited) = oneshot::channel();
+        self.head_waiters
+            .entry(branch.to_owned())
+            .or_default()
+            .push(landed);
+        cx.background_spawn(async move {
+            waited.await.ok();
+        })
+    }
+
+    /// The head read of `branch` landed, or gave way to one of Studio's commits.
+    fn head_landed(&mut self, branch: &str) {
+        for waiter in self.head_waiters.remove(branch).into_iter().flatten() {
+            waiter.send(()).ok();
         }
     }
 
@@ -1707,7 +1747,7 @@ impl GraphSession {
                     Ok(ReadOutput {
                         graph_commit_id: Some(head),
                         ..
-                    }) => this.saw_head(branch, head, false, None, cx),
+                    }) => this.saw_head(branch.clone(), head, false, None, cx),
                     // The probe matches a type of the schema held, which another writer renamed
                     // or dropped: the schema is read again, and the heads under it.
                     Err(ReadError::Refused(refusal)) if refusal.status == 400 => {
@@ -1715,6 +1755,7 @@ impl GraphSession {
                     }
                     _ => {}
                 }
+                this.head_landed(&branch);
             })
             .ok();
         });
@@ -1764,8 +1805,10 @@ impl GraphSession {
         cx: &mut Context<Self>,
     ) {
         if own {
-            // A head read sent before this commit could answer with the head before it.
+            // A head read sent before this commit could answer with the head before it: this
+            // commit is the newest head now, for what waited on it too.
             self.head_reads.remove(&branch);
+            self.head_landed(&branch);
         }
         // The head read placing one of Studio's own commits (below) found it at the head: the
         // commit was told already, and is no other writer's.
@@ -1794,8 +1837,13 @@ impl GraphSession {
         // Before views hear of the move, so they find the read under way. Only Studio's own
         // commit on top of the head held leaves the schema as it was: one placed by a head read
         // sits on another writer's.
-        let on_top = own && previous.is_some() && parent == previous.as_deref();
-        self.read_changes(&branch, on_top, cx);
+        if own && previous.is_some() && parent == previous.as_deref() {
+            self.own_heads
+                .entry(branch.clone())
+                .or_default()
+                .insert(head.clone());
+        }
+        self.read_changes(&branch, cx);
         if previous.is_some() && !own && !placed {
             self.commit_lists.forget(&branch);
             self.head_commits.forget(&branch);
