@@ -154,6 +154,20 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   plan move the light with the text. An operator the planner adds on its own lights nothing.
 - Statements (`branch …`, `show …`) run without a request target; `branch create/delete/merge`
   asks first like a mutation.
+- To adopt with the next minimum-server bump (spec 012, "On OmniGraph main, 2026-10-20"):
+  - The compiler's new checks show as you type: `T27` for a full-text call (`search`, `fuzzy`,
+    `match_text`, `bm25`) on a property without `@index`, `T59` for an `rrf()` over two bindings
+    one traversal connects, exact `@range` bounds, and `from commit "<id>"` in `branch create`.
+    The engine catalogue's `@` types (`@Operator` and the rest) complete and highlight as
+    built-in types.
+  - A 409 with `full_text_index_required` reads "`Type.property` has no full-text index at this
+    snapshot" and names the fix: `omnigraph optimize` on `main`, or
+    `omnigraph rebuild-full-text-indexes --branch <branch>` elsewhere.
+  - Explain shows a document's `pipelines` (`explain_version` 7) as their own section, each
+    with its source, operators and sink, the pipelines it depends on, and its operators lit in
+    the physical tree on hover.
+  - An overwrite `load csv`'s `executed.operators` shows under the write's outcome: each node's
+    rows, compute time and wall time.
 
 ## Deferred
 

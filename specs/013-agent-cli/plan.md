@@ -62,6 +62,15 @@ OmniGraph at `d8d2e3a8` (main), and the released 0.13.0 binaries at `~/.local/bi
   - `schema plan|apply` have no HTTP path and refuse `--server` (`planes.rs:279-296`).
 - `--store`, the direct-storage commands and `cluster` without `--server` never go through
   HTTP (`planes.rs:152-153`).
+- Since OmniGraph main `2c9eb1e0` (#1090, 2026-10-20), after 0.14's edge build: `--server`,
+  `--store`, `--cluster`, `--profile`, `--managed`, `--direct`, `--api`, `--organization`, graph
+  `--uri` and `use` are removed. `--target NAME|ADDRESS`, or `defaults.target`, selects one
+  backend, and the resolved target is printed to stderr. The operator file is
+  `target_config_version: 1` with `targets`; a server target has an `endpoint`, a
+  `default_graph` and one `credential` owner, whose token is `OMNIGRAPH_TOKEN_<OWNER>` or what
+  `omnigraph login --target` stored in `credentials`, bound to the endpoint. No command reads
+  `OMNIGRAPH_BEARER_TOKEN` (#1030). `version --json` reports `protocols.target`. A `unix:///…`
+  endpoint is a server (E24, #988), and a refused write is reported as not started (E22, #981).
 - Policy branch scopes are `any`, `protected`, `unprotected`
   (`crates/omnigraph-policy/src/lib.rs:213-217`). A commit records the actor resolved from the
   bearer token (`handlers.rs:415-437`).
@@ -133,6 +142,24 @@ defaults:
 # credentials (0600), removed when the conversation ends
 [studio]
 token = <32 random bytes as hex>
+```
+
+A CLI whose `version --json` reports `protocols.target` (OmniGraph #1090) gets the target form
+instead, and the session token through `omnigraph login --target studio` with the token on
+stdin, so the credentials file keeps the CLI's own format and the token never passes through
+argv:
+
+```yaml
+# config.yaml (0600)
+target_config_version: 1
+defaults:
+  target: studio
+targets:
+  studio:
+    kind: server
+    endpoint: "http://127.0.0.1:<gateway port>"
+    credential: studio
+    default_graph: "<graph id>"
 ```
 
 `omnigraph` (`0700`) is a wrapper: it unsets every `OMNIGRAPH_TOKEN_*`,
@@ -209,8 +236,8 @@ server never sees, and a repeated key could be judged by one value and read as a
 
 Writes are checked on the conversation's graph only. A refusal is a 403 `ErrorOutput` with
 `code: forbidden` and the contract header; its message ends "Nothing was sent." and says what to
-do instead. Until E22, the CLI still reports it as `effects: unknown`; `AGENTS.md` says a Studio
-refusal never wrote anything.
+do instead. A CLI with E22 (OmniGraph #981) reports it as not started; an older one still says
+`effects: unknown`, so `AGENTS.md` says a Studio refusal never wrote anything.
 
 A forwarded write's answer is read whole (at most 8 MiB) so the card can show it, then sent on.
 When the server's answer is lost, the gateway closes the connection without one, and the CLI
@@ -246,9 +273,10 @@ and cards apply, because the CLI still speaks to the gateway.
   not in the temporary directory, which a sandboxed agent may write. The folder goes with the
   conversation.
 
-- Studio adds `--server studio` and `--graph <graph>` unless the arguments name them, and
-  refuses `--server`, `--store`, `--uri`, `--cluster`, `--profile`, `--direct`, `--managed`,
-  `--api` and `--as`, so a call cannot leave the gateway.
+- Studio adds `--target studio` (on a CLI without targets, `--server studio`) and `--graph
+  <graph>` unless the arguments name them, and refuses a `--target` naming anything else,
+  `--config`, `--server`, `--store`, `--uri`, `--cluster`, `--profile`, `--direct`, `--managed`,
+  `--api`, `--organization` and `--as`, so a call cannot leave the gateway.
 - Commands: `query`, `mutate`, `load`, `branch`, `snapshot`, `export`, `blob`, `commit`,
   `changes`, `schema show`, `graphs list`, `version` and `lint`. Anything else is refused before
   running. `lint` checks queries against a schema file offline (`--query`, `--schema`, `--json`
@@ -273,8 +301,10 @@ and cards apply, because the CLI still speaks to the gateway.
   outcome is returned once; a new session, or the agent stopping, kills runs still going.
 
 Giving Codex network access (a codex-acp mode with network) lets its shell reach the gateway
-too, and opens all network, so it stays the person's choice. E24 would let the sandbox allow one
-socket instead.
+too, and opens all network, so it stays the person's choice. E24 has landed (a `unix:///…`
+server, OmniGraph #988), so a sandbox can allow one socket instead. To adopt: the gateway also
+listens on a Unix socket in the conversation's folder, and a target-capable CLI's home points at
+it, so Codex reaches the gateway without network.
 
 ### The skill
 
@@ -331,7 +361,9 @@ same write would split the cards and the rules.
 | On Windows the agent starts through Studio's own executable as `launch-agent` | `cmd /c set NAME= & PROGRAM ARGS…`; starting the agent's process without the ACP crate | `cmd` expands `%` even inside quotes and does not read the quotes the standard library writes, and the ACP crate passes arguments only through the standard library, so a path or argument could change. Starting the process without the crate would repeat its stderr capture, exit and shutdown handling. Studio already re-runs its executable as `mcp-proxy` |
 | Request bodies read whole, at most 64 MiB; answers to reads stream | Stream request bodies too | The rules need small JSON bodies whole; a load larger than 64 MiB is refused before sending, which bounds memory (IX) |
 | The gateway passes the upstream contract through and refuses a CLI that speaks another | Translate between contracts | The contract is an exact-match safety property. A translation layer would be a second API that drifts |
-| Studio tests each CLI once against the gateway | Map package versions to contracts | The package version does not determine the contract; a real request does, until E23 |
+| Studio tests each CLI once against the gateway | Map package versions to contracts | The package version does not determine the contract; a real request does, until E23. Superseded by `version --json` (see "Choosing the CLI") |
+| A CLI with targets gets a `targets` home and `--target studio`; one without, the `servers` home and `--server studio` | Require a CLI with targets; keep only `--server` | The CLI is whatever is installed: 0.14's edge build has no targets and OmniGraph main has no `--server` (#1090). The agent works with either until the oldest CLI Studio supports has targets |
+| The agent keeps Studio's gateway, not the server's MCP | Point the agent at the server's MCP, which has read and opt-in write tools since #994 | Its writes would go wherever the agent's token may write; until E20 only the gateway keeps them on the agent's branch, and only the gateway shows each write as a card |
 | Codex gets network only when the person allows it | Always enable it; always refuse the CLI to Codex | Enabling it opens all network; refusing it gives up the CLI where the person accepts the risk |
 | The CLI is the only graph tool; `omnigraph_run` runs it for agents without network | Keep spec 011's schema, query and propose tools beside the CLI | The CLI covers every served route and composes; the old tools were a subset with their own write path. One path keeps one set of rules and cards |
 | `omnigraph_run` takes an argument list and runs the chosen CLI without a shell, from a private home | A command string run by a shell; running the agent's wrapper | A list cannot smuggle a second command or a redirect, and the allowlist and file checks read the same arguments the CLI gets |
@@ -346,11 +378,12 @@ Engine changes, in [spec 012](../012-omnigraph-engine-changes/plan.md) and
   credentials. The server would enforce the sandbox for any client and record the agent in
   history. The gateway then only provisions a credential and shows cards.
 - **E22** ([#976](https://github.com/ModernRelay/omnigraph/issues/976)): the CLI reports a 401, a
-  403 or a contract 400 on a write as not started.
+  403 or a contract 400 on a write as not started. Landed (#981); `AGENTS.md` keeps its note
+  for older CLIs.
 - **E23** ([#977](https://github.com/ModernRelay/omnigraph/issues/977)): `omnigraph version --json`
-  with the HTTP contract.
+  with the HTTP contract. Landed (#987) and used to choose the CLI.
 - **E24** ([#979](https://github.com/ModernRelay/omnigraph/issues/979)): Unix-socket transport,
-  so a sandbox can allow one socket.
+  so a sandbox can allow one socket. Landed (#988), not used yet (see the Codex note above).
 - **E1, E4** ([#980](https://github.com/ModernRelay/omnigraph/issues/980)): `omnigraph studio`. The
   launcher would pass its own CLI path and contract, so agent sessions on that graph use it.
 

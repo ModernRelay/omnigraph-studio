@@ -657,7 +657,15 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
   of that kind is refused with a note until OmniGraph has `omnigraph studio`.
 - Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
   - E9 branch details: the branch menu derives head and fork from `GET /commits?branch=` until then.
-  - E15 who am I: every action stays visible; a 403 is shown as a denial and the draft stays.
+  - E15 what may I do: landed as `GET /graphs/{id}/access` (OmniGraph #1073), adopted with the
+    next minimum-server bump. Studio then reads it when a graph opens, when the branch changes
+    and at a 403 (the credential may have changed), for the graph and the window's branch (and
+    the merge target in a review); every action the answer does not allow (edit, insert,
+    delete, Blob writes, branch create, delete and merge, commit publish and drop) stays visible
+    but disabled, its tooltip naming the action the credential lacks, and the status bar's
+    branch says "read only" when `change` is not allowed there. The server stays the authority:
+    a 403 still shows as a denial and the draft stays. Until then every action stays visible;
+    a 403 is shown as a denial and the draft stays.
 
 ## Validation log
 

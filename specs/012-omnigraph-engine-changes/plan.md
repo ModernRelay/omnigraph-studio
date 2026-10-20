@@ -1,9 +1,11 @@
 # 012: OmniGraph engine changes
 
-Status: deferred · 2026-10-11; E6, E7, E8, E23 and E24 landed on OmniGraph main by 2026-10-15
-(see "On OmniGraph main, 2026-10-15"), none of them released yet. Studio ships against the 0.13
-contract (constitution X). When a change is picked up it becomes an OmniGraph RFC and issue in
-`ModernRelay/omnigraph`, follows that repository's invariants and test ownership, and Studio
+Status: open · 2026-10-11, updated 2026-10-20. Landed on OmniGraph main: E6, E7, E8, E23 and E24
+by 2026-10-15, then E10, E15 (as the access route), E21 and E22 by 2026-10-20 (see "On OmniGraph
+main, 2026-10-20"). Studio's oldest supported server is 0.14, the edge build
+`edge-20261017-d883c49` until 0.14 is released (2026-10-17, `911a885`), whose HTTP contract header
+is still `0.13` (constitution X). When a change is picked up it becomes an OmniGraph RFC and issue
+in `ModernRelay/omnigraph`, follows that repository's invariants and test ownership, and Studio
 adopts it once its minimum server serves it, or before then only when a server's OpenAPI
 document advertises it.
 
@@ -66,6 +68,67 @@ not know.
   cursor), E11 (`ReadOutput.columns` is still names), E12–E19, E20 (#978), E21
   (`BranchCreateRequest` is still `name` and `from`), E22 (#976).
 
+## On OmniGraph main, 2026-10-20
+
+Checked at main `4ba904d3` by diffing its `openapi.json` with the contract Studio carries
+(`crates/graph_client/openapi/omnigraph-0.14.0-edge.json`, from `edge-20261017-d883c49`) and
+reading the `changelog.d` notes added since. The contract header is still `0.13` and every HTTP
+change is additive; the CLI's is not.
+
+- Landed:
+  - E10 (#1013): `GET /commits` takes `limit` (1 to 1,000) and an opaque `page_token`, and answers
+    `head_commit_id` and, while older commits remain, `next_page_token`; later pages answer for
+    that head even after the branch moves. Without either parameter the whole list, as before.
+  - E15 as `GET /graphs/{id}/access` (#1073): the caller's actor, the actions its credential
+    allows on the graph and, for a `branch` and a `target_branch`, there, decided by the policy
+    as the routes that perform them decide; the MCP `access` tool answers the same.
+  - E21 (#1016): `from_commit` on `POST /branches` and `from commit "<id>"` in `branch create`
+    (GQ language version 2.3); every receipt carries `from_commit_id`. A commit cleanup no longer
+    retains answers 410; one under an earlier schema or before the storage upgrade, of a deleted
+    branch, unpublished, or an unattached snapshot answers 409; `ErrorOutput.branch_start_refusal`
+    names the reason.
+  - E22 (#981): a served write refused at authentication, policy or the contract is reported as
+    not started.
+  - E24 in a new form: a server endpoint may be `unix:///…` (`--target unix:///…`).
+- New beside them:
+  - **CLI targets** (#1090, breaking). `--target NAME|ADDRESS` and `defaults.target` select one
+    backend; `--server`, `--store`, `--cluster`, `--profile`, `--managed`, `--direct`, `--api`,
+    `--organization`, graph `--uri`, `use` and profiles are removed. The operator file is
+    `target_config_version: 1` with `targets` of kind `direct`, `server` or `managed`; a server
+    target has an `endpoint`, a `default_graph` and one `credential` owner (a token stored by
+    `omnigraph login --target`, bound to its endpoint, or `OMNIGRAPH_TOKEN_<OWNER>`) or
+    `auth: anonymous`. `omnigraph credential get --target NAME` exports a server target's token to
+    a pipe; `omnigraph target import` converts a legacy file and keeps it as `config.legacy.yaml`.
+    No command reads `OMNIGRAPH_BEARER_TOKEN` (#1030). `version --json` adds `protocols`
+    (`target`, `credential`). Specs 003 and 013.
+  - **Full text** (#1066): a full-text call (`search`, `fuzzy`, `match_text`, `bm25`) on a String
+    property without `@index` is a type error, `T27`; a declared index with no part at the query's
+    snapshot is a 409 whose `full_text_index_required` names `Type.property`, lifted by
+    `omnigraph optimize` on `main` or `omnigraph rebuild-full-text-indexes --branch <branch>`.
+    Spec 007.
+  - **Explain and execution** (#1099, #1086): every planner explain document carries `pipelines`
+    (`explain_version` 7); a `load csv` receipt's `executed`, and `ChangeOutput.executed` for an
+    overwrite load, carry `operators` with each node's rows and timings; query inspection reports
+    ANN stage timings, which no route serves, so E12 stays open. Spec 007.
+  - **Language** (#1069, #1071): a ranked order on a binding a traversal reaches roots its
+    component; an `rrf()` over two bindings one traversal connects is `T59`, and the planner codes
+    `P001` and `P005` are withdrawn; `@range(p, ..max)` is an inclusive maximum, a list's elements
+    are checked against its range, and integer bounds stay within `I64`. Specs 007 and 014.
+  - **Engine catalogue** (#1008, in `edge-20261017-d883c49`): five `@` node types (`@Operator`,
+    planner passes, settings, storage format, logical plan kinds), also served as the reserved
+    graph id `og_catalog`. They hold no index status, so E13 stays open. Spec 007.
+  - **The server's MCP** (#992, #994, #995, #999): read tools (`access`, paged `commits_list`,
+    changes) and opt-in write tools (`mutate`, `load`, branch create, delete and merge), with the
+    skill's references as resources. Specs 011 and 013.
+  - Lance 13 (#1072): storage format 16 is unchanged; nothing for Studio.
+- Still open: E1 to E5 (#980; the launcher's RFC and its stack, #1017, are under way), E9 (#1012
+  not merged), E11, E12, E13, E14, E16 to E20 (#978), E25 to E28.
+- To adopt: E10, E15, E21, `full_text_index_required`, `executed` and `pipelines` are on main but
+  not in `edge-20261017-d883c49`, so Studio adopts them with its next minimum-server bump (an edge
+  build at or after `4ba904d3`), or before it only where a server's OpenAPI document advertises
+  them. The CLI change cannot wait for that bump: the agent's CLI and the person's are whatever
+  is installed, so specs 003 and 013 read both operator-file formats.
+
 ## The changes
 
 Each change names the Studio spec that waits on it and Studio's behavior until then.
@@ -74,8 +137,7 @@ Each change names the Studio spec that waits on it and Studio's behavior until t
 
 **E1. `omnigraph studio` CLI command.** Filed with E4 as
 [ModernRelay/omnigraph#980](https://github.com/ModernRelay/omnigraph/issues/980).
-Resolve the target the way other commands do (`--store`, `--cluster --graph`, `--server
---graph`, profile). For a local target, serve it in-process on loopback (E2); for a server
+Resolve the target the way other commands do (`--target`, with `--graph`). For a local target, serve it in-process on loopback (E2); for a server
 target, pass the server through. Mint a per-launch token tied to `operator.actor` and a
 generated policy granting that actor the graph actions. Open Studio with a single-use code
 through `omnigraph-studio://connect?code=…`; Studio redeems it once at the loopback server for
@@ -118,12 +180,12 @@ mutating route is needed: edits, loads, merges, branch and commit control alread
 | E7 | `GET /graphs/{id}/merge-base?a=&b=` | Commit lineage (`generation` on graph commits) | Pure read of `__manifest` lineage | 008 | Walk `GET /commits` parents |
 | E8 | `POST /graphs/{id}/branches/merge/preview {source, target}` → outcome, merge base, conflicts, change summary | A merge-planning step that stops before staging | Must stage nothing durable, not even a detached commit; `read` on both branches. If the engine can only answer by staging, keep `as_commit` as the preview | 008 | Merge on request; a 409 lists conflicts and nothing moved |
 | E9 | `GET /graphs/{id}/branches?detail=true` → name, head, fork commit, creator, created and updated times | Branch refs and lineage | Derived from `__manifest`; no shadow branch table | 002, 008 | Derive from `GET /commits?branch=` |
-| E10 | `GET /graphs/{id}/commits?branch=&limit=&before=` | Bounded lineage walk, keyset on generation and id | Cost scales with the page, not history | 009 | Load the full list; warn above 5,000 commits |
+| E10 | `GET /graphs/{id}/commits?branch=&limit=&before=` | Bounded lineage walk, keyset on generation and id | Cost scales with the page, not history | 009 | Landed as `limit` and `page_token` (#1013); until adopted, load the full list and warn above 5,000 commits |
 | E11 | Typed columns in `ReadOutput` (`columns: [{name, type, nullable}]`) or Arrow IPC (RFC 0051) | The result's Arrow schema | Additive DTO field; regenerate `openapi.json` | 004, 007 | `describe_query_operation` in `omnigraph-compiler` |
 | E12 | `POST /graphs/{id}/query?profile=true` | `query_inspected`, made a supported API | Exposes plan internals; gate on `read` or a new `inspect` action | 007 | Plans only, through `explain query …` |
 | E13 | `GET /graphs/{id}/indexes` | RFC 0046 index status | Observes only, never builds | 010 | Index facts from `explain` statistics |
 | E14 | `POST /graphs/{id}/schema/plan {schema_source}` → migration plan | `plan_schema` | Read-only; apply stays a deployment on clusters and direct-only on standalone graphs | later | Schema changes stay with `omnigraph cluster apply` |
-| E15 | `GET /whoami` → actor and permitted actions per graph and branch scope | Policy evaluation for the resolved token | Never lets a client assert identity | 002 | Show every action; a 403 is a denial and the draft stays |
+| E15 | `GET /whoami` → actor and permitted actions per graph and branch scope | Policy evaluation for the resolved token | Never lets a client assert identity | 002 | Landed as `GET /graphs/{id}/access` (#1073); until adopted, show every action, and a 403 is a denial and the draft stays |
 | E16 | `GET /graphs/{id}/nodes/{type}/{key}/neighborhood` → count per edge type and direction | Graph index degree (the source of filter-free `count { }` blocks) | Pinned to a snapshot; bounded by the schema's edge types | 005, 006 | One count query per edge type, concurrent, cached for the pinned commit |
 
 ### Language tooling
@@ -155,7 +217,7 @@ branch name says who made them.
 
 ### The agent's CLI (spec 013)
 
-**E22. A refused write is reported as not started.**
+**E22. A refused write is reported as not started.** *Landed (#981).*
 [ModernRelay/omnigraph#976](https://github.com/ModernRelay/omnigraph/issues/976). After a write
 is sent, the 0.13 CLI reports every failure except a typed 429 and a verified 412 as `effects:
 unknown, action: reconcile`, including 401, 403 and the contract 400
@@ -168,15 +230,16 @@ before effects. Engine rule: confirm each code is produced only before staging. 
 reports the contract a binary speaks (`main.rs:152-158, 612-620`; `cli.rs:428`). *Waits:* 013.
 *Today:* Studio tests each installed CLI once against the gateway.
 
-**E24. Unix-socket transport for `--server`.**
-[ModernRelay/omnigraph#979](https://github.com/ModernRelay/omnigraph/issues/979). The CLI speaks
+**E24. Unix-socket transport for `--server`.** *Landed (#988); since #1090 a `unix:///…`
+target.* [ModernRelay/omnigraph#979](https://github.com/ModernRelay/omnigraph/issues/979). The CLI speaks
 only http(s), and a `unix://` value falls through to storage resolution. Codex's sandbox can
 allow one Unix socket but blocks loopback TCP. *Waits:* 013. *Today:* Codex reaches the gateway
 only when the person gives the conversation network access.
 
 ### Branching
 
-**E21. A branch from a commit.** `BranchCreateRequest` at 0.13.0 takes `name` and `from`, a
+**E21. A branch from a commit.** *Landed (#1016) as `from_commit`; see "On OmniGraph main,
+2026-10-20".* `BranchCreateRequest` at 0.13.0 takes `name` and `from`, a
 parent branch whose head the new branch forks ("Parent branch to fork from. Defaults to
 `main`", `openapi.json`). Forking at a commit of a branch's history (`from_commit`) would let
 History start a branch where a change was made, to try a fix or revert there. Engine rule: the
@@ -226,15 +289,22 @@ proposal and to preview a merge. *Specs:* 004, 008.
 
 ## Order if picked up
 
-1. E22 refused-write outcomes and E23 `version --json`: small CLI changes the agent's CLI needs
-   (spec 013); started 2026-10-13.
-2. E11 typed columns and E10 paged commits: small, additive, used everywhere.
-3. E9 branch details, E7 merge base, E6 diff: the review surface.
-4. E1–E5 launcher: the one-command local experience.
-5. E20 delegated credentials (an RFC) and E24 Unix sockets, which retire spec 013's gateway
-   rules and let sandboxed agents in.
-6. E8 merge preview, E16 neighbourhood counts, E15 whoami.
-7. E12, E13, E14, E17, E18, E19 as the matching Studio work starts.
+Studio's own work first, for what landed:
+
+1. CLI targets in the agent's CLI and in reading the person's operator file (specs 013, 003):
+   the next CLI build refuses Studio's `--server` and `defaults.server`.
+2. With the next minimum-server bump: E10 paged history (009), E15 access (002), E21 a branch
+   from a commit (008, 009), `full_text_index_required` and the compiler's new codes (007), then
+   `executed` and `pipelines` (007).
+
+Then engine changes still open:
+
+3. E11 typed columns: additive, used everywhere.
+4. E9 branch details (#1012, open): the review surface.
+5. E1 to E5 launcher: the one-command local experience.
+6. E20 delegated credentials (an RFC), which retires spec 013's gateway rules.
+7. E16 neighbourhood counts.
+8. E12, E13, E14, E17, E18, E19 as the matching Studio work starts.
 
 ## Decisions
 
@@ -248,6 +318,7 @@ proposal and to preview a merge. *Specs:* 004, 008.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-20 | What OmniGraph main serves that Studio's minimum server does not | `openapi.json` at main `4ba904d3` diffed with `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` by operation, parameter and schema property; the `changelog.d` notes added since `d883c49e`; the CLI reference and targets guide at `4ba904d3` | New: `GET /graphs/{id}/access`; `limit`, `page_token`, `head_commit_id`, `next_page_token` on commits; `from_commit` and `from_commit_id` on branch creation; `ChangeOutput.executed`; error details `branch_start_refusal` and `full_text_index_required`. Contract header still `0.13`. The CLI drops `--server` and profiles for targets (#1090) |
 | 2026-10-15 | What OmniGraph main serves that 0.13.0 does not | `openapi.json` at `v0.13.0` and at main `fe69c039`, diffed by operation id, schema properties and parameters; issues #976–#980 | New: `cluster_getDiff`, `cluster_getBranchDiff`, `cluster_getMergeBase`, `cluster_putBlob`, `cluster_clearBlob`, `cluster_publishCommit`, `cluster_dropCommit`, OAuth resource metadata; `dry_run` and `as_commit` on merge; commit kinds and filters; `ReadOutput.page`. Contract header still `0.13`. #977 and #979 closed by #987 and #988; #976, #978 and #980 open |
 | 2026-10-11 | Route list at 0.13.0 and main | parsed `openapi.json` at `v0.13.0` and main | 0.13.0 lacks Blob PUT/DELETE and commit publish/drop |
 | 2026-10-11 | `BranchMergeRequest` at 0.13.0 | parsed `openapi.json` at `v0.13.0` | `source`, `target`, `delete_branch`, `settings`; no `as_commit` |

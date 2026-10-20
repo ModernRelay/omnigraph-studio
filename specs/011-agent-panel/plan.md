@@ -44,6 +44,11 @@ change the agent makes must be visible and approved before it lands, and must ar
 - OmniGraph (`v0.13.0`): the server's `/mcp` endpoint (`crates/omnigraph-server/src/mcp.rs`)
   is read-only and serves stored queries only ("Mutation tools are unavailable"), so it cannot
   carry proposals, and using it would hand the agent a bearer token.
+- OmniGraph main (2026-10-20; #992, #994, #995, #999): the server's MCP has read tools (`access`,
+  paged `commits_list`, changes, `snapshot`) and opt-in write tools (`mutate`, `load`, branch
+  create, delete and merge), with the skill's references as resources. Its writes go wherever
+  the token the agent holds may write, and no credential narrows that to the agent's branch
+  yet (E20), so the agent still reaches the graph only through Studio's gateway (spec 013).
 - OmniGraph (`v0.13.0`): branch names may contain `/`. Checked on the dev server: creating
   `agent/probe-1` from `main`, listing it, and deleting it as `agent%2Fprobe-1` all succeeded.
 

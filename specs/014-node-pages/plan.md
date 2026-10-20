@@ -141,8 +141,10 @@ Four parts, built in this order; each lands on its own.
 - **Typed editors**: an enum is a menu of its values; a boolean a switch; a date and a
   datetime a field with a calendar; a list editable chips (so an element may hold a comma); a
   nullable property a clear button (×) that sets null, so an empty string can also be stored;
-  numbers right-aligned, with `@range` bounds shown and checked before saving; `@check` regexes
-  checked before saving. The server stays the authority; these checks only save a round trip.
+  numbers right-aligned, with `@range` bounds shown and checked before saving as the server
+  checks them (OmniGraph #1071): both bounds inclusive, `..max` an inclusive maximum, each
+  element of a list against the range, integer bounds within `I64`; `@check` regexes checked
+  before saving. The server stays the authority; these checks only save a round trip.
 - Keys and ids stay read-only (the engine cannot change them).
 
 ### 3. Long text and markdown

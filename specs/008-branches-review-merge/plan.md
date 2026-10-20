@@ -146,7 +146,12 @@ place), X (designed on 0.13; the better routes are deferred).
     the commit list of a branch its target was merged into.
   - E8 merge preview with no effects: merge on request and show the 409 conflicts until then.
   - E9 branch details: derived from `GET /commits?branch=` until then.
-  - E21 a branch from a commit: 0.13 forks only a branch's head (`from` names a branch).
+  - E21 a branch from a commit: landed as `from_commit` (OmniGraph #1016), adopted with the next
+    minimum-server bump. The new-branch dialog then also starts at a commit (History's "New
+    branch here…", spec 009), the outcome names the receipt's `from_commit_id`, and a refusal
+    reads its `branch_start_refusal` reason: a commit cleanup no longer keeps (410), or one
+    under an earlier schema, from before the storage upgrade, of a deleted branch, unpublished,
+    or an unattached snapshot (409). Until then a branch starts from a branch head.
   - R2 unpublished commits: `as_commit` merge proposals. The minimum server (0.14) serves
     them; Studio does not use them yet.
   - E28 a merge bound to the reviewed source head: until then a commit landing between the

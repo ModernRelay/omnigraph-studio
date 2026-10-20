@@ -30,6 +30,14 @@ from the served document).
   `<name>`: env `OMNIGRAPH_TOKEN_<NAME>` (dashes become underscores, upper case), then
   `[<name>] token = …` in `$OMNIGRAPH_HOME/credentials`, which must not be group or world
   readable (`crates/omnigraph-cli/src/operator.rs:350-420` at `v0.13.0`).
+- Since OmniGraph main `2c9eb1e0` (#1090, after 0.14's edge build): the operator file is
+  `target_config_version: 1` with `defaults.target` and `targets` of kind `direct`, `server` or
+  `managed`. A `server` target has an `endpoint`, a `default_graph`, and one `credential` owner
+  (its token stored by `omnigraph login --target`, bound to the endpoint's scope, or
+  `OMNIGRAPH_TOKEN_<OWNER>`) or `auth: anonymous`; a `managed` target's data `endpoint` and
+  `default_graph` serve graphs the same way. `omnigraph credential get --target NAME` exports a
+  server target's token to a pipe. `omnigraph target import` converts a legacy file and keeps it
+  as `config.legacy.yaml`. An endpoint may be `unix:///…`.
 - Routes on OmniGraph main but not in `v0.13.0`: Blob `PUT`/`DELETE`, commit publish and drop.
 
 ## Design
@@ -48,6 +56,14 @@ from the served document).
    settings file's are. A token from `OMNIGRAPH_TOKEN_<NAME>` is the one Studio started with,
    as for the CLI. The untargeted `OMNIGRAPH_BEARER_TOKEN` is sent to no server: a token goes
    only to the server it is keyed to (OmniGraph #1030).
+   An operator file with `target_config_version` is read as targets: every `server` target, and
+   every `managed` target with an `endpoint`, is a server labelled with the target's name. Its
+   token is `OMNIGRAPH_TOKEN_<OWNER>` for the target's credential owner, else what
+   `omnigraph credential get --target <name>` writes to a pipe (the CLI owns the credentials
+   file's format; the token never passes through argv), and `auth: anonymous` sends none. A
+   `unix:///…` endpoint is listed, with the reason it cannot be opened: `graph_client` speaks
+   HTTP(S) over TCP only. A file without `target_config_version` is read as `servers` and
+   `profiles`, as before; after `omnigraph target import`, `config.legacy.yaml` is not read.
 2. Servers added in Studio (URL, optional token). Tokens go to the OS keychain through GPUI's
    credentials API; the server list goes to Studio's settings.
    An address is made a server root before it is used (`graph_client::server_root`): trimmed,
@@ -58,8 +74,9 @@ from the served document).
    an entry saved before it (`localhost:8080`) loads as `http://localhost:8080`, its token
    copied to the new address. `GraphClient::new` refuses an unusable root rather than
    building URLs on it.
-3. Graph ids for a server come from, in order: `GET /graphs` when allowed; the operator config's
-   profiles and `default_graph`; graph ids the person typed before. A 403 on `/graphs` is not an
+3. Graph ids for a server come from, in order: `GET /graphs` when allowed; the target's
+   `default_graph` (a legacy file's profiles and `default_graph`); graph ids the person typed
+   before. A 403 on `/graphs` is not an
    error state; Studio says "This server does not list graphs for your token. Enter a graph id."
 
 ### Connecting

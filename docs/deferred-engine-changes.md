@@ -13,18 +13,15 @@ one is picked up it goes through OmniGraph's own RFC process.
 | E4 | Owner discovery for a graph root (discovery, not fencing) | E1 | — |
 | E5 | Writer-safety rules for local sessions | E1 | Enforced by the server Studio talks to |
 | E9 | Branch details (head, fork, creator, times) | 002, 008 | Derived from `GET /commits?branch=` |
-| E10 | Paged commit list | 009 | Full list, virtualized, warning above 5,000 commits |
 | E11 | Typed result columns or Arrow IPC | 004, 007 | Column types from `omnigraph-compiler`'s `describe_query_operation` |
 | E12 | Query profile over HTTP | 007 | Plans only, through `explain query …` |
 | E13 | Index status | 010 | Index facts from `explain` statistics |
 | E14 | Read-only schema plan | later | Schema changes stay with `omnigraph cluster apply` |
-| E15 | Who am I and what may I do | 002 | Every action shown; a 403 is a denial and the draft stays |
 | E16 | Neighbourhood counts per node | 005, 006 | One count query per edge type, concurrent, cached per pinned commit |
 | E17 | `omnigraph lsp` language server | 007 | `gq_language` calls `omnigraph-compiler` in-process |
 | E18 | Tree-sitter grammars and a Zed extension in the OmniGraph repository | E17 | Grammars in this repository under `grammars/` |
 | E19 | Publish `omnigraph-compiler` to crates.io again (stops at 0.8.0) | 001 | Git dependency on tag `edge-20261017-d883c49` |
 | E20 | Delegated, branch-scoped credentials for agents, recorded in history beside the actor ([#978](https://github.com/ModernRelay/omnigraph/issues/978)) | 011, 013 | Agent commits are recorded under the person's actor, on a branch named `agent/<stamp>`; Studio's gateway keeps the agent's writes on that branch |
-| E22 | The CLI reports a write refused at authentication, policy or the contract as not started ([#976](https://github.com/ModernRelay/omnigraph/issues/976)) | 013 | `AGENTS.md` says a Studio refusal wrote nothing |
 | E25 | One mutation that both adds and removes (lift rule D2 for one write) | 014 | A relationship replacement saves as two ordered commits, or through a branch and a merge |
 | E26 | Edge update (T16) | 014 | An unkeyed edge's properties save as delete and insert, with a new id |
 | E27 | Annotation-only schema changes (a display hint on an existing property) | 014 | Every String reads as markdown; a hint can go only on a new property or type |
@@ -35,8 +32,26 @@ header is still `0.13`), and so are on every server Studio supports. Studio uses
 and E23: a review reads its fork and head from the merge base, and a merge is confirmed by the
 source head becoming the merge base; a branch its target was merged into is reviewed from
 `GET /diff` from that base; a review asks a dry-run merge whether the branch merges cleanly;
-the agent's CLI is chosen by its `version --json`. E24 is not used yet. Paged commit lists
-(E10, #1013) landed on main after that build.
+the agent's CLI is chosen by its `version --json`. E24 is not used yet.
+
+These landed on OmniGraph main after that build (checked at `4ba904d3`, 2026-10-20), so Studio
+adopts them with its next minimum-server bump, or before it only where a server's OpenAPI
+document advertises them ([spec 012](../specs/012-omnigraph-engine-changes/plan.md), "On OmniGraph
+main, 2026-10-20"):
+
+| ID | Feature | Operation | Spec | Studio does until then |
+|---|---|---|---|---|
+| E10 | Paged commit list: `limit`, `page_token`; `head_commit_id`, `next_page_token` (#1013) | `GET /commits` | 009 | Full list, virtualized, warning above 5,000 commits |
+| E15 | What the caller's credential may do on a graph and its branches (#1073) | `GET /graphs/{id}/access` | 002 | Every action shown; a 403 is a denial and the draft stays |
+| E21 | A branch from a commit: `from_commit`, `from_commit_id`, `branch_start_refusal` (#1016) | `POST /branches` | 008, 009 | A branch starts from a branch head |
+| E22 | The CLI reports a write refused at authentication, policy or the contract as not started (#981) | CLI | 013 | `AGENTS.md` says a Studio refusal wrote nothing |
+| — | A full-text call on an unindexed property is `T27`; a missing index part is a 409 `full_text_index_required` (#1066) | `POST /query` | 007 | A generic failure |
+| — | Execution reports and explain pipelines: `ChangeOutput.executed`, `explain_version` 7 (#1099) | `POST /mutate`, `explain` | 007 | Explain trees without pipelines |
+
+One change on main is not additive: the CLI selects a backend with `--target` and reads an
+operator file of `targets` (#1090), and no longer accepts `--server`, `defaults.server` or
+profiles. Studio's agent CLI and its reading of the person's operator file follow it at once,
+since the CLI is whatever is installed (specs 013 and 003).
 
 | ID | Feature | Operation | Spec |
 |---|---|---|---|

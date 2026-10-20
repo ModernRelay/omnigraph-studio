@@ -67,8 +67,17 @@ away are dropped.
 ## Deferred
 
 - Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
-  - E10 paged commit list: the full list loads, virtualized, with a warning above 5,000 commits,
-    until then.
+  - E10 paged commit list: landed as `limit` and `page_token` (OmniGraph #1013), adopted with the
+    next minimum-server bump. History then reads the branch's newest 200 commits and the next
+    page when scrolling comes within a screen of the list's end. Every page answers for the
+    first page's `head_commit_id`, so the list stays one history while the branch moves; a
+    commit landing meanwhile shows as "N newer commits · Refresh" through the head watch. The
+    other branches read for merged-in commits are paged the same way, as far back as the
+    oldest commit shown. The warning above 5,000 commits goes. Until then the full list loads,
+    virtualized, with that warning.
+  - E21 a branch from a commit: landed (OmniGraph #1016), adopted with the same bump. A commit's
+    menu and its detail offer "New branch here…", which starts a branch at that commit
+    (spec 008).
   - E9 branch details: branch chips derived from per-branch commit lists until then.
 
 ## Validation log
