@@ -85,14 +85,14 @@ impl TypesList {
         workspace.read(cx).active_item()?.dedupe_key(cx)
     }
 
-    /// Whether the active tab is the canvas showing an exploration rather than the ontology:
-    /// the canvas names its tab "Canvas" then (`graph_canvas`).
-    fn exploring(&self, cx: &App) -> bool {
+    /// Whether the active tab shows what `action` opens: the canvas's ontology and its walk
+    /// from a node are one tab, which only the tab can tell apart.
+    fn active_shows(&self, action: &dyn gpui::Action, cx: &App) -> bool {
         self.workspace.upgrade().is_some_and(|workspace| {
             workspace
                 .read(cx)
                 .active_item()
-                .is_some_and(|item| item.tab_title(cx) == "Canvas")
+                .is_some_and(|item| item.opened_by(action, cx))
         })
     }
 }
@@ -173,22 +173,19 @@ impl TypesList {
             return div().into_any_element();
         };
         let active = self.active_key(cx);
-        let canvas_open = active
-            .as_deref()
-            .is_some_and(|key| key.starts_with("canvas:"));
         let view_row = |id: &'static str, label: &'static str, icon: IconName| {
             studio_ui::ds::SidebarRow::new(id, label).icon(icon)
         };
         match row {
             Row::Ontology => view_row("view-ontology", "Ontology", IconName::GitGraph)
-                .selected(canvas_open && !self.exploring(cx))
+                .selected(self.active_shows(&OpenOntology, cx))
                 .tooltip_fn(|_, cx| {
                     Tooltip::for_action("The types and relationships as a map", &OpenOntology, cx)
                 })
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenOntology), cx))
                 .into_any_element(),
             Row::Canvas => view_row("view-canvas", "Canvas", IconName::Crosshair)
-                .selected(canvas_open && self.exploring(cx))
+                .selected(self.active_shows(&OpenCanvas, cx))
                 .tooltip_fn(|_, cx| {
                     Tooltip::for_action(
                         "Walk the graph from a node: ↵ on a row opens one",

@@ -67,6 +67,13 @@ pub trait Item: Render + Focusable + EventEmitter<ItemEvent> {
         None
     }
 
+    /// Whether the tab shows what `action` opens, so a panel row that dispatches it shows as
+    /// selected while the tab is active. One tab can show what different actions open (the
+    /// canvas's ontology and its walk from a node), which its dedupe key does not tell apart.
+    fn opened_by(&self, _action: &dyn Action, _cx: &App) -> bool {
+        false
+    }
+
     /// The item has unsaved work; closing asks first.
     fn is_dirty(&self, _cx: &App) -> bool {
         false
@@ -103,6 +110,7 @@ pub trait ItemHandle: 'static {
     fn tab_title(&self, cx: &App) -> SharedString;
     fn tab_icon(&self, cx: &App) -> Option<IconName>;
     fn dedupe_key(&self, cx: &App) -> Option<SharedString>;
+    fn opened_by(&self, action: &dyn Action, cx: &App) -> bool;
     fn is_dirty(&self, cx: &App) -> bool;
     fn is_stale(&self, cx: &App) -> bool;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
@@ -131,6 +139,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn dedupe_key(&self, cx: &App) -> Option<SharedString> {
         self.read(cx).dedupe_key(cx)
+    }
+
+    fn opened_by(&self, action: &dyn Action, cx: &App) -> bool {
+        self.read(cx).opened_by(action, cx)
     }
 
     fn is_dirty(&self, cx: &App) -> bool {

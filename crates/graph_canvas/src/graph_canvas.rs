@@ -375,6 +375,17 @@ impl Item for GraphCanvas {
         })
     }
 
+    /// The ontology is what `OpenOntology` opens and the walk from a node what `OpenCanvas`
+    /// opens; a query's result nodes are neither.
+    fn opened_by(&self, action: &dyn gpui::Action, _cx: &App) -> bool {
+        let action = action.as_any();
+        match self.mode {
+            Mode::Schema => action.is::<OpenOntology>(),
+            Mode::Explore => action.is::<OpenCanvas>(),
+            Mode::Results => false,
+        }
+    }
+
     /// The exploration canvas comes back after a restart; a results canvas is transient.
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
         self.results.is_none().then(|| SavedItem {
