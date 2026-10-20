@@ -50,7 +50,7 @@ fn settings_choose_the_active_theme(cx: &mut HeadlessAppContext, data: &Path) {
     settle(cx);
     assert_eq!(
         cx.update(|cx| cx.theme().name.to_string()),
-        "Vitesse Refined Light",
+        "Studio Light",
         "Studio's bundled default light theme"
     );
 

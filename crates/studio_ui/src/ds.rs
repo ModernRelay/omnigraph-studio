@@ -224,8 +224,12 @@ pub mod size {
     pub const DISCLOSURE: f32 = 12.;
     /// A status or type dot.
     pub const DOT: f32 = 7.;
-    /// A tag, a count badge, a write target: the small chips inside rows and headers.
+    /// A tag, a count badge, a write target: the small chips inside rows and headers. Also a
+    /// switch's height.
     pub const TAG: f32 = 18.;
+    /// A switch's width, and its knob, inside a [`TAG`]-high track.
+    pub const SWITCH_WIDTH: f32 = 32.;
+    pub const SWITCH_KNOB: f32 = 14.;
     /// A line being dragged (a column's or a dock's new edge).
     pub const DRAG_LINE: f32 = 2.;
     /// A coloured line down an item's leading edge: a change card's kind, a focused tree row.
@@ -1406,9 +1410,83 @@ pub fn toolbar_icon_button(id: impl Into<ElementId>, icon: IconName) -> IconButt
     icon_button(id, icon).size(ButtonSize::Default)
 }
 
-/// A switch: on in the primary button's ink, as Tower's; off on the theme's quiet track.
-pub fn switch(id: impl Into<ElementId>, state: ui::ToggleState, cx: &App) -> ui::Switch {
-    ui::Switch::new(id, state).color(ui::SwitchColor::Custom(cx.theme().colors().text))
+/// A switch: a pill track and a round knob. On, the track is the primary button's ink; off,
+/// the [`surface::divider`]'s grey; the knob is the solid surface with interfaces.dev's shadow
+/// in both, so it reads on either. Studio draws it rather than Zed's `Switch`, whose knob takes
+/// the theme's text colour, the ink of an on track, so an on switch showed no knob.
+pub fn switch(id: impl Into<ElementId>, state: ui::ToggleState, _cx: &App) -> Switch {
+    Switch {
+        id: id.into(),
+        on: state == ui::ToggleState::Selected,
+        on_click: None,
+    }
+}
+
+/// What a [`Switch`] calls with the state a click turns it to.
+type SwitchHandler = Box<dyn Fn(&ui::ToggleState, &mut Window, &mut App) + 'static>;
+
+/// See [`switch`].
+#[derive(IntoElement)]
+pub struct Switch {
+    id: ElementId,
+    on: bool,
+    on_click: Option<SwitchHandler>,
+}
+
+impl Switch {
+    /// Called with the state a click turns the switch to.
+    pub fn on_click(
+        mut self,
+        handler: impl Fn(&ui::ToggleState, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_click = Some(Box::new(handler));
+        self
+    }
+}
+
+impl RenderOnce for Switch {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let ink = cx.theme().colors().text;
+        let (track, hover) = if self.on {
+            (ink, ink.opacity(0.9))
+        } else {
+            let divider = surface::divider(cx);
+            (divider, divider.blend(surface::highlight(cx)))
+        };
+        let next = if self.on {
+            ui::ToggleState::Unselected
+        } else {
+            ui::ToggleState::Selected
+        };
+        let inset = (size::TAG - size::SWITCH_KNOB) / 2.;
+        h_flex()
+            .id(self.id)
+            .role(gpui::Role::Switch)
+            .aria_toggled(if self.on {
+                gpui::Toggled::True
+            } else {
+                gpui::Toggled::False
+            })
+            .flex_none()
+            .w(px(size::SWITCH_WIDTH))
+            .h(px(size::TAG))
+            .px(px(inset))
+            .when(self.on, |track| track.justify_end())
+            .rounded_full()
+            .bg(track)
+            .hover(move |style| style.bg(hover))
+            .cursor_pointer()
+            .when_some(self.on_click, |track, on_click| {
+                track.on_click(move |_, window, cx| on_click(&next, window, cx))
+            })
+            .child(
+                div()
+                    .size(px(size::SWITCH_KNOB))
+                    .rounded_full()
+                    .bg(surface::solid(cx))
+                    .shadow(elevation::custom(cx)),
+            )
+    }
 }
 
 /// A toast's surface: on glass a small floating glass surface, like the canvas's bars; flat,

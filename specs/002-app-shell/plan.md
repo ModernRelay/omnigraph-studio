@@ -303,12 +303,25 @@ second line shows it (`omnigraph branch create feature-x --from main`).
     that can name it, and Reset.
 - `studio_theme` implements `theme::ThemeSettingsProvider` from these settings: UI font,
   buffer font, sizes, density.
-- The default light theme is Vitesse Refined Light (2026-10-16; it was One Light), the theme
-  Ragnor uses in Zed. Studio bundles its family unchanged from the Zed extension
-  `vitesse-theme-refined` 0.5.0 (MIT, Colin Lienard, after Anthony Fu's MIT Vitesse) as
-  `assets/themes/vitesse-refined/`; `studio_theme::Assets` lists Studio's themes beside Zed's, so
-  Zed's loader registers them before the first window, and all five appear in the theme menus.
-  The dark default stays One Dark.
+- **Gray tones** (since 2026-10-20). The default themes are Studio Light and Studio Dark
+  (`assets/themes/studio/studio-theme.json`): Vitesse Refined Light and Dark with every interface
+  grey replaced by interfaces.dev's scale, written by `script/studio-theme.py`, the one place the
+  greys are named. Text is `--color-gray-1200` (`#202020`; dark `#eee`), muted text and icons
+  `-1100` (`#646464`; `#b5b5b5`), a placeholder and a line number `-800` (`#bbb`; `#606060`),
+  a border `-400` (`#e8e8e8`; `#252525`) and its quieter variant `-300`; the window's chrome
+  (sidebar, tab bar, status bar) is the page (`#fcfcfc`; `#101010`), a document and an active tab
+  the card (`#fff`; `#0b0b0b`), and a floating surface white (dark `#191919`). A hover, a
+  selection, a guide or a scrollbar is the text grey at a low alpha, so it holds on any fill.
+  Vitesse keeps its syntax, terminal and status colours. Vitesse Refined Light was the default
+  from 2026-10-16 (One Light before), the dark default One Dark; Studio still bundles Vitesse's
+  family unchanged from the Zed extension `vitesse-theme-refined` 0.5.0 (MIT, Colin Lienard,
+  after Anthony Fu's MIT Vitesse) as `assets/themes/vitesse-refined/`, and `studio_theme::Assets`
+  lists Studio's themes beside Zed's, so Zed's loader registers them before the first window and
+  all of them appear in the theme menus.
+- **Switches** (since 2026-10-20) are Studio's own (`ds::switch`): a pill track, ink when on and
+  the divider's grey when off, and a knob in the solid surface with `shadow-custom`. Zed's
+  `Switch` drew its knob in the theme's text colour, the ink of an on track, so an on switch
+  showed no knob, and framed it in the theme's `border.transparent`, which Vitesse paints grey.
 
 ### Modals
 
@@ -691,6 +704,8 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-20 | Studio's greys are interfaces.dev's | Its `--color-gray-*`, `--color-gray-background` and `--color-preview-*`, light and dark (`_next/static/immutable/chunks/26aw_19s171nu.css`); `script/studio-theme.py`; `studio_theme` test `studio_themes_are_listed_and_read_as_families`; `studio` test `settings_apply`; offscreen snapshots of Settings, the table, History and the ontology in Studio Light and Studio Dark | Text `#202020`, muted `#646464`, placeholders `#bbb`, borders `#e8e8e8`, chrome `#fcfcfc` and documents white; dark `#101010`, `#0b0b0b`, `#191919`, text `#eee`, rings 8 % white. Vitesse's syntax and status colours kept |
+| 2026-10-20 | An on switch shows its knob | Offscreen snapshots of Settings' "Show memory and CPU", light and dark; Zed `v1.23.2` `crates/ui/src/components/toggle.rs` (`thumb_color = base_color`, the text colour) | Before, a dark pill in a grey frame with no knob; now an ink track with a white knob (dark: a light track with a dark knob) |
 | 2026-10-20 | Shadows and borders are interfaces.dev's | Its stylesheets (`_next/static/immutable/chunks/26aw_19s171nu.css`: `--shadow-custom`, `-hover`, `-active`, `--shadow-border`, the `.dark` values); a reference page with those values at whole pixels, captured at 2x in the app's browser; offscreen 2x snapshots of the design gallery | Out from a card's bottom edge, the CSS reads 226, 232, 245, 252, 249, 250 and Studio 226, 230, 247, 249, 251, 251; from its left edge 232, 239, 249, 254 and 235, 236, 252, 253. With the ring drawn as the element's border the bottom edge had read 240, 240, 247: the fill hid the drops. Workspace Clippy (`-D warnings`), 609 tests, and the design-token and layer guards pass |
 | 2026-10-20 | GPUI's shadow blur is a sigma | Zed `v1.23.2` `crates/gpui_apple/src/shaders.metal` (`gaussian(y, shadow.blur_radius)`, `erf(… (sqrt(0.5) / sigma))`, the `blur_radius == 0` branch) and `crates/gpui/src/window.rs` `paint_drop_shadows` | `blur_radius` is the Gaussian's sigma, half of CSS's blur; a zero blur draws a hard edge with 1 px antialiasing; every shadow keeps the element's corner radii |
 | 2026-10-19 | A node has one name everywhere, chosen per graph and type | See spec 006's row of this date (the same checks) | The choice lives on the schema model, so the canvas, tree, inspector, tables and palette take it from one place; the table keeps its columns, filters, order and grouping and reads its rows again, the explorer reads its names again at the same commit with every path as it was, and the inspector renames its title from the values held and reads the neighbours it shows again |

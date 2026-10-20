@@ -1,8 +1,8 @@
 {
   "theme": {
     "mode": "system",
-    "light": "Vitesse Refined Light",
-    "dark": "One Dark"
+    "light": "Studio Light",
+    "dark": "Studio Dark"
   },
   "ui_font_family": null,
   "ui_font_size": 15.0,

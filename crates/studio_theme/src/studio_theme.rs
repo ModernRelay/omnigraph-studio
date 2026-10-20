@@ -16,10 +16,18 @@ mod icons;
 /// Themes Studio bundles beside Zed's, by asset path (`assets/themes/` in this repository, with
 /// their notices in `assets/themes/LICENSES`). Zed's theme loader lists `themes/` and loads each
 /// family, so these are registered with Zed's own.
-const STUDIO_THEMES: &[(&str, &[u8])] = &[(
-    "themes/vitesse-refined/vitesse-theme-refined.json",
-    include_bytes!("../../../assets/themes/vitesse-refined/vitesse-theme-refined.json"),
-)];
+const STUDIO_THEMES: &[(&str, &[u8])] = &[
+    (
+        "themes/vitesse-refined/vitesse-theme-refined.json",
+        include_bytes!("../../../assets/themes/vitesse-refined/vitesse-theme-refined.json"),
+    ),
+    // Studio Light and Studio Dark, the defaults: Vitesse Refined with interfaces.dev's greys,
+    // written by `script/studio-theme.py`.
+    (
+        "themes/studio/studio-theme.json",
+        include_bytes!("../../../assets/themes/studio/studio-theme.json"),
+    ),
+];
 
 /// Inter, Tower's typeface and Studio's default interface font (`assets/fonts/inter/`, with its
 /// OFL licence): the weights Studio draws, static files GPUI loads as they are.
@@ -153,10 +161,9 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
-        assert!(
-            names.iter().any(|name| name == "Vitesse Refined Light"),
-            "{names:?}"
-        );
+        for name in ["Vitesse Refined Light", "Studio Light", "Studio Dark"] {
+            assert!(names.iter().any(|named| named == name), "{name}: {names:?}");
+        }
     }
 
     #[test]
