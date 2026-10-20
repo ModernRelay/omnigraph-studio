@@ -76,13 +76,13 @@ pub(crate) fn session_routing(
     (session, asked)
 }
 
-/// As [`session_routing`], every write matching nothing, as one bound to a value that changed
-/// elsewhere does: it commits nothing.
+/// As [`session_followed`], every write matching nothing, as one bound to a value the other
+/// writer changed does: it commits nothing.
 pub(crate) fn session_routing_unmatched(
     schema: &str,
     answer: impl Fn(&Value) -> Value + Send + Sync + 'static,
     cx: &mut TestAppContext,
-) -> Entity<GraphSession> {
+) -> (Entity<GraphSession>, Arc<Writer>) {
     let unmatched = json!({
         "branch": "main",
         "query_name": "q",
@@ -90,7 +90,15 @@ pub(crate) fn session_routing_unmatched(
         "affected_edges": 0,
         "commit": null,
     });
-    serve_with(schema, Arc::new(answer), always(200, unmatched), None, cx)
+    let writer = Arc::new(Writer::default());
+    let session = serve_with(
+        schema,
+        Arc::new(answer),
+        always(200, unmatched),
+        Some(writer.clone()),
+        cx,
+    );
+    (session, writer)
 }
 
 /// Another writer's commits, which the fake server's head and change feed follow: the head
@@ -327,7 +335,17 @@ fn serve_with(
             } else if path.ends_with("/query") {
                 let mut bytes = Vec::new();
                 request.into_body().read_to_end(&mut bytes).await.ok();
-                let asked: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                let mut asked: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                // A read at a commit is answered there; a read of the branch at the other
+                // writer's newest commit, or c1. The rows see it as `at`.
+                let at = asked["snapshot"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| writer.as_ref().and_then(|writer| writer.head()))
+                    .unwrap_or_else(|| "c1".to_owned());
+                if let Some(asked) = asked.as_object_mut() {
+                    asked.insert("at".into(), Value::String(at.clone()));
+                }
                 let rows = rows(&asked);
                 // A read of nodes' fields gets the nodes answered in its shape.
                 let rows = if asked["name"] == "studio_nodes_fields" {
@@ -345,13 +363,6 @@ fn serve_with(
                         ))
                         .unwrap());
                 }
-                // A read at a commit is answered there; a read of the branch at the other
-                // writer's newest commit, or c1.
-                let at = asked["snapshot"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .or_else(|| writer.as_ref().and_then(|writer| writer.head()))
-                    .unwrap_or_else(|| "c1".to_owned());
                 (
                     200,
                     json!({

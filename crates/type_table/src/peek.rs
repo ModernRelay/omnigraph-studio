@@ -62,7 +62,7 @@ const COUNT_DELAY: Duration = Duration::from_millis(120);
 static NULL: Value = Value::Null;
 
 /// Why a field opens again when its write matched nothing and the node could not be read to
-/// say what it holds now.
+/// say what it holds now, or was read still holding the value the write was bound to.
 const CHANGED_UNREAD: &str =
     "The value changed elsewhere while you were editing. Nothing was written.";
 
@@ -213,6 +213,28 @@ struct FieldWrite {
     shown: Value,
 }
 
+/// A draft as ⌘S sent it: the value it was bound to, the one it asks for, and the text typed.
+struct SentDraft {
+    name: String,
+    old: Value,
+    new: Value,
+    text: String,
+}
+
+/// A read of the node sent ([`NodePeek::send_node_read`]): what its answer is landed with.
+struct NodeRead {
+    /// Which of the view's reads of the node it is ([`NodePeek::node_reads`]).
+    sent: u64,
+    /// Read as fields, without the properties the commit does not hold.
+    fields: bool,
+    /// The head the session held, when the read pins the view there.
+    asked: Option<String>,
+}
+
+/// What a read of the node found: its values; `Some(None)` when it is gone, `None` when it
+/// could not be read.
+type Held = Option<Option<Map<String, Value>>>;
+
 /// Adding a relationship from the node: the search over the other type and what it found.
 struct AddEdge {
     /// The relationship group it adds to.
@@ -308,6 +330,12 @@ pub struct NodePeek {
     awaiting_changes: bool,
     /// The node's read: a newer one replaces it, so an older answer never lands over it.
     _node_read: Option<Task<()>>,
+    /// The reads of the node sent ([`Self::send_node_read`]). An answer lands only while its
+    /// read is the newest, so a write's read of the node that comes back after the view was
+    /// read again is dropped.
+    node_reads: u64,
+    /// Refresh asking after the branch's head before it reads the node again.
+    _refresh: Option<Task<()>>,
     /// Takes the copied mark down; a refresh keeps it, and a second copy starts it again.
     _copied: Option<Task<()>>,
     _subscription: Subscription,
@@ -420,7 +448,8 @@ impl NodePeek {
                 this.group_notices.clear();
                 this.drafts_notice = None;
                 this.confirm_discard = false;
-                this.refresh(cx);
+                this._refresh = None;
+                this.reload(cx);
                 return;
             }
             // Another writer changed the schema: the view stays as read until Refresh.
@@ -484,6 +513,8 @@ impl NodePeek {
             groups_absent: Vec::new(),
             awaiting_changes: false,
             _node_read: None,
+            node_reads: 0,
+            _refresh: None,
             _copied: None,
             _subscription: subscription,
         };
@@ -574,9 +605,31 @@ impl NodePeek {
         self.awaiting_changes = false;
     }
 
-    /// Reads a node again at the branch head, with its relationships and Blobs, under the
-    /// session's schema.
+    /// Refresh: the branch's head is asked after first, and the node read again at the head the
+    /// session then holds ([`Self::reload`]). The session may not hold the newest head yet, and
+    /// a pin at the head it holds is one it compares the next heads with.
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        let branch = self.branch.clone();
+        let head = self
+            .session
+            .update(cx, |session, cx| session.head_now(&branch, cx));
+        self._refresh = Some(cx.spawn(async move |this, cx| {
+            head.await;
+            this.update(cx, |this, cx| this.reload(cx)).ok();
+        }));
+    }
+
+    /// Reads a node again at the head the session holds, with its relationships and Blobs,
+    /// under the session's schema.
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        self.forget_shown(cx);
+        self.load_node(cx);
+        cx.notify();
+    }
+
+    /// Lets go of what the view shows, before the node is read again at the head the session
+    /// holds, under the session's schema.
+    fn forget_shown(&mut self, cx: &mut Context<Self>) {
         let schema = self
             .session
             .read(cx)
@@ -597,17 +650,55 @@ impl NodePeek {
                 session.reset_scope(scope, &branch);
             });
         }
-        self.load_node(cx);
+    }
+
+    /// For a write on `branch` that matched nothing: the view moves to the head the session
+    /// holds, as [`Self::reload`] does, and the read of the node is handed back for the write to
+    /// land ([`Self::node_read_landed`]) and settle against. A Refresh waiting for the head, or
+    /// a read of the node out, gives way to it. `None` when the view reads another branch now,
+    /// or no read can be built.
+    fn reread_at_head(
+        &mut self,
+        branch: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<(Task<Result<ReadOutput, ReadError>>, NodeRead)> {
+        if self.branch != branch {
+            return None;
+        }
+        self._refresh = None;
+        self._node_read = None;
+        self.forget_shown(cx);
+        let read = self.send_node_read(cx);
         cx.notify();
+        read
     }
 
     fn load_node(&mut self, cx: &mut Context<Self>) {
-        let PeekSubject::Node { type_name, id } = &self.subject else {
+        let Some((read, sent)) = self.send_node_read(cx) else {
             return;
+        };
+        self._node_read = Some(cx.spawn(async move |this, cx| {
+            let result = read.await;
+            this.update(cx, |this, cx| {
+                this.node_read_landed(result, sent, cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Sends a read of the node at the commit the view shows, else at the head the session
+    /// holds, with what its answer is landed with ([`Self::node_read_landed`]). `None` when no
+    /// read can be built: the view says why.
+    fn send_node_read(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(Task<Result<ReadOutput, ReadError>>, NodeRead)> {
+        let PeekSubject::Node { type_name, id } = &self.subject else {
+            return None;
         };
         let Some(schema) = self.schema.clone() else {
             self.values = Loadable::Failed("The schema is still loading.".into());
-            return;
+            return None;
         };
         // At a commit made before a property was added or renamed, the whole node is refused:
         // the rest of it is read as fields.
@@ -622,10 +713,9 @@ impl NodePeek {
             Ok(query) => query,
             Err(error) => {
                 self.values = Loadable::Failed(error.to_string());
-                return;
+                return None;
             }
         };
-        let type_name = type_name.clone();
         self.values = Loadable::Loading;
         // At the head the session knows, a node kept there answers at once: a table's page
         // read it already.
@@ -637,70 +727,89 @@ impl NodePeek {
         // sees move while it is out finds no pin to compare, and is compared once it lands.
         let asked = self.snapshot.is_none().then(|| snapshot.clone()).flatten();
         let read = self.read_shown(&query, snapshot, cx);
-        self._node_read = Some(cx.spawn(async move |this, cx| {
-            let result = read.await;
-            this.update(cx, |this, cx| {
-                match result {
-                    Ok(output) => {
-                        if this.snapshot.is_none() {
-                            this.snapshot = output.graph_commit_id.clone();
-                            if asked.is_some()
-                                && this.snapshot == asked
-                                && this.saving.is_empty()
-                                && this.edge_writes.is_empty()
-                            {
-                                this.compare_head(cx);
-                            }
-                        }
-                        let rows = if fields {
-                            field_rows(&output.rows)
-                        } else {
-                            node_rows(&output.rows)
-                        };
-                        let values = rows.into_iter().next().map(|row| row.values);
-                        match values {
-                            Some(values) => {
-                                this.values = Loadable::Loaded(values);
-                                this.load_groups(cx);
-                                this.load_blobs(false, cx);
-                            }
-                            None => {
-                                this.values = Loadable::Failed(
-                                    "This node does not exist at this commit.".into(),
-                                );
-                            }
-                        }
+        self.node_reads += 1;
+        let sent = NodeRead {
+            sent: self.node_reads,
+            fields,
+            asked,
+        };
+        Some((read, sent))
+    }
+
+    /// Lands the answer to a read of the node ([`Self::send_node_read`]): the view shows the
+    /// node as read, pinned to the commit it was read at. Hands back what it found; `None` too
+    /// when it is not the view's newest read, whose answer is dropped: the view was read again
+    /// since it was sent.
+    fn node_read_landed(
+        &mut self,
+        result: Result<ReadOutput, ReadError>,
+        read: NodeRead,
+        cx: &mut Context<Self>,
+    ) -> Held {
+        if read.sent != self.node_reads {
+            return None;
+        }
+        let NodeRead { fields, asked, .. } = read;
+        let type_name = self.subject.type_name().to_owned();
+        let mut found = None;
+        match result {
+            Ok(output) => {
+                if self.snapshot.is_none() {
+                    self.snapshot = output.graph_commit_id.clone();
+                    if asked.is_some()
+                        && self.snapshot == asked
+                        && self.saving.is_empty()
+                        && self.edge_writes.is_empty()
+                    {
+                        self.compare_head(cx);
                     }
-                    Err(ReadError::Refused(refusal)) => match refusal.historical_gap() {
-                        Some(HistoricalGap::Property {
-                            owner,
-                            property,
-                            then,
-                        }) if owner == type_name
-                            && !this.absent.contains_key(&property)
-                            && this
-                                .schema
-                                .as_ref()
-                                .and_then(|schema| schema.node(&type_name))
-                                .is_some_and(|node| node.property(&property).is_some()) =>
-                        {
-                            // Once per property, so this ends.
-                            this.absent.insert(property, then);
-                            this.load_node(cx);
-                        }
-                        Some(HistoricalGap::Type { name }) if name == type_name => {
-                            this.values = Loadable::Failed(format!(
-                                "{type_name} did not exist at this commit."
-                            ));
-                        }
-                        _ => this.values = Loadable::Failed(refusal.message),
-                    },
-                    Err(error) => this.values = Loadable::Failed(error.to_string()),
                 }
-                cx.notify();
-            })
-            .ok();
-        }));
+                let rows = if fields {
+                    field_rows(&output.rows)
+                } else {
+                    node_rows(&output.rows)
+                };
+                let values = rows.into_iter().next().map(|row| row.values);
+                found = Some(values.clone());
+                match values {
+                    Some(values) => {
+                        self.values = Loadable::Loaded(values);
+                        self.load_groups(cx);
+                        self.load_blobs(false, cx);
+                    }
+                    None => {
+                        self.values =
+                            Loadable::Failed("This node does not exist at this commit.".into());
+                    }
+                }
+            }
+            Err(ReadError::Refused(refusal)) => match refusal.historical_gap() {
+                Some(HistoricalGap::Property {
+                    owner,
+                    property,
+                    then,
+                }) if owner == type_name
+                    && !self.absent.contains_key(&property)
+                    && self
+                        .schema
+                        .as_ref()
+                        .and_then(|schema| schema.node(&type_name))
+                        .is_some_and(|node| node.property(&property).is_some()) =>
+                {
+                    // Once per property, so this ends.
+                    self.absent.insert(property, then);
+                    self.load_node(cx);
+                }
+                Some(HistoricalGap::Type { name }) if name == type_name => {
+                    self.values =
+                        Loadable::Failed(format!("{type_name} did not exist at this commit."));
+                }
+                _ => self.values = Loadable::Failed(refusal.message),
+            },
+            Err(error) => self.values = Loadable::Failed(error.to_string()),
+        }
+        cx.notify();
+        found
     }
 
     /// The subject's Blob properties.
@@ -1859,10 +1968,12 @@ impl NodePeek {
         cx.notify();
     }
 
-    /// A field's write matched nothing: the value it was bound to changed elsewhere. Reads the
-    /// property at the branch's head, and opens the field again bound to what it holds now,
-    /// which the view shows and the notice names; without that read, still bound to the value
-    /// it was typed over. The field shows as saving until the read lands.
+    /// A field's write matched nothing: the value it was bound to changed elsewhere. The view
+    /// moves to the branch's head: the head is asked after, and the node read again at the one
+    /// the session then holds ([`Self::reread_at_head`]). The field opens again bound to the
+    /// value the view then shows, which the notice names. When the node could not be read, or
+    /// the read still finds the value the field was typed over, it stays bound to that value.
+    /// The field shows as saving until the read lands.
     fn reread_conflict(
         &mut self,
         property: gq_language::Property,
@@ -1872,30 +1983,42 @@ impl NodePeek {
         cx: &mut Context<Self>,
     ) {
         let name = property.name.clone();
-        let Some(read) = self.read_at_head(std::slice::from_ref(&name), cx) else {
-            let notice = Notice::new(Tone::Conflict, CHANGED_UNREAD);
-            self.reopen(property, old, text, notice, window, cx);
-            return;
-        };
         self.saving.insert(name.clone());
         let (session, branch, key) = (
             self.session.clone(),
             self.branch.clone(),
             self.draft_key(&name),
         );
-        let id = self.subject.id().to_owned();
+        let head = session.update(cx, |session, cx| session.head_now(&branch, cx));
         // Detached, as the write was: the text is settled however the view ends.
         cx.spawn_in(window, async move |this, cx| {
-            let now = held_now(read.await, &id);
+            head.await;
+            let read = this
+                .update(cx, |this, cx| this.reread_at_head(&branch, cx))
+                .ok()
+                .flatten();
+            let landed = match read {
+                Some((read, sent)) => Some((read.await, sent)),
+                None => None,
+            };
             let shown = this.update_in(cx, |this, window, cx| {
+                let found =
+                    landed.and_then(|(result, sent)| this.node_read_landed(result, sent, cx));
                 this.saving.remove(&name);
                 if this.branch == branch {
+                    // Dropped for a newer read of the view's, it settles against what the view
+                    // shows.
+                    let now = found.or_else(|| this.values.loaded().cloned().map(Some));
                     let (bound, notice) = match &now {
                         Some(Some(values)) => {
                             let value = values.get(&name).cloned().unwrap_or(Value::Null);
-                            this.restore(&name, value.clone());
-                            let notice = changed_elsewhere(Some(&property), Some(&value));
-                            (value, notice)
+                            if same_value(&value, &old) {
+                                // The read did not reach the change.
+                                (old.clone(), Notice::new(Tone::Conflict, CHANGED_UNREAD))
+                            } else {
+                                let notice = changed_elsewhere(Some(&property), Some(&value));
+                                (value, notice)
+                            }
                         }
                         Some(None) => (old.clone(), Notice::new(Tone::Conflict, NODE_GONE)),
                         None => (old.clone(), Notice::new(Tone::Conflict, CHANGED_UNREAD)),
@@ -1924,49 +2047,41 @@ impl NodePeek {
         .detach();
     }
 
-    /// Reads `properties` of the node at the branch's head; `None` when no such read can be
-    /// built (no schema, or a property it does not hold). [`held_now`] reads its answer.
-    fn read_at_head(
-        &self,
-        properties: &[String],
-        cx: &mut Context<Self>,
-    ) -> Option<Task<Result<ReadOutput, ReadError>>> {
-        let PeekSubject::Node { type_name, id } = &self.subject else {
-            return None;
-        };
-        let schema = self.schema.as_ref()?;
-        let ids = std::slice::from_ref(id);
-        let query = builder::nodes_fields_by_id(schema, type_name, ids, properties).ok()?;
-        let branch = self.branch.clone();
-        Some(
-            self.session
-                .update(cx, |session, cx| session.read_on(&branch, &query, cx)),
-        )
-    }
-
     /// ⌘S matched nothing: a value its drafts were bound to changed elsewhere, and nothing was
-    /// written. Reads them at the branch's head ([`Self::drafts_read`] settles them); each
-    /// shows as saving until the read lands.
-    fn reread_drafts(&mut self, cells: Vec<(String, Value, Value)>, cx: &mut Context<Self>) {
-        let names: Vec<String> = cells.iter().map(|(name, ..)| name.clone()).collect();
-        let Some(read) = self.read_at_head(&names, cx) else {
-            self.drafts_read(cells, None, cx);
-            return;
-        };
-        self.saving.extend(names.iter().cloned());
+    /// written. The view moves to the branch's head as for a field ([`Self::reread_conflict`]),
+    /// and [`Self::drafts_read`] settles the drafts against what it then shows; each shows as
+    /// saving until the read lands.
+    fn reread_drafts(&mut self, sent: Vec<SentDraft>, cx: &mut Context<Self>) {
+        self.saving
+            .extend(sent.iter().map(|draft| draft.name.clone()));
         let branch = self.branch.clone();
-        let id = self.subject.id().to_owned();
+        let head = self
+            .session
+            .update(cx, |session, cx| session.head_now(&branch, cx));
         // Detached: a view that goes leaves the drafts as they were bound, since what the head
         // holds was never shown.
         cx.spawn(async move |this, cx| {
-            let now = held_now(read.await, &id);
+            head.await;
+            let read = this
+                .update(cx, |this, cx| this.reread_at_head(&branch, cx))
+                .ok()
+                .flatten();
+            let landed = match read {
+                Some((read, node)) => Some((read.await, node)),
+                None => None,
+            };
             this.update(cx, |this, cx| {
-                for name in &names {
-                    this.saving.remove(name);
+                let found =
+                    landed.and_then(|(result, node)| this.node_read_landed(result, node, cx));
+                for draft in &sent {
+                    this.saving.remove(&draft.name);
                 }
                 // The view reads another branch now: the drafts stay as they were typed there.
                 if this.branch == branch {
-                    this.drafts_read(cells, now.as_ref(), cx);
+                    // Dropped for a newer read of the view's, it settles against what the view
+                    // shows.
+                    let now = found.or_else(|| this.values.loaded().cloned().map(Some));
+                    this.drafts_read(sent, now.as_ref(), cx);
                 }
                 if this.saving.is_empty() && this.edge_writes.is_empty() {
                     this.compare_head(cx);
@@ -1978,35 +2093,40 @@ impl NodePeek {
         .detach();
     }
 
-    /// Settles drafts ⌘S sent that matched nothing, read again at the head (`now`, as
-    /// [`held_now`] gives it). A draft asking for what the node holds now goes; one over a value
-    /// that changed is bound to the value read, which the view then shows; the others stay as
-    /// they were bound. The drafts' notice names what changed. A draft changed or discarded
-    /// while the read was out stands as it is.
+    /// Settles drafts ⌘S sent that matched nothing, against the node read again at the head
+    /// (`now`, as [`Held`] says it), which the view shows. A draft asking for what the node
+    /// holds now goes; one over a value that changed is bound to the value read; the others
+    /// stay as they were bound. The drafts' notice names what changed. A draft retyped,
+    /// rebound or let go while the read was out, here or in another view, stands as it is.
     fn drafts_read(
         &mut self,
-        cells: Vec<(String, Value, Value)>,
+        sent: Vec<SentDraft>,
         now: Option<&Option<Map<String, Value>>>,
         cx: &mut Context<Self>,
     ) {
         let mut changed = Vec::new();
         if let Some(Some(values)) = now {
-            for (name, old, new) in cells {
-                let Some(draft) = self
+            for draft in sent {
+                let SentDraft {
+                    name,
+                    old,
+                    new,
+                    text,
+                } = draft;
+                // Still as it was sent: bound to the same value, with the same text.
+                let as_sent = self
                     .draft_of(&name, cx)
-                    .filter(|draft| same_value(&draft.old, &old))
-                else {
+                    .is_some_and(|held| same_value(&held.old, &old) && held.text == text);
+                if !as_sent {
                     continue;
-                };
+                }
                 let value = values.get(&name).cloned().unwrap_or(Value::Null);
                 if same_value(&value, &new) {
-                    self.restore(&name, value);
                     self.drop_draft(&name, cx);
                 } else if !same_value(&value, &old) {
                     let shown = display_value(self.property_named(&name), &value);
                     changed.push(format!("{name} to “{shown}”"));
-                    self.restore(&name, value.clone());
-                    self.put_draft(&name, value, draft.text, cx);
+                    self.put_draft(&name, value, text, cx);
                 }
             }
         }
@@ -2520,7 +2640,7 @@ impl NodePeek {
         else {
             return;
         };
-        let mut cells = Vec::new();
+        let mut sent = Vec::new();
         for (name, draft) in self.node_drafts(cx) {
             // A field's own save under way keeps its draft until it lands; sent again, the two
             // writes would race on one value.
@@ -2552,12 +2672,21 @@ impl NodePeek {
                 // the change.
                 None => old.clone(),
             };
-            cells.push((name, old, new));
+            sent.push(SentDraft {
+                name,
+                old,
+                new,
+                text: draft.text,
+            });
         }
-        if cells.is_empty() {
+        if sent.is_empty() {
             cx.notify();
             return;
         }
+        let cells: Vec<(String, Value, Value)> = sent
+            .iter()
+            .map(|draft| (draft.name.clone(), draft.old.clone(), draft.new.clone()))
+            .collect();
         let branch = self.branch.clone();
         // A list among them, which a write's `where` cannot compare, is compared at the head
         // first (`write_properties`).
@@ -2579,27 +2708,27 @@ impl NodePeek {
         };
         self.saving_drafts = true;
         self.drafts_notice = None;
-        for (name, _, _) in &cells {
-            self.saving.insert(name.clone());
+        for draft in &sent {
+            self.saving.insert(draft.name.clone());
         }
         let session = self.session.clone();
-        let keys: Vec<DraftKey> = cells
+        let keys: Vec<DraftKey> = sent
             .iter()
-            .filter_map(|(name, _, _)| self.draft_key(name))
+            .filter_map(|draft| self.draft_key(&draft.name))
             .collect();
         cx.spawn_in(window, async move |this, cx| {
             let result = write.await;
             let saved = matches!(result, SaveResult::Saved { .. });
             let shown = this.update(cx, |this, cx| {
                 this.saving_drafts = false;
-                for (name, _, _) in &cells {
-                    this.saving.remove(name);
+                for draft in &sent {
+                    this.saving.remove(&draft.name);
                 }
                 // The view reads another branch now: the drafts saved were the branch left's.
                 if this.branch != branch {
                     if let SaveResult::Saved { .. } = result {
-                        for (name, _, _) in &cells {
-                            this.drop_draft_on(&branch, name, cx);
+                        for draft in &sent {
+                            this.drop_draft_on(&branch, &draft.name, cx);
                         }
                     }
                     cx.notify();
@@ -2607,9 +2736,9 @@ impl NodePeek {
                 }
                 match result {
                     SaveResult::Saved { commit, parent } => {
-                        for (name, _, new) in cells {
-                            this.restore(&name, new);
-                            this.drop_draft(&name, cx);
+                        for draft in sent {
+                            this.restore(&draft.name, draft.new);
+                            this.drop_draft(&draft.name, cx);
                         }
                         if parent.is_some() && parent == this.snapshot {
                             this.snapshot = Some(commit);
@@ -2619,9 +2748,9 @@ impl NodePeek {
                     }
                     SaveResult::NoMatch => {
                         this.newer = true;
-                        // What the node holds now is read at the head, and the drafts bound
-                        // to it.
-                        this.reread_drafts(cells, cx);
+                        // The view moves to the head, and the drafts are bound to what it
+                        // holds there.
+                        this.reread_drafts(sent, cx);
                     }
                     SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
                         this.drafts_notice = Some(notice);
@@ -3739,16 +3868,6 @@ async fn read_first_edges(
         Err(error) => Loadable::Failed(error),
     };
     Some(Ok(FirstEdges { shown, count }))
-}
-
-/// What a read of the node's fields ([`NodePeek::read_at_head`]) found of node `id`: its
-/// values; `Some(None)` when it is gone, `None` when it could not be read.
-fn held_now(read: Result<ReadOutput, ReadError>, id: &str) -> Option<Option<Map<String, Value>>> {
-    let output = read.ok()?;
-    let row = field_rows(&output.rows)
-        .into_iter()
-        .find(|row| row.id == id);
-    Some(row.map(|row| row.values))
 }
 
 fn neighbours_from(rows: &Value) -> Vec<Neighbour> {
@@ -5222,9 +5341,9 @@ mod tests {
         view.read_with(cx, |view, _| assert!(view.saving.is_empty()));
     }
 
-    /// A write that does not land while the node is being read again (Refresh pressed while it
-    /// was out) cannot open its field: what was typed is kept as the property's draft, bound to
-    /// the value it was typed over, and the node's drafts say why.
+    /// A write that does not land while the node is being read again (a Refresh's read out
+    /// when it lands) cannot open its field: what was typed is kept as the property's draft,
+    /// bound to the value it was typed over, and the node's drafts say why.
     #[gpui::test]
     async fn a_refused_write_during_a_refresh_keeps_its_text_and_reason(cx: &mut TestAppContext) {
         let session = session(PEOPLE, cx);
@@ -5232,7 +5351,7 @@ mod tests {
         view.update_in(cx, |view, window, cx| {
             let person = view.schema.as_ref().unwrap().node("Person").unwrap();
             let property = person.property("name").unwrap().clone();
-            view.refresh(cx);
+            view.reload(cx);
             assert!(matches!(view.values, Loadable::Loading), "read again");
             let field = FieldWrite {
                 property,
@@ -5266,34 +5385,64 @@ mod tests {
         });
     }
 
-    /// A write that matched nothing reads the property at the head: the field opens again bound
-    /// to what the node holds now, which the view shows and the notice names, so the next ↵
-    /// writes over the value seen rather than conflicting again. ⌘S binds its drafts there
-    /// alike.
+    /// A write that matched nothing moves the view to the head: the head is asked after, and
+    /// the node read again at it. The field opens again bound to what the view then shows,
+    /// which the notice names, so the next ↵ writes over the value seen rather than conflicting
+    /// again, and a Refresh keeps that value in view. ⌘S binds its drafts there alike; a draft
+    /// retyped while their read was out stands as it is.
     #[gpui::test]
     async fn a_conflict_is_bound_to_the_value_read_at_the_head(cx: &mut TestAppContext) {
-        let session = crate::test_support::session_routing_unmatched(
+        // Another writer renames Ada at c2, and again at c3.
+        let (session, writer) = crate::test_support::session_routing_unmatched(
             PEOPLE,
-            |request| match request["name"].as_str() {
-                Some("studio_nodes_fields") => json!([{ "id": "p1", "v_name": "Ada B" }]),
-                _ => json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }]),
+            |request| {
+                let name = match request["at"].as_str() {
+                    Some("c2") => "Ada B",
+                    Some("c3") => "Ada C",
+                    _ => "Ada",
+                };
+                json!([{ "n": { "@id": "p1", "slug": "p1", "name": name } }])
             },
             cx,
         );
         let (view, cx) = page(session.clone(), cx);
+        let at_head = |cx: &mut VisualTestContext, commit: &str, value: &str| {
+            session.read_with(cx, |session, _| {
+                assert_eq!(session.head("main"), Some(commit), "asked after")
+            });
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.snapshot.as_deref(),
+                    Some(commit),
+                    "the view is at the head"
+                );
+                assert!(!view.newer);
+                assert_eq!(view.value_of("name"), json!(value), "what the head holds");
+                assert!(view.saving.is_empty());
+            });
+        };
+        writer.commit("c2", vec![changed("node", "Person", "p1", None)]);
         edit_name(&view, "Ada Lovelace", cx);
+        at_head(cx, "c2", "Ada B");
         view.read_with(cx, |view, cx| {
-            assert_eq!(view.value_of("name"), json!("Ada B"), "what the head holds");
             let edit = &view.edits["name"];
             assert_eq!(edit.old, json!("Ada B"), "bound to it");
             assert_eq!(edit.editor.read(cx).text(cx), "Ada Lovelace");
             let notice = edit.notice.as_ref().expect("why it did not land");
             assert_eq!(notice.tone, Tone::Conflict);
             assert!(notice.message.contains("Ada B"), "{}", notice.message);
-            assert!(view.saving.is_empty());
         });
 
-        // A draft typed over the old value: ⌘S finds the change, and binds it to the new one.
+        // Refresh reads at the head again: the value the field is bound to stays in view.
+        view.update(cx, |view, cx| view.refresh(cx));
+        cx.run_until_parked();
+        at_head(cx, "c2", "Ada B");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.edits["name"].old, json!("Ada B"));
+        });
+
+        // A draft typed over the old value: ⌘S finds the change, moves the view to the head,
+        // and binds the draft to what it holds there.
         let key = DraftKey {
             type_name: "Person".into(),
             id: "p1".into(),
@@ -5307,6 +5456,7 @@ mod tests {
             };
             session.set_draft(key.clone(), draft, cx);
         });
+        writer.commit("c3", vec![changed("node", "Person", "p1", None)]);
         view.update_in(cx, |view, window, cx| {
             view.save_drafts(&SaveNodeDrafts, window, cx)
         });
@@ -5315,19 +5465,87 @@ mod tests {
         assert_eq!(
             draft,
             Some(DraftEntry {
-                old: json!("Ada B"),
+                old: json!("Ada C"),
                 text: "Ada King".into(),
             })
         );
+        at_head(cx, "c3", "Ada C");
         view.read_with(cx, |view, _| {
-            assert_eq!(view.value_of("name"), json!("Ada B"));
             let notice = view
                 .drafts_notice
                 .as_ref()
                 .expect("why nothing was written");
-            assert!(notice.message.contains("Ada B"), "{}", notice.message);
-            assert!(view.saving.is_empty() && !view.saving_drafts);
+            assert!(notice.message.contains("Ada C"), "{}", notice.message);
+            assert!(!view.saving_drafts);
         });
+
+        // Retyped (in a table cell, on another page) while the read was out, the draft stands,
+        // whether the head holds the value it was sent asking for or another.
+        let retyped = DraftEntry {
+            old: json!("Ada C"),
+            text: "Ada K.".into(),
+        };
+        for head_holds in ["Ada King", "Ada D"] {
+            session.update(cx, |session, cx| {
+                session.set_draft(key.clone(), retyped.clone(), cx)
+            });
+            view.update(cx, |view, cx| {
+                let sent = SentDraft {
+                    name: "name".into(),
+                    old: json!("Ada C"),
+                    new: json!("Ada King"),
+                    text: "Ada King".into(),
+                };
+                let mut now = view.values.loaded().cloned().unwrap();
+                now.insert("name".into(), json!(head_holds));
+                view.drafts_read(vec![sent], Some(&Some(now)), cx);
+            });
+            let draft = session.read_with(cx, |session, _| session.draft(&key).cloned());
+            assert_eq!(draft.as_ref(), Some(&retyped), "head holds {head_holds}");
+        }
+    }
+
+    /// Refresh wants the newest, which the session may not hold yet: it asks after the head,
+    /// and reads the node at it. A read of the node that lands after the view was read again
+    /// since it was sent is dropped, and puts nothing older back.
+    #[gpui::test]
+    async fn refresh_asks_after_the_head_and_an_older_read_lands_nothing(cx: &mut TestAppContext) {
+        let (session, writer) = session_followed(
+            PEOPLE,
+            |request| {
+                let name = match request["at"].as_str() {
+                    Some("c2") => "Ada B",
+                    _ => "Ada",
+                };
+                json!([{ "n": { "@id": "p1", "slug": "p1", "name": name } }])
+            },
+            cx,
+        );
+        let (view, cx) = page(session.clone(), cx);
+        // A read of the node at the commit shown, out when Refresh is pressed.
+        let (older, sent) = view.update(cx, |view, cx| view.send_node_read(cx)).unwrap();
+        writer.commit("c2", vec![changed("node", "Person", "p1", None)]);
+        view.update(cx, |view, cx| view.refresh(cx));
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.head("main"), Some("c2"))
+        });
+        let at_head = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.snapshot.as_deref(),
+                    Some("c2"),
+                    "read at the head asked after"
+                );
+                assert_eq!(view.value_of("name"), json!("Ada B"));
+                assert!(!view.newer);
+            });
+        };
+        at_head(cx);
+        let answer = older.await;
+        let found = view.update(cx, |view, cx| view.node_read_landed(answer, sent, cx));
+        assert_eq!(found, None, "dropped");
+        at_head(cx);
     }
 
     /// ↵ on a field typed back to the value its draft was typed over lets the draft go, and
@@ -5565,7 +5783,7 @@ mod tests {
         });
         let (ada, ida) = (json!("Ada"), json!("Ida"));
         let query = builder::update_cell(&schema, "Person", "name", "p1", &ada, &ida).unwrap();
-        view.update(cx, |view, cx| view.refresh(cx));
+        view.update(cx, |view, cx| view.reload(cx));
         session
             .update(cx, |session, cx| {
                 session.write(&query, None, "Set name of p1".into(), cx)

@@ -383,8 +383,9 @@ pub fn node_rows(rows: &Value) -> Vec<Row> {
         .collect()
 }
 
-/// Rows of a node read as fields (`builder::node_fields_by_id`, `builder::node_page_fields`),
-/// shaped as a whole-node read gives them: `@id` and the properties that hold a value.
+/// Rows of nodes read as fields (`builder::node_fields_by_id`, `builder::nodes_fields_by_id`,
+/// `builder::node_page_fields`), shaped as a whole-node read gives them: `@id` and the
+/// properties that hold a value.
 pub fn field_rows(rows: &Value) -> Vec<Row> {
     let prefix = gq_language::builder::field_column("");
     let Some(rows) = rows.as_array() else {
