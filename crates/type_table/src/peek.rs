@@ -5895,7 +5895,7 @@ mod tests {
         view.update(cx, |view, cx| view.reload(cx));
         session
             .update(cx, |session, cx| {
-                session.write(&query, None, "Set name of p1".into(), cx)
+                session.write_on("main", &query, None, "Set name of p1".into(), None, cx)
             })
             .detach();
         cx.run_until_parked();

@@ -1749,8 +1749,7 @@ impl GraphSession {
             .retain(|branch, _| watched.contains(branch));
         for branch in std::mem::replace(&mut self.watched, watched.clone()) {
             if !watched.contains(&branch) {
-                self.commit_lists.forget(&branch);
-                self.head_commits.forget(&branch);
+                self.forget_branch(&branch);
             }
         }
         if self.unavailable.is_some() {
@@ -1928,8 +1927,7 @@ impl GraphSession {
             self.read_head(branch.clone(), cx);
         }
         if previous.is_some() && !own && !placed {
-            self.commit_lists.forget(&branch);
-            self.head_commits.forget(&branch);
+            self.forget_branch(&branch);
             if branch == self.branch {
                 self.refresh_counts(cx);
             }
@@ -2463,8 +2461,7 @@ impl GraphSession {
     ) -> Task<Result<CommitList, ReadError>> {
         let key = branch.to_owned();
         if fresh {
-            self.commit_lists.forget(&key);
-            self.head_commits.forget(&key);
+            self.forget_branch(&key);
         }
         let branch = key.clone();
         self.share(
@@ -2891,22 +2888,10 @@ impl GraphSession {
         )
     }
 
-    /// Runs a mutation on the session's branch. `if_commit` binds it to the commit it was read
-    /// at. The outcome is logged; nothing is retried.
-    pub fn write(
-        &mut self,
-        query: &BuiltQuery,
-        if_commit: Option<String>,
-        description: String,
-        cx: &mut Context<Self>,
-    ) -> Task<WriteOutcome<ChangeOutput>> {
-        let branch = self.branch.clone();
-        self.write_on(&branch, query, if_commit, description, None, cx)
-    }
-
-    /// [`Self::write`] on `branch`, whose outcome offers `follow_up` once it commits: each write
-    /// of a chain goes where the first went, and a dialog's where its checks read, though the
-    /// session moved to another branch meanwhile.
+    /// Runs a mutation on `branch`. `if_commit` binds it to the commit it was read at, and its
+    /// outcome offers `follow_up` once it commits. The outcome is logged; nothing is retried.
+    /// The branch is the caller's: each write of a chain goes where the first went, and a
+    /// dialog's where its checks read, though the session moved to another branch meanwhile.
     pub fn write_on(
         &mut self,
         branch: &str,
@@ -3072,8 +3057,7 @@ impl GraphSession {
         if branch == self.branch {
             self.refresh_counts(cx);
         }
-        self.commit_lists.forget(&branch);
-        self.head_commits.forget(&branch);
+        self.forget_branch(&branch);
         cx.emit(SessionEvent::Committed {
             branch: branch.clone(),
         });
@@ -4286,7 +4270,7 @@ mod tests {
         };
         probes.lock().unwrap().clear();
         let write = session.update(cx, |session, cx| {
-            session.write(&query, None, "Set slug".into(), cx)
+            session.write_on("main", &query, None, "Set slug".into(), None, cx)
         });
         write.await;
         cx.run_until_parked();
@@ -4640,7 +4624,7 @@ mod tests {
             ..Default::default()
         };
         let write = session.update(cx, |session, cx| {
-            session.write(&query, None, "Set title".into(), cx)
+            session.write_on("main", &query, None, "Set title".into(), None, cx)
         });
         write.await;
         cx.run_until_parked();
