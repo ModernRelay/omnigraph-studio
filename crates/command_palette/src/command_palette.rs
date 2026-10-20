@@ -751,6 +751,9 @@ impl CommandPalette {
                 let ranked = self.matches.get(ix)?;
                 let candidate = &self.candidates[ranked.index];
                 let row = &self.rows[ranked.index];
+                // A click runs the row clicked, by its key: rows that came in since this frame
+                // was drawn (nodes found, saved queries) can have moved it.
+                let key = candidate.key.clone();
                 let label =
                     HighlightedLabel::new(candidate.label.clone(), ranked.positions.clone())
                         .truncate();
@@ -811,8 +814,13 @@ impl CommandPalette {
                                         .child(div().flex_none().child(end)),
                                 )
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.selected = ix;
-                                    this.run_selected(window, cx);
+                                    let at = this.matches.iter().position(|ranked| {
+                                        this.candidates[ranked.index].key == key
+                                    });
+                                    if let Some(at) = at {
+                                        this.selected = at;
+                                        this.run_selected(window, cx);
+                                    }
                                 })),
                         )
                         .into_any_element(),

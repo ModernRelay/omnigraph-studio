@@ -214,7 +214,6 @@ pub fn edge_hint(edge: &[(String, Value)]) -> Option<String> {
     (hint.chars().count() <= LONGEST).then_some(hint)
 }
 
-/// A grouping value as its row shows it: text as written, other values formatted, and
 /// What a value row of a grouped relationship says: its label, else its value. Grouped by a
 /// relationship of the neighbours, those related to none read "No Company" (the type it
 /// reaches).
@@ -248,6 +247,7 @@ pub fn bucket_row_text(
     }
 }
 
+/// A grouping value as its row shows it: text as written, other values formatted, and
 /// "No value" for neighbours without one.
 pub fn bucket_text(value: &BucketValue) -> String {
     match value.value() {

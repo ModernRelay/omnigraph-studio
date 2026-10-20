@@ -498,6 +498,8 @@ pub fn explore_scene(
         }
     }
 
+    // A chip one path left out and another drew is drawn.
+    hidden.retain(|id| !by_id.contains_key(id));
     if !hidden.is_empty() {
         // The table offered is the type most of them are, or lead to.
         let mut counts: HashMap<&str, usize> = HashMap::new();

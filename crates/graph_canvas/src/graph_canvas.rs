@@ -695,6 +695,22 @@ impl GraphCanvas {
                 }));
             }
             Mode::Explore => {
+                // Chips being dragged are laid out from where they are now, so what opens on
+                // them meanwhile grows from there.
+                let dragged: HashMap<SceneId, Vec2> = match self.drag.as_mut() {
+                    Some(drag) if drag.moved => {
+                        drag.follow(&self.scene);
+                        drag.node
+                            .iter()
+                            .chain(&drag.followers)
+                            .filter_map(|&(index, _)| {
+                                let id = self.scene.nodes.get(index)?.id.clone();
+                                Some((id, *self.positions.get(index)?))
+                            })
+                            .collect()
+                    }
+                    _ => HashMap::new(),
+                };
                 let entries = exploration.entries(cx);
                 let scene = model::explore_scene(
                     &entries,
@@ -720,10 +736,12 @@ impl GraphCanvas {
                         previous: if matches!(node.kind, SceneKind::More { .. }) {
                             None
                         } else {
-                            pin_key(&node.id)
-                                .and_then(|key| self.pinned.get(&key))
-                                .or_else(|| self.known.get(&node.id))
-                                .copied()
+                            dragged.get(&node.id).copied().or_else(|| {
+                                pin_key(&node.id)
+                                    .and_then(|key| self.pinned.get(&key))
+                                    .or_else(|| self.known.get(&node.id))
+                                    .copied()
+                            })
                         },
                     })
                     .collect();
@@ -862,16 +880,16 @@ impl GraphCanvas {
         self.hovered = hovered.and_then(|id| self.scene.index_of(&id));
         self.positions = Arc::new(positions);
         // Chips being dragged stay under the pointer, not where the new layout put them.
-        if let Some(drag) = self.drag.as_mut()
-            && drag.moved
-            && drag.node.is_some()
-        {
+        if let Some(drag) = self.drag.as_mut().filter(|drag| drag.moved) {
+            // Followed first: a drag whose chip the layout removed moves nothing more.
             drag.follow(&self.scene);
-            let positions = Arc::make_mut(&mut self.positions);
-            for &(index, from) in drag.node.iter().chain(&drag.followers) {
-                self.appear.remove(&index);
-                if let Some(position) = positions.get_mut(index) {
-                    *position = from + drag.delta;
+            if drag.node.is_some() {
+                let positions = Arc::make_mut(&mut self.positions);
+                for &(index, from) in drag.node.iter().chain(&drag.followers) {
+                    self.appear.remove(&index);
+                    if let Some(position) = positions.get_mut(index) {
+                        *position = from + drag.delta;
+                    }
                 }
             }
         }
@@ -1652,7 +1670,11 @@ impl GraphCanvas {
                         .entry("Explore from here", None, {
                             // On the explorer the node is drawn already: showing it would only
                             // select it.
-                            let path = node.path.clone().filter(|_| exploring);
+                            // The root explores from itself already: shown, it is centred on.
+                            let path = node
+                                .path
+                                .clone()
+                                .filter(|path| exploring && !path.is_root());
                             let show = open_action(ShowNodeOnCanvas {
                                 type_name: type_name.clone(),
                                 id: key.clone(),
@@ -2244,8 +2266,8 @@ impl GraphCanvas {
             .absolute()
             .bottom(px(space::LG))
             .left(px(space::LG))
-            // A press on the caption is not one on a chip drawn under it.
-            .occlude()
+            // A press on the caption is not one on a chip drawn under it; a drag passes over it.
+            .when(self.drag.is_none(), |caption| caption.occlude())
             .px(px(space::CONTROL_INSET))
             .py(px(space::XS))
             .rounded(px(studio_ui::ds::radii(cx).bar()))
@@ -2713,6 +2735,8 @@ impl Render for GraphCanvas {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::secondary_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
+            // Keys pressed do not count as the pointer leaving.
+            .hover_listener_mode(gpui::HoverListenerMode::InputModalityIndependent)
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 if !*hovered {
                     this.pointer_left(cx);
