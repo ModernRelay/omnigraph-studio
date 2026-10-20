@@ -589,8 +589,9 @@ fn remove_overlaps(x: &mut [Vec2], half: &[Vec2], fixed: &[bool]) {
     }
 }
 
-/// Types on a circle in the order given (sorted by name), so positions depend only on names.
-pub fn schema_positions(count: usize) -> Vec<Vec2> {
+/// Chips on a circle in the order given, so positions depend only on that order: a few
+/// result roots stand this way.
+fn ring_positions(count: usize) -> Vec<Vec2> {
     match count {
         0 => Vec::new(),
         1 => vec![Vec2::default()],
@@ -614,7 +615,7 @@ pub fn result_root_positions(count: usize) -> Vec<Vec2> {
     const ACROSS: f32 = 640.;
     const DOWN: f32 = 200.;
     if count <= RING_MAX {
-        return schema_positions(count);
+        return ring_positions(count);
     }
     // Columns for a grid about 16:9 on screen, given each cell's shape.
     let columns = ((count as f32 * 16. / 9. * DOWN / ACROSS).sqrt().ceil() as usize).max(1);
@@ -1043,7 +1044,7 @@ mod tests {
 
     #[test]
     fn many_result_roots_stand_in_a_landscape_grid_a_view_can_hold() {
-        assert_eq!(result_root_positions(5), schema_positions(5));
+        assert_eq!(result_root_positions(5), ring_positions(5));
         let roots = result_root_positions(4_000);
         let (min, max) = extent(&roots, |_| 0.).unwrap();
         let (width, height) = (max.x - min.x, max.y - min.y);
@@ -1051,7 +1052,7 @@ mod tests {
         // 1,300-pixel view, unlike a ring of 4,000.
         assert!(width > height, "{width} × {height}");
         assert!(width < 1_300. / 0.05 * 2., "{width}");
-        let ring = schema_positions(4_000);
+        let ring = ring_positions(4_000);
         let (ring_min, ring_max) = extent(&ring, |_| 0.).unwrap();
         assert!(ring_max.x - ring_min.x > 4. * width);
         // Every root has its own cell.
@@ -1153,7 +1154,7 @@ mod tests {
     fn the_same_input_lays_out_the_same() {
         let nodes = star(4, 8);
         assert_eq!(explore_positions(&nodes), explore_positions(&nodes));
-        assert_eq!(schema_positions(5), schema_positions(5));
+        assert_eq!(ring_positions(5), ring_positions(5));
     }
 
     #[test]
@@ -1438,7 +1439,7 @@ mod tests {
     fn the_ontology_reads_better_than_a_ring() {
         let (nodes, edges) = crm_like();
         let map = ontology_positions(&nodes, &edges);
-        let ring = schema_positions(nodes.len());
+        let ring = ring_positions(nodes.len());
         assert!(crossings(&map, &edges) * 2 < crossings(&ring, &edges));
         assert!(edge_length(&map, &edges) < edge_length(&ring, &edges));
     }
@@ -1565,8 +1566,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_positions_depend_only_on_order() {
-        let positions = schema_positions(3);
+    fn ring_positions_depend_only_on_order() {
+        let positions = ring_positions(3);
         assert_eq!(positions.len(), 3);
         assert!((positions[0].x).abs() < 1e-3 && positions[0].y < 0.);
         let (min, max) = extent(&positions, |_| 10.).unwrap();

@@ -92,25 +92,44 @@ fn open(
             Some((item.item_id(), item.tab_title(cx).to_string(), first))
         })
         .collect();
-    let saved: Vec<String> = session
-        .as_ref()
-        .map(|session| {
-            studio_settings::saved_queries(&session.read(cx).settings_key(cx))
-                .into_iter()
-                .map(|(path, _)| path.to_string_lossy().into_owned())
-                .filter(|path| !open_paths.contains(path))
-                .collect()
-        })
-        .unwrap_or_default();
+    let saved = SavedQueries {
+        graph: session
+            .as_ref()
+            .map(|session| session.read(cx).settings_key(cx)),
+        open: open_paths,
+    };
     let handle = cx.entity().downgrade();
     workspace.toggle_modal(window, cx, move |window, cx| {
         CommandPalette::new(mode, session, handle, queries, saved, window, cx)
     });
 }
 
+/// The graph whose saved query files the picker lists, and the files a tab has open already,
+/// which it leaves out.
+#[derive(Default)]
+pub(crate) struct SavedQueries {
+    graph: Option<String>,
+    open: Vec<String>,
+}
+
+impl SavedQueries {
+    /// The saved files no tab has open, newest first: read off the main thread, the folder
+    /// listed and each file's time read.
+    fn read(self) -> Vec<String> {
+        let Some(graph) = self.graph else {
+            return Vec::new();
+        };
+        studio_settings::saved_queries(&graph)
+            .into_iter()
+            .map(|(path, _)| path.to_string_lossy().into_owned())
+            .filter(|path| !self.open.contains(path))
+            .collect()
+    }
+}
+
 /// A slice of what the picker lists (spec 002, scope tabs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Scope {
+pub(crate) enum Scope {
     All,
     Types,
     Nodes,
@@ -159,7 +178,7 @@ impl Scope {
 
 /// The picker, in one of its scopes, or the keyboard-shortcut sheet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
+pub(crate) enum Mode {
     Picker(Scope),
     /// `?`: every action with a key binding where the person is.
     Keys,
@@ -267,7 +286,7 @@ const ROW_HEIGHT: f32 = studio_ui::ds::size::PALETTE_ROW;
 const LIST_PAD: f32 = studio_ui::ds::space::XS;
 const VISIBLE_ROWS: usize = 11;
 
-pub struct CommandPalette {
+pub(crate) struct CommandPalette {
     mode: Mode,
     session: Option<Entity<GraphSession>>,
     workspace: WeakEntity<Workspace>,
@@ -281,6 +300,11 @@ pub struct CommandPalette {
     selected: usize,
     scroll: UniformListScrollHandle,
     node_search: Option<Task<()>>,
+    /// The text the node rows are, or are being, found for: a scope that shows nodes looks
+    /// them up again when the text moved on in one that does not.
+    nodes_for: String,
+    /// The graph's saved query files, being read.
+    _saved: Option<Task<()>>,
     /// Nodes are being looked up for the current text: from the keystroke, through the pause,
     /// until every type has answered.
     searching: bool,
@@ -306,12 +330,12 @@ impl Focusable for CommandPalette {
 impl CommandPalette {
     /// Builds the picker from what the focused element offers. Called before focus moves to
     /// the picker, so `available_actions` and the bindings are those of where the person was.
-    pub fn new(
+    fn new(
         mode: Mode,
         session: Option<Entity<GraphSession>>,
         workspace: WeakEntity<Workspace>,
         queries: Vec<(EntityId, String, String)>,
-        saved: Vec<String>,
+        saved: SavedQueries,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -341,21 +365,8 @@ impl CommandPalette {
                 });
                 rows.push(Row::Tab { id, first_line });
             }
-            for path in saved {
-                let name = std::path::Path::new(&path)
-                    .file_stem()
-                    .map(|stem| stem.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.clone());
-                candidates.push(Candidate {
-                    label: name,
-                    key: format!("query-file:{path}"),
-                    group: Group::Query,
-                });
-                rows.push(Row::Saved {
-                    action: Box::new(OpenQueryFile { path: Some(path) }),
-                });
-            }
         }
+        let read_saved = matches!(mode, Mode::Picker(_)) && saved.graph.is_some();
 
         let query = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
@@ -384,12 +395,53 @@ impl CommandPalette {
             selected: 0,
             scroll: UniformListScrollHandle::new(),
             node_search: None,
+            nodes_for: String::new(),
             searching: false,
             answers: Answers::default(),
+            _saved: None,
             _subscription: subscription,
         };
+        if read_saved {
+            let read = cx.background_spawn(async move { saved.read() });
+            palette._saved = Some(cx.spawn(async move |this, cx| {
+                let saved = read.await;
+                this.update(cx, |this, cx| this.add_saved(saved, cx)).ok();
+            }));
+        }
         palette.update_matches(cx);
         palette
+    }
+
+    /// Lists the saved query files with the fixed rows, before any node found.
+    fn add_saved(&mut self, saved: Vec<String>, cx: &mut Context<Self>) {
+        if saved.is_empty() {
+            return;
+        }
+        let (rows, candidates): (Vec<Row>, Vec<Candidate>) = saved
+            .into_iter()
+            .map(|path| {
+                let name = std::path::Path::new(&path)
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                let candidate = Candidate {
+                    label: name,
+                    key: format!("query-file:{path}"),
+                    group: Group::Query,
+                };
+                let row = Row::Saved {
+                    action: Box::new(OpenQueryFile { path: Some(path) }),
+                };
+                (row, candidate)
+            })
+            .unzip();
+        let selected = self.selected_key();
+        let at = self.fixed;
+        self.fixed += rows.len();
+        self.rows.splice(at..at, rows);
+        self.candidates.splice(at..at, candidates);
+        self.update_matches(cx);
+        self.select_key(selected, cx);
     }
 
     /// After a pause in typing, looks up nodes of every node type whose id starts with, or
@@ -402,6 +454,7 @@ impl CommandPalette {
         let Some(session) = self.session.clone() else {
             return;
         };
+        self.nodes_for = text.clone();
         if text.chars().count() < 2 {
             self.node_search = None;
             self.searching = false;
@@ -527,7 +580,12 @@ impl CommandPalette {
             });
         }
         self.update_matches(cx);
-        if let Some(index) = selected.and_then(|key| {
+        self.select_key(selected, cx);
+    }
+
+    /// Highlights the row with candidate key `key` again, where it is ranked now.
+    fn select_key(&mut self, key: Option<String>, cx: &mut Context<Self>) {
+        if let Some(index) = key.and_then(|key| {
             self.matches
                 .iter()
                 .position(|ranked| self.candidates[ranked.index].key == key)
@@ -552,7 +610,7 @@ impl CommandPalette {
         self.query.update(cx, |query, cx| {
             query.set_placeholder_text(placeholder, window, cx)
         });
-        if scope.searches_nodes() && self.rows.len() == self.fixed {
+        if scope.searches_nodes() && self.nodes_for != self.query.read(cx).text(cx).trim() {
             self.schedule_node_search(cx);
         }
         self.update_matches(cx);
@@ -805,7 +863,7 @@ fn add_action_rows(
     rows: &mut Vec<Row>,
     candidates: &mut Vec<Candidate>,
 ) {
-    let documentation = cx.action_documentation().clone();
+    let documentation = cx.action_documentation();
     for action in window.available_actions(cx) {
         let name = action.name();
         if hidden(name) {
@@ -885,17 +943,19 @@ fn add_type_rows(
                 .iter()
                 .map(|e| (e.name.clone(), "edge", graph_store::EntityKind::Edge)),
         );
+    let open = |type_name: String| OpenType {
+        type_name,
+        at_commit: None,
+        filter_id: None,
+        via: None,
+        preview: false,
+    };
+    // Whether a type opens where the person is does not depend on which type it is.
+    if !window.is_action_available(&open(String::new()), cx) {
+        return;
+    }
     for (name, kind, entity) in types {
-        let action = OpenType {
-            type_name: name.clone(),
-            at_commit: None,
-            filter_id: None,
-            via: None,
-            preview: false,
-        };
-        if !window.is_action_available(&action, cx) {
-            return;
-        }
+        let action = open(name.clone());
         candidates.push(Candidate {
             label: name.clone(),
             key: format!("type:{name}"),
@@ -1120,7 +1180,7 @@ mod tests {
                     Some(session),
                     WeakEntity::new_invalid(),
                     Vec::new(),
-                    Vec::new(),
+                    SavedQueries::default(),
                     window,
                     cx,
                 )
@@ -1178,6 +1238,23 @@ mod tests {
             palette.select(p2, cx);
             palette.set_nodes(found(&["p0", "p1", "p2"]), cx);
             assert_eq!(palette.selected_key().as_deref(), Some("node:Person:p2"));
+            // So do saved queries that are listed later.
+            palette.add_saved(vec!["/queries/people.gq".to_owned()], cx);
+            assert_eq!(palette.selected_key().as_deref(), Some("node:Person:p2"));
+        });
+
+        // Text typed in a scope without nodes is looked up on going back to one with them.
+        palette.update_in(cx, |palette, window, cx| {
+            palette.set_scope(Scope::Commands, window, cx);
+            palette
+                .query
+                .update(cx, |query, cx| query.set_text("Bo", window, cx));
+        });
+        cx.run_until_parked();
+        palette.update_in(cx, |palette, window, cx| {
+            assert!(!palette.searching);
+            palette.set_scope(Scope::Nodes, window, cx);
+            assert!(palette.searching, "the node rows were found for other text");
         });
     }
 

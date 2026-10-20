@@ -19,5 +19,10 @@ graph_store = { workspace = true }
 gq_language = { workspace = true }
 theme = { workspace = true }
 
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+graph_store = { workspace = true, features = ["test-support"] }
+studio_theme = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true

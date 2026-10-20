@@ -1,7 +1,9 @@
 //! What the tree shows, without GPUI: row identity, the text a filter matches, filtering that
 //! keeps ancestors, and the moves the keys make.
 
-use graph_store::{BucketValue, Entry, EntryKind, ExplorePath, ExploreState, NodeRef};
+use gq_language::builder::GroupOn;
+use gq_language::{Direction, SchemaModel};
+use graph_store::{BucketValue, Entry, EntryKind, ExplorePath, ExploreState, GroupKey, NodeRef};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -54,8 +56,8 @@ pub fn node_text(state: &ExploreState, node: &NodeRef) -> String {
         .unwrap_or_else(|| node.id.clone())
 }
 
-/// The text a filter matches against.
-pub fn row_text(entry: &Entry, state: &ExploreState) -> String {
+/// The text a filter matches against: what the row says.
+pub fn row_text(entry: &Entry, state: &ExploreState, schema: Option<&SchemaModel>) -> String {
     match &entry.kind {
         EntryKind::Node { node, .. } | EntryKind::Cycle { node, .. } => {
             format!("{} {}", node_text(state, node), node.id)
@@ -69,11 +71,7 @@ pub fn row_text(entry: &Entry, state: &ExploreState) -> String {
                 .unwrap_or_default()
         ),
         EntryKind::Group { key, .. } => format!("{} {}", key.group.edge, key.group.other_type),
-        EntryKind::Bucket { key, .. } => state
-            .bucket_label(key)
-            .map(str::to_owned)
-            .or_else(|| key.within.as_ref().map(|within| bucket_text(&within.value)))
-            .unwrap_or_default(),
+        EntryKind::Bucket { key, .. } => bucket_row_text(key, state, schema),
         EntryKind::OtherValues { .. }
         | EntryKind::More { .. }
         | EntryKind::Loading { .. }
@@ -104,6 +102,7 @@ fn under_empty_group(entries: &[Entry], index: usize) -> bool {
 pub fn filter(
     entries: &[Entry],
     state: &ExploreState,
+    schema: Option<&SchemaModel>,
     query: &str,
     hide_empty: bool,
 ) -> Vec<usize> {
@@ -114,7 +113,11 @@ pub fn filter(
     }
     let mut keep = vec![false; entries.len()];
     for (index, entry) in entries.iter().enumerate() {
-        if index == 0 || row_text(entry, state).to_lowercase().contains(&query) {
+        if index == 0
+            || row_text(entry, state, schema)
+                .to_lowercase()
+                .contains(&query)
+        {
             let mut current = Some(index);
             while let Some(ix) = current {
                 if keep[ix] {
@@ -212,6 +215,39 @@ pub fn edge_hint(edge: &[(String, Value)]) -> Option<String> {
 }
 
 /// A grouping value as its row shows it: text as written, other values formatted, and
+/// What a value row of a grouped relationship says: its label, else its value. Grouped by a
+/// relationship of the neighbours, those related to none read "No Company" (the type it
+/// reaches).
+pub fn bucket_row_text(
+    key: &GroupKey,
+    state: &ExploreState,
+    schema: Option<&SchemaModel>,
+) -> String {
+    let value = key.within.as_ref().map(|within| &within.value);
+    let reached = key
+        .within
+        .as_ref()
+        .filter(|within| within.by.on == GroupOn::Relationship)
+        .filter(|_| value.is_none_or(|value| value.is_null()))
+        .and_then(|within| {
+            let (direction, edge) =
+                gq_language::builder::parse_relationship_key(&within.by.property)?;
+            let edge = schema?.edge(edge)?;
+            Some(match direction {
+                Direction::Outgoing => edge.to.clone(),
+                Direction::Incoming => edge.from.clone(),
+            })
+        });
+    match reached {
+        Some(reached) => format!("No {reached}"),
+        None => state
+            .bucket_label(key)
+            .map(str::to_owned)
+            .or_else(|| value.map(bucket_text))
+            .unwrap_or_default(),
+    }
+}
+
 /// "No value" for neighbours without one.
 pub fn bucket_text(value: &BucketValue) -> String {
     match value.value() {
@@ -317,8 +353,8 @@ mod tests {
                 let entry = &entries[*ix];
                 let text = match &entry.kind {
                     EntryKind::More { shown, total, .. } => more_label(*shown, *total, 50),
-                    EntryKind::Cycle { .. } => format!("↺ {}", row_text(entry, state)),
-                    _ => row_text(entry, state),
+                    EntryKind::Cycle { .. } => format!("↺ {}", row_text(entry, state, None)),
+                    _ => row_text(entry, state, None),
                 };
                 format!("{}{}", "  ".repeat(entry.depth), text.trim())
             })
@@ -328,7 +364,7 @@ mod tests {
     #[test]
     fn the_tree_flattens_with_cycles_and_paging_rows() {
         let (_, state, entries) = fixture();
-        let all = filter(&entries, &state, "", false);
+        let all = filter(&entries, &state, None, "", false);
         let shown = texts(&entries, &state, &all);
         assert_eq!(shown[0], "Ada Lovelace ada");
         assert!(
@@ -344,7 +380,7 @@ mod tests {
     #[test]
     fn filtering_keeps_matches_and_their_ancestors() {
         let (_, state, entries) = fixture();
-        let visible = filter(&entries, &state, "young", false);
+        let visible = filter(&entries, &state, None, "young", false);
         // The group's "Show more" row stays, to search the rest of the group on the server.
         assert_eq!(
             texts(&entries, &state, &visible),
@@ -356,7 +392,7 @@ mod tests {
             ]
         );
         // The root always stays, so the filter never empties the tree.
-        assert_eq!(filter(&entries, &state, "zzz", false), vec![0]);
+        assert_eq!(filter(&entries, &state, None, "zzz", false), vec![0]);
     }
 
     #[test]
@@ -365,8 +401,8 @@ mod tests {
         let bob_knows = GroupKey::new(person("bob"), knows());
         state.counts.insert(bob_knows, Loadable::Loaded(0));
         let entries = state.entries(&schema);
-        let all = filter(&entries, &state, "", false);
-        let without = filter(&entries, &state, "", true);
+        let all = filter(&entries, &state, None, "", false);
+        let without = filter(&entries, &state, None, "", true);
         assert!(without.len() < all.len());
         assert!(without.iter().all(|ix| !matches!(
             &entries[*ix].kind,
@@ -380,7 +416,7 @@ mod tests {
     #[test]
     fn moves_follow_parents_and_children() {
         let (_, state, entries) = fixture();
-        let visible = filter(&entries, &state, "", false);
+        let visible = filter(&entries, &state, None, "", false);
         let group_row = visible
             .iter()
             .position(|ix| matches!(&entries[*ix].kind, EntryKind::Group { key, .. } if key.node.id == "ada" && key.group.edge == "Knows"))
@@ -434,6 +470,27 @@ mod tests {
         assert_eq!(more_label(20, Some(418), 20), "Show 20 more of 398");
         assert_eq!(bucket_text(&BucketValue::new(&json!("lead"))), "lead");
         assert_eq!(bucket_text(&BucketValue::new(&json!(null))), "No value");
+        // Grouped by where people work, those who work nowhere read as the row shows them,
+        // which is what the filter finds them by.
+        let works_at = RelationshipGroup {
+            edge: "WorksAt".into(),
+            direction: Direction::Outgoing,
+            other_type: "Company".into(),
+        };
+        let mut nowhere = GroupKey::new(person("ada"), knows());
+        nowhere.within = Some(graph_store::Within {
+            by: gq_language::builder::GroupBy {
+                on: GroupOn::Relationship,
+                property: gq_language::builder::relationship_key(&works_at),
+            },
+            value: BucketValue::new(&json!(null)),
+        });
+        let schema = SchemaModel::parse(SCHEMA).unwrap();
+        let state = ExploreState::rooted(person("ada"));
+        assert_eq!(
+            bucket_row_text(&nowhere, &state, Some(&schema)),
+            "No Company"
+        );
         assert_eq!(bucket_text(&BucketValue::new(&json!(true))), "true");
         assert_eq!(other_values_label(100, Some(42)), "42 more in other values");
         assert_eq!(other_values_label(100, None), "The 100 most common values");

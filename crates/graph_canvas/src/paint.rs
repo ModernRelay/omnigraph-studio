@@ -206,10 +206,12 @@ impl Role {
 }
 
 /// What a chip says, before colour: the same for painting it and for measuring it, so the
-/// layout makes room for the chip the painter draws.
+/// layout makes room for the chip the painter draws. Made once per layout, not per frame.
 pub(crate) struct ChipText {
     pub mark: bool,
-    pub pieces: Vec<(String, Role)>,
+    /// The letter of its mark, drawn from afar too.
+    pub initial: SharedString,
+    pub pieces: Vec<(SharedString, Role)>,
     /// The text size at zoom 1.
     pub size: f32,
 }
@@ -217,18 +219,21 @@ pub(crate) struct ChipText {
 pub(crate) fn chip_text(node: &SceneNode) -> ChipText {
     // A label is drawn on one line: a control character shows as its picture.
     let label = ui::utils::replace_control_characters(&node.label);
+    let initial = initial(&node.label, &node.color_key);
     match &node.kind {
         SceneKind::Type { count } => ChipText {
             mark: true,
-            pieces: std::iter::once((label.into_owned(), Role::RootName))
-                .chain(count.map(|count| (format_count(count), Role::Count)))
+            initial,
+            pieces: std::iter::once((label.into_owned().into(), Role::RootName))
+                .chain(count.map(|count| (studio_ui::group_count(count).into(), Role::Count)))
                 .collect(),
             size: CHIP_TEXT,
         },
         SceneKind::Node { root, .. } => ChipText {
             mark: true,
+            initial,
             pieces: vec![(
-                truncate(&label, CHIP_LABEL_CHARS),
+                studio_ui::text::cut(&label, CHIP_LABEL_CHARS).into(),
                 if *root { Role::RootName } else { Role::Name },
             )],
             size: CHIP_TEXT,
@@ -240,15 +245,20 @@ pub(crate) fn chip_text(node: &SceneNode) -> ChipText {
             };
             ChipText {
                 mark: false,
-                pieces: std::iter::once((name, if *open { Role::OpenHub } else { Role::Muted }))
-                    .chain(count.map(|count| (count, Role::Count)))
-                    .collect(),
+                initial,
+                pieces: std::iter::once((
+                    name.into(),
+                    if *open { Role::OpenHub } else { Role::Muted },
+                ))
+                .chain(count.map(|count| (count.into(), Role::Count)))
+                .collect(),
                 size: HUB_TEXT,
             }
         }
         SceneKind::More { .. } => ChipText {
             mark: false,
-            pieces: vec![(label.into_owned(), Role::Muted)],
+            initial,
+            pieces: vec![(label.into_owned().into(), Role::Muted)],
             size: HUB_TEXT,
         },
     }
@@ -258,7 +268,7 @@ pub(crate) fn chip_text(node: &SceneNode) -> ChipText {
 /// chips").
 pub(crate) fn whole_label(node: &SceneNode) -> Option<String> {
     if !matches!(node.kind, SceneKind::Node { .. })
-        || node.label.chars().count() <= CHIP_LABEL_CHARS
+        || studio_ui::text::cut(&node.label, CHIP_LABEL_CHARS) == node.label
     {
         return None;
     }
@@ -283,7 +293,8 @@ pub(crate) fn label_width(label: &str, measure: impl Fn(&str, f32, FontWeight) -
     chip_width(
         &ChipText {
             mark: false,
-            pieces: vec![(label.to_owned(), Role::Muted)],
+            initial: SharedString::default(),
+            pieces: vec![(label.to_owned().into(), Role::Muted)],
             size: LABEL_TEXT,
         },
         measure,
@@ -292,7 +303,7 @@ pub(crate) fn label_width(label: &str, measure: impl Fn(&str, f32, FontWeight) -
 
 /// One piece of a chip's text.
 struct Piece {
-    text: String,
+    text: SharedString,
     color: Hsla,
     weight: FontWeight,
 }
@@ -301,6 +312,7 @@ struct Piece {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn paint(
     scene: &Scene,
+    texts: &[ChipText],
     screen: &[Point<Pixels>],
     bounds: Bounds<Pixels>,
     zoom: f32,
@@ -314,7 +326,7 @@ pub(crate) fn paint(
     cx: &mut App,
 ) {
     paint_dots(bounds, palette, window);
-    if screen.len() != scene.nodes.len() {
+    if screen.len() != scene.nodes.len() || texts.len() != scene.nodes.len() {
         return;
     }
     // Chips grow with the view up to their size at zoom 1 (13-pixel text), in
@@ -470,7 +482,7 @@ pub(crate) fn paint(
                 .is_some_and(|n| !(n.contains(&edge.from) && n.contains(&edge.to)));
             let alpha = if dim { studio_ui::ds::opacity::FAR } else { 1. };
             let pieces = [Piece {
-                text: label.clone(),
+                text: label.clone().into(),
                 color: palette.muted.opacity(alpha),
                 weight: studio_ui::ds::text::weight::BODY,
             }];
@@ -497,7 +509,7 @@ pub(crate) fn paint(
 
     // Chips. From afar most are a letter mark, and a frame of thousands repeats a few letters:
     // each is shaped once here, not once a chip.
-    let mut letters: HashMap<(char, u32), ShapedLine> = HashMap::new();
+    let mut letters: HashMap<(SharedString, u32), ShapedLine> = HashMap::new();
     let mut rects = chips.borrow_mut();
     rects.clear();
     rects.resize(scene.nodes.len(), Bounds::default());
@@ -526,18 +538,10 @@ pub(crate) fn paint(
                     paint_dot(p, HUB_DOT, palette.hub_dot.opacity(alpha), window)
                 }
                 _ => {
-                    let first = initial_char(&node.label, &node.color_key);
+                    let initial = &texts[index].initial;
                     let line = letters
-                        .entry((first, alpha.to_bits()))
-                        .or_insert_with(|| {
-                            shape_letter(
-                                &initial(&node.label, &node.color_key),
-                                12.,
-                                alpha,
-                                palette,
-                                window,
-                            )
-                        })
+                        .entry((initial.clone(), alpha.to_bits()))
+                        .or_insert_with(|| shape_letter(initial, 12., alpha, palette, window))
                         .clone();
                     paint_letter_mark(
                         p,
@@ -553,8 +557,8 @@ pub(crate) fn paint(
             continue;
         }
         let tint = type_color(&node.color_key);
-        let text = chip_text(node);
-        let mark = text.mark.then_some(tint);
+        let text = &texts[index];
+        let mark = text.mark.then(|| (tint, text.initial.clone()));
         let pieces: Vec<Piece> = text
             .pieces
             .iter()
@@ -579,7 +583,7 @@ pub(crate) fn paint(
         rects[index] = paint_pill(
             p,
             &pieces,
-            mark.map(|tint| (tint, initial(&node.label, &node.color_key))),
+            mark,
             size,
             PillStyle {
                 fill: palette.card.opacity(alpha),
@@ -603,10 +607,7 @@ pub(crate) fn paint(
         rects[index] = paint_open_chip(
             rects[index],
             &label,
-            (
-                type_color(&node.color_key),
-                initial(&node.label, &node.color_key),
-            ),
+            (type_color(&node.color_key), texts[index].initial.clone()),
             text_size,
             PillStyle {
                 fill: palette.card,
@@ -625,7 +626,6 @@ pub(crate) fn paint(
     }
 }
 
-/// The dot grid: the foreground at 7%, a 1.2-pixel dot every 22 pixels, fixed to the screen.
 /// Strokes lines as one path. Lines that need more vertices than a path holds are painted in
 /// halves, so a batch is never dropped.
 fn stroke_lines(window: &mut Window, lines: &[Segment], color: Hsla) {
@@ -737,6 +737,7 @@ fn dashes(points: &[Point<Pixels>], out: &mut Vec<Segment>) {
     }
 }
 
+/// The dot grid: a dot every [`DOT_STEP`] pixels, fixed to the screen.
 fn paint_dots(bounds: Bounds<Pixels>, palette: &Palette, window: &mut Window) {
     let color = palette.grid_dot;
     let left = f32::from(bounds.left());
@@ -776,7 +777,7 @@ struct PillStyle {
 fn paint_pill(
     at: Point<Pixels>,
     pieces: &[Piece],
-    mark: Option<(Hsla, String)>,
+    mark: Option<(Hsla, SharedString)>,
     text_size: f32,
     style: PillStyle,
     palette: &Palette,
@@ -792,7 +793,7 @@ fn paint_pill(
                 ..palette.font.clone()
             };
             window.text_system().shape_line(
-                SharedString::from(piece.text.clone()),
+                piece.text.clone(),
                 px(text_size),
                 &[TextRun {
                     len: piece.text.len(),
@@ -874,7 +875,7 @@ fn paint_pill(
 fn paint_open_chip(
     chip: Bounds<Pixels>,
     label: &str,
-    (tint, letter): (Hsla, String),
+    (tint, letter): (Hsla, SharedString),
     text_size: f32,
     style: PillStyle,
     palette: &Palette,
@@ -1081,39 +1082,9 @@ fn edge_is_member(scene: &Scene, from: usize, to: usize) -> bool {
     scene.nodes[hub].parent != Some(node)
 }
 
-/// The letter of a mark: the label's first character, else the type's.
-/// The character [`initial`] is made from.
-fn initial_char(label: &str, type_name: &str) -> char {
-    label
-        .trim()
-        .chars()
-        .next()
-        .or_else(|| type_name.chars().next())
-        .unwrap_or('?')
-}
-
-fn initial(label: &str, type_name: &str) -> String {
-    label
-        .trim()
-        .chars()
-        .next()
-        .or_else(|| type_name.chars().next())
-        .unwrap_or('?')
-        .to_uppercase()
-        .collect()
-}
-
-fn truncate(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        text.to_owned()
-    } else {
-        format!("{}…", text.chars().take(max - 1).collect::<String>())
-    }
-}
-
-/// A row count with its thousands grouped, as the rest of Studio writes it.
-pub(crate) fn format_count(count: i64) -> String {
-    studio_ui::group_digits(count.max(0) as usize)
+/// The letter of a mark, as every type mark of Studio draws it.
+fn initial(label: &str, type_name: &str) -> SharedString {
+    studio_ui::text::initial(label, type_name).into()
 }
 
 /// Whether the box around the line from `a` to `b` meets `bounds` grown by `margin`: a curve

@@ -25,8 +25,8 @@ use gpui::{
     canvas, deferred, point, px,
 };
 use graph_store::{
-    Exploration, ExplorationEvent, ExplorePath, GraphSession, GroupKey, Loadable, NodeRef,
-    PageStatus, SessionEvent,
+    EntryKind, Exploration, ExplorationEvent, ExplorePath, GraphSession, GroupKey, Loadable,
+    NodeRef, PageStatus, SessionEvent,
 };
 use studio_actions::canvas::{
     ClearSelection, CollapseNode, ExpandNode, FitToWindow, FocusSelected, MoveDown, MoveLeft,
@@ -46,8 +46,9 @@ use model::{HUB_STEP, Scene, SceneId, SceneKind};
 use studio_ui::menu::ContextMenu;
 use studio_ui::motion::{self, Ease, Lerp, Tween};
 
-/// Labels of graph nodes show from this zoom up; hubs from a little further out.
+/// The closest the view zooms in.
 const MAX_ZOOM: f32 = 2.;
+/// How far one Zoom In or Zoom Out goes.
 const ZOOM_STEP: f32 = 1.25;
 
 /// Registers the canvas's keys and the actions that open it.
@@ -162,9 +163,14 @@ struct Drag {
     start: Point<Pixels>,
     center: Vec2,
     moved: bool,
+    /// How far the pointer has moved since the drag began, in world units.
+    delta: Vec2,
     /// A drag that began on a node or a relationship pill moves it (from where it was)
     /// instead of the view.
     node: Option<(usize, Vec2)>,
+    /// It began on a chip: once a relayout removes the chip, it moves nothing, rather than
+    /// turning into a pan by the whole distance dragged so far.
+    took_chip: bool,
     /// What moves with it: a node's pills not placed by hand, and their "+K more"; with
     /// several chips marked, the other marked chips too.
     followers: Vec<(usize, Vec2)>,
@@ -176,20 +182,18 @@ struct Drag {
 }
 
 impl Drag {
+    /// Whether it pans the view: a drag begun on empty space.
+    fn pans(&self) -> bool {
+        self.node.is_none() && !self.took_chip
+    }
+
     /// Points the drag's indices into `scene`, by the chips' ids, when the canvas was laid out
     /// again since; a chip no longer drawn stops moving.
     fn follow(&mut self, scene: &Arc<Scene>) {
         if Arc::ptr_eq(&self.scene, scene) {
             return;
         }
-        // Found by id once for every chip, not by a walk of the scene for each: ⌘A can mark
-        // thousands.
-        let at: HashMap<&SceneId, usize> = scene
-            .nodes
-            .iter()
-            .enumerate()
-            .map(|(index, node)| (&node.id, index))
-            .collect();
+        let at = scene.indices();
         let moved = |index: usize| {
             self.scene
                 .nodes
@@ -206,6 +210,14 @@ impl Drag {
             .collect();
         self.scene = scene.clone();
     }
+}
+
+/// What "+K more" does: draws neighbours already read, reads more of a list, or opens a value
+/// of a grouped relationship.
+enum More {
+    Drawn,
+    Read(GroupKey),
+    Open(ExplorePath),
 }
 
 /// The key a placed chip is remembered by: a type on the schema canvas, a node or a
@@ -253,7 +265,7 @@ fn pins_to_json(pinned: &HashMap<String, Vec2>) -> serde_json::Value {
 }
 
 /// The canvas tab of one graph.
-pub struct GraphCanvas {
+pub(crate) struct GraphCanvas {
     session: Entity<GraphSession>,
     exploration: Entity<Exploration>,
     /// Set for a canvas of query results; such a canvas never shows the exploration.
@@ -266,8 +278,15 @@ pub struct GraphCanvas {
     positions: Arc<Vec<Vec2>>,
     /// Half of each node's chip width at zoom 1, as measured for the layout.
     half_widths: Arc<Vec<f32>>,
-    /// Where each node was drawn, for the current mode and root: such nodes never move.
+    /// What each chip of the scene says, made with the scene rather than on every frame.
+    texts: Arc<Vec<paint::ChipText>>,
+    /// The scene's node chips, counted with it for the caption and the overlay.
+    node_count: usize,
+    /// Where each node was drawn, for the explorer's root (or the query, on a results
+    /// canvas): such nodes never move. A visit to the ontology keeps them.
     known: HashMap<SceneId, Vec2>,
+    /// The root the explorer's `known` places are for.
+    known_root: Option<NodeRef>,
     /// Nodes the person dragged into place, by [`pin_key`]: kept across layouts and restarts,
     /// with the graph's tabs (spec 006, saved layouts).
     pinned: HashMap<String, Vec2>,
@@ -299,6 +318,8 @@ pub struct GraphCanvas {
     /// Nodes stepped back from with `[`, most recent last, for `]`.
     walked: Vec<SceneId>,
     hovered: Option<usize>,
+    /// The node the first click of a double click opened: the second leaves it open.
+    clicked_open: Option<SceneId>,
     /// The cut chip the pointer rested on, shown open (spec 006, "Opened chips").
     opened: Option<SceneId>,
     drag: Option<Drag>,
@@ -379,7 +400,7 @@ impl GraphCanvas {
 }
 
 impl GraphCanvas {
-    pub fn new(session: Entity<GraphSession>, cx: &mut Context<Self>) -> Self {
+    fn new(session: Entity<GraphSession>, cx: &mut Context<Self>) -> Self {
         Self::build(session, None, cx)
     }
 
@@ -420,7 +441,12 @@ impl GraphCanvas {
                         }));
                     }
                 }
-                ExplorationEvent::SelectionChanged => this.follow_selection(cx),
+                // The ontology and a results canvas keep their own selection.
+                ExplorationEvent::SelectionChanged => {
+                    if this.draws_exploration() {
+                        this.follow_selection(cx);
+                    }
+                }
             }),
             cx.subscribe(&session, |this, _, event: &SessionEvent, cx| match event {
                 SessionEvent::SchemaChanged => this.rebuild(cx),
@@ -446,7 +472,10 @@ impl GraphCanvas {
             scene: Arc::default(),
             positions: Arc::default(),
             half_widths: Arc::default(),
+            texts: Arc::default(),
+            node_count: 0,
             known: HashMap::new(),
+            known_root: None,
             pinned: HashMap::new(),
             layout_key: None,
             layout_generation: 0,
@@ -465,6 +494,7 @@ impl GraphCanvas {
             selected: None,
             walked: Vec::new(),
             hovered: None,
+            clicked_open: None,
             opened: None,
             drag: None,
             marked: HashSet::new(),
@@ -479,10 +509,6 @@ impl GraphCanvas {
             _subscriptions: subscriptions,
         };
         canvas.rebuild(cx);
-        // A results canvas selects nothing of the exploration.
-        if canvas.results.is_none() {
-            canvas.follow_selection(cx);
-        }
         canvas
     }
 
@@ -513,9 +539,12 @@ impl GraphCanvas {
 
     /// Shows the ontology (the schema's types and relationships), or the exploration when
     /// there is one.
-    pub fn set_ontology(&mut self, ontology: bool, cx: &mut Context<Self>) {
+    fn set_ontology(&mut self, ontology: bool, cx: &mut Context<Self>) {
         if self.show_schema != ontology {
             self.show_schema = ontology;
+            if self.draws_exploration() {
+                self.follow_selection(cx);
+            }
             self.rebuild(cx);
             cx.emit(ItemEvent::UpdateTab);
         }
@@ -523,7 +552,7 @@ impl GraphCanvas {
 
     /// Shows `node`: selects it where the exploration shows it, else roots the exploration
     /// there; then centers on it.
-    pub fn show_node(&mut self, node: NodeRef, cx: &mut Context<Self>) {
+    fn show_node(&mut self, node: NodeRef, cx: &mut Context<Self>) {
         self.show_schema = false;
         let id = SceneId::Node(node.clone());
         self.center_on = Some(id.clone());
@@ -531,20 +560,45 @@ impl GraphCanvas {
         let shown = self
             .exploration
             .update(cx, |exploration, cx| exploration.reveal(node.clone(), cx));
-        self.rebuild(cx);
         // In the tree but not drawn here (a hub draws some of its neighbours): rooted at it,
-        // it is.
-        if shown && self.scene.index_of(&id).is_none() {
+        // it is. Asked of the scene the exploration makes now, not of the one drawn, which is
+        // the one before until its layout comes back from the background.
+        if shown && self.results.is_none() && !self.would_draw(&id, cx) {
             self.exploration
                 .update(cx, |exploration, cx| exploration.root_at(node, cx));
-            self.rebuild(cx);
         }
+        self.rebuild(cx);
+    }
+
+    /// Roots the exploration at `node`, which `path` reaches, keeping what is open below it.
+    fn explore_from(&mut self, path: &ExplorePath, node: NodeRef, cx: &mut Context<Self>) {
+        self.selected = Some(SceneId::Node(node));
+        self.exploration
+            .update(cx, |exploration, cx| exploration.reroot(path, cx));
+        self.rebuild(cx);
+    }
+
+    /// Whether the explorer's scene, as the exploration stands, has `id`.
+    fn would_draw(&self, id: &SceneId, cx: &App) -> bool {
+        let exploration = self.exploration.read(cx);
+        let entries = exploration.entries(cx);
+        model::explore_scene(
+            &entries,
+            exploration.state(),
+            &self.hub_limits,
+            self.node_cap(cx),
+        )
+        .index_of(id)
+        .is_some()
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         let Some(schema) = self.session.read(cx).schema_model() else {
             self.scene = Arc::default();
+            self.texts = Arc::default();
+            self.node_count = 0;
             self.positions = Arc::default();
+            self.hovered = None;
             self.chips.borrow_mut().clear();
             cx.notify();
             return;
@@ -563,7 +617,10 @@ impl GraphCanvas {
         };
         let key = (mode, root.filter(|_| mode == Mode::Explore));
         if self.layout_key.as_ref() != Some(&key) {
-            self.known.clear();
+            if mode == Mode::Explore && self.known_root != key.1 {
+                self.known.clear();
+                self.known_root = key.1.clone();
+            }
             self.fit_pending = true;
             self.layout_key = Some(key);
         }
@@ -789,9 +846,35 @@ impl GraphCanvas {
                 }
             }
         }
-        self.hovered = None;
+        // The pointer is on the same chip, wherever the new scene puts it: dropping it would
+        // hide its line labels and let a nudge close the chip shown open.
+        let hovered = self
+            .hovered
+            .and_then(|index| self.scene.nodes.get(index))
+            .map(|node| node.id.clone());
+        self.texts = Arc::new(scene.nodes.iter().map(paint::chip_text).collect());
+        self.node_count = scene
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, SceneKind::Node { .. }))
+            .count();
         self.scene = Arc::new(scene);
+        self.hovered = hovered.and_then(|id| self.scene.index_of(&id));
         self.positions = Arc::new(positions);
+        // Chips being dragged stay under the pointer, not where the new layout put them.
+        if let Some(drag) = self.drag.as_mut()
+            && drag.moved
+            && drag.node.is_some()
+        {
+            drag.follow(&self.scene);
+            let positions = Arc::make_mut(&mut self.positions);
+            for &(index, from) in drag.node.iter().chain(&drag.followers) {
+                self.appear.remove(&index);
+                if let Some(position) = positions.get_mut(index) {
+                    *position = from + drag.delta;
+                }
+            }
+        }
         // The chips painted were the old scene's, by its indices: a click before the next
         // paint hits nothing rather than another node.
         self.chips.borrow_mut().clear();
@@ -838,9 +921,8 @@ impl GraphCanvas {
             .then(|| Tween::glide(from, to, motion::GLIDE, Ease::InOutCubic, Instant::now()));
     }
 
-    /// Stops a glide where it is drawn, before the person moves the view by hand.
-    /// The person takes the camera: a glide under way stops where it is, and a node still to be
-    /// centred on once drawn is let go, so the view does not move off on its own later.
+    /// The person takes the camera: a glide under way stops where it is drawn, and a node still
+    /// to be centred on once drawn is let go, so the view does not move off on its own later.
     fn settle_camera(&mut self) {
         self.center_on = None;
         if let Some(glide) = self.glide.take() {
@@ -955,6 +1037,16 @@ impl GraphCanvas {
         self.scene.index_of(self.selected.as_ref()?)
     }
 
+    /// The pointer left the canvas, or went over something drawn on it: no chip is under it,
+    /// and what resting on one would read or open is let go.
+    fn pointer_left(&mut self, cx: &mut Context<Self>) {
+        self._prefetch = None;
+        self._open = None;
+        if self.hovered.take().is_some() | self.opened.take().is_some() {
+            cx.notify();
+        }
+    }
+
     /// A cut chip the pointer rests on opens after a moment; one it leaves closes at once.
     fn open_after_rest(&mut self, cx: &mut Context<Self>) {
         self.opened = None;
@@ -1019,9 +1111,7 @@ impl GraphCanvas {
                 expanded,
                 ..
             } => match node.path {
-                Some(path) if expanded && !expand_only => {
-                    self.exploration.update(cx, |e, cx| e.collapse(&path, cx));
-                }
+                Some(_) if expanded && !expand_only => self.close(&node.id, cx),
                 Some(path) => {
                     self.exploration.update(cx, |e, cx| e.expand(&path, cx));
                 }
@@ -1038,7 +1128,7 @@ impl GraphCanvas {
             SceneKind::Hub { open, .. } => {
                 if let Some(path) = node.path {
                     if open && !expand_only {
-                        self.exploration.update(cx, |e, cx| e.collapse(&path, cx));
+                        self.close(&node.id, cx);
                     } else {
                         self.exploration.update(cx, |e, cx| e.expand(&path, cx));
                     }
@@ -1048,27 +1138,77 @@ impl GraphCanvas {
         }
     }
 
+    /// Closes the node or relationship `id` by every path the exploration opened it by.
+    fn close(&mut self, id: &SceneId, cx: &mut Context<Self>) {
+        self.close_all(std::slice::from_ref(id), cx);
+    }
+
+    /// Closes every one of `ids` (nodes and relationships; "+K more" closes its relationship),
+    /// as one change.
+    fn close_all(&mut self, ids: &[SceneId], cx: &mut Context<Self>) {
+        let exploration = self.exploration.read(cx);
+        let entries = exploration.entries(cx);
+        let paths = model::open_paths(&entries, exploration.state(), ids);
+        self.exploration
+            .update(cx, |e, cx| e.set_open(&paths, false, cx));
+    }
+
     fn show_more(&mut self, key: GroupKey, cx: &mut Context<Self>) {
         let limit = self.hub_limits.entry(key.clone()).or_insert(HUB_STEP);
         *limit += HUB_STEP;
         let wanted = *limit;
-        let (loaded, ready) = self
-            .exploration
-            .read(cx)
-            .state()
-            .neighbours
-            .get(&key)
-            .map(|list| {
-                (
-                    list.rows.len(),
-                    list.status == PageStatus::Idle && !list.exhausted,
-                )
-            })
-            .unwrap_or((0, false));
-        if loaded < wanted && ready {
-            self.exploration.update(cx, |e, cx| e.load_more(&key, cx));
+        let exploration = self.exploration.read(cx);
+        let state = exploration.state();
+        let ready = |key: &GroupKey| {
+            state
+                .neighbours
+                .get(key)
+                .is_some_and(|list| list.status == PageStatus::Idle && !list.exhausted)
+        };
+        let loaded = |key: &GroupKey| state.neighbours.get(key).map_or(0, |list| list.rows.len());
+        let more = if exploration.grouping(&key.group).is_some() {
+            // A grouped relationship is read a value at a time (spec 005), and its hub draws
+            // the neighbours of the values open: more are those of an open value with more to
+            // read, else those of the next value not open.
+            let entries = exploration.entries(cx);
+            let values: Vec<(&GroupKey, &ExplorePath, bool)> = entries
+                .iter()
+                .filter_map(|entry| match &entry.kind {
+                    EntryKind::Bucket {
+                        key: value,
+                        count,
+                        expanded,
+                    } if *count > 0 && value.node == key.node && value.group == key.group => {
+                        Some((value, &entry.path, *expanded))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let drawn: usize = values
+                .iter()
+                .filter(|(.., open)| *open)
+                .map(|(value, ..)| loaded(value))
+                .sum();
+            if drawn >= wanted {
+                More::Drawn
+            } else if let Some((value, ..)) =
+                values.iter().find(|(value, _, open)| *open && ready(value))
+            {
+                More::Read((*value).clone())
+            } else if let Some((_, path, _)) = values.iter().find(|(.., open)| !open) {
+                More::Open((*path).clone())
+            } else {
+                More::Drawn
+            }
+        } else if loaded(&key) < wanted && ready(&key) {
+            More::Read(key)
         } else {
-            self.rebuild(cx);
+            More::Drawn
+        };
+        match more {
+            More::Drawn => self.rebuild(cx),
+            More::Read(key) => self.exploration.update(cx, |e, cx| e.load_more(&key, cx)),
+            More::Open(path) => self.exploration.update(cx, |e, cx| e.expand(&path, cx)),
         }
     }
 
@@ -1100,7 +1240,9 @@ impl GraphCanvas {
             start: event.position,
             center: self.center,
             moved: false,
+            delta: Vec2::default(),
             node,
+            took_chip: node.is_some(),
             followers,
             area: hit.is_none() && event.modifiers.shift,
             scene: self.scene.clone(),
@@ -1193,26 +1335,23 @@ impl GraphCanvas {
             if drag.moved || dx.abs() + dy.abs() > 3. {
                 drag.moved = true;
                 let delta = Vec2::new(dx, dy) * (1. / self.zoom);
+                drag.delta = delta;
                 match drag.node {
-                    Some((index, from)) => {
-                        let moved = std::iter::once((index, from)).chain(drag.followers.clone());
-                        for (index, from) in moved {
+                    // Where the chips end up is remembered once, at the drop.
+                    Some(dragged) => {
+                        let positions = Arc::make_mut(&mut self.positions);
+                        for &(index, from) in std::iter::once(&dragged).chain(&drag.followers) {
                             self.appear.remove(&index);
-                            let at = from + delta;
-                            if let Some(position) =
-                                Arc::make_mut(&mut self.positions).get_mut(index)
-                            {
-                                *position = at;
-                            }
-                            if let Some(node) = self.scene.nodes.get(index) {
-                                self.known.insert(node.id.clone(), at);
+                            if let Some(position) = positions.get_mut(index) {
+                                *position = from + delta;
                             }
                         }
                     }
-                    None => {
+                    None if drag.pans() => {
                         self.center = drag.center - delta;
                         self.camera_touched = true;
                     }
+                    None => {}
                 }
                 cx.notify();
             }
@@ -1278,6 +1417,7 @@ impl GraphCanvas {
             self.peek(index, window, cx);
             return;
         }
+        let clicked_open = self.clicked_open.take().filter(|_| event.click_count >= 2);
         match self.scene.nodes[index].kind {
             // A click on a type browses its rows under the canvas.
             SceneKind::Type { .. } if event.click_count < 2 => {
@@ -1288,18 +1428,29 @@ impl GraphCanvas {
                     cx,
                 );
             }
-            // A click opens a relationship or closes it, and shows more.
+            // A click opens a relationship or closes it, and shows more; a double click is
+            // that one click, not an open and a close.
             SceneKind::Hub { .. } | SceneKind::More { .. } => {
-                self.activate(index, false, window, cx);
+                if event.click_count < 2 {
+                    self.activate(index, false, window, cx);
+                }
             }
             // A click expands a closed node; an open one is only selected, so a click never
-            // folds away what was walked. A double click closes it.
+            // folds away what was walked. A double click closes it, unless its first click
+            // opened it.
             SceneKind::Node { expanded, .. }
                 if self.scene.nodes[index].path.is_some() && !expanded =>
             {
-                self.activate(index, true, window, cx);
+                if event.click_count < 2 {
+                    self.clicked_open = Some(self.scene.nodes[index].id.clone());
+                    self.activate(index, true, window, cx);
+                }
             }
-            _ if event.click_count >= 2 => self.activate(index, false, window, cx),
+            _ if event.click_count >= 2
+                && clicked_open.as_ref() != Some(&self.scene.nodes[index].id) =>
+            {
+                self.activate(index, false, window, cx)
+            }
             _ => {}
         }
     }
@@ -1343,6 +1494,11 @@ impl GraphCanvas {
         let Some((index, _)) = drag.node else {
             return;
         };
+        for ix in std::iter::once(index).chain(drag.followers.iter().map(|(ix, _)| *ix)) {
+            if let (Some(node), Some(at)) = (self.scene.nodes.get(ix), self.positions.get(ix)) {
+                self.known.insert(node.id.clone(), *at);
+            }
+        }
         let mut placed = vec![index];
         if self.is_marked(index) {
             placed.extend(drag.followers.iter().map(|(ix, _)| *ix));
@@ -1358,6 +1514,8 @@ impl GraphCanvas {
         }
         self.keep_ontology_as_drawn();
         cx.emit(ItemEvent::UpdateTab);
+        // The canvas is drawn cached: Reset layout shows once something is placed.
+        cx.notify();
     }
 
     /// After types were placed: the ontology as drawn is the layout of its pins now, so a later
@@ -1471,17 +1629,12 @@ impl GraphCanvas {
                             }),
                         )
                         .when(node.path.is_some(), |menu| {
-                            let path = node.path.clone();
                             if *expanded {
                                 menu.entry(
                                     "Collapse",
                                     Some(Box::new(CollapseNode)),
                                     Self::on_menu(&this, move |canvas, _, cx| {
-                                        if let Some(path) = &path {
-                                            canvas
-                                                .exploration
-                                                .update(cx, |e, cx| e.collapse(path, cx));
-                                        }
+                                        canvas.close(&id, cx)
                                     }),
                                 )
                             } else {
@@ -1496,14 +1649,26 @@ impl GraphCanvas {
                                 )
                             }
                         })
-                        .entry(
-                            "Explore from here",
-                            None,
-                            open_action(ShowNodeOnCanvas {
+                        .entry("Explore from here", None, {
+                            // On the explorer the node is drawn already: showing it would only
+                            // select it.
+                            let path = node.path.clone().filter(|_| exploring);
+                            let show = open_action(ShowNodeOnCanvas {
                                 type_name: type_name.clone(),
                                 id: key.clone(),
-                            }),
-                        )
+                            });
+                            let this = this.clone();
+                            let graph_node = graph_node.clone();
+                            move |window, cx| match &path {
+                                Some(path) => {
+                                    this.update(cx, |canvas, cx| {
+                                        canvas.explore_from(path, graph_node.clone(), cx)
+                                    })
+                                    .ok();
+                                }
+                                None => show(window, cx),
+                            }
+                        })
                         .entry(
                             "Open in table",
                             None,
@@ -1712,9 +1877,14 @@ impl GraphCanvas {
 
     /// Opens or closes every marked node and relationship.
     fn expand_marked(&mut self, ids: &[SceneId], open: bool, cx: &mut Context<Self>) {
+        if !open {
+            self.close_all(ids, cx);
+            return;
+        }
+        let at = self.scene.indices();
         let paths: Vec<ExplorePath> = ids
             .iter()
-            .filter_map(|id| self.scene.index_of(id))
+            .filter_map(|id| at.get(id).copied())
             .filter_map(|index| {
                 let node = &self.scene.nodes[index];
                 match node.kind {
@@ -1724,16 +1894,17 @@ impl GraphCanvas {
             })
             .collect();
         self.exploration
-            .update(cx, |e, cx| e.set_open(&paths, open, cx));
+            .update(cx, |e, cx| e.set_open(&paths, true, cx));
     }
 
     /// Keeps the marked chips where they are drawn now.
     fn pin_marked(&mut self, ids: &[SceneId], cx: &mut Context<Self>) {
+        let at = self.scene.indices();
         for id in ids {
-            if let (Some(key), Some(index)) = (pin_key(id), self.scene.index_of(id))
-                && let Some(at) = self.positions.get(index)
+            if let (Some(key), Some(index)) = (pin_key(id), at.get(id))
+                && let Some(position) = self.positions.get(*index)
             {
-                self.pinned.insert(key, *at);
+                self.pinned.insert(key, *position);
             }
         }
         self.keep_ontology_as_drawn();
@@ -1842,15 +2013,9 @@ impl GraphCanvas {
         let Some(index) = self.selected_index() else {
             return;
         };
-        let node = &self.scene.nodes[index];
-        let path = match &node.kind {
-            SceneKind::Node { .. } | SceneKind::Hub { .. } | SceneKind::More { .. } => {
-                node.path.clone()
-            }
-            SceneKind::Type { .. } => None,
-        };
-        if let Some(path) = path {
-            self.exploration.update(cx, |e, cx| e.collapse(&path, cx));
+        let id = self.scene.nodes[index].id.clone();
+        if !matches!(id, SceneId::Type(_)) {
+            self.close(&id, cx);
         }
     }
 
@@ -1979,6 +2144,7 @@ impl GraphCanvas {
             font: theme::theme_settings(cx).ui_font(cx).clone(),
         };
         let scene = self.scene.clone();
+        let texts = self.texts.clone();
         let now = Instant::now();
         let positions: Arc<Vec<Vec2>> = if self.appear.is_empty() {
             self.positions.clone()
@@ -2018,7 +2184,7 @@ impl GraphCanvas {
                         .map(|world| to_screen(*world, bounds, center, zoom))
                         .collect();
                     paint::paint(
-                        &scene, &screen, bounds, zoom, selected, &marked, hovered, opened,
+                        &scene, &texts, &screen, bounds, zoom, selected, &marked, hovered, opened,
                         &palette, &chips, window, cx,
                     );
                 });
@@ -2067,12 +2233,7 @@ impl GraphCanvas {
                 )
             }
             Mode::Explore | Mode::Results => {
-                let nodes = self
-                    .scene
-                    .nodes
-                    .iter()
-                    .filter(|n| matches!(n.kind, SceneKind::Node { .. }))
-                    .count();
+                let nodes = self.node_count;
                 format!(
                     "{nodes} {} · click to open · ⇧-click to inspect · ⇧-drag to select",
                     if nodes == 1 { "node" } else { "nodes" }
@@ -2083,6 +2244,8 @@ impl GraphCanvas {
             .absolute()
             .bottom(px(space::LG))
             .left(px(space::LG))
+            // A press on the caption is not one on a chip drawn under it.
+            .occlude()
             .px(px(space::CONTROL_INSET))
             .py(px(space::XS))
             .rounded(px(studio_ui::ds::radii(cx).bar()))
@@ -2131,12 +2294,7 @@ impl GraphCanvas {
                             .unwrap_or_else(|| root.id.clone())
                     })
                     .unwrap_or_default();
-                let nodes = self
-                    .scene
-                    .nodes
-                    .iter()
-                    .filter(|n| matches!(n.kind, SceneKind::Node { .. }))
-                    .count();
+                let nodes = self.node_count;
                 let noun = if nodes == 1 { "node" } else { "nodes" };
                 format!("From {root} · {nodes} {noun}")
             }
@@ -2352,8 +2510,6 @@ impl GraphCanvas {
     }
 }
 
-/// The room a node needs in layout: about half its chip's width at zoom 1 (a mark, the label
-/// at about seven pixels a character, a count, and the padding).
 /// Measures text with the UI font, as the painter shapes chip text, for the layout.
 ///
 /// GPUI's app-level `layout_width` shapes each character with CoreText and keeps nothing, so
@@ -2557,6 +2713,11 @@ impl Render for GraphCanvas {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::secondary_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if !*hovered {
+                    this.pointer_left(cx);
+                }
+            }))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up_out))
             .on_scroll_wheel(cx.listener(Self::scroll))
@@ -2612,7 +2773,9 @@ mod tests {
             start: point(px(0.), px(0.)),
             center: Vec2::new(0., 0.),
             moved: true,
+            delta: Vec2::default(),
             node: Some((1, Vec2::new(1., 1.))),
+            took_chip: true,
             followers: vec![(2, Vec2::new(2., 2.)), (0, Vec2::new(0., 0.))],
             area: false,
             scene: before.clone(),
@@ -2624,10 +2787,12 @@ mod tests {
         drag.follow(&after);
         assert_eq!(drag.node, Some((1, Vec2::new(1., 1.))));
         assert_eq!(drag.followers, vec![(3, Vec2::new(2., 2.))]);
-        // The dragged chip itself gone: the drag moves nothing.
+        // The dragged chip itself gone: the drag moves nothing, the view included.
+        assert!(!drag.pans());
         drag.follow(&scene(&["C"]));
         assert_eq!(drag.node, None);
         assert_eq!(drag.followers, vec![(0, Vec2::new(2., 2.))]);
+        assert!(!drag.pans());
     }
 
     #[test]
@@ -2688,5 +2853,176 @@ mod tests {
         assert!(
             pins_from_json(&serde_json::json!({"pinned": {"a": [1, "x"], "b": [1]}})).is_empty()
         );
+    }
+
+    /// A canvas over a session serving people, with Ada as the exploration's root.
+    fn canvas_of_ada(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<GraphCanvas>, Entity<Exploration>, NodeRef) {
+        cx.update(studio_theme::init_test);
+        let (session, _served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\n",
+            |_| serde_json::json!([{ "id": "p1", "label": "Ada", "n": 0 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let canvas = cx.new(|cx| GraphCanvas::new(session, cx));
+        let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
+        let ada = NodeRef::new("Person", "p1");
+        exploration.update(cx, |exploration, cx| exploration.root_at(ada.clone(), cx));
+        cx.run_until_parked();
+        (canvas, exploration, ada)
+    }
+
+    fn type_scene(names: &[&str]) -> Scene {
+        Scene {
+            nodes: names
+                .iter()
+                .map(|name| crate::model::SceneNode {
+                    id: SceneId::Type((*name).into()),
+                    kind: SceneKind::Type { count: None },
+                    label: (*name).into(),
+                    color_key: (*name).into(),
+                    parent: None,
+                    path: None,
+                })
+                .collect(),
+            edges: Vec::new(),
+            capped: None,
+        }
+    }
+
+    /// A relayout keeps the pointer on the chip it was on, wherever the chip now is; a drop
+    /// redraws the canvas, which is drawn cached, so Reset layout shows.
+    #[gpui::test]
+    async fn a_relayout_keeps_the_hover_and_the_drag_and_a_drop_redraws(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (canvas, _, _) = canvas_of_ada(cx);
+        canvas.update(cx, |canvas, cx| {
+            canvas.apply_layout(
+                type_scene(&["A", "B"]),
+                vec![10.; 2],
+                vec![Vec2::default(); 2],
+                cx,
+            );
+            canvas.hovered = Some(1);
+            canvas.apply_layout(
+                type_scene(&["New", "A", "B"]),
+                vec![10.; 3],
+                vec![Vec2::default(); 3],
+                cx,
+            );
+            assert_eq!(canvas.hovered, Some(2), "still on B");
+            // A read that lands mid-drag lays out again: A stays under the pointer.
+            canvas.drag = Some(Drag {
+                start: point(px(0.), px(0.)),
+                center: Vec2::default(),
+                moved: true,
+                delta: Vec2::new(5., 5.),
+                node: Some((1, Vec2::new(1., 1.))),
+                took_chip: true,
+                followers: Vec::new(),
+                area: false,
+                scene: canvas.scene.clone(),
+            });
+            canvas.apply_layout(
+                type_scene(&["Z", "New", "A", "B"]),
+                vec![10.; 4],
+                vec![Vec2::default(); 4],
+                cx,
+            );
+            assert_eq!(canvas.positions[2], Vec2::new(6., 6.));
+            assert!(
+                !canvas.appear.contains_key(&2),
+                "no glide away from the pointer"
+            );
+            let drag = canvas.drag.take().unwrap();
+            assert_eq!(drag.node, Some((2, Vec2::new(1., 1.))));
+        });
+        let notified = Arc::new(AtomicUsize::new(0));
+        let counted = notified.clone();
+        let _counting = cx.update(|cx| {
+            cx.observe(&canvas, move |_, _| {
+                counted.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        canvas.update(cx, |canvas, cx| {
+            let drag = Drag {
+                start: point(px(0.), px(0.)),
+                center: Vec2::default(),
+                moved: true,
+                delta: Vec2::default(),
+                node: Some((1, Vec2::default())),
+                took_chip: true,
+                followers: Vec::new(),
+                area: false,
+                scene: canvas.scene.clone(),
+            };
+            canvas.place_dragged(&drag, cx);
+            assert!(!canvas.pinned.is_empty());
+        });
+        cx.run_until_parked();
+        assert!(notified.load(Ordering::SeqCst) > 0);
+    }
+
+    /// The ontology keeps its own selection when the tree's moves; back on the explorer, the
+    /// canvas shows the tree's.
+    #[gpui::test]
+    async fn the_ontology_keeps_its_selection_from_the_tree(cx: &mut gpui::TestAppContext) {
+        let (canvas, exploration, ada) = canvas_of_ada(cx);
+        let person = SceneId::Type("Person".into());
+        canvas.update(cx, |canvas, _| canvas.selected = Some(person.clone()));
+        exploration.update(cx, |exploration, cx| exploration.select(None, cx));
+        exploration.update(cx, |exploration, cx| {
+            exploration.select(Some(ExplorePath::root()), cx)
+        });
+        cx.run_until_parked();
+        canvas.read_with(cx, |canvas, _| {
+            assert_eq!(canvas.selected, Some(person.clone()))
+        });
+        canvas.update(cx, |canvas, cx| canvas.set_ontology(false, cx));
+        canvas.read_with(cx, |canvas, _| {
+            assert_eq!(canvas.selected, Some(SceneId::Node(ada)))
+        });
+    }
+
+    /// Show on canvas, from the ontology, of a node the exploration shows selects it there;
+    /// it does not start the exploration again at it, though the ontology drawn has no nodes.
+    #[gpui::test]
+    async fn showing_a_shown_node_keeps_the_exploration(cx: &mut gpui::TestAppContext) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        cx.update(studio_theme::init_test);
+        let (session, _served) = graph_store::test_server::followed_session(
+            "node Person {\n  slug: String @key\n  name: String\n}\n",
+            |_| serde_json::json!([{ "id": "p1", "label": "Ada", "n": 0 }]),
+            cx,
+        );
+        cx.run_until_parked();
+        let canvas = cx.new(|cx| GraphCanvas::new(session, cx));
+        let exploration = canvas.read_with(cx, |canvas, _| canvas.exploration.clone());
+        let ada = NodeRef::new("Person", "p1");
+        exploration.update(cx, |exploration, cx| exploration.root_at(ada.clone(), cx));
+        cx.run_until_parked();
+        let changes = Arc::new(AtomicUsize::new(0));
+        let counted = changes.clone();
+        let _counting = cx.update(|cx| {
+            cx.subscribe(&exploration, move |_, event: &ExplorationEvent, _| {
+                if matches!(event, ExplorationEvent::Changed) {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        });
+        assert!(canvas.read_with(cx, |canvas, _| canvas.show_schema));
+        canvas.update(cx, |canvas, cx| canvas.show_node(ada.clone(), cx));
+        cx.run_until_parked();
+        assert_eq!(changes.load(Ordering::SeqCst), 0, "not rooted again");
+        canvas.read_with(cx, |canvas, _| {
+            assert!(!canvas.show_schema);
+            assert!(canvas.scene.index_of(&SceneId::Node(ada)).is_some());
+        });
     }
 }

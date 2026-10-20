@@ -15,12 +15,13 @@
 
 mod rows;
 
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    KeyContext, KeyDownEvent, ListSizingBehavior, Render, ScrollStrategy, Subscription,
+    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EntityId, FocusHandle,
+    Focusable, KeyContext, KeyDownEvent, ListSizingBehavior, Render, ScrollStrategy, Subscription,
     UniformListScrollHandle, Window, uniform_list,
 };
 use gq_language::builder::{GroupBy, GroupOn};
@@ -120,10 +121,36 @@ impl StickyCandidate for StickyRow {
     }
 }
 
-pub struct RelationshipTree {
+/// Whether a row opens, and whether it is open: a node that has relationships, a group or a
+/// value with neighbours.
+fn disclosure(entry: &Entry) -> (bool, bool) {
+    match &entry.kind {
+        EntryKind::Node {
+            expandable,
+            expanded,
+            ..
+        } => (*expandable, *expanded),
+        EntryKind::Group {
+            count, expanded, ..
+        } => (*count != Loadable::Loaded(0), *expanded),
+        EntryKind::Bucket {
+            count, expanded, ..
+        } => (*count > 0, *expanded),
+        _ => (false, false),
+    }
+}
+
+pub(crate) struct RelationshipTree {
     exploration: Option<Entity<Exploration>>,
+    /// Each graph the window has open, by its session, with its exploration: the registry
+    /// keeps an exploration only while something holds it, and the tree is what does when no
+    /// canvas is open, so going back to a graph shows its walk as it was.
+    kept: HashMap<EntityId, Entity<Exploration>>,
     /// The exploration's, shared with it and the canvas: made once per change.
     entries: Arc<Vec<Entry>>,
+    /// Whether some relationship group in `entries` has no relationships: worked out with
+    /// them, not on every draw of the actions.
+    any_empty: bool,
     /// Indices into `entries` of the rows shown under the filter.
     visible: Vec<usize>,
     selected: Option<RowId>,
@@ -162,6 +189,13 @@ impl RelationshipTree {
             window,
             |this, workspace, event: &WorkspaceEvent, window, cx| {
                 let WorkspaceEvent::SessionChanged = event;
+                let open: HashSet<EntityId> = workspace
+                    .read(cx)
+                    .open_graphs()
+                    .iter()
+                    .map(|(session, _)| session.entity_id())
+                    .collect();
+                this.kept.retain(|session, _| open.contains(session));
                 let session = workspace.read(cx).session().cloned();
                 // With nothing focused, GPUI dispatches actions from the window's root node,
                 // above the workspace's handlers; give the keyboard a home once a graph opens.
@@ -173,7 +207,9 @@ impl RelationshipTree {
         );
         let mut tree = Self {
             exploration: None,
+            kept: HashMap::new(),
             entries: Arc::default(),
+            any_empty: false,
             visible: Vec::new(),
             selected: None,
             selected_row_index_hint: None,
@@ -199,6 +235,13 @@ impl RelationshipTree {
             .map(|session| Exploration::for_session(session, cx));
         if exploration == self.exploration {
             return;
+        }
+        // The filter goes with the graph shown, and so do the server searches it asked for.
+        if !self.filter.is_empty() {
+            self.with_exploration(cx, |e, cx| e.clear_searches(cx));
+        }
+        if let (Some(exploration), Some(session)) = (&exploration, &session) {
+            self.kept.insert(session.entity_id(), exploration.clone());
         }
         self.exploration_subscriptions.clear();
         if let (Some(exploration), Some(session)) = (&exploration, &session) {
@@ -246,6 +289,15 @@ impl RelationshipTree {
             Some(exploration) => exploration.read(cx).entries(cx),
             None => Arc::default(),
         };
+        self.any_empty = self.entries.iter().any(|entry| {
+            matches!(
+                entry.kind,
+                EntryKind::Group {
+                    count: Loadable::Loaded(0),
+                    ..
+                }
+            )
+        });
         self.refilter(cx);
     }
 
@@ -254,12 +306,16 @@ impl RelationshipTree {
     fn refilter(&mut self, cx: &mut Context<Self>) {
         let previous_row = self.selected_row_index_hint;
         self.visible = match &self.exploration {
-            Some(exploration) => rows::filter(
-                &self.entries,
-                exploration.read(cx).state(),
-                &self.filter,
-                self.hide_empty,
-            ),
+            Some(exploration) => {
+                let exploration = exploration.read(cx);
+                rows::filter(
+                    &self.entries,
+                    exploration.state(),
+                    exploration.schema(cx).as_deref(),
+                    &self.filter,
+                    self.hide_empty,
+                )
+            }
             None => Vec::new(),
         };
         if let Some(selected) = &self.selected
@@ -288,9 +344,6 @@ impl RelationshipTree {
         else {
             return;
         };
-        if self.selected.as_ref().is_some_and(|id| id.path == path) {
-            return;
-        }
         let row = self.visible.iter().position(|ix| {
             let entry = &self.entries[*ix];
             entry.path == path
@@ -300,7 +353,15 @@ impl RelationshipTree {
                 )
         });
         if let Some(row) = row {
-            self.selected = Some(rows::row_id(&self.entries[self.visible[row]]));
+            let entry = &self.entries[self.visible[row]];
+            if self
+                .selected
+                .as_ref()
+                .is_some_and(|id| rows::is_row(entry, id))
+            {
+                return;
+            }
+            self.selected = Some(rows::row_id(entry));
             self.scroll_handle
                 .scroll_to_item(row, ScrollStrategy::Nearest);
             cx.notify();
@@ -376,20 +437,7 @@ impl RelationshipTree {
             return self.select_row(0, cx);
         };
         let entry = self.entries[self.visible[row]].clone();
-        let (expandable, expanded) = match &entry.kind {
-            EntryKind::Node {
-                expandable,
-                expanded,
-                ..
-            } => (*expandable, *expanded),
-            EntryKind::Group {
-                count, expanded, ..
-            } => (*count != Loadable::Loaded(0), *expanded),
-            EntryKind::Bucket {
-                count, expanded, ..
-            } => (*count > 0, *expanded),
-            _ => (false, false),
-        };
+        let (expandable, expanded) = disclosure(&entry);
         if expandable && !expanded {
             self.with_exploration(cx, |e, cx| e.expand(&entry.path, cx));
         } else if let Some(child) = rows::first_child(&self.visible, &self.entries, row) {
@@ -501,14 +549,21 @@ impl RelationshipTree {
         }
     }
 
-    fn show_on_canvas(&mut self, _: &ShowOnCanvas, window: &mut Window, cx: &mut Context<Self>) {
-        let node = match self.selected_entry().map(|entry| &entry.kind) {
-            Some(EntryKind::Node { node, .. } | EntryKind::Cycle { node, .. }) => node.clone(),
-            Some(EntryKind::Field {
+    /// The node the selected row shows: a node, a cycle back to one, or a field's target.
+    fn selected_node(&self) -> Option<NodeRef> {
+        match &self.selected_entry()?.kind {
+            EntryKind::Node { node, .. } | EntryKind::Cycle { node, .. } => Some(node.clone()),
+            EntryKind::Field {
                 target: Some(target),
                 ..
-            }) => target.node.clone(),
-            _ => return,
+            } => Some(target.node.clone()),
+            _ => None,
+        }
+    }
+
+    fn show_on_canvas(&mut self, _: &ShowOnCanvas, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(node) = self.selected_node() else {
+            return;
         };
         window.dispatch_action(
             Box::new(ShowNodeOnCanvas {
@@ -538,13 +593,8 @@ impl RelationshipTree {
 
     /// Space: the selected node in the inspector, focus staying in the tree.
     fn peek_selected(&mut self, _: &PeekSelected, window: &mut Window, cx: &mut Context<Self>) {
-        let node = match self.selected_entry().map(|entry| &entry.kind) {
-            Some(EntryKind::Node { node, .. } | EntryKind::Cycle { node, .. }) => node.clone(),
-            Some(EntryKind::Field {
-                target: Some(target),
-                ..
-            }) => target.node.clone(),
-            _ => return,
+        let Some(node) = self.selected_node() else {
+            return;
         };
         window.dispatch_action(
             Box::new(PeekNode {
@@ -619,6 +669,11 @@ impl RelationshipTree {
         }
         if keystroke.key == "backspace" {
             if self.filter.pop().is_some() {
+                // An emptied filter is a cleared one: a group narrowed on the server for it
+                // reads whole again.
+                if self.filter.is_empty() {
+                    self.with_exploration(cx, |e, cx| e.clear_searches(cx));
+                }
                 self.refilter(cx);
                 cx.stop_propagation();
             }
@@ -657,20 +712,7 @@ impl RelationshipTree {
         };
         let state = exploration.read(cx).state();
 
-        let (disclosure, expanded) = match &entry.kind {
-            EntryKind::Node {
-                expandable,
-                expanded,
-                ..
-            } => (*expandable, *expanded),
-            EntryKind::Group {
-                count, expanded, ..
-            } => (*count != Loadable::Loaded(0), *expanded),
-            EntryKind::Bucket {
-                count, expanded, ..
-            } => (*count > 0, *expanded),
-            _ => (false, false),
-        };
+        let (disclosure, expanded) = disclosure(entry);
         let toggle_path = entry.path.clone();
         let chevron = div()
             .id((
@@ -847,32 +889,12 @@ impl RelationshipTree {
                     .into_any_element()
             }
             EntryKind::Bucket { key, count, .. } => {
-                let value = key.within.as_ref().map(|within| &within.value);
-                let missing = value.is_none_or(|value| value.is_null());
-                // By a relationship of the neighbours: the related node's label, or "No
-                // Company" for the neighbours related to none.
-                let other = key
+                let missing = key
                     .within
                     .as_ref()
-                    .filter(|within| within.by.on == GroupOn::Relationship)
-                    .and_then(|within| {
-                        let schema = exploration.read(cx).schema(cx)?;
-                        let (direction, edge) =
-                            gq_language::builder::parse_relationship_key(&within.by.property)?;
-                        let edge = schema.edge(edge)?;
-                        Some(match direction {
-                            gq_language::Direction::Outgoing => edge.to.clone(),
-                            gq_language::Direction::Incoming => edge.from.clone(),
-                        })
-                    });
-                let text = match (&other, missing) {
-                    (Some(other), true) => format!("No {other}"),
-                    _ => state
-                        .bucket_label(key)
-                        .map(str::to_owned)
-                        .or_else(|| value.map(rows::bucket_text))
-                        .unwrap_or_default(),
-                };
+                    .is_none_or(|within| within.value.is_null());
+                let schema = exploration.read(cx).schema(cx);
+                let text = rows::bucket_row_text(key, state, schema.as_deref());
                 h_flex()
                     .min_w_0()
                     .flex_1()
@@ -1243,19 +1265,6 @@ impl RelationshipTree {
         self.prefetch = Some((path.clone(), task));
     }
 
-    /// Whether some relationship group shown has no relationships.
-    fn has_empty_groups(&self) -> bool {
-        self.entries.iter().any(|entry| {
-            matches!(
-                entry.kind,
-                EntryKind::Group {
-                    count: Loadable::Loaded(0),
-                    ..
-                }
-            )
-        })
-    }
-
     /// Closes everything below the root.
     fn collapse_to_root(&mut self, cx: &mut Context<Self>) {
         let root = graph_store::ExplorePath::root();
@@ -1392,7 +1401,7 @@ impl Render for RelationshipTree {
 
 /// The Explore panel's title-row actions: hide relationships with none, and close everything
 /// below the root.
-pub struct ExploreActions {
+pub(crate) struct ExploreActions {
     tree: gpui::WeakEntity<RelationshipTree>,
     _observe: Subscription,
 }
@@ -1418,7 +1427,7 @@ impl Render for ExploreActions {
                     .as_ref()
                     .is_some_and(|e| e.read(cx).root().is_some()),
                 tree.hide_empty,
-                tree.has_empty_groups(),
+                tree.any_empty,
             )
         };
         let weak = self.tree.clone();

@@ -41,6 +41,9 @@ pub struct StorageInspector {
     graphs: Loadable<GraphListResponse>,
     /// Its datasets nodes first, each kind by type name, as the table lists them.
     snapshot: Loadable<SnapshotOutput>,
+    /// Counts the reads of the snapshot begun: only the latest one's answer is shown, so an
+    /// older read that finishes later does not put back the storage it saw.
+    snapshot_reads: u64,
     _task: Option<Task<()>>,
     _snapshot_task: Option<Task<()>>,
     _subscription: Subscription,
@@ -105,6 +108,7 @@ impl StorageInspector {
             readiness: Loadable::NotLoaded,
             graphs: Loadable::NotLoaded,
             snapshot: Loadable::NotLoaded,
+            snapshot_reads: 0,
             _task: None,
             _snapshot_task: None,
             _subscription: subscription,
@@ -121,6 +125,8 @@ impl StorageInspector {
         self.readiness = Loadable::Loading;
         self.graphs = Loadable::Loading;
         self.snapshot = Loadable::Loading;
+        self.snapshot_reads += 1;
+        let snapshot_read = self.snapshot_reads;
         let read = self
             .session
             .update(cx, |session, cx| session.server_state(&branch, cx));
@@ -131,8 +137,8 @@ impl StorageInspector {
                 this.health = loadable(state.health);
                 this.readiness = loadable(state.readiness);
                 this.graphs = loadable(state.graphs);
-                // A branch moved to meanwhile is read on its own.
-                if this.branch == branch {
+                // A branch moved to, or a commit, meanwhile is read on its own.
+                if this.snapshot_reads == snapshot_read {
                     this.snapshot = loadable(state.snapshot.map(tables_in_order));
                 }
                 cx.notify();
@@ -150,13 +156,15 @@ impl StorageInspector {
         if clear {
             self.snapshot = Loadable::Loading;
         }
+        self.snapshot_reads += 1;
+        let snapshot_read = self.snapshot_reads;
         let read = self
             .session
             .update(cx, |session, cx| session.branch_snapshot(&branch, cx));
         self._snapshot_task = Some(cx.spawn(async move |this, cx| {
             let snapshot = read.await;
             this.update(cx, |this, cx| {
-                if this.branch == branch {
+                if this.snapshot_reads == snapshot_read {
                     this.snapshot = loadable(snapshot.map(tables_in_order));
                     cx.notify();
                 }
@@ -566,7 +574,7 @@ impl Render for StorageInspector {
                         div()
                             .id("index-status")
                             .tooltip(ui::Tooltip::text(
-                                "OmniGraph does not serve index status yet (E13); `explain` in the query editor shows a type's index facts",
+                                "OmniGraph does not serve index status yet; `explain` in the query editor shows a type's index facts",
                             ))
                             .child(studio_ui::ds::meta(IconName::Info, "Index status not served")),
                     ),

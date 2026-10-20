@@ -10,8 +10,8 @@ use graph_store::{Entry, EntryKind, ExplorePath, ExploreState, GroupKey, Loadabl
 /// Neighbours a hub shows before "+K more", and how many each click on it adds.
 pub const HUB_STEP: usize = 8;
 
-/// The most nodes the canvas draws by default; past the cap it says so (constitution IX). The
-/// cap in use is the graph's `canvas_max_nodes` setting.
+/// The cap the tests draw under: the default of the `canvas_max_nodes` setting, which is the
+/// cap in use.
 #[cfg(test)]
 pub const NODE_CAP: usize = 2_000;
 
@@ -77,6 +77,49 @@ impl Scene {
     pub fn index_of(&self, id: &SceneId) -> Option<usize> {
         self.nodes.iter().position(|node| node.id == *id)
     }
+
+    /// Where each chip is, for finding many by id at once: ⌘A can mark thousands, and a walk
+    /// of the scene for each would be quadratic.
+    pub fn indices(&self) -> HashMap<&SceneId, usize> {
+        self.nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (&node.id, index))
+            .collect()
+    }
+}
+
+/// Every open path the exploration reaches any of the chips `ids` by, in one pass over the
+/// entries; "+K more" stands for its relationship. A node or relationship reached by more than
+/// one path is drawn once and shows open while any of them is, so closing it closes them all.
+pub fn open_paths(entries: &[Entry], state: &ExploreState, ids: &[SceneId]) -> Vec<ExplorePath> {
+    let mut nodes = HashSet::new();
+    let mut hubs = HashSet::new();
+    for id in ids {
+        match id {
+            SceneId::Node(node) => {
+                nodes.insert(node);
+            }
+            SceneId::Hub(key) | SceneId::More(key) => {
+                hubs.insert(key);
+            }
+            SceneId::Type(_) => {}
+        }
+    }
+    entries
+        .iter()
+        .filter(|entry| match &entry.kind {
+            EntryKind::Node { node, expanded, .. } => *expanded && nodes.contains(node),
+            EntryKind::Group { key, expanded, .. } => *expanded && hubs.contains(key),
+            EntryKind::Field {
+                key,
+                target: Some(_),
+                ..
+            } => hubs.contains(key) && state.is_expanded(&entry.path),
+            _ => false,
+        })
+        .map(|entry| entry.path.clone())
+        .collect()
 }
 
 /// The schema graph: one node per type, sorted by name, one edge per edge type.
@@ -179,10 +222,13 @@ pub fn explore_scene(
     // The scene index each entry maps to (its node or hub), and entries left out.
     let mut placed: Vec<Option<usize>> = vec![None; entries.len()];
     let mut skipped = vec![false; entries.len()];
+    // Entries the cap left out, with everything under them: the banner counts them, once each
+    // however many paths reach them. Neighbours past a hub's limit are "+K more" instead.
+    let mut capped = vec![false; entries.len()];
+    let mut hidden: HashSet<SceneId> = HashSet::new();
     let mut shown_per_hub: HashMap<usize, usize> = HashMap::new();
     // The lines drawn so far, so a line is drawn once without searching every line.
     let mut lines: HashSet<(usize, usize)> = HashSet::new();
-    let mut hidden: HashMap<String, usize> = HashMap::new();
     let label_of = |node: &NodeRef| {
         state
             .label(node)
@@ -202,6 +248,10 @@ pub fn explore_scene(
             && skipped[parent]
         {
             skipped[index] = true;
+            if capped[parent] {
+                capped[index] = true;
+                left_out(entry, &by_id, &mut hidden);
+            }
             continue;
         }
         let parent_scene = entry.parent.and_then(|parent| placed[parent]);
@@ -232,8 +282,9 @@ pub fn explore_scene(
                     continue;
                 }
                 if scene.nodes.len() >= cap {
-                    *hidden.entry(node.type_name.clone()).or_default() += 1;
+                    hidden.insert(id);
                     skipped[index] = true;
+                    capped[index] = true;
                     continue;
                 }
                 let root = entry.parent.is_none();
@@ -282,7 +333,9 @@ pub fn explore_scene(
                     continue;
                 }
                 if scene.nodes.len() >= cap {
+                    hidden.insert(id);
                     skipped[index] = true;
+                    capped[index] = true;
                     continue;
                 }
                 let arrow = key.group.direction.arrow();
@@ -324,7 +377,16 @@ pub fn explore_scene(
                 let open = state.is_expanded(&entry.path);
                 let hub_id = SceneId::Hub(key.clone());
                 let hub = match by_id.get(&hub_id).copied() {
-                    Some(existing) => existing,
+                    // Drawn by another path: open while either path opens it.
+                    Some(existing) => {
+                        if open
+                            && let SceneKind::Hub { open: shown, .. } =
+                                &mut scene.nodes[existing].kind
+                        {
+                            *shown = true;
+                        }
+                        existing
+                    }
                     None if scene.nodes.len() < cap => {
                         let arrow = key.group.direction.arrow();
                         let hub = add(
@@ -346,7 +408,13 @@ pub fn explore_scene(
                         push_edge(&mut scene, &mut lines, owner, hub);
                         hub
                     }
-                    None => continue,
+                    None => {
+                        hidden.insert(hub_id);
+                        if open {
+                            hidden.insert(SceneId::Node(target.node.clone()));
+                        }
+                        continue;
+                    }
                 };
                 placed[index] = Some(hub);
                 if !open {
@@ -371,7 +439,10 @@ pub fn explore_scene(
                             path: None,
                         },
                     ),
-                    None => continue,
+                    None => {
+                        hidden.insert(id);
+                        continue;
+                    }
                 };
                 push_edge(&mut scene, &mut lines, hub, to);
             }
@@ -408,7 +479,9 @@ pub fn explore_scene(
         };
         let drawn = drawn_from.get(&hub).copied().unwrap_or(0);
         let total = count.unwrap_or(0);
-        if total > drawn && scene.nodes.len() < cap {
+        if total > drawn && scene.nodes.len() >= cap {
+            hidden.insert(SceneId::More(key));
+        } else if total > drawn {
             let more = SceneNode {
                 id: SceneId::More(key.clone()),
                 kind: SceneKind::More {
@@ -426,10 +499,39 @@ pub fn explore_scene(
     }
 
     if !hidden.is_empty() {
-        let total = hidden.values().sum();
-        scene.capped = most_left_out(hidden).map(|type_name| (total, type_name));
+        // The table offered is the type most of them are, or lead to.
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for id in &hidden {
+            let type_name = match id {
+                SceneId::Node(node) => node.type_name.as_str(),
+                SceneId::Hub(key) | SceneId::More(key) => key.group.other_type.as_str(),
+                SceneId::Type(name) => name.as_str(),
+            };
+            *counts.entry(type_name).or_default() += 1;
+        }
+        scene.capped = most_left_out(counts).map(|type_name| (hidden.len(), type_name));
     }
     scene
+}
+
+/// Records `entry`, under an entry the cap left out, as not drawn, unless it is drawn by
+/// another path.
+fn left_out(entry: &Entry, drawn: &HashMap<SceneId, usize>, hidden: &mut HashSet<SceneId>) {
+    let id = match &entry.kind {
+        EntryKind::Node { node, .. } => SceneId::Node(node.clone()),
+        EntryKind::Group { key, count, .. } if *count != Loadable::Loaded(0) => {
+            SceneId::Hub(key.clone())
+        }
+        EntryKind::Field {
+            key,
+            target: Some(_),
+            ..
+        } => SceneId::Hub(key.clone()),
+        _ => return,
+    };
+    if !drawn.contains_key(&id) {
+        hidden.insert(id);
+    }
 }
 
 /// The type most of the nodes left out belong to; of types as many, the first by name, so the
@@ -666,6 +768,114 @@ mod tests {
         );
     }
 
+    /// p05, reached from Ada and from p00, is one chip, open while either path is: closing it
+    /// closes both, so it does not stay open by the path not drawn.
+    #[test]
+    fn a_node_reached_twice_is_closed_by_both_paths() {
+        let (schema, mut state) = exploration();
+        let knows = schema
+            .relationships_of("Person")
+            .iter()
+            .find(|g| g.edge == "Knows" && g.direction == Direction::Outgoing)
+            .cloned()
+            .unwrap();
+        let from_ada = ExplorePath::root()
+            .child_group(&knows)
+            .child_node(&person("p05"));
+        let from_p00 = ExplorePath::root()
+            .child_group(&knows)
+            .child_node(&person("p00"))
+            .child_group(&knows)
+            .child_node(&person("p05"));
+        let p05 = SceneId::Node(person("p05"));
+        let opened = |state: &ExploreState| {
+            let scene = explore_scene(&state.entries(&schema), state, &HashMap::new(), NODE_CAP);
+            let chip = &scene.nodes[scene.index_of(&p05).unwrap()];
+            matches!(chip.kind, SceneKind::Node { expanded: true, .. })
+        };
+        state.expand(&from_p00);
+        assert!(opened(&state), "open by the path not drawn first");
+        state.expand(&from_ada);
+        let mut paths = open_paths(&state.entries(&schema), &state, std::slice::from_ref(&p05));
+        paths.sort_by_key(|path| format!("{path:?}"));
+        let mut both = vec![from_ada, from_p00];
+        both.sort_by_key(|path| format!("{path:?}"));
+        assert_eq!(paths, both);
+        for path in &paths {
+            state.collapse(path);
+        }
+        assert!(!opened(&state));
+        assert!(open_paths(&state.entries(&schema), &state, &[p05]).is_empty());
+    }
+
+    /// Bob is reached directly and through Cid; his employer, opened by the second path only,
+    /// is one hub that shows open, with the company it reaches.
+    #[test]
+    fn a_single_target_hub_reached_twice_is_open_by_either_path() {
+        let schema = SchemaModel::parse(&format!(
+            "{SCHEMA}edge Employer: Person -> Company @card(0..1)\n"
+        ))
+        .unwrap();
+        let group = |edge: &str| {
+            schema
+                .relationships_of("Person")
+                .iter()
+                .find(|g| g.edge == edge && g.direction == Direction::Outgoing)
+                .cloned()
+                .unwrap()
+        };
+        let (knows, employer) = (group("Knows"), group("Employer"));
+        let (ada, bob, cid) = (person("ada"), person("bob"), person("cid"));
+        let acme = NodeRef::new("Company", "acme");
+        let list = |nodes: Vec<NodeRef>| NeighbourList {
+            rows: nodes
+                .into_iter()
+                .map(|node| Neighbour {
+                    node,
+                    label: None,
+                    edge: Vec::new(),
+                })
+                .collect(),
+            exhausted: true,
+            ..Default::default()
+        };
+        let mut state = ExploreState::rooted(ada.clone());
+        state.root_status = Loadable::Loaded(());
+        state.neighbours.insert(
+            GroupKey::new(ada, knows.clone()),
+            list(vec![bob.clone(), cid.clone()]),
+        );
+        state.neighbours.insert(
+            GroupKey::new(cid.clone(), knows.clone()),
+            list(vec![bob.clone()]),
+        );
+        let key = GroupKey::new(bob.clone(), employer.clone());
+        state
+            .neighbours
+            .insert(key.clone(), list(vec![acme.clone()]));
+        let ada_knows = ExplorePath::root().child_group(&knows);
+        let direct = ada_knows.child_node(&bob);
+        let cid_knows = ada_knows.child_node(&cid).child_group(&knows);
+        let via_cid = cid_knows.child_node(&bob);
+        for path in [
+            ada_knows.clone(),
+            direct,
+            ada_knows.child_node(&cid),
+            cid_knows,
+            via_cid.clone(),
+            via_cid.child_group(&employer),
+        ] {
+            state.expanded.insert(path);
+        }
+        let scene = explore_scene(&state.entries(&schema), &state, &HashMap::new(), NODE_CAP);
+        let hub = scene.index_of(&SceneId::Hub(key)).unwrap();
+        assert!(matches!(
+            scene.nodes[hub].kind,
+            SceneKind::Hub { open: true, .. }
+        ));
+        assert!(scene.index_of(&SceneId::Node(acme)).is_some());
+    }
+
     #[test]
     fn the_cap_stops_drawing_and_says_how_many_are_left_out() {
         let (schema, state) = exploration();
@@ -681,5 +891,16 @@ mod tests {
         let (hidden, type_name) = scene.capped.clone().unwrap();
         assert!(hidden > 0);
         assert_eq!(type_name, "Person");
+    }
+
+    /// At a cap that leaves only Ada drawn, the banner counts what it left out: Ada's three
+    /// relationship chips, the 20 people under one of them (p05 once, though p00 reaches it
+    /// too), and p00's three relationship chips.
+    #[test]
+    fn the_cap_counts_relationships_and_each_node_once() {
+        let (schema, state) = exploration();
+        let scene = explore_scene(&state.entries(&schema), &state, &HashMap::new(), 1);
+        assert_eq!(scene.nodes.len(), 1);
+        assert_eq!(scene.capped, Some((3 + 20 + 3, "Person".into())));
     }
 }
