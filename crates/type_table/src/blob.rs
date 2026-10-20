@@ -228,6 +228,36 @@ impl Drop for RangeSave {
     }
 }
 
+/// The folder a save of a value is offered in: Downloads, else the system's temporary folder.
+pub fn save_folder() -> PathBuf {
+    std::env::home_dir()
+        .map(|home| home.join("Downloads"))
+        .filter(|dir| dir.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// The bytes of a managed value of `size` bytes from `from` on, at `snapshot`, as much as one
+/// read gives; `None` once the value ends.
+pub async fn read_range(
+    session: &WeakEntity<GraphSession>,
+    cell: &BlobCell,
+    snapshot: &Option<String>,
+    from: u64,
+    size: u64,
+    cx: &mut AsyncApp,
+) -> Result<Option<Vec<u8>>, String> {
+    let read = session
+        .update(cx, |session, cx| {
+            session.blob_bytes(cell.clone(), snapshot.clone(), from..size, cx)
+        })
+        .map_err(|_| "The graph closed.".to_owned())?;
+    match read.await {
+        Ok(chunk) if !chunk.is_empty() => Ok(Some(chunk)),
+        Ok(_) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 /// Reads a managed value whole, in ranges at `snapshot`, telling `progress` how far it got.
 pub async fn read_value(
     session: WeakEntity<GraphSession>,
@@ -240,15 +270,9 @@ pub async fn read_value(
     let mut bytes = Vec::with_capacity(size as usize);
     while (bytes.len() as u64) < size {
         let from = bytes.len() as u64;
-        let read = session
-            .update(cx, |session, cx| {
-                session.blob_bytes(cell.clone(), snapshot.clone(), from..size, cx)
-            })
-            .map_err(|_| "The graph closed.".to_owned())?;
-        match read.await {
-            Ok(chunk) if !chunk.is_empty() => bytes.extend(chunk),
-            Ok(_) => break,
-            Err(error) => return Err(error.to_string()),
+        match read_range(&session, &cell, &snapshot, from, size, cx).await? {
+            Some(chunk) => bytes.extend(chunk),
+            None => break,
         }
         progress(bytes.len() as u64, cx);
     }
@@ -275,21 +299,12 @@ pub async fn save_value(
         .map_err(|error| format!("Could not write: {error}"))?;
     while save.written() < size {
         let from = save.written();
-        let read = match session.update(cx, |session, cx| {
-            session.blob_bytes(cell.clone(), snapshot.clone(), from..size, cx)
-        }) {
-            Ok(read) => read,
-            Err(_) => {
-                save.abandon();
-                return Err("The graph closed.".into());
-            }
-        };
-        let chunk = match read.await {
-            Ok(chunk) if !chunk.is_empty() => chunk,
-            Ok(_) => break,
+        let chunk = match read_range(&session, &cell, &snapshot, from, size, cx).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
             Err(error) => {
                 save.abandon();
-                return Err(error.to_string());
+                return Err(error);
             }
         };
         let (returned, written) = cx

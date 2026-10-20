@@ -24,8 +24,8 @@ use ui::Tooltip;
 use ui::prelude::*;
 
 use crate::blob::{
-    ShownImage, hex_dump_lines, read_value, save_value, sniff_image, suggested_file_name,
-    text_prefix,
+    ShownImage, hex_dump_lines, read_value, save_folder, save_value, sniff_image,
+    suggested_file_name, text_prefix,
 };
 use crate::pdf;
 
@@ -379,11 +379,7 @@ impl BlobView {
     }
 
     fn save(&mut self, cx: &mut Context<Self>) {
-        let directory = std::env::home_dir()
-            .map(|home| home.join("Downloads"))
-            .filter(|dir| dir.is_dir())
-            .unwrap_or_else(std::env::temp_dir);
-        let chosen = cx.prompt_for_new_path(&directory, Some(&self.file_name()));
+        let chosen = cx.prompt_for_new_path(&save_folder(), Some(&self.file_name()));
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(path))) = chosen.await else {
                 return;
