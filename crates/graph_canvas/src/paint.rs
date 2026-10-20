@@ -315,8 +315,10 @@ pub(crate) fn paint(
             .nodes
             .iter()
             .all(|n| matches!(n.kind, SceneKind::Type { .. }));
-    // What pointing at a chip brings out: the chip and what its lines reach.
-    let near: Option<HashSet<usize>> = hovered.map(|h| {
+    // What pointing at a chip brings out in the ontology: the chip and what its lines reach,
+    // the rest fading. The explorer fades nothing under the pointer for now; the pointed chip's
+    // own lines still stand out.
+    let near: Option<HashSet<usize>> = hovered.filter(|_| schema).map(|h| {
         let mut near = HashSet::from([h]);
         for edge in &scene.edges {
             if edge.from == h {
@@ -371,15 +373,9 @@ pub(crate) fn paint(
                     0.45
                 }
             }
-            Some(_) => {
-                if schema {
-                    0.05
-                } else {
-                    0.06
-                }
-            }
-            None if !schema && touches(selected) => 0.25,
-            None => base,
+            Some(_) if schema => 0.05,
+            _ if !schema && touches(selected) => 0.25,
+            _ => base,
         };
         let tone = Tone {
             alpha: (alpha * 1000.) as u16,

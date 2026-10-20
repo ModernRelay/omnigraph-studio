@@ -198,8 +198,9 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   hairline and a soft contact shadow, with a letter mark (the label's initial in white on one of
   eight muted tints, chosen by a hash of the type's name) and a muted
   count; lines are 1-pixel greys (schema 15%, a pointed type's 40% and the rest 5%; hub lines
-  20% and dotted while the hub is closed); pointing at a chip fades what it does not reach to
-  30%; the selection carries a warm ring; a faint dot grid lies behind; a schema with up
+  20% and dotted while the hub is closed); in the ontology, pointing at a chip fades what it
+  does not reach to 30% (the explorer stopped fading under the pointer on 2026-10-19, at
+  Ragnor's request, for now: its pointed chip's lines still stand out); the selection carries a warm ring; a faint dot grid lies behind; a schema with up
   to 16 relationships labels every line. Chips grow with the view to their size at zoom 1 and
   become marks alone from afar. Overlay: the mode switch, a "Search nodes…" pill (⌘P) and the
   zoom controls on top, the caption bottom left. Colour is kept to node types: relationships
