@@ -33,8 +33,8 @@ use crate::blob::{
     suggested_file_name,
 };
 use crate::model::{
-    FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, count_of, display_value, edited, field_rows,
-    node_label, node_rows, reads_as_markdown, save_result,
+    FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, changed_elsewhere, count_of, display_value,
+    edited, field_rows, node_label, node_rows, reads_as_markdown, save_result,
 };
 use crate::suggest;
 use gq_language::input::same_value;
@@ -60,6 +60,15 @@ const PAGE_WIDTH: f32 = studio_ui::ds::size::READING_WIDTH;
 const COUNT_DELAY: Duration = Duration::from_millis(120);
 /// What a property the node holds no value for shows, borrowed like a value it holds.
 static NULL: Value = Value::Null;
+
+/// Why a field opens again when its write matched nothing and the node could not be read to
+/// say what it holds now.
+const CHANGED_UNREAD: &str =
+    "The value changed elsewhere while you were editing. Nothing was written.";
+
+/// Why a field opens again when its write matched nothing because the node is gone.
+const NODE_GONE: &str =
+    "This node was deleted elsewhere while you were editing. Nothing was written.";
 
 /// How far past the rows in view the view's list lays rows out. A group is read once its row
 /// is laid out, so this is how far ahead of a scroll the groups are read: a few rows.
@@ -1837,11 +1846,7 @@ impl NodePeek {
             SaveResult::NoMatch => {
                 self.put_back(&name, &new, shown);
                 self.newer = true;
-                let notice = Notice::new(
-                    Tone::Conflict,
-                    "Changed elsewhere while you were editing; Refresh reads it now",
-                );
-                self.reopen(property, old, text, notice, window, cx);
+                self.reread_conflict(property, old, text, window, cx);
             }
             SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
                 self.put_back(&name, &new, shown);
@@ -1852,6 +1857,188 @@ impl NodePeek {
             self.compare_head(cx);
         }
         cx.notify();
+    }
+
+    /// A field's write matched nothing: the value it was bound to changed elsewhere. Reads the
+    /// property at the branch's head, and opens the field again bound to what it holds now,
+    /// which the view shows and the notice names; without that read, still bound to the value
+    /// it was typed over. The field shows as saving until the read lands.
+    fn reread_conflict(
+        &mut self,
+        property: gq_language::Property,
+        old: Value,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = property.name.clone();
+        let Some(read) = self.read_at_head(std::slice::from_ref(&name), cx) else {
+            let notice = Notice::new(Tone::Conflict, CHANGED_UNREAD);
+            self.reopen(property, old, text, notice, window, cx);
+            return;
+        };
+        self.saving.insert(name.clone());
+        let (session, branch, key) = (
+            self.session.clone(),
+            self.branch.clone(),
+            self.draft_key(&name),
+        );
+        let id = self.subject.id().to_owned();
+        // Detached, as the write was: the text is settled however the view ends.
+        cx.spawn_in(window, async move |this, cx| {
+            let now = held_now(read.await, &id);
+            let shown = this.update_in(cx, |this, window, cx| {
+                this.saving.remove(&name);
+                if this.branch == branch {
+                    let (bound, notice) = match &now {
+                        Some(Some(values)) => {
+                            let value = values.get(&name).cloned().unwrap_or(Value::Null);
+                            this.restore(&name, value.clone());
+                            let notice = changed_elsewhere(Some(&property), Some(&value));
+                            (value, notice)
+                        }
+                        Some(None) => (old.clone(), Notice::new(Tone::Conflict, NODE_GONE)),
+                        None => (old.clone(), Notice::new(Tone::Conflict, CHANGED_UNREAD)),
+                    };
+                    this.reopen(property.clone(), bound, text.clone(), notice, window, cx);
+                } else {
+                    // The view reads another branch now: the text stays a draft where it was
+                    // typed.
+                    this.put_draft_on(&branch, &name, old.clone(), text.clone(), cx);
+                }
+                if this.saving.is_empty() && this.edge_writes.is_empty() {
+                    this.compare_head(cx);
+                }
+                cx.notify();
+            });
+            // The view went first: the text stays a draft where it was typed, bound to the
+            // value it was typed over, since what the head holds was never shown.
+            if shown.is_err()
+                && let Some(key) = key
+            {
+                session.update(cx, |session, cx| {
+                    session.set_draft_on(&branch, key, DraftEntry { old, text }, cx)
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Reads `properties` of the node at the branch's head; `None` when no such read can be
+    /// built (no schema, or a property it does not hold). [`held_now`] reads its answer.
+    fn read_at_head(
+        &self,
+        properties: &[String],
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<ReadOutput, ReadError>>> {
+        let PeekSubject::Node { type_name, id } = &self.subject else {
+            return None;
+        };
+        let schema = self.schema.as_ref()?;
+        let ids = std::slice::from_ref(id);
+        let query = builder::nodes_fields_by_id(schema, type_name, ids, properties).ok()?;
+        let branch = self.branch.clone();
+        Some(
+            self.session
+                .update(cx, |session, cx| session.read_on(&branch, &query, cx)),
+        )
+    }
+
+    /// ⌘S matched nothing: a value its drafts were bound to changed elsewhere, and nothing was
+    /// written. Reads them at the branch's head ([`Self::drafts_read`] settles them); each
+    /// shows as saving until the read lands.
+    fn reread_drafts(&mut self, cells: Vec<(String, Value, Value)>, cx: &mut Context<Self>) {
+        let names: Vec<String> = cells.iter().map(|(name, ..)| name.clone()).collect();
+        let Some(read) = self.read_at_head(&names, cx) else {
+            self.drafts_read(cells, None, cx);
+            return;
+        };
+        self.saving.extend(names.iter().cloned());
+        let branch = self.branch.clone();
+        let id = self.subject.id().to_owned();
+        // Detached: a view that goes leaves the drafts as they were bound, since what the head
+        // holds was never shown.
+        cx.spawn(async move |this, cx| {
+            let now = held_now(read.await, &id);
+            this.update(cx, |this, cx| {
+                for name in &names {
+                    this.saving.remove(name);
+                }
+                // The view reads another branch now: the drafts stay as they were typed there.
+                if this.branch == branch {
+                    this.drafts_read(cells, now.as_ref(), cx);
+                }
+                if this.saving.is_empty() && this.edge_writes.is_empty() {
+                    this.compare_head(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Settles drafts ⌘S sent that matched nothing, read again at the head (`now`, as
+    /// [`held_now`] gives it). A draft asking for what the node holds now goes; one over a value
+    /// that changed is bound to the value read, which the view then shows; the others stay as
+    /// they were bound. The drafts' notice names what changed. A draft changed or discarded
+    /// while the read was out stands as it is.
+    fn drafts_read(
+        &mut self,
+        cells: Vec<(String, Value, Value)>,
+        now: Option<&Option<Map<String, Value>>>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = Vec::new();
+        if let Some(Some(values)) = now {
+            for (name, old, new) in cells {
+                let Some(draft) = self
+                    .draft_of(&name, cx)
+                    .filter(|draft| same_value(&draft.old, &old))
+                else {
+                    continue;
+                };
+                let value = values.get(&name).cloned().unwrap_or(Value::Null);
+                if same_value(&value, &new) {
+                    self.restore(&name, value);
+                    self.drop_draft(&name, cx);
+                } else if !same_value(&value, &old) {
+                    let shown = display_value(self.property_named(&name), &value);
+                    changed.push(format!("{name} to “{shown}”"));
+                    self.restore(&name, value.clone());
+                    self.put_draft(&name, value, draft.text, cx);
+                }
+            }
+        }
+        let message = match now {
+            Some(Some(_)) if changed.is_empty() => {
+                "Nothing was written; your changes are kept".to_owned()
+            }
+            Some(Some(_)) => format!(
+                "Changed elsewhere: {}; nothing was written and your changes are kept",
+                changed.join(", ")
+            ),
+            Some(None) => {
+                "This node was deleted elsewhere; nothing was written and your changes are kept"
+                    .to_owned()
+            }
+            None => "A value changed elsewhere; nothing was written and your changes are kept"
+                .to_owned(),
+        };
+        // Drafts that all went need no word.
+        let kept = !self.node_drafts(cx).is_empty();
+        self.drafts_notice = kept.then(|| Notice::new(Tone::Conflict, message));
+        self.confirm_discard = false;
+    }
+
+    /// The subject's property `name` in the view's schema.
+    fn property_named(&self, name: &str) -> Option<&gq_language::Property> {
+        let schema = self.schema.as_ref()?;
+        let properties = match &self.subject {
+            PeekSubject::Node { type_name, .. } => &schema.node(type_name)?.properties,
+            PeekSubject::Edge { edge_type, .. } => &schema.edge(edge_type)?.properties,
+        };
+        properties.iter().find(|property| property.name == name)
     }
 
     fn restore(&mut self, name: &str, value: Value) {
@@ -1870,7 +2057,9 @@ impl NodePeek {
         }
     }
 
-    /// Opens the field again with what was typed and why it did not land (constitution III).
+    /// Opens the field again with what was typed and why it did not land (constitution III),
+    /// bound to `old`. A field that cannot open now (the node is being read again) keeps the
+    /// text as its draft, bound alike, and the node's drafts say why.
     fn reopen(
         &mut self,
         property: gq_language::Property,
@@ -1882,11 +2071,18 @@ impl NodePeek {
     ) {
         let name = property.name.clone();
         self.start_edit(property, window, cx);
-        if let Some(edit) = self.edits.get_mut(&name) {
-            edit.old = old;
-            edit.notice = Some(notice);
-            edit.editor
-                .update(cx, |editor, cx| editor.set_text(text, window, cx));
+        match self.edits.get_mut(&name) {
+            Some(edit) => {
+                edit.old = old;
+                edit.notice = Some(notice);
+                edit.editor
+                    .update(cx, |editor, cx| editor.set_text(text, window, cx));
+            }
+            None => {
+                self.put_draft(&name, old, text, cx);
+                self.drafts_notice = Some(notice);
+                self.confirm_discard = false;
+            }
         }
     }
 
@@ -2423,11 +2619,9 @@ impl NodePeek {
                     }
                     SaveResult::NoMatch => {
                         this.newer = true;
-                        this.drafts_notice = Some(Notice::new(
-                            Tone::Conflict,
-                            "A value changed elsewhere; nothing was written and your changes \
-                             are kept. Refresh reads it now.",
-                        ));
+                        // What the node holds now is read at the head, and the drafts bound
+                        // to it.
+                        this.reread_drafts(cells, cx);
                     }
                     SaveResult::Refused(notice) | SaveResult::Unknown(notice) => {
                         this.drafts_notice = Some(notice);
@@ -3545,6 +3739,16 @@ async fn read_first_edges(
         Err(error) => Loadable::Failed(error),
     };
     Some(Ok(FirstEdges { shown, count }))
+}
+
+/// What a read of the node's fields ([`NodePeek::read_at_head`]) found of node `id`: its
+/// values; `Some(None)` when it is gone, `None` when it could not be read.
+fn held_now(read: Result<ReadOutput, ReadError>, id: &str) -> Option<Option<Map<String, Value>>> {
+    let output = read.ok()?;
+    let row = field_rows(&output.rows)
+        .into_iter()
+        .find(|row| row.id == id);
+    Some(row.map(|row| row.values))
 }
 
 fn neighbours_from(rows: &Value) -> Vec<Neighbour> {
@@ -5016,6 +5220,114 @@ mod tests {
             assert!(session.draft(&key).is_none(), "nothing on fix");
         });
         view.read_with(cx, |view, _| assert!(view.saving.is_empty()));
+    }
+
+    /// A write that does not land while the node is being read again (Refresh pressed while it
+    /// was out) cannot open its field: what was typed is kept as the property's draft, bound to
+    /// the value it was typed over, and the node's drafts say why.
+    #[gpui::test]
+    async fn a_refused_write_during_a_refresh_keeps_its_text_and_reason(cx: &mut TestAppContext) {
+        let session = session(PEOPLE, cx);
+        let (view, cx) = page(session.clone(), cx);
+        view.update_in(cx, |view, window, cx| {
+            let person = view.schema.as_ref().unwrap().node("Person").unwrap();
+            let property = person.property("name").unwrap().clone();
+            view.refresh(cx);
+            assert!(matches!(view.values, Loadable::Loading), "read again");
+            let field = FieldWrite {
+                property,
+                old: json!("Ada"),
+                new: json!("Ada Lovelace"),
+                text: "Ada Lovelace".into(),
+                shown: json!("Ada"),
+            };
+            let notice = Notice::new(Tone::Refused, "Nothing was written.");
+            view.finish_write(field, SaveResult::Refused(notice), window, cx);
+            assert!(view.edits.is_empty(), "the field cannot open yet");
+        });
+        cx.run_until_parked();
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        let draft = session.read_with(cx, |session, _| session.draft(&key).cloned());
+        assert_eq!(
+            draft,
+            Some(DraftEntry {
+                old: json!("Ada"),
+                text: "Ada Lovelace".into(),
+            })
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.value_of("name"), json!("Ada"), "read");
+            let tone = view.drafts_notice.as_ref().map(|notice| notice.tone);
+            assert_eq!(tone, Some(Tone::Refused), "why it did not land");
+        });
+    }
+
+    /// A write that matched nothing reads the property at the head: the field opens again bound
+    /// to what the node holds now, which the view shows and the notice names, so the next ↵
+    /// writes over the value seen rather than conflicting again. ⌘S binds its drafts there
+    /// alike.
+    #[gpui::test]
+    async fn a_conflict_is_bound_to_the_value_read_at_the_head(cx: &mut TestAppContext) {
+        let session = crate::test_support::session_routing_unmatched(
+            PEOPLE,
+            |request| match request["name"].as_str() {
+                Some("studio_nodes_fields") => json!([{ "id": "p1", "v_name": "Ada B" }]),
+                _ => json!([{ "n": { "@id": "p1", "slug": "p1", "name": "Ada" } }]),
+            },
+            cx,
+        );
+        let (view, cx) = page(session.clone(), cx);
+        edit_name(&view, "Ada Lovelace", cx);
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.value_of("name"), json!("Ada B"), "what the head holds");
+            let edit = &view.edits["name"];
+            assert_eq!(edit.old, json!("Ada B"), "bound to it");
+            assert_eq!(edit.editor.read(cx).text(cx), "Ada Lovelace");
+            let notice = edit.notice.as_ref().expect("why it did not land");
+            assert_eq!(notice.tone, Tone::Conflict);
+            assert!(notice.message.contains("Ada B"), "{}", notice.message);
+            assert!(view.saving.is_empty());
+        });
+
+        // A draft typed over the old value: ⌘S finds the change, and binds it to the new one.
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        view.update(cx, |view, _| view.edits.clear());
+        session.update(cx, |session, cx| {
+            let draft = DraftEntry {
+                old: json!("Ada"),
+                text: "Ada King".into(),
+            };
+            session.set_draft(key.clone(), draft, cx);
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.save_drafts(&SaveNodeDrafts, window, cx)
+        });
+        cx.run_until_parked();
+        let draft = session.read_with(cx, |session, _| session.draft(&key).cloned());
+        assert_eq!(
+            draft,
+            Some(DraftEntry {
+                old: json!("Ada B"),
+                text: "Ada King".into(),
+            })
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.value_of("name"), json!("Ada B"));
+            let notice = view
+                .drafts_notice
+                .as_ref()
+                .expect("why nothing was written");
+            assert!(notice.message.contains("Ada B"), "{}", notice.message);
+            assert!(view.saving.is_empty() && !view.saving_drafts);
+        });
     }
 
     /// ↵ on a field typed back to the value its draft was typed over lets the draft go, and

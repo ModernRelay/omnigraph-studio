@@ -158,6 +158,17 @@ struct DraftEdit {
     shown: Value,
 }
 
+/// The table's own inserts and deletes made on commits past its pin, which a count read at the
+/// pin does not hold: the rows they added (negative for removed), and those of them through
+/// `filters`, the filters they were counted under.
+#[derive(Debug)]
+struct CountShift {
+    pin: String,
+    filters: Vec<Filter>,
+    rows: i64,
+    matching: i64,
+}
+
 /// A bulk set being written: the property, and what came of the last try.
 #[derive(Default)]
 struct BulkDraft {
@@ -267,6 +278,10 @@ pub struct TypeTable {
     kind: TableKind,
     schema: Option<Arc<SchemaModel>>,
     missing: bool,
+    /// The next first read asks the server for the branch's head instead of reading at the one
+    /// the session holds: Refresh wants the newest, which the session may not have seen yet
+    /// (a write refused because the branch moved is the case).
+    fresh: bool,
     /// Every column the schema gives this type, in schema order.
     all_columns: Vec<ColumnSpec>,
     /// Which of them show, and in what order.
@@ -397,6 +412,9 @@ pub struct TypeTable {
     section_tasks: HashMap<usize, Task<()>>,
     count_task: Option<Task<()>>,
     total_task: Option<Task<()>>,
+    /// What the table's own writes past its pin change in its counts: a count read at the pin
+    /// lands with it added, whether it was out when they landed or is read after.
+    count_shift: Option<CountShift>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -566,6 +584,7 @@ impl TypeTable {
             kind: TableKind::Node,
             schema: None,
             missing: false,
+            fresh: false,
             all_columns: Vec::new(),
             layout: opening.layout,
             columns: Vec::new(),
@@ -636,6 +655,7 @@ impl TypeTable {
             section_tasks: HashMap::new(),
             count_task: None,
             total_task: None,
+            count_shift: None,
             _subscriptions: subscriptions,
         };
         // Drafts already kept for this type (on a node's page, in another table) show at once.
@@ -1975,6 +1995,7 @@ impl TypeTable {
             self.paging.reset();
             // A table opened at a commit stays pinned to it (constitution II).
             self.paging.pinned = self.at_commit.clone();
+            self.count_shift = None;
             self.newer = false;
             cx.emit(ItemEvent::UpdateTab);
         }
@@ -2032,8 +2053,12 @@ impl TypeTable {
             }
         };
         // A first read goes to the head the session holds, as the groups' read does, so the pin
-        // is a commit the session compares its next head with.
-        let asked = self.head_asked(cx);
+        // is a commit the session compares its next head with; a Refresh goes to the server's.
+        let asked = if std::mem::take(&mut self.fresh) {
+            None
+        } else {
+            self.head_asked(cx)
+        };
         let snapshot = self.paging.pinned.clone().or_else(|| asked.clone());
         let read = self.read_shown(&query, snapshot, cx);
         self.page_task = Some(cx.spawn(async move |this, cx| {
@@ -2321,12 +2346,16 @@ impl TypeTable {
         let snapshot = self.paging.pinned.clone();
         // The rows with none are counted at the commit the groups are read at. Known before
         // either is read (the table's pin, or the head the session saw), both go at once;
-        // otherwise the groups' answer names it.
+        // otherwise the groups' answer names it. A Refresh reads at the server's head.
+        let fresh = std::mem::take(&mut self.fresh);
         let known = snapshot.clone().or_else(|| {
             let session = self.session.read(cx);
-            session.head(&self.branch).map(str::to_owned)
+            session
+                .head(&self.branch)
+                .filter(|_| !fresh)
+                .map(str::to_owned)
         });
-        let asked = self.head_asked(cx);
+        let asked = if fresh { None } else { self.head_asked(cx) };
         let read = self.read_shown(&query, known.clone().or(snapshot), cx);
         let none_at_once = known
             .as_ref()
@@ -2935,13 +2964,15 @@ impl TypeTable {
                 return None;
             }
         };
+        let at = snapshot.clone();
         let read = self.read_shown(&query, snapshot, cx);
         Some(cx.spawn(async move |this, cx| {
             let result = read.await;
             this.update(cx, |this, cx| {
+                let shift = this.count_shift_at(at.as_deref(), filtered);
                 let value = match result {
                     Ok(output) => match count_of(&output.rows) {
-                        Some(n) => Loadable::Loaded(n),
+                        Some(n) => Loadable::Loaded(n + shift),
                         None => Loadable::Failed("The count came back empty".into()),
                     },
                     Err(error) => Loadable::Failed(error.to_string()),
@@ -2955,6 +2986,23 @@ impl TypeTable {
             })
             .ok();
         }))
+    }
+
+    /// What the table's own writes past its pin add to a count read at `at`: to the count
+    /// through the filters (`filtered`), or to the total. One counted under other filters than
+    /// the table's adds nothing to the count through them: it is not known there.
+    fn count_shift_at(&self, at: Option<&str>, filtered: bool) -> i64 {
+        let shift = self.count_shift.as_ref();
+        let Some(shift) = shift.filter(|shift| Some(shift.pin.as_str()) == at) else {
+            return 0;
+        };
+        if !filtered || self.filters.is_empty() {
+            shift.rows
+        } else if shift.filters == self.filters {
+            shift.matching
+        } else {
+            0
+        }
     }
 
     /// Offers Refresh when the branch head the session last saw is not the commit the table
@@ -3026,6 +3074,11 @@ impl TypeTable {
             (Some(shown), Some(held)) => shown.source != held.source,
             _ => false,
         };
+        // The newest is wanted, which the session may not hold yet: the server's head is read,
+        // and the session asks after the heads too.
+        self.fresh = true;
+        self.session
+            .update(cx, |session, cx| session.check_heads(cx));
         if schema_moved {
             // Its columns and rows come from the new schema.
             self.load_schema(cx);
@@ -3131,7 +3184,8 @@ impl TypeTable {
     /// them through its filters (negative for a delete). With the pin moved to the commit, they
     /// are read again there: the rows changed are counted as the commit counts them, those not
     /// loaded and those a filter on a relationship keeps included. Behind it, a read at the pin
-    /// would not hold the change, so they are adjusted here until Refresh.
+    /// would not hold the change, so they are adjusted here until Refresh: those shown now, and
+    /// each read at the pin as it lands, one out now included.
     fn recount(&mut self, behind: bool, rows: i64, matching: i64, cx: &mut Context<Self>) {
         if !behind {
             if matches!(self.first_page, Loadable::Loaded(())) {
@@ -3145,6 +3199,27 @@ impl TypeTable {
         if let Loadable::Loaded(n) = &mut self.total {
             *n += rows;
         }
+        let Some(pin) = self.paging.pinned.clone() else {
+            return;
+        };
+        let mut shift = match self.count_shift.take() {
+            Some(shift) if shift.pin == pin => shift,
+            _ => CountShift {
+                pin,
+                filters: self.filters.clone(),
+                rows: 0,
+                matching: 0,
+            },
+        };
+        // Those counted under other filters are not known under these, which the counts were
+        // read with since.
+        if shift.filters != self.filters {
+            shift.filters = self.filters.clone();
+            shift.matching = 0;
+        }
+        shift.rows += rows;
+        shift.matching += matching;
+        self.count_shift = Some(shift);
     }
 
     /// Rows the table's own delete removed in `commit`: they leave the list, with their drafts
@@ -4383,8 +4458,9 @@ impl TypeTable {
         }
     }
 
-    /// Reads each row of a short batch at the head: a draft whose value is there landed; any
-    /// other is kept, with what the cell holds now, and why when that changed elsewhere.
+    /// Reads the rows of a short batch at the head, together in one read of the properties
+    /// their drafts set: a draft whose value is there landed; any other is kept, with what the
+    /// cell holds now, and why when that changed elsewhere.
     fn reread_drafts(
         &mut self,
         edits: Vec<DraftEdit>,
@@ -4394,81 +4470,81 @@ impl TypeTable {
         let Some(schema) = self.schema.clone() else {
             return;
         };
-        // A row's drafts are next to one another, in table order.
-        let mut rows: Vec<(String, Vec<DraftEdit>)> = Vec::new();
-        for edit in edits {
-            match rows.last_mut().filter(|(id, _)| *id == edit.row_id) {
-                Some((_, row)) => row.push(edit),
-                None => rows.push((edit.row_id.clone(), vec![edit])),
-            }
-        }
-        for (id, row_edits) in rows {
-            let Ok(query) = builder::node_by_id(&schema, &self.type_name, &id) else {
-                continue;
-            };
-            let read = self
-                .session
-                .update(cx, |session, cx| session.read(&query, None, cx));
-            self.saves_in_flight += 1;
-            let (session, branch) = (self.session.clone(), self.branch.clone());
-            let keys: Vec<DraftKey> = row_edits
-                .iter()
-                .map(|edit| self.draft_key(&edit.row_id, &edit.column))
-                .collect();
-            cx.spawn_in(window, async move |this, cx| {
-                // The row at the head: `None` when it could not be read, `Some(None)` when it
-                // is gone.
-                let now = read
-                    .await
-                    .ok()
-                    .map(|output| node_rows(&output.rows).into_iter().next());
-                let shown = this.update_in(cx, |this, _window, cx| {
-                    this.saves_in_flight = this.saves_in_flight.saturating_sub(1);
-                    if !this.shows(&session, &branch) {
-                        this.saves_settled(cx);
-                        return false;
-                    }
-                    this.drafts_read(row_edits.clone(), now.as_ref(), cx);
+        let mut ids: Vec<String> = edits.iter().map(|edit| edit.row_id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        let mut properties: Vec<String> = edits.iter().map(|edit| edit.column.clone()).collect();
+        properties.sort();
+        properties.dedup();
+        let Ok(query) = builder::nodes_fields_by_id(&schema, &self.type_name, &ids, &properties)
+        else {
+            // Kept as they are, with why: whether they landed cannot be told.
+            self.drafts_read(edits, None, cx);
+            return;
+        };
+        let read = self
+            .session
+            .update(cx, |session, cx| session.read(&query, None, cx));
+        self.saves_in_flight += 1;
+        let (session, branch) = (self.session.clone(), self.branch.clone());
+        let keys: Vec<DraftKey> = edits
+            .iter()
+            .map(|edit| self.draft_key(&edit.row_id, &edit.column))
+            .collect();
+        cx.spawn_in(window, async move |this, cx| {
+            // The rows at the head, by id: `None` when they could not be read; a row missing
+            // from them is gone.
+            let now: Option<HashMap<String, Row>> = read.await.ok().map(|output| {
+                field_rows(&output.rows)
+                    .into_iter()
+                    .map(|row| (row.id.clone(), row))
+                    .collect()
+            });
+            let shown = this.update_in(cx, |this, _window, cx| {
+                this.saves_in_flight = this.saves_in_flight.saturating_sub(1);
+                if !this.shows(&session, &branch) {
                     this.saves_settled(cx);
-                    true
-                });
-                // The table moved on, or its tab closed: each draft is settled where it was
-                // typed, and nothing here changes. One that did not land stays bound to the
-                // value it was typed over: what the head holds was never shown, and why it
-                // changed went with the table, so its next save finds the change again rather
-                // than writing over it.
-                if !shown.unwrap_or(false) {
-                    session.update(cx, |session, cx| {
-                        for (edit, key) in row_edits.into_iter().zip(keys) {
-                            let landed = matches!(
-                                &now,
-                                Some(Some(row)) if same_value(row.value(&edit.column), &edit.new)
-                            );
-                            if landed {
-                                session.remove_draft_on(&branch, &key, cx);
-                            } else {
-                                let entry = DraftEntry {
-                                    old: edit.old,
-                                    text: edit.text,
-                                };
-                                session.set_draft_on(&branch, key, entry, cx);
-                            }
-                        }
-                    });
+                    return false;
                 }
-            })
-            .detach();
-        }
+                this.drafts_read(edits.clone(), now.as_ref(), cx);
+                this.saves_settled(cx);
+                true
+            });
+            // The table moved on, or its tab closed: each draft is settled where it was typed,
+            // and nothing here changes. One that did not land stays bound to the value it was
+            // typed over: what the head holds was never shown, and why it changed went with the
+            // table, so its next save finds the change again rather than writing over it.
+            if !shown.unwrap_or(false) {
+                session.update(cx, |session, cx| {
+                    for (edit, key) in edits.into_iter().zip(keys) {
+                        let landed = now
+                            .as_ref()
+                            .and_then(|rows| rows.get(&edit.row_id))
+                            .is_some_and(|row| same_value(row.value(&edit.column), &edit.new));
+                        if landed {
+                            session.remove_draft_on(&branch, &key, cx);
+                        } else {
+                            let entry = DraftEntry {
+                                old: edit.old,
+                                text: edit.text,
+                            };
+                            session.set_draft_on(&branch, key, entry, cx);
+                        }
+                    }
+                });
+            }
+        })
+        .detach();
     }
 
-    /// Settles a row's drafts read again at the head (`now`, as [`Self::reread_drafts`] reads
-    /// it): one whose value is there landed and goes; one whose row was left alone for another
-    /// draft's sake stands as typed; the others are kept, bound to what the row holds now,
-    /// with why.
+    /// Settles a batch's drafts read again at the head (`now`, the rows by id as
+    /// [`Self::reread_drafts`] reads them): one whose value is there landed and goes; one whose
+    /// row was left alone for another draft's sake stands as typed; the others are kept, bound
+    /// to what the row holds now, with why.
     fn drafts_read(
         &mut self,
         edits: Vec<DraftEdit>,
-        now: Option<&Option<Row>>,
+        now: Option<&HashMap<String, Row>>,
         cx: &mut Context<Self>,
     ) {
         let places = self.row_places();
@@ -4480,7 +4556,7 @@ impl TypeTable {
                 .map(Vec::as_slice)
                 .unwrap_or_default();
             self.cells.remove(&key);
-            let (old, notice) = match now {
+            let (old, notice) = match now.map(|rows| rows.get(&edit.row_id)) {
                 Some(Some(row)) => {
                     let value = row.value(&edit.column).clone();
                     if same_value(&value, &edit.new) {
@@ -5128,7 +5204,7 @@ impl TypeTable {
                 };
                 let needle = suggest::needle(&text, list);
                 let search =
-                    suggest::search_nodes(&session, &schema, &type_name, needle, snapshot, cx);
+                    suggest::search_nodes(&session, &schema, &type_name, &needle, snapshot, cx);
                 draft._suggest_task = Some(cx.spawn(async move |this, cx| {
                     let result = search.await;
                     this.update(cx, |this, cx| {
@@ -7741,6 +7817,93 @@ mod tests {
         table.read_with(cx, |table, _| assert_eq!(table.saves_in_flight, 0));
     }
 
+    /// A short batch reads its rows again at the head in one read: a draft whose value is there
+    /// landed and goes; one whose row holds another value now is kept, bound to it, which the
+    /// cell shows.
+    #[gpui::test]
+    async fn a_short_batch_reads_its_rows_again_in_one_read(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, names) = crate::test_support::session_routing(
+            PEOPLE,
+            |request| match request["name"].as_str() {
+                Some("studio_nodes_fields") => serde_json::json!([
+                    { "id": "p1", "v_slug": "p1", "v_name": "Ada Lovelace" },
+                    { "id": "p2", "v_slug": "p2", "v_name": "Grace B" },
+                ]),
+                _ => serde_json::json!([
+                    {"n": {"@id": "p1", "slug": "p1", "name": "Ada"}},
+                    {"n": {"@id": "p2", "slug": "p2", "name": "Grace"}},
+                ]),
+            },
+            cx,
+        );
+        let key = |id: &str| DraftKey {
+            type_name: "Person".into(),
+            id: id.into(),
+            property: "name".into(),
+        };
+        let (table, cx) = cx.add_window_view({
+            let session = session.clone();
+            |window, cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            }
+        });
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            let edit = |id: &str, old: &str, new: &str| DraftEdit {
+                row_id: id.into(),
+                column: "name".into(),
+                old: old.into(),
+                new: new.into(),
+                text: new.into(),
+                shown: old.into(),
+            };
+            let edits = vec![
+                edit("p1", "Ada", "Ada Lovelace"),
+                edit("p2", "Grace", "Grace Hopper"),
+            ];
+            table.reread_drafts(edits, window, cx);
+        });
+        cx.run_until_parked();
+        let rows_read = names
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|name| *name == "studio_nodes_fields")
+            .count();
+        assert_eq!(rows_read, 1, "one read for the batch");
+        session.read_with(cx, |session, _| {
+            assert!(session.draft(&key("p1")).is_none(), "landed");
+            assert_eq!(
+                session.draft(&key("p2")),
+                Some(&graph_store::DraftEntry {
+                    old: "Grace B".into(),
+                    text: "Grace Hopper".into(),
+                }),
+                "bound to what the row holds now"
+            );
+        });
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.rows[1].value("name"), "Grace B");
+            assert!(
+                table
+                    .draft_notices
+                    .contains_key(&("p2".to_owned(), "name".to_owned()))
+            );
+            assert_eq!(table.saves_in_flight, 0);
+        });
+    }
+
     /// A save that does not land puts back what the row showed, not the value a draft was typed
     /// over before a Refresh: shown as read at the pin, that value would bind a list's next save
     /// to the pin, over the newer one. The draft stays bound to the value it was typed over.
@@ -8437,6 +8600,32 @@ mod tests {
             assert!(table.newer);
             assert_eq!(table.count, Loadable::Loaded(1), "counted here");
         });
+
+        // A count read at the pin does not hold them either, one out when another lands
+        // included: they are added to it as it lands.
+        count.store(1, Ordering::SeqCst);
+        let values = serde_json::from_value(serde_json::json!({"name": "Ida"})).unwrap();
+        table.update(cx, |table, cx| {
+            table.load_counts(cx);
+            table.row_inserted("main", None, values, "c7", Some("c6"), cx);
+        });
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(
+                table.count,
+                Loadable::Loaded(2),
+                "the read out, with the insert"
+            );
+        });
+        table.update(cx, |table, cx| table.load_counts(cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(
+                table.count,
+                Loadable::Loaded(2),
+                "a read after, with all three"
+            );
+        });
     }
 
     /// A head the session sees move while the table's first read is out is compared once the
@@ -8476,7 +8665,8 @@ mod tests {
             &"Ida".into(),
         )
         .unwrap();
-        table.update_in(cx, |table, window, cx| table.refresh(window, cx));
+        // Read again as a schema or a naming change reads it: from the head the session holds.
+        table.update(cx, |table, cx| table.reload(false, cx));
         session
             .update(cx, |session, cx| {
                 session.write(&query, None, "Set name of p1".into(), cx)
@@ -8534,7 +8724,7 @@ mod tests {
         assert_eq!(held.as_deref(), Some("c1"));
         // Another writer's commit, which only the server has seen.
         writer.commit("c2", vec![changed("node", "Person", "p1", None)]);
-        table.update_in(cx, |table, window, cx| table.refresh(window, cx));
+        table.update(cx, |table, cx| table.reload(false, cx));
         cx.run_until_parked();
         table.read_with(cx, |table, _| {
             assert_eq!(table.paging.pinned.as_deref(), Some("c1"));
@@ -8550,6 +8740,20 @@ mod tests {
         table.read_with(cx, |table, _| {
             assert!(table.newer, "a person it shows changed")
         });
+        // Refresh wants the newest, which the session may not hold yet: it reads at the
+        // server's head.
+        writer.commit("c3", vec![changed("node", "Person", "p2", None)]);
+        table.update_in(cx, |table, window, cx| table.refresh(window, cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.paging.pinned.as_deref(), Some("c3"));
+            assert!(!table.newer);
+        });
+        assert_eq!(
+            pages.lock().unwrap().last(),
+            Some(&serde_json::Value::Null),
+            "read at the branch"
+        );
     }
 
     /// ↵ on a draft typed back to the value it was typed over lets the draft go, as leaving the

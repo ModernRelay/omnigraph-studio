@@ -5,8 +5,10 @@
 use std::time::Duration;
 
 use gpui::{App, Entity, Task};
+use gq_language::input::{edit_text, list_items};
 use gq_language::{SchemaModel, builder};
 use graph_store::GraphSession;
+use serde_json::Value;
 
 /// One offered value: what goes in the field, and a label shown beside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,15 +67,65 @@ pub fn from_node_rows(rows: &serde_json::Value) -> Vec<Suggestion> {
         .collect()
 }
 
-/// The part of the field a suggestion completes: all of it, or for a list (`in`) the text after
-/// the last comma.
-pub fn needle(text: &str, list: bool) -> &str {
-    let needle = if list {
-        text.rsplit(',').next().unwrap_or(text)
+/// The part of the field a suggestion completes: all of it, or for a list (`in`) its last item
+/// as typed so far, read as [`list_items`] reads one: unquoted, a doubled quote standing for
+/// one, and a quote not closed yet allowed.
+pub fn needle(text: &str, list: bool) -> String {
+    if list {
+        last_item(text).1
     } else {
-        text
-    };
-    needle.trim()
+        text.trim().to_owned()
+    }
+}
+
+/// Where a list's last item starts in `text`, past the comma before it, and that item as typed
+/// so far. A comma inside a quoted item is part of it, as [`list_items`] reads it.
+fn last_item(text: &str) -> (usize, String) {
+    let mut start = 0;
+    let mut chars = text.char_indices().peekable();
+    loop {
+        while chars.next_if(|(_, c)| c.is_whitespace()).is_some() {}
+        let mut item = String::new();
+        if chars.next_if(|(_, c)| *c == '"').is_some() {
+            loop {
+                match chars.next() {
+                    Some((_, '"')) if chars.next_if(|(_, c)| *c == '"').is_some() => item.push('"'),
+                    Some((_, '"')) => break,
+                    Some((_, c)) => item.push(c),
+                    None => return (start, item),
+                }
+            }
+            // Past the closing quote, up to the next comma; text there is the list's error.
+            loop {
+                match chars.next() {
+                    None => return (start, item),
+                    Some((at, ',')) => {
+                        start = at + 1;
+                        break;
+                    }
+                    Some(_) => {}
+                }
+            }
+            continue;
+        }
+        loop {
+            match chars.next() {
+                None => return (start, item.trim().to_owned()),
+                Some((at, ',')) => {
+                    start = at + 1;
+                    break;
+                }
+                Some((_, c)) => item.push(c),
+            }
+        }
+    }
+}
+
+/// The items given before a list's last one, as [`list_items`] reads them; none while they do
+/// not read.
+fn given_items(text: &str) -> Vec<String> {
+    let (start, _) = last_item(text);
+    list_items(&text[..start]).unwrap_or_default()
 }
 
 /// The values that hold the needle, those starting with it first, in their own order
@@ -81,11 +133,9 @@ pub fn needle(text: &str, list: bool) -> &str {
 pub fn from_values(values: &[String], text: &str, list: bool) -> Vec<Suggestion> {
     let needle = needle(text, list).to_lowercase();
     let given: Vec<String> = if list {
-        let mut parts: Vec<&str> = text.split(',').collect();
-        parts.pop();
-        parts
+        given_items(text)
             .iter()
-            .map(|part| part.trim().to_lowercase())
+            .map(|item| item.to_lowercase())
             .collect()
     } else {
         Vec::new()
@@ -106,16 +156,24 @@ pub fn from_values(values: &[String], text: &str, list: bool) -> Vec<Suggestion>
 }
 
 /// The field after picking `value`: the value itself, or in a list the values before it, the
-/// value, and a separator for the next one.
+/// value, and a separator for the next one, each written as a list cell writes its items
+/// ([`edit_text`]): one holding a comma or a quote is quoted, so it reads back whole.
 pub fn complete(text: &str, value: &str, list: bool) -> String {
     if !list {
         return value.to_owned();
     }
-    let mut parts: Vec<&str> = text.split(',').map(str::trim).collect();
-    parts.pop();
-    parts.retain(|part| !part.is_empty());
-    parts.push(value);
-    format!("{}, ", parts.join(", "))
+    let (start, _) = last_item(text);
+    let before = &text[..start];
+    let picked = Value::String(value.to_owned());
+    match list_items(before) {
+        Ok(items) => {
+            let mut items: Vec<Value> = items.into_iter().map(Value::String).collect();
+            items.push(picked);
+            format!("{}, ", edit_text(&Value::Array(items)))
+        }
+        // Items that do not read stay as typed, for the filter to say why.
+        Err(_) => format!("{before} {}, ", edit_text(&Value::Array(vec![picked]))),
+    }
 }
 
 /// Whether an offered value is no more than what is typed, so ↵ needs no pick. Exactly as
@@ -195,5 +253,37 @@ mod tests {
             "another case is a pick"
         );
         assert!(!already_typed("do", "done", false));
+    }
+
+    /// A list's items are read and written as a list cell's: a comma or a quote inside a
+    /// quoted item is part of it, and a picked value that holds one is quoted, so the filter
+    /// reads every item back whole.
+    #[test]
+    fn a_list_reads_and_writes_quoted_items_whole() {
+        let values: Vec<String> = ["Smith, John", "Doe", "Say \"hi\""]
+            .map(str::to_owned)
+            .to_vec();
+        assert_eq!(needle("Doe, \"Smith, J", true), "Smith, J");
+        assert_eq!(needle("\"a \"\"b\"\"\"", true), "a \"b\"");
+        assert_eq!(
+            shown(&from_values(&values, "\"smith, j", true)),
+            ["Smith, John"]
+        );
+        assert_eq!(
+            shown(&from_values(&values, "\"Smith, John\", ", true)),
+            ["Doe", "Say \"hi\""],
+            "a quoted item given is left out"
+        );
+        assert!(already_typed("Doe, \"Smith, John\"", "Smith, John", true));
+
+        let picked = complete("Doe, Smi", "Smith, John", true);
+        assert_eq!(picked, "Doe, \"Smith, John\", ");
+        assert_eq!(list_items(&picked).unwrap(), ["Doe", "Smith, John"]);
+        let picked = complete("\"a,b\", Sa", "Say \"hi\"", true);
+        assert_eq!(
+            picked, "\"a,b\", \"Say \"\"hi\"\"\", ",
+            "the item given stays whole"
+        );
+        assert_eq!(list_items(&picked).unwrap(), ["a,b", "Say \"hi\""]);
     }
 }

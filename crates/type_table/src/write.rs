@@ -12,7 +12,7 @@ use graph_client::api::ChangeOutput;
 use graph_store::GraphSession;
 use serde_json::{Map, Value};
 
-use crate::model::{Notice, SaveResult, Tone, node_rows, save_result};
+use crate::model::{Notice, SaveResult, Tone, save_result};
 
 /// How a write bound to the values it was read at ended: sent, with the server's outcome, or
 /// not sent.
@@ -240,7 +240,14 @@ fn send_bound(
         return Ok(cx.spawn(async move |_| Bound::Sent(write.await)));
     }
     let ids: Vec<String> = lists.iter().map(|(id, _)| id.clone()).collect();
-    let nodes = builder::nodes_by_id(schema, type_name, &ids).map_err(|error| error.to_string())?;
+    let mut properties: Vec<String> = lists
+        .iter()
+        .flat_map(|(_, read)| read.iter().map(|(property, _)| property.clone()))
+        .collect();
+    properties.sort();
+    properties.dedup();
+    let nodes = builder::nodes_fields_by_id(schema, type_name, &ids, &properties)
+        .map_err(|error| error.to_string())?;
     let session = session.clone();
     Ok(cx.spawn(async move |cx| {
         let output = match session
@@ -268,18 +275,24 @@ fn send_bound(
     }))
 }
 
-/// Whether the nodes a `nodes_by_id` read found hold each value as `read` says, every node
-/// there.
+/// Whether the nodes a `nodes_fields_by_id` read found hold each value as `read` says, every
+/// node there.
 fn holds(rows: &Value, read: &[Read]) -> bool {
-    let found: HashMap<String, Map<String, Value>> = node_rows(rows)
+    let found: HashMap<&str, &Map<String, Value>> = rows
+        .as_array()
         .into_iter()
-        .map(|row| (row.id, row.values))
+        .flatten()
+        .filter_map(|row| {
+            let row = row.as_object()?;
+            Some((row.get("id")?.as_str()?, row))
+        })
         .collect();
     read.iter().all(|(id, values)| {
-        found.get(id).is_some_and(|row| {
-            values
-                .iter()
-                .all(|(property, old)| same_value(row.get(property).unwrap_or(&Value::Null), old))
+        found.get(id.as_str()).is_some_and(|row| {
+            values.iter().all(|(property, old)| {
+                let held = row.get(&builder::field_column(property));
+                same_value(held.unwrap_or(&Value::Null), old)
+            })
         })
     })
 }
@@ -327,13 +340,13 @@ mod tests {
                         .unwrap_or_default();
                     let rows: Vec<Value> = ids
                         .iter()
-                        .map(|id| json!({ "n": { "@id": id, "slug": id, "tags": ["a", "b"] } }))
+                        .map(|id| json!({ "id": id, "v_tags": ["a", "b"] }))
                         .collect();
                     json!({
-                        "query_name": "studio_nodes",
+                        "query_name": "studio_nodes_fields",
                         "target": { "branch": "main", "snapshot": null },
                         "row_count": rows.len(),
-                        "columns": ["n"],
+                        "columns": ["id", "v_tags"],
                         "rows": rows,
                         "graph_commit_id": "c5",
                     })

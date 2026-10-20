@@ -76,6 +76,23 @@ pub(crate) fn session_routing(
     (session, asked)
 }
 
+/// As [`session_routing`], every write matching nothing, as one bound to a value that changed
+/// elsewhere does: it commits nothing.
+pub(crate) fn session_routing_unmatched(
+    schema: &str,
+    answer: impl Fn(&Value) -> Value + Send + Sync + 'static,
+    cx: &mut TestAppContext,
+) -> Entity<GraphSession> {
+    let unmatched = json!({
+        "branch": "main",
+        "query_name": "q",
+        "affected_nodes": 0,
+        "affected_edges": 0,
+        "commit": null,
+    });
+    serve_with(schema, Arc::new(answer), always(200, unmatched), None, cx)
+}
+
 /// Another writer's commits, which the fake server's head and change feed follow: the head
 /// probe answers the newest, and the feed the commits after its `start`, with only the changes
 /// to the types it names.
@@ -242,6 +259,31 @@ pub(crate) fn session_writing(
     )
 }
 
+/// Rows answered as whole nodes (`{"n": {…}}`) shaped as a read of their fields gives them:
+/// `id` and each property in its field column. Rows already shaped so stay as they are.
+fn as_fields(rows: Value) -> Value {
+    match rows {
+        Value::Array(rows) => Value::Array(rows.into_iter().map(as_field_row).collect()),
+        rows => rows,
+    }
+}
+
+/// One row as [`as_fields`] shapes it.
+fn as_field_row(row: Value) -> Value {
+    let fields = row.get("n").and_then(Value::as_object).map(|node| {
+        node.iter()
+            .map(|(property, value)| {
+                let column = match property.as_str() {
+                    "@id" => "id".to_owned(),
+                    _ => gq_language::builder::field_column(property),
+                };
+                (column, value.clone())
+            })
+            .collect::<serde_json::Map<String, Value>>()
+    });
+    fields.map_or(row, Value::Object)
+}
+
 fn serve(
     schema: &str,
     rows: Value,
@@ -287,6 +329,12 @@ fn serve_with(
                 request.into_body().read_to_end(&mut bytes).await.ok();
                 let asked: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
                 let rows = rows(&asked);
+                // A read of nodes' fields gets the nodes answered in its shape.
+                let rows = if asked["name"] == "studio_nodes_fields" {
+                    as_fields(rows)
+                } else {
+                    rows
+                };
                 // An answer `{"refuse": message}` is the server refusing the read.
                 if let Some(message) = rows.get("refuse").and_then(Value::as_str) {
                     return Ok(Response::builder()
