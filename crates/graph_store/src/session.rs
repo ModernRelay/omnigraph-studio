@@ -16,9 +16,10 @@ use gq_language::input::same_value;
 use gq_language::{BuiltQuery, RelationshipGroup, SchemaModel, builder};
 use graph_client::api::{
     BranchCreateOutput, BranchCreateRequest, BranchMergeOutput, BranchMergeRequest,
-    ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitOutput, DiffOutput, EntityKind,
-    GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput, QueryCatalogEntry, QueryRequest,
-    ReadOutput, ReadTargetOutput, ReadinessOutput, SnapshotDatasetOutput, SnapshotOutput,
+    ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitKind, CommitOutput, DiffOutput,
+    EntityKind, GraphListResponse, InvokeStoredQueryRequest, MergeBaseOutput, QueryCatalogEntry,
+    QueryRequest, ReadOutput, ReadTargetOutput, ReadinessOutput, SnapshotDatasetOutput,
+    SnapshotOutput,
 };
 use graph_client::{
     ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CommitChanges, FeedAt, GraphClient, ReadError,
@@ -828,9 +829,9 @@ impl GraphSession {
                 .invoke_stored_write(&graph, &name, &request, if_commit.as_deref())
                 .await;
             let kind = outcome_kind(&outcome, |output: &ChangeOutput| {
-                output.commit.as_ref().map(|c| c.graph_commit_id.clone())
+                published(output).map(|c| c.graph_commit_id.clone())
             });
-            let parent = parent_of(&outcome, |output: &ChangeOutput| output.commit.as_ref());
+            let parent = parent_of(&outcome, published);
             this.update(cx, |this, cx| {
                 this.finish_write(branch, description, kind, parent, None, cx);
             })
@@ -1081,6 +1082,14 @@ impl GraphSession {
                 Ok(output) => Loadable::Loaded(branch_order(output.branches)),
                 Err(error) => Loadable::Failed(error.to_string()),
             };
+            // A name the server lists again was made again since it was deleted.
+            if let Loadable::Loaded(branches) = &result {
+                let listed: HashSet<&String> = branches.iter().collect();
+                this.update(cx, |this, _| {
+                    this.gone_branches.retain(|branch| !listed.contains(branch))
+                })
+                .ok();
+            }
             this.update(cx, |this, cx| {
                 if let Some(changed) = &changed {
                     this.forget_branch(changed);
@@ -1690,16 +1699,28 @@ impl GraphSession {
                     }
                 }
                 // The commits a read stopped short of stay unknown; the next read starts at the
-                // head.
+                // head. That head can be past another writer's move made while this read was
+                // out, which the next read then never sees: the schema is compared now.
+                let mut jumped = false;
                 if let Some(head) = head
                     && stopped
                     && !log.holds(&head)
                 {
                     log.last = Some(head);
+                    jumped = true;
                 }
+                let moved_meanwhile = jumped && this.foreign_moves.remove(&branch);
                 cx.emit(SessionEvent::ChangesRead {
                     branch: branch.clone(),
                 });
+                // A schema that changed again while this read was out started a new epoch,
+                // which drops this read's text: one newer than the epoch's is read again.
+                let newer_text = this.schema_epoch != epoch
+                    && matches!(&schema_read, Some(Ok(output))
+                        if this.schema_text.as_deref() != Some(&*output.schema_source));
+                if moved_meanwhile || newer_text {
+                    this.recheck_schema(None, cx);
+                }
                 if schema_moved && this.schema_epoch == epoch {
                     // The text just read, when there is one, is not read again.
                     let read = match schema_read {
@@ -2964,9 +2985,9 @@ impl GraphSession {
         let work = cx.spawn(async move |this, cx| {
             let outcome = client.mutate(&graph, &request, if_commit.as_deref()).await;
             let kind = outcome_kind(&outcome, |output: &ChangeOutput| {
-                output.commit.as_ref().map(|c| c.graph_commit_id.clone())
+                published(output).map(|c| c.graph_commit_id.clone())
             });
-            let parent = parent_of(&outcome, |output: &ChangeOutput| output.commit.as_ref());
+            let parent = parent_of(&outcome, published);
             let branch = match &outcome {
                 WriteOutcome::Committed(output) if statement && !output.branch.is_empty() => {
                     output.branch.clone()
@@ -3104,6 +3125,10 @@ impl GraphSession {
                 .await;
             let kind = outcome_kind(&outcome, |_| None);
             this.update(cx, |this, cx| {
+                // A branch made again under a deleted one's name takes drafts again.
+                if matches!(outcome, WriteOutcome::Committed(_)) {
+                    this.gone_branches.remove(&branch);
+                }
                 this.finish_write(branch.clone(), description, kind, None, None, cx);
                 this.reload_branches_after(branch, cx);
             })
@@ -3222,6 +3247,15 @@ fn outcome_kind<T>(
 }
 
 /// The parent of the commit a write's answer names.
+/// The commit a mutation's answer names when it moved its branch's head: a proposal
+/// (`as commit`) or a snapshot (`as unattached branch`) is a commit no branch's head moved to.
+fn published(output: &ChangeOutput) -> Option<&CommitOutput> {
+    output
+        .commit
+        .as_ref()
+        .filter(|commit| commit.kind == CommitKind::Published)
+}
+
 fn parent_of<T>(
     outcome: &WriteOutcome<T>,
     commit: impl Fn(&T) -> Option<&CommitOutput>,
@@ -5012,6 +5046,21 @@ mod tests {
         };
         assert_eq!(drafts("feature", cx), 0);
         assert_eq!(drafts("kept", cx), 1);
+
+        // A save settling after its branch was deleted keeps no draft there; once a branch of
+        // that name is listed again, one does.
+        let settle = |cx: &mut TestAppContext| {
+            session.update(cx, |session, cx| {
+                session.settle_draft_on("feature", key.clone(), None, Some(entry.clone()), cx)
+            })
+        };
+        settle(cx);
+        assert_eq!(drafts("feature", cx), 0);
+        served.lock().unwrap().branches.push("feature".into());
+        session.update(cx, |session, cx| session.reload_branches(cx));
+        cx.run_until_parked();
+        settle(cx);
+        assert_eq!(drafts("feature", cx), 1);
 
         // Deleted by the CLI: the poll's branch list no longer holds it.
         served.lock().unwrap().branches.retain(|b| b != "elsewhere");
