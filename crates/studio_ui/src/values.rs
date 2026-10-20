@@ -37,6 +37,16 @@ pub fn group_digits(n: usize) -> String {
     out
 }
 
+/// A count with its thousands grouped, as Studio writes every count: `-12480` → `-12,480`.
+pub fn group_count(n: i64) -> String {
+    let grouped = group_digits(n.unsigned_abs() as usize);
+    if n < 0 {
+        format!("-{grouped}")
+    } else {
+        grouped
+    }
+}
+
 /// A byte count for people: "690 B", "2.1 KB", "14 MB", in powers of 1000 as macOS shows sizes.
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
@@ -45,11 +55,20 @@ pub fn format_bytes(bytes: u64) -> String {
     }
     let mut value = bytes as f64 / 1000.;
     let mut unit = 0;
-    while value >= 999.95 && unit < UNITS.len() - 1 {
+    // The unit steps up by the number as written, one decimal below 10 and none from there:
+    // 999,600 bytes is "1.0 MB", not "1000 KB".
+    let written = |value: f64| {
+        if value < 9.95 {
+            (value * 10.).round() / 10.
+        } else {
+            value.round()
+        }
+    };
+    while written(value) >= 1000. && unit < UNITS.len() - 1 {
         value /= 1000.;
         unit += 1;
     }
-    if value < 10. {
+    if value < 9.95 {
         format!("{value:.1} {}", UNITS[unit])
     } else {
         format!("{value:.0} {}", UNITS[unit])
@@ -203,6 +222,12 @@ mod tests {
         assert_eq!(format_bytes(2_140), "2.1 KB");
         assert_eq!(format_bytes(14_200_000), "14 MB");
         assert_eq!(format_bytes(999_999), "1.0 MB");
+        assert_eq!(format_bytes(999_600), "1.0 MB");
+        assert_eq!(format_bytes(999_400), "999 KB");
+        assert_eq!(format_bytes(9_960), "10 KB");
+        assert_eq!(format_bytes(9_940), "9.9 KB");
+        assert_eq!(group_count(-12_480), "-12,480");
+        assert_eq!(group_count(200), "200");
         assert_eq!(format_bytes(3_000_000_000), "3.0 GB");
     }
 

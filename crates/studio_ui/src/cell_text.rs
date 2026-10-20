@@ -24,11 +24,15 @@ pub struct CellText {
     style: TextStyleRefinement,
 }
 
+/// The most of a text one line shows: a column is at most `COLUMN_MAX_WIDTH` wide, so the rest
+/// of a long value (a paragraph in a Text cell) is never copied, scanned or shaped.
+const SHOWN_CHARS: usize = 512;
+
 /// `text` on one line, from the start of its room, as a small label draws it. A control
 /// character (a line break, a tab) shows as its picture, as a single-line label has it.
 pub fn cell_text(text: impl Into<SharedString>, cx: &App) -> CellText {
     CellText {
-        text: one_line(text.into()),
+        text: one_line(shown_part(text.into())),
         align: TextAlign::Left,
         hug: false,
         style: TextStyleRefinement {
@@ -128,7 +132,11 @@ impl Element for CellText {
                     flex_shrink: 1.,
                     ..Style::default()
                 };
-                style.size.width = Length::Definite(DefiniteLength::Absolute(whole.width.into()));
+                // Up to a whole device pixel: a size set is rounded to the nearest, which can
+                // leave the line a fraction wider than its room, and cut it at every frame.
+                let scale = window.scale_factor();
+                let width = px((f32::from(whole.width) * scale).ceil() / scale);
+                style.size.width = Length::Definite(DefiniteLength::Absolute(width.into()));
                 style
             }
             None => Style {
@@ -231,6 +239,14 @@ impl CellText {
     }
 }
 
+/// The start of `text` one line can show ([`SHOWN_CHARS`]), found without reading the rest.
+fn shown_part(text: SharedString) -> SharedString {
+    match text.char_indices().nth(SHOWN_CHARS) {
+        Some((end, _)) => text[..end].to_owned().into(),
+        None => text,
+    }
+}
+
 /// `text` with each control character as its picture: GPUI shapes one line only.
 fn one_line(text: SharedString) -> SharedString {
     match ui::utils::replace_control_characters(&text) {
@@ -253,6 +269,15 @@ fn line_height(window: &Window) -> Pixels {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_value_is_kept_to_what_a_line_shows() {
+        let long: String = "é".repeat(SHOWN_CHARS * 4);
+        let shown = shown_part(long.into());
+        assert_eq!(shown.chars().count(), SHOWN_CHARS);
+        let short = SharedString::from("Ada");
+        assert_eq!(shown_part(short.clone()), short);
+    }
 
     #[test]
     fn a_value_with_line_breaks_is_drawn_on_one_line() {

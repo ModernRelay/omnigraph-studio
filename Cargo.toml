@@ -38,6 +38,8 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGAffineTransform", "CGBitmapContext", "CGColorSpace", "CGContext", "CGDataProvider", "CGImage", "CGPDFDocument", "CGPDFPage"] }
 # CommonMark, the parser Zed's `markdown` renders with: text values read as markdown (spec 014).
 pulldown-cmark = { version = "0.13", default-features = false }
+# Cuts and marks take whole characters as a reader sees them (a flag, an accented letter).
+unicode-segmentation = "1.13"
 # Studio crates
 tree-sitter-gq = { path = "grammars/tree-sitter-gq" }
 tree-sitter-pg = { path = "grammars/tree-sitter-pg" }

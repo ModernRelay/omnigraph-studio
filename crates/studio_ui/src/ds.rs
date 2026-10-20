@@ -744,18 +744,12 @@ pub enum Status {
 /// either line up: for rows whose context already names the type, where a lettered mark would
 /// repeat it.
 pub fn type_dot(type_name: &str) -> Div {
-    div()
-        .size(px(size::ROW_ICON))
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(
-            div()
-                .size(px(size::DOT))
-                .rounded_full()
-                .bg(studio_theme::type_color(type_name)),
-        )
+    icon_slot(
+        div()
+            .size(px(size::DOT))
+            .rounded_full()
+            .bg(studio_theme::type_color(type_name)),
+    )
 }
 
 pub fn status_dot(status: Status) -> Div {
@@ -1093,7 +1087,7 @@ impl RenderOnce for SidebarRow {
                 row.hover(move |style| style.bg(hover_bg))
             })
             .when_some(self.tooltip, |row, tooltip| row.tooltip(tooltip))
-            .children(self.start.map(row_icon))
+            .children(self.start.map(icon_slot))
             .child(
                 Label::new(self.label)
                     .size(LabelSize::Small)
@@ -1132,8 +1126,9 @@ pub fn sidebar_count(text: impl Into<SharedString>) -> Label {
     text::meta(text)
 }
 
-/// A sidebar row's icon slot ([`size::ROW_ICON`]), with what leads the label centered in it.
-fn row_icon(start: impl IntoElement) -> Div {
+/// A row's icon slot ([`size::ROW_ICON`]), with what leads the label centered in it: an icon,
+/// a type's dot or mark.
+pub fn icon_slot(start: impl IntoElement) -> Div {
     div()
         .size(px(size::ROW_ICON))
         .flex_none()
@@ -1160,7 +1155,7 @@ pub fn sidebar_placeholder(
         .gap(px(space::MD))
         .items_center()
         .tooltip(Tooltip::text(tooltip))
-        .child(row_icon(
+        .child(icon_slot(
             Icon::new(icon).size(IconSize::Small).color(Color::Disabled),
         ))
         .child(
@@ -1625,13 +1620,9 @@ pub fn chip(label: impl Into<SharedString>, cx: &App) -> Div {
         .items_center()
         .rounded(px(radii(cx).xs))
         .bg(surface::tag(cx))
-        .child(
-            Label::new(label.into())
-                .size(LabelSize::XSmall)
-                .buffer_font(cx)
-                .single_line()
-                .truncate(),
-        )
+        // A cell text, not a truncating label: every enum cell draws one, and a truncating
+        // label is shaped again on every pass of every frame.
+        .child(crate::cell_text(label, cx).meta(cx).buffer_font(cx).hug())
 }
 
 /// A checkbox and its label: a box of the scale's extra-small corner, filled with the ink
@@ -1804,6 +1795,9 @@ impl RenderOnce for Callout {
         let (icon_name, color) = notice_icon(self.severity);
         let (fill, _) = surface::notice(self.severity, cx);
         let line = window.line_height();
+        // Keyed by its title: callouts side by side (settings.json's problems and
+        // keymap.json's) scroll apart.
+        let description_id = SharedString::from(format!("callout-{}", self.title));
         h_flex()
             .min_w_0()
             .w_full()
@@ -1837,7 +1831,7 @@ impl RenderOnce for Callout {
                     )
                     .children(self.description.map(|description| {
                         div()
-                            .id("callout-description")
+                            .id(description_id)
                             .w_full()
                             .max_h(px(size::NOTICE_MAX_HEIGHT))
                             .overflow_y_scroll()

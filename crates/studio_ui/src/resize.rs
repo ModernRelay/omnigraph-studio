@@ -3,12 +3,13 @@
 //! no rules between columns.
 //!
 //! The grid owns the state: it records a [`ColumnResize`] when the pointer goes down on a
-//! handle, follows [`ColumnDrag`] moves over the whole grid with `on_drag_move`, and forgets the
-//! resize on drop. Clicking a handle twice fits its column again.
+//! handle, follows its own [`ColumnDrag`] moves over the whole grid with `on_drag_move`, and
+//! forgets the resize when the button comes up, by a drop or a click that dragged nothing.
+//! Clicking a handle twice fits its column again.
 
 use gpui::{
-    App, ClickEvent, Div, DragMoveEvent, MouseButton, MouseDownEvent, Pixels, SharedString,
-    Stateful, Window,
+    App, ClickEvent, Div, DragMoveEvent, EntityId, MouseButton, MouseDownEvent, Pixels,
+    SharedString, Stateful, Window,
 };
 use ui::prelude::*;
 
@@ -16,9 +17,19 @@ use ui::prelude::*;
 pub const COLUMN_MIN_WIDTH: f32 = 48.;
 pub const COLUMN_MAX_WIDTH: f32 = 1_200.;
 
-/// A column's right edge being dragged; what follows the pointer draws nothing.
+/// A column's right edge being dragged, by the grid's view that owns it: every grid hears
+/// every drag's moves, and follows its own only. What follows the pointer draws nothing.
 #[derive(Clone, Copy)]
-pub struct ColumnDrag;
+pub struct ColumnDrag {
+    pub owner: EntityId,
+}
+
+impl ColumnDrag {
+    /// Whether the drag `event` moves is one of `owner`'s columns.
+    pub fn of(event: &DragMoveEvent<ColumnDrag>, owner: EntityId, cx: &App) -> bool {
+        event.drag(cx).owner == owner
+    }
+}
 
 impl Render for ColumnDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -59,10 +70,12 @@ pub fn clamp_width(width: f32) -> f32 {
     width.clamp(COLUMN_MIN_WIDTH, COLUMN_MAX_WIDTH).round()
 }
 
-/// The handle at a column header's right edge. Place it in a header cell that is `relative()`.
-/// `on_start` runs when the pointer goes down on it, `on_reset` on a double click; neither
-/// reaches the header behind it. `active` keeps the line shown while this column is dragged.
+/// The handle at a column header's right edge, of the grid `owner` draws. Place it in a header
+/// cell that is `relative()`. `on_start` runs when the pointer goes down on it, `on_reset` on a
+/// double click; neither reaches the header behind it. `active` keeps the line shown while this
+/// column is dragged.
 pub fn column_resize_handle(
+    owner: EntityId,
     index: usize,
     active: bool,
     on_start: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
@@ -99,7 +112,7 @@ pub fn column_resize_handle(
                 on_reset(event, window, cx);
             }
         })
-        .on_drag(ColumnDrag, |drag, _, _, cx| cx.new(|_| *drag))
+        .on_drag(ColumnDrag { owner }, |drag, _, _, cx| cx.new(|_| *drag))
 }
 
 #[cfg(test)]

@@ -17,6 +17,8 @@ theme = { workspace = true }
 studio_theme = { workspace = true }
 serde_json = { workspace = true }
 pulldown-cmark = { workspace = true }
+markdown = { workspace = true }
+unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

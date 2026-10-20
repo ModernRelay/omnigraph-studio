@@ -34,8 +34,8 @@ pub use resize::{
     COLUMN_MAX_WIDTH, COLUMN_MIN_WIDTH, ColumnDrag, ColumnResize, clamp_width, column_resize_handle,
 };
 pub use values::{
-    CopyableValue, format_bytes, group_digits, now_micros, relative_span, relative_time,
-    short_commit_id, utc_date_time, value_text,
+    CopyableValue, format_bytes, group_count, group_digits, now_micros, relative_span,
+    relative_time, short_commit_id, utc_date_time, value_text,
 };
 
 /// A column in a data grid.
@@ -181,13 +181,7 @@ pub fn type_swatch(type_name: &str, cx: &App) -> Div {
 /// not a thing, so only node types carry a colour.
 pub fn kind_swatch(type_name: &str, is_edge: bool, cx: &App) -> Div {
     if is_edge {
-        div()
-            .size(px(ds::size::ROW_ICON))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(crate::ds::icon::meta(IconName::ArrowRight))
+        ds::icon_slot(crate::ds::icon::meta(IconName::ArrowRight))
     } else {
         type_swatch(type_name, cx)
     }
@@ -198,14 +192,7 @@ pub fn kind_swatch(type_name: &str, is_edge: bool, cx: &App) -> Div {
 /// letter which one.
 pub fn type_mark(type_name: &str, label: &str, cx: &App) -> Div {
     let color: Hsla = type_color(type_name);
-    let initial = label
-        .trim()
-        .chars()
-        .next()
-        .or_else(|| type_name.chars().next())
-        .unwrap_or('?')
-        .to_uppercase()
-        .collect::<String>();
+    let initial = text::initial(label, type_name);
     div()
         .size(px(ds::size::ROW_ICON))
         .flex_none()

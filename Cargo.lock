@@ -4166,6 +4166,7 @@ dependencies = [
  "graph_store",
  "serde_json",
  "studio_actions",
+ "studio_theme",
  "studio_ui",
  "studio_workspace",
  "theme",
@@ -4358,6 +4359,7 @@ dependencies = [
  "change_cards",
  "editor",
  "gpui",
+ "gq_language",
  "graph_client",
  "graph_store",
  "http_client",
@@ -9888,6 +9890,7 @@ name = "studio_ui"
 version = "0.2.1"
 dependencies = [
  "gpui",
+ "markdown",
  "menu",
  "pulldown-cmark",
  "serde_json",
@@ -9895,6 +9898,7 @@ dependencies = [
  "studio_theme",
  "theme",
  "ui",
+ "unicode-segmentation",
 ]
 
 [[package]]

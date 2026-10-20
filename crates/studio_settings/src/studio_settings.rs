@@ -273,11 +273,6 @@ pub struct TypeNaming {
 }
 
 impl TypeNaming {
-    /// What names the nodes now.
-    pub fn in_effect(&self) -> &str {
-        self.chosen.as_deref().unwrap_or(&self.default)
-    }
-
     /// Names the type's nodes by `choice` in this graph, or by its default when `None`.
     pub fn choose(&self, choice: Option<String>, cx: &mut App) {
         let (graph, type_name) = (self.graph.clone(), self.type_name.clone());
