@@ -385,30 +385,40 @@ impl SourceMap {
     }
 }
 
-/// A problem the server reported with a position, already mapped into the editor's text.
+/// A problem the server reported, its position already mapped into the editor's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerDiagnostic {
     pub code: Option<String>,
     pub message: String,
     pub byte: Option<usize>,
+    /// The one concrete fix the server names, absent when the message names the decision.
+    pub fix: Option<String>,
 }
 
-/// Reads an `ErrorOutput.diagnostic` (`{"code":"Q001","position":{"line":1,"column":46,
-/// "byte":45},"expected":"…"}`).
+/// Reads an `ErrorOutput.diagnostic`, the diagnostics contract of a refused query: its code,
+/// where it failed (a source position, or after parsing the stage and the expression), what
+/// was expected and the fix (`{"code":"Q001","position":{"line":1,"column":46,"byte":45},
+/// "expected":"…"}`). A failure with no position names the expression it was found in.
 pub fn server_diagnostic(value: &Value, fallback: &str, map: SourceMap) -> ServerDiagnostic {
-    let message = ["message", "expected", "detail"]
+    let text = |key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    let expected = ["message", "expected", "detail"]
         .iter()
-        .find_map(|key| value.get(*key).and_then(Value::as_str))
-        .unwrap_or(fallback)
-        .to_owned();
+        .find_map(|key| text(key))
+        .unwrap_or_else(|| fallback.to_owned());
+    let byte = value
+        .get("position")
+        .and_then(|p| p.get("byte"))
+        .and_then(Value::as_u64)
+        .map(|byte| map.editor_offset(byte as usize));
+    let message = match text("expression").filter(|_| byte.is_none()) {
+        Some(expression) => format!("{expected}, in `{expression}`"),
+        None => expected,
+    };
     ServerDiagnostic {
-        code: value.get("code").and_then(Value::as_str).map(str::to_owned),
+        code: text("code"),
         message,
-        byte: value
-            .get("position")
-            .and_then(|p| p.get("byte"))
-            .and_then(Value::as_u64)
-            .map(|byte| map.editor_offset(byte as usize)),
+        byte,
+        fix: text("fix"),
     }
 }
 
@@ -599,5 +609,22 @@ mod tests {
         assert_eq!(diagnostic.code.as_deref(), Some("Q001"));
         assert_eq!(diagnostic.message, "expected return_clause");
         assert_eq!(diagnostic.byte, Some(47));
+        assert_eq!(diagnostic.fix, None);
+
+        // A failure found after parsing has no position: it names its expression and the fix.
+        let diagnostic = server_diagnostic(
+            &json!({"code": "T27", "stage": "typecheck", "expression": "search($p.name, $q)", "expected": "a full-text index on Person.name", "fix": "declare @index(name) on Person"}),
+            "refused",
+            map,
+        );
+        assert_eq!(diagnostic.byte, None);
+        assert_eq!(
+            diagnostic.message,
+            "a full-text index on Person.name, in `search($p.name, $q)`"
+        );
+        assert_eq!(
+            diagnostic.fix.as_deref(),
+            Some("declare @index(name) on Person")
+        );
     }
 }

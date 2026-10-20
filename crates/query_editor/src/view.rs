@@ -2959,6 +2959,7 @@ impl QueryEditor {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use studio_ui::ds::{self, space};
+        let fix = diagnostic.as_ref().and_then(|d| d.fix.clone());
         v_flex()
             .flex_1()
             .min_h_0()
@@ -3008,7 +3009,10 @@ impl QueryEditor {
                                         }
                                     },
                                 ))
-                            })),
+                            }))
+                            .children(
+                                fix.map(|fix| ds::text::muted(format!("Fix: {fix}"))),
+                            ),
                     ),
             )
             .into_any_element()
