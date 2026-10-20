@@ -360,7 +360,8 @@ impl CommandPalette {
                     } else {
                         format!("{title} · {first_line}")
                     },
-                    key: format!("query-tab:{title}"),
+                    // By the tab, not its title: two files of one name are two tabs.
+                    key: format!("query-tab:{}", id.as_u64()),
                     group: Group::Query,
                 });
                 rows.push(Row::Tab { id, first_line });

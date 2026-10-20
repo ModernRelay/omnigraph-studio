@@ -201,6 +201,7 @@ struct Fix {
 
 /// Why a fix is not sent while a merge is out.
 const MERGE_RUNNING: &str = "A merge is running: a fix now could land on either side of it.";
+const BRANCH_DELETED: &str = "The merge deleted the branch: there is no branch to fix now.";
 
 /// What a reviewed mark is kept by: the entity and what its change does, so the mark holds
 /// until the entity changes again, whichever commits the review reads the change from. A review
@@ -1050,8 +1051,13 @@ impl ReviewView {
         if self.cards.get(ix)?.fix.done() {
             return None;
         }
-        if self.merging() {
-            self.cards[ix].fix = FixState::Refused(MERGE_RUNNING.into());
+        if self.merging() || self.branch_deleted {
+            let reason = if self.branch_deleted {
+                BRANCH_DELETED
+            } else {
+                MERGE_RUNNING
+            };
+            self.cards[ix].fix = FixState::Refused(reason.into());
             cx.notify();
             return None;
         }
@@ -1246,6 +1252,9 @@ impl ReviewView {
         if self.merging() {
             return Err(MERGE_RUNNING.into());
         }
+        if self.branch_deleted {
+            return Err(BRANCH_DELETED.into());
+        }
         // The form was filled from the change with this key; the review may have been read
         // again since, and its cards moved.
         const GONE: &str = "The review was read again and no longer shows this change.";
@@ -1429,7 +1438,8 @@ impl ReviewView {
 
     fn writes_settled(&mut self, cx: &mut Context<Self>) {
         if !self.merging() {
-            // A fix refused while the merge was out may be asked for again.
+            // A fix refused while the merge was out may be asked for again; one that would
+            // write to a branch the merge deleted is refused when asked.
             for card in &mut self.cards {
                 if matches!(&card.fix, FixState::Refused(reason) if reason == MERGE_RUNNING) {
                     card.fix = FixState::Idle;
@@ -3441,6 +3451,13 @@ pub(crate) mod tests {
                 assert_eq!(view._head_watch.is_none(), delete);
                 assert_eq!(view.serialize(cx).is_none(), delete);
             });
+            // Nothing is fixed on a branch the merge deleted.
+            if delete {
+                view.update(cx, |view, cx| {
+                    view.revert(0, cx);
+                    assert_eq!(view.cards[0].fix, FixState::Refused(BRANCH_DELETED.into()));
+                });
+            }
             // A Refresh after the merge does not bring the deleted branch's tab back.
             view.update(cx, |view, cx| view.reload(cx));
             cx.run_until_parked();

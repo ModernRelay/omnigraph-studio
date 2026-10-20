@@ -1265,6 +1265,8 @@ impl GraphCanvas {
             area: hit.is_none() && event.modifiers.shift,
             scene: self.scene.clone(),
         });
+        // Drawn again, so the caption lets the drag pass over it.
+        cx.notify();
     }
 
     /// A pointer that rests on a node or a relationship pill reads ahead what opening it will
@@ -1388,6 +1390,8 @@ impl GraphCanvas {
         let Some(mut drag) = self.drag.take() else {
             return;
         };
+        // Drawn again, so the caption takes its own presses again.
+        cx.notify();
         drag.follow(&self.scene);
         if drag.area {
             // The chips the area touches are marked, added to those marked before.
@@ -1493,16 +1497,15 @@ impl GraphCanvas {
 
     /// A drag released outside the canvas ends as one released on it, and an area is dropped.
     fn mouse_up_out(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(mut drag) = self.drag.take()
-            && drag.moved
-            && !drag.area
-        {
+        let Some(mut drag) = self.drag.take() else {
+            return;
+        };
+        if drag.moved && !drag.area {
             drag.follow(&self.scene);
             self.place_dragged(&drag, cx);
         }
-        if self.area.take().is_some() {
-            cx.notify();
-        }
+        self.area = None;
+        cx.notify();
     }
 
     /// A dragged node or pill stays where it was dropped, and is remembered there, as does
@@ -1532,6 +1535,11 @@ impl GraphCanvas {
         }
         self.keep_ontology_as_drawn();
         cx.emit(ItemEvent::UpdateTab);
+        // A layout begun during the drag took where the chips were then: laid out again from
+        // where they were dropped.
+        if self.layout_task.is_some() {
+            self.rebuild(cx);
+        }
         // The canvas is drawn cached: Reset layout shows once something is placed.
         cx.notify();
     }

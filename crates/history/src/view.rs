@@ -367,8 +367,9 @@ impl HistoryView {
         let own_read = self
             .session
             .update(cx, |session, cx| session.commits(&branch, fresh, cx));
-        // A head read for a branch the history no longer reads would put its tag back.
-        self.head_reads.retain(|name, _| others.contains(name));
+        // Every list read now is at least as new as a head read already out, whose answer
+        // landing after the layout would put a tag back.
+        self.head_reads.clear();
         self.others = others.clone();
         let other_reads: Vec<_> = others
             .into_iter()

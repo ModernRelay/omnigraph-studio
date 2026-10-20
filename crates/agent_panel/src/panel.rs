@@ -554,12 +554,22 @@ impl MessageQueue {
 
 struct Host {
     commands: mpsc::UnboundedSender<HostCommand>,
+    /// The conversation's events, closed as the host is dropped: the connection then sees at
+    /// once that this panel let go, before the panel asks for the session again, and the new
+    /// conversation waits for this one to free the session.
+    events: mpsc::UnboundedSender<HostEvent>,
     /// Keeps the agent's process running while this conversation is open.
     _connection: std::sync::Arc<crate::connection::AgentConnection>,
     _socket: ToolSocket,
     /// The conversation's CLI home (spec 013); its session token goes with it.
     cli_home: Option<std::sync::Arc<CliHome>>,
     _tasks: Vec<Task<()>>,
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        self.events.close_channel();
+    }
 }
 
 /// What a conversation's agent needs before it is launched, made off the main thread: its
@@ -1069,7 +1079,7 @@ impl AgentPanel {
             },
             cx,
         );
-        if !connection.open(launch, events_tx, commands_rx) {
+        if !connection.open(launch, events_tx.clone(), commands_rx) {
             self.fail_start("The agent is not running.".into(), cx);
             return;
         }
@@ -1127,6 +1137,7 @@ impl AgentPanel {
         tasks.extend([serve, event_pump, tool_pump]);
         self.host = Some(Host {
             commands: commands_tx,
+            events: events_tx,
             _connection: connection,
             _socket: socket,
             cli_home,
