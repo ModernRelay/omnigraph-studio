@@ -4202,6 +4202,7 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "studio_settings",
+ "studio_ui",
  "url",
 ]
 

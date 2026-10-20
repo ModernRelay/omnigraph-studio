@@ -17,7 +17,7 @@ use gq_language::{BuiltQuery, SchemaModel};
 use graph_client::ReadError;
 use serde_json::Value;
 
-use crate::changes::{ChangeFold, NetChange, REVIEW_CHANGE_CAP, grouped};
+use crate::changes::{ChangeFold, NetChange, REVIEW_CHANGE_CAP};
 use crate::fixes::{compose, revert_query};
 use crate::session::GraphSession;
 
@@ -252,7 +252,7 @@ pub fn undo_query(
                 return Err(format!(
                     "The commit removed more than {} nodes and relationships, more than Undo puts \
                      back in one commit.",
-                    grouped(UNDO_CAP)
+                    studio_ui::group_digits(UNDO_CAP)
                 ));
             }
             for change in page.changes {

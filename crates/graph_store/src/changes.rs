@@ -360,20 +360,8 @@ impl FoldedChanges {
 }
 
 fn plural(count: usize, one: &str, many: &str) -> String {
-    format!("{} {}", grouped(count), if count == 1 { one } else { many })
-}
-
-/// `20000` → `20,000`.
-pub(crate) fn grouped(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
+    let word = if count == 1 { one } else { many };
+    format!("{} {word}", studio_ui::group_digits(count))
 }
 
 /// The review header's sentence: "17 entities and 22 relationships changed in 3 commits by
@@ -857,7 +845,7 @@ mod tests {
             summary_sentence(20_000, 0, 3, &dev),
             "20,000 entities changed in 3 commits by act-dev"
         );
-        assert_eq!(grouped(999), "999");
-        assert_eq!(grouped(1_234_567), "1,234,567");
+        assert_eq!(plural(999, "commit", "commits"), "999 commits");
+        assert_eq!(plural(1_234_567, "commit", "commits"), "1,234,567 commits");
     }
 }
