@@ -28,7 +28,8 @@ use ui::prelude::*;
 use ui::{Indicator, PopoverMenu, ToggleState, Tooltip};
 
 use crate::blob::{
-    IMAGE_MAX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, save_value, suggested_file_name,
+    IMAGE_MAX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, read_range, save_folder, save_value,
+    suggested_file_name,
 };
 use crate::model::{
     FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, display_value, field_rows, format_count,
@@ -767,17 +768,12 @@ impl NodePeek {
                 // The prefix, then the rest of an image that fits.
                 while (bytes.len() as u64) < wanted {
                     let from = bytes.len() as u64;
-                    let Ok(read) = session.update(cx, |session, cx| {
-                        session.blob_bytes(cell.clone(), snapshot.clone(), from..wanted, cx)
-                    }) else {
-                        return;
-                    };
-                    match read.await {
-                        Ok(chunk) if !chunk.is_empty() => bytes.extend(chunk),
-                        Ok(_) => break,
+                    match read_range(&session, &cell, &snapshot, from, wanted, cx).await {
+                        Ok(Some(chunk)) => bytes.extend(chunk),
+                        Ok(None) => break,
                         Err(error) => {
                             this.update(cx, |this, cx| {
-                                this.blobs[index].preview = Loadable::Failed(error.to_string());
+                                this.blobs[index].preview = Loadable::Failed(error);
                                 cx.notify();
                             })
                             .ok();
@@ -815,11 +811,7 @@ impl NodePeek {
         };
         let id = self.subject.id().to_owned();
         let name = suggested_file_name(&id, &slot.property, &slot.head);
-        let directory = std::env::home_dir()
-            .map(|home| home.join("Downloads"))
-            .filter(|dir| dir.is_dir())
-            .unwrap_or_else(std::env::temp_dir);
-        let chosen = cx.prompt_for_new_path(&directory, Some(&name));
+        let chosen = cx.prompt_for_new_path(&save_folder(), Some(&name));
         let cell = BlobCell {
             edge: matches!(self.subject, PeekSubject::Edge { .. }),
             type_name: self.subject.type_name().to_owned(),
@@ -2033,14 +2025,16 @@ impl NodePeek {
         self.group_notices.remove(&index);
         let session = self.session.clone();
         let edge = group.edge;
-        let shown = self.snapshot.clone();
         // Detached: closing the page or moving the peek never cancels a write.
         cx.spawn_in(window, async move |this, cx| {
             // A replace is two commits, the removal then the addition. The page follows its own
-            // commits from the one it shows while each is on top of the one before.
+            // commits while each is on top of the one before, and the first is on top of the
+            // commit the page shows when they land: another write of the page's, started with
+            // this one, may have moved it there meanwhile.
             let mut outcome = None;
-            let mut reached = shown.clone();
-            let mut followed = true;
+            let mut first_parent: Option<String> = None;
+            let mut reached: Option<String> = None;
+            let mut chained = true;
             let mut landed = 0;
             for (query, verb) in built {
                 let description = format!("{verb} {edge} of {id} · {other}");
@@ -2050,7 +2044,12 @@ impl NodePeek {
                 let result = save_result(&write.await, &branch);
                 let saved = match &result {
                     SaveResult::Saved { commit, parent } => {
-                        followed &= parent.is_some() && *parent == reached;
+                        if landed == 0 {
+                            first_parent = parent.clone();
+                            chained &= parent.is_some();
+                        } else {
+                            chained &= parent.is_some() && *parent == reached;
+                        }
                         reached = Some(commit.clone());
                         landed += 1;
                         true
@@ -2070,7 +2069,7 @@ impl NodePeek {
                     return;
                 }
                 if landed > 0 {
-                    if followed && this.snapshot == shown {
+                    if chained && first_parent.is_some() && this.snapshot == first_parent {
                         this.snapshot = reached;
                     } else {
                         this.newer = true;
@@ -4474,6 +4473,30 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// Two relationship writes started together each follow the page on: the second lands on
+    /// top of the first, which the page shows by then, and is no sign of newer data.
+    #[gpui::test]
+    async fn overlapping_relationship_writes_follow_one_another(cx: &mut TestAppContext) {
+        use crate::test_support::{committed, session_writing};
+        let session = session_writing(
+            KNOWS,
+            vec![(200, committed("c2", "c1")), (200, committed("c3", "c2"))],
+            cx,
+        );
+        let (view, cx) = page(session, cx);
+        view.update_in(cx, |view, window, cx| {
+            assert!(view.groups.len() >= 2, "out and in");
+            view.snapshot = Some("c1".into());
+            view.write_edge(0, EdgeChange::Add("p9".into()), None, window, cx);
+            view.write_edge(1, EdgeChange::Add("p8".into()), None, window, cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.as_deref(), Some("c3"));
+            assert!(!view.newer, "nothing came from elsewhere");
+        });
     }
 
     /// ↵ picks from the results for what is typed now: results read for earlier text are not
