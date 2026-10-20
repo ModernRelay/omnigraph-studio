@@ -1032,6 +1032,10 @@ pub fn nodes_fields_by_id(
     let mut columns = vec!["$n.@id as id".to_owned()];
     for name in properties {
         let property = property(node, name)?;
+        // Blob and Vector values are read on their own, never in a projection.
+        if !property.projectable() {
+            return Err(BuildError::NotEditable(property.name.clone()));
+        }
         columns.push(format!(
             "$n.{} as {}",
             property.name,
@@ -1060,7 +1064,8 @@ pub fn nodes_fields_by_id(
     })
 }
 
-/// The column a property is read into by [`node_fields_by_id`] and [`node_page_fields`].
+/// The column a property is read into by [`node_fields_by_id`], [`nodes_fields_by_id`] and
+/// [`node_page_fields`].
 pub fn field_column(property: &str) -> String {
     format!("v_{property}")
 }
