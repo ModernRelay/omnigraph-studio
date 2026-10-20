@@ -1446,7 +1446,7 @@ impl GraphSession {
                             },
                             row_count: 1,
                             columns: output.columns.clone(),
-                            rows: Value::Array(vec![row.clone()]),
+                            rows: Value::Array(vec![row.clone()]).into(),
                             graph_commit_id: Some(commit.clone()),
                         };
                         self.pinned_reads.insert(key, answer);
@@ -3155,7 +3155,10 @@ mod tests {
         let later = session.update(cx, |session, cx| {
             session.read(&query, Some("c1".into()), cx)
         });
-        assert_eq!(later.await.unwrap().rows, first.rows);
+        let later = later.await.unwrap();
+        assert_eq!(later.rows, first.rows);
+        // The rows kept are handed over as they are, not copied for each reader.
+        assert!(Arc::ptr_eq(&later.rows, &second.rows));
         assert_eq!(
             queries.load(Ordering::SeqCst) - at_start,
             1,
@@ -3284,7 +3287,7 @@ mod tests {
             "the branch moved: read again at the commit"
         );
         assert_eq!(
-            output.rows,
+            *output.rows,
             serde_json::json!([{ "at": "c1" }]),
             "the rows are the commit's"
         );

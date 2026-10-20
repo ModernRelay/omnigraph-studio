@@ -31,7 +31,7 @@ pub fn search_nodes(
     text: &str,
     snapshot: Option<String>,
     cx: &App,
-) -> Task<Result<serde_json::Value, String>> {
+) -> Task<Result<std::sync::Arc<serde_json::Value>, String>> {
     let query = match builder::node_search(schema, type_name, text, NODE_SUGGESTIONS) {
         Ok(query) => query,
         Err(error) => return Task::ready(Err(error.to_string())),

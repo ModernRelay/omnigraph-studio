@@ -150,7 +150,7 @@ impl BuiltRows {
         columns: Option<&[ResultColumn]>,
         schema: Option<Arc<SchemaModel>>,
     ) -> Self {
-        let rows = std::mem::take(&mut output.rows);
+        let rows = Arc::unwrap_or_clone(std::mem::take(&mut output.rows));
         let table = ResultTable::new(output.columns.clone(), rows, columns);
         let widths = (0..table.columns.len())
             .map(|i| table.column_width(i))

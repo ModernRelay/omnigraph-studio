@@ -1078,7 +1078,7 @@ impl ExploreState {
 }
 
 fn rows(output: &ReadOutput) -> Vec<&serde_json::Map<String, Value>> {
-    match &output.rows {
+    match &*output.rows {
         Value::Array(rows) => rows.iter().filter_map(Value::as_object).collect(),
         _ => Vec::new(),
     }
@@ -1709,7 +1709,7 @@ impl Exploration {
                             .and_then(|row| row.get("n"))
                             .cloned()
                             .unwrap_or(Value::from(0));
-                        if let Value::Array(rows) = &mut output.rows {
+                        if let Value::Array(rows) = std::sync::Arc::make_mut(&mut output.rows) {
                             rows.push(serde_json::json!({ "n": n }));
                         }
                         Ok(output)
@@ -1873,7 +1873,7 @@ mod tests {
             },
             row_count: rows.as_array().map_or(0, |r| r.len() as i64),
             columns: columns.iter().map(|c| c.to_string()).collect(),
-            rows,
+            rows: rows.into(),
             graph_commit_id: Some("c1".into()),
         }
     }

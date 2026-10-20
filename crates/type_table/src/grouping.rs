@@ -181,7 +181,7 @@ impl Grouping {
     /// Takes the grouped counts: a section per value in value order, rows without a value
     /// last. Every section starts open with nothing read.
     pub fn accept_counts(&mut self, output: &ReadOutput, limit: u32) {
-        let rows = match &output.rows {
+        let rows = match &*output.rows {
             Value::Array(rows) => rows.as_slice(),
             _ => &[],
         };
@@ -418,7 +418,7 @@ mod tests {
             },
             row_count: rows.as_array().map_or(0, |r| r.len() as i64),
             columns: vec!["value".into(), "n".into()],
-            rows,
+            rows: rows.into(),
             graph_commit_id: Some("c1".into()),
         }
     }

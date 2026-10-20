@@ -472,7 +472,7 @@ impl CommandPalette {
                 }) else {
                     continue;
                 };
-                let Value::Array(rows) = output.rows else {
+                let Value::Array(rows) = std::sync::Arc::unwrap_or_clone(output.rows) else {
                     continue;
                 };
                 let rows: Vec<Found> = rows

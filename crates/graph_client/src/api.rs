@@ -4,7 +4,9 @@
 //! of this file fails if a type here and the contract disagree. Add fields only as surfaces
 //! need them, and add each new type to the test.
 
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 // ---- health and graphs ----
@@ -241,9 +243,17 @@ pub struct ReadOutput {
     pub row_count: i64,
     #[serde(default)]
     pub columns: Vec<String>,
-    pub rows: Value,
+    /// Shared: an answer kept for its commit is handed to every reader that asks again, and a
+    /// copy is made only by one that takes the rows for its own (`Arc::unwrap_or_clone`).
+    #[serde(deserialize_with = "shared_value")]
+    pub rows: Arc<Value>,
     #[serde(default)]
     pub graph_commit_id: Option<String>,
+}
+
+/// A JSON value read once and shared.
+fn shared_value<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Arc<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Arc::new)
 }
 
 #[derive(Debug, Clone, Deserialize)]
