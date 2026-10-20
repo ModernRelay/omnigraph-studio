@@ -895,6 +895,22 @@ impl GraphClient {
             .await
     }
 
+    /// One commit by its id, whichever branch's history holds it: its parents and creation
+    /// metadata, which never change.
+    pub async fn commit(
+        &self,
+        graph: &str,
+        commit_id: &str,
+    ) -> Result<crate::api::CommitOutput, ReadError> {
+        self.read(
+            Method::GET,
+            &["graphs", graph, "commits", commit_id],
+            &[],
+            None,
+        )
+        .await
+    }
+
     /// One page of a commit's changes against its first parent.
     pub async fn commit_changes(
         &self,

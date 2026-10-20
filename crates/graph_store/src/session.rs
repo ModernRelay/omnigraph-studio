@@ -2449,10 +2449,12 @@ impl GraphSession {
         self.counted_read(request, cx)
     }
 
-    /// A branch's commits as the server lists them. Read once and shared by every view that
-    /// asks (the history, the branches panel), and read again only after a commit Studio makes
-    /// on that branch or a change to the branch list; `fresh` reads it again now, as a Refresh
-    /// does, to see commits made elsewhere.
+    /// A branch's commits as the server lists them, whole: Review's fork and merge checks read
+    /// them when a page will not do, and History reads the other branches' lists for merged-in
+    /// commits when the server refuses this token commits by id. Read once and shared by every
+    /// view that asks, and read again only after a commit Studio makes on that branch or a
+    /// change to the branch list; `fresh` reads it again now, as a Refresh does, to see commits
+    /// made elsewhere.
     pub fn commits(
         &mut self,
         branch: &str,
@@ -2508,18 +2510,38 @@ impl GraphSession {
         )
     }
 
+    /// One commit by its id ([`GraphClient::commit`]), whichever branch made it: a merged-in
+    /// commit, which the listing of the branch it was merged into names only by id. Not kept: a
+    /// commit never changes, so the view that reads one keeps it.
+    pub fn commit(
+        &mut self,
+        commit_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<CommitOutput, ReadError>> {
+        let client = self.client(cx);
+        let graph = self.graph_id.clone();
+        let commit_id = commit_id.to_owned();
+        self.counted_read(async move { client.commit(&graph, &commit_id).await }, cx)
+    }
+
     /// `branch`'s newest commit, as a list of branches shows it: from its commit list when one
     /// is held or being read, else read alone and kept until a commit lands on the branch. A
-    /// branch with no commit has none.
+    /// branch with no commit has none. `fresh` forgets what is held of the branch's history
+    /// and reads it again now, as a Refresh does, to see commits made elsewhere.
     pub fn head_commit(
         &mut self,
         branch: &str,
+        fresh: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<CommitOutput>, ReadError>> {
         let key = branch.to_owned();
+        if fresh {
+            self.forget_branch(&key);
+        }
         match self.commit_lists.held(&key) {
             Some(Held::Done(list)) => return Task::ready(Ok(list.first().cloned())),
-            // The whole list is on its way (History asked): its first commit, not a second read.
+            // The whole list is on its way (Review, or History reading merged-in commits from
+            // the lists, asked): its first commit, not a second read.
             Some(Held::Pending(pending)) if pending.read.upgrade().is_some() => {
                 let list = self.commits(branch, false, cx);
                 return cx.spawn(async move |_, _| Ok(list.await?.first().cloned()));
@@ -4448,7 +4470,7 @@ mod tests {
         let asked = || std::mem::take(&mut *lists.lock().unwrap());
         asked();
         let head = |session: &Entity<GraphSession>, branch: &str, cx: &mut TestAppContext| {
-            let read = session.update(cx, |session, cx| session.head_commit(branch, cx));
+            let read = session.update(cx, |session, cx| session.head_commit(branch, false, cx));
             cx.run_until_parked();
             futures::executor::block_on(read)
                 .unwrap()
@@ -4475,6 +4497,11 @@ mod tests {
         assert_eq!(asked(), vec!["branch=feature"], "the list's read alone");
         assert_eq!(head(&session, "feature", cx).as_deref(), Some("c2"));
         assert!(asked().is_empty(), "from the list");
+        // A Refresh reads the head again now, though the list is held.
+        let fresh = session.update(cx, |session, cx| session.head_commit("feature", true, cx));
+        cx.run_until_parked();
+        futures::executor::block_on(fresh).unwrap();
+        assert_eq!(asked(), vec!["branch=feature&limit=1"]);
 
         // A commit on main: its head is read again.
         session.update(cx, |session, cx| {
@@ -4504,7 +4531,7 @@ mod tests {
         commit(&session, "c4", cx);
         let (open, wait) = oneshot::channel::<()>();
         *gate.lock().unwrap() = Some(wait);
-        let overtaken = session.update(cx, |session, cx| session.head_commit("main", cx));
+        let overtaken = session.update(cx, |session, cx| session.head_commit("main", false, cx));
         cx.run_until_parked();
         commit(&session, "c5", cx);
         open.send(()).ok();

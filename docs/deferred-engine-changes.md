@@ -41,7 +41,7 @@ main, 2026-10-20"):
 
 | ID | Feature | Operation | Spec | Studio does until then |
 |---|---|---|---|---|
-| E10 | Paged commit list: `limit`, `page_token`; `head_commit_id`, `next_page_token` (#1013) | `GET /commits` | 009 | Full list, virtualized, warning above 5,000 commits |
+| E10 | Paged commit list: `limit`, `page_token`; `head_commit_id`, `next_page_token` (#1013) | `GET /commits` | 009 | Adopted: History reads a page at a time, the query editor's snapshot picker one page, and Review down to the fork; a server that pages none answers whole, read as one page |
 | E15 | What the caller's credential may do on a graph and its branches (#1073) | `GET /graphs/{id}/access` | 002 | Every action shown; a 403 is a denial and the draft stays |
 | E21 | A branch from a commit: `from_commit`, `from_commit_id`, `branch_start_refusal` (#1016) | `POST /branches` | 008, 009 | A branch starts from a branch head |
 | E22 | The CLI reports a write refused at authentication, policy or the contract as not started (#981) | CLI | 013 | `AGENTS.md` says a Studio refusal wrote nothing |

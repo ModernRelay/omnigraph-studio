@@ -4,17 +4,17 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    AnyElement, AnyView, App, Bounds, ClipboardItem, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Hsla, KeyContext, PathBuilder, Pixels, Render, ScrollStrategy, SharedString,
-    StyleRefinement, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, canvas,
-    point, px, uniform_list,
+    AnyElement, AnyView, App, AsyncApp, Bounds, ClipboardItem, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, Hsla, KeyContext, PathBuilder, Pixels, Render, ScrollStrategy,
+    SharedString, StyleRefinement, Subscription, Task, UniformListScrollHandle, WeakEntity, Window,
+    canvas, point, px, uniform_list,
 };
 use graph_client::ReadError;
-use graph_client::api::CommitOutput;
+use graph_client::api::{CommitListOutput, CommitOutput};
 use graph_store::{GraphSession, HeadWatch, SessionEvent};
 use studio_actions::graph::OpenCommit;
 use studio_actions::history::{NextMatch, PreviousMatch};
@@ -22,22 +22,38 @@ use studio_ui::menu::ContextMenu;
 use studio_ui::{change_counts, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
-use ui::{Severity, Tooltip, right_click_menu};
+use ui::{Tooltip, right_click_menu};
 
 use crate::commit_view::{CommitCounts, CommitView};
 use crate::lanes::{Graph, GraphCommit, assign_lanes};
-use crate::merged::{branch_heads, move_head, unresolved_parents, with_merged_commits};
+use crate::merged::{Drawn, HistoryRead, branch_heads};
 
-/// Above this many commits the list warns that it is read and laid out whole: History asks
-/// for a branch's whole commit list, not a page of it.
-pub const LONG_HISTORY: usize = 5_000;
+/// Commits read per page of the branch's history. A row is `ds::size::ROW` tall, so one page
+/// fills several screens of the tab and the first shows after one read; a page costs the server
+/// only the commits it returns, and each page read lays the list read so far out again off the
+/// main thread, which stays quick at this size. The next page is read once the rows drawn come
+/// within a screen of the list's end.
+const PAGE: u32 = 200;
+/// Merged-in commits read by id in one walk, at most, and how many at once. A walk follows
+/// each page read, and another starts while the rows drawn name a merged-in commit not read yet
+/// ([`HistoryView::want_merged`]). A merged branch's chain is read one commit at a time, since
+/// each names only its parents, so one longer than this goes on in a later walk rather than
+/// holding up the reads meanwhile.
+const MERGED_READS: usize = PAGE as usize;
+const MERGED_AT_ONCE: usize = 8;
+/// How long a merged-in commit whose read failed (a timeout, a 5xx, a 429) waits before a row
+/// naming it, drawn, asks for it again. Long enough that a server shedding load is not asked
+/// again at once, and that a failure lasting minutes costs one read per commit every few
+/// seconds, and only while its row is drawn; short enough that a passing failure heals while
+/// the person looks.
+const MERGED_RETRY_AFTER: Duration = Duration::from_secs(5);
 
 /// How long scrolling must pause before the drawn rows' change counts are read, and stepping
 /// through commits before the selected one's changes are.
 const COUNTS_AFTER: Duration = Duration::from_millis(120);
 /// How long typing in the search pauses before the commits are matched.
 const SEARCH_DELAY: Duration = Duration::from_millis(80);
-/// Other branches whose lists History reads for heads and merged-in commits.
+/// Other branches whose heads History reads for their tags.
 const OTHER_BRANCHES: usize = 20;
 
 const ROW_HEIGHT: f32 = studio_ui::ds::size::ROW;
@@ -58,6 +74,88 @@ enum State {
     Failed(SharedString),
 }
 
+/// The read of the listing's next page.
+enum More {
+    Idle,
+    Reading,
+    /// Why it failed: the end of the list says so and offers to try again, and scrolling reads
+    /// nothing more until then. With `restart`, the server refused the page's continuation,
+    /// which it would refuse again: Try again reads the listing from its first page.
+    Failed {
+        error: SharedString,
+        restart: bool,
+    },
+}
+
+/// How the listing goes on after a page.
+struct Listing {
+    /// The head the listing resolved, which each later page answers for.
+    head: Option<String>,
+    next: Option<String>,
+    complete: bool,
+}
+
+impl Listing {
+    fn of(page: &CommitListOutput) -> Self {
+        // A server that pages no history answers it whole, with no token. A page with no commits
+        // ends the listing too: a token after nothing would only ask for nothing again.
+        let next = page
+            .next_page_token
+            .clone()
+            .filter(|_| !page.commits.is_empty());
+        Self {
+            head: page
+                .head_commit_id
+                .clone()
+                .or_else(|| page.commits.first().map(|c| c.graph_commit_id.clone())),
+            complete: next.is_none(),
+            next,
+        }
+    }
+}
+
+/// A layout of what was read, made off the main thread: the commits drawn, what the search
+/// finds them by, their lanes, and the merged-in commits to read next.
+struct Arranged {
+    read: Arc<HistoryRead>,
+    commits: Vec<CommitOutput>,
+    commit_texts: Vec<CommitText>,
+    graph: Graph,
+    wanted: Vec<String>,
+}
+
+/// A batch of merged-in commits read: laid out again, or (none sorting among the rows read)
+/// only kept, with the ids answered.
+enum Answered {
+    Drawn(Arranged),
+    Unseen(Arc<HistoryRead>, Vec<String>),
+}
+
+fn arrange(mut read: HistoryRead) -> Arranged {
+    let Drawn { commits, wanted } = read.draw();
+    let nodes: Vec<GraphCommit> = commits
+        .iter()
+        .map(|c| GraphCommit {
+            id: c.graph_commit_id.clone(),
+            parents: c
+                .parent_commit_id
+                .iter()
+                .chain(c.merged_parent_commit_id.iter())
+                .cloned()
+                .collect(),
+        })
+        .collect();
+    let graph = assign_lanes(&nodes);
+    let commit_texts = commits.iter().map(CommitText::of).collect();
+    Arranged {
+        read: Arc::new(read),
+        commits,
+        commit_texts,
+        graph,
+        wanted,
+    }
+}
+
 pub struct HistoryView {
     session: Entity<GraphSession>,
     branch: String,
@@ -72,7 +170,30 @@ pub struct HistoryView {
     match_query: String,
     _search_task: Option<Task<()>>,
     focus_handle: FocusHandle,
+    /// The first page's read.
     state: State,
+    /// What was read of the branch's history: its own pages and the commits merged in.
+    read: Arc<HistoryRead>,
+    /// Where the listing goes on: the token after the last page read, and the head the
+    /// listing's first page resolved, which every later page answers for, so the pages stay
+    /// one history while the branch moves on.
+    next_page: Option<String>,
+    listing_head: Option<String>,
+    more: More,
+    /// The merged-in commits the commits drawn name and History has not read, top rows' first,
+    /// and when each whose read failed since the last page read failed: it is asked for again
+    /// after the next page read, or by a drawn row naming it once [`MERGED_RETRY_AFTER`] has
+    /// passed, which the rows are drawn again for.
+    wanted: Vec<String>,
+    merged_failed: HashMap<String, Instant>,
+    _merged_retry: Option<Task<()>>,
+    /// Whether merged-in commits are read by id. The server checks that route against a read
+    /// grant on every branch, so it refuses (403) a token whose grant names branches; merged-in
+    /// commits then come from the other branches' whole listings, which it checks branch by
+    /// branch, read once into `listed`, until the next load or Refresh.
+    by_id: bool,
+    listed: Option<Arc<HashMap<String, CommitOutput>>>,
+    /// The commits drawn, newest first: the branch's own and those merged in.
     commits: Vec<CommitOutput>,
     /// What the search finds each commit by, made with the list.
     commit_texts: Vec<CommitText>,
@@ -96,9 +217,9 @@ pub struct HistoryView {
     drawn_due: bool,
     /// Branch names by the commit they point at.
     heads: HashMap<String, Vec<String>>,
-    /// Commits in the branch's own list; the rest came in through merges.
-    own_count: usize,
     scroll: UniformListScrollHandle,
+    /// The read of the history under way, until it ends: a page, then the merged-in commits it
+    /// names, or a walk of those alone.
     _task: Option<Task<()>>,
     _detail_subscription: Option<Subscription>,
     _search_subscription: Subscription,
@@ -106,15 +227,17 @@ pub struct HistoryView {
     /// A tab's own branch asked after while it is open, so another writer's commits to it
     /// arrive; the panel's is the session's, always asked after.
     _head_watch: Option<HeadWatch>,
-    /// The other branches whose lists the history read: a commit to one shows here too, as
-    /// its head or a merge from it.
+    /// The other branches whose heads the history shows as tags: a commit to one moves its
+    /// tag.
     others: Vec<String>,
-    /// The parents and merged parents the history names without holding, from its last
-    /// layout: a commit to another branch lays it out again only when that branch's list now
-    /// holds one.
-    unresolved: Arc<HashSet<String>>,
-    /// Other branches' lists read again after a commit to them, for their heads, by branch.
+    /// Their heads as last read, by branch.
+    other_heads: HashMap<String, String>,
+    /// The head read last asked for each, by number, and the reads under way: only the one
+    /// last asked for sets the tag, so a read sent before a commit, landing after one sent
+    /// since, does not put the tag back.
+    head_asked: HashMap<String, u64>,
     head_reads: HashMap<String, Task<()>>,
+    next_head_read: u64,
 }
 
 impl EventEmitter<ItemEvent> for HistoryView {}
@@ -165,14 +288,14 @@ impl HistoryView {
         let mut view = Self::build(session.clone(), branch, false, window, cx);
         view._head_watch =
             Some(session.update(cx, |session, cx| session.watch_head(&view.branch, cx)));
-        // Its own branch's commits, and the other branches whose heads and merges it shows: a
-        // tab restored before the branch list was read draws them once it is.
+        // Its own branch's commits, and the other branches whose heads it shows: a tab restored
+        // before the branch list was read draws them once it is.
         view._session_subscription =
             Some(cx.subscribe(&session, |this, _, event, cx| match event {
                 SessionEvent::Committed { branch } if this.shows(branch) => {
                     this.committed(branch, cx)
                 }
-                SessionEvent::BranchesChanged => this.reload(cx),
+                SessionEvent::BranchesChanged => this.branches_changed(cx),
                 _ => {}
             }));
         view
@@ -197,8 +320,8 @@ impl HistoryView {
                     SessionEvent::Committed { branch } if this.shows(branch) => {
                         this.committed(branch, cx)
                     }
-                    // The list of other branches, whose heads and merges the history shows.
-                    SessionEvent::BranchesChanged => this.reload(cx),
+                    // The list of other branches, whose heads the history shows.
+                    SessionEvent::BranchesChanged => this.branches_changed(cx),
                     _ => {}
                 }),
             );
@@ -241,10 +364,21 @@ impl HistoryView {
             _session_subscription: None,
             _head_watch: None,
             others: Vec::new(),
-            unresolved: Arc::default(),
+            other_heads: HashMap::new(),
+            head_asked: HashMap::new(),
             head_reads: HashMap::new(),
+            next_head_read: 0,
             focus_handle: cx.focus_handle(),
             state: State::Loading,
+            read: Arc::default(),
+            next_page: None,
+            listing_head: None,
+            more: More::Idle,
+            wanted: Vec::new(),
+            merged_failed: HashMap::new(),
+            _merged_retry: None,
+            by_id: true,
+            listed: None,
             commits: Vec::new(),
             commit_texts: Vec::new(),
             graph: Graph::default(),
@@ -260,7 +394,6 @@ impl HistoryView {
             drawn_rows: None,
             drawn_due: false,
             heads: HashMap::new(),
-            own_count: 0,
             scroll: UniformListScrollHandle::new(),
             _task: None,
             _detail_subscription: None,
@@ -269,9 +402,18 @@ impl HistoryView {
         view
     }
 
-    /// Lets go of what was shown for the branch left, so its commits never show under the new
-    /// one's name while that is read.
+    /// Lets go of what was shown and read for the branch left, so its commits never show under
+    /// the new one's name while that is read; the branch left is one of the others now.
     fn forget_branch(&mut self) {
+        self.read = Arc::default();
+        self.next_page = None;
+        self.listing_head = None;
+        self.more = More::Idle;
+        self.wanted.clear();
+        self.merged_failed.clear();
+        self._merged_retry = None;
+        self.by_id = true;
+        self.listed = None;
         self.commits.clear();
         self.commit_texts.clear();
         self.graph = Graph::default();
@@ -279,77 +421,557 @@ impl HistoryView {
         self.detail = None;
         self._detail_subscription = None;
         self.heads.clear();
-        self.own_count = 0;
         self.matches.clear();
         self.match_at = None;
         self.count_rows = None;
+        self.others.clear();
+        self.other_heads.clear();
+        self.head_asked.clear();
+        self.head_reads.clear();
     }
 
-    /// Shows the branch's history again from the session's commit lists, which are read again
-    /// only for branches with new commits.
+    /// Shows the branch's history again from its first page, and reads the heads of other
+    /// branches not read yet.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
         self.load(false, cx);
+        self.load_heads(false, cx);
     }
 
-    /// Refresh: reads every branch's commits again, the other branches' too, to see commits
-    /// made elsewhere: another branch's head, and a merge from it, show from its list.
+    /// Refresh: reads the history again from its first page, the merged-in commits the server
+    /// did not have, and every other branch's head again now. The session keeps a head until
+    /// Studio sees a commit land on its branch, and another writer's commit to a branch nobody
+    /// watches is seen only so; the head read again is the session's, so the branches panel
+    /// and a later load show it too.
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.load(true, cx);
+        Arc::make_mut(&mut self.read).forget_missing();
+        self.load(false, cx);
+        self.load_heads(true, cx);
     }
 
     /// Whether a commit to `branch` changes what the history shows: its own branch's, or one
-    /// of the others it read.
+    /// of the others whose heads it shows.
     fn shows(&self, branch: &str) -> bool {
         self.branch == branch || self.others.iter().any(|other| other == branch)
     }
 
-    /// A commit landed on `branch`. One to the history's own branch, or one while the history
-    /// is read, lays it out again. One to another branch it reads moves that branch's head
-    /// tag only: that branch's new commits are not in this history, unless its list now holds
-    /// a parent the history named without holding, which lays it out again.
+    /// A commit landed on `branch`. One to the history's own branch reads its first page again,
+    /// on top of the pages read ([`HistoryRead::first_page`]). One to another branch moves that
+    /// branch's tag alone: its new commits are not this history's, and a merge of them would
+    /// land on this branch.
     fn committed(&mut self, branch: &str, cx: &mut Context<Self>) {
-        if branch == self.branch || matches!(self.state, State::Loading) {
-            self.reload(cx);
-            return;
+        if branch == self.branch {
+            self.load(true, cx);
+        } else {
+            self.read_head(branch.to_owned(), false, cx);
         }
-        let read = self
-            .session
-            .update(cx, |session, cx| session.commits(branch, false, cx));
-        let unresolved = self.unresolved.clone();
-        let name = branch.to_owned();
-        let task = cx.spawn(async move |this, cx| {
-            // Gone through off the main thread: a list holds the branch's whole history.
-            let (head, holds_unresolved) = match read.await {
-                Ok(list) => {
-                    cx.background_spawn(async move {
-                        let head = list.first().map(|c| c.graph_commit_id.clone());
-                        let holds = list.iter().any(|c| unresolved.contains(&c.graph_commit_id));
-                        (head, holds)
-                    })
-                    .await
-                }
-                // As a layout leaves out a branch whose list could not be read.
-                Err(_) => (None, false),
-            };
-            this.update(cx, |this, cx| {
-                this.head_reads.remove(&name);
-                if holds_unresolved {
-                    this.reload(cx);
-                } else {
-                    move_head(&mut this.heads, &name, head.as_deref());
-                    cx.notify();
-                }
-            })
-            .ok();
-        });
-        self.head_reads.insert(branch.to_owned(), task);
     }
 
-    fn load(&mut self, fresh: bool, cx: &mut Context<Self>) {
+    /// The branch list changed: the tags follow the branches made and gone. A history that
+    /// could not be read is read again, as its branch may have been made since.
+    fn branches_changed(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.state, State::Failed(_)) {
+            self.load(false, cx);
+        }
+        self.load_heads(false, cx);
+    }
+
+    /// Reads the branch's first page and lays it out, then the merged-in commits it names. With
+    /// `landed`, the pages read stay below it when it reaches the head they were read from
+    /// ([`HistoryRead::first_page`]), and go on continuing their listing.
+    fn load(&mut self, landed: bool, cx: &mut Context<Self>) {
         self.state = State::Loading;
+        // A next page under way continues a listing this read may replace.
+        self.more = More::Idle;
+        self.merged_failed.clear();
+        self.by_id = true;
+        self.listed = None;
+        let page = self.session.update(cx, |session, cx| {
+            session.commit_page(&self.branch, PAGE, None, cx)
+        });
+        self._task = Some(cx.spawn(async move |this, cx| {
+            Self::first_page(&this, page, landed, cx).await;
+            this.update(cx, |this, _| this._task = None).ok();
+        }));
+        cx.notify();
+    }
+
+    async fn first_page(
+        this: &WeakEntity<Self>,
+        page: Task<Result<CommitListOutput, ReadError>>,
+        landed: bool,
+        cx: &mut AsyncApp,
+    ) {
+        let page = match page.await {
+            Ok(page) => page,
+            Err(error) => {
+                this.update(cx, |this, cx| {
+                    this.state = State::Failed(error.to_string().into());
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
+        };
+        let Ok(held) = this.update(cx, |this, _| this.read.clone()) else {
+            return;
+        };
+        let listing = Listing::of(&page);
+        let complete = listing.complete;
+        // What was read goes to the background as it is, and is copied there with the page:
+        // copying thousands of commits on the main thread would hold up frames.
+        let (arranged, kept) = cx
+            .background_spawn(async move {
+                let mut read = HistoryRead::clone(&held);
+                let kept = read.first_page(page.commits, complete, landed);
+                (arrange(read), kept)
+            })
+            .await;
+        let laid_out = this.update(cx, |this, cx| {
+            if !kept {
+                this.next_page = listing.next;
+                this.listing_head = listing.head;
+            }
+            this.take(arranged, cx);
+        });
+        if laid_out.is_ok() {
+            Self::read_merged(this, cx).await;
+        }
+    }
+
+    /// Reads the listing's next page, which continues the listing the first page resolved even
+    /// after the branch moved on: one page at a time, none once the listing ends, and none after
+    /// one failed until it is tried again. It takes the place of a walk of merged-in commits
+    /// under way, which the walk after the page goes on with.
+    fn load_next(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.state, State::Ready) || !matches!(self.more, More::Idle) {
+            return;
+        }
+        let Some(token) = self.next_page.clone() else {
+            return;
+        };
+        self.more = More::Reading;
+        self.merged_failed.clear();
+        let asked_head = self.listing_head.clone();
+        let page = self.session.update(cx, |session, cx| {
+            session.commit_page(&self.branch, PAGE, Some(token), cx)
+        });
+        self._task = Some(cx.spawn(async move |this, cx| {
+            Self::next_page(&this, page, asked_head, cx).await;
+            this.update(cx, |this, _| this._task = None).ok();
+        }));
+        cx.notify();
+    }
+
+    async fn next_page(
+        this: &WeakEntity<Self>,
+        page: Task<Result<CommitListOutput, ReadError>>,
+        asked_head: Option<String>,
+        cx: &mut AsyncApp,
+    ) {
+        let page = match page.await {
+            Ok(page) => page,
+            Err(error) => {
+                // A continuation refused (its token rejected, say) is refused again when sent
+                // again; one that did not complete, or met a busy server, is sent again.
+                let restart = matches!(
+                    &error,
+                    ReadError::Refused(refusal)
+                        if (400..500).contains(&refusal.status)
+                            && !matches!(refusal.status, 408 | 429)
+                );
+                this.update(cx, |this, cx| {
+                    this.more = More::Failed {
+                        error: error.to_string().into(),
+                        restart,
+                    };
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
+        };
+        // A page answering for another head is of another listing than the pages read, and is
+        // not added to them. Reading the first page again here could go on for as long as the
+        // server answers so; Try again reads it once, from a listing later pages answer for.
+        if page.head_commit_id.is_some()
+            && asked_head.is_some()
+            && page.head_commit_id != asked_head
+        {
+            this.update(cx, |this, cx| {
+                this.more = More::Failed {
+                    error: "the server answered for another head".into(),
+                    restart: true,
+                };
+                cx.notify();
+            })
+            .ok();
+            return;
+        }
+        let Ok(held) = this.update(cx, |this, _| this.read.clone()) else {
+            return;
+        };
+        let listing = Listing::of(&page);
+        let complete = listing.complete;
+        let arranged = cx
+            .background_spawn(async move {
+                let mut read = HistoryRead::clone(&held);
+                read.next_page(page.commits, complete);
+                arrange(read)
+            })
+            .await;
+        let laid_out = this.update(cx, |this, cx| {
+            this.next_page = listing.next;
+            this.more = More::Idle;
+            this.take(arranged, cx);
+        });
+        if laid_out.is_ok() {
+            Self::read_merged(this, cx).await;
+        }
+    }
+
+    /// Reads the next page once the rows drawn come within a screen of the list's end.
+    fn want_more(&mut self, rows: &Range<usize>, cx: &mut Context<Self>) {
+        if rows.end + rows.len() >= self.commits.len() {
+            self.load_next(cx);
+        }
+    }
+
+    /// Whether the list ends in a row for the next page: the listing goes on.
+    fn has_more(&self) -> bool {
+        !self.read.complete && !self.commits.is_empty()
+    }
+
+    /// Try again, after the next page failed: that page again, or the listing from its first
+    /// page when the server refused the page's continuation.
+    fn retry_more(&mut self, cx: &mut Context<Self>) {
+        if let More::Failed { restart: true, .. } = self.more {
+            self.load(false, cx);
+        } else {
+            self.more = More::Idle;
+            self.load_next(cx);
+        }
+    }
+
+    /// Goes on reading merged-in commits once the rows drawn name one not read yet, when
+    /// nothing is being read: those a walk left for want of [`MERGED_READS`], read as the person
+    /// scrolls to them, and those whose read failed [`MERGED_RETRY_AFTER`] ago. A walk asks
+    /// for none it asked for within that time, so the walks end once the rows drawn name none.
+    fn want_merged(&mut self, rows: &Range<usize>, cx: &mut Context<Self>) {
+        if self._task.is_some() || !matches!(self.state, State::Ready) {
+            return;
+        }
+        // From the listings, which cannot be read before the branch list is.
+        if !self.by_id && self.listed.is_none() && self.session.read(cx).branches.loaded().is_none()
+        {
+            return;
+        }
+        let now = cx.background_executor().now();
+        let drawn = self
+            .commits
+            .get(rows.start..rows.end.min(self.commits.len()))
+            .unwrap_or_default();
+        let names_unread = drawn
+            .iter()
+            .flat_map(|c| c.parent_commit_id.iter().chain(&c.merged_parent_commit_id))
+            .any(|id| self.wanted.contains(id) && self.may_ask(id, now));
+        if names_unread {
+            self._task = Some(cx.spawn(async move |this, cx| {
+                Self::read_merged(&this, cx).await;
+                this.update(cx, |this, _| this._task = None).ok();
+            }));
+        }
+    }
+
+    /// Whether merged-in commit `id` may be asked for at `now`: its read has not failed since
+    /// the last page read, or failed [`MERGED_RETRY_AFTER`] ago or more.
+    fn may_ask(&self, id: &str, now: Instant) -> bool {
+        self.merged_failed
+            .get(id)
+            .is_none_or(|failed| now.saturating_duration_since(*failed) >= MERGED_RETRY_AFTER)
+    }
+
+    /// The merged-in commits to read next, at most `count`: those the rows drawn last name
+    /// first, so a stub scrolled to does not wait for every merge above it, then the rest, top
+    /// rows' first.
+    fn merged_to_read(&self, count: usize, now: Instant) -> Vec<String> {
+        let wanted: HashSet<&str> = self.wanted.iter().map(String::as_str).collect();
+        let drawn = self.drawn_rows.clone().unwrap_or_default();
+        let named = self
+            .commits
+            .get(drawn.start..drawn.end.min(self.commits.len()))
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|c| c.parent_commit_id.iter().chain(&c.merged_parent_commit_id))
+            .map(String::as_str)
+            .filter(|id| wanted.contains(id));
+        let mut picked = Vec::new();
+        let mut seen = HashSet::new();
+        for id in named.chain(self.wanted.iter().map(String::as_str)) {
+            if picked.len() == count {
+                break;
+            }
+            if self.may_ask(id, now) && seen.insert(id) {
+                picked.push(id.to_owned());
+            }
+        }
+        picked
+    }
+
+    /// Draws the rows again once [`MERGED_RETRY_AFTER`] has passed since a merged-in read
+    /// failed, so a drawn row naming it asks again ([`Self::want_merged`]) without waiting for a
+    /// scroll. One wait at a time: a later failure's takes its place, and ends after it.
+    fn retry_merged_later(&mut self, cx: &mut Context<Self>) {
+        self._merged_retry = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(MERGED_RETRY_AFTER).await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        }));
+    }
+
+    /// Reads the merged-in commits the commits drawn name, by id, [`MERGED_AT_ONCE`] at a time
+    /// and at most [`MERGED_READS`] in one walk ([`Self::merged_to_read`]), laying the history
+    /// out again when a batch brings a commit among the rows read. A commit the server does not
+    /// have draws as a stub from then on; one whose read failed otherwise is asked for again
+    /// later. Once the server refuses this token a read by id, the rest come from the other
+    /// branches' listings ([`Self::read_listed`]).
+    async fn read_merged(this: &WeakEntity<Self>, cx: &mut AsyncApp) {
+        let mut left = MERGED_READS;
+        loop {
+            let Ok(by_id) = this.update(cx, |this, _| this.by_id) else {
+                return;
+            };
+            if !by_id {
+                Self::read_listed(this, cx).await;
+                return;
+            }
+            if left == 0 {
+                return;
+            }
+            let Ok(reads) = this.update(cx, |this, cx| {
+                let now = cx.background_executor().now();
+                this.merged_to_read(MERGED_AT_ONCE.min(left), now)
+                    .into_iter()
+                    .map(|id| {
+                        let read = this
+                            .session
+                            .update(cx, |session, cx| session.commit(&id, cx));
+                        (id, read)
+                    })
+                    .collect::<Vec<_>>()
+            }) else {
+                return;
+            };
+            if reads.is_empty() {
+                return;
+            }
+            left -= reads.len();
+            // Sent together above; the answers are awaited in the order asked.
+            let mut answers = Vec::with_capacity(reads.len());
+            let mut failed = Vec::new();
+            let mut refused = false;
+            for (id, read) in reads {
+                match read.await {
+                    Ok(commit) => answers.push((id, Some(commit))),
+                    // This token may not read commits by id: the listings answer this one too.
+                    Err(ReadError::Refused(refusal)) if refusal.status == 403 => refused = true,
+                    Err(ReadError::Refused(refusal))
+                        if matches!(refusal.status, 400 | 404 | 410) =>
+                    {
+                        answers.push((id, None))
+                    }
+                    Err(_) => failed.push(id),
+                }
+            }
+            let Ok(held) = this.update(cx, |this, cx| {
+                if !failed.is_empty() {
+                    let now = cx.background_executor().now();
+                    this.merged_failed
+                        .extend(failed.into_iter().map(|id| (id, now)));
+                    this.retry_merged_later(cx);
+                }
+                if refused {
+                    this.by_id = false;
+                }
+                this.read.clone()
+            }) else {
+                return;
+            };
+            if answers.is_empty() {
+                continue;
+            }
+            let taken = cx
+                .background_spawn(async move {
+                    let mut read = HistoryRead::clone(&held);
+                    // A batch of commits held back, or not had, changes no row drawn: the
+                    // history is laid out again only for one that sorts among the rows read.
+                    let shows = answers
+                        .iter()
+                        .any(|(_, commit)| commit.as_ref().is_some_and(|c| read.shows(c)));
+                    let answered: Vec<String> = answers.iter().map(|(id, _)| id.clone()).collect();
+                    for (id, commit) in answers {
+                        read.merged_read(id, commit);
+                    }
+                    if shows {
+                        Answered::Drawn(arrange(read))
+                    } else {
+                        Answered::Unseen(Arc::new(read), answered)
+                    }
+                })
+                .await;
+            let kept = this.update(cx, |this, cx| match taken {
+                Answered::Drawn(arranged) => this.take(arranged, cx),
+                Answered::Unseen(read, answered) => {
+                    this.read = read;
+                    this.wanted.retain(|id| !answered.contains(id));
+                }
+            });
+            if kept.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Answers the merged-in commits wanted from the other branches' listings, for a token the
+    /// server refuses commits by id: up to [`OTHER_BRANCHES`] live branches' whole lists, read
+    /// once into `listed`, then laid out once. A commit no list holds draws as a stub.
+    async fn read_listed(this: &WeakEntity<Self>, cx: &mut AsyncApp) {
+        let Ok(held) = this.update(cx, |this, _| this.listed.clone()) else {
+            return;
+        };
+        let listed = match held {
+            Some(listed) => listed,
+            None => {
+                let Ok(Some(reads)) = this.update(cx, |this, cx| {
+                    let branch = this.branch.clone();
+                    let names: Vec<String> = this
+                        .session
+                        .read(cx)
+                        .branches
+                        .loaded()?
+                        .iter()
+                        .filter(|name| **name != branch)
+                        .take(OTHER_BRANCHES)
+                        .cloned()
+                        .collect();
+                    Some(
+                        names
+                            .into_iter()
+                            .map(|name| {
+                                this.session
+                                    .update(cx, |session, cx| session.commits(&name, false, cx))
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }) else {
+                    // No branch list yet: the stubs stay, and a drawn row naming one walks again
+                    // once it is in.
+                    return;
+                };
+                // As a branch whose list could not be read holds none of them.
+                let mut lists = Vec::with_capacity(reads.len());
+                for read in reads {
+                    if let Ok(list) = read.await {
+                        lists.push(list);
+                    }
+                }
+                let listed = cx
+                    .background_spawn(async move {
+                        let mut by_id: HashMap<String, CommitOutput> = HashMap::new();
+                        for commit in lists.iter().flat_map(|list| list.iter()) {
+                            by_id
+                                .entry(commit.graph_commit_id.clone())
+                                .or_insert_with(|| commit.clone());
+                        }
+                        Arc::new(by_id)
+                    })
+                    .await;
+                if this
+                    .update(cx, |this, _| this.listed = Some(listed.clone()))
+                    .is_err()
+                {
+                    return;
+                }
+                listed
+            }
+        };
+        let Ok(held) = this.update(cx, |this, _| this.read.clone()) else {
+            return;
+        };
+        let arranged = cx
+            .background_spawn(async move {
+                let mut read = HistoryRead::clone(&held);
+                read.take_from(&listed);
+                arrange(read)
+            })
+            .await;
+        this.update(cx, |this, cx| this.take(arranged, cx)).ok();
+    }
+
+    /// Shows a layout of what was read, keeping the commit selected.
+    fn take(&mut self, arranged: Arranged, cx: &mut Context<Self>) {
+        let previous = self
+            .selected
+            .and_then(|ix| self.commits.get(ix))
+            .map(|c| c.graph_commit_id.clone());
+        self.read = arranged.read;
+        self.commits = arranged.commits;
+        self.commit_texts = arranged.commit_texts;
+        self.graph = arranged.graph;
+        self.wanted = arranged.wanted;
+        self.heads = self.branch_heads();
+        self.state = State::Ready;
+        // The drawn rows' counts were found in the list before.
+        self.count_rows = None;
+        let keep =
+            previous.and_then(|id| self.commits.iter().position(|c| c.graph_commit_id == id));
+        match keep {
+            Some(ix) => self.selected = Some(ix),
+            None if !self.commits.is_empty() => self.select(0, cx),
+            None => {}
+        }
+        // So were the matches: found again, a page may bring some, and placed at the selection,
+        // so a step goes on from it.
+        self.match_commits(cx);
+        self.match_at = self.match_at_selection();
+        cx.notify();
+    }
+
+    /// Where the selection sits among the matches: its own place when it is one, else the
+    /// last match above it, or the last of all when none is, so a step forward lands on the
+    /// first match below it.
+    fn match_at_selection(&self) -> Option<usize> {
+        let last = self.matches.len().checked_sub(1)?;
+        let Some(selected) = self.selected else {
+            return Some(last);
+        };
+        Some(match self.matches.binary_search(&selected) {
+            Ok(at) => at,
+            Err(0) => last,
+            Err(below) => below - 1,
+        })
+    }
+
+    /// Branch names by the commit each points at: this branch's at the newest commit its
+    /// listing read, the others' at the heads read for them.
+    fn branch_heads(&self) -> HashMap<String, Vec<String>> {
+        let own = self
+            .read
+            .own
+            .first()
+            .map(|head| (self.branch.as_str(), head.graph_commit_id.as_str()));
+        branch_heads(
+            own.into_iter().chain(
+                self.other_heads
+                    .iter()
+                    .map(|(branch, head)| (branch.as_str(), head.as_str())),
+            ),
+        )
+    }
+
+    /// Reads the other branches' heads for their tags: the live branches besides this one, up
+    /// to [`OTHER_BRANCHES`], one commit each. A head already read is kept unless `fresh`; a
+    /// branch no longer listed loses its tag.
+    fn load_heads(&mut self, fresh: bool, cx: &mut Context<Self>) {
         let branch = self.branch.clone();
-        // Other live branches: their heads, and the commits merged in from them. All the
-        // lists are asked for at once, and come from the session's lists where it has them.
         let others: Vec<String> = self
             .session
             .read(cx)
@@ -364,106 +986,70 @@ impl HistoryView {
                     .collect()
             })
             .unwrap_or_default();
-        let own_read = self
-            .session
-            .update(cx, |session, cx| session.commits(&branch, fresh, cx));
-        // Every list read now is at least as new as a head read already out, whose answer
-        // landing after the layout would put a tag back.
-        self.head_reads.clear();
-        self.others = others.clone();
-        let other_reads: Vec<_> = others
-            .into_iter()
-            .map(|name| {
-                let read = self
-                    .session
-                    .update(cx, |session, cx| session.commits(&name, fresh, cx));
-                (name, read)
-            })
+        self.other_heads.retain(|name, _| others.contains(name));
+        self.head_asked.retain(|name, _| others.contains(name));
+        self.head_reads.retain(|name, _| others.contains(name));
+        let unread: Vec<String> = others
+            .iter()
+            .filter(|name| fresh || !self.head_asked.contains_key(*name))
+            .cloned()
             .collect();
-        self._task = Some(cx.spawn(async move |this, cx| {
-            // The shared lists go to the background as they are; copying thousands of commits
-            // on the main thread would hold up frames.
-            let own = match own_read.await {
-                Ok(list) => list,
-                Err(error) => {
-                    this.update(cx, |this, cx| {
-                        this.state = State::Failed(error.to_string().into());
-                        cx.notify();
-                    })
-                    .ok();
+        self.others = others;
+        self.heads = self.branch_heads();
+        for name in unread {
+            self.read_head(name, fresh, cx);
+        }
+        cx.notify();
+    }
+
+    /// Reads `branch`'s head for its tag: the one the session keeps
+    /// ([`GraphSession::head_commit`]), which it reads again once a commit lands on the branch,
+    /// or with `fresh` read again now, for every view that shows it.
+    fn read_head(&mut self, branch: String, fresh: bool, cx: &mut Context<Self>) {
+        self.next_head_read += 1;
+        let asked = self.next_head_read;
+        self.head_asked.insert(branch.clone(), asked);
+        let read = self
+            .session
+            .update(cx, |session, cx| session.head_commit(&branch, fresh, cx));
+        let name = branch.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let head = read.await;
+            this.update(cx, |this, cx| {
+                if this.head_asked.get(&name) != Some(&asked) {
                     return;
                 }
-            };
-            let mut others = Vec::new();
-            for (name, read) in other_reads {
-                if let Ok(list) = read.await {
-                    others.push((name, list));
+                this.head_reads.remove(&name);
+                match head {
+                    Ok(Some(head)) => {
+                        this.other_heads.insert(name, head.graph_commit_id);
+                    }
+                    Ok(None) => {
+                        this.other_heads.remove(&name);
+                    }
+                    // A branch whose head could not be read has no tag; the next reload asks.
+                    Err(_) => {
+                        this.other_heads.remove(&name);
+                        this.head_asked.remove(&name);
+                    }
                 }
-            }
-            // Laid out off the main thread; a long history is laid out whole.
-            let own_count = own.len();
-            let (commits, commit_texts, layout, heads, unresolved) = cx
-                .background_executor()
-                .spawn(async move {
-                    let own: Vec<CommitOutput> = own.as_ref().clone();
-                    let heads = branch_heads(
-                        std::iter::once((branch.as_str(), own.as_slice())).chain(
-                            others
-                                .iter()
-                                .map(|(name, commits)| (name.as_str(), commits.as_slice())),
-                        ),
-                    );
-                    let lists: Vec<Vec<CommitOutput>> = others
-                        .into_iter()
-                        .map(|(_, commits)| commits.as_ref().clone())
-                        .collect();
-                    let commits = with_merged_commits(own, &lists);
-                    let nodes: Vec<GraphCommit> = commits
-                        .iter()
-                        .map(|c| GraphCommit {
-                            id: c.graph_commit_id.clone(),
-                            parents: c
-                                .parent_commit_id
-                                .iter()
-                                .chain(c.merged_parent_commit_id.iter())
-                                .cloned()
-                                .collect(),
-                        })
-                        .collect();
-                    let layout = assign_lanes(&nodes);
-                    let commit_texts: Vec<CommitText> =
-                        commits.iter().map(CommitText::of).collect();
-                    let unresolved = unresolved_parents(&commits);
-                    (commits, commit_texts, layout, heads, unresolved)
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                let previous = this
-                    .selected
-                    .and_then(|ix| this.commits.get(ix))
-                    .map(|c| c.graph_commit_id.clone());
-                this.commits = commits;
-                this.commit_texts = commit_texts;
-                this.graph = layout;
-                this.heads = heads;
-                this.unresolved = Arc::new(unresolved);
-                this.own_count = own_count;
-                this.state = State::Ready;
-                // The matches and the drawn rows' counts were found in the list before.
-                this.match_commits(cx);
-                this.count_rows = None;
-                let keep = previous
-                    .and_then(|id| this.commits.iter().position(|c| c.graph_commit_id == id));
-                match keep {
-                    Some(ix) => this.selected = Some(ix),
-                    None if !this.commits.is_empty() => this.select(0, cx),
-                    None => {}
-                }
+                this.heads = this.branch_heads();
                 cx.notify();
             })
             .ok();
-        }));
-        cx.notify();
+        });
+        self.head_reads.insert(branch, task);
+    }
+
+    /// The search's counter: where the selection is among the matches, or that there are none.
+    fn match_counter(&self) -> Option<String> {
+        if self.match_query.is_empty() {
+            return None;
+        }
+        Some(match self.match_at {
+            Some(at) => format!("{}/{}", at + 1, self.matches.len()),
+            None => "No match".to_owned(),
+        })
     }
 
     /// The commits the search text finds ([`CommitText::matches`]); the first is selected.
@@ -614,13 +1200,16 @@ impl HistoryView {
 
     /// Notes the rows a frame draws. The list also lays one row out twice a frame to measure
     /// it, so the rows are taken once the frame is out, as the last range it asked for: else
-    /// every redraw would restart the pause before the counts are read.
+    /// every redraw would restart the pause before the counts are read. Rows drawn near the
+    /// list's end read its next page, and rows naming a merged-in commit not read yet read it.
     fn drawn(&mut self, rows: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
         self.drawn_rows = Some(rows);
         if !std::mem::replace(&mut self.drawn_due, true) {
             cx.defer_in(window, |this, _, cx| {
                 this.drawn_due = false;
                 if let Some(rows) = this.drawn_rows.clone() {
+                    this.want_more(&rows, cx);
+                    this.want_merged(&rows, cx);
                     this.want_row_counts(rows, cx);
                 }
             });
@@ -749,7 +1338,9 @@ impl HistoryView {
             .opacity(studio_ui::ds::opacity::DIMMED);
         let graph_width = self.graph_width();
         let now = now_micros();
-        range
+        let more = (self.has_more() && range.contains(&self.commits.len()))
+            .then(|| self.render_more(graph_width, cx));
+        let mut rows: Vec<AnyElement> = range
             .filter_map(|ix| {
                 let commit = self.commits.get(ix)?;
                 let row = self.graph.rows.get(ix)?.clone();
@@ -772,7 +1363,8 @@ impl HistoryView {
                         .map(|l| (l.lane, color(l.color)))
                         .collect(),
                     merge: commit.merged_parent_commit_id.is_some(),
-                    // A merged parent History could not read (a deleted branch's commit).
+                    // A merged parent not drawn: not read yet, or one the server does not have
+                    // (a deleted branch's commit).
                     stub: commit.merged_parent_commit_id.is_some()
                         && !row.outgoing.iter().any(|l| l.lane != row.lane),
                 };
@@ -914,7 +1506,46 @@ impl HistoryView {
                         .into_any_element(),
                 )
             })
-            .collect()
+            .collect();
+        rows.extend(more);
+        rows
+    }
+
+    /// The row after the last commit read while the listing goes on: its next page being read,
+    /// or why it could not be, with Try again.
+    fn render_more(&self, graph_width: f32, cx: &mut Context<Self>) -> AnyElement {
+        let status = match &self.more {
+            More::Failed { error, .. } => h_flex()
+                .min_w_0()
+                .gap(px(studio_ui::ds::space::MD))
+                .child(
+                    div().min_w_0().overflow_hidden().child(
+                        studio_ui::ds::text::muted(format!(
+                            "More commits could not be read: {error}"
+                        ))
+                        .single_line()
+                        .truncate(),
+                    ),
+                )
+                .child(
+                    studio_ui::ds::row_button("retry-more-commits", "Try again")
+                        .style(ButtonStyle::Subtle)
+                        .on_click(cx.listener(|this, _, _, cx| this.retry_more(cx))),
+                ),
+            More::Idle | More::Reading => h_flex()
+                .gap(px(studio_ui::ds::space::SM))
+                .child(studio_ui::ds::spinner())
+                .child(studio_ui::ds::text::meta("Reading more commits…")),
+        };
+        h_flex()
+            .id("more-commits")
+            .h(px(ROW_HEIGHT))
+            .mx(px(studio_ui::ds::space::SM))
+            .pr(px(studio_ui::ds::space::MD))
+            .gap(px(studio_ui::ds::space::LG))
+            .child(div().w(px(graph_width)).h_full().flex_none())
+            .child(status)
+            .into_any_element()
     }
 
     fn render_list(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -925,7 +1556,7 @@ impl HistoryView {
             .child(
                 uniform_list(
                     "history-rows",
-                    self.commits.len(),
+                    self.commits.len() + usize::from(self.has_more()),
                     cx.processor(|this, range: Range<usize>, window, cx| {
                         this.drawn(range.clone(), window, cx);
                         this.render_rows(range, window, cx)
@@ -1099,20 +1730,23 @@ impl HistoryView {
 impl Render for HistoryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.commits.len();
-        let searched = !self.match_query.is_empty();
-        let counter = match (searched, self.match_at) {
-            (false, _) => None,
-            (true, Some(at)) => Some(format!("{}/{}", at + 1, self.matches.len())),
-            (true, None) => Some("No match".to_owned()),
-        };
+        let counter = self.match_counter();
         let search = studio_ui::ds::search_field(self.search.clone(), cx)
             .w(px(if self.compact { 200. } else { 240. }))
             .children(counter.map(studio_ui::ds::text::meta));
         let summary = match self.state {
-            State::Ready if count > self.own_count => {
-                format!("{count} commits · {} merged in", count - self.own_count)
+            State::Ready => {
+                // Of the commits read: the listing may go on below them.
+                let merged = count.saturating_sub(self.read.own.len());
+                let mut summary = format!("{count} commit{}", if count == 1 { "" } else { "s" });
+                if !self.read.complete {
+                    summary.push_str(" so far");
+                }
+                if merged > 0 {
+                    summary.push_str(&format!(" · {merged} merged in"));
+                }
+                summary
             }
-            State::Ready => format!("{count} commit{}", if count == 1 { "" } else { "s" }),
             State::Loading => "Reading…".into(),
             State::Failed(_) => String::new(),
         };
@@ -1133,16 +1767,6 @@ impl Render for HistoryView {
                     .tooltip(Tooltip::text("Read the history again"))
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
             );
-        let warning = (count > LONG_HISTORY).then(|| {
-            div().px(px(studio_ui::ds::space::XL)).py(px(studio_ui::ds::space::XS)).child(
-                studio_ui::ds::banner(Severity::Warning)
-                    .child(
-                        studio_ui::ds::text::body(format!(
-                            "{count} commits. History reads the whole list at once, which takes a while for a history this long."
-                        )),
-                    ),
-            )
-        });
         let body = match &self.state {
             State::Failed(error) => {
                 studio_ui::ds::error_state("History could not be read", error.clone())
@@ -1192,7 +1816,6 @@ impl Render for HistoryView {
             .on_action(cx.listener(|this, _: &NextMatch, _, cx| this.step_match(true, cx)))
             .on_action(cx.listener(|this, _: &PreviousMatch, _, cx| this.step_match(false, cx)))
             .child(header)
-            .children(warning)
             .child(body)
     }
 }
@@ -1201,38 +1824,224 @@ impl Render for HistoryView {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, VisualTestContext};
     use graph_store::{Connection, ServerEntry, ServerSource};
-    use http_client::{AsyncBody, FakeHttpClient, Response};
-    use serde_json::json;
+    use http_client::{AsyncBody, FakeHttpClient, Inner, Response};
+    use serde_json::{Value, json};
 
     use super::*;
 
-    /// A History tab opened before the branch list was read reads the other branches, whose
-    /// heads and merges it shows, once the list is in.
-    #[gpui::test]
-    async fn a_tab_opened_before_the_branch_list_reads_the_other_branches(cx: &mut TestAppContext) {
+    /// A server for History's tests. It holds each branch's first-parent chain, newest first,
+    /// and pages a listing as OmniGraph does (`limit`, `page_token`, `head_commit_id`; a later
+    /// page answers for the head the first resolved), or answers it whole as a 0.14 build
+    /// before paging did. It answers a commit by its id, the head probe with the branch's
+    /// newest commit, and every commit's changes with none, and notes every request.
+    #[derive(Default)]
+    struct Served {
+        /// Each branch's chain, newest first, in the branch list's order.
+        branches: Vec<(String, Vec<Value>)>,
+        /// Commits only their id reaches: those of a branch not listed.
+        loose: Vec<Value>,
+        /// `limit` and `page_token` are ignored, and a listing is answered whole.
+        unpaged: bool,
+        /// A read of a commit by id is refused (403), as for a token whose read grant names
+        /// branches; and how many such reads fail (500) before one is answered.
+        refuse_by_id: bool,
+        fail_by_id: usize,
+        /// A page token is refused (400), or its read fails (500).
+        refuse_tokens: bool,
+        fail_tokens: bool,
+        /// Every request's path and query.
+        asked: Vec<String>,
+    }
+
+    impl Served {
+        fn chain(&self, branch: &str) -> &[Value] {
+            self.branches
+                .iter()
+                .find(|(name, _)| name == branch)
+                .map_or(&[], |(_, chain)| chain.as_slice())
+        }
+
+        fn chain_mut(&mut self, branch: &str) -> &mut Vec<Value> {
+            &mut self
+                .branches
+                .iter_mut()
+                .find(|(name, _)| name == branch)
+                .expect("a branch served")
+                .1
+        }
+
+        /// The listings asked for, by query.
+        fn listings(&self) -> Vec<&str> {
+            self.asked
+                .iter()
+                .filter_map(|asked| asked.strip_prefix("/graphs/knowledge/commits?"))
+                .collect()
+        }
+
+        /// How many times commit `id` was read by its id.
+        fn reads_of(&self, id: &str) -> usize {
+            let path = format!("/graphs/knowledge/commits/{id}?");
+            self.asked.iter().filter(|asked| **asked == path).count()
+        }
+
+        fn answer(&mut self, path: &str, query: &str, body: &Value) -> (u16, Value) {
+            let pairs: HashMap<&str, &str> = query
+                .split('&')
+                .filter_map(|pair| pair.split_once('='))
+                .collect();
+            if path.ends_with("/branches") {
+                let names: Vec<&String> = self.branches.iter().map(|(name, _)| name).collect();
+                (200, json!({ "branches": names }))
+            } else if path.ends_with("/schema") {
+                // A node type for the head probe to match.
+                let schema = "node Person {\n  slug: String @key\n}\n";
+                (200, json!({ "schema_source": schema }))
+            } else if path.ends_with("/query") {
+                let branch = body["branch"].as_str().unwrap_or("main");
+                let head = self
+                    .chain(branch)
+                    .first()
+                    .map(|c| c["graph_commit_id"].clone());
+                (
+                    200,
+                    json!({
+                        "query_name": body["name"], "target": { "branch": branch },
+                        "row_count": 0, "columns": [], "rows": [], "graph_commit_id": head,
+                    }),
+                )
+            } else if path.contains("/commits/") && path.ends_with("/changes") {
+                let id = path.rsplit('/').nth(1).unwrap_or_default();
+                let cause =
+                    json!({ "graph_commit_id": id, "authored_branch": "main", "authored_at": 1 });
+                (200, json!({ "cause": cause, "changes": [] }))
+            } else if path.ends_with("/changes") {
+                (
+                    200,
+                    json!({ "blocks": [], "cursor": "cursor", "caught_up": true }),
+                )
+            } else if path.ends_with("/commits")
+                && pairs.contains_key("page_token")
+                && self.refuse_tokens
+            {
+                (400, json!({ "error": "page token rejected" }))
+            } else if path.ends_with("/commits")
+                && pairs.contains_key("page_token")
+                && self.fail_tokens
+            {
+                (500, json!({ "error": "busy" }))
+            } else if path.ends_with("/commits") {
+                let branch = pairs.get("branch").copied().unwrap_or("main");
+                let limit = pairs.get("limit").map(|limit| limit.parse().unwrap());
+                (
+                    200,
+                    self.listing(branch, limit, pairs.get("page_token").copied()),
+                )
+            } else if path.contains("/commits/") && self.refuse_by_id {
+                (403, json!({ "error": "forbidden" }))
+            } else if path.contains("/commits/") && self.fail_by_id > 0 {
+                self.fail_by_id -= 1;
+                (500, json!({ "error": "busy" }))
+            } else if let Some((_, id)) = path.rsplit_once("/commits/") {
+                let found = self
+                    .branches
+                    .iter()
+                    .flat_map(|(_, chain)| chain)
+                    .chain(&self.loose)
+                    .find(|commit| commit["graph_commit_id"] == id);
+                match found {
+                    Some(commit) => (200, commit.clone()),
+                    None => (404, json!({ "error": "commit not found" })),
+                }
+            } else {
+                (200, json!({}))
+            }
+        }
+
+        /// A page of `branch`'s chain. A token names the head the first page resolved and how
+        /// far below it the listing has come, so later pages answer for that head's chain.
+        fn listing(&self, branch: &str, limit: Option<usize>, token: Option<&str>) -> Value {
+            let chain = self.chain(branch);
+            if self.unpaged || (limit.is_none() && token.is_none()) {
+                return json!({ "commits": chain });
+            }
+            let limit = limit.unwrap_or(100);
+            let (head, offset) = match token {
+                Some(token) => {
+                    let (head, offset) = token.rsplit_once('_').expect("a token served");
+                    (Some(head.to_owned()), offset.parse::<usize>().unwrap())
+                }
+                None => (
+                    chain
+                        .first()
+                        .and_then(|c| c["graph_commit_id"].as_str())
+                        .map(str::to_owned),
+                    0,
+                ),
+            };
+            let at = head
+                .as_deref()
+                .and_then(|head| chain.iter().position(|c| c["graph_commit_id"] == head))
+                .unwrap_or(chain.len());
+            let start = (at + offset).min(chain.len());
+            let end = (start + limit).min(chain.len());
+            let next = (end < chain.len())
+                .then(|| format!("{}_{}", head.as_deref().unwrap_or_default(), offset + limit));
+            json!({ "commits": &chain[start..end], "head_commit_id": head, "next_page_token": next })
+        }
+    }
+
+    fn commit(id: &str, at: i64, parent: Option<&str>, merged: Option<&str>) -> Value {
+        json!({
+            "graph_commit_id": id, "graph_manifest_version": at, "created_at": at,
+            "parent_commit_id": parent, "merged_parent_commit_id": merged,
+        })
+    }
+
+    /// A chain of `n` commits, newest first: `{prefix}{n-1}` down to `{prefix}0`.
+    fn chain(prefix: &str, n: usize) -> Vec<Value> {
+        (0..n)
+            .rev()
+            .map(|i| {
+                let parent = i.checked_sub(1).map(|p| format!("{prefix}{p}"));
+                commit(
+                    &format!("{prefix}{i}"),
+                    10 * i as i64 + 10,
+                    parent.as_deref(),
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    /// A session on a graph `served` holds, with the theme and editor a view needs.
+    fn serve(
+        served: Served,
+        cx: &mut TestAppContext,
+    ) -> (Entity<GraphSession>, Arc<Mutex<Served>>) {
         cx.update(|cx| {
             studio_theme::init_test(cx);
             editor::init(cx);
         });
-        let lists = Arc::new(Mutex::new(Vec::<String>::new()));
-        let asked = lists.clone();
+        let served = Arc::new(Mutex::new(served));
+        let state = served.clone();
         let http = FakeHttpClient::create(move |request| {
             let path = request.uri().path().to_owned();
             let query = request.uri().query().unwrap_or_default().to_owned();
-            let asked = asked.clone();
+            let body: Value = match &request.body().0 {
+                Inner::Bytes(bytes) => serde_json::from_slice(bytes.get_ref()).unwrap_or_default(),
+                _ => Value::Null,
+            };
+            let state = state.clone();
             async move {
-                let body = if path.ends_with("/branches") {
-                    json!({ "branches": ["main", "fix"] })
-                } else if path.ends_with("/commits") {
-                    asked.lock().unwrap().push(query);
-                    json!({ "commits": [] })
-                } else {
-                    json!({})
+                let (status, body) = {
+                    let mut served = state.lock().unwrap();
+                    served.asked.push(format!("{path}?{query}"));
+                    served.answer(&path, &query, &body)
                 };
                 Ok(Response::builder()
-                    .status(200)
+                    .status(status)
                     .header(graph_client::CONTRACT_HEADER, "0.13")
                     .body(AsyncBody::from(body.to_string()))
                     .unwrap())
@@ -1247,167 +2056,639 @@ mod tests {
         let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
         let session =
             cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
-        let (_view, cx) = cx.add_window_view(move |window, cx| {
+        (session, served)
+    }
+
+    /// `main`'s History tab, read as far as it goes without scrolling.
+    fn open<'a>(
+        session: &Entity<GraphSession>,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<HistoryView>, &'a mut VisualTestContext) {
+        let session = session.clone();
+        let (view, cx) = cx.add_window_view(move |window, cx| {
             HistoryView::new(session, "main".into(), window, cx)
         });
         cx.run_until_parked();
-        let lists = lists.lock().unwrap();
-        assert!(
-            lists.iter().any(|query| query.contains("branch=fix")),
-            "{lists:?}"
+        (view, cx)
+    }
+
+    fn ids(view: &HistoryView) -> Vec<&str> {
+        view.commits
+            .iter()
+            .map(|c| c.graph_commit_id.as_str())
+            .collect()
+    }
+
+    /// History lays out its branch's newest page, and reads the next when the rows drawn come
+    /// within a screen of the end, continuing the listing the first page resolved; once the
+    /// listing ends, nothing more is read. No listing is ever read whole.
+    #[gpui::test]
+    async fn history_reads_its_branch_a_page_at_a_time(cx: &mut TestAppContext) {
+        let (session, served) = serve(
+            Served {
+                branches: vec![("main".into(), chain("m", 450))],
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.commits.len(), PAGE as usize);
+            assert_eq!(view.commits[0].graph_commit_id, "m449");
+            assert_eq!(view.heads.get("m449"), Some(&vec!["main".to_owned()]));
+            assert!(view.has_more());
+        });
+        assert_eq!(served.lock().unwrap().listings(), ["branch=main&limit=200"]);
+        // Rows a screen or more from the end read nothing; rows near it read the next page.
+        view.update(cx, |view, cx| view.want_more(&(0..40), cx));
+        cx.run_until_parked();
+        assert_eq!(served.lock().unwrap().listings().len(), 1);
+        view.update(cx, |view, cx| view.want_more(&(170..200), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.commits.len(), 400);
+            assert_eq!(view.selected, Some(0), "the selection stays");
+        });
+        view.update(cx, |view, cx| view.want_more(&(380..401), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.commits.len(), 450);
+            assert_eq!(view.commits.last().unwrap().graph_commit_id, "m0");
+            assert!(view.read.complete);
+            assert!(!view.has_more());
+        });
+        view.update(cx, |view, cx| view.want_more(&(430..450), cx));
+        cx.run_until_parked();
+        assert_eq!(
+            served.lock().unwrap().listings(),
+            [
+                "branch=main&limit=200",
+                "branch=main&limit=200&page_token=m449_200",
+                "branch=main&limit=200&page_token=m449_400",
+            ]
         );
     }
 
-    /// A commit to another branch moves that branch's tag without laying the history out
-    /// again; one whose list now holds a merged parent the history could not find lays it out
-    /// again, with that commit.
+    /// A server that pages no history answers the first page's read with the whole listing and
+    /// no token: History lays it out as the one page there is, and reads no more.
+    #[gpui::test]
+    async fn an_old_server_answers_the_whole_history_as_one_page(cx: &mut TestAppContext) {
+        let (session, served) = serve(
+            Served {
+                branches: vec![("main".into(), chain("m", 450))],
+                unpaged: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.commits.len(), 450);
+            assert!(view.read.complete);
+            assert_eq!(view.next_page, None);
+            assert!(!view.has_more());
+        });
+        view.update(cx, |view, cx| view.want_more(&(430..450), cx));
+        cx.run_until_parked();
+        assert_eq!(served.lock().unwrap().listings(), ["branch=main&limit=200"]);
+    }
+
+    /// A commit landing on the branch reads its first page again: the commits above the head
+    /// the pages were read from go on top of them, and the next page still continues their
+    /// listing.
+    #[gpui::test]
+    async fn a_commit_landing_on_the_branch_keeps_the_pages_read(cx: &mut TestAppContext) {
+        let (session, served) = serve(
+            Served {
+                branches: vec![("main".into(), chain("m", 450))],
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        view.update(cx, |view, cx| view.want_more(&(170..200), cx));
+        cx.run_until_parked();
+        // Another writer commits; Studio hears of it at the next head read.
+        session
+            .update(cx, |session, cx| session.head_now("main", cx))
+            .await;
+        served
+            .lock()
+            .unwrap()
+            .chain_mut("main")
+            .insert(0, commit("m450", 4_510, Some("m449"), None));
+        session
+            .update(cx, |session, cx| session.head_now("main", cx))
+            .await;
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.commits.len(), 401);
+            assert_eq!(view.commits[0].graph_commit_id, "m450");
+            assert_eq!(view.heads.get("m450"), Some(&vec!["main".to_owned()]));
+            assert_eq!(view.heads.get("m449"), None);
+        });
+        view.update(cx, |view, cx| view.want_more(&(380..402), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.commits.len(), 451);
+            assert!(view.read.complete);
+        });
+        assert_eq!(
+            served.lock().unwrap().listings(),
+            [
+                "branch=main&limit=200",
+                "branch=main&limit=200&page_token=m449_200",
+                "branch=main&limit=200",
+                "branch=main&limit=200&page_token=m449_400",
+            ]
+        );
+    }
+
+    /// Commits merged in are read one at a time by their ids, as each names the next, and join
+    /// the history in time order with their lanes. A merged parent the server does not have
+    /// stays a stub. A Refresh reads none of those read again, since a commit never changes,
+    /// and asks again for the one the server did not have.
+    #[gpui::test]
+    async fn merged_in_commits_are_read_by_their_ids(cx: &mut TestAppContext) {
+        let (session, served) = serve(
+            Served {
+                branches: vec![(
+                    "main".into(),
+                    vec![
+                        commit("m3", 30, Some("m2"), Some("b2")),
+                        commit("m2", 20, Some("m1"), Some("gone")),
+                        commit("m1", 10, None, None),
+                    ],
+                )],
+                loose: vec![
+                    commit("b2", 25, Some("b1"), None),
+                    commit("b1", 15, Some("m1"), None),
+                ],
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        let check = |view: &HistoryView| {
+            assert_eq!(ids(view), ["m3", "b2", "m2", "b1", "m1"]);
+            assert_eq!(view.read.own.len(), 3);
+            // m3's merge opens a lane that b1 closes into m1.
+            assert_eq!(view.graph.lane_count, 2);
+            assert_eq!(view.graph.rows[0].outgoing.len(), 2);
+            assert_eq!(view.graph.rows[4].incoming.len(), 2);
+            // m2's merged parent is not drawn: its merge is a stub.
+            let m2 = &view.graph.rows[2];
+            assert!(m2.outgoing.iter().all(|line| line.lane == m2.lane));
+        };
+        view.read_with(cx, |view, _| check(view));
+        let reads = |served: &Arc<Mutex<Served>>| {
+            let served = served.lock().unwrap();
+            ["b2", "b1", "gone"].map(|id| served.reads_of(id))
+        };
+        assert_eq!(reads(&served), [1, 1, 1]);
+        view.update(cx, |view, cx| view.refresh(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| check(view));
+        assert_eq!(reads(&served), [1, 1, 2]);
+    }
+
+    /// A merge whose branch goes on below the oldest commit of the pages read is read as far
+    /// as those pages, and goes on with the next page.
+    #[gpui::test]
+    async fn a_merged_branch_is_read_as_far_as_the_pages_read(cx: &mut TestAppContext) {
+        let mut main = chain("m", 250);
+        // m240 merged x2, which forked from m0 before x1.
+        main[9] = commit("m240", 2_410, Some("m239"), Some("x2"));
+        let (session, served) = serve(
+            Served {
+                branches: vec![("main".into(), main)],
+                loose: vec![
+                    commit("x2", 2_405, Some("x1"), None),
+                    commit("x1", 15, Some("m0"), None),
+                ],
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        view.read_with(cx, |view, _| {
+            assert!(ids(view).contains(&"x2"));
+            assert!(!ids(view).contains(&"x1"), "below the pages read");
+            assert_eq!(view.commits.len(), PAGE as usize + 1);
+        });
+        view.update(cx, |view, cx| view.want_more(&(180..201), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.commits.len(), 252);
+            assert_eq!(&ids(view)[249..], ["m1", "x1", "m0"]);
+            assert_eq!(view.graph.lane_count, 2);
+        });
+        let served = served.lock().unwrap();
+        assert_eq!([served.reads_of("x2"), served.reads_of("x1")], [1, 1]);
+    }
+
+    /// One walk reads at most [`MERGED_READS`] merged-in commits; the rest are read once the rows
+    /// naming them are drawn.
+    #[gpui::test]
+    async fn a_long_merged_branch_is_read_as_its_rows_are_drawn(cx: &mut TestAppContext) {
+        let mut merged = chain("x", 205);
+        merged[204] = commit("x0", 10, Some("m0"), None);
+        let (session, served) = serve(
+            Served {
+                branches: vec![(
+                    "main".into(),
+                    vec![
+                        commit("m1", 100_000, Some("m0"), Some("x204")),
+                        commit("m0", 1, None, None),
+                    ],
+                )],
+                loose: merged,
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        let by_id = |served: &Arc<Mutex<Served>>| {
+            let served = served.lock().unwrap();
+            (0..205)
+                .map(|i| served.reads_of(&format!("x{i}")))
+                .collect::<Vec<_>>()
+        };
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.commits.len(), 2 + MERGED_READS);
+            assert_eq!(view.wanted, ["x4"]);
+        });
+        let reads = by_id(&served);
+        assert_eq!(reads[5..], [1; 200]);
+        assert_eq!(reads[..5], [0; 5]);
+        // The rows at the end of what was read name x4.
+        view.update(cx, |view, cx| view.want_merged(&(190..202), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.commits.len(), 207);
+            assert!(view.wanted.is_empty());
+            assert_eq!(view.graph.lane_count, 2);
+        });
+        assert_eq!(by_id(&served), [1; 205]);
+    }
+
+    /// A token whose read grant names branches is refused commits by id: merged-in commits then
+    /// come from the other branches' listings, read whole, and one no listing holds is a stub.
+    #[gpui::test]
+    async fn a_token_refused_commits_by_id_reads_merges_from_the_listings(cx: &mut TestAppContext) {
+        let (session, served) = serve(
+            Served {
+                branches: vec![
+                    (
+                        "main".into(),
+                        vec![
+                            commit("m3", 30, Some("m2"), Some("b2")),
+                            commit("m2", 20, Some("m1"), Some("gone")),
+                            commit("m1", 10, None, None),
+                        ],
+                    ),
+                    (
+                        "feature".into(),
+                        vec![
+                            commit("b3", 35, Some("b2"), None),
+                            commit("b2", 25, Some("b1"), None),
+                            commit("b1", 15, Some("m1"), None),
+                            commit("m1", 10, None, None),
+                        ],
+                    ),
+                ],
+                refuse_by_id: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(ids(view), ["m3", "b2", "m2", "b1", "m1"]);
+            assert_eq!(view.graph.lane_count, 2);
+            let m2 = &view.graph.rows[2];
+            assert!(
+                m2.outgoing.iter().all(|line| line.lane == m2.lane),
+                "a stub"
+            );
+            assert!(!view.by_id);
+        });
+        let whole = |served: &Arc<Mutex<Served>>| {
+            served
+                .lock()
+                .unwrap()
+                .listings()
+                .into_iter()
+                .filter(|listing| *listing == "branch=feature")
+                .count()
+        };
+        assert_eq!(whole(&served), 1);
+        // A Refresh tries by id again, is refused again, and reads the lists again, as it reads
+        // every head again.
+        view.update(cx, |view, cx| view.refresh(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(ids(view).len(), 5));
+        assert_eq!(whole(&served), 2);
+    }
+
+    /// A merged-in commit whose read failed is asked for again once a while has passed, while a
+    /// row naming it is drawn, and not before.
+    #[gpui::test]
+    async fn a_failed_merged_read_is_asked_again_after_a_while(cx: &mut TestAppContext) {
+        let (session, served) = serve(
+            Served {
+                branches: vec![(
+                    "main".into(),
+                    vec![
+                        commit("m2", 20, Some("m1"), Some("b1")),
+                        commit("m1", 10, None, None),
+                    ],
+                )],
+                loose: vec![commit("b1", 15, Some("m1"), None)],
+                fail_by_id: 1,
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        let reads = |served: &Arc<Mutex<Served>>| served.lock().unwrap().reads_of("b1");
+        view.read_with(cx, |view, _| assert_eq!(ids(view), ["m2", "m1"]));
+        assert_eq!(reads(&served), 1);
+        cx.executor()
+            .advance_clock(MERGED_RETRY_AFTER - Duration::from_millis(1));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| view.want_merged(&(0..2), cx));
+        cx.run_until_parked();
+        assert_eq!(reads(&served), 1, "asked again too soon");
+        cx.executor().advance_clock(Duration::from_millis(1));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(ids(view), ["m2", "b1", "m1"]));
+        assert_eq!(reads(&served), 2);
+    }
+
+    /// The merged-in commits the rows drawn name are read first, then the rest top rows' first.
+    #[gpui::test]
+    async fn merged_reads_go_to_the_rows_drawn_first(cx: &mut TestAppContext) {
+        let main: Vec<Value> = (0..12)
+            .rev()
+            .map(|i| commit(&format!("m{i}"), 10 * i + 10, None, Some(&format!("p{i}"))))
+            .collect();
+        let (session, _served) = serve(
+            Served {
+                branches: vec![("main".into(), main)],
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        view.update(cx, |view, cx| {
+            // None of the merged parents is served: they stand for parents still to read.
+            view.wanted = (0..12).rev().map(|i| format!("p{i}")).collect();
+            view.drawn_rows = Some(10..12);
+            let now = cx.background_executor().now();
+            assert_eq!(
+                view.merged_to_read(4, now),
+                ["p1", "p0", "p11", "p10"],
+                "rows 10 and 11 are m1 and m0"
+            );
+        });
+    }
+
+    /// Matches a later page brings are found, and the counter and a step go on from the
+    /// selection.
+    #[gpui::test]
+    async fn a_search_finds_matches_a_later_page_brings(cx: &mut TestAppContext) {
+        let mut main = chain("m", 450);
+        // m100, on the second page.
+        main[349]["actor_id"] = json!("act-dev");
+        let (session, _served) = serve(
+            Served {
+                branches: vec![("main".into(), main)],
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.search
+                .update(cx, |editor, cx| editor.set_text("dev", window, cx))
+        });
+        cx.executor().advance_clock(SEARCH_DELAY);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.match_counter().as_deref(), Some("No match"));
+        });
+        view.update(cx, |view, cx| view.want_more(&(170..200), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.matches, [349]);
+            assert_eq!(view.match_counter().as_deref(), Some("1/1"));
+        });
+        view.update(cx, |view, cx| view.step_match(true, cx));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.selected, Some(349));
+            assert_eq!(view.commits[349].graph_commit_id, "m100");
+        });
+    }
+
+    /// Try again after a refused continuation reads the listing from its first page; after one
+    /// that failed otherwise it sends the same continuation again.
+    #[gpui::test]
+    async fn try_again_after_a_refused_page_starts_from_the_first(cx: &mut TestAppContext) {
+        let (session, served) = serve(
+            Served {
+                branches: vec![("main".into(), chain("m", 450))],
+                fail_tokens: true,
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        view.update(cx, |view, cx| view.want_more(&(170..200), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.more, More::Failed { restart: false, .. }));
+        });
+        {
+            let mut served = served.lock().unwrap();
+            served.fail_tokens = false;
+            served.refuse_tokens = true;
+        }
+        view.update(cx, |view, cx| view.retry_more(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.more, More::Failed { restart: true, .. }));
+        });
+        view.update(cx, |view, cx| view.retry_more(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.more, More::Idle));
+            assert_eq!(view.commits.len(), 200);
+        });
+        assert_eq!(
+            served.lock().unwrap().listings(),
+            [
+                "branch=main&limit=200",
+                "branch=main&limit=200&page_token=m449_200",
+                "branch=main&limit=200&page_token=m449_200",
+                "branch=main&limit=200",
+            ]
+        );
+    }
+
+    /// Other branches' tags sit at each one's newest commit, read alone; a branch with no
+    /// commit has none.
+    #[gpui::test]
+    async fn tags_sit_at_each_branchs_newest_commit(cx: &mut TestAppContext) {
+        let (session, served) = serve(
+            Served {
+                branches: vec![
+                    (
+                        "main".into(),
+                        vec![
+                            commit("m2", 20, Some("m1"), None),
+                            commit("m1", 10, None, None),
+                        ],
+                    ),
+                    (
+                        "feature".into(),
+                        vec![
+                            commit("m2", 20, Some("m1"), None),
+                            commit("m1", 10, None, None),
+                        ],
+                    ),
+                    (
+                        "fix".into(),
+                        vec![
+                            commit("f1", 15, Some("m1"), None),
+                            commit("m1", 10, None, None),
+                        ],
+                    ),
+                    ("empty".into(), Vec::new()),
+                ],
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.heads["m2"], ["main", "feature"]);
+            assert_eq!(view.heads["f1"], ["fix"]);
+            assert_eq!(view.heads.len(), 2);
+            assert!(!ids(view).contains(&"f1"), "fix is not merged");
+        });
+        let served = served.lock().unwrap();
+        let mut others: Vec<&str> = served
+            .listings()
+            .into_iter()
+            .filter(|listing| !listing.starts_with("branch=main&"))
+            .collect();
+        others.sort();
+        assert_eq!(
+            others,
+            [
+                "branch=empty&limit=1",
+                "branch=feature&limit=1",
+                "branch=fix&limit=1",
+            ]
+        );
+    }
+
+    /// A History tab opened before the branch list was read reads the other branches' heads
+    /// once the list is in.
+    #[gpui::test]
+    async fn a_tab_opened_before_the_branch_list_reads_the_other_branches(cx: &mut TestAppContext) {
+        let (session, served) = serve(
+            Served {
+                branches: vec![
+                    ("main".into(), vec![commit("m1", 10, None, None)]),
+                    ("fix".into(), vec![commit("m1", 10, None, None)]),
+                ],
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        let listings = served.lock().unwrap().listings().join(" ");
+        assert!(listings.contains("branch=fix&limit=1"), "{listings}");
+        view.read_with(cx, |view, _| assert_eq!(view.heads["m1"], ["main", "fix"]));
+    }
+
+    /// A commit to another branch moves that branch's tag without laying the history out again.
     #[gpui::test]
     async fn a_commit_to_another_branch_moves_its_tag_alone(cx: &mut TestAppContext) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        cx.update(|cx| {
-            studio_theme::init_test(cx);
-            editor::init(cx);
-        });
-        // `main` merged `fix` at f1, and x1 from a list not read; `fix` then commits f2, then
-        // x1 shows in its list.
-        let fix_version = Arc::new(AtomicUsize::new(0));
-        let served = fix_version.clone();
-        let http = FakeHttpClient::create(move |request| {
-            let path = request.uri().path().to_owned();
-            let query = request.uri().query().unwrap_or_default().to_owned();
-            let version = served.load(Ordering::SeqCst);
-            async move {
-                let commit = |id: &str, at: i64, parent: Option<&str>, merged: Option<&str>| {
-                    json!({
-                        "graph_commit_id": id, "graph_manifest_version": at, "created_at": at,
-                        "parent_commit_id": parent, "merged_parent_commit_id": merged,
-                    })
-                };
-                let body = if path.ends_with("/branches") {
-                    json!({ "branches": ["main", "fix"] })
-                } else if path.ends_with("/commits") && query.contains("branch=fix") {
-                    let mut commits = vec![
-                        commit("f1", 2, Some("m1"), None),
-                        commit("m1", 1, None, None),
-                    ];
-                    if version >= 1 {
-                        commits.insert(0, commit("f2", 4, Some("f1"), None));
-                    }
-                    if version >= 2 {
-                        commits.insert(0, commit("x1", 5, Some("f2"), None));
-                    }
-                    json!({ "commits": commits })
-                } else if path.ends_with("/commits") {
-                    json!({ "commits": [
-                        commit("m3", 6, Some("m2"), Some("x1")),
-                        commit("m2", 3, Some("m1"), Some("f1")),
-                        commit("m1", 1, None, None),
-                    ] })
-                } else {
-                    json!({})
-                };
-                Ok(Response::builder()
-                    .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
-                    .body(AsyncBody::from(body.to_string()))
-                    .unwrap())
-            }
-        });
-        let server = ServerEntry {
-            name: "dev".into(),
-            url: "http://127.0.0.1:8787".into(),
-            source: ServerSource::Environment,
-            known_graphs: Vec::new(),
-        };
-        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
-        let session =
-            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
-        let (view, cx) = cx.add_window_view({
-            let session = session.clone();
-            move |window, cx| HistoryView::new(session, "main".into(), window, cx)
-        });
+        // `main` merged `fix` at f1, and x1 from a branch not listed.
+        let (session, served) = serve(
+            Served {
+                branches: vec![
+                    (
+                        "main".into(),
+                        vec![
+                            commit("m3", 60, Some("m2"), Some("x1")),
+                            commit("m2", 30, Some("m1"), Some("f1")),
+                            commit("m1", 10, None, None),
+                        ],
+                    ),
+                    (
+                        "fix".into(),
+                        vec![
+                            commit("f1", 20, Some("m1"), None),
+                            commit("m1", 10, None, None),
+                        ],
+                    ),
+                ],
+                loose: vec![commit("x1", 50, Some("f1"), None)],
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        // Studio watches `fix` (its branches panel, say), and so hears of commits to it.
+        let _watch = session.update(cx, |session, cx| session.watch_head("fix", cx));
         cx.run_until_parked();
-        let tag = |view: &HistoryView, commit: &str| view.heads.get(commit).cloned();
         let laid_out = view.read_with(cx, |view, _| {
-            assert_eq!(tag(view, "f1"), Some(vec!["fix".to_owned()]));
+            assert_eq!(ids(view), ["m3", "x1", "m2", "f1", "m1"]);
+            assert_eq!(view.heads.get("f1"), Some(&vec!["fix".to_owned()]));
             view.commits.as_ptr()
         });
-        // Another writer's commit to `fix`, as the session hears of one: its list is read again.
-        let commit_to_fix = |version: usize, cx: &mut gpui::VisualTestContext| {
-            fix_version.store(version, Ordering::SeqCst);
-            let read = session.update(cx, |session, cx| {
-                let read = session.commits("fix", true, cx);
-                cx.emit(SessionEvent::Committed {
-                    branch: "fix".into(),
-                });
-                read
-            });
-            cx.run_until_parked();
-            drop(read);
-        };
-        commit_to_fix(1, cx);
+        served
+            .lock()
+            .unwrap()
+            .chain_mut("fix")
+            .insert(0, commit("f2", 70, Some("f1"), None));
+        session
+            .update(cx, |session, cx| session.head_now("fix", cx))
+            .await;
+        cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.commits.as_ptr(), laid_out, "laid out again");
-            assert_eq!(tag(view, "f2"), Some(vec!["fix".to_owned()]));
-            assert_eq!(tag(view, "f1"), None);
+            assert_eq!(view.heads.get("f2"), Some(&vec!["fix".to_owned()]));
+            assert_eq!(view.heads.get("f1"), None);
         });
-        commit_to_fix(2, cx);
-        view.read_with(cx, |view, _| {
-            assert_ne!(view.commits.as_ptr(), laid_out, "x1 joins the history");
-            assert!(view.commits.iter().any(|c| c.graph_commit_id == "x1"));
-            assert_eq!(tag(view, "x1"), Some(vec!["fix".to_owned()]));
-        });
+        let served = served.lock().unwrap();
+        let fix: Vec<&str> = served
+            .listings()
+            .into_iter()
+            .filter(|listing| listing.contains("branch=fix"))
+            .collect();
+        assert_eq!(fix, ["branch=fix&limit=1", "branch=fix&limit=1"]);
     }
 
     /// A session on a graph whose `main` holds one commit, `c1`, which changed nothing.
     fn one_commit_session(cx: &mut TestAppContext) -> Entity<GraphSession> {
-        let http = FakeHttpClient::create(move |request| {
-            let path = request.uri().path().to_owned();
-            async move {
-                let body = if path.ends_with("/branches") {
-                    json!({ "branches": ["main"] })
-                } else if path.ends_with("/changes") {
-                    json!({
-                        "cause": {"graph_commit_id": "c1", "authored_branch": "main", "authored_at": 1},
-                        "changes": [],
-                    })
-                } else if path.ends_with("/commits") {
-                    json!({ "commits": [{
-                        "graph_commit_id": "c1", "graph_manifest_version": 1, "created_at": 1,
-                    }] })
-                } else {
-                    json!({})
-                };
-                Ok(Response::builder()
-                    .status(200)
-                    .header(graph_client::CONTRACT_HEADER, "0.13")
-                    .body(AsyncBody::from(body.to_string()))
-                    .unwrap())
-            }
-        });
-        let server = ServerEntry {
-            name: "dev".into(),
-            url: "http://127.0.0.1:8787".into(),
-            source: ServerSource::Environment,
-            known_graphs: Vec::new(),
+        let served = Served {
+            branches: vec![("main".into(), vec![commit("c1", 1, None, None)])],
+            ..Default::default()
         };
-        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
-        cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx))
+        serve(served, cx).0
     }
 
     /// The commit shown beside the list draws on its own: a change there (a scroll, a page of
     /// changes read) leaves the list as it was drawn; a change of the history draws it again.
     #[gpui::test]
     async fn the_commit_beside_the_list_leaves_the_list_drawn(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            studio_theme::init_test(cx);
-            editor::init(cx);
-        });
         let session = one_commit_session(cx);
-        let (view, cx) = cx.add_window_view(move |window, cx| {
-            HistoryView::new(session, "main".into(), window, cx)
-        });
-        cx.run_until_parked();
+        let (view, cx) = open(&session, cx);
         view.update(cx, |view, cx| view.select(0, cx));
         cx.run_until_parked();
         let renders = |cx: &mut gpui::VisualTestContext| {
@@ -1427,15 +2708,8 @@ mod tests {
     /// matches were found for.
     #[gpui::test]
     async fn a_search_matches_the_commits_once_typing_pauses(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            studio_theme::init_test(cx);
-            editor::init(cx);
-        });
         let session = one_commit_session(cx);
-        let (view, cx) = cx.add_window_view(move |window, cx| {
-            HistoryView::new(session, "main".into(), window, cx)
-        });
-        cx.run_until_parked();
+        let (view, cx) = open(&session, cx);
         view.update_in(cx, |view, window, cx| {
             view.search
                 .update(cx, |editor, cx| editor.set_text("C1", window, cx))

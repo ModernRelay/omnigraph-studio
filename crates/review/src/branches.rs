@@ -111,7 +111,8 @@ impl BranchList {
             .into_iter()
             .take(DETAIL_LIMIT)
             .map(|branch| {
-                let read = session.update(cx, |session, cx| session.head_commit(&branch, cx));
+                let read =
+                    session.update(cx, |session, cx| session.head_commit(&branch, false, cx));
                 (branch, read)
             })
             .collect();
