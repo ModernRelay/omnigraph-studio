@@ -63,6 +63,13 @@ pub trait ModalView: Render + Focusable + EventEmitter<DismissEvent> {
     fn placement(&self) -> ModalPlacement {
         ModalPlacement::Dialog
     }
+
+    /// Whether the modal asks about the shown graph or one of its tabs. Such a modal goes,
+    /// unasked, when that graph leaves the window: answered over another graph, it would act
+    /// on one no longer shown.
+    fn goes_with_graph(&self) -> bool {
+        false
+    }
 }
 
 /// Where a modal sits (spec 002, "Modals"), after Tower's: a dialog over a dim, a quarter of
@@ -80,6 +87,8 @@ type BeforeDismiss = Box<dyn Fn(&mut Window, &mut App) -> bool>;
 struct ActiveModal {
     view: AnyView,
     placement: ModalPlacement,
+    /// [`ModalView::goes_with_graph`], asked as it opens.
+    goes_with_graph: bool,
     previous_focus: Option<FocusHandle>,
     before_dismiss: BeforeDismiss,
     _subscription: Subscription,
@@ -255,6 +264,9 @@ struct DockHost {
     /// The panel scrolls itself (a list that draws only its rows in view), so the host gives
     /// it its size rather than scrolling it.
     scrolls_itself: bool,
+    /// Held by the panel's whole body, in whichever dock it is drawn: the keyboard in any of
+    /// the panel's elements is in its dock ([`Workspace::dock_has_focus`]).
+    focus_handle: FocusHandle,
 }
 
 impl Render for DockHost {
@@ -879,7 +891,17 @@ impl Workspace {
         // The inspector shows the graph's rows, and holds its session.
         self.remove_panel(INSPECTOR_PANEL);
         self.zoomed = None;
-        // A modal open now must not hand the focus back to a tab of this graph.
+        // A modal about this graph goes with it: a close asked about the graph, confirmed over
+        // the next one shown, would close that one and drop its unsaved tabs unasked. Another
+        // modal stays, and must not hand the focus back to a tab of this graph. The callers
+        // focus the graph shown next.
+        if self
+            .modal
+            .as_ref()
+            .is_some_and(|modal| modal.goes_with_graph)
+        {
+            self.modal = None;
+        }
         if let Some(modal) = &mut self.modal {
             modal.previous_focus = None;
         }
@@ -1744,9 +1766,10 @@ impl Workspace {
     fn host_for(&mut self, view: &AnyView, cx: &mut Context<Self>) {
         let view = view.clone();
         self.dock_hosts.entry(view.entity_id()).or_insert_with(|| {
-            cx.new(|_| DockHost {
+            cx.new(|cx| DockHost {
                 view,
                 scrolls_itself: false,
+                focus_handle: cx.focus_handle(),
             })
         });
     }
@@ -1940,6 +1963,7 @@ impl Workspace {
             });
         let focus = view.focus_handle(cx);
         let placement = view.read(cx).placement();
+        let goes_with_graph = view.read(cx).goes_with_graph();
         let asked = view.clone();
         let before_dismiss = Box::new(move |window: &mut Window, cx: &mut App| {
             asked.update(cx, |modal, cx| modal.on_before_dismiss(window, cx))
@@ -1947,6 +1971,7 @@ impl Workspace {
         self.modal = Some(ActiveModal {
             view: view.into(),
             placement,
+            goes_with_graph,
             previous_focus,
             before_dismiss,
             _subscription: subscription,
@@ -2215,7 +2240,7 @@ impl Workspace {
         let body = v_flex().id("sidebar-panel").flex_1().min_h_0().children(
             self.left
                 .active_panel()
-                .map(|panel| div().size_full().child(self.panel_body(panel))),
+                .map(|panel| div().size_full().child(self.panel_body(panel, cx))),
         );
         let glass = studio_ui::ds::is_glass(cx);
         let column = if glass {
@@ -2416,17 +2441,26 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Whether the keyboard is in a panel of the dock at `position`.
+    /// Whether the keyboard is in a panel of the dock at `position`: in any element of its body
+    /// (a filter or rename field included), or in the focus the panel names for itself.
     fn dock_has_focus(&self, position: PanelPosition, window: &Window, cx: &App) -> bool {
         let dock = match position {
             PanelPosition::Left => &self.left,
             PanelPosition::Right => &self.right,
             PanelPosition::Bottom => &self.bottom,
         };
-        dock.panels
-            .iter()
-            .filter_map(|panel| panel.focus.as_ref()?(cx))
-            .any(|focus| focus.contains_focused(window, cx))
+        dock.panels.iter().any(|panel| {
+            let in_body = self
+                .dock_hosts
+                .get(&panel.view.entity_id())
+                .is_some_and(|host| host.read(cx).focus_handle.contains_focused(window, cx));
+            in_body
+                || panel
+                    .focus
+                    .as_ref()
+                    .and_then(|focus| focus(cx))
+                    .is_some_and(|focus| focus.contains_focused(window, cx))
+        })
     }
 
     /// Gives the keyboard to the active tab: the dock that had it is hidden or covered, and the
@@ -2447,9 +2481,9 @@ impl Workspace {
                 // The server's round trip from the last health check, beside its state.
                 let state = match (&connection.state, connection.latency) {
                     (ConnectionState::Ready, Some(latency)) => {
-                        format!("{} · {} ms", connection.state.label(), latency.as_millis())
+                        format!("{} · {} ms", connection.label(), latency.as_millis())
                     }
-                    (state, _) => state.label(),
+                    _ => connection.label(),
                 };
                 (
                     color,
@@ -3377,7 +3411,7 @@ impl Workspace {
                 .when(!glass, |d| d.bg(panel_background))
                 .when(!(glass && alone), |d| d.border_t_1().border_color(hairline))
                 .child(self.render_dock_header(PanelPosition::Bottom, cx))
-                .child(div().flex_1().min_h_0().child(self.panel_body(panel)))
+                .child(div().flex_1().min_h_0().child(self.panel_body(panel, cx)))
                 .child(resize_handle(PanelPosition::Bottom))
                 .into_any_element(),
         )
@@ -3458,9 +3492,10 @@ impl Workspace {
     /// A panel's content, drawn as it was made for: a side panel in its scrolling host, a
     /// bottom panel cached at the dock's size (it scrolls itself), whichever dock it is in now.
     /// A sidebar panel's list starts below its header by the inset its selected row has from
-    /// the column's sides.
-    fn panel_body(&self, panel: &PanelEntry) -> AnyElement {
-        match panel.home {
+    /// the column's sides. The body holds its host's focus handle, so the keyboard anywhere in
+    /// it is the dock's ([`Self::dock_has_focus`]).
+    fn panel_body(&self, panel: &PanelEntry, cx: &App) -> AnyElement {
+        let body = match panel.home {
             PanelPosition::Bottom => panel.view.clone().cached(cached_fill()).into_any_element(),
             PanelPosition::Left => div()
                 .size_full()
@@ -3468,6 +3503,14 @@ impl Workspace {
                 .child(self.hosted(&panel.view))
                 .into_any_element(),
             PanelPosition::Right => self.hosted(&panel.view),
+        };
+        match self.dock_hosts.get(&panel.view.entity_id()) {
+            Some(host) => div()
+                .size_full()
+                .track_focus(&host.read(cx).focus_handle)
+                .child(body)
+                .into_any_element(),
+            None => body,
         }
     }
 
@@ -3487,7 +3530,7 @@ impl Workspace {
                 v_flex()
                     .size_full()
                     .child(self.render_dock_header(position, cx))
-                    .child(div().flex_1().min_h_0().child(self.panel_body(panel)))
+                    .child(div().flex_1().min_h_0().child(self.panel_body(panel, cx)))
                     .into_any_element()
             }
         };
@@ -3581,7 +3624,7 @@ impl Workspace {
         if !self.right.visible() || self.zoomed == Some(Zoomed::Dock(PanelPosition::Right)) {
             return None;
         }
-        let panel = self.panel_body(self.right.active_panel()?);
+        let panel = self.panel_body(self.right.active_panel()?, cx);
         let editor_background = studio_ui::ds::surface::document(cx);
         let hairline = studio_ui::ds::surface::rule(cx);
         let column = if studio_ui::ds::is_glass(cx) {
@@ -4451,7 +4494,13 @@ const UNSAVED_NAMED: usize = 8;
 
 impl EventEmitter<DismissEvent> for ConfirmClose {}
 
-impl ModalView for ConfirmClose {}
+impl ModalView for ConfirmClose {
+    /// A tab's or the graph's question is about the graph shown; the window's and Quit's are
+    /// about every graph.
+    fn goes_with_graph(&self) -> bool {
+        matches!(self.closing, Closing::Tab(_) | Closing::Graph)
+    }
+}
 
 impl Focusable for ConfirmClose {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -4632,9 +4681,7 @@ pub fn connection_color(state: &ConnectionState) -> Color {
         ConnectionState::Ready => Color::Success,
         ConnectionState::Connecting | ConnectionState::Idle => Color::Muted,
         ConnectionState::ContractMismatch { .. } | ConnectionState::TooOld { .. } => Color::Warning,
-        ConnectionState::Unauthorized
-        | ConnectionState::Unreachable(_)
-        | ConnectionState::TokenUnreadable(_) => Color::Error,
+        ConnectionState::Unauthorized | ConnectionState::Unreachable(_) => Color::Error,
     }
 }
 
@@ -4874,6 +4921,62 @@ mod tests {
         });
     }
 
+    /// A close asked about the shown graph or one of its tabs goes when another graph is shown:
+    /// confirmed over that one, it would close the graph on screen and drop its unsaved tabs
+    /// unasked.
+    #[gpui::test]
+    fn a_close_asked_about_a_graph_goes_when_another_is_shown(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let http = http_client::FakeHttpClient::create(|_| async {
+            Ok(http_client::http::Response::builder()
+                .status(404)
+                .body(http_client::AsyncBody::default())
+                .unwrap())
+        });
+        let server = graph_store::ServerEntry {
+            name: "test".into(),
+            url: "http://studio.test".into(),
+            source: graph_store::ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| graph_store::Connection::new(server, None, http).unwrap());
+        let notes =
+            cx.new(|cx| GraphSession::new(connection.clone(), "notes".into(), "main".into(), cx));
+        let people = cx.new(|cx| GraphSession::new(connection, "people".into(), "main".into(), cx));
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.graph_order.push(notes.entity_id());
+            workspace.subscribe_session(notes.clone(), cx);
+            workspace.open_item("draft".to_owned(), window, cx, |_, cx| Unsaved {
+                focus_handle: cx.focus_handle(),
+            });
+            workspace.add_behind(people.clone(), None, cx);
+            for about_the_tab in [false, true] {
+                if about_the_tab {
+                    workspace.close_item(0, window, cx);
+                } else {
+                    workspace.close_graph(window, cx);
+                }
+                assert!(workspace.has_modal(), "asked");
+                workspace.show_graph(people.entity_id(), window, cx);
+                assert!(!workspace.has_modal(), "the question went with its graph");
+                assert_eq!(
+                    workspace.session().map(Entity::entity_id),
+                    Some(people.entity_id())
+                );
+                workspace.show_graph(notes.entity_id(), window, cx);
+                assert_eq!(
+                    workspace.unsaved_tabs(cx),
+                    [SharedString::from("Draft")],
+                    "nothing was closed"
+                );
+            }
+        });
+    }
+
     struct Split {
         field: Entity<Field>,
         part: Entity<Part>,
@@ -5031,6 +5134,58 @@ mod tests {
             );
             workspace.press_panel_button(PanelPosition::Left, "types", window, cx);
             assert_eq!(left(workspace), (true, Some("types".into())));
+        });
+    }
+
+    /// Hiding a dock, or zooming a pane over it, gives the keyboard back to the tab from
+    /// anywhere in the dock's panel: from a field of a panel that names no focus of its own
+    /// too, as the Conversations filter, the inspector and the activity log are. A side panel
+    /// and a bottom one are drawn differently, so both are asked.
+    #[gpui::test]
+    fn a_hidden_or_covered_dock_gives_the_keyboard_back_from_any_field_of_its_panel(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let (fields, tab) = workspace.update_in(cx, |workspace, window, cx| {
+            let mut fields = Vec::new();
+            for (position, id) in [
+                (PanelPosition::Right, "inspector"),
+                (PanelPosition::Bottom, "activity"),
+            ] {
+                let field = cx.focus_handle();
+                let view = cx.new(|_| Other {
+                    focus_handle: field.clone(),
+                });
+                workspace.add_panel(position, id, id, IconName::Table, view.into(), cx);
+                workspace.activate_panel(id, cx);
+                fields.push(field);
+            }
+            workspace.open_item("draft".to_owned(), window, cx, |_, cx| Unsaved {
+                focus_handle: cx.focus_handle(),
+            });
+            let tab = workspace
+                .pane(workspace.active_pane)
+                .and_then(|pane| pane.active_item())
+                .map(|item| item.focus_handle(cx))
+                .expect("the tab");
+            (fields, tab)
+        });
+        // Drawn, so the frame knows which panel holds each field.
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            window.focus(&fields[0], cx);
+            workspace.set_dock_open(PanelPosition::Right, false, window, cx);
+            assert!(
+                tab.is_focused(window),
+                "hiding the dock gives the tab the keyboard"
+            );
+            window.focus(&fields[1], cx);
+            workspace.toggle_zoom(window, cx);
+            assert!(tab.is_focused(window), "so does zooming the pane over it");
         });
     }
 

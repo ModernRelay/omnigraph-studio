@@ -543,7 +543,10 @@ struct Can {
     close: bool,
 }
 
-/// Opens one conversation and serves it until its panel lets go.
+/// Opens one conversation and serves it until its panel lets go. A panel can let go while the
+/// agent opens the session (a restart while starting does), and its tab may already have asked
+/// for the same session again: after each step the conversation stops when its panel let go, and
+/// it never takes a route another conversation holds.
 async fn open_session(
     connection: ConnectionTo<Agent>,
     launch: SessionLaunch,
@@ -570,12 +573,14 @@ async fn open_session(
     {
         let id = SessionId::new(id);
         // Routed before it is asked for: a load's replay arrives as updates while it runs. A
-        // session another open conversation still listens to is not opened a second time.
-        let claimed = routes
-            .lock()
-            .is_ok_and(|mut routes| routes.claim(id.clone(), events.clone()));
+        // session another open conversation still listens to is not opened a second time, nor
+        // one for a panel that let go.
+        let claimed = routes.lock().is_ok_and(|mut routes| {
+            !events.is_closed() && routes.claim(id.clone(), events.clone())
+        });
         if !claimed {
             opened_or_failed(&opening);
+            // A panel that let go hears nothing.
             events
                 .unbounded_send(HostEvent::Exited {
                     message: "This conversation is open in another tab.".to_owned(),
@@ -616,6 +621,11 @@ async fn open_session(
             routes.remove(&id, &events);
         }
     }
+    // A new session is not opened for a panel that let go.
+    if opened.is_none() && events.is_closed() {
+        opened_or_failed(&opening);
+        return Ok(());
+    }
     let (session_id, opened) = match opened {
         Some(opened) => opened,
         None => {
@@ -642,10 +652,27 @@ async fn open_session(
             }
         }
     };
-    if let Ok(mut routes) = routes.lock() {
-        routes.add(session_id.clone(), events.clone());
-    }
+    // Another conversation can take the route over while the agent opens the session only once
+    // this one's panel let go, and then keeps it. A conversation whose panel let go frees what
+    // the agent opened for it, unless another holds it.
+    let routed = routes
+        .lock()
+        .is_ok_and(|mut routes| routes.claim(session_id.clone(), events.clone()));
     opened_or_failed(&opening);
+    if !routed {
+        events
+            .unbounded_send(HostEvent::Exited {
+                message: "This conversation is open in another tab.".to_owned(),
+                stderr: String::new(),
+                failed: false,
+            })
+            .ok();
+        return Ok(());
+    }
+    if events.is_closed() {
+        let_go(&connection, &routes, session_id, &events, false, can.close).await;
+        return Ok(());
+    }
     events
         .unbounded_send(HostEvent::ConfigOptions(config_options))
         .ok();
@@ -713,24 +740,45 @@ async fn open_session(
             }
         }
     }
-    // The panel let go: the agent may free the session, unless another conversation has
-    // opened it again since.
-    let ours = routes
-        .lock()
-        .is_ok_and(|mut routes| routes.remove(&session_id, &events));
-    if ours && turns.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-        connection
-            .send_notification(CancelNotification::new(session_id.clone()))
-            .ok();
-    }
-    if ours && can.close {
-        connection
-            .send_request(CloseSessionRequest::new(session_id))
-            .block_task()
-            .await
-            .ok();
-    }
+    let running = turns.load(std::sync::atomic::Ordering::SeqCst) > 0;
+    let_go(
+        &connection,
+        &routes,
+        session_id,
+        &events,
+        running,
+        can.close,
+    )
+    .await;
     Ok(())
+}
+
+/// The panel of `events`' conversation let go of `session`: unless another conversation has
+/// taken the session over since, the agent stops its turn (when one is `running`) and may free
+/// it. Both are sent while the routes are held, so a conversation that opens the session again
+/// sends its request after them, never before.
+async fn let_go(
+    connection: &ConnectionTo<Agent>,
+    routes: &SharedRoutes,
+    session: SessionId,
+    events: &mpsc::UnboundedSender<HostEvent>,
+    running: bool,
+    can_close: bool,
+) {
+    let close = routes.lock().ok().and_then(|mut routes| {
+        if !routes.remove(&session, events) {
+            return None;
+        }
+        if running {
+            connection
+                .send_notification(CancelNotification::new(session.clone()))
+                .ok();
+        }
+        can_close.then(|| connection.send_request(CloseSessionRequest::new(session)))
+    });
+    if let Some(close) = close {
+        close.block_task().await.ok();
+    }
 }
 
 /// Every page of the agent's sessions in `cwd`, up to a bound.
@@ -888,6 +936,35 @@ mod tests {
         assert!(routes.claim(SessionId::new("b"), second_tx));
         routes.update(SessionId::new("b"), chunk("the second's"));
         assert_eq!(text(second_rx.try_recv().ok()), "the second's");
+    }
+
+    /// A tab restarted while the agent loads its session asks for the session again. When the
+    /// first load returns, the conversation its panel let go neither takes the route back nor
+    /// frees the session; the restarted one frees it when it lets go in turn.
+    #[test]
+    fn a_conversation_let_go_while_loading_leaves_the_session_to_its_restarted_tab() {
+        let mut routes = Routes::default();
+        let session = SessionId::new("s");
+        let (first_tx, first_rx) = mpsc::unbounded();
+        assert!(routes.claim(session.clone(), first_tx.clone()));
+        // The restart: the panel lets go of the first conversation and opens the session again.
+        drop(first_rx);
+        let (restarted_tx, mut restarted_rx) = mpsc::unbounded();
+        assert!(routes.claim(session.clone(), restarted_tx.clone()));
+        // The first load returns, as `open_session` then routes and lets go.
+        assert!(!routes.claim(session.clone(), first_tx.clone()));
+        assert!(!routes.remove(&session, &first_tx), "nothing is freed");
+        routes.update(session.clone(), chunk("the restarted tab's"));
+        assert!(matches!(restarted_rx.try_recv(), Ok(HostEvent::Update(_))));
+        assert!(routes.remove(&session, &restarted_tx));
+
+        // A session the agent created for a conversation whose panel let go meanwhile is
+        // routed to it and freed at once.
+        let (gone_tx, gone_rx) = mpsc::unbounded();
+        drop(gone_rx);
+        let created = SessionId::new("created");
+        assert!(routes.claim(created.clone(), gone_tx.clone()));
+        assert!(routes.remove(&created, &gone_tx));
     }
 }
 
