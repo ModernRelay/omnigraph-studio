@@ -66,9 +66,40 @@ pub fn branch_heads<'a>(
         }
     }
     for names in heads.values_mut() {
-        names.sort_by(|a, b| (a != "main").cmp(&(b != "main")).then(a.cmp(b)));
+        sort_names(names);
     }
     heads
+}
+
+/// Moves `branch`'s name in `heads` to the commit `head` it points at now, or takes it out for
+/// none, keeping each commit's names in [`branch_heads`]'s order.
+pub fn move_head(heads: &mut HashMap<String, Vec<String>>, branch: &str, head: Option<&str>) {
+    heads.retain(|_, names| {
+        names.retain(|name| name != branch);
+        !names.is_empty()
+    });
+    if let Some(head) = head {
+        let names = heads.entry(head.to_owned()).or_default();
+        names.push(branch.to_owned());
+        sort_names(names);
+    }
+}
+
+/// The names of the branches at one commit: main first, then the rest by name.
+fn sort_names(names: &mut [String]) {
+    names.sort_by(|a, b| (a != "main").cmp(&(b != "main")).then(a.cmp(b)));
+}
+
+/// The commits `commits` names as a parent or a merged parent without holding them: merges from
+/// a branch whose list was not read, or did not hold the commit when it was.
+pub fn unresolved_parents(commits: &[CommitOutput]) -> HashSet<String> {
+    let held: HashSet<&str> = commits.iter().map(|c| c.graph_commit_id.as_str()).collect();
+    commits
+        .iter()
+        .flat_map(|c| c.parent_commit_id.iter().chain(&c.merged_parent_commit_id))
+        .filter(|id| !held.contains(id.as_str()))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -117,6 +148,15 @@ mod tests {
         ]);
         assert_eq!(heads["m3"], vec!["main"]);
         assert_eq!(heads["b3"], vec!["feature"]);
+        assert!(unresolved_parents(&all).is_empty());
+
+        // A commit to a branch moves its name alone, in the same order.
+        let mut moved = heads.clone();
+        move_head(&mut moved, "other", Some("m3"));
+        assert_eq!(moved["m3"], vec!["main", "other"]);
+        assert!(!moved.contains_key("x1"));
+        move_head(&mut moved, "feature", None);
+        assert!(!moved.contains_key("b3"));
     }
 
     #[test]
@@ -127,5 +167,6 @@ mod tests {
         ];
         let all = with_merged_commits(main, &[]);
         assert_eq!(all.len(), 2);
+        assert_eq!(unresolved_parents(&all), HashSet::from(["gone".to_owned()]));
     }
 }

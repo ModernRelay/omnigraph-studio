@@ -9,7 +9,7 @@ use gpui::{
     Window,
 };
 use gq_language::Property;
-use gq_language::input::{edit_text, parse_input, same_value};
+use gq_language::input::{edit_text, same_value, typed};
 use serde_json::Value;
 use studio_ui::ds;
 use ui::prelude::*;
@@ -23,14 +23,6 @@ struct Field {
     /// The value the branch holds, which the save is bound to.
     current: Value,
     error: Option<String>,
-}
-
-/// What a field's text asks for: nothing while it is the text the form was filled with, so a
-/// field left alone is left as the branch holds it, even a value its text cannot say again (an
-/// empty text, a null in a list, a number past what an input parses); else the value typed, or
-/// why the text is not one.
-fn typed(property: &Property, current: &Value, text: &str) -> Option<Result<Value, String>> {
-    (text != edit_text(current)).then(|| parse_input(property, text))
 }
 
 pub(crate) struct EditModal {

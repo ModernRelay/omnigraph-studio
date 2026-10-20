@@ -177,8 +177,8 @@ struct ReviewData {
     card_rows: CardRows,
     /// Each change's reviewed mark ([`mark_of`]), made with the fold.
     marks: Vec<u64>,
-    /// The schema the groups, the revert checks and the cards' rows were made with: another,
-    /// loaded since, applied, or naming nodes otherwise, makes them again.
+    /// The schema the groups, the revert checks and the cards' rows were made with: one with
+    /// another text, loaded since or applied, or naming nodes otherwise, makes them again.
     schema: Option<Arc<SchemaModel>>,
     partial: bool,
     /// The feed went past the reviewed head while reading: the branch moved.
@@ -312,10 +312,11 @@ fn revert_checks(
         .collect()
 }
 
-/// Whether two schemas are the same one, by identity: a schema read or named again is another.
+/// Whether two schemas group and draw the cards alike: the same text, naming each type's nodes
+/// by the same property. A schema read again with the same text is the same one.
 fn same_schema(a: Option<&Arc<SchemaModel>>, b: Option<&Arc<SchemaModel>>) -> bool {
     match (a, b) {
-        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.same_as(b),
         (None, None) => true,
         _ => false,
     }
@@ -368,6 +369,9 @@ pub struct ReviewView {
     show_conflicts: bool,
     /// Someone else wrote to the branch after this review was read.
     newer: bool,
+    /// Another writer changed the schema while the review being read was read: the review it
+    /// finishes with is newer at once.
+    schema_moved_while_loading: bool,
     /// Fixes asked for and not yet back, the one out and those waiting for it.
     fixes_running: usize,
     /// Fixes waiting for the one out: each is sent bound to the head the one before left.
@@ -469,8 +473,7 @@ impl ReviewView {
                     this.preview_moved(cx)
                 }
                 SessionEvent::SchemaChanged => this.schema_changed(cx),
-                // Another writer's schema: the cards were made under the one before.
-                SessionEvent::SchemaMoved if !this.newer => this.mark_newer(cx),
+                SessionEvent::SchemaMoved => this.schema_moved(cx),
                 _ => {}
             });
         let head_watch = session.update(cx, |session, cx| session.watch_head(&branch, cx));
@@ -502,6 +505,7 @@ impl ReviewView {
             delete_branch: true,
             show_conflicts: false,
             newer: false,
+            schema_moved_while_loading: false,
             fixes_running: 0,
             fix_queue: VecDeque::new(),
             fix_out: false,
@@ -533,6 +537,17 @@ impl ReviewView {
         cx.notify();
     }
 
+    /// Another writer's schema: the cards were made under the one before, as are those of a
+    /// review being read, which keeps it for when it finishes.
+    fn schema_moved(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.load, LoadState::Loading { .. }) {
+            self.schema_moved_while_loading = true;
+        }
+        if !self.newer {
+            self.mark_newer(cx);
+        }
+    }
+
     /// Groups the review again when it was grouped under another schema than the session's,
     /// off the main thread: its cards pair moved relationships, say what cannot be reverted and
     /// show their rows by the schema they are drawn with. A tab opened again with the window can
@@ -543,6 +558,8 @@ impl ReviewView {
         let shows_head = self.shows_head();
         let Some(data) = &self.data else { return };
         if same_schema(data.schema.as_ref(), schema.as_ref()) {
+            // Grouped as the session's schema groups: a regroup under way is for one since gone.
+            self._regroup_task = None;
             return;
         }
         let folded = data.folded.clone();
@@ -574,7 +591,7 @@ impl ReviewView {
                 data.revert_blocked = revert_blocked;
                 let ends = data.groups.unnamed_ends();
                 let head = data.head.clone();
-                this.lay_out();
+                this.lay_out_in_place();
                 this.read_names(ends, head, cx);
                 cx.notify();
             })
@@ -601,6 +618,7 @@ impl ReviewView {
         }
         self.load = LoadState::Loading { folded: 0 };
         self.newer = false;
+        self.schema_moved_while_loading = false;
         self.show_conflicts = false;
         if !matches!(self.merge, MergeState::Merging | MergeState::Checking) {
             self.merge = MergeState::Idle;
@@ -658,7 +676,8 @@ impl ReviewView {
                     }
                 }
                 self.bound_head = data.head.clone();
-                self.newer = data.moved_while_reading;
+                let schema_moved = std::mem::take(&mut self.schema_moved_while_loading);
+                self.newer = data.moved_while_reading || schema_moved;
                 self.summary = self.summary_of(&data);
                 let ends = data.groups.unnamed_ends();
                 let head = data.head.clone();
@@ -674,15 +693,16 @@ impl ReviewView {
                     self.search_after(None, cx);
                 }
                 self.read_names(ends, head, cx);
-                // Read now, or once the fix or merge out is back.
                 self.preview = Preview::Unread;
                 self._preview_task = None;
+                // A head that moved while this was read, a fix of this review's included, is
+                // offered as newer: the cards show the head read. Compared before the dry run,
+                // which is not read for a head the cards no longer show.
+                self.compare_head(cx);
+                // Read now, or once the fix or merge out is back.
                 if changed {
                     self.preview_moved(cx);
                 }
-                // A head that moved while this was read, a fix of this review's included, is
-                // offered as newer: the cards show the head read.
-                self.compare_head(cx);
                 // A schema that arrived while this was read groups it again.
                 self.regroup(cx);
             }
@@ -910,6 +930,14 @@ impl ReviewView {
                 .first()
                 .and_then(|&group| data.groups.groups[group].primary());
         }
+    }
+
+    /// [`Self::lay_out`] for the same changes grouped again, keeping the place the person
+    /// scrolled to.
+    fn lay_out_in_place(&mut self) {
+        let top = self.list_state.logical_scroll_top();
+        self.lay_out();
+        self.list_state.scroll_to(top);
     }
 
     /// Reviews everything since the fork (`None`) or one commit, reading again.
@@ -1400,6 +1428,14 @@ impl ReviewView {
     }
 
     fn writes_settled(&mut self, cx: &mut Context<Self>) {
+        if !self.merging() {
+            // A fix refused while the merge was out may be asked for again.
+            for card in &mut self.cards {
+                if matches!(&card.fix, FixState::Refused(reason) if reason == MERGE_RUNNING) {
+                    card.fix = FixState::Idle;
+                }
+            }
+        }
         if self.fixes_running == 0
             && !matches!(self.merge, MergeState::Merging)
             && std::mem::take(&mut self.head_moved_while_writing)
@@ -1449,6 +1485,7 @@ impl ReviewView {
                         this.merge = MergeState::Refused(format!(
                             "Studio could not read {branch}'s head: {error}"
                         ));
+                        this.writes_settled(cx);
                         cx.notify();
                     })
                     .ok();
@@ -1459,6 +1496,7 @@ impl ReviewView {
                 this.update(cx, |this, cx| {
                     this.merge = MergeState::Moved { head };
                     this.mark_newer(cx);
+                    this.writes_settled(cx);
                 })
                 .ok();
                 return;
@@ -3518,6 +3556,99 @@ pub(crate) mod tests {
         );
     }
 
+    /// A review read while another writer changed the schema is newer once it is in, as is
+    /// one read at a head behind the one the session saw; neither sends a dry run for the
+    /// head its cards show.
+    #[gpui::test]
+    async fn a_review_read_behind_the_schema_or_the_head_is_newer(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, asked) = reviewed_server(false, cx);
+        let (view, cx) = cx.add_window_view({
+            let session = session.clone();
+            |window, cx| ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let dry_runs = |asked: &std::sync::Mutex<Vec<String>>| {
+            asked
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.contains("\"dry_run\":true"))
+                .count()
+        };
+        let assert_newer = |view: &ReviewView| {
+            assert!(matches!(view.load, LoadState::Ready));
+            assert!(view.newer);
+            assert!(
+                matches!(view.preview, Preview::Unread),
+                "{:?}",
+                view.preview
+            );
+        };
+
+        asked.lock().unwrap().clear();
+        view.update(cx, |view, cx| view.reload(cx));
+        session.update(cx, |_, cx| cx.emit(SessionEvent::SchemaMoved));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_newer(view));
+        assert_eq!(dry_runs(&asked), 0);
+
+        // Another writer's commit f3, seen by the session; the review read again shows f2.
+        session.update(cx, |session, cx| {
+            session
+                .external_write("feature".into(), "Agent write".into(), false, cx)
+                .finish(graph_store::OutcomeKind::Committed {
+                    commit: Some("f3".into()),
+                })
+        });
+        cx.run_until_parked();
+        asked.lock().unwrap().clear();
+        view.update(cx, |view, cx| view.reload(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.bound_head.as_deref(), Some("f2"));
+            assert_newer(view);
+        });
+        assert_eq!(dry_runs(&asked), 0);
+    }
+
+    /// A fix asked for while the merge is out is refused on its card until the merge is back,
+    /// and offered again then.
+    #[gpui::test]
+    async fn a_fix_refused_for_a_running_merge_is_offered_again_once_it_is_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, asked) = reviewed_server(false, cx);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            ReviewView::new(session, "feature".into(), "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.merge(cx);
+            view.revert(0, cx);
+            assert_eq!(view.cards[0].fix, FixState::Refused(MERGE_RUNNING.into()));
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.merge, MergeState::Merged { .. }));
+            assert_eq!(view.cards[0].fix, FixState::Idle);
+        });
+        assert!(
+            !asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.contains("/mutate"))
+        );
+    }
+
     /// A schema that arrives after the review was grouped (one loaded after a tab restored
     /// with the window read, or one naming nodes otherwise in the settings) groups the cards
     /// again from the changes read, without reading the branch again.
@@ -3553,7 +3684,9 @@ pub(crate) mod tests {
             let data = view.data.as_ref().unwrap();
             assert_eq!(data.groups, EntityGroups::new(&data.folded, Some(&*loaded)));
         });
-        // A schema read again is another, as one naming nodes otherwise is.
+        // A schema read again with the same text, as after the graph answers again, is the same
+        // one: the cards stay as grouped, where the person scrolled to.
+        let grouped = view.read_with(cx, |view, _| grouped_with(view).unwrap());
         session.update(cx, |session, cx| session.reload_schema(cx));
         cx.run_until_parked();
         let again = session
@@ -3562,6 +3695,11 @@ pub(crate) mod tests {
         assert!(!Arc::ptr_eq(&again, &loaded));
         view.read_with(cx, |view, _| {
             assert!(same_schema(grouped_with(view).as_ref(), Some(&again)));
+            assert!(
+                Arc::ptr_eq(&grouped_with(view).unwrap(), &grouped),
+                "not grouped again"
+            );
+            assert!(view._regroup_task.is_none());
         });
         let asked = asked.lock().unwrap();
         assert!(

@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 
 use editor::{Editor, EditorEvent};
@@ -25,7 +26,7 @@ use ui::{Severity, Tooltip, right_click_menu};
 
 use crate::commit_view::{CommitCounts, CommitView};
 use crate::lanes::{Graph, GraphCommit, assign_lanes};
-use crate::merged::{branch_heads, with_merged_commits};
+use crate::merged::{branch_heads, move_head, unresolved_parents, with_merged_commits};
 
 /// Above this many commits the list warns that it is read and laid out whole: History asks
 /// for a branch's whole commit list, not a page of it.
@@ -108,6 +109,12 @@ pub struct HistoryView {
     /// The other branches whose lists the history read: a commit to one shows here too, as
     /// its head or a merge from it.
     others: Vec<String>,
+    /// The parents and merged parents the history names without holding, from its last
+    /// layout: a commit to another branch lays it out again only when that branch's list now
+    /// holds one.
+    unresolved: Arc<HashSet<String>>,
+    /// Other branches' lists read again after a commit to them, for their heads, by branch.
+    head_reads: HashMap<String, Task<()>>,
 }
 
 impl EventEmitter<ItemEvent> for HistoryView {}
@@ -162,7 +169,9 @@ impl HistoryView {
         // tab restored before the branch list was read draws them once it is.
         view._session_subscription =
             Some(cx.subscribe(&session, |this, _, event, cx| match event {
-                SessionEvent::Committed { branch } if this.shows(branch) => this.reload(cx),
+                SessionEvent::Committed { branch } if this.shows(branch) => {
+                    this.committed(branch, cx)
+                }
                 SessionEvent::BranchesChanged => this.reload(cx),
                 _ => {}
             }));
@@ -185,7 +194,9 @@ impl HistoryView {
                         this.forget_branch();
                         this.reload(cx);
                     }
-                    SessionEvent::Committed { branch } if this.shows(branch) => this.reload(cx),
+                    SessionEvent::Committed { branch } if this.shows(branch) => {
+                        this.committed(branch, cx)
+                    }
                     // The list of other branches, whose heads and merges the history shows.
                     SessionEvent::BranchesChanged => this.reload(cx),
                     _ => {}
@@ -230,6 +241,8 @@ impl HistoryView {
             _session_subscription: None,
             _head_watch: None,
             others: Vec::new(),
+            unresolved: Arc::default(),
+            head_reads: HashMap::new(),
             focus_handle: cx.focus_handle(),
             state: State::Loading,
             commits: Vec::new(),
@@ -290,6 +303,48 @@ impl HistoryView {
         self.branch == branch || self.others.iter().any(|other| other == branch)
     }
 
+    /// A commit landed on `branch`. One to the history's own branch, or one while the history
+    /// is read, lays it out again. One to another branch it reads moves that branch's head
+    /// tag only: that branch's new commits are not in this history, unless its list now holds
+    /// a parent the history named without holding, which lays it out again.
+    fn committed(&mut self, branch: &str, cx: &mut Context<Self>) {
+        if branch == self.branch || matches!(self.state, State::Loading) {
+            self.reload(cx);
+            return;
+        }
+        let read = self
+            .session
+            .update(cx, |session, cx| session.commits(branch, false, cx));
+        let unresolved = self.unresolved.clone();
+        let name = branch.to_owned();
+        let task = cx.spawn(async move |this, cx| {
+            // Gone through off the main thread: a list holds the branch's whole history.
+            let (head, holds_unresolved) = match read.await {
+                Ok(list) => {
+                    cx.background_spawn(async move {
+                        let head = list.first().map(|c| c.graph_commit_id.clone());
+                        let holds = list.iter().any(|c| unresolved.contains(&c.graph_commit_id));
+                        (head, holds)
+                    })
+                    .await
+                }
+                // As a layout leaves out a branch whose list could not be read.
+                Err(_) => (None, false),
+            };
+            this.update(cx, |this, cx| {
+                this.head_reads.remove(&name);
+                if holds_unresolved {
+                    this.reload(cx);
+                } else {
+                    move_head(&mut this.heads, &name, head.as_deref());
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+        self.head_reads.insert(branch.to_owned(), task);
+    }
+
     fn load(&mut self, fresh: bool, cx: &mut Context<Self>) {
         self.state = State::Loading;
         let branch = self.branch.clone();
@@ -312,6 +367,8 @@ impl HistoryView {
         let own_read = self
             .session
             .update(cx, |session, cx| session.commits(&branch, fresh, cx));
+        // A head read for a branch the history no longer reads would put its tag back.
+        self.head_reads.retain(|name, _| others.contains(name));
         self.others = others.clone();
         let other_reads: Vec<_> = others
             .into_iter()
@@ -344,7 +401,7 @@ impl HistoryView {
             }
             // Laid out off the main thread; a long history is laid out whole.
             let own_count = own.len();
-            let (commits, commit_texts, layout, heads) = cx
+            let (commits, commit_texts, layout, heads, unresolved) = cx
                 .background_executor()
                 .spawn(async move {
                     let own: Vec<CommitOutput> = own.as_ref().clone();
@@ -375,7 +432,8 @@ impl HistoryView {
                     let layout = assign_lanes(&nodes);
                     let commit_texts: Vec<CommitText> =
                         commits.iter().map(CommitText::of).collect();
-                    (commits, commit_texts, layout, heads)
+                    let unresolved = unresolved_parents(&commits);
+                    (commits, commit_texts, layout, heads, unresolved)
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -387,6 +445,7 @@ impl HistoryView {
                 this.commit_texts = commit_texts;
                 this.graph = layout;
                 this.heads = heads;
+                this.unresolved = Arc::new(unresolved);
                 this.own_count = own_count;
                 this.state = State::Ready;
                 // The matches and the drawn rows' counts were found in the list before.
@@ -437,6 +496,13 @@ impl HistoryView {
     }
 
     fn step_match(&mut self, forward: bool, cx: &mut Context<Self>) {
+        // Within the pause after typing, the matches are for the text before: they are found
+        // for the text the box holds, which selects the first.
+        if self.search.read(cx).text(cx).trim().to_lowercase() != self.match_query {
+            self._search_task = None;
+            self.find(cx);
+            return;
+        }
         let count = self.matches.len();
         let Some(at) = self.match_at.filter(|_| count > 0) else {
             return;
@@ -1191,6 +1257,107 @@ mod tests {
         );
     }
 
+    /// A commit to another branch moves that branch's tag without laying the history out
+    /// again; one whose list now holds a merged parent the history could not find lays it out
+    /// again, with that commit.
+    #[gpui::test]
+    async fn a_commit_to_another_branch_moves_its_tag_alone(cx: &mut TestAppContext) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        // `main` merged `fix` at f1, and x1 from a list not read; `fix` then commits f2, then
+        // x1 shows in its list.
+        let fix_version = Arc::new(AtomicUsize::new(0));
+        let served = fix_version.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            let query = request.uri().query().unwrap_or_default().to_owned();
+            let version = served.load(Ordering::SeqCst);
+            async move {
+                let commit = |id: &str, at: i64, parent: Option<&str>, merged: Option<&str>| {
+                    json!({
+                        "graph_commit_id": id, "graph_manifest_version": at, "created_at": at,
+                        "parent_commit_id": parent, "merged_parent_commit_id": merged,
+                    })
+                };
+                let body = if path.ends_with("/branches") {
+                    json!({ "branches": ["main", "fix"] })
+                } else if path.ends_with("/commits") && query.contains("branch=fix") {
+                    let mut commits = vec![
+                        commit("f1", 2, Some("m1"), None),
+                        commit("m1", 1, None, None),
+                    ];
+                    if version >= 1 {
+                        commits.insert(0, commit("f2", 4, Some("f1"), None));
+                    }
+                    if version >= 2 {
+                        commits.insert(0, commit("x1", 5, Some("f2"), None));
+                    }
+                    json!({ "commits": commits })
+                } else if path.ends_with("/commits") {
+                    json!({ "commits": [
+                        commit("m3", 6, Some("m2"), Some("x1")),
+                        commit("m2", 3, Some("m1"), Some("f1")),
+                        commit("m1", 1, None, None),
+                    ] })
+                } else {
+                    json!({})
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        let (view, cx) = cx.add_window_view({
+            let session = session.clone();
+            move |window, cx| HistoryView::new(session, "main".into(), window, cx)
+        });
+        cx.run_until_parked();
+        let tag = |view: &HistoryView, commit: &str| view.heads.get(commit).cloned();
+        let laid_out = view.read_with(cx, |view, _| {
+            assert_eq!(tag(view, "f1"), Some(vec!["fix".to_owned()]));
+            view.commits.as_ptr()
+        });
+        // Another writer's commit to `fix`, as the session hears of one: its list is read again.
+        let commit_to_fix = |version: usize, cx: &mut gpui::VisualTestContext| {
+            fix_version.store(version, Ordering::SeqCst);
+            let read = session.update(cx, |session, cx| {
+                let read = session.commits("fix", true, cx);
+                cx.emit(SessionEvent::Committed {
+                    branch: "fix".into(),
+                });
+                read
+            });
+            cx.run_until_parked();
+            drop(read);
+        };
+        commit_to_fix(1, cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.commits.as_ptr(), laid_out, "laid out again");
+            assert_eq!(tag(view, "f2"), Some(vec!["fix".to_owned()]));
+            assert_eq!(tag(view, "f1"), None);
+        });
+        commit_to_fix(2, cx);
+        view.read_with(cx, |view, _| {
+            assert_ne!(view.commits.as_ptr(), laid_out, "x1 joins the history");
+            assert!(view.commits.iter().any(|c| c.graph_commit_id == "x1"));
+            assert_eq!(tag(view, "x1"), Some(vec!["fix".to_owned()]));
+        });
+    }
+
     /// A session on a graph whose `main` holds one commit, `c1`, which changed nothing.
     fn one_commit_session(cx: &mut TestAppContext) -> Entity<GraphSession> {
         let http = FakeHttpClient::create(move |request| {
@@ -1283,6 +1450,15 @@ mod tests {
             assert_eq!(view.matches, [0]);
             assert_eq!(view.match_at, Some(0));
             assert_eq!(view.match_query, "c1");
+        });
+        // A step taken before typing pauses steps among the matches for the text typed.
+        view.update_in(cx, |view, window, cx| {
+            view.search
+                .update(cx, |editor, cx| editor.set_text("nothing", window, cx));
+            view.step_match(true, cx);
+            assert!(view.matches.is_empty());
+            assert_eq!(view.match_at, None);
+            assert_eq!(view.match_query, "nothing");
         });
     }
 

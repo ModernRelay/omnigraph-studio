@@ -59,8 +59,8 @@ pub struct CommitView {
     /// The changes by entity, each node with its relationship changes, as the review shows
     /// them.
     groups: EntityGroups,
-    /// The schema the groups and the cards' rows were made with: another, loaded since,
-    /// applied, or naming nodes otherwise, groups the changes again.
+    /// The schema the groups and the cards' rows were made with: one with another text, loaded
+    /// since or applied, or naming nodes otherwise, groups the changes again.
     schema: Option<Arc<SchemaModel>>,
     /// The cards' property rows, made as they are first drawn; new with each fold.
     card_rows: CardRows,
@@ -334,15 +334,21 @@ impl CommitView {
 
     /// Groups the changes read again when they were grouped under another schema than the
     /// session's, off the main thread: one loaded after they were read, applied, or naming
-    /// nodes otherwise. The changes stay as read; a read under way groups its own.
+    /// nodes otherwise. A schema read again with the same text and node names groups them
+    /// alike, and leaves them. The changes stay as read; a read under way groups its own.
     fn regroup(&mut self, cx: &mut Context<Self>) {
         let schema = self.session.read(cx).schema_model();
         let same = match (&self.schema, &schema) {
-            (Some(made), Some(current)) => Arc::ptr_eq(made, current),
+            (Some(made), Some(current)) => Arc::ptr_eq(made, current) || made.same_as(current),
             (None, None) => true,
             _ => false,
         };
-        if same || matches!(self.state, State::Loading) {
+        if same {
+            // A regroup under way is for a schema since gone.
+            self._regroup_task = None;
+            return;
+        }
+        if matches!(self.state, State::Loading) {
             return;
         }
         let folded = self.folded.clone();
@@ -889,6 +895,21 @@ mod tests {
                 view.groups.groups.iter().all(|group| !group.is_edge),
                 "the relationship shows on its node's card"
             );
+        });
+        // The same text read again groups nothing again, so the list keeps its place.
+        let grouped = view.read_with(cx, |view, _| view.schema.clone().unwrap());
+        session.update(cx, |session, cx| session.reload_schema(cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            let current = view.session.read(cx).schema_model().unwrap();
+            assert!(!Arc::ptr_eq(&current, &grouped), "read again");
+            assert!(
+                view.schema
+                    .as_ref()
+                    .is_some_and(|made| Arc::ptr_eq(made, &grouped)),
+                "not grouped again"
+            );
+            assert!(view._regroup_task.is_none());
         });
         assert_eq!(reads.load(Ordering::SeqCst), 1, "the commit was read again");
     }
