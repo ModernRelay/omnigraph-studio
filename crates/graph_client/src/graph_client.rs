@@ -15,7 +15,7 @@ pub use api::ErrorOutput;
 pub use client::{
     ApiErrorSummary, BlobAt, BlobCell, BlobMeta, CommitChanges, FeedAt, ForwardRequest,
     ForwardResponse, GraphClient, HistoricalGap, MIN_SERVER_VERSION, MergePreview, PropertyThen,
-    ReadError, ServerHealth, server_root,
+    ReadError, ServerHealth, judge_write, server_root,
 };
 pub use http_client::{
     AsyncBody,
@@ -26,9 +26,14 @@ pub use http_client::{
 /// (`omnigraph-api-types` `HTTP_API_CONTRACT_HEADER` at OmniGraph v0.13.0).
 pub const CONTRACT_HEADER: &str = "omnigraph-http-api";
 
-/// The contracts this client speaks: `HTTP_API_CONTRACT`, unchanged from OmniGraph 0.13 to
+/// The contract this client speaks: `HTTP_API_CONTRACT`, unchanged from OmniGraph 0.13 to
 /// 0.14.
-pub const SUPPORTED_CONTRACTS: &[&str] = &["0.13"];
+pub const CONTRACT: &str = "0.13";
+
+/// Whether a response's contract header names the contract Studio speaks.
+pub fn speaks_contract(served: Option<&str>) -> bool {
+    served == Some(CONTRACT)
+}
 
 /// Header that binds a write to the commit it was read at.
 pub const IF_GRAPH_COMMIT_HEADER: &str = "Omnigraph-If-Graph-Commit";

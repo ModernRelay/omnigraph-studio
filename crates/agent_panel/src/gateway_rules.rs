@@ -184,7 +184,13 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
         ("POST", ["branches"]) => {
             let name = json_str(request.json, "name");
             let from = json_str(request.json, "from").unwrap_or("main");
-            if name != Some(sandbox.branch.as_str()) || from != sandbox.base {
+            // The agent's branch starts at its base's head: one started at a commit (`from
+            // commit`) holds whatever that commit held, which the card cannot show.
+            let at_commit = request
+                .json
+                .and_then(|json| json.get("from_commit"))
+                .is_some_and(|commit| !commit.is_null());
+            if name != Some(sandbox.branch.as_str()) || from != sandbox.base || at_commit {
                 return Verdict::Refuse(format!(
                     "Studio: the agent may create only its own branch, {} from {}: `omnigraph \
                      branch create {} --from {}`. Nothing was sent.",
@@ -215,6 +221,26 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
             })
         }
         ("POST", ["branches", "merge"]) => {
+            let flag = |key: &str| {
+                request
+                    .json
+                    .and_then(|json| json.get(key))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            };
+            // A dry run reads both branches and writes nothing: a preview, into any branch.
+            if flag("dry_run") && !flag("as_commit") && !flag("delete_branch") {
+                return Verdict::Read;
+            }
+            // A merge held as an unpublished commit is listed nowhere in Studio, and publishing
+            // it is the person's.
+            if flag("as_commit") {
+                return Verdict::Refuse(
+                    "Studio: a merge held as an unpublished commit is not forwarded; merge into \
+                     the agent's branch as it is. Nothing was sent."
+                        .into(),
+                );
+            }
             let target = json_str(request.json, "target");
             if !on_agent_branch(target) {
                 return Verdict::Refuse(format!(
@@ -223,12 +249,7 @@ fn graph_route(request: &Incoming<'_>, sandbox: &Sandbox, graph: &str, rest: &[&
                     sandbox.branch
                 ));
             }
-            if request
-                .json
-                .and_then(|json| json.get("delete_branch"))
-                .and_then(Value::as_bool)
-                == Some(true)
-            {
+            if flag("delete_branch") {
                 return Verdict::Refuse(
                     "Studio: a merge that deletes its source branch is not forwarded. Nothing \
                      was sent."
@@ -473,6 +494,13 @@ mod tests {
             &[],
             Some(json!({"name": "feature", "from": "main"}))
         )));
+        // Started at a commit, the branch holds what that commit held, not its base's head.
+        assert!(refused(&verdict(
+            "POST",
+            "/graphs/knowledge/branches",
+            &[],
+            Some(json!({"name": AGENT, "from_commit": "01J"}))
+        )));
         assert!(matches!(
             verdict(
                 "DELETE",
@@ -515,6 +543,23 @@ mod tests {
             "/graphs/knowledge/branches/merge",
             &[],
             Some(json!({"source": "main", "target": AGENT, "delete_branch": true}))
+        )));
+        // A dry run writes nothing, into any branch; a merge held as an unpublished commit is
+        // never forwarded.
+        assert_eq!(
+            verdict(
+                "POST",
+                "/graphs/knowledge/branches/merge",
+                &[],
+                Some(json!({"source": AGENT, "target": "main", "dry_run": true}))
+            ),
+            Verdict::Read
+        );
+        assert!(refused(&verdict(
+            "POST",
+            "/graphs/knowledge/branches/merge",
+            &[],
+            Some(json!({"source": "main", "target": AGENT, "as_commit": true}))
         )));
 
         assert!(matches!(

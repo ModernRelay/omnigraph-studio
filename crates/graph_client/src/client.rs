@@ -21,7 +21,9 @@ use crate::api::{
     MergeBaseOutput, QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput,
     SnapshotOutput,
 };
-use crate::{ApiError, CONTRACT_HEADER, IF_GRAPH_COMMIT_HEADER, SUPPORTED_CONTRACTS, WriteOutcome};
+use crate::{
+    ApiError, CONTRACT, CONTRACT_HEADER, IF_GRAPH_COMMIT_HEADER, WriteOutcome, speaks_contract,
+};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -150,7 +152,7 @@ impl std::fmt::Display for ReadError {
             } => write!(
                 f,
                 "The server speaks contract {served}; Studio speaks {}",
-                SUPPORTED_CONTRACTS.join(", ")
+                CONTRACT
             ),
             ReadError::ContractMismatch { served: None } => {
                 write!(f, "The server did not say which contract it speaks")
@@ -172,9 +174,7 @@ pub struct ServerHealth {
 
 impl ServerHealth {
     pub fn contract_supported(&self) -> bool {
-        self.contract
-            .as_deref()
-            .is_some_and(|served| SUPPORTED_CONTRACTS.contains(&served))
+        speaks_contract(self.contract.as_deref())
     }
 
     /// Whether the server is OmniGraph [`MIN_SERVER_VERSION`] or later, by the version
@@ -423,7 +423,7 @@ impl GraphClient {
         let mut builder = Request::builder()
             .method(method)
             .uri(url.as_str())
-            .header(CONTRACT_HEADER, SUPPORTED_CONTRACTS[0])
+            .header(CONTRACT_HEADER, CONTRACT)
             .follow_redirects(RedirectPolicy::NoFollow)
             .timeout(timeout);
         if let Some(token) = self.token() {
@@ -716,7 +716,7 @@ impl GraphClient {
         let mut builder = Request::builder()
             .method(request.method)
             .uri(url.as_str())
-            .header(CONTRACT_HEADER, SUPPORTED_CONTRACTS[0])
+            .header(CONTRACT_HEADER, CONTRACT)
             .follow_redirects(RedirectPolicy::NoFollow);
         if let Some(token) = self.token() {
             builder = builder.header("authorization", format!("Bearer {token}"));
@@ -1110,7 +1110,7 @@ fn json<T: Serialize>(value: &T) -> Vec<u8> {
 /// A successful read must carry a contract Studio speaks.
 fn check_contract(raw: &RawResponse) -> Result<(), ReadError> {
     match raw.contract.as_deref() {
-        Some(served) if SUPPORTED_CONTRACTS.contains(&served) => Ok(()),
+        served if speaks_contract(served) => Ok(()),
         served => Err(ReadError::ContractMismatch {
             served: served.map(str::to_owned),
         }),
@@ -1137,46 +1137,60 @@ fn summary(status: StatusCode, body: &[u8]) -> ApiErrorSummary {
     }
 }
 
-/// Classifies a write's response (constitution III, spec 003).
+/// What a write's answer says happened (constitution III, spec 003), its success body not yet
+/// read as any type: Studio's own writes and the agent's, forwarded by its gateway, are judged
+/// alike.
 ///
-/// - 2xx with the contract header and a readable body: committed.
+/// - 2xx with the contract header: committed, with the body.
 /// - 4xx, 503 and 429 with the contract header and the server's error body: refused; the server
 ///   did not admit or did not apply the write. OmniGraph stamps the header on every response
 ///   it sends, errors included, so an error without it came from something in between (a
 ///   proxy, a gateway), which cannot say whether the server applied the write.
-/// - Anything else (a lost contract header, an unreadable success body, other 5xx): unknown.
-fn classify_write<T: DeserializeOwned>(raw: RawResponse) -> WriteOutcome<T> {
-    let contract_ok = raw
-        .contract
-        .as_deref()
-        .is_some_and(|served| SUPPORTED_CONTRACTS.contains(&served));
-    if raw.status.is_success() {
+/// - Anything else (a lost contract header, an error without the server's body, other 5xx):
+///   unknown.
+pub fn judge_write<'a>(
+    status: StatusCode,
+    contract: Option<&str>,
+    body: &'a [u8],
+) -> WriteOutcome<&'a [u8]> {
+    let contract_ok = speaks_contract(contract);
+    if status.is_success() {
         if !contract_ok {
             return WriteOutcome::Unknown {
                 reason: "the response did not carry the contract header".into(),
             };
         }
-        return match serde_json::from_slice(&raw.body) {
-            Ok(value) => WriteOutcome::Committed(value),
-            Err(error) => WriteOutcome::Unknown {
-                reason: format!("the success response could not be read: {error}"),
-            },
-        };
+        return WriteOutcome::Committed(body);
     }
-    let refused = raw.status.is_client_error()
-        || raw.status == StatusCode::SERVICE_UNAVAILABLE
-        || raw.status == StatusCode::TOO_MANY_REQUESTS;
+    let refused = status.is_client_error()
+        || status == StatusCode::SERVICE_UNAVAILABLE
+        || status == StatusCode::TOO_MANY_REQUESTS;
     if refused
         && contract_ok
-        && let Ok(body) = serde_json::from_slice::<ErrorOutput>(&raw.body)
+        && let Ok(body) = serde_json::from_slice::<ErrorOutput>(body)
     {
         return WriteOutcome::Refused(ApiError {
-            status: raw.status.as_u16(),
+            status: status.as_u16(),
             body,
         });
     }
     WriteOutcome::Unknown {
-        reason: format!("the server answered {}", raw.status),
+        reason: format!("the server answered {status}"),
+    }
+}
+
+/// [`judge_write`], with a committed write's body read as `T`; one that cannot be read is
+/// unknown.
+fn classify_write<T: DeserializeOwned>(raw: RawResponse) -> WriteOutcome<T> {
+    match judge_write(raw.status, raw.contract.as_deref(), &raw.body) {
+        WriteOutcome::Committed(body) => match serde_json::from_slice(body) {
+            Ok(value) => WriteOutcome::Committed(value),
+            Err(error) => WriteOutcome::Unknown {
+                reason: format!("the success response could not be read: {error}"),
+            },
+        },
+        WriteOutcome::Refused(error) => WriteOutcome::Refused(error),
+        WriteOutcome::Unknown { reason } => WriteOutcome::Unknown { reason },
     }
 }
 
@@ -1346,7 +1360,7 @@ mod tests {
                 log.lock().unwrap().push(token);
                 Ok(Response::builder()
                     .status(200)
-                    .header(CONTRACT_HEADER, SUPPORTED_CONTRACTS[0])
+                    .header(CONTRACT_HEADER, CONTRACT)
                     .body(AsyncBody::from("{}"))
                     .unwrap())
             }

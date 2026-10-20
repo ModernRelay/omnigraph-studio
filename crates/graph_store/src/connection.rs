@@ -54,11 +54,11 @@ impl ConnectionState {
         match self {
             ConnectionState::Idle => "Not connected".into(),
             ConnectionState::Connecting => "Connecting…".into(),
-            ConnectionState::Ready => format!("contract {}", graph_client::SUPPORTED_CONTRACTS[0]),
+            ConnectionState::Ready => format!("contract {}", graph_client::CONTRACT),
             ConnectionState::ContractMismatch { served } => match served {
                 Some(served) => format!(
                     "Server speaks {served}; Studio speaks {}",
-                    graph_client::SUPPORTED_CONTRACTS.join(", ")
+                    graph_client::CONTRACT
                 ),
                 None => "Server did not say which contract it speaks".into(),
             },

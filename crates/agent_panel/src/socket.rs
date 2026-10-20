@@ -1,6 +1,6 @@
 //! The tool server's socket (spec 011). The agent starts `omnigraph-studio mcp-proxy <socket>`
 //! as a stdio MCP server; the proxy connects here and copies bytes both ways. Studio answers
-//! MCP itself and sends tool calls to the panel, which runs them on the person's session.
+//! MCP itself and sends tool calls to the panel, which runs them with the omnigraph CLI.
 //!
 //! The socket lives in a short per-user runtime directory only the person can enter (`0700`),
 //! so no other local user can reach it, and it is removed when the agent session ends. Unix

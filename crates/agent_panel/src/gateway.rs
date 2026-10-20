@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use futures::channel::{mpsc, oneshot};
 use futures::{AsyncReadExt as _, AsyncWriteExt as _};
 use graph_client::{
-    AsyncBody, CONTRACT_HEADER, ForwardRequest, GraphClient, HeaderMap, Method,
-    SUPPORTED_CONTRACTS, StatusCode,
+    AsyncBody, CONTRACT, CONTRACT_HEADER, ForwardRequest, GraphClient, HeaderMap, Method,
+    StatusCode, WriteOutcome,
 };
 use serde_json::{Value, json};
 use smol::net::{TcpListener, TcpStream};
@@ -226,7 +226,7 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
         return;
     }
     let contracts = request.headers_named(CONTRACT_HEADER);
-    if contracts != [SUPPORTED_CONTRACTS[0]] {
+    if contracts != [CONTRACT] {
         let sent = if contracts.is_empty() {
             "none".to_owned()
         } else {
@@ -239,7 +239,7 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
             &format!(
                 "Studio: this omnigraph CLI speaks HTTP API {sent}, and this graph speaks {}. Use \
                  the omnigraph CLI Studio named for this conversation.",
-                SUPPORTED_CONTRACTS[0]
+                CONTRACT
             ),
         )
         .await;
@@ -406,32 +406,28 @@ async fn read_write_answer(
     if let Err(error) = read {
         return (Seen::Unknown(error.to_string()), None);
     }
-    let confirmed = response
+    // One contract header, as the server sends it; more than one confirms nothing.
+    let mut contracts = response
         .headers
         .get_all(CONTRACT_HEADER)
         .iter()
-        .filter_map(|value| value.to_str().ok())
-        .eq([SUPPORTED_CONTRACTS[0]]);
-    let json: Option<Value> = serde_json::from_slice(&body).ok();
-    let outcome = if !confirmed {
-        Seen::Unknown("the answer did not confirm the HTTP contract".into())
-    } else if response.status.is_success() {
-        let json = json.unwrap_or(Value::Null);
-        Seen::Committed {
-            commit: commit_of(&json),
-            nodes: count_of(&json, "affected_nodes", "nodes"),
-            edges: count_of(&json, "affected_edges", "edges"),
+        .filter_map(|value| value.to_str().ok());
+    let contract = match (contracts.next(), contracts.next()) {
+        (Some(one), None) => Some(one),
+        _ => None,
+    };
+    // Judged as Studio's own writes are.
+    let outcome = match graph_client::judge_write(response.status, contract, &body) {
+        WriteOutcome::Committed(body) => {
+            let json: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+            Seen::Committed {
+                commit: commit_of(&json),
+                nodes: count_of(&json, "affected_nodes", "nodes"),
+                edges: count_of(&json, "affected_edges", "edges"),
+            }
         }
-    } else if response.status.is_client_error() {
-        Seen::Refused(
-            json.as_ref()
-                .and_then(|json| json.get("error"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("HTTP {}", response.status.as_u16())),
-        )
-    } else {
-        Seen::Unknown(format!("HTTP {}", response.status.as_u16()))
+        WriteOutcome::Refused(error) => Seen::Refused(error.body.error),
+        WriteOutcome::Unknown { reason } => Seen::Unknown(reason),
     };
     (outcome, Some((response.status, response.headers, body)))
 }
@@ -684,7 +680,7 @@ async fn write_simple(stream: &mut TcpStream, status: u16, content_type: &str, b
         "HTTP/1.1 {status} {}\r\n{CONTRACT_HEADER}: {}\r\ncontent-type: {content_type}\r\n\
          content-length: {}\r\ncache-control: no-store\r\nconnection: close\r\n\r\n",
         reason(status),
-        SUPPORTED_CONTRACTS[0],
+        CONTRACT,
         body.len()
     );
     stream.write_all(head.as_bytes()).await.ok();
@@ -1338,7 +1334,7 @@ mod end_to_end {
         let chosen = smol::block_on(cli_home::choose_cli(
             &home,
             candidates,
-            graph_client::SUPPORTED_CONTRACTS[0],
+            graph_client::CONTRACT,
         ));
         assert!(
             matches!(chosen, cli_home::CliChoice::Chosen { .. }),

@@ -2,8 +2,8 @@
 //! agents, as Delta's sidebar lists threads and Zed's lists its agent threads. Pinned ones
 //! first, then by the person's last message; each row is the conversation's title with what it
 //! is doing (running, waiting for the person, failed, finished unseen) or when it was last
-//! active, and pin and archive on hover. A right click renames, pins, archives or deletes. A
-//! search field appears once the list is long; archived ones fold away at the end; the agent's
+//! active, and pin and archive on hover. A right click renames, pins, archives or deletes. The
+//! Filter button narrows the list by title or agent; archived ones fold away at the end; the agent's
 //! own conversations in the graph's directory can be imported. A row opens the conversation in
 //! its own tab, or shows the tab it is in.
 

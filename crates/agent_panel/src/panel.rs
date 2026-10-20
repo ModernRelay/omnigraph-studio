@@ -1,5 +1,5 @@
-//! The agent panel's view and state: the thread, approval cards, the composer, and the tools
-//! run on the person's session.
+//! The agent panel's view and state: the thread, approval cards, the composer, and Studio's
+//! tools, which run the omnigraph CLI against the conversation's gateway.
 
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use std::path::{Path, PathBuf};
@@ -699,9 +699,9 @@ pub struct AgentPanel {
     /// command killed) when its call is cancelled, at Stop and with a new session.
     runs: std::collections::HashMap<u64, CliRun>,
     next_run: u64,
-    /// The card of each write the gateway forwards, by the gateway's id: the entry, and
-    /// whether the write creates the agent's branch.
-    gateway_cards: std::collections::HashMap<u64, (usize, WriteKind)>,
+    /// The card of each write the gateway forwards, by the gateway's id: the entry, what the
+    /// write is, and whether it creates the agent's branch (a branch create, a load `--from`).
+    gateway_cards: std::collections::HashMap<u64, (usize, WriteKind, bool)>,
 }
 
 impl EventEmitter<ItemEvent> for AgentPanel {}
@@ -1106,7 +1106,7 @@ impl AgentPanel {
                 let chosen = cx
                     .background_spawn(async move {
                         let candidates = cli_home::candidates(wanted.as_deref());
-                        let contract = graph_client::SUPPORTED_CONTRACTS[0];
+                        let contract = graph_client::CONTRACT;
                         cli_home::choose_cli(&home, candidates, contract).await
                     })
                     .await;
@@ -1933,7 +1933,8 @@ impl AgentPanel {
             creates_from: write.creates_branch.then(|| branch.base.clone()),
             state,
         }));
-        self.gateway_cards.insert(id, (index, write.kind));
+        self.gateway_cards
+            .insert(id, (index, write.kind, write.creates_branch));
         // A write that makes or deletes the agent's branch reads the branch list again.
         let (branch, description, moves_branches) = (
             branch.name.clone(),
@@ -1993,10 +1994,9 @@ impl AgentPanel {
     }
 
     fn gateway_finished(&mut self, id: u64, outcome: Seen, cx: &mut Context<Self>) {
-        let Some((index, kind)) = self.gateway_cards.remove(&id) else {
+        let Some((index, kind, creates_branch)) = self.gateway_cards.remove(&id) else {
             return;
         };
-        let creates_branch = matches!(kind, WriteKind::BranchCreate);
         let state = match &outcome {
             Seen::Committed {
                 commit: Some(commit),
@@ -2053,7 +2053,7 @@ impl AgentPanel {
         configured: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let contract = graph_client::SUPPORTED_CONTRACTS[0];
+        let contract = graph_client::CONTRACT;
         self.cli_ready = Some(matches!(choice, cli_home::CliChoice::Chosen { .. }));
         for waiting in self.cli_waiting.drain(..) {
             waiting.send(()).ok();
