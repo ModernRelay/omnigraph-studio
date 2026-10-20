@@ -185,7 +185,12 @@ pub fn init(cx: &mut App) {
         if let Some(path) = data.get("path").and_then(|path| path.as_str()) {
             if let Some(editor) = open_file(workspace, PathBuf::from(path), Some(text), window, cx)
             {
-                editor.update(cx, |editor, _| editor.set_column_widths(widths));
+                editor.update(cx, |editor, cx| {
+                    editor.set_column_widths(widths);
+                    if let Some(commit) = at_commit {
+                        editor.pin_to(commit, cx);
+                    }
+                });
             }
             return;
         }

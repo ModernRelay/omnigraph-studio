@@ -71,6 +71,9 @@ struct Prepared {
     params: Option<Value>,
     columns: Option<Vec<ResultColumn>>,
     map: SourceMap,
+    /// Where the settings prefix and the declaration sent start in the editor, followed
+    /// through typing while the run is out: `map` is placed by them when the answer comes.
+    anchors: Option<(Anchor, Anchor)>,
     /// The stored query to invoke by name instead of sending `text` (spec 007).
     stored: Option<String>,
 }
@@ -123,27 +126,41 @@ struct RowsOutput {
 }
 
 /// A read's rows made ready to show: the table, each column's width from its content, which
-/// columns align right, and the graph the node columns make.
+/// columns align right, the graph the node columns make, and a place for each row's cells.
 struct BuiltRows {
     table: ResultTable,
     widths: Vec<f32>,
     right_aligned: Vec<bool>,
     graph: Option<Arc<ResultGraph>>,
+    shown: Vec<std::cell::OnceCell<Box<[SharedString]>>>,
+}
+
+/// A read's answer as a run shows it, made off the main thread: a plan, rows built into the
+/// table, or the refusal.
+enum Answer {
+    Plan(ReadOutput),
+    Rows(ReadOutput, BuiltRows),
+    Refused(ReadError),
+}
+
+impl Answer {
+    fn of(
+        result: Result<ReadOutput, ReadError>,
+        columns: Option<&[ResultColumn]>,
+        schema: Option<Arc<SchemaModel>>,
+    ) -> Self {
+        match result {
+            Ok(output) if is_plan(&output.columns) => Answer::Plan(output),
+            Ok(mut output) => {
+                let built = BuiltRows::new(&mut output, columns, schema);
+                Answer::Rows(output, built)
+            }
+            Err(error) => Answer::Refused(error),
+        }
+    }
 }
 
 impl BuiltRows {
-    /// The rows of an answer that holds them, not a plan's or a failure's.
-    fn of(
-        result: &mut Result<ReadOutput, ReadError>,
-        columns: Option<&[ResultColumn]>,
-        schema: Option<Arc<SchemaModel>>,
-    ) -> Option<Self> {
-        match result {
-            Ok(output) if !is_plan(&output.columns) => Some(Self::new(output, columns, schema)),
-            _ => None,
-        }
-    }
-
     /// Takes the answer's rows into the table.
     fn new(
         output: &mut ReadOutput,
@@ -165,11 +182,13 @@ impl BuiltRows {
             })
             .collect();
         let graph = schema.and_then(|schema| table.graph(&schema)).map(Arc::new);
+        let shown = table.rows.iter().map(|_| Default::default()).collect();
         Self {
             table,
             widths,
             right_aligned,
             graph,
+            shown,
         }
     }
 }
@@ -287,6 +306,12 @@ pub struct QueryEditor {
     /// The text differs from `saved_text`: found once per edit, not on every draw of the tab.
     unsaved: bool,
     file_error: Option<String>,
+    /// The file is being written. A tab writes one at a time, so a second ⌘S neither names
+    /// another new file nor lands before the first.
+    saving: bool,
+    /// Asked for while saving, and done once the write ends: ⌘S (`None`), or a file chosen to
+    /// save as.
+    save_next: Option<Option<std::path::PathBuf>>,
     /// The run line above each declaration (spec 007): the blocks, the declarations they were
     /// made for, and each declaration's last outcome by name.
     run_lines: Vec<CustomBlockId>,
@@ -296,6 +321,8 @@ pub struct QueryEditor {
     /// Where each problem of the last check starts, kept by the text as it is edited: a jump
     /// made before the next check lands where the problem is now.
     problem_starts: Vec<Option<Anchor>>,
+    /// Where the server's diagnostic shown points in the text, followed through later edits.
+    diagnostic_at: Option<Anchor>,
     last_runs: HashMap<String, RunNote>,
     /// The branch's latest commits, for the snapshot picker: id, Unix micros, actor.
     commits: Vec<(String, i64, Option<String>)>,
@@ -321,7 +348,8 @@ pub struct QueryEditor {
     column_widths: BTreeMap<String, f32>,
     /// The result column being dragged, by position.
     resizing: Option<ColumnResize<usize>>,
-    example: Option<String>,
+    /// The tab was filled with an example read once; emptied, it stays empty.
+    filled_example: bool,
     results_scroll: UniformListScrollHandle,
     /// How far the results are scrolled sideways, for the columns a frame draws.
     results_hscroll: ScrollHandle,
@@ -427,14 +455,14 @@ impl Item for QueryEditor {
         })
     }
 
-    /// The draft comes back after a restart (spec 007: the text is never cleared). It is
-    /// written to the workspace file, never to a log.
     /// The window's footer, as the table's: the result's facts on the leading side, what the
     /// keyboard does with it on the trailing side.
     fn footer(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Option<ItemFooter> {
         Some(self.footer_parts(cx))
     }
 
+    /// The draft comes back after a restart (spec 007: the text is never cleared). It is
+    /// written to the workspace file, never to a log.
     fn serialize(&self, cx: &App) -> Option<SavedItem> {
         if let Some(stored) = &self.stored {
             // The values typed come back with the tab, as a query's text does.
@@ -512,10 +540,10 @@ impl QueryEditor {
             };
             editor.set_placeholder_text(&placeholder, window, cx);
             editor.set_completion_provider(Some(std::rc::Rc::new(GqCompletionProvider::new(
-                Some(session.downgrade()),
+                session.downgrade(),
             ))));
             editor.set_semantics_provider(Some(std::rc::Rc::new(crate::hover::GqSemantics::new(
-                Some(session.downgrade()),
+                session.downgrade(),
             ))));
             editor
         });
@@ -542,8 +570,11 @@ impl QueryEditor {
                     SessionEvent::BranchChanged | SessionEvent::BranchesChanged => {
                         // A write waiting to be confirmed was for the branch shown when it
                         // was asked for.
+                        // So are the commits offered to pin to: none until the new branch's
+                        // come back.
                         if matches!(event, SessionEvent::BranchChanged) {
                             this.pending_write = None;
+                            this.commits.clear();
                         }
                         this.load_commits(cx);
                         cx.notify()
@@ -565,12 +596,15 @@ impl QueryEditor {
             saved_text: None,
             unsaved: false,
             file_error: None,
+            saving: false,
+            save_next: None,
             commits: Vec::new(),
             commits_task: None,
             run_lines: Vec::new(),
             run_line_names: Vec::new(),
             run_line_starts: Vec::new(),
             problem_starts: Vec::new(),
+            diagnostic_at: None,
             last_runs: HashMap::new(),
             at_commit: None,
             editor,
@@ -585,7 +619,7 @@ impl QueryEditor {
             selected: None,
             column_widths: BTreeMap::new(),
             resizing: None,
-            example: None,
+            filled_example: false,
             results_scroll: UniformListScrollHandle::new(),
             results_hscroll: ScrollHandle::new(),
             results_focus: cx.focus_handle(),
@@ -778,8 +812,17 @@ impl QueryEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.save_now(window, cx);
+    }
+
+    fn save_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A stored query lives on the server; there is no text here to save.
         if self.stored.is_some() {
+            return;
+        }
+        if self.saving {
+            // A file chosen to save as meanwhile is where this goes too.
+            self.save_next.get_or_insert(None);
             return;
         }
         let path = match &self.path {
@@ -833,6 +876,11 @@ impl QueryEditor {
     }
 
     fn write_to(&mut self, path: std::path::PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving {
+            self.save_next = Some(Some(path));
+            return;
+        }
+        self.saving = true;
         let text = self.editor.read(cx).text(cx);
         let written = text.clone();
         let target = path.clone();
@@ -845,7 +893,8 @@ impl QueryEditor {
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = write.await;
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
+                this.saving = false;
                 match result {
                     Ok(()) => {
                         this.path = Some(path);
@@ -861,6 +910,11 @@ impl QueryEditor {
                 }
                 cx.emit(ItemEvent::UpdateTab);
                 cx.notify();
+                match this.save_next.take() {
+                    Some(Some(path)) => this.write_to(path, window, cx),
+                    Some(None) => this.save_now(window, cx),
+                    None => {}
+                }
             })
             .ok();
         })
@@ -883,13 +937,13 @@ impl QueryEditor {
 
     /// Fills an untouched, empty editor with a read over the schema's first node type.
     fn set_example(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.stored.is_some() || self.example.is_some() || !self.editor.read(cx).is_empty(cx) {
+        if self.stored.is_some() || self.filled_example || !self.editor.read(cx).is_empty(cx) {
             return;
         }
         let Some(text) = self.schema(cx).and_then(|s| gq_language::example_read(&s)) else {
             return;
         };
-        self.example = Some(text.clone());
+        self.filled_example = true;
         self.editor.update(cx, |editor, cx| {
             editor.set_text(text, window, cx);
             // Put the cursor inside the query, so ⌘↵ runs it straight away.
@@ -1033,7 +1087,9 @@ impl QueryEditor {
     }
 
     /// Puts a run line above each declaration, when the declarations changed since the lines
-    /// were placed; anchored to the text, the lines move with edits in between.
+    /// were placed; anchored to the text, the lines move with edits in between. Lines whose
+    /// anchors no longer sit where their declarations start are placed again: text pasted over
+    /// them all collapses their anchors to one place, the names unchanged.
     fn sync_run_lines(&mut self, cx: &mut Context<Self>) {
         let Some(analysis) = self.analysis.clone() else {
             return;
@@ -1044,7 +1100,16 @@ impl QueryEditor {
             .iter()
             .map(|d| d.name.clone())
             .collect();
-        if names == self.run_line_names {
+        // The check is of the text as it is now (`apply_analysis`), so its offsets are this
+        // text's.
+        let in_place = {
+            let snapshot = self.editor.read(cx).buffer().read(cx).snapshot(cx);
+            self.run_line_starts
+                .iter()
+                .map(|at| at.to_offset(&snapshot).0)
+                .eq(analysis.outline.declarations.iter().map(|d| d.range.start))
+        };
+        if names == self.run_line_names && in_place {
             return;
         }
         let this = cx.entity().downgrade();
@@ -1247,6 +1312,7 @@ impl QueryEditor {
             params: (!values.is_empty()).then_some(Value::Object(values)),
             columns: None,
             map: SourceMap::default(),
+            anchors: None,
             stored: Some(name.clone()),
         })
     }
@@ -1339,6 +1405,48 @@ impl QueryEditor {
         }
     }
 
+    /// Anchors at the settings prefix's start and the declaration's, for a run's [`SourceMap`].
+    fn anchors_at(&self, prefix: usize, declaration: usize, cx: &App) -> (Anchor, Anchor) {
+        let snapshot = self.editor.read(cx).buffer().read(cx).snapshot(cx);
+        (
+            snapshot.anchor_after(MultiBufferOffset(prefix)),
+            snapshot.anchor_after(MultiBufferOffset(declaration)),
+        )
+    }
+
+    /// `map` placed where the text it was made for is now.
+    fn placed(&self, map: SourceMap, anchors: Option<(Anchor, Anchor)>, cx: &App) -> SourceMap {
+        match anchors {
+            Some((prefix, declaration)) => SourceMap {
+                prefix_start: self.offset_of(&prefix, cx),
+                start: self.offset_of(&declaration, cx),
+                ..map
+            },
+            None => map,
+        }
+    }
+
+    /// Holds where the diagnostic of the output shown points, so a jump to it lands there
+    /// after later edits too.
+    fn hold_diagnostic(&mut self, cx: &App) {
+        let byte = match &self.output {
+            Output::Failed(Failure {
+                diagnostic: Some(diagnostic),
+                ..
+            })
+            | Output::Written(WriteResult::Refused {
+                diagnostic: Some(diagnostic),
+                ..
+            }) => diagnostic.byte,
+            _ => None,
+        };
+        self.diagnostic_at = byte.map(|byte| {
+            let snapshot = self.editor.read(cx).buffer().read(cx).snapshot(cx);
+            let byte = MultiBufferOffset(byte.min(snapshot.len().0));
+            snapshot.anchor_before(snapshot.clip_offset(byte, Bias::Left))
+        });
+    }
+
     fn offset_of(&self, anchor: &Anchor, cx: &App) -> usize {
         let snapshot = self.editor.read(cx).buffer().read(cx).snapshot(cx);
         anchor.to_offset(&snapshot).0
@@ -1399,6 +1507,7 @@ impl QueryEditor {
                     prefix_len: source.len(),
                     ..Default::default()
                 },
+                anchors: Some(self.anchors_at(outline.prefix.start, outline.prefix.start, cx)),
                 stored: None,
             });
         }
@@ -1447,7 +1556,9 @@ impl QueryEditor {
                 prefix_len: outline.prefix.end,
                 inserted: if explained { "explain ".len() } else { 0 },
                 start: declaration.range.start,
+                ..Default::default()
             },
+            anchors: Some(self.anchors_at(outline.prefix.start, declaration.range.start, cx)),
             stored: None,
         })
     }
@@ -1476,6 +1587,7 @@ impl QueryEditor {
         // A read still out from an earlier run would land over what this one shows; a read
         // this one sends replaces it.
         self.run_task = None;
+        self.unlight_plan(cx);
         match self.prepare(false, cx) {
             Err(message) => self.output = Output::Failed(Failure::new(message)),
             Ok(prepared) if prepared.write && self.at_commit.is_some() => {
@@ -1514,6 +1626,7 @@ impl QueryEditor {
             return;
         }
         self.run_task = None;
+        self.unlight_plan(cx);
         match self.prepare(true, cx) {
             Err(message) => self.output = Output::Failed(Failure::new(message)),
             Ok(prepared) => self.send_read(prepared, cx),
@@ -1533,7 +1646,8 @@ impl QueryEditor {
             branch: (!prepared.statement && self.at_commit.is_none()).then(|| branch.clone()),
             snapshot: self.at_commit.clone().filter(|_| !prepared.statement),
         };
-        let branch = match &self.at_commit {
+        // Named by what is sent: a statement goes without the pinned commit.
+        let branch = match self.at_commit.as_ref().filter(|_| !prepared.statement) {
             Some(commit) => format!("commit {}", short_commit_id(commit)),
             None => branch,
         };
@@ -1549,9 +1663,12 @@ impl QueryEditor {
                 .session
                 .update(cx, |session, cx| session.read_request(request, cx)),
         };
-        self.output = Output::Running {
-            label: format!("Running {} on {branch}…", prepared.label).into(),
-        };
+        self.replace_output(
+            Output::Running {
+                label: format!("Running {} on {branch}…", prepared.label).into(),
+            },
+            cx,
+        );
         self.selected = None;
         let schema = self.session.read(cx).schema_model();
         // Replacing the task cancels an earlier read still in flight.
@@ -1560,17 +1677,16 @@ impl QueryEditor {
             let elapsed = started.elapsed();
             // The rows are built off the main thread: a large answer would hold up frames.
             let columns = prepared.columns.clone();
-            let (result, built) = cx
-                .background_spawn(async move {
-                    let mut result = result;
-                    let built = BuiltRows::of(&mut result, columns.as_deref(), schema);
-                    (result, built)
-                })
+            let answer = cx
+                .background_spawn(async move { Answer::of(result, columns.as_deref(), schema) })
                 .await;
             this.update(cx, |this, cx| {
                 // A new output replaces the plan whose operator lit the text.
                 this.light_plan_parts(None, cx);
-                this.show_read(prepared, branch, result, built, elapsed);
+                let mut prepared = prepared;
+                prepared.map = this.placed(prepared.map, prepared.anchors, cx);
+                this.show_read(prepared, branch, answer, elapsed);
+                this.hold_diagnostic(cx);
                 cx.emit(ItemEvent::UpdateTab);
                 this.run_task = None;
                 cx.notify();
@@ -1589,22 +1705,14 @@ impl QueryEditor {
         elapsed: Duration,
         schema: Option<Arc<SchemaModel>>,
     ) {
-        let mut result = result;
-        let built = BuiltRows::of(&mut result, prepared.columns.as_deref(), schema);
-        self.show_read(prepared, branch, result, built, elapsed);
+        let answer = Answer::of(result, prepared.columns.as_deref(), schema);
+        self.show_read(prepared, branch, answer, elapsed);
     }
 
     /// Shows a read's answer, its rows already built ([`BuiltRows`]).
-    fn show_read(
-        &mut self,
-        prepared: Prepared,
-        branch: String,
-        result: Result<ReadOutput, ReadError>,
-        built: Option<BuiltRows>,
-        elapsed: Duration,
-    ) {
-        let note = match &result {
-            Ok(output) => RunNote {
+    fn show_read(&mut self, prepared: Prepared, branch: String, answer: Answer, elapsed: Duration) {
+        let note = match &answer {
+            Answer::Plan(output) | Answer::Rows(output, _) => RunNote {
                 text: format!(
                     "{} · {}",
                     rows_label(output.row_count),
@@ -1612,36 +1720,34 @@ impl QueryEditor {
                 ),
                 failed: false,
             },
-            Err(_) => RunNote {
+            Answer::Refused(_) => RunNote {
                 text: "Refused".into(),
                 failed: true,
             },
         };
         self.note_run(prepared.name.as_deref(), note);
-        self.output = match result {
-            Ok(output) if is_plan(&output.columns) => Output::Plan(PlanOutput {
+        self.output = match answer {
+            Answer::Plan(output) => Output::Plan(PlanOutput {
                 name: prepared.name.clone(),
                 label: prepared.label,
                 items: plan_items(&output.rows),
                 elapsed,
                 commit: output.graph_commit_id,
             }),
-            Ok(mut output) => {
+            Answer::Rows(output, built) => {
                 let BuiltRows {
                     table,
                     widths,
                     right_aligned,
                     graph,
-                } = built.unwrap_or_else(|| {
-                    BuiltRows::new(&mut output, prepared.columns.as_deref(), None)
-                });
+                    shown,
+                } = built;
                 // A width the person dragged a column to wins over the one from its content.
                 let widths = widths
                     .into_iter()
                     .zip(&table.columns)
                     .map(|(width, column)| self.column_widths.get(column).copied().unwrap_or(width))
                     .collect();
-                let shown = table.rows.iter().map(|_| Default::default()).collect();
                 Output::Rows(RowsOutput {
                     label: prepared.label,
                     graph,
@@ -1662,7 +1768,7 @@ impl QueryEditor {
                     commit: output.graph_commit_id,
                 })
             }
-            Err(error) => Output::Failed(Failure::from_read(&error, prepared.map)),
+            Answer::Refused(error) => Output::Failed(Failure::from_read(&error, prepared.map)),
         };
         self.results_scroll.scroll_to_item(0, ScrollStrategy::Top);
     }
@@ -1718,10 +1824,14 @@ impl QueryEditor {
         self.writing = true;
         // A read still out would land over the write's outcome.
         self.run_task = None;
-        self.output = Output::Running {
-            label: format!("Writing {} to {branch}…", prepared.label).into(),
-        };
-        let map = prepared.map;
+        self.unlight_plan(cx);
+        self.replace_output(
+            Output::Running {
+                label: format!("Writing {} to {branch}…", prepared.label).into(),
+            },
+            cx,
+        );
+        let (map, anchors) = (prepared.map, prepared.anchors);
         let name = prepared.name.clone();
         // Detached, not stored: closing the tab must not cancel a write in flight, and the
         // session logs its outcome either way (constitution III).
@@ -1749,6 +1859,7 @@ impl QueryEditor {
                 };
                 this.note_run(name.as_deref(), note);
                 cx.emit(ItemEvent::UpdateTab);
+                let map = this.placed(map, anchors, cx);
                 this.output = Output::Written(match outcome {
                     WriteOutcome::Committed(output) => WriteResult::Committed {
                         branch: output.branch,
@@ -1768,6 +1879,7 @@ impl QueryEditor {
                     },
                     WriteOutcome::Unknown { reason } => WriteResult::Unknown { reason },
                 });
+                this.hold_diagnostic(cx);
                 cx.notify();
             })
             .ok();
@@ -2291,7 +2403,6 @@ impl QueryEditor {
         }
     }
 
-    /// Before the first run: the columns the query under the cursor will return.
     /// Before the first run: the columns the query under the cursor will return, or what Run
     /// will do.
     fn render_expected(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2431,10 +2542,20 @@ impl QueryEditor {
                     this.drag_column(event, cx)
                 }),
             )
-            .on_drop(cx.listener(|this, _: &ColumnDrag, _, cx| {
-                this.resizing = None;
-                cx.notify();
+            // Released, by a drop here or elsewhere, or a click that dragged nothing.
+            .capture_any_mouse_up(cx.listener(|this, _, _, cx| {
+                if this.resizing.take().is_some() {
+                    cx.notify();
+                }
             }))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.resizing.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .flex_1()
             .min_h_0()
             .child(body)
@@ -2456,13 +2577,17 @@ impl QueryEditor {
             this.resizing = None;
             this.resize_column(index, None, cx);
         });
-        studio_ui::column_resize_handle(index, active, on_start, on_reset, cx).into_any_element()
+        studio_ui::column_resize_handle(cx.entity_id(), index, active, on_start, on_reset, cx)
+            .into_any_element()
     }
 
     fn drag_column(&mut self, event: &DragMoveEvent<ColumnDrag>, cx: &mut Context<Self>) {
         let Some(resizing) = &self.resizing else {
             return;
         };
+        if !ColumnDrag::of(event, cx.entity_id(), cx) {
+            return;
+        }
         let (index, width) = (resizing.column, resizing.width(event));
         self.resize_column(index, Some(width), cx);
     }
@@ -2610,6 +2735,23 @@ impl QueryEditor {
     /// Lights the parts of the query that the plan operator at `ix` stands for, or none
     /// (spec 007). The declaration is found again by name, so edits since the plan was read
     /// move the light with the text.
+    /// Shows `output` while a run is out. The rows it replaces are dropped off the main thread,
+    /// where a large answer's would hold up a frame.
+    fn replace_output(&mut self, output: Output, cx: &mut Context<Self>) {
+        let replaced = std::mem::replace(&mut self.output, output);
+        if matches!(replaced, Output::Rows(_)) {
+            cx.background_spawn(async move { drop(replaced) }).detach();
+        }
+    }
+
+    /// Clears the text a plan's operator lit, before the output with the plan is replaced: the
+    /// row the pointer was on goes, and with it the hover that would clear it.
+    fn unlight_plan(&mut self, cx: &mut Context<Self>) {
+        if self.plan_hovered.is_some() {
+            self.light_plan_parts(None, cx);
+        }
+    }
+
     fn light_plan_parts(&mut self, ix: Option<usize>, cx: &mut Context<Self>) {
         let key = HighlightKey::ConsoleAnsiHighlight(PLAN_KEY);
         self.plan_hovered = ix;
@@ -2850,7 +2992,9 @@ impl QueryEditor {
                             })
                             .children(diagnostic.map(|diagnostic| {
                                 // A stored query's text is the server's: no place in this tab.
-                                let at = diagnostic.byte.filter(|_| self.stored.is_none());
+                                let at = self
+                                    .diagnostic_at
+                                    .filter(|_| diagnostic.byte.is_some() && self.stored.is_none());
                                 ds::button(
                                     "server-diagnostic",
                                     format!(
@@ -2867,6 +3011,7 @@ impl QueryEditor {
                                 .on_click(cx.listener(
                                     move |this, _, window, cx| {
                                         if let Some(at) = at {
+                                            let at = this.offset_of(&at, cx);
                                             this.jump_to(at, window, cx);
                                         }
                                     },
@@ -3238,6 +3383,7 @@ mod tests {
                 params: None,
                 columns: None,
                 map: SourceMap::default(),
+                anchors: None,
                 stored: None,
             };
             editor.finish_read(prepared, "main".into(), Ok(output), Duration::ZERO, None);
@@ -3294,6 +3440,7 @@ mod tests {
                     params: None,
                     columns: None,
                     map: SourceMap::default(),
+                    anchors: None,
                     stored: None,
                 };
                 editor.finish_read(prepared, "main".into(), Ok(output), Duration::ZERO, None);
@@ -3324,6 +3471,7 @@ mod tests {
                     params: None,
                     columns: None,
                     map: SourceMap::default(),
+                    anchors: None,
                     stored: None,
                 },
                 branch: "main".into(),
@@ -3400,6 +3548,50 @@ mod tests {
                 let at = editor.problem_starts[0].expect("anchored");
                 assert_eq!(editor.offset_of(&at, cx), problem + note.len());
                 assert_eq!(editor.offset_of(&editor.run_line_starts[0], cx), note.len());
+            });
+        }
+
+        /// Text pasted over every declaration, the names kept, gets its run lines placed again
+        /// at the new declarations: the old lines' anchors all collapsed into the paste.
+        #[gpui::test]
+        async fn run_lines_are_placed_again_when_pasted_over(cx: &mut TestAppContext) {
+            cx.update(|cx| {
+                studio_theme::init_test(cx);
+                editor::init(cx);
+            });
+            let session = session(cx);
+            let (editor, cx) =
+                cx.add_window_view(|window, cx| QueryEditor::new(1, session, window, cx));
+            let schema = SchemaModel::parse("node Person {\n  slug: String @key\n}\n").unwrap();
+            editor.update_in(cx, |editor, window, cx| {
+                let first = "query a() { match { $p: Person } return { $p.slug } }\n\
+                             query b() { match { $p: Person } return { $p.slug } }";
+                editor.set_text(first, window, cx);
+                editor.apply_analysis(
+                    Arc::new(Analysis::new(&schema, first.to_owned())),
+                    window,
+                    cx,
+                );
+                let revised = "// people\nquery a() { match { $p: Person } return { $p } }\n\n\
+                               query b() { match { $p: Person } return { $p.slug } }";
+                let end = editor.editor.read(cx).buffer().read(cx).len(cx);
+                editor.editor.update(cx, |editor, cx| {
+                    editor.edit([(MultiBufferOffset(0)..end, revised)], cx)
+                });
+                let analysis = Arc::new(Analysis::new(&schema, revised.to_owned()));
+                let wanted: Vec<usize> = analysis
+                    .outline
+                    .declarations
+                    .iter()
+                    .map(|d| d.range.start)
+                    .collect();
+                editor.apply_analysis(analysis, window, cx);
+                let placed: Vec<usize> = editor
+                    .run_line_starts
+                    .iter()
+                    .map(|at| editor.offset_of(at, cx))
+                    .collect();
+                assert_eq!(placed, wanted);
             });
         }
 

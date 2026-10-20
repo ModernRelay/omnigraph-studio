@@ -12,11 +12,11 @@ use language::{Buffer, CodeLabel, ToOffset as _};
 use project::{Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource};
 
 pub struct GqCompletionProvider {
-    session: Option<WeakEntity<GraphSession>>,
+    session: WeakEntity<GraphSession>,
 }
 
 impl GqCompletionProvider {
-    pub fn new(session: Option<WeakEntity<GraphSession>>) -> Self {
+    pub fn new(session: WeakEntity<GraphSession>) -> Self {
         Self { session }
     }
 }
@@ -32,8 +32,7 @@ impl CompletionProvider for GqCompletionProvider {
     ) -> Task<Result<Vec<CompletionResponse>>> {
         let schema = self
             .session
-            .as_ref()
-            .and_then(WeakEntity::upgrade)
+            .upgrade()
             .and_then(|session| session.read(cx).schema_model());
         let Some(schema) = schema else {
             return Task::ready(Ok(Vec::new()));

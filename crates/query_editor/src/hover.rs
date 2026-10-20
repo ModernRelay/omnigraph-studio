@@ -20,11 +20,11 @@ use project::{
 };
 
 pub struct GqSemantics {
-    session: Option<WeakEntity<GraphSession>>,
+    session: WeakEntity<GraphSession>,
 }
 
 impl GqSemantics {
-    pub fn new(session: Option<WeakEntity<GraphSession>>) -> Self {
+    pub fn new(session: WeakEntity<GraphSession>) -> Self {
         Self { session }
     }
 }
@@ -38,23 +38,27 @@ impl SemanticsProvider for GqSemantics {
     ) -> Option<Task<Option<Vec<Hover>>>> {
         let schema = self
             .session
-            .as_ref()
-            .and_then(WeakEntity::upgrade)
+            .upgrade()
             .and_then(|session| session.read(cx).schema_model())?;
-        let buffer = buffer.read(cx);
-        let text = buffer.text();
-        let offset = position.to_offset(buffer);
-        let found = gq_language::hover(&schema, &text, offset).map(|(range, shown)| {
-            vec![Hover {
-                contents: vec![HoverBlock {
-                    text: shown,
-                    kind: HoverBlockKind::PlainText,
-                }],
-                range: Some(buffer.anchor_before(range.start)..buffer.anchor_after(range.end)),
-                language: None,
-            }]
-        });
-        Some(Task::ready(found))
+        // Worked out off the main thread, on a snapshot (a cheap copy of the rope), as the
+        // completions are: finding what is under the pointer reads the whole text.
+        let snapshot = buffer.read(cx).snapshot();
+        Some(cx.background_executor().spawn(async move {
+            let text = snapshot.text();
+            let offset = position.to_offset(&snapshot);
+            gq_language::hover(&schema, &text, offset).map(|(range, shown)| {
+                vec![Hover {
+                    contents: vec![HoverBlock {
+                        text: shown,
+                        kind: HoverBlockKind::PlainText,
+                    }],
+                    range: Some(
+                        snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end),
+                    ),
+                    language: None,
+                }]
+            })
+        }))
     }
 
     fn inline_values(
