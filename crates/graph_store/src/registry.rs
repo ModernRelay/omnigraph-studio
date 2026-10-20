@@ -148,12 +148,8 @@ impl ConnectionRegistry {
             };
             connection.update(cx, |connection, _| connection.await_token());
             cx.spawn(async move |_, cx| {
-                let token = read
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|(_, bytes)| String::from_utf8(bytes).ok());
-                connection.update(cx, |connection, cx| connection.set_token(token, cx));
+                let read = read.await;
+                connection.update(cx, |connection, cx| connection.token_read(read, cx));
             })
             .detach();
         }
@@ -240,20 +236,26 @@ impl ConnectionRegistry {
     /// changed. A new server is added, with the graphs Studio remembered for it (`saved`); one
     /// no longer named leaves the list (a window open on it keeps its connection); one at a new
     /// address is a new connection; a token changed in the files replaces the connection's; a
-    /// profile's graph is added. Files that could not be read change no server.
+    /// profile's graph is added. Files that could not be read change no server. What they could
+    /// not give, a server they name that cannot be added included, is a change only when it
+    /// differs from what was kept.
     fn apply_operator_files(
         &mut self,
         files: OperatorFiles,
         saved: &SavedServers,
         cx: &mut Context<Self>,
     ) -> bool {
-        let mut changed = files.errors != self.cli_errors;
-        self.cli_errors = files.errors;
-        let Some(servers) = files.servers else {
-            return changed;
+        let OperatorFiles {
+            servers,
+            aliases,
+            mut errors,
+        } = files;
+        let Some(servers) = servers else {
+            return self.keep_cli_errors(errors);
         };
-        if files.aliases != self.aliases {
-            self.aliases = files.aliases;
+        let mut changed = false;
+        if aliases != self.aliases {
+            self.aliases = aliases;
             changed = true;
         }
         let named: Vec<String> = servers
@@ -325,9 +327,17 @@ impl ConnectionRegistry {
                     self.cli_tokens.insert(server.name, token);
                     changed = true;
                 }
-                Err(error) => self.cli_errors.push(error.to_string()),
+                Err(error) => errors.push(error.to_string()),
             }
         }
+        let errors_changed = self.keep_cli_errors(errors);
+        changed || errors_changed
+    }
+
+    /// Keeps `errors` as what the CLI's files could not give, and says whether they changed.
+    fn keep_cli_errors(&mut self, errors: Vec<String>) -> bool {
+        let changed = errors != self.cli_errors;
+        self.cli_errors = errors;
         changed
     }
 
@@ -368,19 +378,18 @@ impl ConnectionRegistry {
             }
             return Ok(existing);
         }
-        if let Some(token) = &token {
-            cx.write_credentials(&url, KEYCHAIN_USER, token.as_bytes())
-                .detach();
-        }
         let entry = ServerEntry {
             name,
-            url,
+            url: url.clone(),
             source: ServerSource::Studio,
             known_graphs: graphs,
         };
         let connection = self
-            .add_connection(entry, token, cx)
+            .add_connection(entry, token.clone(), cx)
             .map_err(anyhow::Error::msg)?;
+        if let Some(token) = &token {
+            Self::save_token(&connection, &url, token, cx);
+        }
         self.save(cx);
         cx.emit(RegistryEvent::ServersChanged);
         cx.notify();
@@ -404,9 +413,20 @@ impl ConnectionRegistry {
             connection.set_token(Some(token.clone()), cx)
         });
         if source == ServerSource::Studio {
-            cx.write_credentials(&url, KEYCHAIN_USER, token.as_bytes())
-                .detach();
+            Self::save_token(connection, &url, &token, cx);
         }
+    }
+
+    /// Saves `token` for the server at `url` in the OS keychain. A save that fails is kept on
+    /// the connection ([`Connection::token_unsaved`]): the token lasts this run only.
+    fn save_token(connection: &Entity<Connection>, url: &str, token: &str, cx: &mut Context<Self>) {
+        let write = cx.write_credentials(url, KEYCHAIN_USER, token.as_bytes());
+        let connection = connection.clone();
+        cx.spawn(async move |_, cx| {
+            let saved = write.await.map_err(|error| error.to_string());
+            connection.update(cx, |connection, cx| connection.token_saved(saved, cx));
+        })
+        .detach();
     }
 
     /// Writes Studio-added servers and remembered graph ids to the data directory.
@@ -599,6 +619,20 @@ mod tests {
         registry.read_with(cx, |registry, _| {
             assert_eq!(registry.cli_errors(), ["could not parse config.yaml"])
         });
+
+        // A server at an address that cannot be one is said once; the same files read again
+        // change nothing.
+        let with_bad = || {
+            files(&[
+                ("a", "http://a2.test", Some("two")),
+                ("bad", "http://bad host", None),
+                ("c", "http://c.test", None),
+            ])
+        };
+        assert!(apply(cx, with_bad()));
+        assert!(find(cx, "bad").is_none());
+        registry.read_with(cx, |registry, _| assert_eq!(registry.cli_errors().len(), 1));
+        assert!(!apply(cx, with_bad()), "nothing else changed");
 
         // Aliases are found by server and graph; one that names no graph is under none.
         let alias = |name: &str, graph: Option<&str>| CliAlias {

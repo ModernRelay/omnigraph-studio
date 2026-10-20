@@ -1,6 +1,7 @@
-//! A fake server for this crate's tests whose branch another writer commits to: the head probe
-//! answers the newest commit, and the change feed the commits after its `start`, with only the
-//! changes to the types it names.
+//! A fake server for tests whose branch another writer commits to: the head probe answers the
+//! newest commit, or is refused when it matches a type the schema no longer declares, and the
+//! change feed the commits after its `start`, with only the changes to the types it names.
+//! Other crates' tests reach it through the `test-support` feature.
 
 use std::sync::{Arc, Mutex};
 
@@ -13,9 +14,9 @@ use crate::connection::{Connection, ServerEntry, ServerSource};
 use crate::session::GraphSession;
 
 /// The rows a read other than the head probe answers with, from its request body.
-pub(crate) type Rows = Box<dyn Fn(&Value) -> Value + Send>;
+pub type Rows = Box<dyn Fn(&Value) -> Value + Send>;
 
-pub(crate) struct Served {
+pub struct Served {
     pub head: String,
     pub schema: String,
     /// The schema read fails, as a server that cannot answer it.
@@ -24,6 +25,8 @@ pub(crate) struct Served {
     pub commits: Vec<(String, String, Vec<Value>)>,
     /// The query string of every feed read.
     pub feeds: Vec<String>,
+    /// The branch list, and what every other route answers: `main` alone at first.
+    pub branches: Vec<String>,
     rows: Rows,
 }
 
@@ -32,6 +35,19 @@ impl Served {
     pub fn commit(&mut self, id: &str, changes: Vec<Value>) {
         let parent = std::mem::replace(&mut self.head, id.to_owned());
         self.commits.push((id.to_owned(), parent, changes));
+    }
+
+    /// Whether the served schema declares the node type head probe `text` matches: a server
+    /// refuses a probe of a type renamed or dropped since the probe was built.
+    fn probes_a_declared_type(&self, text: &str) -> bool {
+        let probed = text
+            .split("$n: ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next());
+        match (probed, gq_language::SchemaModel::parse(&self.schema)) {
+            (Some(ty), Ok(schema)) => schema.node(ty).is_some(),
+            _ => true,
+        }
     }
 
     fn feed(&mut self, query: &str) -> Value {
@@ -80,7 +96,7 @@ impl Served {
 }
 
 /// One update to a node, as the change feed reports it.
-pub(crate) fn node_change(ty: &str, id: &str) -> Value {
+pub fn node_change(ty: &str, id: &str) -> Value {
     json!({
         "kind": "node",
         "type": { "id": ty, "name": ty },
@@ -93,7 +109,7 @@ pub(crate) fn node_change(ty: &str, id: &str) -> Value {
 
 /// A session on a server serving `schema` at head `c1`; reads other than the head probe are
 /// answered at the head with the rows `rows` gives.
-pub(crate) fn followed_session(
+pub fn followed_session(
     schema: &str,
     rows: impl Fn(&Value) -> Value + Send + 'static,
     cx: &mut TestAppContext,
@@ -105,6 +121,7 @@ pub(crate) fn followed_session(
         schema_fails: false,
         commits: Vec::new(),
         feeds: Vec::new(),
+        branches: vec!["main".into()],
         rows: Box::new(rows),
     }));
     let state = served.clone();
@@ -131,6 +148,17 @@ pub(crate) fn followed_session(
                 served.feed(&query)
             } else if path.ends_with("/query") {
                 let asked: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                if asked["name"] == "studio_head"
+                    && !served.probes_a_declared_type(asked["query"].as_str().unwrap_or_default())
+                {
+                    return Ok(Response::builder()
+                        .status(400)
+                        .header(graph_client::CONTRACT_HEADER, "0.13")
+                        .body(AsyncBody::from(
+                            r#"{"error":"unknown node type","code":"bad_request"}"#,
+                        ))
+                        .unwrap());
+                }
                 let rows = if asked["name"] == "studio_head" {
                     json!([])
                 } else {
@@ -145,7 +173,7 @@ pub(crate) fn followed_session(
                     "graph_commit_id": served.head,
                 })
             } else {
-                json!({ "branches": ["main"] })
+                json!({ "branches": served.branches })
             };
             Ok(Response::builder()
                 .status(200)

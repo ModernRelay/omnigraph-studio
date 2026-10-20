@@ -44,6 +44,10 @@ pub enum ConnectionState {
     },
     Unauthorized,
     Unreachable(String),
+    /// The server's token could not be read from the OS keychain (locked, or access denied),
+    /// for this reason. Studio does not connect without it, which the server would refuse as a
+    /// wrong token; a token typed in connects ([`Connection::set_token`]).
+    TokenUnreadable(String),
 }
 
 impl ConnectionState {
@@ -66,6 +70,7 @@ impl ConnectionState {
             }
             ConnectionState::Unauthorized => "Token refused".into(),
             ConnectionState::Unreachable(_) => "Unreachable".into(),
+            ConnectionState::TokenUnreadable(_) => "Token not read from the keychain".into(),
         }
     }
 }
@@ -95,6 +100,9 @@ pub struct Connection {
     /// it. `None` until one answers, and after one fails.
     pub latency: Option<Duration>,
     pub graphs: GraphListing,
+    /// Why the token last typed for this server could not be saved to the OS keychain: it
+    /// lasts this run only. `None` once one is saved.
+    pub token_unsaved: Option<String>,
     _task: Option<Task<()>>,
     /// The next health re-check (spec 003).
     _health_check: Option<Task<()>>,
@@ -124,16 +132,59 @@ impl Connection {
             health: None,
             latency: None,
             graphs: GraphListing::Unknown,
+            token_unsaved: None,
             _task: None,
             _health_check: None,
             token_pending: false,
         })
     }
 
-    /// Notes that the token is being read; [`Connection::set_token`] ends the wait, and a
-    /// connect asked for meanwhile goes then.
+    /// Notes that the token is being read; [`Connection::token_read`] or
+    /// [`Connection::set_token`] ends the wait, and a connect asked for meanwhile goes then.
     pub fn await_token(&mut self) {
         self.token_pending = true;
+    }
+
+    /// Takes the token read from the OS keychain, which is none when none was saved. One that
+    /// could not be read ends the wait without connecting
+    /// ([`ConnectionState::TokenUnreadable`]).
+    pub(crate) fn token_read(
+        &mut self,
+        read: anyhow::Result<Option<(String, Vec<u8>)>>,
+        cx: &mut Context<Self>,
+    ) {
+        let token = match read {
+            Ok(None) => None,
+            Ok(Some((_, bytes))) => match String::from_utf8(bytes) {
+                Ok(token) => Some(token),
+                Err(_) => {
+                    return self.token_unreadable("The keychain's entry is not text.".into(), cx);
+                }
+            },
+            Err(error) => return self.token_unreadable(error.to_string(), cx),
+        };
+        self.set_token(token, cx);
+    }
+
+    /// Ends the wait for a token that could not be read, for `reason`: nothing connects until
+    /// one is typed in.
+    fn token_unreadable(&mut self, reason: String, cx: &mut Context<Self>) {
+        self.token_pending = false;
+        self._task = None;
+        self._health_check = None;
+        self.state = ConnectionState::TokenUnreadable(reason);
+        cx.emit(ConnectionEvent::StateChanged);
+        cx.notify();
+    }
+
+    /// Records how saving the token to the OS keychain ended ([`Connection::token_unsaved`]).
+    pub(crate) fn token_saved(&mut self, saved: Result<(), String>, cx: &mut Context<Self>) {
+        let unsaved = saved.err();
+        if unsaved != self.token_unsaved {
+            self.token_unsaved = unsaved;
+            cx.emit(ConnectionEvent::StateChanged);
+            cx.notify();
+        }
     }
 
     pub(crate) fn client(&self) -> &GraphClient {
@@ -181,6 +232,10 @@ impl Connection {
     pub fn set_token(&mut self, token: Option<String>, cx: &mut Context<Self>) {
         self.token_pending = false;
         self.client.set_token(token);
+        if let ConnectionState::TokenUnreadable(_) = self.state {
+            // The token missing is in.
+            self.state = ConnectionState::Connecting;
+        }
         if self.state != ConnectionState::Idle {
             self.connect(cx);
         }
@@ -198,8 +253,12 @@ impl Connection {
         }
     }
 
-    /// Checks health and contract, then reads the graph list.
+    /// Checks health and contract, then reads the graph list. A connection whose token could
+    /// not be read stays as it is until one is typed in.
     pub fn connect(&mut self, cx: &mut Context<Self>) {
+        if let ConnectionState::TokenUnreadable(_) = self.state {
+            return;
+        }
         self.state = ConnectionState::Connecting;
         // The probe schedules the next check when it ends.
         self._health_check = None;
@@ -458,6 +517,43 @@ mod tests {
             assert!(connection._health_check.is_none());
             assert_eq!(connection.state, ConnectionState::Idle);
         });
+
+        // A token the keychain could not give: the wait ends without connecting, which the
+        // server would refuse as a wrong token, and a connect asked for later sends nothing.
+        // A token typed in connects. A token that could not be saved says so.
+        sent.lock().unwrap().clear();
+        connection.update(cx, |connection, cx| {
+            connection.await_token();
+            connection.connect(cx);
+            connection.token_read(Err(anyhow::anyhow!("the keychain is locked")), cx);
+            connection.connect(cx);
+        });
+        cx.run_until_parked();
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(
+                connection.state,
+                ConnectionState::TokenUnreadable("the keychain is locked".into())
+            )
+        });
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "nothing sent without the token"
+        );
+        connection.update(cx, |connection, cx| {
+            connection.set_token(Some("typed".into()), cx);
+            connection.token_saved(Err("access denied".into()), cx);
+        });
+        cx.run_until_parked();
+        connection.read_with(cx, |connection, _| {
+            assert_eq!(connection.state, ConnectionState::Ready);
+            assert_eq!(connection.token_unsaved.as_deref(), Some("access denied"));
+        });
+        assert!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .all(|token| token.as_deref() == Some("Bearer typed"))
+        );
     }
 
     /// A refused token stays refused through health checks, which pass without one: the

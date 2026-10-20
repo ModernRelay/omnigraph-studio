@@ -255,6 +255,14 @@ pub enum Since {
 pub(crate) struct ChangeLog {
     commits: HashMap<String, Logged>,
     order: VecDeque<String>,
+    /// Where each commit a walk back can meet stands, older lower: every commit recorded, and
+    /// the parent of each when nothing ranked it before (the commit a read started after). A
+    /// walk back by first parent meets them in falling rank, so it can stop once past the
+    /// oldest it looks for.
+    ranks: HashMap<String, u64>,
+    /// The commits `ranks` holds, lowest first, and the rank the next one takes.
+    ranked: VecDeque<String>,
+    next_rank: u64,
     /// The commit the next feed read starts after: the newest one recorded, or a head seen
     /// while nothing was recorded.
     pub(crate) last: Option<String>,
@@ -274,27 +282,68 @@ impl ChangeLog {
     }
 
     pub(crate) fn record(&mut self, commit: String, logged: Logged) {
+        if let Some(parent) = &logged.parent {
+            self.rank_next(parent);
+        }
+        self.rank_next(&commit);
         if self.commits.insert(commit.clone(), logged).is_none() {
             self.order.push_back(commit.clone());
         }
         while self.order.len() > LOG_COMMITS {
             if let Some(oldest) = self.order.pop_front() {
                 self.commits.remove(&oldest);
+                self.forget_ranks_below(&oldest);
             }
         }
         self.last = Some(commit);
     }
 
+    /// Where `commit` stands among the commits a walk back through the log can meet, older
+    /// lower; `None` for one no walk meets.
+    pub(crate) fn rank(&self, commit: &str) -> Option<u64> {
+        self.ranks.get(commit).copied()
+    }
+
+    /// Ranks `commit` above every commit ranked, unless it has a rank.
+    fn rank_next(&mut self, commit: &str) {
+        if self.ranks.contains_key(commit) {
+            return;
+        }
+        self.ranks.insert(commit.to_owned(), self.next_rank);
+        self.ranked.push_back(commit.to_owned());
+        self.next_rank += 1;
+    }
+
+    /// Forgets the ranks below `gone`'s, a commit the log let go: a walk back ends at it, the
+    /// parent of the oldest commit kept, and meets nothing older.
+    fn forget_ranks_below(&mut self, gone: &str) {
+        let Some(floor) = self.rank(gone) else {
+            return;
+        };
+        while self
+            .ranked
+            .front()
+            .and_then(|front| self.rank(front))
+            .is_some_and(|rank| rank < floor)
+        {
+            if let Some(front) = self.ranked.pop_front() {
+                self.ranks.remove(&front);
+            }
+        }
+    }
+
     /// What the commits after `from` up to and including `to` changed, walking back from `to`
     /// by first parent; `None` when one of them is not in the log.
     pub(crate) fn since(&self, from: &str, to: &str) -> Option<ChangesSince> {
+        let from_rank = self.rank(from)?;
         let mut found = None;
         self.since_each(to, |start, range| {
             if start == from {
                 found = Some(range.clone());
                 return true;
             }
-            false
+            // Below `from`'s rank, the walk is past it.
+            self.rank(start).is_some_and(|rank| rank < from_rank)
         });
         found
     }
@@ -540,6 +589,42 @@ pub(crate) mod tests {
             ["c3", "c2"],
             "newest first, until the visit ends the walk"
         );
+    }
+
+    /// A walk back meets commits in falling rank: each commit recorded ranks above its parent,
+    /// the commit the log started after included, and one no walk meets has none. A log that
+    /// lets its oldest commits go keeps the rank of the last one gone, the parent of the
+    /// oldest kept, and forgets those below it.
+    #[test]
+    fn commits_rank_in_the_order_a_walk_back_meets_them() {
+        let short = log(
+            &[page(
+                json!([
+                    block("c2", "c1", json!([])),
+                    block("c3", "c2", json!([])),
+                    block("c9", "c7", json!([])),
+                ]),
+                true,
+            )],
+            &["Person"],
+        );
+        let ranks: Vec<u64> = ["c1", "c2", "c3", "c7", "c9"]
+            .iter()
+            .map(|commit| short.rank(commit).unwrap())
+            .collect();
+        assert!(ranks.windows(2).all(|pair| pair[0] < pair[1]), "{ranks:?}");
+        assert_eq!(short.rank("c0"), None);
+        // A start ranked above the commit asked for is not on the walk back from it.
+        assert!(short.since("c3", "c2").is_none());
+
+        // One commit more than the log keeps: c2 goes.
+        let blocks: Vec<Value> = (2..=LOG_COMMITS + 2)
+            .map(|n| block(&format!("c{n}"), &format!("c{}", n - 1), json!([])))
+            .collect();
+        let long = log(&[page(Value::Array(blocks), true)], &["Person"]);
+        assert_eq!(long.rank("c1"), None, "below the commit gone");
+        assert!(long.rank("c2").is_some(), "the parent of the oldest kept");
+        assert!(long.since("c2", &format!("c{}", LOG_COMMITS + 2)).is_some());
     }
 
     #[test]

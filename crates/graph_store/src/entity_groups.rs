@@ -470,18 +470,6 @@ impl EntityGroups {
         ends
     }
 
-    /// The lines of group `ix`'s card: the relationship changes reviewed there, then the
-    /// mirrors, each with its other end named, from the review or else from `names`.
-    pub fn entries(
-        &self,
-        folded: &FoldedChanges,
-        ix: usize,
-        schema: Option<&SchemaModel>,
-        names: &NodeNames,
-    ) -> Vec<RelationshipEntry> {
-        self.lines(folded, ix, schema, names, usize::MAX).entries
-    }
-
     /// Each line of group `ix`'s card in order, as its change and whether it is a mirror.
     fn line_changes(&self, ix: usize) -> impl Iterator<Item = (&GroupRelationship, bool)> {
         let group = &self.groups[ix];
@@ -507,9 +495,10 @@ impl EntityGroups {
             .position(|(relationship, _)| relationship.change == change)
     }
 
-    /// Group `ix`'s card's first `take` lines ([`Self::entries`]) and what all its lines count,
-    /// counted when the groups were made: a node with thousands of relationship changes draws
-    /// its first few at the cost of a few.
+    /// Group `ix`'s card's first `take` lines and what all its lines count, counted when the
+    /// groups were made: the relationship changes reviewed there, then the mirrors, each with
+    /// its other end named, from the review or else from `names`. A node with thousands of
+    /// relationship changes draws its first few at the cost of a few.
     pub fn lines(
         &self,
         folded: &FoldedChanges,
@@ -811,7 +800,9 @@ mod tests {
             .collect();
         assert_eq!(ends, ["Person:ana", "Person:bob", "Company:acme"]);
         let names = NodeNames::from([(("Person".into(), "ana".into()), "Ana Lima".into())]);
-        let lines = groups.entries(&folded, 0, Some(&schema), &names);
+        let lines = groups
+            .lines(&folded, 0, Some(&schema), &names, usize::MAX)
+            .entries;
         assert_eq!(lines[0].other, "Ana Lima", "a name read from the graph");
         // Theo's label is his key: the id is his name.
         assert_eq!(lines[1].other, "theo");
@@ -867,7 +858,9 @@ mod tests {
         ]);
         let groups = EntityGroups::new(&folded, Some(&schema));
         assert_eq!(groups.groups[0].repoints, [(1, 2)]);
-        let lines = groups.entries(&folded, 0, Some(&schema), &NodeNames::default());
+        let lines = groups
+            .lines(&folded, 0, Some(&schema), &NodeNames::default(), usize::MAX)
+            .entries;
         let moved: Vec<_> = lines
             .iter()
             .map(|line| (line.change, line.net, line.replaces.clone()))

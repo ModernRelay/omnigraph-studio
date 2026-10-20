@@ -25,5 +25,9 @@ url = { workspace = true }
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 
+[features]
+# The fake server (`test_server`), for the tests of crates that show a session.
+test-support = ["gpui/test-support"]
+
 [lints]
 workspace = true

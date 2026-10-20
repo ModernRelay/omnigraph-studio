@@ -191,7 +191,7 @@ pub const MIN_SERVER_VERSION: (u64, u64) = (0, 14);
 
 /// A server version's major and minor numbers: `0.14.0`, and an edge build such as
 /// `0.14.0-edge+d883c49`, are both (0, 14).
-pub fn server_version(version: &str) -> Option<(u64, u64)> {
+fn server_version(version: &str) -> Option<(u64, u64)> {
     let mut parts = version.trim().split(['.', '-', '+']);
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
@@ -237,7 +237,7 @@ pub enum BlobMeta {
 }
 
 /// The most bytes [`GraphClient::blob_bytes`] reads in one request.
-pub const BLOB_READ_MAX: u64 = 16 * 1024 * 1024;
+const BLOB_READ_MAX: u64 = 16 * 1024 * 1024;
 
 /// A server address as typed, made into the root URL a client is built on: trimmed, without a
 /// trailing slash, and with `http://` (loopback hosts) or `https://` (any other host) when no
@@ -600,8 +600,8 @@ impl GraphClient {
         }
     }
 
-    /// `GET /graphs/{id}/blob` with a `Range`: bytes `range` of a managed value, at most
-    /// [`BLOB_READ_MAX`]. An external reference is refused; Studio never fetches it.
+    /// `GET /graphs/{id}/blob` with a `Range`: bytes `range` of a managed value, at most 16 MiB
+    /// (`BLOB_READ_MAX`). An external reference is refused; Studio never fetches it.
     pub async fn blob_bytes(
         &self,
         graph: &str,

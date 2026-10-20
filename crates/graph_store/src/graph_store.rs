@@ -16,8 +16,8 @@ mod memo;
 mod registry;
 pub mod scope;
 mod session;
-#[cfg(test)]
-mod test_server;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_server;
 
 use std::sync::Arc;
 

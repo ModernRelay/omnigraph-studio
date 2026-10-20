@@ -1054,9 +1054,8 @@ impl ExploreState {
                         .iter()
                         .filter_map(|column| {
                             let value = row.get(*column)?;
-                            (!value.is_null()).then(|| {
-                                (column.trim_start_matches("e_").to_owned(), value.clone())
-                            })
+                            let property = column.strip_prefix("e_")?;
+                            (!value.is_null()).then(|| (property.to_owned(), value.clone()))
                         })
                         .collect(),
                 })
@@ -1649,7 +1648,7 @@ impl Exploration {
                     &key.node.type_name,
                     &key.group,
                     &key.node.id,
-                    list.next_after(),
+                    list.next_after().map(builder::After::Neighbour),
                     narrow,
                     page_size,
                 )
@@ -1841,14 +1840,8 @@ impl Exploration {
         }
         match target {
             LoadTarget::Root => self.state.apply_root(&output),
-            LoadTarget::Count(key) => {
-                let count = rows(&output)
-                    .first()
-                    .and_then(|row| row.get("n"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                self.state.apply_count(key.clone(), count)
-            }
+            // A count is read with the others asked for this turn, and taken by `spawn_count`.
+            LoadTarget::Count(_) => {}
             LoadTarget::Values(key, by) => {
                 self.state
                     .apply_values(key.clone(), by.clone(), &output, VALUES_LIMIT)

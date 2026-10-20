@@ -215,7 +215,7 @@ fn load_operator_from(path: &Path) -> Result<(Vec<CliServer>, Vec<CliAlias>), St
 }
 
 /// `intel-dev` → `OMNIGRAPH_TOKEN_INTEL_DEV`.
-pub fn token_env_name(server: &str) -> String {
+fn token_env_name(server: &str) -> String {
     let mut name = String::from("OMNIGRAPH_TOKEN_");
     for c in server.chars() {
         name.push(match c {
@@ -242,7 +242,9 @@ fn token_in(dir: Option<&Path>, server: &str) -> Result<Option<String>, String> 
     Ok(None)
 }
 
-pub fn read_credential_at(path: &Path, server: &str) -> Result<Option<String>, String> {
+/// The token `[server]` holds in the credentials file at `path`, refused when other users can
+/// read the file.
+fn read_credential_at(path: &Path, server: &str) -> Result<Option<String>, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
