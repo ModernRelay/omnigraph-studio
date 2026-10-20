@@ -1,5 +1,6 @@
 //! How the canvas looks (spec 006): a faint dot grid; hairline grey lines; every node,
-//! type, hub and "+K more" a chip, a white pill with a hairline and a soft contact shadow, with
+//! type, hub and "+K more" a chip, a white pill with interfaces.dev's shadow (a 1 px ring and
+//! two soft drops, on its `#fcfcfc` ground), with
 //! the type's letter mark and a muted count. Pointing at a chip lights its lines and fades the
 //! rest; the selected chip carries a warm ring. Colour is kept to the small type marks.
 
@@ -10,6 +11,7 @@ use gpui::{
     App, BorderStyle, Bounds, BoxShadow, Corners, Font, FontWeight, Hsla, PathBuilder, Pixels,
     Point, ShapedLine, SharedString, TextAlign, TextRun, Window, point, px, quad, size,
 };
+use studio_ui::ds::elevation::Layer;
 use studio_ui::type_color;
 
 use crate::model::{Scene, SceneKind, SceneNode};
@@ -19,17 +21,16 @@ pub(crate) struct Palette {
     pub muted: Hsla,
     /// The chip fill.
     pub card: Hsla,
-    /// The chip hairline.
-    pub border: Hsla,
-    /// A chip's shadow, the design system's floating one.
-    pub shadow: Vec<BoxShadow>,
+    /// A chip's shadow, its ring first: interfaces.dev's `--shadow-custom`, painted as a
+    /// browser paints it ([`studio_ui::ds::elevation::paint_layers`]).
+    pub shadow: Vec<Layer>,
+    /// The same under the pointer (`--shadow-custom-hover`).
+    pub pointed: Vec<Layer>,
     /// A type mark's letter on its tint.
     pub on_tint: Hsla,
     /// Where you are: the selected or marked chip's ring, and its halo.
     pub here: Hsla,
     pub here_halo: Hsla,
-    /// A pointed chip's hairline.
-    pub pointed: Hsla,
     /// The dot grid's dots.
     pub grid_dot: Hsla,
     /// A relationship label's fill, and a closed hub's dot from afar.
@@ -491,10 +492,16 @@ pub(crate) fn paint(
                 &pieces,
                 None,
                 LABEL_TEXT * scale.max(0.8),
+                // Every line named up front: the ring alone, so the names do not read as chips.
                 PillStyle {
                     fill: palette.label_fill.opacity(alpha),
-                    border: palette.border.opacity(alpha),
-                    shadow: !label_all,
+                    border: None,
+                    shadow: if label_all {
+                        &palette.shadow[..1]
+                    } else {
+                        &palette.shadow
+                    },
+                    alpha,
                     ring: None,
                 },
                 palette,
@@ -573,13 +580,6 @@ pub(crate) fn paint(
             })
             .collect();
         let size = text.size * scale;
-        let border = if focus {
-            palette.here
-        } else if pointed {
-            palette.pointed
-        } else {
-            palette.border
-        };
         rects[index] = paint_pill(
             p,
             &pieces,
@@ -587,8 +587,13 @@ pub(crate) fn paint(
             size,
             PillStyle {
                 fill: palette.card.opacity(alpha),
-                border: border.opacity(alpha),
-                shadow: true,
+                border: focus.then_some(palette.here.opacity(alpha)),
+                shadow: if pointed {
+                    &palette.pointed
+                } else {
+                    &palette.shadow
+                },
+                alpha,
                 ring: focus.then_some(palette.here_halo),
             },
             palette,
@@ -611,8 +616,9 @@ pub(crate) fn paint(
             text_size,
             PillStyle {
                 fill: palette.card,
-                border: if focus { palette.here } else { palette.pointed },
-                shadow: true,
+                border: focus.then_some(palette.here),
+                shadow: &palette.pointed,
+                alpha: 1.,
                 ring: focus.then_some(palette.here_halo),
             },
             palette,
@@ -763,13 +769,48 @@ fn paint_dots(bounds: Bounds<Pixels>, palette: &Palette, window: &mut Window) {
     }
 }
 
-struct PillStyle {
+struct PillStyle<'a> {
     fill: Hsla,
-    border: Hsla,
-    /// A soft contact shadow.
-    shadow: bool,
+    /// A hairline inside the chip: only where you are; otherwise its shadow's ring outlines it.
+    border: Option<Hsla>,
+    /// Its shadow, the ring first, faded with the chip by `alpha`.
+    shadow: &'a [Layer],
+    alpha: f32,
     /// The focus ring's glow.
     ring: Option<Hsla>,
+}
+
+/// Paints a chip's glow, shadow and body: the shadow as a browser draws a CSS `box-shadow`
+/// (each layer's corner with its spread), then the fill and, where you are, the hairline.
+fn paint_chip_body(rect: Bounds<Pixels>, radius: f32, style: &PillStyle, window: &mut Window) {
+    if let Some(ring) = style.ring {
+        window.paint_drop_shadows(
+            rect,
+            Corners::all(px(radius)),
+            &[BoxShadow {
+                color: ring,
+                offset: point(px(0.), px(0.)),
+                blur_radius: px(0.),
+                spread_radius: px(3.),
+                inset: false,
+            }],
+        );
+    }
+    for layer in style.shadow {
+        let layer = Layer {
+            color: layer.color.opacity(style.alpha),
+            ..*layer
+        };
+        studio_ui::ds::elevation::paint_layers(rect, radius, &[layer], window);
+    }
+    window.paint_quad(quad(
+        rect,
+        Corners::all(px(radius)),
+        style.fill,
+        px(if style.border.is_some() { 1. } else { 0. }),
+        style.border.unwrap_or(gpui::transparent_black()),
+        BorderStyle::Solid,
+    ));
 }
 
 /// A chip centred on `at`: an optional letter mark, then the pieces of text. Returns its bounds.
@@ -820,31 +861,8 @@ fn paint_pill(
         size(px(width), px(height)),
     );
     // A chip is not a button: the scale's `sm` corner, zoomed with it, never past round.
-    let radius = Corners::all(px((studio_ui::ds::radii(cx).sm * s).min(height / 2.)));
-    if let Some(ring) = style.ring {
-        window.paint_drop_shadows(
-            rect,
-            radius,
-            &[BoxShadow {
-                color: ring,
-                offset: point(px(0.), px(0.)),
-                blur_radius: px(0.),
-                spread_radius: px(3.),
-                inset: false,
-            }],
-        );
-    }
-    if style.shadow {
-        window.paint_drop_shadows(rect, radius, &palette.shadow);
-    }
-    window.paint_quad(quad(
-        rect,
-        radius,
-        style.fill,
-        px(1.),
-        style.border,
-        BorderStyle::Solid,
-    ));
+    let radius = (studio_ui::ds::radii(cx).sm * s).min(height / 2.);
+    paint_chip_body(rect, radius, &style, window);
     let mut x = f32::from(rect.left()) + pad_x;
     let middle = at.y;
     if let Some((tint, letter)) = mark {
@@ -927,31 +945,8 @@ fn paint_open_chip(
     let width = (pad_x * 2. + mark_size + gap + text_width).max(f32::from(chip.size.width));
     let height = (text_height + pad_y * 2.).max(f32::from(chip.size.height));
     let rect = Bounds::new(chip.origin, size(px(width), px(height)));
-    let radius = Corners::all(px(studio_ui::ds::radii(cx).sm * s));
-    if let Some(ring) = style.ring {
-        window.paint_drop_shadows(
-            rect,
-            radius,
-            &[BoxShadow {
-                color: ring,
-                offset: point(px(0.), px(0.)),
-                blur_radius: px(0.),
-                spread_radius: px(3.),
-                inset: false,
-            }],
-        );
-    }
-    if style.shadow {
-        window.paint_drop_shadows(rect, radius, &palette.shadow);
-    }
-    window.paint_quad(quad(
-        rect,
-        radius,
-        style.fill,
-        px(1.),
-        style.border,
-        BorderStyle::Solid,
-    ));
+    let radius = studio_ui::ds::radii(cx).sm * s;
+    paint_chip_body(rect, radius, &style, window);
     // The mark stays where the chip had it, beside the first line.
     let left = f32::from(rect.left()) + pad_x;
     let first_middle = rect.top() + px(pad_y + line_height / 2.);

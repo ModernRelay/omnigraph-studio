@@ -11,7 +11,7 @@
 
 use gpui::{
     AnyView, App, BoxShadow, ClickEvent, CursorStyle, DefiniteLength, ElementId, FocusHandle, Hsla,
-    MouseButton, Role, Stateful, Window, point,
+    MouseButton, Role, Stateful, Window,
 };
 use ui::prelude::*;
 use ui::{ElevationIndex, KeyBinding, TintColor};
@@ -94,24 +94,9 @@ fn paint(variant: Variant, selected: bool, cx: &App) -> Paint {
             fill: ink,
             hover: ink.opacity(0.9),
             active: ink.opacity(0.84),
+            // Its ring in its own fill, as interfaces.dev's primary.
             border: ink,
-            shadows: vec![
-                // A light catching the top edge, and a contact shadow in the ink's own colour.
-                BoxShadow {
-                    color: gpui::white().opacity(0.16),
-                    offset: point(px(0.), px(1.)),
-                    blur_radius: px(0.),
-                    spread_radius: px(0.),
-                    inset: true,
-                },
-                BoxShadow {
-                    color: ink.opacity(0.24),
-                    offset: point(px(0.), px(1.)),
-                    blur_radius: px(2.),
-                    spread_radius: px(0.),
-                    inset: false,
-                },
-            ],
+            shadows: ds::elevation::filled(ink),
             ink: Color::Custom(colors.editor_background),
         },
         Variant::Destructive => {
@@ -120,36 +105,23 @@ fn paint(variant: Variant, selected: bool, cx: &App) -> Paint {
                 fill: red,
                 hover: red.opacity(0.9),
                 active: red.opacity(0.84),
+                // As the primary, in red.
                 border: red,
-                // As the primary: a light top edge inside, a tinted contact shadow.
-                shadows: vec![
-                    BoxShadow {
-                        color: gpui::white().opacity(0.16),
-                        offset: point(px(0.), px(1.)),
-                        blur_radius: px(0.),
-                        spread_radius: px(0.),
-                        inset: true,
-                    },
-                    BoxShadow {
-                        color: red.opacity(0.24),
-                        offset: point(px(0.), px(1.)),
-                        blur_radius: px(2.),
-                        spread_radius: px(0.),
-                        inset: false,
-                    },
-                ],
+                shadows: ds::elevation::filled(red),
                 ink: Color::Custom(gpui::white()),
             }
         }
+        // interfaces.dev's secondary button: its hairline and two soft drops
+        // (`shadow-custom`), and a fill a shade off white under the pointer.
         Variant::Outline => Paint {
             fill: if selected {
                 colors.editor_background.blend(pressed)
             } else {
                 colors.editor_background
             },
-            hover: colors.editor_background.blend(ink.opacity(0.02)),
+            hover: ds::surface::control_hover(colors.editor_background, cx),
             active: colors.editor_background.blend(pressed),
-            border: ink.opacity(0.1),
+            border: clear,
             shadows: ds::elevation::control(cx),
             ink: Color::Default,
         },
@@ -177,7 +149,7 @@ fn paint(variant: Variant, selected: bool, cx: &App) -> Paint {
             fill: ds::surface::glass(colors.elevated_surface_background, 0.92, cx),
             hover: ds::surface::glass(colors.elevated_surface_background, 0.98, cx),
             active: ds::surface::glass(colors.elevated_surface_background, 0.98, cx).blend(pressed),
-            border: ink.opacity(0.08),
+            border: ds::surface::outline(cx),
             shadows: ds::elevation::float(cx),
             ink: Color::Default,
         },

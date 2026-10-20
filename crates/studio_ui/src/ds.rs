@@ -8,8 +8,8 @@
 //! elevation.
 
 use gpui::{
-    AnyElement, App, BoxShadow, ClickEvent, Div, ElementId, Hsla, MouseButton, SharedString,
-    Stateful, Window, point,
+    AnyElement, App, Bounds, BoxShadow, ClickEvent, Corners, Div, ElementId, Hsla, MouseButton,
+    Pixels, SharedString, Stateful, Window, point,
 };
 use studio_settings::{StudioSettings, WindowStyle};
 use ui::prelude::*;
@@ -321,14 +321,65 @@ pub mod surface {
         }
     }
 
-    /// The rule between regions and rows: a hairline when flat; on glass 14% ink, which a
-    /// row's or a section's dotted rule (`super::dotted`) lands at about half a solid line's
+    /// The rule between regions and rows: the [`divider`] when flat; on glass 14% ink, which
+    /// a row's or a section's dotted rule (`super::dotted`) lands at about half a solid line's
     /// weight. A region's edge (a toolbar's, a strip's, a pane's) stays solid in both styles.
     pub fn rule(cx: &App) -> Hsla {
         if is_glass(cx) {
             gpui::black().opacity(0.14)
         } else {
-            cx.theme().colors().border_variant.opacity(0.6)
+            divider(cx)
+        }
+    }
+
+    /// The hairline around a surface (a button, a card, a field, a menu), drawn as its 1 px
+    /// border: interfaces.dev's `--shadow-border` ring, `#0000000f` in a light theme and
+    /// `#ffffff14` in a dark one. Its hovered and pressed steps are [`outline_hover`] and
+    /// [`outline_pressed`]; the drops that go with it are [`super::elevation::custom`].
+    pub fn outline(cx: &App) -> Hsla {
+        super::elevation::layers(super::elevation::Lift::Rest, cx)[0].color
+    }
+
+    /// The hovered [`outline`] (`--shadow-custom-hover`'s ring): `#00000014` / `#ffffff21`.
+    pub fn outline_hover(cx: &App) -> Hsla {
+        super::elevation::layers(super::elevation::Lift::Hover, cx)[0].color
+    }
+
+    /// The pressed or focused [`outline`] (`--shadow-custom-active`'s ring): `#0000001f` /
+    /// `#ffffff33`.
+    pub fn outline_pressed(cx: &App) -> Hsla {
+        super::elevation::layers(super::elevation::Lift::Pressed, cx)[0].color
+    }
+
+    /// A line that divides (rows in a list, a toolbar's edge, a checkbox's or an outlined
+    /// chip's edge): interfaces.dev's `--color-gray-400`, `#e8e8e8` on a white page, as 9 %
+    /// black so it holds on any fill; in a dark theme 8 % white (its `#1f1f1f` on `#0b0b0b`).
+    pub fn divider(cx: &App) -> Hsla {
+        if cx.theme().appearance.is_light() {
+            gpui::black().opacity(23. / 255.)
+        } else {
+            gpui::white().opacity(20. / 255.)
+        }
+    }
+
+    /// The canvas's ground, under its chips: interfaces.dev's `--color-gray-background`
+    /// (`#fcfcfc`), so a white chip and its hairline read as they do there; in a dark theme
+    /// the document's own fill, under lighter chips.
+    pub fn canvas(cx: &App) -> Hsla {
+        if cx.theme().appearance.is_light() {
+            document(cx).blend(gpui::black().opacity(3. / 255.))
+        } else {
+            document(cx)
+        }
+    }
+
+    /// An outlined control's fill when hovered: interfaces.dev's `hover:bg-gray-100`, `#fcfcfc`
+    /// over white, and in a dark theme its `#111` over `#0b0b0b`.
+    pub fn control_hover(fill: Hsla, cx: &App) -> Hsla {
+        if cx.theme().appearance.is_light() {
+            fill.blend(gpui::black().opacity(3. / 255.))
+        } else {
+            fill.blend(gpui::white().opacity(6. / 255.))
         }
     }
 
@@ -338,23 +389,14 @@ pub mod surface {
         gpui::black().opacity(0.015)
     }
 
-    /// A card's hairline, and the rule inside it over its footer: raised on glass, the
-    /// theme's border softened when flat.
+    /// A card's hairline, and the rule inside it over its footer: the [`outline`].
     pub fn card_border(cx: &App) -> Hsla {
-        if is_glass(cx) {
-            raised_border(cx)
-        } else {
-            cx.theme().colors().border.opacity(0.7)
-        }
+        outline(cx)
     }
 
-    /// The hairline of a solid item that sits on glass.
+    /// The hairline of a solid item that sits on glass: the [`outline`].
     pub fn raised_border(cx: &App) -> Hsla {
-        if cx.theme().appearance.is_light() {
-            gpui::black().opacity(0.07)
-        } else {
-            gpui::white().opacity(0.07)
-        }
+        outline(cx)
     }
 
     /// Sunken areas: header strips, code blocks, a card's header. The editor background, 2%
@@ -413,10 +455,10 @@ pub mod surface {
         cx.theme().colors().elevated_surface_background
     }
 
-    /// The hairline of a floating surface (a modal, a menu): 8 % ink, the same in both
-    /// styles, so it reads on the dim behind a modal as on the page.
+    /// The hairline of a floating surface (a modal, a menu, a chip on the canvas): the
+    /// [`outline`], so every surface has the one hairline.
     pub fn floating_border(cx: &App) -> Hsla {
-        cx.theme().colors().text.opacity(0.08)
+        outline(cx)
     }
 
     /// The light veil behind the command palette: the page keeps its colour behind it.
@@ -504,9 +546,11 @@ pub mod surface {
         cx.theme().colors().drop_target_background
     }
 
-    /// A control's hairline: an outlined field or chip (10 % ink, as an outline button's).
+    /// The edge of a checkbox, an outlined chip or a composer control: the [`divider`], as
+    /// interfaces.dev's checkbox (`border-gray-400`). A field or a button is a surface and has
+    /// the [`outline`] instead.
     pub fn control_border(cx: &App) -> Hsla {
-        cx.theme().colors().text.opacity(0.1)
+        divider(cx)
     }
 
     /// The focused control's ring, and a line being dragged (a column's new width).
@@ -628,17 +672,188 @@ pub mod surface {
 
 /// Elevation as layered transparent shadows (better-ui: shadows for elevation, borders for
 /// structure).
+///
+/// Every value here is a CSS `box-shadow` layer as a browser draws it. GPUI takes a shadow's
+/// `blur_radius` as the Gaussian's sigma, where CSS's blur is twice the sigma, so a layer's
+/// blur is halved on the way in ([`Layer::shadow`]); copied as written, it would draw twice as
+/// soft.
 pub mod elevation {
     use super::*;
 
-    fn shadow(alpha: f32, y: f32, blur: f32, spread: f32) -> BoxShadow {
-        BoxShadow {
-            color: gpui::black().opacity(alpha),
-            offset: point(px(0.), px(y)),
-            blur_radius: px(blur),
-            spread_radius: px(spread),
-            inset: false,
+    /// One CSS `box-shadow` layer, in the reference's own terms: `blur` is CSS's, and `spread`
+    /// grows (or shrinks) the box it is cast from.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Layer {
+        pub color: Hsla,
+        pub y: f32,
+        pub blur: f32,
+        pub spread: f32,
+    }
+
+    impl Layer {
+        const fn black(alpha: f32, y: f32, blur: f32, spread: f32) -> Self {
+            Self {
+                color: Hsla {
+                    h: 0.,
+                    s: 0.,
+                    l: 0.,
+                    a: alpha,
+                },
+                y,
+                blur,
+                spread,
+            }
         }
+
+        const fn white(alpha: f32, y: f32, blur: f32, spread: f32) -> Self {
+            Self {
+                color: Hsla {
+                    h: 0.,
+                    s: 0.,
+                    l: 1.,
+                    a: alpha,
+                },
+                y,
+                blur,
+                spread,
+            }
+        }
+
+        /// The layer as GPUI draws it under the same box: CSS's blur is twice GPUI's sigma.
+        pub fn shadow(self) -> BoxShadow {
+            BoxShadow {
+                color: self.color,
+                offset: point(px(0.), px(self.y)),
+                blur_radius: px(self.blur / 2.),
+                spread_radius: px(self.spread),
+                inset: false,
+            }
+        }
+
+        /// The corner a browser gives this layer on a box whose corner is `radius`
+        /// (CSS Backgrounds 3, "spread distance"): a spread adds to the corner, scaled down
+        /// when the corner is smaller than the spread, and a negative one takes from it.
+        pub fn corner(self, radius: f32) -> f32 {
+            let spread = self.spread;
+            if spread < 0. {
+                (radius + spread).max(0.)
+            } else if radius <= 0. || spread == 0. {
+                radius
+            } else if radius >= spread {
+                radius + spread
+            } else {
+                let ratio = radius / spread;
+                radius + spread * (1. + (ratio - 1.).powi(3))
+            }
+        }
+    }
+
+    /// How engaged a surface is: at rest, under the pointer, pressed or focused.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Lift {
+        Rest,
+        Hover,
+        Pressed,
+    }
+
+    /// interfaces.dev's `--shadow-custom`, its `-hover` and its `-active`, the one shadow of
+    /// every button, chip, pill and card there: a 1 px ring, then two soft drops in a light
+    /// theme; the ring alone in a dark one. The ring comes first.
+    const LIGHT: [[Layer; 3]; 3] = [
+        [
+            Layer::black(15. / 255., 0., 0., 1.),
+            Layer::black(15. / 255., 1., 2., -1.),
+            Layer::black(10. / 255., 2., 4., 0.),
+        ],
+        [
+            Layer::black(20. / 255., 0., 0., 1.),
+            Layer::black(20. / 255., 1., 2., -1.),
+            Layer::black(15. / 255., 2., 4., 0.),
+        ],
+        [
+            Layer::black(31. / 255., 0., 0., 1.),
+            Layer::black(26. / 255., 1., 2., -1.),
+            Layer::black(20. / 255., 2., 4., 0.),
+        ],
+    ];
+    const DARK: [Layer; 3] = [
+        Layer::white(20. / 255., 0., 0., 1.),
+        Layer::white(33. / 255., 0., 0., 1.),
+        Layer::white(51. / 255., 0., 0., 1.),
+    ];
+
+    /// The layers of [`LIGHT`] or [`DARK`] at `lift`, the ring first.
+    pub fn layers(lift: Lift, cx: &App) -> Vec<Layer> {
+        let step = match lift {
+            Lift::Rest => 0,
+            Lift::Hover => 1,
+            Lift::Pressed => 2,
+        };
+        if dark(cx) {
+            vec![DARK[step]]
+        } else {
+            LIGHT[step].to_vec()
+        }
+    }
+
+    /// [`layers`] at `lift` as an element's shadows, the ring first and outside the box, as
+    /// CSS draws them: the drops darken the ring where they cross it, which a ring drawn as the
+    /// element's border would hide under its fill. The element's own border is clear
+    /// ([`super::lifted`]). GPUI keeps the element's corner for every layer where CSS grows it
+    /// with the spread, so the ring is a little heavier at a corner.
+    pub fn lift(lift: Lift, cx: &App) -> Vec<BoxShadow> {
+        layers(lift, cx).into_iter().map(Layer::shadow).collect()
+    }
+
+    /// interfaces.dev's `--shadow-custom` at rest: a card, a field, a pill, a bar, an outlined
+    /// button ([`lift`]).
+    pub fn custom(cx: &App) -> Vec<BoxShadow> {
+        lift(Lift::Rest, cx)
+    }
+
+    /// Paints `layers` under a shape its painter draws itself (a chip on the canvas) as a
+    /// browser draws a CSS `box-shadow` on a box of `bounds` and `radius`: the ring outside
+    /// the shape, and each layer's corner grown or shrunk with its spread.
+    pub fn paint_layers(
+        bounds: Bounds<Pixels>,
+        radius: f32,
+        layers: &[Layer],
+        window: &mut Window,
+    ) {
+        for layer in layers {
+            window.paint_drop_shadows(
+                bounds,
+                Corners::all(px(layer.corner(radius))),
+                &[layer.shadow()],
+            );
+        }
+    }
+
+    /// A solid button's shadow (interfaces.dev's primary): a faint white haze inside
+    /// (`inset 0 0 1px 1px`), a 1.5 px drop at 10 % black, and a 1 px ring outside in the
+    /// button's own `fill`.
+    pub fn filled(fill: Hsla) -> Vec<BoxShadow> {
+        vec![
+            BoxShadow {
+                color: gpui::white().opacity(0.06),
+                offset: point(px(0.), px(0.)),
+                blur_radius: px(0.5),
+                spread_radius: px(size::HAIRLINE),
+                inset: true,
+            },
+            Layer::black(0.1, 1.5, 2., 0.).shadow(),
+            Layer {
+                color: fill,
+                y: 0.,
+                blur: 0.,
+                spread: size::HAIRLINE,
+            }
+            .shadow(),
+        ]
+    }
+
+    fn shadow(alpha: f32, y: f32, blur: f32, spread: f32) -> BoxShadow {
+        Layer::black(alpha, y, blur, spread).shadow()
     }
 
     fn rim(alpha: f32) -> BoxShadow {
@@ -655,38 +870,28 @@ pub mod elevation {
         !cx.theme().appearance.is_light()
     }
 
-    /// A 1 px line under (or, negative, over) an edge: Tower's `before:shadow-[0_1px_…]`.
-    fn edge(color: Hsla, y: f32) -> BoxShadow {
-        BoxShadow {
-            color,
-            offset: point(px(0.), px(y)),
-            blur_radius: px(0.),
-            spread_radius: px(0.),
-            inset: false,
-        }
-    }
-
     // Tower's values, light and dark (`styles/glass.css`, `styles/theme.css`, `button.tsx`).
 
-    /// A solid item on glass (a card, a tile, the palette's results): only a contact shadow.
+    /// [`custom`]'s drops alone, for an element that draws its own hairline as its border (a
+    /// document page with its rule, the palette's results card): the box includes that line,
+    /// so each drop's spread is one less than CSS's.
     pub fn raised(cx: &App) -> Vec<BoxShadow> {
-        vec![shadow(if dark(cx) { 0.3 } else { 0.04 }, 1., 2., 0.)]
+        layers(Lift::Rest, cx)
+            .into_iter()
+            .skip(1)
+            .map(|layer| {
+                Layer {
+                    spread: layer.spread - size::HAIRLINE,
+                    ..layer
+                }
+                .shadow()
+            })
+            .collect()
     }
 
-    /// An outlined control (an outline button, a field): a faint contact shadow and a 1 px
-    /// edge under it; in a dark theme a 1 px light edge over it instead.
+    /// An outlined control (an outline button, a field): [`custom`].
     pub fn control(cx: &App) -> Vec<BoxShadow> {
-        if dark(cx) {
-            vec![
-                shadow(0.05, 1., 2., 0.),
-                edge(gpui::white().opacity(0.06), -1.),
-            ]
-        } else {
-            vec![
-                shadow(0.05, 1., 2., 0.),
-                edge(gpui::black().opacity(0.04), 1.),
-            ]
-        }
+        custom(cx)
     }
 
     /// A glass sheet, and everything that floats over the page (a menu, a popover, a modal):
@@ -1353,13 +1558,20 @@ pub fn field_frame(invalid: bool, cx: &App) -> Div {
         .items_center()
         .rounded(px(radii(cx).sm))
         .border_1()
-        .border_color(if invalid {
-            surface::error_border(cx)
-        } else {
-            surface::control_border(cx)
-        })
         .bg(surface::document(cx))
-        .shadow(elevation::control(cx))
+        // interfaces.dev's field: the surface's ring and drops; an invalid one has its red
+        // line instead of the ring.
+        .map(|field| {
+            if invalid {
+                field
+                    .border_color(surface::error_border(cx))
+                    .shadow(elevation::raised(cx))
+            } else {
+                field
+                    .border_color(gpui::transparent_black())
+                    .shadow(elevation::control(cx))
+            }
+        })
 }
 
 /// A field's editor, filling what its [`field_frame`] leaves.
@@ -1428,10 +1640,10 @@ pub fn filter_pill(
         .h(px(size::PILL))
         .flex_none()
         .rounded_full()
-        .border_1()
-        .border_color(surface::raised_border(cx))
         .bg(surface::document(cx))
-        .shadow(elevation::raised(cx))
+        .border_1()
+        .border_color(gpui::transparent_black())
+        .shadow(elevation::custom(cx))
         .overflow_hidden()
         .child(
             segment()
@@ -1537,8 +1749,8 @@ pub fn float_bar(id: impl Into<ElementId>, cx: &App) -> Stateful<Div> {
         .rounded(px(radii(cx).bar()))
         .bg(surface::glass(colors.elevated_surface_background, 0.92, cx))
         .border_1()
-        .border_color(surface::floating_border(cx))
-        .shadow(elevation::float(cx))
+        .border_color(gpui::transparent_black())
+        .shadow(elevation::custom(cx))
         .occlude()
 }
 
@@ -1946,16 +2158,26 @@ pub fn field(label: impl Into<SharedString>, value: impl IntoElement) -> Div {
 
 /// A card, as Zed draws a tool call: a tinted header, a body and a footer of actions. Compose
 /// with [`card_header`], [`card_footer`].
-pub fn card(cx: &App) -> Div {
-    let card = v_flex()
-        .w_full()
-        .rounded(px(radii(cx).md))
+/// interfaces.dev's `shadow-custom` on a surface: its ring outside the box and its two soft
+/// drops ([`elevation::custom`]), over a clear 1 px border, so the layout keeps the hairline's
+/// room.
+pub fn lifted<E: Styled>(element: E, cx: &App) -> E {
+    element
         .border_1()
-        .border_color(surface::card_border(cx))
-        .bg(surface::document(cx))
-        .overflow_hidden();
-    // A solid item on glass: raised.
-    card.when(is_glass(cx), |card| card.shadow(elevation::raised(cx)))
+        .border_color(gpui::transparent_black())
+        .shadow(elevation::custom(cx))
+}
+
+pub fn card(cx: &App) -> Div {
+    // interfaces.dev's card (`.preview-card`).
+    lifted(
+        v_flex()
+            .w_full()
+            .rounded(px(radii(cx).md))
+            .bg(surface::document(cx))
+            .overflow_hidden(),
+        cx,
+    )
 }
 
 pub fn card_header(cx: &App) -> Div {

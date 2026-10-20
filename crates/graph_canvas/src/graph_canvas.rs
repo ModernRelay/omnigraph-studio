@@ -2156,18 +2156,13 @@ impl GraphCanvas {
         let palette = paint::Palette {
             text: Color::Default.color(cx),
             muted: Color::Muted.color(cx),
-            // Chips are white cards in the light theme.
+            // Chips are white cards in the light theme, with interfaces.dev's shadow.
             card: studio_ui::ds::surface::solid(cx),
-            border: studio_ui::ds::surface::floating_border(cx),
-            // The canvas paints drop shadows only; a rim would draw as a halo.
-            shadow: studio_ui::ds::elevation::float(cx)
-                .into_iter()
-                .filter(|shadow| !shadow.inset)
-                .collect(),
+            shadow: studio_ui::ds::elevation::layers(studio_ui::ds::elevation::Lift::Rest, cx),
+            pointed: studio_ui::ds::elevation::layers(studio_ui::ds::elevation::Lift::Hover, cx),
             on_tint: studio_ui::ds::surface::on_tint(cx),
             here: studio_ui::ds::surface::here(cx),
             here_halo: studio_ui::ds::surface::here_halo(cx),
-            pointed: studio_ui::ds::surface::pointed_border(cx),
             grid_dot: studio_ui::ds::surface::grid_dot(cx),
             label_fill: studio_ui::ds::surface::canvas_label(cx),
             hub_dot: studio_ui::ds::surface::canvas_hub(cx),
@@ -2280,9 +2275,7 @@ impl GraphCanvas {
             .py(px(space::XS))
             .rounded(px(studio_ui::ds::radii(cx).bar()))
             .bg(studio_ui::ds::surface::solid(cx))
-            .border_1()
-            .border_color(studio_ui::ds::surface::floating_border(cx))
-            .shadow(studio_ui::ds::elevation::float(cx))
+            .map(|caption| studio_ui::ds::lifted(caption, cx))
             .child(studio_ui::ds::text::meta(text))
     }
 
@@ -2684,7 +2677,7 @@ impl Render for GraphCanvas {
                 self.fit(viewport);
             }
         }
-        let background = studio_ui::ds::surface::document(cx);
+        let background = studio_ui::ds::surface::canvas(cx);
         let canvas = self.render_canvas(window, cx).into_any_element();
         let overlay = self.render_overlay(cx).into_any_element();
         // The area being drawn: a tinted rectangle from where the drag began to the pointer.

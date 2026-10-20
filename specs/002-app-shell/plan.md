@@ -320,7 +320,7 @@ waits for it is not dropped.
 
 Since 2026-10-18 every dialog is one card, after Tower's dialogs (`studio_ui::modal`, through
 `ds`): `ds::modal` (480 px, `size::MODAL_WIDE` 720 for Open a graph; 16 px corners, the
-floating fill, an 8 % hairline and the sheet shadow), then `ds::ModalHeader` (the title,
+floating fill, the 6 % outline hairline and the sheet shadow), then `ds::ModalHeader` (the title,
 semibold; beside it what the dialog writes to, `ds::write_target`; a round outline close
 button, faded while a write runs), `ds::modal_body` and `ds::modal_footer` (a strip under a
 hairline, the actions on the right: Cancel an outline pill, `ds::cancel_button`; the action
@@ -424,7 +424,10 @@ than styling one-off elements.
   floats the three columns as sheets over a soft wash, with one gap around and between them,
   and moves the traffic lights into the sidebar sheet. They sit centered in the first header
   strip (`studio_workspace::traffic_light_position`), where a window also opens with them.
-- **Hairlines.** `ds::surface::rule`. A rule between the rows or the sections of a document
+- **Hairlines.** `ds::surface::rule`, which when flat is `surface::divider`: interfaces.dev's
+  `--color-gray-400`, `#e8e8e8` on a white page (9 % black), 8 % white in a dark theme; a
+  checkbox's, an outlined chip's and a composer control's edge is the same line
+  (`surface::control_border`). A rule between the rows or the sections of a document
   (a table's rows, query results, settings rows, a queue, storage's sections, a feed's date
   rule) is `ds::dotted`: dotted on glass, as Tower's feeds, solid when flat. A region's edge
   (a toolbar's, a strip's, a pane's, the composer's) is solid in both styles.
@@ -487,7 +490,8 @@ than styling one-off elements.
   `size::BAR_BUTTON` (22 px: a segment, a bar's button, the status bar's items), `size::TAG`
   (18 px: tags, count badges, a write target), `size::DOT` and `size::DISCLOSURE`. Every
   single-line field is `ds::field_frame` (the scale's `sm` corner at a control's height, a
-  10 % hairline and the control shadow, the error border when invalid)
+  `shadow-custom` (below; its border clear), the error border with the drops alone when
+  invalid)
   around `ds::field_input`, and every search box is `ds::search_field`, so fields line up
   with the buttons beside them: the settings search and text fields, the history and review
   searches, the dialogs' fields, the review editor's fields and the query's parameters. A
@@ -506,7 +510,8 @@ than styling one-off elements.
 - **Buttons, after Tower's** (since 2026-10-18; `studio_ui::button`, `ds::Button`,
   `ds::IconButton`). A text button is a pill and an icon button takes the scale's corner
   (above), medium weight, in six variants: primary (solid ink; a surface's one action), secondary (a faint ink
-  fill), outline (the surface's own fill, a 10 % hairline and a contact shadow; Cancel),
+  fill), outline (interfaces.dev's secondary button: the surface's own fill and
+  `shadow-custom`, a fill a shade off it under the pointer, `#fcfcfc` on white; Cancel),
   ghost (nothing until hovered; toolbars, rows), destructive (solid red) and glass (a floating
   pill). Zed's `ButtonStyle` picks the variant, so call sites keep `.style(…)`: Filled is
   primary, Outlined outline, Subtle ghost, Tinted(Error) destructive. Sizes keep Zed's
@@ -527,9 +532,10 @@ than styling one-off elements.
   interface size, Tower's `text-sm`) and the small size below; a leading icon is 16 px at
   28 px and 12 px below, a trailing one (a chevron) 12 px, both at 80 % of the label's ink.
   A toggled button sits on the pressed fill; a disabled one fades to 64 %; a key hint on a
-  solid button takes its ink. Primary and destructive carry a 16 % white top edge inside and
-  a 24 % tinted contact shadow; outline buttons and fields the control shadow
-  (`elevation::control`: a 5 % contact shadow and a 4 % 1 px edge under them). A toolbar's
+  solid button takes its ink. Primary and destructive carry interfaces.dev's primary shadow
+  (`elevation::filled`: a 6 % white haze inside, a 10 % drop 1.5 px down, and a 1 px ring
+  outside in their own fill); outline buttons and fields `elevation::control`, which is
+  `shadow-custom`. A toolbar's
   buttons sit in `ds::toolbar_actions`, with no gap beyond their own padding. Zed's `ButtonLike` keeps its corners at 4 px and
   its colours private, so Studio draws its own and keeps Zed's builder traits; no view
   constructs Zed's `Button` or `IconButton`.
@@ -591,12 +597,26 @@ than styling one-off elements.
   `ds::row_button`. Toolbar buttons are Zed's 22 px
   size, Tower's `xs`, with small type and 12 px icons, set with no gap beyond their padding
   (`ds::toolbar_actions`), so the chrome reads smaller than the document it serves.
-- **Shadows, Tower's values** (`ds::elevation`, light and dark): `raised` for a solid item on
-  glass (4 %, 1/2 px; 30 % dark); `control` for outline buttons and fields; `sheet` for glass
-  sheets and everything that floats (an inner white rim at 70 %, 6 % dark; 4 % at 1/2 px and
-  11 % at 12/28 px, spread −9; 30 % and 60 % dark); `float` for floating bars and chips
-  (12 % at 6/14 px, spread −6; 50 % dark). Menus, popovers, modals and the palette use
-  `sheet` (`floating`), as Tower gives every popup the glass shadow.
+- **Shadows and borders, interfaces.dev's** (since 2026-10-20; its CSS is
+  `--shadow-custom`, `-hover`, `-active` and `--shadow-border`). Every button, field, card,
+  pill, floating bar and canvas chip carries `shadow-custom`: a 1 px ring (`#0000000f`) and two
+  soft drops (`0 1px 2px -1px #0000000f`, `0 2px 4px #0000000a`) in a light theme, the ring
+  alone (`#ffffff14`) in a dark one; hovered `#00000014`/`#00000014`/`#0000000f` (`#ffffff21`),
+  pressed `#0000001f`/`#0000001a`/`#00000014` (`#fff3`). One table holds them
+  (`elevation::layers`, by `elevation::Lift`). GPUI takes a shadow's blur as the Gaussian's
+  sigma where CSS's blur is twice the sigma, so every layer's blur is halved on the way in
+  (`elevation::Layer::shadow`); Tower's values, copied as written, had drawn twice as soft.
+  The ring is drawn outside the box as a spread shadow, as CSS draws it, so the drops darken
+  it where they cross it (a ring drawn as the border hid them under the fill, and an edge
+  read 240 where the page reads 224–233); the element's border is clear and keeps its room
+  (`ds::lifted`). GPUI keeps the element's corner for every layer where CSS grows it with the
+  spread, so a ring is a little heavier at a corner; the canvas, which paints its own chips,
+  gives each layer CSS's corner (`elevation::paint_layers`). `raised` is the drops alone, for
+  an element that draws its own hairline (a document page, the palette's results).
+  `surface::outline` is the ring's colour, the one hairline of a floating surface
+  (`floating_border`, `card_border`). Menus, popovers, modals and glass sheets keep Tower's
+  `sheet` (`floating`) and `float` shadows (an inner white rim at 70 %, 6 % dark; 4 % at
+  1/2 px and 11 % at 12/28 px, spread −9; 30 % and 60 % dark), now drawn at CSS's blur.
 - **Sidebar rows.** `ds::SidebarRow`: section labels muted, not bold; the selected row a grey
   pill; counts muted and right-aligned. Footnotes become tooltips. What leads a label (an icon
   through `SidebarRow::icon`, at 14 px, or a type mark) sits in one 16 px slot
@@ -671,6 +691,8 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-20 | Shadows and borders are interfaces.dev's | Its stylesheets (`_next/static/immutable/chunks/26aw_19s171nu.css`: `--shadow-custom`, `-hover`, `-active`, `--shadow-border`, the `.dark` values); a reference page with those values at whole pixels, captured at 2x in the app's browser; offscreen 2x snapshots of the design gallery | Out from a card's bottom edge, the CSS reads 226, 232, 245, 252, 249, 250 and Studio 226, 230, 247, 249, 251, 251; from its left edge 232, 239, 249, 254 and 235, 236, 252, 253. With the ring drawn as the element's border the bottom edge had read 240, 240, 247: the fill hid the drops. Workspace Clippy (`-D warnings`), 609 tests, and the design-token and layer guards pass |
+| 2026-10-20 | GPUI's shadow blur is a sigma | Zed `v1.23.2` `crates/gpui_apple/src/shaders.metal` (`gaussian(y, shadow.blur_radius)`, `erf(… (sqrt(0.5) / sigma))`, the `blur_radius == 0` branch) and `crates/gpui/src/window.rs` `paint_drop_shadows` | `blur_radius` is the Gaussian's sigma, half of CSS's blur; a zero blur draws a hard edge with 1 px antialiasing; every shadow keeps the element's corner radii |
 | 2026-10-19 | A node has one name everywhere, chosen per graph and type | See spec 006's row of this date (the same checks) | The choice lives on the schema model, so the canvas, tree, inspector, tables and palette take it from one place; the table keeps its columns, filters, order and grouping and reads its rows again, the explorer reads its names again at the same commit with every path as it was, and the inspector renames its title from the values held and reads the neighbours it shows again |
 | 2026-10-19 | One hover per kind, one spinner, one way to say a thing | `script/check-design-tokens.py` (new rule: a turning icon outside `ds::spinner`); workspace clippy `-D warnings` and the workspace suite (43 targets); offscreen glass snapshots on a scratch dev server, sampled by pixel: an inspector property row and a sidebar row hovered | Before: an inspector row's hover darkened it by 8–9 levels where a sidebar or table row's darkened by 6–7 (the control fill); the query problems list the same. The agent panel drew work under way four times by hand, a running session as an accent `LoadCircle` and a running proposal as a still icon. "Loading…" in two places where Studio says "Reading…", a "Save View…" menu entry, an "e.g." placeholder, and History's toolbar fact a meta row repeating the tab's branch. After: both rows darken by 6; every running state is `ds::spinner()`; the copy reads one way; History's toolbar reads "History  2 commits" as the table's "Person  200 rows" |
 | 2026-10-19 | Buttons sized by role; every icon, label and type size from the design system | `script/check-design-tokens.py` with its new rules (`ButtonSize::`, `.icon_size`, `IconSize::`, `LabelSize::`, `TextSize::` and `.text_ui*` outside the system); `studio_ui` `controls_draw_at_their_sizes` (a toolbar icon button 22 px, a row button and a row icon button 18 px squares, a tab's inline icon under 18 px, the icon size each button size gives); workspace clippy `-D warnings` and the workspace suite (43 targets) on a copy of the parent commit with only these paths; offscreen glass snapshots on a scratch dev server: the design gallery, Person's table with its peek and a pinned tab, a hovered relationship group | Before: views chose 25 button sizes and 47 icon sizes by name, so one kind of row action was an 18, 22 or 28 px square (the session list, saved queries, the relationship tree, the peek, the review, a toast); 15 calls restated the default icon and four named `TextSize`. After: none, and the guard refuses them. Row actions are 18 px squares with 12 px icons, their hover fill 4 to 10 px smaller; labelled row buttons stay 18 px; a tab's pin and close and every toolbar's buttons are unchanged |

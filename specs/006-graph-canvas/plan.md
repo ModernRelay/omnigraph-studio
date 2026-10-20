@@ -61,13 +61,21 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
   (`CHIP_LABEL_CHARS`); layout always measures that, so opening a chip never moves another.
   Pointing at a cut chip for a moment opens it: its whole name, wrapped at 320 px at zoom 1
   (`OPEN_CHIP_MAX_WIDTH`) in lines of even length, drawn over its neighbours from where the
-  chip starts, never narrower than it, with its mark and the pointed or selected border;
+  chip starts, never narrower than it, with its mark and the pointed shadow or the selected
+  border;
   selecting it keeps it open until another chip is selected, and the opened chip is hit where
   it is drawn. A node chip's menu offers "Show as ▸"
   with its type's single text properties and "Automatic": the graph's node name for the type
   (spec 002, "Node names"), so the whole graph, not only the canvas, takes it.
 - Chips and relationship labels take the radius scale's `sm` corner, fill, border, shadow and
-  ring alike (the fill was drawn round until 2026-10-19 while its shadow took `sm`).
+  ring alike (the fill was drawn round until 2026-10-19 while its shadow took `sm`). Since
+  2026-10-20 their shadow is interfaces.dev's `shadow-custom` (spec 002, "Shadows and
+  borders"), painted as a browser paints a CSS `box-shadow`: the ring outside the chip and
+  each layer's corner grown or shrunk with its spread (`elevation::paint_layers`). A chip has
+  no border but where you are (the here ring); pointing at one steps its shadow to `-hover`;
+  a label shows the ring alone while every line is named, and the drops too when it floats
+  over the pointed type's lines. The canvas's ground is `surface::canvas`, interfaces.dev's
+  `#fcfcfc` in a light theme, so its white chips read as they do there.
 - Dragging a type, a node or a relationship pill places it: it stays where it was dropped
   through every later layout, and the canvas tab saves the placed chips with the graph's tabs
   (`{"pinned": {key: [x, y]}}`, keys `type:Name`, `node:Type/id` and
@@ -119,6 +127,7 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-20 | Chips carry interfaces.dev's shadow | Offscreen 2x ontology snapshots on `script/dev-server` (light, pointed, dark) against the site's `x-height` chip at 2x | Out from the top edge, the site reads 240, 238, 239, 246 and Studio 242, 236, 236, 245; from the bottom 234, 231, 235, 245 and 236, 226, 228, 240 (a chip sits at a fractional position, so its ring spreads over three pixels); pointed, the bottom reads 230, 217, 219; dark, the 8 % white ring alone. Before, a chip showed no ring and a broad, soft shadow |
 | 2026-10-11 | Layout and edge costs at 1k/10k/50k | research benchmark on this Mac | 2.2/34/254 ms per layout step; 0.14/1.3/8 ms edges per frame |
 | superseded | Pan and zoom p95 < 16 ms at 10k nodes, 30k edges | spike S2 | Answered by the rows below: met at the default cap of 2,000, not at 10,000. First pass 2026-10-13, debug build, not yet the claim: branch `perf-10k` of the dev graph (`dev-seed.py --people 10000`, loaded in chunks of at most 8,000 per type, the server's limit), the `knows` query's 20,534 rows drawn as 9,767 nodes, `canvas_max_nodes` 10,000, the snapshot tool's new `measure:120,drag=8:0` and `measure:120,scroll=40`. Pan p95 24.8 ms, zoom p95 25.0 ms, a notify alone p95 1.6 ms. The canvas stayed blank from about 4,000 nodes: a result's roots sit on one ring sized by their count, which at thousands of roots is wider than the view can zoom out to, so the frame time measures per-frame work over every edge with few chips on screen. Needs a release build and a result layout for many components |
 | 2026-10-13 | Pan and zoom p95 under 16 ms at the default cap | `release-fast` build (new profile: release without link-time optimization), the snapshot tool's `measure:300`, `measure:300,drag=8:0`, `measure:300,scroll=40` on the `knows` result of `perf-10k`; the paint function's sections timed temporarily | 2,000 nodes: pan p95 25.9 → 15.4 ms, zoom p95 23.5 → 15.1 ms, a notify p95 12.3 ms. Edges took 4.65 ms a frame as curves and 0.40 ms drawn straight from afar (chips are letter marks there, and a curve is dozens of triangles); marks 8.8 → 7.3 ms with each letter shaped once a frame instead of once a chip. Routes cost 0.3 ms. At 9,767 nodes pan p95 is 95.6 ms (was 299) and zoom 134 ms (was 298): the 2,000 cap stays |
@@ -208,7 +217,8 @@ V (layout of the schema view never depends on counts), VII (camera motion only o
 - **Mode.** "Schema" and "Exploration" toggle in the canvas; the schema view never clears the
   shared exploration.
 - **Look (2026-10-12):** every type, node, hub and "+K more" is a chip, a white pill with a
-  hairline and a soft contact shadow, with a letter mark (the label's initial in white on one of
+  hairline and a soft contact shadow (since 2026-10-20 interfaces.dev's ring and two drops),
+  with a letter mark (the label's initial in white on one of
   eight muted tints, chosen by a hash of the type's name) and a muted
   count; lines are 1-pixel greys (schema 15%, a pointed type's 40% and the rest 5%; hub lines
   20% and dotted while the hub is closed); in the ontology, pointing at a chip fades what it
