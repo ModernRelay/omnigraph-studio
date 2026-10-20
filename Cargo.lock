@@ -4143,6 +4143,7 @@ dependencies = [
 name = "gq_language"
 version = "0.2.1"
 dependencies = [
+ "chrono",
  "omnigraph-compiler",
  "serde_json",
 ]

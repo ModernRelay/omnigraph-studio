@@ -222,19 +222,52 @@ pub(crate) fn begins_a_date(text: &str) -> bool {
     digits.starts_with(|c: char| c.is_ascii_digit())
 }
 
-/// A time typed with a space or a `t` between its date and its time (`2024-01-02 10:00:00`)
-/// spelled with the `T` the engine writes: the engine reads both alike, and values compared
-/// here as text then order as the engine orders them.
+/// A time typed in a spelling the engine reads (a space or a `t` before the time, a zone or
+/// an offset, a date alone) spelled as the engine writes it: in UTC with no zone, and with
+/// milliseconds only when they are not zero (`2024-01-02T08:00:00` for `2024-01-02 10:00:00+02:00`).
+/// The engine reads both alike, and values compared here as text then order as the engine
+/// orders them. Text it cannot read as a time, or with digits past the millisecond, which the
+/// engine refuses when they are not zero, goes as typed, for the server to judge.
 pub(crate) fn date_time(text: &str) -> String {
     let bytes = text.as_bytes();
     let dated = bytes.len() > 10
         && bytes[..4].iter().all(u8::is_ascii_digit)
         && bytes[4] == b'-'
         && bytes[7] == b'-';
-    match bytes.get(10) {
+    let spaced = match bytes.get(10) {
         Some(b' ' | b't') if dated => format!("{}T{}", &text[..10], text[11..].trim_start()),
         _ => text.to_owned(),
+    };
+    engine_date_time(&spaced).unwrap_or(spaced)
+}
+
+/// `text` as the engine writes the instant it names, when it names one to the millisecond.
+fn engine_date_time(text: &str) -> Option<String> {
+    use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+    if let Some((_, fraction)) = text.split_once('.') {
+        let past_millis = fraction
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .skip(3)
+            .any(|digit| digit != b'0');
+        if past_millis {
+            return None;
+        }
     }
+    let at = if let Ok(zoned) = DateTime::parse_from_rfc3339(text) {
+        zoned.with_timezone(&Utc).naive_utc()
+    } else if let Ok(naive) = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f") {
+        naive
+    } else {
+        NaiveDate::parse_from_str(text, "%Y-%m-%d")
+            .ok()?
+            .and_hms_opt(0, 0, 0)?
+    };
+    let seconds = at.format("%Y-%m-%dT%H:%M:%S");
+    Some(match at.and_utc().timestamp_subsec_millis() {
+        0 => seconds.to_string(),
+        millis => format!("{seconds}.{millis:03}"),
+    })
 }
 
 /// `true`, `yes` or `1`, and `false`, `no` or `0`, in any case.
@@ -347,27 +380,32 @@ mod tests {
         assert!(!same_value(&json!(u64::MAX), &json!(u64::MAX - 1)));
     }
 
-    /// Every spelling the engine reads a time in goes to it, which refuses the rest.
+    /// Every spelling the engine reads a time in is spelled as the engine writes it, in UTC
+    /// with no zone, so text compared here orders as the engine orders the times. What it
+    /// cannot read as one goes as typed, and the engine refuses it.
     #[test]
-    fn dates_and_times_go_as_typed() {
+    fn dates_and_times_are_spelled_as_the_engine_writes_them() {
         let at = property(ScalarKind::DateTime, "DateTime");
-        for typed in [
-            "2024-01-02T10:00:00Z",
-            "2024-01-02T10:00:00+02:00",
-            "2024-01-02",
+        for (typed, written) in [
+            ("2024-01-02T10:00:00Z", "2024-01-02T10:00:00"),
+            ("2024-01-02T10:00:00+02:00", "2024-01-02T08:00:00"),
+            ("2024-01-02 10:00:00", "2024-01-02T10:00:00"),
+            ("2024-01-02t10:00:00.250Z", "2024-01-02T10:00:00.250"),
+            ("2024-01-02T10:00:00.5", "2024-01-02T10:00:00.500"),
+            ("2024-01-02T10:00:00.000", "2024-01-02T10:00:00"),
+            ("2024-01-02", "2024-01-02T00:00:00"),
+            // Past the millisecond, which the engine refuses, and without seconds, which it
+            // does not read: as typed.
+            ("2024-01-02T10:00:00.1234", "2024-01-02T10:00:00.1234"),
+            ("2024-01-02T10:00", "2024-01-02T10:00"),
         ] {
-            assert_eq!(parse_scalar(&at, typed), Ok(Value::String(typed.into())));
+            assert_eq!(parse_scalar(&at, typed), Ok(json!(written)), "{typed}");
         }
         let on = property(ScalarKind::Date, "Date");
         assert_eq!(parse_scalar(&on, " 2024-01-02 "), Ok(json!("2024-01-02")));
         // A word is no date in any spelling.
         assert!(parse_scalar(&on, "yesterday").is_err());
         assert!(parse_scalar(&at, "soon").is_err());
-        // A space before the time is spelled as the engine writes it, so text orders as times.
-        assert_eq!(
-            parse_scalar(&at, "2024-01-02 10:00:00"),
-            Ok(json!("2024-01-02T10:00:00"))
-        );
     }
 
     /// A cell takes a whole number in its type's range, as a query parameter does.

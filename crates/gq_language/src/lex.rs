@@ -234,13 +234,31 @@ pub fn tokenize(source: &str) -> Vec<Token> {
             let after_dot = previous.is_some_and(|t| {
                 t.kind == TokenKind::Punctuation && &source[t.range.clone()] == "."
             });
-            let after_query = previous.is_some_and(|t| {
-                t.kind == TokenKind::Keyword && &source[t.range.clone()] == "query"
-            });
+            let after_keyword = |token: Option<&Token>, keyword: &str| {
+                token.is_some_and(|t| {
+                    t.kind == TokenKind::Keyword && &source[t.range.clone()] == keyword
+                })
+            };
+            let after_query = after_keyword(previous, "query");
+            // How a declaration publishes: `as commit`, `as unattached branch on …`.
+            let publishes = match word {
+                "commit" | "unattached" => after_keyword(previous, "as"),
+                "on" => {
+                    let before = tokens
+                        .iter()
+                        .rev()
+                        .filter(|t| t.kind != TokenKind::Comment)
+                        .nth(1);
+                    after_keyword(previous, "branch") && after_keyword(before, "unattached")
+                }
+                _ => false,
+            };
             if after_dot {
                 TokenKind::Property
             } else if after_query {
                 TokenKind::QueryName
+            } else if publishes {
+                TokenKind::Keyword
             } else if b.is_ascii_uppercase() {
                 TokenKind::Type
             } else if KEYWORDS.contains(&word) {
@@ -642,9 +660,38 @@ mod tests {
                 .collect();
             assert_eq!(keywords, words, "{source}");
         }
-        // Outside a statement they are names: a property `load`, an edge `commit`.
-        let tokens = kinds("query q() { match { $p commit $c } return { $p.load, $p.mode } }");
+        // A declaration's publication is keywords.
+        let keywords = |source: &str| -> Vec<String> {
+            kinds(source)
+                .into_iter()
+                .filter(|(kind, _)| *kind == TokenKind::Keyword)
+                .map(|(_, word)| word.to_owned())
+                .collect()
+        };
+        assert_eq!(
+            keywords("query q() as commit { insert Person { slug: \"a\" } }"),
+            ["query", "as", "commit", "insert"]
+        );
+        assert_eq!(
+            keywords(
+                "query q() as unattached branch on \"01J\" { delete Person where slug = \"a\" }"
+            ),
+            [
+                "query",
+                "as",
+                "unattached",
+                "branch",
+                "on",
+                "delete",
+                "where"
+            ]
+        );
+        // Outside a statement they are names: a property `load`, an edge `commit`, a variable's
+        // edge `on`.
+        let tokens =
+            kinds("query q() { match { $p commit $c $p on $d } return { $p.load, $p.mode } }");
         assert!(tokens.contains(&(TokenKind::Identifier, "commit")));
+        assert!(tokens.contains(&(TokenKind::Identifier, "on")));
         assert!(tokens.contains(&(TokenKind::Property, "load")));
         assert!(tokens.contains(&(TokenKind::Property, "mode")));
         // An engine catalogue type is a type; a meta field stays a property.

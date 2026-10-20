@@ -9,6 +9,7 @@ publish.workspace = true
 path = "src/gq_language.rs"
 
 [dependencies]
+chrono = { workspace = true }
 omnigraph-compiler = { workspace = true }
 serde_json = { workspace = true }
 

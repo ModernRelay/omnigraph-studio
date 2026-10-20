@@ -128,10 +128,20 @@ pub fn operator_parts(parts: &[QueryPart], node: &str, detail: &str) -> Vec<Rang
     let mut found = match name {
         "Limit" | "Page" | "GlobalLimit" | "LocalLimit" | "Offset" => of_kind(PartKind::Limit),
         "Sort" | "TopK" | "PartialSort" | "SortPreservingMerge" => of_kind(PartKind::Order),
-        "Projection" | "Aggregate" => of_kind(PartKind::Return),
-        n if n.starts_with("AntiJoin") => blocks(parts, PartKind::Negation, &vars),
-        n if n.contains("SemiJoin") || n.contains("Subquery") || n.contains("Exists") => {
-            blocks(parts, PartKind::Subquery, &vars)
+        // A count answered from table metadata, and the late read of returned columns, stand
+        // for the `return` too.
+        "Projection" | "Aggregate" | "MetadataCount" | "Hydrate" | "HydrateColumns" => {
+            of_kind(PartKind::Return)
+        }
+        // One operator serves every correlated block, told apart by its predicate: one asking
+        // that nothing match is a `not`; `exists`, `count` and the column aggregates are not.
+        n if n.starts_with("AntiJoin") => {
+            let kind = if negates(json.as_ref(), detail) {
+                PartKind::Negation
+            } else {
+                PartKind::Subquery
+            };
+            blocks(parts, kind, &vars)
         }
         n if n.contains("Expand") || n.contains("Travers") => traversals(parts, &vars),
         n if n.contains("Filter") => matching_filters(parts, &filters),
@@ -295,10 +305,27 @@ fn split_top_level(text: &str) -> Vec<String> {
 
 fn is_search(name: &str) -> bool {
     [
-        "Nearest", "Knn", "Vector", "Search", "Rrf", "Bm25", "FullText", "Fts",
+        "Nearest", "Knn", "Vector", "Search", "Rrf", "RankFuse", "Bm25", "FullText", "Fts",
     ]
     .iter()
     .any(|word| name.contains(word))
+}
+
+/// Whether a correlated block's predicate (`count = 0`, the JSON `predicate` or the start of
+/// DataFusion's text) asks that nothing match, as a `not { … }` does: a row count `= 0`,
+/// `<= 0` or `< 1`, as the compiler reads one.
+fn negates(json: Option<&Value>, detail: &str) -> bool {
+    let predicate = json
+        .and_then(|json| json.get("predicate"))
+        .and_then(Value::as_str)
+        .unwrap_or(detail);
+    let words: Vec<&str> = predicate
+        .split_whitespace()
+        .map(|word| word.trim_end_matches(','))
+        .collect();
+    words
+        .windows(3)
+        .any(|w| w[0] == "count" && matches!((w[1], w[2]), ("=" | "<=", "0") | ("<", "1")))
 }
 
 fn has_search_call(part: &QueryPart) -> bool {
@@ -799,6 +826,15 @@ mod tests {
             at("AntiJoin", r#"{"outer_var":"f","predicate":"count = 0"}"#),
             ["not { $f worksAt $c }"]
         );
+        // The same operator for a counted block, which is no `not`.
+        assert_eq!(
+            at("AntiJoin", r#"{"outer_var":"p","predicate":"count > 2"}"#),
+            ["count { $p contributes $j } > 2"]
+        );
+        assert_eq!(
+            at("MetadataCount", r#"{"table":"node:Person"}"#),
+            ["return { $p.name, count($f) as friends }"]
+        );
         // The planner splits `and`; each conjunct finds the clause holding it.
         assert_eq!(
             at(
@@ -858,6 +894,10 @@ mod tests {
         assert_eq!(
             at("AntiJoinMaskExec", "$f count = 0, bulk=WorksAt Out"),
             ["not { $f worksAt $c }"]
+        );
+        assert_eq!(
+            at("AntiJoinMaskExec", "$p count > 2, key_set"),
+            ["count { $p contributes $j } > 2"]
         );
         assert_eq!(at("LimitExec", "rows=5"), ["limit 5"]);
     }
