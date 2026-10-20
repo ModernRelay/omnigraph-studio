@@ -39,6 +39,20 @@ remain null even when its source text is supplied.
 omnigraph embed --input raw.jsonl --output embedded.jsonl --spec embeddings.json
 ```
 
+The spec maps each type to its vector and the one source property its
+`@embed` names; `fields` must hold exactly that property:
+
+```json
+{ "dimension": 1536, "types": { "Chunk": { "target": "embedding", "fields": ["text"] } } }
+```
+
+The source value is embedded exactly as stored, with no type or field-name
+template, which is also how a text `nearest($c.embedding, $q)` embeds `$q`; a
+chunk whose text equals the query lies at distance zero under a
+role-independent model. A record with an absent, null or blank source gets no
+vector. Vectors from older `omnigraph embed` builds embedded a
+`type: <T>\n<field>: <value>` template; regenerate them with `--reembed-all`.
+
 By default it fills missing vectors. Load the output explicitly afterward.
 
 Use the same file/spec form with `--reembed-all` to replace selected vectors,
@@ -149,7 +163,7 @@ Filter with graph traversal before invoking vector or text ranking. Ranking over
 ```gq
 query related_chunks($artifact_slug: String, $q: Vector(1536)) {
     match {
-        $c: Chunk                                 // declare the ranked binding first
+        $c: Chunk                                 // the ranked binding
         $c partOfArtifact $a                      // scope: only this artifact's chunks
         $a.slug = $artifact_slug
     }
@@ -161,11 +175,11 @@ query related_chunks($artifact_slug: String, $q: Vector(1536)) {
 
 Don't rank over the entire chunk set if you know a traversal can narrow it first.
 
-Declare the ranked binding first and reach the scoping node through the
-traversal. A `nearest` or `bm25` order, alone or as an `rrf` arm, on a variable
-that a traversal introduces (`$a: InformationArtifact { … }` first, then
-`$c partOfArtifact $a`, ranked on `$c`) is refused when the query runs:
-"a traversal destination, which engine v2 does not support".
+The ranked binding starts the traversal whichever binding `match` declares
+first, and whether or not it is declared: with `$a: InformationArtifact { … }`
+first, then `$c partOfArtifact $a`, ranked on `$c`, the query ranks `Chunk`
+and keeps the chunks the traversal reaches. An `rrf` whose two arms rank two
+bindings one traversal connects is refused at type checking (`T59`).
 
 A standalone `nearest` ordering widens an underfilled candidate set, finally
 using an exact scan if needed to fill the limit with available survivors.

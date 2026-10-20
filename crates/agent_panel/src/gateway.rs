@@ -1363,7 +1363,7 @@ mod end_to_end {
             "--json",
         ]
         .map(str::to_owned);
-        let mut plan = cli_home::check_run_args(&read, &cwd, &graph, home.form()).unwrap();
+        let mut plan = cli_home::check_run_args(&read, &cwd, &graph).unwrap();
         let (text, failed) = smol::block_on(cli_home::run(&home, &cwd, plan.clone()));
         assert!(
             !failed && text.starts_with("exit 0") && text.contains("\"rows\""),

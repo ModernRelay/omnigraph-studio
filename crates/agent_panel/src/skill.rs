@@ -60,6 +60,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../skill/upstream/references/remote-ops.md"),
     ),
     (
+        "references/schema-design.md",
+        include_str!("../skill/upstream/references/schema-design.md"),
+    ),
+    (
         "references/schema.md",
         include_str!("../skill/upstream/references/schema.md"),
     ),

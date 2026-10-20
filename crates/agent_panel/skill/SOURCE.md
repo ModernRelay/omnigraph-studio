@@ -1,9 +1,10 @@
 # The OmniGraph guide in Studio's agent skill
 
 `upstream/` is a copy of the OmniGraph skill, unmodified: `skills/omnigraph/` and `LICENSE`
-from [ModernRelay/omnigraph](https://github.com/ModernRelay/omnigraph) at tag `v0.13.0`
-(commit `926ba3528c51583049c862f02a9604a610a9f560`), the release whose HTTP contract (0.13)
-Studio speaks. It is MIT-licensed; `upstream/LICENSE` is its license.
+from [ModernRelay/omnigraph](https://github.com/ModernRelay/omnigraph) at tag
+`edge-20261020-b692610` (commit `b692610c4aa31066cb6a9fd34830f56977288943`), the first build
+whose CLI has targets, which the agent's CLI must have; it speaks HTTP contract 0.13, as Studio
+does. It is MIT-licensed; `upstream/LICENSE` is its license.
 
 Studio writes it into each graph's agent working directory as the `omnigraph-studio` skill
 (`src/skill.rs`): `SKILL.md` here is the entry point, and the upstream `SKILL.md` becomes

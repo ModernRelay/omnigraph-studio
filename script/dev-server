@@ -6,8 +6,9 @@
 #   script/dev-server            # first run applies the cluster and loads dev/seed.jsonl
 #   script/dev-server --reset    # start again from an empty graph
 #
-# Needs OmniGraph 0.14 (`omnigraph` and `omnigraph-server`; until it is released, the edge build
-# `edge-20261017-d883c49`, named by OMNIGRAPH_BIN and OMNIGRAPH_SERVER_BIN when not on PATH).
+# Needs OmniGraph 0.14 with CLI targets (`omnigraph` and `omnigraph-server`; until it is released,
+# the edge build `edge-20261020-b692610` or later, named by OMNIGRAPH_BIN and OMNIGRAPH_SERVER_BIN
+# when not on PATH).
 # Data lives in dev/.data; 0.14 stamps it format 16 on its first write, which 0.13 cannot open.
 set -euo pipefail
 
@@ -26,8 +27,9 @@ fi
 # line into a closed pipe, which `pipefail` turns into a failed start.
 version=$("$CLI" version)
 version=${version%%$'\n'*}
-if [[ "$version" != "omnigraph 0.14."* ]]; then
-  echo "dev-server needs OmniGraph 0.14; found: $version (set OMNIGRAPH_BIN and OMNIGRAPH_SERVER_BIN)" >&2
+targets=$("$CLI" version --json | python3 -c 'import json,sys; print(json.load(sys.stdin).get("protocols", {}).get("target", ""))')
+if [[ "$version" != "omnigraph 0.14."* || "$targets" != 1 ]]; then
+  echo "dev-server needs OmniGraph 0.14 with CLI targets (edge-20261020-b692610 or later); found: $version (set OMNIGRAPH_BIN and OMNIGRAPH_SERVER_BIN)" >&2
   exit 1
 fi
 
@@ -36,10 +38,10 @@ if [[ ! -d "$DATA/__cluster" ]]; then
   fresh=1
   mkdir -p "$DATA"
   cp "$ROOT"/dev/cluster/*.yaml "$ROOT"/dev/cluster/*.pg "$DATA"/
-  (cd "$DATA" && "$CLI" cluster apply --config . > /dev/null)
+  (cd "$DATA" && "$CLI" cluster apply --config . --target . > /dev/null)
   # A direct apply keeps the cluster lock; nothing else uses this directory, so release it.
   lock=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["lock_id"])' "$DATA/__cluster/lock.json")
-  (cd "$DATA" && "$CLI" cluster force-unlock "$lock" --config . > /dev/null)
+  (cd "$DATA" && "$CLI" cluster force-unlock "$lock" --target . > /dev/null)
 fi
 
 # A server stopped without shutting down (killed, or its shell closed) leaves its lock behind.
@@ -47,7 +49,7 @@ fi
 if [[ -f "$DATA/__cluster/lock.json" ]]; then
   read -r lock pid < <(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["lock_id"], d.get("pid", ""))' "$DATA/__cluster/lock.json")
   if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
-    (cd "$DATA" && "$CLI" cluster force-unlock "$lock" --config . > /dev/null)
+    (cd "$DATA" && "$CLI" cluster force-unlock "$lock" --target . > /dev/null)
     echo "Released the lock of a stopped server (pid $pid)." >&2
   fi
 fi
@@ -55,10 +57,10 @@ fi
 OMNIGRAPH_SERVER_BEARER_TOKENS_JSON="{\"act-dev\":\"$TOKEN\"}" \
   "$SERVER" --cluster "$DATA" --bind "$BIND" &
 server=$!
-# The CLI sends a token only to a server its config names, never from OMNIGRAPH_BEARER_TOKEN, so
-# the seed loads run in a home of their own that names this one, outside the cluster root.
+# The CLI sends a token only to a target its config names, never from OMNIGRAPH_BEARER_TOKEN, so
+# the seed loads run in a home of their own that names this server, outside the cluster root.
 home=$(mktemp -d)
-printf 'servers:\n  dev:\n    url: http://%s\n' "$BIND" > "$home/config.yaml"
+printf 'target_config_version: 1\ntargets:\n  dev: { kind: server, endpoint: "http://%s", credential: dev }\n' "$BIND" > "$home/config.yaml"
 trap 'kill $server 2>/dev/null; rm -rf "$home"' EXIT INT TERM
 
 for _ in $(seq 1 60); do
@@ -68,10 +70,10 @@ done
 
 if [[ $fresh == 1 ]]; then
   [[ -f "$ROOT/dev/seed.jsonl" ]] || python3 "$ROOT/script/dev-seed.py" > "$ROOT/dev/seed.jsonl"
-  OMNIGRAPH_HOME=$home OMNIGRAPH_TOKEN_DEV=$TOKEN "$CLI" load --server dev --graph knowledge \
-    --data "$ROOT/dev/seed.jsonl" --mode overwrite --yes --quiet > /dev/null
-  OMNIGRAPH_HOME=$home OMNIGRAPH_TOKEN_DEV=$TOKEN "$CLI" load --server dev --graph notes \
-    --data "$ROOT/dev/notes-seed.jsonl" --mode overwrite --yes --quiet > /dev/null
+  OMNIGRAPH_HOME=$home OMNIGRAPH_TOKEN_DEV=$TOKEN "$CLI" load --target dev --graph knowledge \
+    --data "$ROOT/dev/seed.jsonl" --mode overwrite --yes > /dev/null
+  OMNIGRAPH_HOME=$home OMNIGRAPH_TOKEN_DEV=$TOKEN "$CLI" load --target dev --graph notes \
+    --data "$ROOT/dev/notes-seed.jsonl" --mode overwrite --yes > /dev/null
   echo "Loaded dev/seed.jsonl into knowledge and dev/notes-seed.jsonl into notes."
 fi
 

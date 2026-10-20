@@ -131,29 +131,6 @@ environment or in one instructions file. Each conversation gets
 
 ```yaml
 # config.yaml (0600)
-servers:
-  studio: { url: "http://127.0.0.1:<gateway port>" }
-defaults:
-  server: studio
-  default_graph: "<graph id>"
-```
-
-```ini
-# credentials (0600), removed when the conversation ends
-[studio]
-token = <32 random bytes as hex>
-endpoint = http://127.0.0.1:<gateway port>
-```
-
-A CLI whose `version --json` reports `protocols.target` (OmniGraph #1090) gets the target form
-instead. Studio rewrites `config.yaml` in the chosen CLI's form in both homes when it chooses
-one: a CLI with targets refuses a file with `servers`, and one before them knows no `targets`.
-The credentials file is the same for both, written by Studio in the CLI's own format: the 0.14
-CLI reads only `token`, and a CLI with targets sends the token only to requests under
-`endpoint`, so the token never passes through a process:
-
-```yaml
-# config.yaml (0600)
 target_config_version: 1
 defaults:
   target: studio
@@ -165,6 +142,17 @@ targets:
     default_graph: "<graph id>"
 ```
 
+```ini
+# credentials (0600), removed when the conversation ends
+[studio]
+token = <32 random bytes as hex>
+endpoint = http://127.0.0.1:<gateway port>
+```
+
+Studio writes the credentials file in the CLI's own format, so the token never passes through a
+process; the CLI sends it only to requests under `endpoint`. The CLI must have targets
+(OmniGraph #1090): Studio writes no other form.
+
 `omnigraph` (`0700`) is a wrapper: it unsets every `OMNIGRAPH_TOKEN_*`,
 `OMNIGRAPH_BEARER_TOKEN`, `OMNIGRAPH_PROFILE` and `OMNIGRAPH_CONTROL_*`, sets `OMNIGRAPH_HOME` to
 the directory, puts `127.0.0.1,localhost` in `NO_PROXY`, and runs the chosen CLI. The agent runs
@@ -173,8 +161,8 @@ can change what the CLI reads.
 
 The agent learns the path two ways: the conversation's MCP server adds it to its `initialize`
 instructions, and a new `omnigraph_cli` tool returns it with the branch, its base and the rules.
-The instructions are written before a CLI is chosen, and both forms make the gateway and the
-graph the default, so they tell the agent to give no `--server`, `--target` or `--graph`.
+The config makes the gateway and the graph the default, so they tell the agent to give no
+`--target` or `--graph`.
 `<cwd>/AGENTS.md`, shared by the graph's conversations, gives the rules and says where to find
 the command. Codex reads `AGENTS.md`; Claude reads it when there is no `CLAUDE.md`.
 
@@ -205,15 +193,16 @@ it is.
 
 1. `agent.omnigraph_cli` (Settings → Agent → OmniGraph CLI), then each `omnigraph` on PATH, then
    `~/.local/bin`, `/opt/homebrew/bin` and `/usr/local/bin`, without duplicates.
-2. Each says which HTTP contract it speaks, without a server, bounded to 5 s: `omnigraph
-   version --json` reports `http_contract` (OmniGraph #987, E23), as every release Studio
-   supports (0.14 and later) does. An older release, or one that does not answer, fits
-   nothing; its `--version` only names it in the notice. The first that speaks Studio's
-   contract goes in the wrapper, so a slow or unavailable server never decides which CLI a
-   conversation gets.
+2. Each says which HTTP contract it speaks and whether it has targets, without a server,
+   bounded to 5 s: `omnigraph version --json` reports `http_contract` (OmniGraph #987, E23) and
+   `protocols.target` (#1090). An older release, or one that does not answer, fits nothing; its
+   `--version` only names it in the notice. The first that speaks Studio's contract and target
+   protocol 1 goes in the wrapper (edge `edge-20261020-b692610` is the first), so a slow or
+   unavailable server never decides which CLI a conversation gets.
 3. If none fits, the wrapper runs nothing and prints why, so `omnigraph_run` and the agent's
    shell refuse rather than run a CLI the server would refuse. A notice in the thread names the
-   contract and each CLI found with its release and what it speaks, and the `omnigraph_cli`
+   contract and each CLI found with its release and what it speaks, or that it has no CLI
+   targets, and the `omnigraph_cli`
    tool says the CLI is unavailable. The agent keeps the graph tools. A configured
    `agent.omnigraph_cli` that does not fit is passed over with a notice naming the one used.
 
@@ -278,16 +267,15 @@ and cards apply, because the CLI still speaks to the gateway.
   not in the temporary directory, which a sandboxed agent may write. The folder goes with the
   conversation.
 
-- Studio adds `--target studio` (on a CLI without targets, `--server studio`) and `--graph
-  <graph>` unless the arguments name a graph, and refuses `--target` and `--server`, even
-  naming `studio`, since Studio adds them, and `--store`, `--uri`, `--cluster`, `--profile`,
-  `--direct`, `--managed`, `--api`, `--organization` and `--as`, so a call cannot leave the
-  gateway. `--config` passes: on a CLI with targets it names source files, for `cluster`
+- Studio adds `--target studio` and `--graph <graph>` unless the arguments name a graph, and
+  refuses `--target`, even naming `studio`, since Studio adds it, and `--as`, so a call cannot
+  leave the gateway. The flags #1090 removed (`--server`, `--store`, `--profile` and the rest)
+  are refused by the CLI itself. `--config` passes: on a CLI with targets it names source files, for `cluster`
   commands only, which `omnigraph_run` does not run.
 - Commands: `query`, `mutate`, `load`, `branch`, `snapshot`, `export`, `blob`, `commit`,
   `changes`, `schema show`, `graphs list`, `version` and `lint`. Anything else is refused before
   running. `lint` checks queries against a schema file offline (`--query`, `--schema`, `--json`
-  only, no server added): 0.13 refuses `lint` with `--server`, and a positional storage URI
+  only, no target added): `lint` takes no target, and a positional storage URI
   would make Studio open storage itself.
 - Files given to `--query`, `--data`, `--params-file`, `--file`, `--out` and `--schema`, and
   `save_to`, must be inside the working directory (relative, or absolute under it, never
@@ -322,7 +310,7 @@ conversation start, beside `AGENTS.md`: `.claude/skills/omnigraph-studio/` for C
 - Its `SKILL.md` is Studio's own (`crates/agent_panel/skill/SKILL.md`): what differs in Studio
   (the CLI path and flags, the agent's branch, no schema changes, unknown outcomes, offline
   lint) and which parts of the guide to read or skip.
-- The guide is the OmniGraph skill of the release whose contract Studio speaks, copied
+- The guide is the OmniGraph skill of the build whose CLI Studio requires, copied
   unmodified with its MIT license (`crates/agent_panel/skill/upstream/`, `SOURCE.md` names the
   tag and commit) and embedded in Studio's binary. Its `SKILL.md` is written as `GUIDE.md`, so
   agents do not list it as a second skill.
@@ -369,7 +357,7 @@ same write would split the cards and the rules.
 | Request bodies read whole, at most 64 MiB; answers to reads stream | Stream request bodies too | The rules need small JSON bodies whole; a load larger than 64 MiB is refused before sending, which bounds memory (IX) |
 | The gateway passes the upstream contract through and refuses a CLI that speaks another | Translate between contracts | The contract is an exact-match safety property. A translation layer would be a second API that drifts |
 | Studio tests each CLI once against the gateway | Map package versions to contracts | The package version does not determine the contract; a real request does, until E23. Superseded by `version --json` (see "Choosing the CLI") |
-| A CLI with targets gets a `targets` home and `--target studio`; one without, the `servers` home and `--server studio` | Require a CLI with targets; keep only `--server` | The CLI is whatever is installed: 0.14's edge build has no targets and OmniGraph main has no `--server` (#1090). The agent works with either until the oldest CLI Studio supports has targets |
+| The agent's CLI must have targets; Studio writes only the target home and adds `--target studio` | Write a `servers` home for a CLI before targets, chosen by `protocols.target` | OmniGraph main refuses a `servers` file (#1090). Two forms meant two homes, two flag sets, and instructions written before the choice that could name neither; Studio supports one CLI line, 0.14 with targets |
 | The agent keeps Studio's gateway, not the server's MCP | Point the agent at the server's MCP, which has read and opt-in write tools since #994 | Its writes would go wherever the agent's token may write; until E20 only the gateway keeps them on the agent's branch, and only the gateway shows each write as a card |
 | Codex gets network only when the person allows it | Always enable it; always refuse the CLI to Codex | Enabling it opens all network; refusing it gives up the CLI where the person accepts the risk |
 | The CLI is the only graph tool; `omnigraph_run` runs it for agents without network | Keep spec 011's schema, query and propose tools beside the CLI | The CLI covers every served route and composes; the old tools were a subset with their own write path. One path keeps one set of rules and cards |
@@ -440,6 +428,8 @@ CLI is the one they trust).
 | 2026-10-20 | The agent's CLI home takes the chosen CLI's form | `agent_panel` `the_cli_that_speaks_the_contract_is_chosen_without_a_server`, with a stand-in CLI reporting `protocols.target` | Both homes' `config.yaml` become the target form (`target_config_version: 1`, `studio` a server target with `credential: studio` and the graph, `defaults.target: studio`, no `servers`), and back to `servers` when a 0.14 CLI is chosen; Studio's own reader of the CLI's files lists `studio` with the session token, the saved endpoint covering the target's |
 | 2026-10-20 | `omnigraph_run` names the gateway as the chosen CLI does | `agent_panel` `run_arguments_stay_on_the_gateway_and_in_the_working_directory` | `--target studio` for a CLI with targets, `--server studio` otherwise, with the graph; `--target` (another address, or `studio`), `--server` and `--organization` from the agent are refused |
 | 2026-10-20 | The 0.14 CLI works with no destination flags and an `endpoint` in its credentials | `agent_panel` `the_stock_cli_reads_and_writes_its_branch_through_the_gateway` (ignored by default) with `omnigraph` 0.14.0-edge+0a62bb7 against `script/dev-server` on `127.0.0.1:8791` | Passed: `omnigraph_run` reads, a saved read, a read on main, the refused writes to main and branch statements, branch creation and writes on the agent's branch, all through the home's defaults. A CLI with targets was not run against the gateway: no edge build with them is installed here (`edge-20261020-b692610` is the first) |
+| 2026-10-20 | A CLI without targets is not chosen | `agent_panel` `the_cli_that_speaks_the_contract_is_chosen_without_a_server` | A 0.14 CLI that speaks the contract but reports no `protocols.target` is passed over for the one that does; with none, the notice says "0.14.0, which has no CLI targets"; both homes are the target form |
+| 2026-10-20 | The CLI with targets works through the gateway with the home's defaults | `agent_panel` `the_stock_cli_reads_and_writes_its_branch_through_the_gateway` (ignored by default) with `omnigraph` 0.14.0-edge+b692610 against `script/dev-server` on `127.0.0.1:8792`; by hand, that CLI with a home as Studio writes it | Passed (0.95 s): `omnigraph_run` reads, whole and saved to a file, a read on main, writes to main and branch statements refused, the branch created and written, all with no destination flags. By hand: `query` with no flags resolved "target studio (default) … graph=knowledge" and read 200 people; the same home in the `servers` form was refused (`target_config_invalid`), and a token saved without `endpoint` (`credential_scope_missing`) |
 
 ## Corrections
 

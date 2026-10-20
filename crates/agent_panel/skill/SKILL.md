@@ -4,7 +4,7 @@ description: Read and change this OmniGraph graph from OmniGraph Studio with the
 license: GPL-3.0-or-later; GUIDE.md and references/ are MIT (see LICENSE)
 metadata:
   author: OmniGraph Studio
-  guide-version: "0.13.0"
+  guide-version: "0.14.0-edge+b692610"
   http-contract: "0.13"
 ---
 
@@ -17,11 +17,12 @@ conversation's CLI.
 
 ## What is different in Studio
 
-- Run the CLI by the absolute path the `omnigraph_cli` tool gives you, with
-  `--server studio --graph <graph>`, or through the `omnigraph_run` tool, which adds both. Never
-  another `omnigraph` on PATH, and never `--store`, a storage URI, `--profile` or `--as`.
+- Run the CLI by the absolute path the `omnigraph_cli` tool gives you, with no `--target` or
+  `--graph`: its config makes Studio's target and this graph the default. Or run it through the
+  `omnigraph_run` tool, which adds both. Never another `omnigraph` on PATH, and never another
+  `--target`, a storage URI or `--as`.
 - The CLI is already set up. Skip the guide's parts on installing, `~/.omnigraph/config.yaml`,
-  credentials, servers, clusters, deployments, aliases, upgrades, migrations and server policy:
+  credentials, targets, clusters, deployments, aliases, upgrades, migrations and server policy:
   those are the person's.
 - Read any branch. Write only to your own branch: create it first, then pass `--branch` to
   `mutate`, `load` and Blob writes. The person reviews and merges it in Studio.
@@ -43,7 +44,8 @@ conversation's CLI.
 - `references/queries.md`: parameters, matching, traversal, correlated blocks, filters,
   aggregation, search functions, mutations and branch statements.
 - `references/data.md`: choosing `mutate` or `load`, NDJSON loads and their `--mode`.
-- `references/schema.md`: reading a `.pg` schema.
+- `references/schema.md`: reading a `.pg` schema; `references/schema-design.md`: why a schema
+  is shaped as it is, for proposing a change to the person.
 - `references/search.md`: vector, full-text and hybrid search.
 - `references/blobs.md`, `references/changes.md`, `references/stored-queries.md`.
 - `references/remote-ops.md`: write receipts, unknown outcomes and reading large output.

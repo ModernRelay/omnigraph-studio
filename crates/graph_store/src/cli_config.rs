@@ -1,15 +1,15 @@
-//! Servers, targets and tokens from the OmniGraph CLI's operator config (spec 003).
+//! Servers and tokens from the OmniGraph CLI's target files (spec 003).
 //!
 //! Studio reads `$OMNIGRAPH_HOME` (else `~/.omnigraph`) the way the CLI does
-//! (`crates/omnigraph-cli/src/operator.rs` and `targets.rs`). A `config.yaml` with
-//! `target_config_version: 1` names `targets`: each `server` target, and each `managed` cluster
-//! target with an `endpoint`, is a server. A server target's token is `OMNIGRAPH_TOKEN_<OWNER>`
-//! for its credential owner, else `[<owner>] token = …` in `credentials` when that section's
-//! `endpoint` covers the target's endpoint. A file without a version is the older form: its
-//! `servers`, the graphs its `profiles` name, and a server's token from `OMNIGRAPH_TOKEN_<NAME>`,
-//! else `[<name>] token = …`. A token is sent only to the server it is keyed to: the untargeted
-//! `OMNIGRAPH_BEARER_TOKEN` goes to none, as the CLI dropped it (OmniGraph #1030). Studio never
-//! writes these files; it reads them again when they change ([`stamp`]).
+//! (`crates/omnigraph-cli/src/operator.rs` and `targets.rs`): `config.yaml` is
+//! `target_config_version: 1` with `targets`. Each `server` target, and each `managed` cluster
+//! target with an `endpoint`, lands on a server; targets on one endpoint with one credential are
+//! one server, since the CLI makes a target of every profile. A server target's token is
+//! `OMNIGRAPH_TOKEN_<OWNER>` for its credential owner, else `[<owner>] token = …` in
+//! `credentials` when that section's `endpoint` covers the target's. A token is sent only to the
+//! server it is keyed to: the untargeted `OMNIGRAPH_BEARER_TOKEN` goes to none, as the CLI
+//! dropped it (OmniGraph #1030). Studio never writes these files; it reads them again when they
+//! change ([`stamp`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -19,23 +19,23 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliServer {
-    /// The server's name in the older form, the target's name in the newer.
+    /// The name of the target named like the server's credential owner, else of the first of
+    /// its targets by name.
     pub name: String,
     pub url: String,
-    /// Graph ids named for this server: by the older form's profiles, or the target's
-    /// `default_graph`.
+    /// Its targets' `default_graph`s.
     pub graphs: Vec<String>,
 }
 
-/// A personal alias in the CLI's config: a name bound to a stored query on a named server and
-/// graph, with default parameter values (spec 007). It carries no query text.
+/// A personal alias in the CLI's config: a name bound to a stored query on a target and graph,
+/// with default parameter values (spec 007). It carries no query text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliAlias {
     pub name: String,
-    /// The server, or target, the alias names.
+    /// The server its target lands on (the target's own name when Studio lists no server for it).
     pub server: String,
-    /// The graph the alias names. Without one the CLI posts to the server root, a route the
-    /// server does not serve, so Studio shows such an alias under no graph.
+    /// The graph the alias names, else its target's `default_graph`. Without either Studio shows
+    /// it under no graph.
     pub graph: Option<String>,
     /// The stored query's name.
     pub query: String,
@@ -45,24 +45,13 @@ pub struct CliAlias {
     pub params: serde_json::Map<String, serde_json::Value>,
 }
 
-/// The older form: servers by name, and profiles naming their graphs.
-#[derive(Debug, Default, Deserialize)]
-struct ServersConfig {
-    #[serde(default)]
-    servers: BTreeMap<String, ServerConfig>,
-    #[serde(default)]
-    profiles: BTreeMap<String, ProfileConfig>,
-    /// Read one by one: an alias Studio cannot read is left out, not the whole file.
-    #[serde(default)]
-    aliases: BTreeMap<String, serde_norway::Value>,
-}
-
-/// The newer form, `target_config_version: 1`.
+/// `config.yaml`, `target_config_version: 1`.
 #[derive(Debug, Default, Deserialize)]
 struct TargetsConfig {
-    /// Read one by one, like the aliases: a target Studio cannot read is said and left out.
+    /// Read one by one: a target Studio cannot read is said and left out, not the whole file.
     #[serde(default)]
     targets: BTreeMap<String, serde_norway::Value>,
+    /// Read one by one too: an alias Studio cannot read is left out.
     #[serde(default)]
     aliases: BTreeMap<String, serde_norway::Value>,
 }
@@ -86,9 +75,7 @@ const TARGET_CONFIG_VERSION: u64 = 1;
 
 #[derive(Debug, Deserialize)]
 struct AliasConfig {
-    /// `server` in the older form, `target` in the newer.
-    #[serde(alias = "target")]
-    server: String,
+    target: String,
     #[serde(default)]
     graph: Option<String>,
     query: String,
@@ -98,24 +85,9 @@ struct AliasConfig {
     params: BTreeMap<String, serde_norway::Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ServerConfig {
-    url: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProfileConfig {
-    #[serde(default)]
-    server: Option<String>,
-    #[serde(default)]
-    default_graph: Option<String>,
-}
-
 /// Where the CLI finds the token for one server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TokenSource {
-    /// The older form: the server's own name keys its token.
-    Named,
     /// A server target's credential owner, whose saved token must be bound to an endpoint that
     /// covers the target's.
     Owner(String),
@@ -188,7 +160,7 @@ pub fn read_operator(dir: Option<&Path>) -> OperatorFiles {
             };
         }
     };
-    let servers = servers
+    let mut servers: Vec<(CliServer, Option<String>)> = servers
         .into_iter()
         .map(|(server, source)| {
             let token = token_in(dir, &server, &source).unwrap_or_else(|error| {
@@ -200,6 +172,7 @@ pub fn read_operator(dir: Option<&Path>) -> OperatorFiles {
             (server, token)
         })
         .collect();
+    servers.sort_by(|(a, _), (b, _)| a.name.cmp(&b.name));
     OperatorFiles {
         servers: Some(servers),
         aliases,
@@ -222,7 +195,7 @@ pub fn stamp(dir: Option<&Path>) -> Vec<Option<(SystemTime, u64)>> {
         .collect()
 }
 
-/// The servers and the aliases in a CLI config file, in whichever form it is written.
+/// The servers and the aliases in a CLI target file.
 fn load_operator_from(path: &Path) -> Result<Operator, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -237,11 +210,8 @@ fn load_operator_from(path: &Path) -> Result<Operator, String> {
     if value.is_null() {
         return Ok(Operator::default());
     }
-    // Each form is decoded from the text, so a parse error keeps its line and column.
     match value.get("target_config_version") {
-        None => Ok(servers_operator(
-            serde_norway::from_str(&text).map_err(unparsed)?,
-        )),
+        // Decoded from the text, so a parse error keeps its line and column.
         Some(version) if version.as_u64() == Some(TARGET_CONFIG_VERSION) => Ok(targets_operator(
             serde_norway::from_str(&text).map_err(unparsed)?,
         )),
@@ -252,42 +222,22 @@ fn load_operator_from(path: &Path) -> Result<Operator, String> {
                 .map(|text| text.trim().to_owned())
                 .unwrap_or_default()
         )),
+        None => Err(format!(
+            "{} has no target_config_version; Studio reads the CLI's target files. Convert it \
+             with `omnigraph target import`",
+            path.display()
+        )),
     }
 }
 
-/// The older form's servers, each with the graphs its profiles name.
-fn servers_operator(config: ServersConfig) -> Operator {
-    let mut servers: Vec<(CliServer, TokenSource)> = config
-        .servers
-        .into_iter()
-        .map(|(name, server)| {
-            let server = CliServer {
-                name,
-                url: server.url,
-                graphs: Vec::new(),
-            };
-            (server, TokenSource::Named)
-        })
-        .collect();
-    for profile in config.profiles.values() {
-        if let (Some(server), Some(graph)) = (&profile.server, &profile.default_graph)
-            && let Some((entry, _)) = servers.iter_mut().find(|(s, _)| &s.name == server)
-            && !entry.graphs.contains(graph)
-        {
-            entry.graphs.push(graph.clone());
-        }
-    }
-    Operator {
-        servers,
-        aliases: read_aliases(config.aliases),
-        errors: Vec::new(),
-    }
-}
-
-/// The newer form's server targets and managed cluster endpoints. A `direct` target opens
-/// storage, which Studio does not, so it is not listed; an entry Studio cannot open is said.
+/// The servers the targets land on, and the aliases with their servers and graphs. A `direct`
+/// target opens storage, which Studio does not, so it is not listed; a target Studio cannot
+/// open is said.
 fn targets_operator(config: TargetsConfig) -> Operator {
-    let mut servers = Vec::new();
+    // Each server with the root its targets share.
+    let mut servers: Vec<(String, CliServer, TokenSource)> = Vec::new();
+    // Each target listed: the server it lands on, and its default graph.
+    let mut landed: BTreeMap<String, (usize, Option<String>)> = BTreeMap::new();
     let mut errors = Vec::new();
     for (name, value) in config.targets {
         let target: TargetConfig = match serde_norway::from_value(value) {
@@ -327,21 +277,58 @@ fn targets_operator(config: TargetsConfig) -> Operator {
             ));
             continue;
         }
-        let server = CliServer {
-            name,
-            url: endpoint,
-            graphs: target.default_graph.into_iter().collect(),
+        let root = graph_client::server_root(&endpoint).unwrap_or_else(|_| endpoint.clone());
+        let owner_named = source == TokenSource::Owner(name.clone());
+        let index = match servers
+            .iter()
+            .position(|(at, _, other)| *at == root && *other == source)
+        {
+            Some(index) => {
+                let (_, server, _) = &mut servers[index];
+                if owner_named {
+                    server.name = name.clone();
+                    server.url = endpoint;
+                }
+                if let Some(graph) = &target.default_graph
+                    && !server.graphs.contains(graph)
+                {
+                    server.graphs.push(graph.clone());
+                }
+                index
+            }
+            None => {
+                let server = CliServer {
+                    name: name.clone(),
+                    url: endpoint,
+                    graphs: target.default_graph.iter().cloned().collect(),
+                };
+                servers.push((root, server, source));
+                servers.len() - 1
+            }
         };
-        servers.push((server, source));
+        landed.insert(name, (index, target.default_graph));
     }
+    let aliases = read_aliases(config.aliases)
+        .into_iter()
+        .map(|mut alias| {
+            if let Some((index, default_graph)) = landed.get(&alias.server) {
+                alias.server = servers[*index].1.name.clone();
+                alias.graph = alias.graph.or_else(|| default_graph.clone());
+            }
+            alias
+        })
+        .collect();
     Operator {
-        servers,
-        aliases: read_aliases(config.aliases),
+        servers: servers
+            .into_iter()
+            .map(|(_, server, source)| (server, source))
+            .collect(),
+        aliases,
         errors,
     }
 }
 
-/// The aliases Studio can read, sorted by name.
+/// The aliases Studio can read, sorted by name, each naming its target.
 fn read_aliases(aliases: BTreeMap<String, serde_norway::Value>) -> Vec<CliAlias> {
     aliases
         .into_iter()
@@ -354,7 +341,7 @@ fn read_aliases(aliases: BTreeMap<String, serde_norway::Value>) -> Vec<CliAlias>
                 .collect();
             Some(CliAlias {
                 name,
-                server: alias.server,
+                server: alias.target,
                 graph: alias.graph,
                 query: alias.query,
                 args: alias.args,
@@ -365,9 +352,9 @@ fn read_aliases(aliases: BTreeMap<String, serde_norway::Value>) -> Vec<CliAlias>
 }
 
 /// `intel-dev` → `OMNIGRAPH_TOKEN_INTEL_DEV`.
-fn token_env_name(server: &str) -> String {
+fn token_env_name(owner: &str) -> String {
     let mut name = String::from("OMNIGRAPH_TOKEN_");
-    for c in server.chars() {
+    for c in owner.chars() {
         name.push(match c {
             '-' => '_',
             other => other.to_ascii_uppercase(),
@@ -376,16 +363,16 @@ fn token_env_name(server: &str) -> String {
     name
 }
 
-/// The token for a CLI server, resolved as the CLI resolves it with its files in `dir`.
+/// The token for a CLI server, resolved as the CLI resolves it with its files in `dir`: the
+/// owner's variable, else its saved token when that was saved for an endpoint covering the
+/// server's.
 fn token_in(
     dir: Option<&Path>,
     server: &CliServer,
     source: &TokenSource,
 ) -> Result<Option<String>, String> {
-    let owner = match source {
-        TokenSource::Named => &server.name,
-        TokenSource::Owner(owner) => owner,
-        TokenSource::Anonymous => return Ok(None),
+    let TokenSource::Owner(owner) = source else {
+        return Ok(None);
     };
     if let Ok(token) = std::env::var(token_env_name(owner)) {
         let token = token.trim();
@@ -399,21 +386,17 @@ fn token_in(
     let Some(saved) = read_credential_at(&dir.join("credentials"), owner)? else {
         return Ok(None);
     };
-    // The older CLI reads no endpoint; the newer sends a saved token only within its own.
-    if let TokenSource::Owner(_) = source {
-        let login = format!("run `omnigraph login --target {}`", server.name);
-        let Some(scope) = saved.endpoint else {
-            return Err(format!(
-                "the token saved for '{owner}' names no endpoint, so the CLI does not send it; \
-                 {login}"
-            ));
-        };
-        if !within_scope(&server.url, &scope) {
-            return Err(format!(
-                "the token saved for '{owner}' is for {scope}, not {}; {login}",
-                server.url
-            ));
-        }
+    let login = format!("run `omnigraph login --target {}`", server.name);
+    let Some(scope) = saved.endpoint else {
+        return Err(format!(
+            "the token saved for '{owner}' names no endpoint, so the CLI does not send it; {login}"
+        ));
+    };
+    if !within_scope(&server.url, &scope) {
+        return Err(format!(
+            "the token saved for '{owner}' is for {scope}, not {}; {login}",
+            server.url
+        ));
     }
     Ok(Some(saved.token))
 }
@@ -512,44 +495,8 @@ fn refuse_over_permissive(_path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn reads_servers_and_profile_graphs() {
-        let dir = std::env::temp_dir().join(format!("studio-cli-config-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.yaml");
-        std::fs::write(
-            &path,
-            "servers:\n  local:\n    url: http://127.0.0.1:8787  # dev\n  prod: { url: https://example.com }\nprofiles:\n  dev: { server: local, default_graph: knowledge }\ndefaults:\n  output: table\naliases:\n  who: { server: local, graph: knowledge, query: who_is, args: [slug], params: { limit: 5, deep: true }, format: kv }\n  bare: { server: local, query: who_is }\n  broken: { graph: knowledge }\n",
-        )
-        .unwrap();
-        let Operator {
-            servers, aliases, ..
-        } = load_operator_from(&path).unwrap();
-        assert_eq!(servers.len(), 2);
-        assert_eq!(servers[0].0.name, "local");
-        assert_eq!(servers[0].0.graphs, vec!["knowledge"]);
-        assert_eq!(servers[0].1, TokenSource::Named);
-        // Aliases come with their parameters; one without a server or query is left out.
-        let names: Vec<_> = aliases.iter().map(|alias| alias.name.as_str()).collect();
-        assert_eq!(names, ["bare", "who"]);
-        let who = &aliases[1];
-        assert_eq!(
-            (
-                who.server.as_str(),
-                who.graph.as_deref(),
-                who.query.as_str()
-            ),
-            ("local", Some("knowledge"), "who_is")
-        );
-        assert_eq!(who.args, ["slug"]);
-        assert_eq!(who.params["limit"], serde_json::json!(5));
-        assert_eq!(who.params["deep"], serde_json::json!(true));
-        assert_eq!(aliases[0].graph, None);
-        std::fs::remove_dir_all(dir).ok();
-    }
-
-    /// Both files are read together; a config that does not parse keeps the servers read
-    /// before, and a stamp tells a rewritten file from an untouched one.
+    /// Both files are read together; a file that does not parse, or is not a target file,
+    /// keeps the servers read before, and a stamp tells a rewritten file from an untouched one.
     #[cfg(unix)]
     #[test]
     fn reads_servers_with_their_tokens_and_stamps_the_files() {
@@ -561,11 +508,15 @@ mod tests {
 
         std::fs::write(
             dir.join("config.yaml"),
-            "servers:\n  studio-test-a: { url: http://a.test }\n  studio-test-b: { url: http://b.test }\n",
+            "target_config_version: 1\ntargets:\n  studio-test-a: { kind: server, endpoint: http://a.test, credential: studio-test-a }\n  studio-test-b: { kind: server, endpoint: http://b.test, credential: studio-test-b }\n",
         )
         .unwrap();
         let credentials = dir.join("credentials");
-        std::fs::write(&credentials, "[studio-test-a]\ntoken = one\n").unwrap();
+        std::fs::write(
+            &credentials,
+            "[studio-test-a]\ntoken = one\nendpoint = http://a.test\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
         let before = stamp(Some(&dir));
         assert!(before.iter().all(Option::is_some));
@@ -585,7 +536,11 @@ mod tests {
         );
         assert!(files.errors.is_empty());
 
-        std::fs::write(&credentials, "[studio-test-a]\ntoken = two\n").unwrap();
+        std::fs::write(
+            &credentials,
+            "[studio-test-a]\ntoken = two\nendpoint = http://a.test\n",
+        )
+        .unwrap();
         assert_ne!(stamp(Some(&dir)), before);
         assert_eq!(
             read_operator(Some(&dir)).servers.unwrap()[0].1.as_deref(),
@@ -598,7 +553,7 @@ mod tests {
         assert_eq!(files.servers.unwrap()[0].1, None);
         assert_eq!(files.errors.len(), 1, "{:?}", files.errors);
 
-        std::fs::write(dir.join("config.yaml"), "servers: [unclosed\n").unwrap();
+        std::fs::write(dir.join("config.yaml"), "targets: [unclosed\n").unwrap();
         let files = read_operator(Some(&dir));
         assert_eq!(files.servers, None);
         assert!(
@@ -606,26 +561,105 @@ mod tests {
             "{:?}",
             files.errors
         );
+        // A file without a version is not read; the reason names the CLI's conversion.
+        std::fs::write(
+            dir.join("config.yaml"),
+            "servers:\n  studio-test-a: { url: http://a.test }\n",
+        )
+        .unwrap();
+        let files = read_operator(Some(&dir));
+        assert_eq!(files.servers, None);
+        assert!(
+            files.errors[0].contains("omnigraph target import"),
+            "{:?}",
+            files.errors
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// `omnigraph target import` makes a target of every server and of every profile, so one
+    /// server's targets differ only in their default graph: they are one server, named like the
+    /// credential owner, with every default graph, and an alias on any of them lands there.
     #[cfg(unix)]
     #[test]
-    fn reads_a_token_section_and_refuses_open_permissions() {
+    fn targets_on_one_endpoint_are_one_server() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("studio-cli-creds-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("studio-cli-grouped-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("credentials");
-        std::fs::write(&path, "[other]\ntoken = a\n[local]\ntoken = \"secret\"\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let saved = read_credential_at(&path, "local").unwrap().unwrap();
-        assert_eq!((saved.token.as_str(), saved.endpoint), ("secret", None));
-        assert!(read_credential_at(&path, "missing").unwrap().is_none());
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_credential_at(&path, "local").is_err());
+        // As the CLI writes it, block style.
+        std::fs::write(
+            dir.join("config.yaml"),
+            "target_config_version: 1\n\
+             targets:\n\
+             \x20 default:\n    kind: server\n    endpoint: http://127.0.0.1:8791\n    credential: studio-test-dev\n    default_graph: knowledge\n\
+             \x20 studio-test-dev:\n    kind: server\n    endpoint: http://127.0.0.1:8791/\n    credential: studio-test-dev\n\
+             \x20 studio-test-other:\n    kind: server\n    endpoint: https://other.test\n    credential: studio-test-other\n\
+             \x20 work:\n    kind: server\n    endpoint: http://127.0.0.1:8791\n    credential: studio-test-dev\n    default_graph: notes\n\
+             \x20 open:\n    kind: server\n    endpoint: http://127.0.0.1:8791\n    auth: anonymous\n\
+             defaults:\n  target: default\n\
+             aliases:\n\
+             \x20 people:\n    target: studio-test-dev\n    graph: knowledge\n    query: who_is\n\
+             \x20 notes:\n    target: work\n    query: recent\n\
+             \x20 lost:\n    target: nowhere\n    query: q\n",
+        )
+        .unwrap();
+        let credentials = dir.join("credentials");
+        std::fs::write(
+            &credentials,
+            "[studio-test-dev]\ntoken = dev-token\nendpoint = http://127.0.0.1:8791\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let files = read_operator(Some(&dir));
+        assert!(files.errors.is_empty(), "{:?}", files.errors);
+        let listed: Vec<_> = files
+            .servers
+            .unwrap()
+            .into_iter()
+            .map(|(server, token)| (server.name, server.url, server.graphs, token))
+            .collect();
+        // The anonymous target on the same address is a server of its own: it sends no token.
+        assert_eq!(
+            listed,
+            vec![
+                ("open".into(), "http://127.0.0.1:8791".into(), vec![], None),
+                (
+                    "studio-test-dev".into(),
+                    "http://127.0.0.1:8791/".into(),
+                    vec!["knowledge".to_owned(), "notes".to_owned()],
+                    Some("dev-token".to_owned())
+                ),
+                (
+                    "studio-test-other".into(),
+                    "https://other.test".into(),
+                    vec![],
+                    None
+                ),
+            ]
+        );
+        let aliases: Vec<_> = files
+            .aliases
+            .iter()
+            .map(|alias| {
+                (
+                    alias.name.as_str(),
+                    alias.server.as_str(),
+                    alias.graph.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            aliases,
+            vec![
+                ("lost", "nowhere", None),
+                ("notes", "studio-test-dev", Some("notes")),
+                ("people", "studio-test-dev", Some("knowledge")),
+            ]
+        );
         std::fs::remove_dir_all(dir).ok();
-        assert_eq!(token_env_name("intel-dev"), "OMNIGRAPH_TOKEN_INTEL_DEV");
     }
+
     /// A target file lists its server targets and managed cluster endpoints; a token saved for
     /// a credential owner reaches a target only within the endpoint it was saved for, as the CLI
     /// sends it.
@@ -751,5 +785,23 @@ mod tests {
         assert_eq!(files.servers, None);
         assert!(files.errors[0].contains("version 1"), "{:?}", files.errors);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_a_token_section_and_refuses_open_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("studio-cli-creds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("credentials");
+        std::fs::write(&path, "[other]\ntoken = a\n[local]\ntoken = \"secret\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let saved = read_credential_at(&path, "local").unwrap().unwrap();
+        assert_eq!((saved.token.as_str(), saved.endpoint), ("secret", None));
+        assert!(read_credential_at(&path, "missing").unwrap().is_none());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_credential_at(&path, "local").is_err());
+        std::fs::remove_dir_all(dir).ok();
+        assert_eq!(token_env_name("intel-dev"), "OMNIGRAPH_TOKEN_INTEL_DEV");
     }
 }

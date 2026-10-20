@@ -673,8 +673,7 @@ async fn turn(
         };
         let command = after("omnigraph CLI is ", &['(']).ok_or("no command in the instructions")?;
         let branch = after("Write only to your branch, ", &[':']).ok_or("no branch")?;
-        let base = after("--from ", &[' ']).ok_or("no base")?;
-        let graph = after("--graph ", &[' ']).ok_or("no graph")?;
+        let base = after("--from ", &['`', ' ']).ok_or("no base")?;
         let run = |args: Vec<String>| {
             let command = command.clone();
             async move {
@@ -696,39 +695,31 @@ async fn turn(
                 })
             }
         };
-        let target = |mut args: Vec<String>| {
-            args.extend([
-                "--server".into(),
-                "studio".into(),
-                "--graph".into(),
-                graph.clone(),
-            ]);
-            args
-        };
-        let created = run(target(vec![
+        // As the instructions say: no `--target` or `--graph`, which the CLI's config sets.
+        let created = run(vec![
             "branch".into(),
             "create".into(),
             branch.clone(),
             "--from".into(),
             base.clone(),
-        ]))
+        ])
         .await?;
-        let changed = run(target(vec![
+        let changed = run(vec![
             "mutate".into(),
             "--branch".into(),
             branch.clone(),
             "-e".into(),
             "query retitle() { update Person set { title: \"Retitled through the CLI\" } where @id = \"person-000002\" }".into(),
-        ]))
+        ])
         .await?;
-        let refused = run(target(vec![
+        let refused = run(vec![
             "mutate".into(),
             "--branch".into(),
             base.clone(),
             "-e".into(),
             "query retitle() { update Person set { title: \"x\" } where @id = \"person-000002\" }"
                 .into(),
-        ]))
+        ])
         .await?;
         say(
             connection,

@@ -3,8 +3,8 @@
 //! agent's environment or in one instructions file. Each conversation gets a directory of its
 //! own, `<cwd>/.studio/<branch>/`:
 //!
-//! - `config.yaml` names this conversation's gateway `studio` and makes it the default, with the
-//!   graph: a target for a CLI with targets, a server for one before them ([`CliForm`]);
+//! - `config.yaml` names this conversation's gateway as the target `studio`, its default, with the
+//!   graph;
 //! - `credentials` (`0600`) holds the gateway's session token, never the person's, bound to the
 //!   gateway's address;
 //! - `omnigraph` (`0700`) runs the CLI Studio found with that directory as `OMNIGRAPH_HOME`,
@@ -39,63 +39,30 @@ pub struct CliHome {
     /// so each write opens the folder again by handle (`confined`).
     cwd: PathBuf,
     folder: String,
-    /// The gateway's port on loopback.
-    port: u16,
     /// The credentials file as written, so a later conversation's file in the same folder is
     /// left alone when this one ends.
     credentials: String,
     /// The home `omnigraph_run` uses, outside the working directory; its runs stage there too.
     private: PathBuf,
-    /// The CLI chosen for the conversation, which `omnigraph_run` starts itself, and how it
-    /// names the gateway; or why there is none.
-    cli: std::sync::Mutex<Result<(PathBuf, CliForm), String>>,
+    /// The CLI chosen for the conversation, which `omnigraph_run` starts itself, or why there
+    /// is none.
+    cli: std::sync::Mutex<Result<PathBuf, String>>,
 }
 
-/// How a CLI names the gateway: as a target, when its `version --json` reports a target
-/// protocol, or, before the CLI had targets, as a server. A CLI with targets refuses a config
-/// with servers in it, and one before them knows no targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CliForm {
-    Server,
-    Target,
-}
+/// The target protocol of the home Studio writes (`target_config_version: 1`). A CLI is chosen
+/// only when its `version --json` reports it.
+const TARGET_PROTOCOL: u64 = 1;
 
-impl CliForm {
-    pub fn of(facts: &CliFacts) -> Self {
-        if facts.target_protocol.is_some() {
-            Self::Target
-        } else {
-            Self::Server
-        }
-    }
-
-    /// The flag that names the gateway.
-    pub fn flag(self) -> &'static str {
-        match self {
-            Self::Server => "--server",
-            Self::Target => "--target",
-        }
-    }
-
-    /// The CLI config naming the gateway on `port` as `studio`, its default, with `graph`.
-    fn config(self, port: u16, graph: &str) -> String {
-        let graph = yaml_string(graph);
-        let written = "# Written by OmniGraph Studio for one agent conversation (spec 013).\n";
-        match self {
-            Self::Server => format!(
-                "{written}\
-                 servers:\n  studio: {{ url: \"http://127.0.0.1:{port}\" }}\n\
-                 defaults:\n  server: studio\n  default_graph: {graph}\n"
-            ),
-            Self::Target => format!(
-                "{written}\
-                 target_config_version: 1\n\
-                 targets:\n  studio: {{ kind: server, endpoint: \"http://127.0.0.1:{port}\", \
-                 credential: studio, default_graph: {graph} }}\n\
-                 defaults:\n  target: studio\n"
-            ),
-        }
-    }
+/// The CLI config naming the gateway on `port` as the target `studio`, its default, with `graph`.
+fn config(port: u16, graph: &str) -> String {
+    format!(
+        "# Written by OmniGraph Studio for one agent conversation (spec 013).\n\
+         target_config_version: 1\n\
+         targets:\n  studio: {{ kind: server, endpoint: \"http://127.0.0.1:{port}\", \
+         credential: studio, default_graph: {} }}\n\
+         defaults:\n  target: studio\n",
+        yaml_string(graph)
+    )
 }
 
 impl Drop for CliHome {
@@ -124,10 +91,8 @@ impl CliHome {
         base: &str,
     ) -> std::io::Result<Self> {
         let name = branch.replace('/', "-");
-        // Rewritten in the chosen CLI's form by `use_cli`.
-        let config = CliForm::Server.config(port, graph);
-        // A CLI with targets sends a saved token only under the address it was saved for; one
-        // before them reads `token` alone.
+        let config = config(port, graph);
+        // The CLI sends a saved token only under the address it was saved for.
         let credentials =
             format!("[studio]\ntoken = {token}\nendpoint = http://127.0.0.1:{port}\n");
         // Private: the credentials hold the gateway's token.
@@ -156,7 +121,6 @@ impl CliHome {
             base: base.to_owned(),
             cwd: cwd.to_owned(),
             folder: format!(".studio/{name}"),
-            port,
             credentials,
             private: private_root.join(folder),
             cli: std::sync::Mutex::new(Err("Studio has not chosen an omnigraph CLI yet.".into())),
@@ -169,22 +133,11 @@ impl CliHome {
             .lock()
             .map_err(|_| "Studio lost track of the conversation's CLI.".to_owned())?
             .clone()
-            .map(|(cli, _)| cli)
     }
 
-    /// How the chosen CLI names the gateway; a server until one is chosen.
-    pub fn form(&self) -> CliForm {
-        match self.cli.lock().as_deref() {
-            Ok(Ok((_, form))) => *form,
-            _ => CliForm::Server,
-        }
-    }
-
-    fn set_cli(&self, cli: Result<(&Path, CliForm), &str>) {
+    fn set_cli(&self, cli: Result<&Path, &str>) {
         if let Ok(mut chosen) = self.cli.lock() {
-            *chosen = cli
-                .map(|(cli, form)| (cli.to_owned(), form))
-                .map_err(str::to_owned);
+            *chosen = cli.map(Path::to_owned).map_err(str::to_owned);
         }
     }
 
@@ -216,12 +169,8 @@ impl CliHome {
         Confined::open(&self.cwd)?.dirs(&self.folder)
     }
 
-    /// Points the wrapper at `cli`, after writing both homes' config in its form.
-    pub fn use_cli(&self, cli: &Path, form: CliForm) -> std::io::Result<()> {
-        let config = form.config(self.port, &self.graph);
-        self.home()?
-            .write("config.yaml", config.as_bytes(), 0o600)?;
-        Confined::open(&self.private)?.write("config.yaml", config.as_bytes(), 0o600)?;
+    /// Points the wrapper at `cli`.
+    pub fn use_cli(&self, cli: &Path) -> std::io::Result<()> {
         let script = format!(
             "#!/bin/sh\n\
              # Written by OmniGraph Studio for one agent conversation (spec 013): the omnigraph\n\
@@ -237,7 +186,7 @@ impl CliHome {
             cli = shell_quote(&cli.to_string_lossy()),
         );
         self.home()?.write("omnigraph", script.as_bytes(), 0o700)?;
-        self.set_cli(Ok((cli, form)));
+        self.set_cli(Ok(cli));
         Ok(())
     }
 
@@ -256,9 +205,8 @@ impl CliHome {
     }
 
     /// What the agent is told about this conversation's CLI: in its MCP instructions and by the
-    /// `omnigraph_cli` tool. The MCP instructions are written before a CLI is chosen, so they
-    /// name no flag that differs between [`CliForm`]s: the config makes the gateway and the
-    /// graph the default in either.
+    /// `omnigraph_cli` tool. The home's config makes the gateway and the graph the default, so
+    /// the agent passes neither.
     pub fn instructions(&self, cli_ready: Option<bool>) -> String {
         let command = self.command.to_string_lossy();
         match cli_ready {
@@ -272,7 +220,7 @@ impl CliHome {
             _ => format!(
                 "This conversation's omnigraph CLI is {command} (run it by that path; another \
                  omnigraph on PATH is not connected to Studio). Its config already points it at \
-                 Studio and the graph {graph}: give no --server, --target or --graph. Read any \
+                 Studio and the graph {graph}: give no --target or --graph. Read any \
                  branch. Write only to your branch, {branch}: create it first with `{command} \
                  branch create {branch} --from {base}`, then pass `--branch {branch}` to mutate \
                  and load. Prefer one load of NDJSON to many \
@@ -303,8 +251,8 @@ pub fn write_agents_md(cwd: &Path, graph: &str) -> std::io::Result<()> {
          instructions of the `omnigraph` MCP server, and the `omnigraph_cli` tool returns it \
          with your branch. Run it by that path: another `omnigraph` on PATH is not connected \
          to Studio.\n\
-         - Its config already points it at Studio and this graph: give no `--server`, \
-         `--target` or `--graph`.\n\
+         - Its config already points it at Studio and this graph: give no `--target` or \
+         `--graph`.\n\
          - Read any branch or commit (`--branch`, `--snapshot`).\n\
          - Write only to your own branch. Create it first with `branch create <your branch> \
          --from <its base>`, then pass `--branch <your branch>` to `mutate`, `load` and Blob \
@@ -366,10 +314,10 @@ pub fn candidates(configured: Option<&str>) -> Vec<PathBuf> {
 pub struct CliFacts {
     /// Its release, as it reports it ("0.14.0").
     pub version: Option<String>,
-    /// `None` for a CLI that did not answer `version --json`: one older than Studio's minimum,
-    /// 0.14, or not OmniGraph's.
+    /// `None` for a CLI that did not answer `version --json`: one older than 0.14, or not
+    /// OmniGraph's.
     pub contract: Option<String>,
-    /// The target protocol it reports (`protocols.target`); `None` for a CLI before targets.
+    /// The target protocol it reports (`protocols.target`); `None` for a CLI without targets.
     pub target_protocol: Option<u64>,
 }
 
@@ -451,7 +399,8 @@ pub async fn choose_cli(home: &CliHome, candidates: Vec<PathBuf>, contract: &str
             break;
         };
         if facts.contract.as_deref() == Some(contract)
-            && home.use_cli(&cli, CliForm::of(&facts)).is_ok()
+            && facts.target_protocol == Some(TARGET_PROTOCOL)
+            && home.use_cli(&cli).is_ok()
         {
             return CliChoice::Chosen {
                 cli,
@@ -464,21 +413,28 @@ pub async fn choose_cli(home: &CliHome, candidates: Vec<PathBuf>, contract: &str
     CliChoice::NoMatch { found }
 }
 
-/// Why a conversation has no CLI: the contract the graph needs and each CLI found.
+/// Why a conversation has no CLI: the contract the graph needs, CLI targets, and each CLI found.
 pub fn no_cli_text(contract: &str, found: &[(PathBuf, CliFacts)]) -> String {
-    let mut text = format!("No omnigraph CLI here speaks this graph's HTTP API ({contract})");
+    let mut text =
+        format!("No omnigraph CLI here speaks this graph's HTTP API ({contract}) with CLI targets");
     if found.is_empty() {
         text.push_str(": Studio found none");
     } else {
         let each: Vec<String> = found
             .iter()
             .map(|(cli, facts)| {
-                let what = match (&facts.version, &facts.contract) {
-                    (Some(version), Some(speaks)) => format!("{version}, which speaks {speaks}"),
-                    (None, Some(speaks)) => format!("a CLI that speaks {speaks}"),
-                    (_, None) => "older than 0.14, or not OmniGraph's: it did not answer \
+                let it = facts.version.as_deref().unwrap_or("a CLI");
+                let what = match (&facts.contract, facts.target_protocol) {
+                    (None, _) => "older than 0.14, or not OmniGraph's: it did not answer \
                                   `version --json`"
                         .to_owned(),
+                    (Some(speaks), _) if speaks != contract => {
+                        format!("{it}, which speaks {speaks}")
+                    }
+                    (Some(_), None) => format!("{it}, which has no CLI targets"),
+                    (Some(_), Some(protocol)) => {
+                        format!("{it}, which reads target protocol {protocol}")
+                    }
                 };
                 format!("{} is {what}", cli.display())
             })
@@ -487,7 +443,8 @@ pub fn no_cli_text(contract: &str, found: &[(PathBuf, CliFacts)]) -> String {
         text.push_str(&each.join("; "));
     }
     text.push_str(&format!(
-        ". Install omnigraph {contract}, or set `agent.omnigraph_cli` to one."
+        ". Install an omnigraph that speaks {contract} with CLI targets (OmniGraph \
+         edge-20261020-b692610 or later), or set `agent.omnigraph_cli` to one."
     ));
     text
 }
@@ -500,21 +457,9 @@ const RUN_COMMANDS: &[&str] = &[
 ];
 /// What `lint` may take: it checks queries against a schema file offline, never a graph.
 const LINT_FLAGS: &[&str] = &["--query", "--schema", "--json"];
-/// Flags that would choose another address, credentials or actor than the conversation's. Studio
-/// names the gateway itself, so `--target` and `--server` are refused even naming `studio`.
-const RUN_FORBIDDEN: &[&str] = &[
-    "--server",
-    "--target",
-    "--organization",
-    "--store",
-    "--uri",
-    "--cluster",
-    "--profile",
-    "--direct",
-    "--managed",
-    "--api",
-    "--as",
-];
+/// Flags that would choose another destination or actor than the conversation's. Studio names
+/// the gateway itself, so `--target` is refused even naming `studio`.
+const RUN_FORBIDDEN: &[&str] = &["--target", "--as"];
 /// Flags whose value is a file the CLI reads or writes; it must be in the working directory.
 const RUN_PATH_FLAGS: &[&str] = &[
     "--query",
@@ -568,14 +513,8 @@ where
 /// Checks the arguments the agent gave `omnigraph_run` (spec 013): the CLI runs in Studio's
 /// process, outside the agent's sandbox, so it may only speak to this conversation's gateway
 /// and touch files in the conversation's working directory. Returns the arguments to run, with
-/// the gateway named as `form` names it (`--target studio`, or `--server studio`) and the
-/// conversation's graph unless one is named added.
-pub fn check_run_args(
-    args: &[String],
-    cwd: &Path,
-    graph: &str,
-    form: CliForm,
-) -> Result<RunPlan, String> {
+/// `--target studio` (and the conversation's graph unless one is named) added.
+pub fn check_run_args(args: &[String], cwd: &Path, graph: &str) -> Result<RunPlan, String> {
     let Some(command) = args.first() else {
         return Err("Pass the omnigraph arguments, for example [\"query\", \"-e\", \"…\"].".into());
     };
@@ -596,7 +535,7 @@ pub fn check_run_args(
         return Err(format!("Only `{command} show`/`list` read through Studio."));
     }
     // `lint` reads a schema file, not the graph: a positional storage URI would make Studio
-    // open storage directly, so only its file flags pass, and no server is added.
+    // open storage directly, so only its file flags pass, and no target is added.
     let lint = command == "lint";
     if lint {
         let mut rest = args[1..].iter();
@@ -629,8 +568,7 @@ pub fn check_run_args(
         if RUN_FORBIDDEN.contains(&flag) {
             return Err(format!(
                 "`{flag}` is not passed: this conversation's CLI speaks only to Studio, which adds \
-                 `{} studio` itself.",
-                form.flag()
+                 `--target studio` itself."
             ));
         }
         if flag == "--graph" {
@@ -660,7 +598,7 @@ pub fn check_run_args(
         index += 1;
     }
     if !lint {
-        checked.extend([form.flag().to_owned(), "studio".to_owned()]);
+        checked.extend(["--target".to_owned(), "studio".to_owned()]);
         if !has_graph {
             checked.extend(["--graph".to_owned(), graph.to_owned()]);
         }
@@ -1031,20 +969,20 @@ mod tests {
             "omnigraph-0.13",
             r#"[ "$1" = --version ] && { echo "omnigraph 0.13.0"; exit 0; }; exit 2"#,
         );
-        let current = fake(
+        // Speaks the contract but has no targets, so it would refuse the home's config.
+        let untargeted = fake(
             "omnigraph-0.14",
             r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.14.0","http_contract":"0.13"}'; exit 0; }; exit 2"#,
+        );
+        let current = fake(
+            "omnigraph-targets",
+            r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.14.0-edge+b692610","http_contract":"0.13","protocols":{"target":1,"credential":1}}'; exit 0; }; exit 2"#,
         );
         // A wrapper that hangs: a match before it is chosen without waiting for it.
         let hung = fake("omnigraph-hung", "sleep 30");
         let other = fake(
             "omnigraph-0.15",
-            r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.15.0","http_contract":"0.15"}'; exit 0; }; exit 2"#,
-        );
-        // A CLI with targets, which refuses a config with servers in it.
-        let targets = fake(
-            "omnigraph-targets",
-            r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.14.0-edge","http_contract":"0.13","protocols":{"target":1,"credential":1}}'; exit 0; }; exit 2"#,
+            r#"[ "$1 $2" = "version --json" ] && { echo '{"version":"0.15.0","http_contract":"0.15","protocols":{"target":1}}'; exit 0; }; exit 2"#,
         );
         let home = CliHome::write(
             &dir,
@@ -1060,31 +998,20 @@ mod tests {
         let choose =
             |candidates: Vec<PathBuf>| smol::block_on(choose_cli(&home, candidates, "0.13"));
 
-        match choose(vec![old.clone(), current.clone()]) {
+        match choose(vec![old.clone(), untargeted.clone(), current.clone()]) {
             CliChoice::Chosen { cli, version } => {
                 assert_eq!(cli, current);
-                assert_eq!(version.as_deref(), Some("0.14.0"));
+                assert_eq!(version.as_deref(), Some("0.14.0-edge+b692610"));
             }
             other => panic!("{other:?}"),
         }
         assert!(wrapper().contains(&*current.to_string_lossy()));
-        assert_eq!(home.form(), CliForm::Server);
-
-        // Chosen, a CLI with targets gets the gateway as a target in both homes; the one before
-        // targets gets it back as a server.
-        let configs = || {
-            [
-                home.dir.join("config.yaml"),
-                home.private.join("config.yaml"),
-            ]
-            .map(|path| std::fs::read_to_string(path).unwrap())
-        };
-        assert!(matches!(
-            choose(vec![targets.clone()]),
-            CliChoice::Chosen { .. }
-        ));
-        assert_eq!(home.form(), CliForm::Target);
-        for config in configs() {
+        // Both homes name the gateway as the target `studio`, the default.
+        for path in [
+            home.dir.join("config.yaml"),
+            home.private.join("config.yaml"),
+        ] {
+            let config = std::fs::read_to_string(path).unwrap();
             assert!(config.contains("target_config_version: 1\n"), "{config}");
             assert!(
                 config.contains(
@@ -1093,7 +1020,6 @@ mod tests {
                 "{config}"
             );
             assert!(config.contains("defaults:\n  target: studio\n"), "{config}");
-            assert!(!config.contains("servers:"), "{config}");
         }
         // Studio's own reading of the CLI's files sends the token to the gateway: the endpoint
         // it is saved for covers the target's.
@@ -1105,15 +1031,6 @@ mod tests {
             (servers[0].0.name.as_str(), servers[0].1.as_deref()),
             ("studio", Some("t"))
         );
-        assert!(matches!(
-            choose(vec![current.clone()]),
-            CliChoice::Chosen { .. }
-        ));
-        assert_eq!(home.form(), CliForm::Server);
-        for config in configs() {
-            assert!(config.contains("servers:\n  studio:"), "{config}");
-            assert!(!config.contains("target_config_version"), "{config}");
-        }
 
         match choose(vec![other.clone(), current.clone()]) {
             CliChoice::Chosen { cli, .. } => assert_eq!(cli, current),
@@ -1131,10 +1048,11 @@ mod tests {
             started.elapsed()
         );
 
-        match choose(vec![old.clone(), other.clone()]) {
+        match choose(vec![old.clone(), untargeted.clone(), other.clone()]) {
             CliChoice::NoMatch { found } => {
                 let text = no_cli_text("0.13", &found);
                 assert!(text.contains("older than 0.14"), "{text}");
+                assert!(text.contains("0.14.0, which has no CLI targets"), "{text}");
                 assert!(text.contains("0.15.0, which speaks 0.15"), "{text}");
             }
             other => panic!("{other:?}"),
@@ -1162,7 +1080,7 @@ mod tests {
         std::os::unix::fs::symlink("/etc/passwd", cwd.join("escape")).ok();
         let cwd = std::fs::canonicalize(&cwd).unwrap();
         let args = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-        let check = |list: &[&str]| check_run_args(&args(list), &cwd, "knowledge", CliForm::Server);
+        let check = |list: &[&str]| check_run_args(&args(list), &cwd, "knowledge");
         let file = |parts: &[&str], output: bool| RunFile {
             parts: parts.iter().map(|part| (*part).to_owned()).collect(),
             output,
@@ -1177,26 +1095,6 @@ mod tests {
                 "-e",
                 "query q() { … }",
                 "--json",
-                "--server",
-                "studio",
-                "--graph",
-                "knowledge"
-            ])
-        );
-        // A CLI with targets is given the gateway as its target.
-        assert_eq!(
-            check_run_args(
-                &args(&["query", "-e", "q"]),
-                &cwd,
-                "knowledge",
-                CliForm::Target
-            )
-            .unwrap()
-            .args,
-            args(&[
-                "query",
-                "-e",
-                "q",
                 "--target",
                 "studio",
                 "--graph",
@@ -1225,7 +1123,7 @@ mod tests {
                 "append",
                 "--graph",
                 "notes",
-                "--server",
+                "--target",
                 "studio",
             ])
         );
@@ -1234,7 +1132,7 @@ mod tests {
         let absolute = cwd.join("data/rows.jsonl");
         let absolute = check(&["load", "--data", &absolute.to_string_lossy()]).unwrap();
         assert_eq!(absolute.files, load.files);
-        // `lint` checks against a saved schema file, offline: no server is added.
+        // `lint` checks against a saved schema file, offline: no target is added.
         let lint = check(&["lint", "--query", "q.gq", "--schema=schema.pg", "--json"]).unwrap();
         assert_eq!(
             lint.args,
@@ -1255,11 +1153,9 @@ mod tests {
             &["init", "--store", "x"][..],
             &["omnigraph", "query"],
             &["schema", "apply"],
-            &["query", "--server", "http://elsewhere"],
             &["query", "--target", "http://elsewhere"],
+            &["query", "--target=file:///tmp/g"],
             &["query", "--target=studio"],
-            &["graphs", "list", "--organization", "org"],
-            &["query", "--store=file:///tmp/g"],
             &["mutate", "--as", "someone"],
             &["load", "--data", "/etc/passwd"],
             &["load", "--data", "../outside.jsonl"],
@@ -1367,10 +1263,10 @@ mod tests {
         let cli = cwd.join("fake-cli");
         std::fs::write(&cli, "#!/bin/sh\npwd\nenv\n").unwrap();
         std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
-        home.use_cli(&cli, CliForm::Server).unwrap();
+        home.use_cli(&cli).unwrap();
         // What the agent may do in its own folder.
         std::fs::write(&home.command, "#!/bin/sh\necho rewritten\n").unwrap();
-        std::fs::write(home.dir.join("config.yaml"), "servers: {}\n").unwrap();
+        std::fs::write(home.dir.join("config.yaml"), "targets: {}\n").unwrap();
 
         let (text, failed) = smol::block_on(run(&home, &cwd, plan()));
         assert!(!failed, "{text}");
@@ -1391,7 +1287,7 @@ mod tests {
         assert!(
             std::fs::read_to_string(home.private.join("config.yaml"))
                 .unwrap()
-                .contains("studio: { url: \"http://127.0.0.1:1\" }")
+                .contains("studio: { kind: server, endpoint: \"http://127.0.0.1:1\"")
         );
         assert!(
             check_run_args(
@@ -1401,8 +1297,7 @@ mod tests {
                     ".studio/agent-x/config.yaml".into()
                 ],
                 &cwd,
-                "knowledge",
-                CliForm::Server
+                "knowledge"
             )
             .is_err()
         );
@@ -1447,7 +1342,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
-        home.use_cli(&cli, CliForm::Server).unwrap();
+        home.use_cli(&cli).unwrap();
         let plan = RunPlan {
             args: vec!["export".into()],
             files: Vec::new(),
@@ -1505,17 +1400,18 @@ mod tests {
         assert_eq!(mode(&home.dir.join("credentials")), 0o600);
         let config = std::fs::read_to_string(home.dir.join("config.yaml")).unwrap();
         assert!(
-            config.contains("studio: { url: \"http://127.0.0.1:49152\" }"),
+            config.contains(
+                "studio: { kind: server, endpoint: \"http://127.0.0.1:49152\", credential: studio, default_graph: \"knowledge\" }"
+            ),
             "{config}"
         );
-        assert!(config.contains("default_graph: \"knowledge\""), "{config}");
+        assert!(config.contains("defaults:\n  target: studio\n"), "{config}");
         assert_eq!(
             std::fs::read_to_string(home.dir.join("credentials")).unwrap(),
             "[studio]\ntoken = abc123\nendpoint = http://127.0.0.1:49152\n"
         );
 
-        home.use_cli(Path::new("/opt/it's here/omnigraph"), CliForm::Server)
-            .unwrap();
+        home.use_cli(Path::new("/opt/it's here/omnigraph")).unwrap();
         assert_eq!(mode(&home.command), 0o700);
         let script = std::fs::read_to_string(&home.command).unwrap();
         assert!(
@@ -1525,8 +1421,7 @@ mod tests {
         assert!(script.contains(&format!("OMNIGRAPH_HOME='{}'", home.dir.display())));
 
         // The wrapper runs with its own home, loopback outside any proxy, and no other token.
-        home.use_cli(Path::new("/usr/bin/env"), CliForm::Target)
-            .unwrap();
+        home.use_cli(Path::new("/usr/bin/env")).unwrap();
         let output = std::process::Command::new(&home.command)
             .env("OMNIGRAPH_TOKEN_PERSONAL", "secret")
             .env("OMNIGRAPH_BEARER_TOKEN", "secret")
@@ -1557,7 +1452,6 @@ mod tests {
             base: "b".repeat(64),
             cwd: cwd.clone(),
             folder: ".studio/agent-20261013-101500".into(),
-            port: 65535,
             credentials: String::new(),
             private: cwd.join("private/longest"),
             cli: std::sync::Mutex::new(Err(String::new())),
@@ -1575,10 +1469,7 @@ mod tests {
         );
         write_agents_md(&cwd, "knowledge").unwrap();
         let rules = std::fs::read_to_string(cwd.join("AGENTS.md")).unwrap();
-        assert!(
-            rules.contains("give no `--server`, `--target` or `--graph`"),
-            "{rules}"
-        );
+        assert!(rules.contains("give no `--target` or `--graph`"), "{rules}");
         std::fs::remove_dir_all(&cwd).ok();
     }
 }

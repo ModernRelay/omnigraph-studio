@@ -2139,8 +2139,7 @@ impl AgentPanel {
                 return;
             }
         }
-        let (graph, form) = (&home.graph, home.form());
-        let checked = cli_home::check_run_args(args, &cwd, graph, form).and_then(|mut plan| {
+        let checked = cli_home::check_run_args(args, &cwd, &home.graph).and_then(|mut plan| {
             plan.save_to = save_to
                 .map(|path| {
                     cli_home::inside(&cwd, path).map(|parts| cli_home::RunFile {

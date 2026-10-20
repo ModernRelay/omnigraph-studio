@@ -305,6 +305,8 @@ query friend_counts() {
 ```
 
 Supported: `count`, `sum`, `avg`, `min`, `max`. Grouping is implicit on non-aggregated return fields.
+Return-clause integer `sum` accumulates exactly in 128 bits and rounds the total
+once to `F64`; `avg` uses a floating-point accumulator.
 
 - `min`/`max` accept numeric, String, Bool (`false` before `true`), Date, and
   DateTime values and return the column's own type; lists, vectors, and Blobs
@@ -448,7 +450,8 @@ branch delete "review/abandoned"
 branch list
 ```
 
-`from` and `into` default to `main`. Quote a name that is not a bare
+`from` and `into` default to `main`; `branch create "fix" from commit "<commit-id>"`
+starts the branch at a published commit. Quote a name that is not a bare
 identifier (a lowercase letter or `_`, then letters, digits, or `_`), such as
 one containing `/`, `-`, or `.`. Run the control writes with
 `omnigraph mutate -e '…'` (HTTP `POST /mutate`) and `branch list` with

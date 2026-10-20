@@ -25,12 +25,9 @@ from the served document).
 - `GET /graphs` needs the `graph_list` action, which is denied without a cluster policy, even to
   a valid token. `GET /graphs/discovery` returns ids and names but accepts only identity
   credentials, not static tokens.
-- The CLI's operator config: `$OMNIGRAPH_HOME` or `~/.omnigraph/config.yaml` with `servers`,
-  `profiles`, `aliases`, `defaults` (`default_server`, `default_graph`). Token for server
-  `<name>`: env `OMNIGRAPH_TOKEN_<NAME>` (dashes become underscores, upper case), then
-  `[<name>] token = …` in `$OMNIGRAPH_HOME/credentials`, which must not be group or world
-  readable (`crates/omnigraph-cli/src/operator.rs:350-420` at `v0.13.0`).
-- Since OmniGraph main `2c9eb1e0` (#1090, after 0.14's edge build): the operator file is
+- The CLI's operator config is `$OMNIGRAPH_HOME/config.yaml`, else `~/.omnigraph/config.yaml`.
+  Since OmniGraph main `2c9eb1e0` (#1090; the first edge build with it is
+  `edge-20261020-b692610`) it is
   `target_config_version: 1` with `defaults.target` and `targets` of kind `direct`, `server` or
   `managed`. A `server` target has an `endpoint`, a `default_graph`, and one `credential` owner
   (its token stored by `omnigraph login --target`, bound to the endpoint's scope, or
@@ -40,45 +37,52 @@ from the served document).
   `endpoint = …`; the CLI refuses one without an endpoint (`credential_scope_missing`) or for a
   request outside it (`credential_scope_mismatch`: another scheme, host or port, or a path not
   under the endpoint's), in `targets.rs` `resolve_server_token_for` and `graph_http.rs`
-  `RequestTarget::is_under`. The 0.14 CLI reads only `token` from a section, so an `endpoint`
-  line does not disturb it. `omnigraph target import` converts a legacy file and keeps it as
-  `config.legacy.yaml`. An endpoint may be `unix:///…`.
+  `RequestTarget::is_under`. `OMNIGRAPH_TOKEN_<OWNER>` upper-cases the owner and turns dashes
+  into underscores. `credentials` must not be group or world readable. The CLI refuses a file
+  with `servers`, `profiles` or no version; `omnigraph target import` converts one, keeping it
+  as `config.legacy.yaml`, and makes a target of every server and of every profile, so one
+  server's targets can differ only in their default graph. It refuses a profile named like a
+  server. An endpoint may be `unix:///…`.
 - Routes on OmniGraph main but not in `v0.13.0`: Blob `PUT`/`DELETE`, commit publish and drop.
 
 ## Design
 
 ### Sources of servers
 
-1. Every server in the operator config, labelled with its config name. Tokens are resolved
-   exactly as the CLI does; Studio never writes the CLI's files. It reads them again when
+1. Every server the CLI's targets name. Tokens are resolved exactly as the CLI does; Studio
+   never writes the CLI's files. It reads them again when
    `config.yaml` or `credentials` changes (their modification time and size, checked every
    2 s off the main thread): a server added there joins the list, one removed leaves it (a
    window open on it keeps its connection), one at a new address is a new connection, a
-   profile's graph is added, and a token changed there (`omnigraph login`) replaces the
+   target's graph is added, and a token changed there (`omnigraph login`) replaces the
    connection's, which a connection in use checks at once. A token typed into Studio for a
    CLI server lasts until the files change that server's token. Files that cannot be read
    keep every server as it was and are named in a toast that stays until dismissed, as a
-   settings file's are. A token from `OMNIGRAPH_TOKEN_<NAME>` is the one Studio started with,
+   settings file's are. A token from `OMNIGRAPH_TOKEN_<OWNER>` is the one Studio started with,
    as for the CLI. The untargeted `OMNIGRAPH_BEARER_TOKEN` is sent to no server: a token goes
    only to the server it is keyed to (OmniGraph #1030).
-   An operator file with `target_config_version: 1` is read as targets: every `server` target,
-   and every `managed` cluster target with an `endpoint`, is a server labelled with the
-   target's name, its `default_graph` a known graph; a `direct` target opens storage, which
-   Studio does not, and is not listed. A server target's token is `OMNIGRAPH_TOKEN_<OWNER>` for
+   Studio reads `target_config_version: 1` only: every `server` target, and every `managed`
+   cluster target with an `endpoint`, lands on a server, its `default_graph` a known graph of
+   that server; a `direct` target opens storage, which Studio does not, and is not listed.
+   Targets with one endpoint (as `graph_client::server_root` writes it) and one credential
+   owner, or both anonymous, are one server, as an imported file makes them: it is labelled
+   with the target named like the owner (an imported server's old name), else the first by
+   name, and knows every target's default graph. A server target's token is `OMNIGRAPH_TOKEN_<OWNER>` for
    its credential owner, else `[<owner>] token = …` in `credentials` when that section's
    `endpoint` covers the target's (the same scheme, host and port, the scheme's default filled
    in, and a path that starts with every segment of the endpoint's), as the CLI checks before
    it sends one. A saved token with no endpoint, or for another, is not sent; the toast says so
-   and names `omnigraph login --target <name>`. Studio reads the file itself, as for the older
-   form, rather than running `omnigraph credential get`: it needs no CLI on PATH and the token
-   never passes through a process. `auth: anonymous` sends no token, nor does a managed target,
+   and names `omnigraph login --target <name>`. Studio reads the file itself rather than running
+   `omnigraph credential get`: it needs no CLI on PATH and the token never passes through a
+   process. `auth: anonymous` sends no token, nor does a managed target,
    whose data token the CLI gets from the control plane. A target Studio cannot open is named
    in the toast with the reason and not listed: a `unix:///…` endpoint (`graph_client` speaks
    HTTP(S) over TCP only), a server target without an endpoint, or without one credential owner
-   or `auth: anonymous`. Another `target_config_version` is refused like a file that does not
-   parse. An alias names `target` in this form and `server` in the older. A file without
-   `target_config_version` is read as `servers` and `profiles`, as before; after
-   `omnigraph target import`, `config.legacy.yaml` is not read.
+   or `auth: anonymous`. A file with another `target_config_version`, or none, is refused like
+   a file that does not parse, the toast naming `omnigraph target import` for one with none;
+   Studio reads no other form, and never `config.legacy.yaml`. An alias names its `target`; it
+   is shown on the server that target lands on, and under the target's `default_graph` when it
+   names no graph.
 2. Servers added in Studio (URL, optional token). Tokens go to the OS keychain through GPUI's
    credentials API; the server list goes to Studio's settings.
    An address is made a server root before it is used (`graph_client::server_root`): trimmed,
@@ -89,9 +93,8 @@ from the served document).
    an entry saved before it (`localhost:8080`) loads as `http://localhost:8080`, its token
    copied to the new address. `GraphClient::new` refuses an unusable root rather than
    building URLs on it.
-3. Graph ids for a server come from, in order: `GET /graphs` when allowed; the target's
-   `default_graph` (a legacy file's profiles and `default_graph`); graph ids the person typed
-   before. A 403 on `/graphs` is not an
+3. Graph ids for a server come from, in order: `GET /graphs` when allowed; its targets'
+   `default_graph`s; graph ids the person typed before. A 403 on `/graphs` is not an
    error state; Studio says "This server does not list graphs for your token. Enter a graph id."
 
 ### Connecting
@@ -200,8 +203,10 @@ from the served document).
 | 2026-10-13 | The head probe answers with the head and no rows on 0.13 | `POST /graphs/knowledge/query` with `studio_head` on the dev server, three times | `row_count` 0, `graph_commit_id` the head; 2-17 ms |
 | 2026-10-13 | A branch made outside Studio appears | offscreen snapshot on the dev server: the Branches panel, then `POST /branches` `head-watch-check` from curl 25 s in, then 40 s more | The panel listed `main` and `head-watch-check`; before, the list was read only when the window opened and after Studio's own branch writes |
 | 2026-10-13 | Opening a window reads each branch's commit list once | `graph_store` test `commit_lists_are_read_again_only_for_the_branch_a_commit_lands_on` (main asked for while the branch list loads, the branches panel asking again on its arrival: one read; it read twice before the fix); offscreen snapshots through a request-counting proxy on the dev graph's four branches: an empty window; three new queries and the history | `GET /commits` 4 times in both, once per branch (before: 5 for the empty window, main twice, and one more per query tab) |
-| 2026-10-20 | The CLI's target files are read as the CLI reads them | `git show origin/main` (`b692610c`) of `crates/omnigraph-cli/src/operator.rs`, `targets.rs` and `graph_http.rs`; `graph_store` test `reads_targets_with_their_endpoint_bound_tokens` | A server target and a managed cluster endpoint are listed with their `default_graph`, an anonymous one with no token, a direct target not at all; the owner's token is sent when the saved `endpoint` covers the target's (a trailing slash too), not when it is missing, at another port or scheme, or deeper than the target's, and the reason never holds the token; a Unix socket and a target without an owner are named; `target_config_version: 2` keeps the servers read before; an alias's `target` is read. The three tests of the older form pass unchanged |
+| 2026-10-20 | The CLI's target files are read as the CLI reads them | `git show origin/main` (`b692610c`) of `crates/omnigraph-cli/src/operator.rs`, `targets.rs` and `graph_http.rs`; `graph_store` test `reads_targets_with_their_endpoint_bound_tokens` | A server target and a managed cluster endpoint are listed with their `default_graph`, an anonymous one with no token, a direct target not at all; the owner's token is sent when the saved `endpoint` covers the target's (a trailing slash too), not when it is missing, at another port or scheme, or deeper than the target's, and the reason never holds the token; a Unix socket and a target without an owner are named; `target_config_version: 2` keeps the servers read before; an alias's `target` is read |
 | 2026-10-20 | Studio reports a target it cannot open | Offscreen snapshot with `OMNIGRAPH_HOME` holding a version-1 file (a server target on the dev server, a `unix:///` one, a direct one) and a bound `credentials` | The toast reads "OmniGraph CLI config: CLI target 'scratch-sock' is served on a Unix socket (unix:///tmp/scratch.sock); Studio reaches servers over HTTP(S)". The Open dialog did not open in the offscreen run with no server chosen (`studio::OpenGraph`, its button or ⌥⌘O), so the listed target is shown by the test above, not by a render |
+| 2026-10-20 | Studio reads target files only, one server per endpoint and credential | `graph_store` tests `targets_on_one_endpoint_are_one_server` (a file as `omnigraph target import` writes it: `default`, the server's own target and a profile's on one endpoint and owner, an anonymous one beside them) and `reads_servers_with_their_tokens_and_stamps_the_files` | The three keyed targets are one server, named like the owner, with both default graphs and the token; the anonymous target is a server of its own with none; an alias on the profile's target lands on that server under the target's graph, one on an unknown target keeps its name. A `servers` file keeps the servers read before, the reason naming `omnigraph target import` |
+| 2026-10-20 | A real operator config converts | `omnigraph` 0.14.0-edge+b692610 `target import` on a copy (five servers, one profile named like its server, 32 aliases, dummy tokens), then on the live home | It refused the profile named like a server ("names more than one binding"); without the profile it wrote five targets and every token with its server's `endpoint`. The config was then written by hand with the comments kept and the profile as that target's `default_graph`; `target list`, a read through `--target` and an alias answered with the saved tokens |
 
 ## Corrections
 
