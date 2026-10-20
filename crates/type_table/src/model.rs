@@ -592,24 +592,8 @@ pub fn relative_value(
             .ok()?
             .and_utc();
             let seconds = (now.with_timezone(&chrono::Utc) - at).num_seconds();
-            let (span, future) = (seconds.abs(), seconds < 0);
-            let ago = |amount: i64, unit: &str| {
-                if future {
-                    format!("in {amount} {unit}")
-                } else {
-                    format!("{amount} {unit} ago")
-                }
-            };
-            let shown = match span {
-                s if s < 45 => "just now".to_owned(),
-                s if s < 3_600 => ago((s + 30) / 60, "min"),
-                s if s < 86_400 => ago(s / 3_600, "h"),
-                s if s < 86_400 * 14 => {
-                    let days = s / 86_400;
-                    ago(days, if days == 1 { "day" } else { "days" })
-                }
-                _ => at.format("%Y-%m-%d").to_string(),
-            };
+            let shown = studio_ui::relative_span(seconds)
+                .unwrap_or_else(|| at.format("%Y-%m-%d").to_string());
             Some((shown, at.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string()))
         }
         ScalarKind::Date => {

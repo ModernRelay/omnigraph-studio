@@ -108,11 +108,12 @@ fn activity_row(index: usize, entry: &OutcomeEntry) -> studio_ui::ds::ActivityRo
             Some(format!("{reason}. Check History before trying again.")),
         ),
     };
-    let when = entry
+    // As every other time in Studio reads.
+    let at = entry
         .at
-        .elapsed()
-        .map(|elapsed| relative(elapsed.as_secs()))
-        .unwrap_or_else(|_| "now".into());
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_micros() as i64);
+    let when = studio_ui::relative_time(at, studio_ui::now_micros());
     let row = studio_ui::ds::ActivityRow::new(
         ("activity", index),
         IconName::Pencil,
@@ -133,15 +134,5 @@ fn activity_row(index: usize, entry: &OutcomeEntry) -> studio_ui::ds::ActivityRo
     match tooltip {
         Some(tooltip) => row.tooltip(tooltip),
         None => row,
-    }
-}
-
-/// "just now", "3m ago", "2h ago", "4d ago".
-fn relative(seconds: u64) -> String {
-    match seconds {
-        0..=44 => "just now".into(),
-        45..=3599 => format!("{}m ago", (seconds + 30) / 60),
-        3600..=86_399 => format!("{}h ago", seconds / 3600),
-        _ => format!("{}d ago", seconds / 86_400),
     }
 }

@@ -64,20 +64,34 @@ pub fn now_micros() -> i64 {
         .unwrap_or(0)
 }
 
-/// "just now", "5 min ago", "3 h ago", "2 days ago", then the date.
+/// "just now", "5 min ago", "3 h ago", "2 days ago", then the date: a time past, as Studio
+/// reads every one. A time ahead of `now` (a clock running behind) is "just now".
 pub fn relative_time(micros: i64, now_micros: i64) -> String {
     let seconds = (now_micros - micros) / 1_000_000;
-    match seconds {
-        s if s < 45 => "just now".into(),
-        // Whole minutes, as hours and days count, so the last minute of an hour is not "60".
-        s if s < 60 * 60 => format!("{} min ago", (s / 60).max(1)),
-        s if s < 60 * 60 * 24 => format!("{} h ago", s / 3600),
+    relative_span(seconds.max(0)).unwrap_or_else(|| utc_date_time(micros)[..10].to_owned())
+}
+
+/// `seconds` from a time to now as Studio reads it: "just now", "5 min ago", "3 h ago",
+/// "2 days ago", or for a time ahead (negative `seconds`) "in 5 min". `None` from two weeks
+/// either way, which a date says better. Whole units, so the last minute of an hour is not
+/// "60 min".
+pub fn relative_span(seconds: i64) -> Option<String> {
+    let (span, ahead) = (seconds.unsigned_abs(), seconds < 0);
+    let (amount, unit) = match span {
+        s if s < 45 => return Some("just now".into()),
+        s if s < 60 * 60 => ((s / 60).max(1), "min"),
+        s if s < 60 * 60 * 24 => (s / 3600, "h"),
         s if s < 60 * 60 * 24 * 14 => {
             let days = s / 86_400;
-            format!("{days} day{} ago", if days == 1 { "" } else { "s" })
+            (days, if days == 1 { "day" } else { "days" })
         }
-        _ => utc_date_time(micros)[..10].to_owned(),
-    }
+        _ => return None,
+    };
+    Some(if ahead {
+        format!("in {amount} {unit}")
+    } else {
+        format!("{amount} {unit} ago")
+    })
 }
 
 /// `2026-10-12 14:03:09 UTC` for Unix microseconds.
@@ -200,6 +214,10 @@ mod tests {
         assert_eq!(relative_time(now - 50_000_000, now), "1 min ago");
         assert_eq!(relative_time(now - 3_590_000_000, now), "59 min ago");
         assert_eq!(relative_time(now - 3_600_000_000, now), "1 h ago");
+        assert_eq!(relative_time(now + 600_000_000, now), "just now");
+        assert_eq!(relative_span(-3_590).as_deref(), Some("in 59 min"));
+        assert_eq!(relative_span(-2 * 86_400).as_deref(), Some("in 2 days"));
+        assert_eq!(relative_span(15 * 86_400), None);
         assert_eq!(relative_time(now - 3 * 3_600_000_000, now), "3 h ago");
         assert_eq!(relative_time(now - 86_400_000_000, now), "1 day ago");
         assert_eq!(relative_time(now - 30 * 86_400_000_000, now), "2026-09-12");

@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::SessionInfo;
-use chrono::{DateTime, Datelike as _, Utc};
+use chrono::{DateTime, Utc};
 use editor::{Editor, EditorEvent};
 use gpui::{
     App, AppContext as _, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable,
@@ -85,8 +85,7 @@ enum RowState {
     Waiting,
     Failed,
     Unread,
-    /// When the person last wrote.
-    Idle(String),
+    Idle,
 }
 
 impl SessionsPanel {
@@ -325,13 +324,7 @@ impl SessionsPanel {
 
     // ---- rows ----
 
-    fn row(
-        &self,
-        record: &SessionRecord,
-        shown: bool,
-        now: DateTime<Utc>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn row(&self, record: &SessionRecord, shown: bool, cx: &mut Context<Self>) -> AnyElement {
         let id = record.session.clone();
         if let Some((_, editor, _)) = self.renaming.as_ref().filter(|(r, _, _)| *r == id) {
             return h_flex()
@@ -353,7 +346,7 @@ impl SessionsPanel {
             Some(Live::Waiting) => RowState::Waiting,
             Some(Live::Failed) => RowState::Failed,
             None if sessions.is_unread(&id) => RowState::Unread,
-            None => RowState::Idle(relative_time(record.updated_at, now)),
+            None => RowState::Idle,
         };
         let panel = cx.entity().downgrade();
         let store = self.sessions.clone();
@@ -453,12 +446,13 @@ fn conversation_row(
             Some("Finished while you were away"),
         ),
         // No time on the row, as Delta's threads: it is in the tooltip.
-        RowState::Idle(_) => (div().into_any_element(), None),
+        RowState::Idle => (div().into_any_element(), None),
     };
     let when = match state {
-        RowState::Idle(when) if when == "now" => "just now".to_owned(),
-        RowState::Idle(when) if when.ends_with(['m', 'h', 'd']) => format!("{when} ago"),
-        RowState::Idle(when) => when.clone(),
+        RowState::Idle => studio_ui::relative_time(
+            record.updated_at.timestamp_micros(),
+            studio_ui::now_micros(),
+        ),
         _ => record
             .updated_at
             .with_timezone(&chrono::Local)
@@ -668,7 +662,7 @@ impl SessionsPanel {
                     return div().into_any_element();
                 };
                 let shown = self.shown(cx).as_deref() == Some(id.as_str());
-                self.row(&record, shown, Utc::now(), cx)
+                self.row(&record, shown, cx)
             }
             ListRow::End => div().h(px(ds::space::SM)).into_any_element(),
         }
@@ -842,25 +836,6 @@ impl Render for DeleteConversation {
 
 /// When a conversation was last active, as a sidebar fits it: "now", "5m", "3h", "2d", "12 Oct",
 /// and "Oct 2025" from another year.
-fn relative_time(at: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    let elapsed = now.signed_duration_since(at);
-    if elapsed.num_minutes() < 1 {
-        "now".into()
-    } else if elapsed.num_minutes() < 60 {
-        format!("{}m", elapsed.num_minutes())
-    } else if elapsed.num_hours() < 24 {
-        format!("{}h", elapsed.num_hours())
-    } else if elapsed.num_days() < 7 {
-        format!("{}d", elapsed.num_days())
-    } else if at.year() == now.year() {
-        at.with_timezone(&chrono::Local)
-            .format("%-d %b")
-            .to_string()
-    } else {
-        at.with_timezone(&chrono::Local).format("%b %Y").to_string()
-    }
-}
-
 /// The agent's name from its command: the package or program, without a version or path.
 fn agent_name(command: &str) -> String {
     let program = command
@@ -877,17 +852,6 @@ fn agent_name(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn times_read_short() {
-        let now = Utc::now();
-        let ago = |minutes: i64| now - chrono::Duration::minutes(minutes);
-        assert_eq!(relative_time(now, now), "now");
-        assert_eq!(relative_time(ago(5), now), "5m");
-        assert_eq!(relative_time(ago(3 * 60), now), "3h");
-        assert_eq!(relative_time(ago(2 * 24 * 60), now), "2d");
-        assert!(!relative_time(ago(30 * 24 * 60), now).ends_with('d'));
-    }
 
     #[test]
     fn agents_are_named_by_their_package() {
