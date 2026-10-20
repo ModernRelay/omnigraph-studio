@@ -45,8 +45,13 @@ const EARLY_SESSIONS: usize = 16;
 const LIST_PAGES: usize = 20;
 /// How long a conversation waits for one whose panel let go to free the session they share
 /// (the agent still answering that one's open, or its close) before it is told to try again:
-/// an agent may finish an open it is asked to cancel all the same.
-const FREED_WITHIN: Duration = Duration::from_secs(15);
+/// an agent may never answer an open it was asked to cancel. A load replays the whole
+/// conversation first, so a long one takes a while.
+const FREED_WITHIN: Duration = Duration::from_secs(60);
+/// How long a conversation that let go waits for the agent to answer its close. One not
+/// answered by then is taken as over, so the session can be opened again rather than waiting
+/// for an answer that may never come.
+const CLOSE_WITHIN: Duration = Duration::from_secs(15);
 
 /// How to start an agent: one process for all of its conversations.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -644,7 +649,7 @@ async fn open_session(
             &routes,
             &id,
             &events,
-            Some(&mut commands),
+            &mut commands,
             &mut held,
             FREED_WITHIN,
         )
@@ -713,11 +718,16 @@ async fn open_session(
         }
     };
     // A conversation whose panel let go meanwhile routes what the agent opened for it too, and
-    // frees it below; one waiting for the session opens it after that.
-    let routed = route(&routes, &session_id, &events, None, &mut held, FREED_WITHIN).await;
+    // frees it below; one waiting for the session opens it after that. A loaded or resumed
+    // session is this conversation's route already, and a new one has an id the agent just
+    // made, so nothing else holds it: one that does is an agent's mistake, and is not taken.
+    let claimed = routes
+        .lock()
+        .ok()
+        .map(|mut routes| routes.claim(session_id.clone(), events.clone()));
     opened_or_failed(&opening);
-    if let Err(not_routed) = routed {
-        not_routed.tell(&events);
+    if !matches!(claimed, Some(Claim::Routed)) {
+        NotRouted::Held.tell(&events);
         return Ok(());
     }
     if events.is_closed() {
@@ -843,14 +853,13 @@ impl NotRouted {
 }
 
 /// Routes `session` to `events`, waiting at most `within` while a conversation whose panel let
-/// go still holds it. Given the panel's `commands`, it stops once that panel lets go, keeping in
-/// `held` what the panel sends meanwhile; without them it routes the session to a conversation
-/// whose panel let go too, which then frees it.
+/// go still holds it. It stops once the panel lets go, keeping in `held` what the panel sends
+/// on `commands` meanwhile.
 async fn route(
     routes: &SharedRoutes,
     session: &SessionId,
     events: &mpsc::UnboundedSender<HostEvent>,
-    mut commands: Option<&mut mpsc::UnboundedReceiver<HostCommand>>,
+    commands: &mut mpsc::UnboundedReceiver<HostCommand>,
     held: &mut Vec<HostCommand>,
     within: Duration,
 ) -> Result<(), NotRouted> {
@@ -860,7 +869,7 @@ async fn route(
             let Ok(mut routes) = routes.lock() else {
                 return Err(NotRouted::Held);
             };
-            if commands.is_some() && events.is_closed() {
+            if events.is_closed() {
                 return Err(NotRouted::LetGo);
             }
             routes.claim(session.clone(), events.clone())
@@ -872,16 +881,10 @@ async fn route(
             // dropped counts as terminated, which `select_biased!` would never poll.
             Claim::Wait(freed) => futures::FutureExt::fuse(freed),
         };
-        // The panel letting go ends its commands; with none to watch, only the wait's end
-        // stops it.
+        // The panel letting go ends its commands.
         let let_go = futures::FutureExt::fuse(async {
-            match commands.as_deref_mut() {
-                Some(commands) => {
-                    while let Some(command) = commands.next().await {
-                        held.push(command);
-                    }
-                }
-                None => futures::future::pending::<()>().await,
+            while let Some(command) = commands.next().await {
+                held.push(command);
             }
         });
         futures::pin_mut!(freed, let_go);
@@ -947,7 +950,8 @@ async fn until_answered<T>(
 /// The panel of `events`' conversation let go of `session`: unless the session is no longer its
 /// own, the agent stops its turn (when one is `running`) and may free it. Both are sent while
 /// the routes are held. A conversation waiting for the session is woken once the agent answered
-/// the close, or at once when no close is sent, so its open never runs beside the close.
+/// the close, or at once when no close is sent, so its open never runs beside the close; a close
+/// not answered within [`CLOSE_WITHIN`] is taken as over.
 async fn let_go(
     connection: &ConnectionTo<Agent>,
     routes: &SharedRoutes,
@@ -969,7 +973,13 @@ async fn let_go(
     });
     if let Some(close) = close {
         // Answered or failed, the close is over; it fails when the connection ends.
-        close.block_task().await.ok();
+        let answered = futures::FutureExt::fuse(close.block_task());
+        let late = futures::FutureExt::fuse(smol::Timer::after(CLOSE_WITHIN));
+        futures::pin_mut!(answered, late);
+        futures::select_biased! {
+            _ = answered => {}
+            _ = late => {}
+        }
         if let Ok(mut routes) = routes.lock() {
             routes.close_answered(&session);
         }
@@ -1156,15 +1166,11 @@ mod tests {
         session: &SessionId,
         events: &mpsc::UnboundedSender<HostEvent>,
     ) -> bool {
-        smol::block_on(route(
-            routes,
-            session,
-            events,
-            None,
-            &mut Vec::new(),
-            FREED_WITHIN,
-        ))
-        .is_ok()
+        let claimed = routes
+            .lock()
+            .unwrap()
+            .claim(session.clone(), events.clone());
+        matches!(claimed, Claim::Routed)
     }
 
     /// A tab restarted while the agent loads its session asks for the session again. Its new
@@ -1191,7 +1197,7 @@ mod tests {
             &routes,
             &session,
             &restarted_tx,
-            Some(&mut restarted_commands),
+            &mut restarted_commands,
             &mut restarted_held,
             FREED_WITHIN,
         ));
@@ -1241,7 +1247,7 @@ mod tests {
                 &routes,
                 &session,
                 &again_tx,
-                Some(&mut again_commands),
+                &mut again_commands,
                 &mut again_held,
                 FREED_WITHIN,
             ));
@@ -1280,7 +1286,7 @@ mod tests {
                 &routes,
                 &session,
                 events,
-                Some(&mut commands),
+                &mut commands,
                 &mut Vec::new(),
                 Duration::ZERO,
             ))
