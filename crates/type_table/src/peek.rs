@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use editor::{Editor, EditorEvent};
 use gpui::{
-    App, AsyncApp, ClipboardItem, Context, Entity, Focusable as _, ListAlignment, ListState,
-    Render, SharedString, Subscription, Task, WeakEntity, Window, list,
+    App, AsyncApp, ClipboardItem, Context, Entity, ExternalPaths, Focusable as _, ListAlignment,
+    ListState, Render, SharedString, Subscription, Task, WeakEntity, Window, list,
 };
 use gq_language::builder::Depends;
 use gq_language::input::edit_text;
@@ -32,6 +32,7 @@ use crate::blob::{
     IMAGE_MAX, PREVIEW_PREFIX, Preview, bytes_wanted, preview, read_range, save_folder, save_value,
     suggested_file_name,
 };
+use crate::blob_write::{self, BlobChange, BlobEdit, BlobWritten};
 use crate::model::{
     FROM_COLUMN, Notice, SaveResult, TO_COLUMN, Tone, changed_elsewhere, count_of, display_value,
     edited, field_rows, node_label, node_rows, reads_as_markdown, save_result,
@@ -189,6 +190,8 @@ struct BlobSlot {
     /// The value's first bytes, to name a saved file for its kind.
     head: Vec<u8>,
     save: Option<SaveState>,
+    /// A file being stored in it or a clear, while out, or why it did not land.
+    edit: Option<BlobEdit>,
     _task: Option<Task<()>>,
     _save: Option<Task<()>>,
 }
@@ -915,109 +918,362 @@ impl NodePeek {
     /// first bytes, or the whole of an image that fits. Pinned to the peek's commit.
     fn load_blobs(&mut self, debounce: bool, cx: &mut Context<Self>) {
         self.release_images(cx);
-        let edge = matches!(self.subject, PeekSubject::Edge { .. });
-        let type_name = self.subject.type_name().to_owned();
-        let id = self.subject.id().to_owned();
         // A value being saved to a file goes on, shown on its property's new slot; one whose
-        // property the view no longer lists still lands in its file.
-        let mut saves: HashMap<String, (Option<SaveState>, Option<Task<()>>)> =
-            std::mem::take(&mut self.blobs)
-                .into_iter()
-                .filter(|slot| slot._save.is_some())
-                .map(|slot| (slot.property, (slot.save, slot._save)))
-                .collect();
+        // property the view no longer lists still lands in its file. A file being stored in it
+        // stays shown as going while it is out.
+        type Going = (Option<SaveState>, Option<Task<()>>, Option<BlobEdit>);
+        let mut going: HashMap<String, Going> = std::mem::take(&mut self.blobs)
+            .into_iter()
+            .filter_map(|slot| {
+                let edit = slot.edit.filter(BlobEdit::is_saving);
+                (slot._save.is_some() || edit.is_some())
+                    .then_some((slot.property, (slot.save, slot._save, edit)))
+            })
+            .collect();
         self.blobs = self
             .blob_properties()
             .into_iter()
             .map(|property| {
-                let (save, task) = saves.remove(&property).unwrap_or_default();
+                let (save, task, edit) = going.remove(&property).unwrap_or_default();
                 BlobSlot {
                     property,
                     meta: Loadable::Loading,
                     preview: Loadable::NotLoaded,
                     head: Vec::new(),
                     save,
+                    edit,
                     _task: None,
                     _save: task,
                 }
             })
             .collect();
-        for (_, (_, task)) in saves {
+        for (_, (_, task, _)) in going {
             if let Some(task) = task {
                 task.detach();
             }
         }
         for index in 0..self.blobs.len() {
-            let cell = BlobCell {
-                edge,
-                type_name: type_name.clone(),
-                id: id.clone(),
-                property: self.blobs[index].property.clone(),
-            };
-            let session = self.session.downgrade();
-            let snapshot = self.snapshot.clone();
-            let scope = self.scope.clone();
-            self.blobs[index]._task = Some(cx.spawn(async move |this, cx| {
-                if debounce {
-                    cx.background_executor().timer(COUNT_DELAY).await;
-                }
-                let Ok(read) = session.update(cx, |session, cx| match &scope {
-                    Some(scope) => session.blob_meta_in(scope, cell.clone(), snapshot.clone(), cx),
-                    None => session.blob_meta(cell.clone(), snapshot.clone(), cx),
-                }) else {
-                    return;
-                };
-                let meta = read.await;
-                let size = match &meta {
-                    Ok(BlobMeta::Managed { size, .. }) => Some(*size),
-                    _ => None,
-                };
-                this.update(cx, |this, cx| {
-                    this.blobs[index].meta = match meta {
-                        Ok(meta) => Loadable::Loaded(meta),
-                        Err(error) => Loadable::Failed(error.to_string()),
-                    };
-                    if size.is_some() {
-                        this.blobs[index].preview = Loadable::Loading;
-                    }
-                    cx.notify();
-                })
-                .ok();
-                let Some(size) = size else { return };
-                let mut bytes = Vec::new();
-                let mut wanted = size.min(PREVIEW_PREFIX);
-                // The prefix, then the rest of an image that fits.
-                while (bytes.len() as u64) < wanted {
-                    let from = bytes.len() as u64;
-                    match read_range(&session, &cell, &snapshot, from, wanted, cx).await {
-                        Ok(Some(chunk)) => bytes.extend(chunk),
-                        Ok(None) => break,
-                        Err(error) => {
-                            this.update(cx, |this, cx| {
-                                this.blobs[index].preview = Loadable::Failed(error);
-                                cx.notify();
-                            })
-                            .ok();
-                            return;
-                        }
-                    }
-                    if from == 0 {
-                        wanted = bytes_wanted(&bytes, size).min(IMAGE_MAX);
-                    }
-                }
-                let head = bytes.iter().take(16).copied().collect();
-                let svg = cx.update(|cx| cx.svg_renderer());
-                let shown = cx
-                    .background_spawn(async move { preview(bytes, size, &svg) })
-                    .await;
-                this.update(cx, |this, cx| {
-                    this.blobs[index].head = head;
-                    this.blobs[index].preview = Loadable::Loaded(shown);
-                    cx.notify();
-                })
-                .ok();
-            }));
+            self.read_blob(index, debounce, None, cx);
         }
+    }
+
+    /// The cell of the subject's Blob property `property`.
+    fn blob_cell(&self, property: &str) -> BlobCell {
+        BlobCell {
+            edge: matches!(self.subject, PeekSubject::Edge { .. }),
+            type_name: self.subject.type_name().to_owned(),
+            id: self.subject.id().to_owned(),
+            property: property.to_owned(),
+        }
+    }
+
+    /// Reads what slot `index` holds at the peek's commit, then enough of a managed value to
+    /// preview it; `known` is what it holds there already (a write's own receipt), which is not
+    /// read again.
+    fn read_blob(
+        &mut self,
+        index: usize,
+        debounce: bool,
+        known: Option<BlobMeta>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(slot) = self.blobs.get(index) else {
+            return;
+        };
+        let cell = self.blob_cell(&slot.property);
+        let session = self.session.downgrade();
+        let snapshot = self.snapshot.clone();
+        let scope = self.scope.clone();
+        self.blobs[index]._task = Some(cx.spawn(async move |this, cx| {
+            if debounce {
+                cx.background_executor().timer(COUNT_DELAY).await;
+            }
+            let meta = match known {
+                Some(known) => Ok(known),
+                None => {
+                    let Ok(read) = session.update(cx, |session, cx| match &scope {
+                        Some(scope) => {
+                            session.blob_meta_in(scope, cell.clone(), snapshot.clone(), cx)
+                        }
+                        None => session.blob_meta(cell.clone(), snapshot.clone(), cx),
+                    }) else {
+                        return;
+                    };
+                    read.await
+                }
+            };
+            let size = match &meta {
+                Ok(BlobMeta::Managed { size, .. }) => Some(*size),
+                _ => None,
+            };
+            this.update(cx, |this, cx| {
+                this.blobs[index].meta = match meta {
+                    Ok(meta) => Loadable::Loaded(meta),
+                    Err(error) => Loadable::Failed(error.to_string()),
+                };
+                if size.is_some() {
+                    this.blobs[index].preview = Loadable::Loading;
+                }
+                cx.notify();
+            })
+            .ok();
+            let Some(size) = size else { return };
+            let mut bytes = Vec::new();
+            let mut wanted = size.min(PREVIEW_PREFIX);
+            // The prefix, then the rest of an image that fits.
+            while (bytes.len() as u64) < wanted {
+                let from = bytes.len() as u64;
+                match read_range(&session, &cell, &snapshot, from, wanted, cx).await {
+                    Ok(Some(chunk)) => bytes.extend(chunk),
+                    Ok(None) => break,
+                    Err(error) => {
+                        this.update(cx, |this, cx| {
+                            this.blobs[index].preview = Loadable::Failed(error);
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                }
+                if from == 0 {
+                    wanted = bytes_wanted(&bytes, size).min(IMAGE_MAX);
+                }
+            }
+            let head = bytes.iter().take(16).copied().collect();
+            let svg = cx.update(|cx| cx.svg_renderer());
+            let shown = cx
+                .background_spawn(async move { preview(bytes, size, &svg) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.blobs[index].head = head;
+                this.blobs[index].preview = Loadable::Loaded(shown);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Why slot `property` cannot take a file here, or `None` when it can: a peek held at a
+    /// commit, an edge's, a property that is not a Blob.
+    fn blob_write_refusal(&self, property: &str) -> Option<String> {
+        let pinned = self.held_commit();
+        blob_write::write_refusal(
+            self.schema.as_deref(),
+            &self.blob_cell(property),
+            pinned.as_deref(),
+        )
+    }
+
+    /// Choose File…: the system's picker, then the file chosen stored in slot `index`.
+    fn choose_blob_file(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(property) = self.blobs.get(index).map(|slot| slot.property.clone()) else {
+            return;
+        };
+        let chosen = blob_write::choose_file(cx);
+        cx.spawn(async move |this, cx| {
+            if let Some(path) = chosen.await {
+                this.update(cx, |this, cx| this.upload_blob(&property, path, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// A drop from the file manager on slot `index`: its one file stored there.
+    fn drop_blob_files(
+        &mut self,
+        index: usize,
+        paths: &[std::path::PathBuf],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(property) = self.blobs.get(index).map(|slot| slot.property.clone()) else {
+            return;
+        };
+        match blob_write::dropped_file(paths) {
+            Ok(path) => self.upload_blob(&property, path, cx),
+            Err(notice) => {
+                self.blobs[index].edit = Some(BlobEdit::Failed {
+                    notice,
+                    again: None,
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    /// Stores the file at `path` in the Blob property `property` on the branch the view reads,
+    /// bound to the value the slot shows at the view's commit.
+    pub(crate) fn upload_blob(
+        &mut self,
+        property: &str,
+        path: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.send_blob_write(property, BlobChange::Upload(path), None, cx);
+    }
+
+    /// Clear: the Blob property `property` set to null, bound to the value the slot shows.
+    pub(crate) fn clear_blob(&mut self, property: &str, cx: &mut Context<Self>) {
+        self.send_blob_write(property, BlobChange::Clear, None, cx);
+    }
+
+    /// Sends `change` to slot `property`, bound to `over` (what a conflict found the cell to
+    /// hold at the head) or else to the value the slot shows at the view's commit. Its dot shows
+    /// while it is out; detached, as every write is, so the view going never cancels it.
+    fn send_blob_write(
+        &mut self,
+        property: &str,
+        change: BlobChange,
+        over: Option<BlobMeta>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.blobs.iter().position(|slot| slot.property == property) else {
+            return;
+        };
+        let refusal = match &change {
+            BlobChange::Upload(_) => self.blob_write_refusal(property),
+            BlobChange::Clear if over.is_some() => self.blob_write_refusal(property),
+            BlobChange::Clear => blob_write::clear_refusal(
+                self.schema.as_deref(),
+                &self.blob_cell(property),
+                self.held_commit().as_deref(),
+                self.blobs[index].meta.loaded(),
+            ),
+        };
+        let slot = &mut self.blobs[index];
+        if slot.edit.as_ref().is_some_and(BlobEdit::is_saving) {
+            return;
+        }
+        let shown = match (&over, slot.meta.loaded()) {
+            (Some(over), _) => Some(over.clone()),
+            (None, Some(shown)) => Some(shown.clone()),
+            (None, None) => None,
+        };
+        let (Some(shown), None) = (shown, refusal.clone()) else {
+            let reason = refusal.unwrap_or_else(|| {
+                format!("Nothing was written: Studio has not read what {property} holds yet.")
+            });
+            slot.edit = Some(BlobEdit::Failed {
+                notice: Notice::new(Tone::Invalid, reason),
+                again: None,
+            });
+            cx.notify();
+            return;
+        };
+        // A change offered again after a conflict is bound to what the head held then, and so
+        // is a view behind its branch, whose commit may not hold the value it shows (its own
+        // write's, made over another writer's): bound to what it shows, a change since is found.
+        let read_at = if over.is_some() || self.newer {
+            None
+        } else {
+            self.snapshot.clone()
+        };
+        slot.edit = Some(BlobEdit::Saving(change.clone()));
+        self.saving.insert(property.to_owned());
+        let (cell, branch) = (self.blob_cell(property), self.branch.clone());
+        let write = match &change {
+            BlobChange::Upload(path) => blob_write::upload(
+                &self.session,
+                &branch,
+                cell,
+                shown,
+                read_at,
+                path.clone(),
+                cx,
+            ),
+            BlobChange::Clear => {
+                blob_write::clear(&self.session, &branch, cell, shown, read_at, cx)
+            }
+        };
+        let property = property.to_owned();
+        cx.spawn(async move |this, cx| {
+            let written = write.await;
+            this.update(cx, |this, cx| {
+                this.blob_written(&property, &branch, change, written, cx)
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Lands a Blob write of slot `property` sent on `branch`. A commit made on the one the view
+    /// shows moves the view to it, and the slot shows the new value; over another writer's, the
+    /// view is behind and says so. One that did not land says why on its slot.
+    fn blob_written(
+        &mut self,
+        property: &str,
+        branch: &str,
+        change: BlobChange,
+        written: BlobWritten,
+        cx: &mut Context<Self>,
+    ) {
+        self.saving.remove(property);
+        let index = self.blobs.iter().position(|slot| slot.property == property);
+        // The view reads another branch now; the write's outcome is told by its toast.
+        if self.branch != branch {
+            if let Some(index) = index {
+                self.blobs[index].edit = None;
+            }
+            cx.notify();
+            return;
+        }
+        let saved = match &written {
+            BlobWritten::Saved {
+                commit,
+                parent,
+                meta,
+            } => Some((commit.clone(), parent.clone(), meta.clone())),
+            _ => None,
+        };
+        if let Some(index) = index {
+            self.blobs[index].edit = BlobEdit::ended(written, change, property);
+        }
+        if let Some((commit, parent, meta)) = saved {
+            if let Some(commit) = commit {
+                if parent.is_some() && parent == self.snapshot {
+                    self.snapshot = Some(commit);
+                } else {
+                    self.newer = true;
+                }
+            }
+            if let Some(index) = index {
+                if let Loadable::Loaded(Preview::Image(image)) = &self.blobs[index].preview {
+                    image.release(cx);
+                }
+                self.blobs[index].preview = Loadable::NotLoaded;
+                self.blobs[index].head.clear();
+                if self.newer {
+                    // The view's commit holds the value replaced: the new one is shown by its
+                    // size, its preview read once the view is read again.
+                    self.blobs[index].meta = Loadable::Loaded(meta);
+                    self.blobs[index]._task = None;
+                } else {
+                    self.read_blob(index, false, Some(meta), cx);
+                }
+            }
+        }
+        if self.saving.is_empty() && self.edge_writes.is_empty() {
+            self.compare_head(cx);
+        }
+        cx.notify();
+    }
+
+    /// The change a conflict on slot `index` offers again, sent bound to what the cell held at
+    /// the head.
+    fn send_blob_again(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(slot) = self.blobs.get(index) else {
+            return;
+        };
+        let Some(BlobEdit::Failed {
+            again: Some((change, now)),
+            ..
+        }) = slot.edit.clone()
+        else {
+            return;
+        };
+        let property = slot.property.clone();
+        self.send_blob_write(&property, change, Some(now), cx);
     }
 
     /// Saves a managed value to a file the person picks: read in ranges at the peek's commit and
@@ -1075,10 +1331,13 @@ impl NodePeek {
 
     fn render_blobs(&self, cx: &mut Context<Self>) -> AnyElement {
         let border = studio_ui::ds::surface::rule(cx);
+        let drop_bg = studio_ui::ds::surface::drop_target(cx);
         v_flex()
             .gap(px(space::MD))
             .children(self.blobs.iter().enumerate().map(|(index, slot)| {
+                let saving = slot.edit.as_ref().is_some_and(BlobEdit::is_saving);
                 let facts = match &slot.meta {
+                    _ if saving => format!("saving to {}…", self.branch),
                     Loadable::Loaded(BlobMeta::Managed { size, .. }) => {
                         studio_ui::format_bytes(*size)
                     }
@@ -1087,6 +1346,33 @@ impl NodePeek {
                     Loadable::Failed(_) => "could not be read".into(),
                     _ => "reading…".into(),
                 };
+                let writes = self.render_blob_writes(index, slot, cx);
+                let notice = match &slot.edit {
+                    Some(BlobEdit::Failed { notice, again }) => {
+                        let again = again.as_ref().map(|(change, now)| {
+                            studio_ui::ds::row_button(
+                                ("peek-blob-again", index),
+                                blob_write::again_label(change, now),
+                            )
+                            .style(ButtonStyle::Subtle)
+                            .tooltip(Tooltip::text(format!(
+                                "Write it over what {} holds now, on {}",
+                                slot.property, self.branch
+                            )))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.send_blob_again(index, cx)),
+                            )
+                            .into_any_element()
+                        });
+                        Some(blob_write::notice_row(
+                            format!("peek-blob-{index}"),
+                            notice,
+                            again,
+                        ))
+                    }
+                    _ => None,
+                };
+                let droppable = self.blob_write_refusal(&slot.property).is_none() && !saving;
                 let body: Option<AnyElement> = match (&slot.meta, &slot.preview) {
                     (Loadable::Failed(error), _) | (_, Loadable::Failed(error)) => {
                         Some(studio_ui::ds::text::error(error.clone()).into_any_element())
@@ -1205,7 +1491,8 @@ impl NodePeek {
                         ),
                         None => None,
                     };
-                v_flex()
+                let slot_view = v_flex()
+                    .id(("peek-blob", index))
                     .gap(px(space::XS))
                     .child(
                         h_flex()
@@ -1213,12 +1500,77 @@ impl NodePeek {
                             .items_center()
                             .child(studio_ui::ds::icon::meta(IconName::File))
                             .child(studio_ui::ds::text::body(slot.property.clone()))
+                            .when(saving, |line| {
+                                line.child(Indicator::dot().color(Color::Warning))
+                            })
                             .child(studio_ui::ds::text::meta(facts))
                             .child(div().flex_1())
-                            .children(save),
+                            .children(save)
+                            .child(writes),
                     )
-                    .children(body)
+                    .children(notice)
+                    .children(body);
+                // A file dropped from the file manager on the slot is stored in it.
+                if droppable {
+                    slot_view
+                        .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_bg))
+                        .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                            this.drop_blob_files(index, paths.paths(), cx)
+                        }))
+                        .into_any_element()
+                } else {
+                    slot_view.into_any_element()
+                }
             }))
+            .into_any_element()
+    }
+
+    /// Slot `index`'s Choose File and Clear, each disabled with its reason where the value
+    /// cannot change here.
+    fn render_blob_writes(
+        &self,
+        index: usize,
+        slot: &BlobSlot,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let cell = self.blob_cell(&slot.property);
+        let saving = slot.edit.as_ref().is_some_and(BlobEdit::is_saving);
+        let pinned = self.held_commit();
+        let upload_refusal = self.blob_write_refusal(&slot.property);
+        let clear_refusal = blob_write::clear_refusal(
+            self.schema.as_deref(),
+            &cell,
+            pinned.as_deref(),
+            slot.meta.loaded(),
+        );
+        let branch = self.branch.clone();
+        let tooltip = move |refusal: Option<String>, clear: bool| {
+            let (cell, branch) = (cell.clone(), branch.clone());
+            move |_: &mut Window, cx: &mut App| match &refusal {
+                Some(reason) => Tooltip::simple(reason.clone(), cx),
+                None if clear => blob_write::clear_tooltip(&cell, &branch, cx),
+                None => blob_write::upload_tooltip(&cell, &branch, cx),
+            }
+        };
+        let property = slot.property.clone();
+        h_flex()
+            .gap(px(space::XXS))
+            .child(
+                studio_ui::ds::row_icon_button(("peek-blob-choose", index), IconName::FolderOpen)
+                    .icon_color(Color::Muted)
+                    .aria_label("Choose File…")
+                    .disabled(upload_refusal.is_some() || saving)
+                    .tooltip(tooltip(upload_refusal, false))
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_blob_file(index, cx))),
+            )
+            .child(
+                studio_ui::ds::row_icon_button(("peek-blob-clear", index), IconName::Close)
+                    .icon_color(Color::Muted)
+                    .aria_label("Clear")
+                    .disabled(clear_refusal.is_some() || saving)
+                    .tooltip(tooltip(clear_refusal, true))
+                    .on_click(cx.listener(move |this, _, _, cx| this.clear_blob(&property, cx))),
+            )
             .into_any_element()
     }
 
@@ -5944,5 +6296,227 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(10));
         cx.run_until_parked();
         assert!(ended.get(), "the save went on");
+    }
+
+    const DOCS: &str = "node Person {\n  slug: String @key\n  name: String\n  doc: Blob?\n}\n";
+
+    /// A page of p1 whose `doc` holds `bytes`, read; and the server's Blob cells.
+    fn page_with_doc<'a>(
+        bytes: Option<&[u8]>,
+        at_commit: Option<&str>,
+        cx: &'a mut TestAppContext,
+    ) -> (
+        Entity<NodePeek>,
+        Entity<GraphSession>,
+        Arc<crate::test_support::Blobs>,
+        &'a mut VisualTestContext,
+    ) {
+        let (session, blobs) = crate::test_support::session_with_blobs(DOCS, cx);
+        if let Some(bytes) = bytes {
+            blobs.set("Person/p1/doc", bytes);
+        }
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let at_commit = at_commit.map(str::to_owned);
+        let (view, cx) = cx.add_window_view({
+            let session = session.clone();
+            move |_, cx| NodePeek::page(session, "Person".into(), "p1".into(), at_commit, cx)
+        });
+        cx.run_until_parked();
+        (view, session, blobs, cx)
+    }
+
+    /// A file stored in a slot is bound to the ETag the slot read, sent once to the view's
+    /// branch; its commit moves the view and the branch's head there, and the slot shows the
+    /// new value. Clear sets it to null the same way.
+    #[gpui::test]
+    async fn a_file_stored_in_a_slot_is_bound_to_the_value_read(cx: &mut TestAppContext) {
+        let (view, session, blobs, cx) = page_with_doc(Some(b"old"), None, cx);
+        let read = blobs.get("Person/p1/doc").unwrap().1;
+        view.read_with(cx, |view, _| {
+            assert!(matches!(
+                &view.blobs[0].meta,
+                Loadable::Loaded(BlobMeta::Managed { size: 3, etag: Some(etag) }) if *etag == read
+            ));
+        });
+        let file = crate::test_support::upload_file("notes.txt", b"new notes", None);
+        view.update(cx, |view, cx| {
+            view.upload_blob("doc", file, cx);
+            assert!(matches!(view.blobs[0].edit, Some(BlobEdit::Saving(_))));
+            assert!(view.saving.contains("doc"), "its dot shows");
+        });
+        cx.run_until_parked();
+        let stored = blobs.get("Person/p1/doc").unwrap();
+        assert_eq!(stored.0, b"new notes");
+        {
+            let writes = blobs.writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0].method, "PUT");
+            assert_eq!(writes[0].if_match.as_deref(), Some(read.as_str()));
+            assert_eq!((writes[0].branch.as_str(), writes[0].bytes), ("main", 9));
+        }
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.as_deref(), Some("c2"), "its own commit");
+            assert!(!view.newer && view.saving.is_empty());
+            assert_eq!(view.blobs[0].edit, None);
+            assert!(matches!(
+                &view.blobs[0].meta,
+                Loadable::Loaded(BlobMeta::Managed { size: 9, etag: Some(etag) }) if *etag == stored.1
+            ));
+            assert!(matches!(
+                &view.blobs[0].preview,
+                Loadable::Loaded(Preview::Text { text, .. }) if text == "new notes"
+            ));
+        });
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.head("main"), Some("c2"));
+            let logged = session.outcomes.last().unwrap();
+            assert_eq!(logged.description, "Upload notes.txt (9 B) to doc of p1");
+            assert_eq!(
+                logged.outcome,
+                graph_store::OutcomeKind::Committed {
+                    commit: Some("c2".into())
+                }
+            );
+        });
+
+        view.update(cx, |view, cx| view.clear_blob("doc", cx));
+        cx.run_until_parked();
+        assert_eq!(blobs.get("Person/p1/doc"), None);
+        let writes = blobs.writes.lock().unwrap().clone();
+        assert_eq!(writes[1].method, "DELETE");
+        assert_eq!(
+            writes[1].if_match.as_deref(),
+            Some(stored.1.as_str()),
+            "bound to the value it stored"
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.snapshot.as_deref(), Some("c3"));
+            assert_eq!(view.blobs[0].meta, Loadable::Loaded(BlobMeta::Null));
+        });
+    }
+
+    /// A value changed elsewhere since the slot read it refuses the write: nothing is
+    /// overwritten, the slot says what the cell holds now, and offers the file again, bound to
+    /// that. Nothing is sent again by itself.
+    #[gpui::test]
+    async fn a_value_changed_elsewhere_is_offered_again_over_the_new_one(cx: &mut TestAppContext) {
+        let (view, _session, blobs, cx) = page_with_doc(Some(b"old"), None, cx);
+        // Another writer's value, of another size.
+        let theirs = blobs.set("Person/p1/doc", b"their value");
+        let file = crate::test_support::upload_file("mine.txt", b"mine", None);
+        view.update(cx, |view, cx| view.upload_blob("doc", file, cx));
+        cx.run_until_parked();
+        assert_eq!(blobs.get("Person/p1/doc").unwrap().0, b"their value");
+        assert_eq!(blobs.writes.lock().unwrap().len(), 1, "sent once");
+        view.read_with(cx, |view, _| {
+            let Some(BlobEdit::Failed { notice, again }) = &view.blobs[0].edit else {
+                panic!("a conflict: {:?}", view.blobs[0].edit);
+            };
+            assert_eq!(notice.tone, Tone::Conflict);
+            assert_eq!(
+                notice.message,
+                "Not uploaded: doc changed since it was read, and now holds a value of 11 B."
+            );
+            let (_, now) = again.as_ref().expect("offered again");
+            assert_eq!(
+                *now,
+                BlobMeta::Managed {
+                    size: 11,
+                    etag: Some(theirs.clone())
+                }
+            );
+            assert_eq!(view.snapshot.as_deref(), Some("c1"), "nothing landed");
+        });
+        view.update(cx, |view, cx| view.send_blob_again(0, cx));
+        cx.run_until_parked();
+        let writes = blobs.writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[1].if_match.as_deref(), Some(theirs.as_str()));
+        assert_eq!(blobs.get("Person/p1/doc").unwrap().0, b"mine");
+        view.read_with(cx, |view, _| assert_eq!(view.blobs[0].edit, None));
+    }
+
+    /// A file over 32 MiB is refused before anything is sent; a page held at a commit stores
+    /// nothing, and says why; a lost answer is unknown, settled by History, never sent again.
+    #[gpui::test]
+    async fn uploads_the_view_cannot_send_say_why_and_send_nothing(cx: &mut TestAppContext) {
+        let (view, _session, blobs, cx) = page_with_doc(None, None, cx);
+        let large = crate::test_support::upload_file(
+            "huge.bin",
+            b"",
+            Some(graph_client::api::BLOB_PUT_MAX + 1),
+        );
+        view.update(cx, |view, cx| view.upload_blob("doc", large, cx));
+        cx.run_until_parked();
+        assert!(blobs.writes.lock().unwrap().is_empty());
+        view.read_with(cx, |view, _| {
+            let Some(BlobEdit::Failed {
+                notice,
+                again: None,
+            }) = &view.blobs[0].edit
+            else {
+                panic!("refused: {:?}", view.blobs[0].edit);
+            };
+            assert_eq!(notice.tone, Tone::Invalid);
+            assert!(
+                notice.message.contains("at most 32 MiB"),
+                "{}",
+                notice.message
+            );
+        });
+
+        blobs
+            .lose_answers
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let file = crate::test_support::upload_file("lost.txt", b"lost", None);
+        view.update(cx, |view, cx| view.upload_blob("doc", file, cx));
+        cx.run_until_parked();
+        assert_eq!(blobs.writes.lock().unwrap().len(), 1, "sent once");
+        assert_eq!(
+            blobs.writes.lock().unwrap()[0].if_match,
+            None,
+            "a null cell has no validator"
+        );
+        view.read_with(cx, |view, _| {
+            let Some(BlobEdit::Failed {
+                notice,
+                again: None,
+            }) = &view.blobs[0].edit
+            else {
+                panic!("unknown: {:?}", view.blobs[0].edit);
+            };
+            assert_eq!(notice.tone, Tone::Unknown);
+            assert!(
+                notice.message.contains("Check History"),
+                "{}",
+                notice.message
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn a_page_held_at_a_commit_stores_no_file(cx: &mut TestAppContext) {
+        let (view, _session, blobs, cx) = page_with_doc(Some(b"old"), Some("c1"), cx);
+        let file = crate::test_support::upload_file("held.txt", b"held", None);
+        view.update(cx, |view, cx| {
+            assert!(view.blob_write_refusal("doc").is_some());
+            view.upload_blob("doc", file, cx);
+            view.clear_blob("doc", cx);
+        });
+        cx.run_until_parked();
+        assert!(blobs.writes.lock().unwrap().is_empty());
+        view.read_with(cx, |view, _| {
+            let Some(BlobEdit::Failed { notice, .. }) = &view.blobs[0].edit else {
+                panic!("refused: {:?}", view.blobs[0].edit);
+            };
+            assert!(
+                notice.message.starts_with("Read-only: this shows commit"),
+                "{}",
+                notice.message
+            );
+        });
     }
 }

@@ -9,10 +9,10 @@ use std::sync::Arc;
 
 use editor::Editor;
 use gpui::{
-    App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    ImageFormat, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement, Pixels,
-    Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled, SvgRenderer, Task, Window,
-    canvas, checkerboard, div, img, point,
+    App, AppContext as _, Bounds, Context, Entity, EventEmitter, ExternalPaths, FocusHandle,
+    Focusable, ImageFormat, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, SharedString, Styled,
+    SvgRenderer, Task, Window, canvas, checkerboard, div, img, point,
 };
 use graph_client::{BlobCell, BlobMeta};
 use graph_store::{GraphSession, Loadable};
@@ -27,6 +27,8 @@ use crate::blob::{
     ShownImage, hex_dump_lines, read_value, save_folder, save_value, sniff_image,
     suggested_file_name, text_prefix,
 };
+use crate::blob_write::{self, BlobChange, BlobEdit, BlobWritten};
+use crate::model::{Notice, Tone};
 use crate::pdf;
 
 /// The largest value the tab reads whole to show.
@@ -86,7 +88,17 @@ enum Export {
 pub struct BlobView {
     session: Entity<GraphSession>,
     cell: BlobCell,
+    /// The commit the tab was opened at, read-only; `None` reads the branch head.
     snapshot: Option<String>,
+    /// The branch the tab read the value on, which a file chosen or dropped is stored on.
+    branch: String,
+    /// The commit of the tab's own last write, which it reads the value at since: the head it
+    /// made, whichever branch the window shows now.
+    own_commit: Option<String>,
+    /// What the cell holds as the tab read it, with its ETag, which a write is bound to.
+    meta: Option<BlobMeta>,
+    /// A file being stored or a clear, while out, or why it did not land.
+    edit: Option<BlobEdit>,
     size: Option<u64>,
     content: Loadable<Content>,
     /// Bytes read so far while reading.
@@ -116,10 +128,15 @@ impl BlobView {
     ) -> Self {
         cx.on_release(|this: &mut Self, cx| this.release_images(cx))
             .detach();
+        let branch = session.read(cx).branch.clone();
         Self {
             session,
             cell,
             snapshot,
+            branch,
+            own_commit: None,
+            meta: None,
+            edit: None,
             size: None,
             content: Loadable::Loading,
             progress: 0,
@@ -166,27 +183,34 @@ impl BlobView {
                 })
                 .ok();
             };
-            let size = match meta.await {
-                Ok(BlobMeta::Managed { size, .. }) => size,
-                Ok(BlobMeta::External { uri }) => {
+            let meta = match meta.await {
+                Ok(meta) => meta,
+                Err(error) => return fail(error.to_string(), cx),
+            };
+            let size = match &meta {
+                BlobMeta::Managed { size, .. } => *size,
+                BlobMeta::External { uri } => {
+                    let uri = uri.clone();
                     this.update(cx, |this, cx| {
+                        this.meta = Some(meta);
                         this.content = Loadable::Loaded(Content::External(uri));
                         cx.notify();
                     })
                     .ok();
                     return;
                 }
-                Ok(BlobMeta::Null) => {
+                BlobMeta::Null => {
                     this.update(cx, |this, cx| {
+                        this.meta = Some(meta);
                         this.content = Loadable::Loaded(Content::Null);
                         cx.notify();
                     })
                     .ok();
                     return;
                 }
-                Err(error) => return fail(error.to_string(), cx),
             };
             this.update(cx, |this, cx| {
+                this.meta = Some(meta);
                 this.size = Some(size);
                 cx.emit(ItemEvent::UpdateTab);
                 cx.notify();
@@ -352,7 +376,7 @@ impl BlobView {
         let (Some(size), session) = (self.size, self.session.downgrade()) else {
             return;
         };
-        let (cell, snapshot) = (self.cell.clone(), self.snapshot.clone());
+        let (cell, snapshot) = (self.cell.clone(), self.reading_at());
         self.export = Some(Export::Busy(if then_open {
             "Opening…"
         } else {
@@ -411,6 +435,230 @@ impl BlobView {
             })
             .ok();
         }));
+    }
+
+    // ---- a file stored in the value, or the value cleared ----
+
+    /// The commit the value is read at: the tab's own write's, else the one it was opened at;
+    /// `None` reads the branch head.
+    fn reading_at(&self) -> Option<String> {
+        self.own_commit.clone().or_else(|| self.snapshot.clone())
+    }
+
+    /// Why the value cannot take a file here, or `None` when it can.
+    fn write_refusal(&self, cx: &App) -> Option<String> {
+        let schema = self.session.read(cx).schema_model();
+        blob_write::write_refusal(schema.as_deref(), &self.cell, self.snapshot.as_deref())
+    }
+
+    /// Why the value cannot be cleared here, or `None` when it can.
+    fn clear_refusal(&self, cx: &App) -> Option<String> {
+        let schema = self.session.read(cx).schema_model();
+        blob_write::clear_refusal(
+            schema.as_deref(),
+            &self.cell,
+            self.snapshot.as_deref(),
+            self.meta.as_ref(),
+        )
+    }
+
+    fn saving(&self) -> bool {
+        self.edit.as_ref().is_some_and(BlobEdit::is_saving)
+    }
+
+    /// Choose File…: the system's picker, then the file chosen stored in the value.
+    fn choose_file(&mut self, cx: &mut Context<Self>) {
+        let chosen = blob_write::choose_file(cx);
+        cx.spawn(async move |this, cx| {
+            if let Some(path) = chosen.await {
+                this.update(cx, |this, cx| this.upload(path, cx)).ok();
+            }
+        })
+        .detach();
+    }
+
+    /// A drop from the file manager: its one file stored in the value.
+    fn drop_files(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        match blob_write::dropped_file(paths) {
+            Ok(path) => self.upload(path, cx),
+            Err(notice) => {
+                self.edit = Some(BlobEdit::Failed {
+                    notice,
+                    again: None,
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    /// Stores the file at `path` in the value on the tab's branch, bound to the value it shows.
+    pub(crate) fn upload(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.send(BlobChange::Upload(path), None, cx);
+    }
+
+    /// Clear: the value set to null, bound to the value the tab shows.
+    pub(crate) fn clear(&mut self, cx: &mut Context<Self>) {
+        self.send(BlobChange::Clear, None, cx);
+    }
+
+    /// The change a conflict offers again, bound to what the cell held at the head.
+    fn send_again(&mut self, cx: &mut Context<Self>) {
+        if let Some(BlobEdit::Failed {
+            again: Some((change, now)),
+            ..
+        }) = self.edit.clone()
+        {
+            self.send(change, Some(now), cx);
+        }
+    }
+
+    /// Sends `change`, bound to `over` (what a conflict found at the head) or else to the value
+    /// shown, read at the commit the tab reads. Detached: closing the tab never cancels it.
+    fn send(&mut self, change: BlobChange, over: Option<BlobMeta>, cx: &mut Context<Self>) {
+        if self.saving() {
+            return;
+        }
+        let refusal = match &change {
+            BlobChange::Clear if over.is_none() => self.clear_refusal(cx),
+            _ => self.write_refusal(cx),
+        };
+        let shown = over.clone().or_else(|| self.meta.clone());
+        let (Some(shown), None) = (shown, refusal.clone()) else {
+            let reason = refusal.unwrap_or_else(|| {
+                format!(
+                    "Nothing was written: Studio has not read what {} holds yet.",
+                    self.cell.property
+                )
+            });
+            self.edit = Some(BlobEdit::Failed {
+                notice: Notice::new(Tone::Invalid, reason),
+                again: None,
+            });
+            cx.notify();
+            return;
+        };
+        let read_at = if over.is_some() {
+            None
+        } else {
+            self.reading_at()
+        };
+        let (cell, branch) = (self.cell.clone(), self.branch.clone());
+        let write = match &change {
+            BlobChange::Upload(path) => blob_write::upload(
+                &self.session,
+                &branch,
+                cell,
+                shown,
+                read_at,
+                path.clone(),
+                cx,
+            ),
+            BlobChange::Clear => {
+                blob_write::clear(&self.session, &branch, cell, shown, read_at, cx)
+            }
+        };
+        self.edit = Some(BlobEdit::Saving(change.clone()));
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let written = write.await;
+            this.update(cx, |this, cx| this.written(change, written, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Lands a write: a stored value is read again at its commit, which the tab reads at since;
+    /// one that did not land says why.
+    fn written(&mut self, change: BlobChange, written: BlobWritten, cx: &mut Context<Self>) {
+        let saved = match &written {
+            BlobWritten::Saved { commit, meta, .. } => Some((commit.clone(), meta.clone())),
+            _ => None,
+        };
+        self.edit = BlobEdit::ended(written, change, &self.cell.property);
+        if let Some((commit, meta)) = saved {
+            self.release_images(cx);
+            self.export = None;
+            self.head.clear();
+            self.progress = 0;
+            match commit {
+                Some(commit) => {
+                    self.own_commit = Some(commit);
+                    self.meta = None;
+                    self.size = None;
+                    self.content = Loadable::Loading;
+                    self._load = None;
+                }
+                // Cleared already: nothing was published.
+                None => {
+                    self.meta = Some(meta);
+                    self.size = None;
+                    self.content = Loadable::Loaded(Content::Null);
+                }
+            }
+        }
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// The status bar's part for writing the value: a write out, or why the last did not land,
+    /// then Choose File… and Clear, each disabled with its reason where the value cannot change.
+    fn write_status(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let mut parts = Vec::new();
+        match &self.edit {
+            Some(BlobEdit::Saving(_)) => parts.push(
+                h_flex()
+                    .gap(px(ds::space::SM))
+                    .child(ui::Indicator::dot().color(Color::Warning))
+                    .child(ds::text::meta(format!("Saving to {}…", self.branch)))
+                    .into_any_element(),
+            ),
+            Some(BlobEdit::Failed { notice, again }) => {
+                let again = again.as_ref().map(|(change, now)| {
+                    ds::button("blob-write-again", blob_write::again_label(change, now))
+                        .style(ButtonStyle::Subtle)
+                        .tooltip(Tooltip::text(format!(
+                            "Write it over what {} holds now, on {}",
+                            self.cell.property, self.branch
+                        )))
+                        .on_click(cx.listener(|this, _, _, cx| this.send_again(cx)))
+                        .into_any_element()
+                });
+                parts.push(blob_write::notice_row("blob-write", notice, again).into_any_element());
+            }
+            None => {}
+        }
+        let saving = self.saving();
+        let (cell, branch) = (self.cell.clone(), self.branch.clone());
+        let tooltip = move |refusal: Option<String>, clear: bool| {
+            let (cell, branch) = (cell.clone(), branch.clone());
+            move |_: &mut Window, cx: &mut App| match &refusal {
+                Some(reason) => Tooltip::simple(reason.clone(), cx),
+                None if clear => blob_write::clear_tooltip(&cell, &branch, cx),
+                None => blob_write::upload_tooltip(&cell, &branch, cx),
+            }
+        };
+        let upload_refusal = self.write_refusal(cx);
+        let clear_refusal = self.clear_refusal(cx);
+        parts.push(
+            ds::button("choose-blob-file", "Choose File…")
+                .style(ButtonStyle::Subtle)
+                .color(Color::Muted)
+                .disabled(upload_refusal.is_some() || saving)
+                .tooltip(tooltip(upload_refusal, false))
+                .on_click(cx.listener(|this, _, _, cx| this.choose_file(cx)))
+                .into_any_element(),
+        );
+        parts.push(
+            ds::button("clear-blob", "Clear")
+                .style(ButtonStyle::Subtle)
+                .color(Color::Muted)
+                .disabled(clear_refusal.is_some() || saving)
+                .tooltip(tooltip(clear_refusal, true))
+                .on_click(cx.listener(|this, _, _, cx| this.clear(cx)))
+                .into_any_element(),
+        );
+        parts
     }
 
     // ---- what the tab says ----
@@ -738,6 +986,11 @@ impl Item for BlobView {
         Some(Self::key(&self.cell, self.snapshot.as_deref()).into())
     }
 
+    /// The tab's dot shows while a file is being stored or the value cleared.
+    fn is_dirty(&self, _cx: &App) -> bool {
+        self.saving()
+    }
+
     fn serialize(&self, _cx: &App) -> Option<SavedItem> {
         Some(SavedItem {
             kind: "blob".into(),
@@ -868,6 +1121,7 @@ impl Item for BlobView {
                     .into_any_element(),
             );
         }
+        end.extend(self.write_status(cx));
         let keys = if zoomable {
             let focus = &self.focus_handle;
             vec![
@@ -885,13 +1139,12 @@ impl Item for BlobView {
 impl Render for BlobView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self._load.is_none() {
-            self._load = Some(Self::load(
-                &self.session,
-                &self.cell,
-                &self.snapshot,
-                window,
-                cx,
-            ));
+            let at = self.reading_at();
+            // Read at the head, the value is the session's branch's, which a write goes to.
+            if at.is_none() {
+                self.branch = self.session.read(cx).branch.clone();
+            }
+            self._load = Some(Self::load(&self.session, &self.cell, &at, window, cx));
         }
         let body = match &self.content {
             Loadable::Loading | Loadable::NotLoaded => {
@@ -911,7 +1164,21 @@ impl Render for BlobView {
             )
             .into_any_element(),
             Loadable::Loaded(Content::Null) => {
-                studio_ui::ds::empty_state(IconName::FileGeneric, "No value").into_any_element()
+                // An empty value's one action is a file to put in it, a drop doing the same.
+                let writable = self.write_refusal(cx).is_none() && !self.saving();
+                let (cell, branch) = (self.cell.clone(), self.branch.clone());
+                studio_ui::ds::empty_state(IconName::FileGeneric, "No value")
+                    .when(writable, |state| {
+                        state.child(
+                            ds::button("choose-blob-empty", "Choose File…")
+                                .style(ButtonStyle::Outlined)
+                                .tooltip(move |_, cx| {
+                                    blob_write::upload_tooltip(&cell, &branch, cx)
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| this.choose_file(cx))),
+                        )
+                    })
+                    .into_any_element()
             }
             // Studio does not fetch objects outside the graph.
             Loadable::Loaded(Content::External(uri)) => {
@@ -982,6 +1249,9 @@ impl Render for BlobView {
             Loadable::Loaded(Content::Text(..) | Content::Bytes(_)) => "BlobText",
             _ => "BlobView",
         };
+        // A file dropped from the file manager anywhere on the tab is stored in the value.
+        let droppable = self.write_refusal(cx).is_none() && !self.saving();
+        let drop_bg = studio_ui::ds::surface::drop_target(cx);
         div()
             .key_context(context)
             .track_focus(&self.focus_handle)
@@ -991,6 +1261,12 @@ impl Render for BlobView {
             .on_action(cx.listener(Self::fit))
             .size_full()
             .bg(studio_ui::ds::surface::document(cx))
+            .when(droppable, |tab| {
+                tab.drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_bg))
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                        this.drop_files(paths.paths(), cx)
+                    }))
+            })
             .child(body)
     }
 }
@@ -1064,6 +1340,97 @@ mod tests {
             assert!(view.file_name().ends_with(".png"), "{}", view.file_name());
         });
         assert_eq!(*ranges.lock().unwrap(), ["bytes=0-1023"]);
+    }
+
+    const DOCS: &str = "node Person {\n  slug: String @key\n  name: String\n  doc: Blob?\n}\n";
+
+    fn doc() -> BlobCell {
+        BlobCell {
+            edge: false,
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "doc".into(),
+        }
+    }
+
+    /// A file stored from the tab is bound to the ETag the tab read, and the tab shows the new
+    /// value read at the commit its write made; Clear empties it the same way.
+    #[gpui::test]
+    async fn a_file_stored_from_the_tab_shows_at_its_own_commit(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let (session, blobs) = crate::test_support::session_with_blobs(DOCS, cx);
+        let read = blobs.set("Person/p1/doc", &[0xff, 0x00, 0x13]);
+        let (view, cx) =
+            cx.add_window_view(|window, cx| BlobView::new(session, doc(), None, window, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(matches!(view.content, Loadable::Loaded(Content::Bytes(_))));
+            assert_eq!(view.branch, "main");
+        });
+        let file = crate::test_support::upload_file("hello.txt", b"hello", None);
+        view.update(cx, |view, cx| {
+            view.upload(file, cx);
+            assert!(view.saving());
+        });
+        cx.run_until_parked();
+        let writes = blobs.writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].if_match.as_deref(), Some(read.as_str()));
+        let stored = blobs.get("Person/p1/doc").unwrap();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.own_commit.as_deref(), Some("c2"));
+            assert_eq!(view.edit, None);
+            assert_eq!(view.size, Some(5));
+            assert!(matches!(
+                view.content,
+                Loadable::Loaded(Content::Text(_, false))
+            ));
+            assert_eq!(
+                view.meta,
+                Some(BlobMeta::Managed {
+                    size: 5,
+                    etag: Some(stored.1.clone())
+                })
+            );
+        });
+
+        view.update(cx, |view, cx| view.clear(cx));
+        cx.run_until_parked();
+        let writes = blobs.writes.lock().unwrap().clone();
+        assert_eq!(writes[1].method, "DELETE");
+        assert_eq!(writes[1].if_match.as_deref(), Some(stored.1.as_str()));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.own_commit.as_deref(), Some("c3"));
+            assert!(matches!(view.content, Loadable::Loaded(Content::Null)));
+        });
+    }
+
+    /// A tab opened at a commit stores no file and clears nothing, and says why.
+    #[gpui::test]
+    async fn a_tab_at_a_commit_writes_nothing(cx: &mut gpui::TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let (session, blobs) = crate::test_support::session_with_blobs(DOCS, cx);
+        blobs.set("Person/p1/doc", b"old");
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            BlobView::new(session, doc(), Some("c1".into()), window, cx)
+        });
+        cx.run_until_parked();
+        let file = crate::test_support::upload_file("tab.txt", b"tab", None);
+        view.update(cx, |view, cx| {
+            assert!(view.write_refusal(cx).is_some() && view.clear_refusal(cx).is_some());
+            view.upload(file, cx);
+        });
+        cx.run_until_parked();
+        assert!(blobs.writes.lock().unwrap().is_empty());
+        view.read_with(cx, |view, _| {
+            assert!(matches!(
+                &view.edit,
+                Some(BlobEdit::Failed { notice, .. }) if notice.message.starts_with("Read-only")
+            ));
+        });
     }
 
     #[test]

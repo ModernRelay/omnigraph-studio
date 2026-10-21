@@ -26,6 +26,7 @@ one is picked up it goes through OmniGraph's own RFC process.
 | E26 | Edge update (T16) | 014 | An unkeyed edge's properties save as delete and insert, with a new id |
 | E27 | Annotation-only schema changes (a display hint on an existing property) | 014 | Every String reads as markdown; a hint can go only on a new property or type |
 | E28 | Merge bound to the reviewed source head (a precondition on the source, as `If-Graph-Commit` binds a write to its target) | 008 | Checks the source head just before merging; a commit landing in between is merged too, and the outcome says the merge took a commit made after the review was read |
+| E29 | A Blob write bound to an empty cell (`If-None-Match: *` on `PUT /graphs/{id}/blob`; `If-Match` matches only a cell that holds a value) | 004 | Reads the cell at the head just before sending, and sends only while it is still empty; a value set in between is overwritten |
 
 These landed in OmniGraph 0.14 (`edge-20261017-d883c49`, checked 2026-10-17; the HTTP contract
 header is still `0.13`), and so are on every server Studio supports. Studio uses E7, E6, E8
@@ -55,7 +56,7 @@ since the CLI is whatever is installed (specs 013 and 003).
 
 | ID | Feature | Operation | Spec |
 |---|---|---|---|
-| R1 | Blob writes | `cluster_putBlob`, `cluster_clearBlob` | 004 |
+| R1 | Blob writes (adopted: Choose File, a file dropped from Finder, and Clear, each bound to the value read) | `cluster_putBlob`, `cluster_clearBlob` | 004 |
 | R2 | Unpublished commits: `as_commit` on writes and merges, publish, drop, `GET /commits?unpublished=` | `cluster_publishCommit`, `cluster_dropCommit` | 004, 008 |
 | E6 | Paged graph diff between two branches or commits, and a branch's diff since its merge base, with `before`/`after` images and `kind`/`type`/`op` filters | `cluster_getDiff`, `cluster_getBranchDiff` | 008 |
 | E7 | Merge base of two branches (used by review and merge) | `cluster_getMergeBase` | 008 |

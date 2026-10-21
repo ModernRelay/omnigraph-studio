@@ -516,6 +516,63 @@ pub struct ChangeImageOutput {
     pub endpoints: Option<Value>,
 }
 
+// ---- Blob writes ----
+
+/// The largest body `PUT /graphs/{id}/blob` takes, inclusive: 32 MiB, the most any server
+/// stores in one value. A server configured for less refuses a larger body with 413.
+pub const BLOB_PUT_MAX: u64 = 32 * 1024 * 1024;
+
+/// `PUT`/`DELETE /graphs/{id}/blob`: the receipt of a Blob put or clear. A put leaves managed
+/// bytes, with their `size` and `etag`; a clear leaves null, with neither. The `etag` is the
+/// one a read at `commit` reports.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlobWriteOutput {
+    pub selector: BlobSelectorOutput,
+    /// The branch the write published to.
+    pub branch: String,
+    pub kind: BlobWriteState,
+    /// The write's own publication; `None` only for a clear of a cell that was already null,
+    /// which publishes nothing.
+    pub commit: Option<CommitOutput>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub actor_id: Option<String>,
+}
+
+/// The cell a Blob write named.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlobSelectorOutput {
+    pub entity: EntityKind,
+    #[serde(rename = "type")]
+    pub type_name: String,
+    pub id: String,
+    pub property: String,
+}
+
+/// What a Blob write left its cell holding (`BlobWriteStateOutput`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlobWriteState {
+    Managed,
+    Null,
+    /// A value a newer server sends that this build does not know: Studio accepts any server
+    /// from 0.14 on, so an answer still decodes.
+    #[serde(other)]
+    Other,
+}
+
+/// A Blob write's `If-Match` did not hold for its cell (HTTP 412), and the write changed
+/// nothing. `current_etag` is the cell's validator when it holds a managed value; a null or
+/// external value has none.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlobPreconditionFailureOutput {
+    #[serde(default)]
+    pub current_etag: Option<String>,
+}
+
 // ---- errors ----
 
 /// Every refusal's body. Typed details are added as surfaces need them; the rest stay in
@@ -529,6 +586,10 @@ pub struct ErrorOutput {
     pub merge_conflicts: Option<Vec<MergeConflictOutput>>,
     #[serde(default)]
     pub precondition_failure: Option<PreconditionFailureOutput>,
+    /// Set with a 412 when a Blob write's `If-Match` did not hold: the value changed since it
+    /// was read.
+    #[serde(default)]
+    pub blob_precondition_failure: Option<BlobPreconditionFailureOutput>,
     #[serde(default)]
     pub diagnostic: Option<Value>,
     #[serde(flatten)]
@@ -757,12 +818,21 @@ mod contract_tests {
         ("ChangeTypeOutput", &["id", "name"]),
         ("ChangeImageOutput", &["properties", "endpoints"]),
         (
+            "BlobWriteOutput",
+            &[
+                "selector", "branch", "kind", "commit", "size", "etag", "actor_id",
+            ],
+        ),
+        ("BlobSelectorOutput", &["entity", "type", "id", "property"]),
+        ("BlobPreconditionFailureOutput", &["current_etag"]),
+        (
             "ErrorOutput",
             &[
                 "error",
                 "code",
                 "merge_conflicts",
                 "precondition_failure",
+                "blob_precondition_failure",
                 "diagnostic",
             ],
         ),
@@ -800,6 +870,8 @@ mod contract_tests {
             ],
         ),
         ("EntityKindOutput", &["node", "edge"]),
+        ("BlobEntityKind", &["node", "edge"]),
+        ("BlobWriteStateOutput", &["managed", "null"]),
         (
             "BranchMergeOutcome",
             &["already_up_to_date", "fast_forward", "merged"],

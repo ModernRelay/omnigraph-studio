@@ -75,6 +75,25 @@ stay put), IX (paged, virtualized).
   directory, emptied of anything a day old, and hands it to the system. The tab comes back after
   a restart with the same value at the same commit. Elsewhere than macOS, a PDF opens in the
   system's viewer.
+- A Blob value takes a file (R1, `PUT`/`DELETE /graphs/{id}/blob`): "Choose File…" opens the
+  system's picker, and a file dropped from the file manager does the same, on the Blob tab
+  (its status bar, the whole tab as the drop target, and "Choose File…" in an empty value's
+  state), on a peek's slot (an open-folder icon and a ×, the slot the drop target) and on a
+  table's Blob cell (a drop alone; the peek beside it has the buttons). "Clear" sets a nullable
+  value to null. The file is read off the main thread and refused over 32 MiB before anything
+  is sent. The write goes to the branch the view shows, once, bound to the value shown as read
+  at the view's commit: a managed value by its ETag, which names the type's table version, so
+  it is read again at the view's commit when the view moved since (its own writes move it); a
+  null cell and an external reference have none, so the cell is read at the head first and the
+  write goes only while it still holds what is shown (`*` for a reference, no `If-Match` for
+  null). While out the value shows the amber dot and "saving to <branch>…"; committed, the view
+  moves to its commit as a cell edit does and shows the new value; refused, the server's reason;
+  changed elsewhere (a 412, or found before sending), what it holds now and "Replace anyway",
+  the change again bound to that (a table cell: drop it again); unknown, check History. Nothing
+  is retried. A view held at a commit, an edge's value and a property that is not a Blob are
+  disabled with the reason, and Clear also for a property that must hold a value. The
+  outcome log names the file and its size, never its bytes. An edge's value is changed with
+  `omnigraph blob put edge …`, as the disabled control says: Studio edits no edge's values.
 
 ### Reading
 
@@ -299,7 +318,11 @@ kept answers.
 - Engine changes, [spec 012](../012-omnigraph-engine-changes/plan.md):
   - E11 typed result columns: column types come from `describe_query_operation` until then.
   - R2 unpublished commits: staged edits as a reviewable proposal. The minimum server (0.14)
-    serves them; Studio does not use them yet. Blob writes (R1) are served there and used.
+    serves them; Studio does not use them yet. Blob writes (R1) are served there too, and used
+    since 2026-10-20 (Layout).
+  - A precondition that a Blob cell is null (`If-None-Match: *` on `PUT /blob`): no `If-Match`
+    describes an empty cell, so a file stored in one is checked at the head just before it is
+    sent and goes unbound, and a value set elsewhere in between is overwritten.
 - Per-row history beyond the commits that the change feed can cheaply return.
 
 ## Validation log
@@ -351,6 +374,8 @@ kept answers.
 | 2026-10-17 | A delete takes its dependents, says so, and can be undone | `gq_language` `deletes_take_many_ids_and_find_the_sources_that_need_them`; `graph_store` `dependents_follow_the_chain_of_required_relationships` (company → person → badge, every read held at the pin, an optional relationship never read), `undo_is_known_before_the_delete`, `a_plan_deletes_every_type_in_one_mutation`; `studio_workspace` `a_delete_that_can_be_put_back_offers_undo`; on a scratch OmniGraph 0.13 graph (`WorksAt @card(1..)`, `Holds @card(1..1)`): `delete Company` alone, then the planned delete, then the undo as one insert mutation; offscreen snapshots: Company, ⌘⌫ on Acme, ↵, then Undo, with CLI reads after each | Alone: refused, "@card violation on edge WorksAt: source 'ada' has 0 edges (min 1)". The dialog listed Ada (needs WorksAt) and b-ada (needs Holds); ↵ deleted 3 nodes and 4 relationships in one commit, Bob kept his Beta job, and the one toast read "Delete Company Acme and 2 that needed them · committed to main" with Undo. Undo committed once more and the CLI read every node and all four `WorksAt` back; the table showed "Newer data · Refresh" |
 | 2026-10-14 | A wider grid draws the columns its new width shows in the frame that widens it | `type_table` `rows_draw_only_the_columns_in_view` extended: the window widened from about 1,730 px of scrolled columns to 5,810, then the columns the rows drew read in that frame, with the fix that asked for a second frame removed | Every column drawn in the frame of the resize: Zed's header row tracks the same scroll handle and is laid out before the list picks its rows' columns. A test with the extra frame disabled passed the same, so the extra frame was not kept |
 | 2026-10-14 | Grouping by a neighbour's property and by an end's property | `gq_language` `rows_group_by_a_neighbours_or_an_ends_property` (for every relationship of every dev node type and every groupable property of the other type: the counts, and pages and counts narrowed to a value and to "no value", compile; for both ends of every dev edge the same), `group_keys_name_one_kind_each`; `type_table` `a_neighbours_property_narrows_by_its_value_and_an_end_has_no_value_in_the_row`, `rows_group_by_a_neighbours_or_an_ends_property` (the menu's keys and labels on Person and WorksAt); offscreen snapshots on the dev server: Person, Group, the `worksAt Company` submenu, city; scrolled to the end; WorksAt, Group, `to Company`, city; and the same counts read with curl | Submenus for `contributes Project`, `knows Person`, `worksAt Company` and `← knows Person`, each with its arrow; Berlin 9, Lisbon 9, London 46, San Francisco 46, Tokyo 58, Toronto 35, "No city" 38 of 200 people, as curl counted; WorksAt by `to Company.city`: Berlin 9, Lisbon 9, London 49, and 7 edges to companies with no city |
+| 2026-10-20 | The Blob write contract | `openapi/omnigraph-0.14.0-edge.json` (`cluster_putBlob`, `cluster_clearBlob`, `BlobWriteOutput`, `ErrorOutput.blob_precondition_failure`); OmniGraph `crates/omnigraph-server/src/handlers.rs` (`server_blob_put`, `server_blob_delete`) and `crates/omnigraph/src/blob.rs` (`managed_blob_etag`) at `cf2b20e9` | `If-Match` is `*` (a value is there) or strong tags; a null cell satisfies neither, and a put takes no `If-None-Match`, so a write into a null cell cannot be bound. The ETag hashes the table version with the row: any write to the type moves every ETag of it. A put needs `Content-Type: application/octet-stream`, at most 32 MiB; a receipt's `commit` is null only for a clear of a cell already null |
+| 2026-10-20 | A Blob write is bound to the value read and has three outcomes | `graph_client` `a_blob_put_sends_raw_bytes_bound_to_the_etag_read`, `a_blob_clear_of_a_null_cell_commits_nothing`, `a_changed_blob_refuses_the_write_with_its_current_etag`, `a_blob_put_without_the_servers_answer_is_unknown`; `type_table` `blob_write` tests, the peek's `a_file_stored_in_a_slot_is_bound_to_the_value_read`, `a_value_changed_elsewhere_is_offered_again_over_the_new_one`, `uploads_the_view_cannot_send_say_why_and_send_nothing`, `a_page_held_at_a_commit_stores_no_file`, the table's `a_file_dropped_on_a_blob_cell_is_stored_bound_to_the_value_read`, the tab's `a_file_stored_from_the_tab_shows_at_its_own_commit` and `a_tab_at_a_commit_writes_nothing`, against the fake server's Blob cells | One `PUT` with one content type, the bytes and the ETag read; the view, the table and the tab move to the write's commit and show its value; a value changed elsewhere sends one write, keeps the other writer's bytes and offers "Replace anyway" bound to the new ETag, which lands; a 32 MiB + 1 file and a held view send nothing; a lost answer is unknown and not sent again. The native picker and a drop from Finder were not driven: no test reaches the system's open panel or its file drags, so the paths after them (`upload_blob`, `upload`) are what the tests call |
 
 ## Corrections
 

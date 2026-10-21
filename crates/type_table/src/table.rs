@@ -16,9 +16,9 @@ use collections::IndexSet;
 use editor::{Editor, EditorEvent};
 use gpui::{
     Anchor, AnyView, App, ClickEvent, ClipboardItem, Context, DragMoveEvent, ElementId, Entity,
-    EventEmitter, FocusHandle, Focusable, KeyContext, MouseButton, MouseDownEvent, Pixels, Render,
-    ScrollStrategy, SharedString, StyleRefinement, Subscription, Task, WeakEntity, Window,
-    anchored, deferred, point,
+    EventEmitter, ExternalPaths, FocusHandle, Focusable, KeyContext, MouseButton, MouseDownEvent,
+    Pixels, Render, ScrollStrategy, SharedString, StyleRefinement, Subscription, Task, WeakEntity,
+    Window, anchored, deferred, point,
 };
 use gq_language::input::same_value;
 use gq_language::{
@@ -46,6 +46,7 @@ use ui::{
     TintColor, Tooltip,
 };
 
+use crate::blob_write::{self, BlobChange, BlobEdit, BlobWritten};
 use crate::dialogs::{
     DeleteRowModal, DeleteTarget, InsertEdgeModal, InsertRowModal, SaveViewModal,
 };
@@ -373,6 +374,9 @@ pub struct TypeTable {
     /// commit; and the reads under way.
     blobs: HashMap<(String, String), Loadable<BlobMeta>>,
     blob_tasks: HashMap<(String, String), Task<()>>,
+    /// Files dropped on Blob cells being stored, by row id and property, and why one that did
+    /// not land did not.
+    blob_edits: HashMap<(String, String), BlobEdit>,
     /// Each row's neighbours in the relationship columns, by row id and relationship key;
     /// read for each page at the page's commit.
     relations: HashMap<(String, String), Relation>,
@@ -643,6 +647,7 @@ impl TypeTable {
             drafts_due: false,
             blobs: HashMap::new(),
             blob_tasks: HashMap::new(),
+            blob_edits: HashMap::new(),
             relations: HashMap::new(),
             relation_tasks: HashMap::new(),
             next_relation_task: 0,
@@ -2014,6 +2019,12 @@ impl TypeTable {
             self.newer = false;
             cx.emit(ItemEvent::UpdateTab);
         }
+        // An edit open over the rows read before is kept as its cell's draft, as leaving the
+        // cell keeps it: a Refresh that lands while the person types loses nothing. It is
+        // judged while its row is still held, so text over a value the row shows since stays.
+        if let Some(editing) = self.editing.take() {
+            self.keep_edit(editing, cx);
+        }
         self.rows.clear();
         self.placed_here.clear();
         self.cell_text.borrow_mut().clear();
@@ -2022,6 +2033,8 @@ impl TypeTable {
         if !keep_pin {
             self.blobs.clear();
             self.blob_tasks.clear();
+            // A file still being stored stays shown as going; why one did not land goes.
+            self.blob_edits.retain(|_, edit| edit.is_saving());
             self.relations.clear();
             self.relation_tasks.clear();
             self.relations_asked.clear();
@@ -2033,11 +2046,6 @@ impl TypeTable {
         // Picked rows stay picked by id; the row a range starts from is a place in the old
         // order.
         self.selection_anchor = None;
-        // An edit open over the rows read before is kept as its cell's draft, as leaving the
-        // cell keeps it: a Refresh that lands while the person types loses nothing.
-        if let Some(editing) = self.editing.take() {
-            self.keep_edit(editing, cx);
-        }
         self.loading_more = false;
         self.more_error = None;
         self.first_page = Loadable::Loading;
@@ -6476,6 +6484,175 @@ impl TypeTable {
         }
     }
 
+    /// The Blob cell of row `row_id`'s `property`.
+    fn blob_cell(&self, row_id: &str, property: &str) -> BlobCell {
+        BlobCell {
+            edge: self.kind == TableKind::Edge,
+            type_name: self.type_name.clone(),
+            id: row_id.to_owned(),
+            property: property.to_owned(),
+        }
+    }
+
+    /// Whether a file dropped on row `row_id`'s Blob `property` is stored there: a node table at
+    /// the head, with no write of the cell out.
+    fn takes_blob_drop(&self, row_id: &str, property: &str) -> bool {
+        // Asked for each Blob cell drawn, so it checks cheaply what `blob_write::write_refusal`
+        // checks: the column is a Blob property of the schema already. A write that refusal
+        // would stop says why when it is sent.
+        self.kind == TableKind::Node
+            && self.at_commit.is_none()
+            && (self.blob_edits.is_empty()
+                || !self
+                    .blob_edits
+                    .get(&(row_id.to_owned(), property.to_owned()))
+                    .is_some_and(BlobEdit::is_saving))
+    }
+
+    /// A drop from the file manager on a Blob cell: its one file stored there.
+    fn drop_blob_files(
+        &mut self,
+        row_id: &str,
+        property: &str,
+        paths: &[std::path::PathBuf],
+        cx: &mut Context<Self>,
+    ) {
+        match blob_write::dropped_file(paths) {
+            Ok(path) => self.upload_blob(row_id, property, path, cx),
+            Err(notice) => {
+                let key = (row_id.to_owned(), property.to_owned());
+                self.blob_edits.insert(
+                    key,
+                    BlobEdit::Failed {
+                        notice,
+                        again: None,
+                    },
+                );
+                cx.notify();
+            }
+        }
+    }
+
+    /// Stores the file at `path` in row `row_id`'s Blob `property` on the table's branch, bound
+    /// to the value the cell shows at the table's commit. After a conflict, a file dropped
+    /// again is bound to what the cell held at the head then, which the cell's notice named.
+    /// The cell shows a dot while it is out; its commit moves the table there as a cell edit's
+    /// does.
+    pub(crate) fn upload_blob(
+        &mut self,
+        row_id: &str,
+        property: &str,
+        path: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (row_id.to_owned(), property.to_owned());
+        if self.blob_edits.get(&key).is_some_and(BlobEdit::is_saving) {
+            return;
+        }
+        let cell = self.blob_cell(row_id, property);
+        let refused = |reason: String| BlobEdit::Failed {
+            notice: Notice::new(Tone::Invalid, reason),
+            again: None,
+        };
+        if let Some(reason) =
+            blob_write::write_refusal(self.schema.as_deref(), &cell, self.at_commit.as_deref())
+        {
+            self.blob_edits.insert(key, refused(reason));
+            cx.notify();
+            return;
+        }
+        let over = match self.blob_edits.get(&key) {
+            Some(BlobEdit::Failed {
+                again: Some((_, now)),
+                ..
+            }) => Some(now.clone()),
+            _ => None,
+        };
+        let shown = over
+            .clone()
+            .or_else(|| self.blobs.get(&key).and_then(Loadable::loaded).cloned());
+        let Some(shown) = shown else {
+            let reason =
+                format!("Nothing was written: Studio has not read what {property} holds yet.");
+            self.blob_edits.insert(key, refused(reason));
+            cx.notify();
+            return;
+        };
+        // A table behind its branch may not hold at its commit what a cell shows (its own
+        // write's, made over another writer's): bound to what it shows, a change since is found.
+        let read_at = if over.is_some() || self.newer {
+            None
+        } else {
+            self.paging.pinned.clone()
+        };
+        let change = BlobChange::Upload(path.clone());
+        let write = blob_write::upload(&self.session, &self.branch, cell, shown, read_at, path, cx);
+        self.blob_edits
+            .insert(key.clone(), BlobEdit::Saving(change.clone()));
+        self.saves_in_flight += 1;
+        let (session, branch) = (self.session.clone(), self.branch.clone());
+        // Detached: a write is never cancelled by closing the tab.
+        cx.spawn(async move |this, cx| {
+            let written = write.await;
+            this.update(cx, |this, cx| {
+                this.blob_written(key, &session, &branch, change, written, cx)
+            })
+            .ok();
+        })
+        .detach();
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
+    /// Lands a Blob write of the cell `key` sent on `session`'s `branch`. A commit on the one the
+    /// table shows moves it there, and the cell shows the new value; over another writer's, the
+    /// table is behind and offers Refresh. One that did not land says why on its cell.
+    fn blob_written(
+        &mut self,
+        key: (String, String),
+        session: &Entity<GraphSession>,
+        branch: &str,
+        change: BlobChange,
+        written: BlobWritten,
+        cx: &mut Context<Self>,
+    ) {
+        self.saves_in_flight = self.saves_in_flight.saturating_sub(1);
+        // The table moved to another branch or graph meanwhile; the outcome is told by its
+        // toast.
+        if !self.shows(session, branch) {
+            self.blob_edits.remove(&key);
+            self.saves_settled(cx);
+            cx.emit(ItemEvent::UpdateTab);
+            cx.notify();
+            return;
+        }
+        if let BlobWritten::Saved {
+            commit,
+            parent,
+            meta,
+        } = &written
+        {
+            if let Some(commit) = commit
+                && self
+                    .paging
+                    .advance_for_own_commit(parent.as_deref(), commit)
+            {
+                self.newer = true;
+            }
+            // A read of the cell still out would land the value replaced.
+            self.blob_tasks.remove(&key);
+            self.blobs
+                .insert(key.clone(), Loadable::Loaded(meta.clone()));
+        }
+        match BlobEdit::ended(written, change, &key.1) {
+            Some(edit) => self.blob_edits.insert(key, edit),
+            None => self.blob_edits.remove(&key),
+        };
+        self.saves_settled(cx);
+        cx.emit(ItemEvent::UpdateTab);
+        cx.notify();
+    }
+
     /// A relationship cell: the first neighbours as chips, then "+N"; "—" for none.
     fn render_relation_cell(
         &self,
@@ -6845,6 +7022,42 @@ impl TypeTable {
             }
             None => (None, relative.map(|(_, exact)| exact)),
         };
+        // A Blob cell takes a file dropped on it from the file manager, and shows the write's
+        // dot while it is out and why it did not land after.
+        let blob = column
+            .property()
+            .filter(|property| property.kind == ScalarKind::Blob)
+            .map(|property| property.name.clone());
+        // Most tables hold no Blob write; looking one up costs two keys' copies.
+        let (dot, tooltip) = match blob
+            .as_ref()
+            .filter(|_| !self.blob_edits.is_empty())
+            .and_then(|property| self.blob_edits.get(&(row.id.clone(), property.clone())))
+        {
+            Some(BlobEdit::Saving(_)) => (
+                Some(Color::Warning),
+                Some(format!("Saving to {}…", self.branch)),
+            ),
+            Some(BlobEdit::Failed { notice, again }) => (
+                Some(notice.tone.color()),
+                Some(match again {
+                    Some(_) => format!(
+                        "{} Drop the file again to write it over that.",
+                        notice.message
+                    ),
+                    None => notice.message.clone(),
+                }),
+            ),
+            None => (dot, tooltip),
+        };
+        if let Some(property) = blob.filter(|property| self.takes_blob_drop(&row.id, property)) {
+            let (row_id, drop_bg) = (row.id.clone(), studio_ui::ds::surface::drop_target(cx));
+            cell = cell
+                .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_bg))
+                .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                    this.drop_blob_files(&row_id, &property, paths.paths(), cx)
+                }));
+        }
         if is_cursor {
             cell = cell.child(ring());
         }
@@ -6932,9 +7145,9 @@ impl TypeTable {
             .into_any_element()
     }
 
-    /// The table's part of the footer strip: how much is loaded and the commit every page is
-    /// read at, then the keys that act on the cursor, as key caps (spec 002: layout, not
-    /// sentences).
+    /// The table's part of the status bar ([`Item::status`]): a page being read, or a Retry
+    /// when one could not be, and the keys that act on the cursor, which the bar's keyboard
+    /// button lists.
     fn status_parts(&self, cx: &mut Context<Self>) -> ItemStatus {
         // The status bar names only what is happening: the row count is in the toolbar, and the
         // keys are behind its keyboard button.
@@ -7026,6 +7239,11 @@ fn set_value(row: &mut Row, column: &str, value: Value) {
 
 impl Render for TypeTable {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // An edit taken from the cell (a reload kept it as a draft) leaves the cell editor
+        // focused but no longer drawn: the keys come back to the table.
+        if self.editing.is_none() && self.cell_editor.focus_handle(cx).is_focused(window) {
+            window.focus(&self.focus_handle, cx);
+        }
         // Keys typed into a field are text, not the table's: the cell editor, the filter
         // value and the bulk value alike.
         let typing = self.editing.is_some()
@@ -8967,6 +9185,151 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert!(params.contains(&"Ada B"), "{params:?}");
+    }
+
+    /// A reload under an open edit keeps it as leaving the cell would: text asking back for the
+    /// value its draft was typed over, which the row no longer shows, stays a draft. The keys
+    /// come back to the table, whose cell editor is no longer drawn.
+    #[gpui::test]
+    async fn a_reload_keeps_an_open_edit_as_leaving_it_would(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let session = session(PEOPLE, cx);
+        let (table, cx) = cx.add_window_view({
+            let session = session.clone();
+            |window, cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            }
+        });
+        cx.run_until_parked();
+        let key = DraftKey {
+            type_name: "Person".into(),
+            id: "p1".into(),
+            property: "name".into(),
+        };
+        // Typed over "Ada B"; the row shows "Ada" since.
+        session.update(cx, |session, cx| {
+            let draft = DraftEntry {
+                old: "Ada B".into(),
+                text: "Ada King".into(),
+            };
+            session.set_draft(key.clone(), draft, cx);
+        });
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            let col = table.column_index("name").unwrap();
+            table.start_edit(Cursor { row: 0, col }, window, cx);
+            table
+                .cell_editor
+                .update(cx, |editor, cx| editor.set_text("Ada B", window, cx));
+            table.reload(false, cx);
+        });
+        cx.run_until_parked();
+        session.read_with(cx, |session, _| {
+            let draft = session.draft(&key).expect("the draft stays");
+            assert_eq!(draft.text, "Ada B");
+        });
+        table.update_in(cx, |table, window, _| {
+            assert!(table.editing.is_none());
+            assert!(
+                table.focus_handle.is_focused(window),
+                "the table has the keys"
+            );
+        });
+    }
+
+    /// A file dropped on a Blob cell is stored there bound to the ETag the cell read at the
+    /// table's commit, and its commit moves the table there with the cell showing the new
+    /// value. A drop of several files, and any drop on a table held at a commit, sends nothing.
+    #[gpui::test]
+    async fn a_file_dropped_on_a_blob_cell_is_stored_bound_to_the_value_read(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = PEOPLE.replace("  name: String\n", "  name: String\n  doc: Blob?\n");
+        let (session, blobs) = crate::test_support::session_with_blobs(&schema, cx);
+        let read = blobs.set("Person/p1/doc", b"old");
+        /// The table, drawn, with its Blob cells read.
+        fn open<'a>(
+            session: &Entity<GraphSession>,
+            at_commit: Option<&str>,
+            cx: &'a mut TestAppContext,
+        ) -> (Entity<TypeTable>, &'a mut VisualTestContext) {
+            let (session, at_commit) = (session.clone(), at_commit.map(str::to_owned));
+            let (table, cx) = cx.add_window_view(|window, cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    at_commit,
+                    window,
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            cx.executor().advance_clock(BLOB_READ_AFTER);
+            cx.run_until_parked();
+            (table, cx)
+        }
+        let key = ("p1".to_owned(), "doc".to_owned());
+
+        let (held, held_cx) = open(&session, Some("c1"), cx);
+        let file = crate::test_support::upload_file("held.txt", b"held", None);
+        held.update(held_cx, |table, cx| {
+            assert!(!table.takes_blob_drop("p1", "doc"));
+            table.upload_blob("p1", "doc", file, cx);
+        });
+        held_cx.run_until_parked();
+        assert!(blobs.writes.lock().unwrap().is_empty());
+        held.read_with(held_cx, |table, _| {
+            assert!(matches!(
+                &table.blob_edits[&key],
+                BlobEdit::Failed { notice, .. } if notice.message.starts_with("Read-only")
+            ));
+        });
+
+        let (table, cx) = open(&session, None, cx);
+        table.update(cx, |table, cx| {
+            assert!(table.takes_blob_drop("p1", "doc"));
+            table.drop_blob_files("p1", "doc", &["a.txt".into(), "b.txt".into()], cx);
+        });
+        assert!(blobs.writes.lock().unwrap().is_empty());
+        let file = crate::test_support::upload_file("scan.txt", b"a new scan", None);
+        table.update(cx, |table, cx| {
+            table.drop_blob_files("p1", "doc", &[file], cx);
+            assert!(table.blob_edits[&key].is_saving(), "its dot shows");
+            assert_eq!(table.saves_in_flight, 1);
+        });
+        cx.run_until_parked();
+        let writes = blobs.writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].if_match.as_deref(), Some(read.as_str()));
+        let stored = blobs.get("Person/p1/doc").unwrap();
+        assert_eq!(stored.0, b"a new scan");
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.paging.pinned.as_deref(), Some("c2"), "its own commit");
+            assert!(!table.newer && table.saves_in_flight == 0);
+            assert!(!table.blob_edits.contains_key(&key));
+            assert_eq!(
+                table.blobs[&key],
+                Loadable::Loaded(BlobMeta::Managed {
+                    size: 10,
+                    etag: Some(stored.1.clone())
+                })
+            );
+        });
     }
 
     /// Naming a type's nodes otherwise keeps a table where it is, at its commit with a cell

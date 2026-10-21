@@ -1416,6 +1416,7 @@ mod tests {
                     expected: "c1".into(),
                     actual: Some("c2".into()),
                 }),
+                blob_precondition_failure: None,
                 diagnostic: None,
                 other: Map::new(),
             },

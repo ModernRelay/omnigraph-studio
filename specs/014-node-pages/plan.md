@@ -89,7 +89,8 @@ Four parts, built in this order; each lands on its own.
 - **The page**, top to bottom: the type mark, the node's label and `#id`, the commit and
   branch, "Newer data · Refresh"; the actions Explore (G), Open in table, Delete; the
   properties, each a labelled field with its `@description` as help; long text and markdown at
-  full height; Blobs with Open and Save; every relationship as a section with its count, read
+  full height; Blobs with Open and Save, and Choose File…, a file dropped on one, and Clear, as
+  spec 004 stores and clears a value; every relationship as a section with its count, read
   in pages of 50 (IX), with "Show more"; for an edge, its endpoints and properties. Back and
   Forward walk pages as any tab.
 - **Keys, the same on every surface**:

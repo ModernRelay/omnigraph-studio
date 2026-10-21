@@ -5,6 +5,7 @@
 
 mod blob;
 mod blob_view;
+mod blob_write;
 mod dialogs;
 mod grouping;
 mod model;

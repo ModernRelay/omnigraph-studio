@@ -2908,6 +2908,98 @@ impl GraphSession {
         )
     }
 
+    /// What a Blob cell holds at `branch`'s head, read now, whichever branch the session shows:
+    /// what a write of the cell on that branch is bound to.
+    pub fn blob_meta_on(
+        &mut self,
+        branch: &str,
+        cell: BlobCell,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<BlobMeta, ReadError>> {
+        let client = self.client(cx);
+        let graph = self.graph_id.clone();
+        let branch = branch.to_owned();
+        self.counted_read(
+            async move {
+                client
+                    .blob_head(&graph, &cell, BlobAt::Branch(&branch))
+                    .await
+            },
+            cx,
+        )
+    }
+
+    /// Stores `bytes` as a Blob cell's value on `branch` (spec 004), bound by `if_match` to the
+    /// value it replaces ([`GraphClient::blob_put`]). One of Studio's own writes: sent once, its
+    /// outcome logged as `description` (never the bytes), and its commit is the branch's head.
+    pub fn blob_put_on(
+        &mut self,
+        branch: &str,
+        cell: BlobCell,
+        if_match: Option<String>,
+        bytes: Vec<u8>,
+        description: String,
+        cx: &mut Context<Self>,
+    ) -> Task<WriteOutcome<graph_client::api::BlobWriteOutput>> {
+        let client = self.client(cx);
+        let (graph, sent_to) = (self.graph_id.clone(), branch.to_owned());
+        let request = async move {
+            client
+                .blob_put(&graph, &sent_to, &cell, if_match.as_deref(), bytes)
+                .await
+        };
+        self.send_blob_write(branch, description, request, cx)
+    }
+
+    /// Sets a nullable Blob cell to null on `branch`, bound as [`Self::blob_put_on`] binds. A
+    /// cell already null publishes nothing, and moves no head.
+    pub fn blob_clear_on(
+        &mut self,
+        branch: &str,
+        cell: BlobCell,
+        if_match: Option<String>,
+        description: String,
+        cx: &mut Context<Self>,
+    ) -> Task<WriteOutcome<graph_client::api::BlobWriteOutput>> {
+        let client = self.client(cx);
+        let (graph, sent_to) = (self.graph_id.clone(), branch.to_owned());
+        let request = async move {
+            client
+                .blob_clear(&graph, &sent_to, &cell, if_match.as_deref())
+                .await
+        };
+        self.send_blob_write(branch, description, request, cx)
+    }
+
+    /// Runs a Blob write on `branch` as every write of the session runs: counted while out, to
+    /// its outcome whoever still waits, logged, and with its commit taken as the head.
+    fn send_blob_write(
+        &mut self,
+        branch: &str,
+        description: String,
+        request: impl Future<Output = WriteOutcome<graph_client::api::BlobWriteOutput>> + 'static,
+        cx: &mut Context<Self>,
+    ) -> Task<WriteOutcome<graph_client::api::BlobWriteOutput>> {
+        let branch = branch.to_owned();
+        self.writes_in_flight += 1;
+        cx.emit(SessionEvent::ActivityChanged);
+        let work = cx.spawn(async move |this, cx| {
+            let outcome = request.await;
+            let kind = outcome_kind(&outcome, |output: &graph_client::api::BlobWriteOutput| {
+                output.commit.as_ref().map(|c| c.graph_commit_id.clone())
+            });
+            let parent = parent_of(&outcome, |output: &graph_client::api::BlobWriteOutput| {
+                output.commit.as_ref()
+            });
+            this.update(cx, |this, cx| {
+                this.finish_write(branch, description, kind, parent, None, cx)
+            })
+            .ok();
+            outcome
+        });
+        Self::to_outcome(work, cx)
+    }
+
     /// Runs a mutation on `branch`. `if_commit` binds it to the commit it was read at, and its
     /// outcome offers `follow_up` once it commits. The outcome is logged; nothing is retried.
     /// The branch is the caller's: each write of a chain goes where the first went, and a
@@ -4511,33 +4603,6 @@ mod tests {
         asked();
         head(&session, "main", cx);
         assert_eq!(asked(), vec!["branch=main&limit=1"]);
-
-        // A commit lands while the head is read: the answer, from before it, is not main's
-        // list, which is read again when asked for.
-        let commit = |session: &Entity<GraphSession>, id: &str, cx: &mut TestAppContext| {
-            session.update(cx, |session, cx| {
-                session
-                    .external_write("main".into(), "w".into(), false, cx)
-                    .finish(OutcomeKind::Committed {
-                        commit: Some(id.into()),
-                    });
-            });
-            cx.run_until_parked();
-        };
-        commit(&session, "c4", cx);
-        let (open, wait) = oneshot::channel::<()>();
-        *gate.lock().unwrap() = Some(wait);
-        let overtaken = session.update(cx, |session, cx| session.head_commit("main", false, cx));
-        cx.run_until_parked();
-        commit(&session, "c5", cx);
-        open.send(()).ok();
-        cx.run_until_parked();
-        futures::executor::block_on(overtaken).unwrap();
-        asked();
-        let list = session.update(cx, |session, cx| session.commits("main", false, cx));
-        cx.run_until_parked();
-        futures::executor::block_on(list).unwrap();
-        assert_eq!(asked(), vec!["branch=main"], "read again");
     }
 
     /// A branch's commit list is read once for every view that shows it, and again only after

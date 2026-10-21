@@ -15,7 +15,7 @@ use serde_json::Value;
 use url::Url;
 
 use crate::api::{
-    BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
+    BlobWriteOutput, BranchCreateOutput, BranchCreateRequest, BranchListOutput, BranchMergeOutput,
     BranchMergeRequest, ChangeFeedOutput, ChangeOutput, ChangeRequest, CommitListOutput,
     DiffOutput, ErrorOutput, GraphListResponse, HealthOutput, InvokeStoredQueryRequest,
     MergeBaseOutput, QueriesCatalogOutput, QueryRequest, ReadOutput, ReadinessOutput, SchemaOutput,
@@ -429,7 +429,12 @@ impl GraphClient {
         if let Some(token) = self.token() {
             builder = builder.header("authorization", format!("Bearer {token}"));
         }
-        if body.is_some() {
+        // A body is JSON unless the caller names its type: a Blob put's is raw bytes.
+        if body.is_some()
+            && !headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        {
             builder = builder.header("content-type", "application/json");
         }
         for (name, value) in headers {
@@ -661,6 +666,57 @@ impl GraphClient {
                 diagnostic: None,
             })),
             _ => Err(ReadError::Refused(summary(raw.status, &raw.body))),
+        }
+    }
+
+    /// `PUT /graphs/{id}/blob`: stores `bytes` as the cell's value on `branch`, sent once like
+    /// every write. `if_match` binds it to the value it replaces: that value's ETag, or `*` for
+    /// any value at all. A cell read as null has no validator, so its put goes unbound. When the
+    /// binding no longer holds the server changes nothing and refuses with 412, its
+    /// `blob_precondition_failure` naming the cell's current ETag. Once the server admits the
+    /// write it finishes it: a response lost after that leaves the outcome unknown.
+    pub async fn blob_put(
+        &self,
+        graph: &str,
+        branch: &str,
+        cell: &BlobCell,
+        if_match: Option<&str>,
+        bytes: Vec<u8>,
+    ) -> WriteOutcome<BlobWriteOutput> {
+        let url = self.blob_url(graph, cell, BlobAt::Branch(branch));
+        let mut headers = vec![("content-type", "application/octet-stream")];
+        headers.extend(if_match.map(|tag| ("if-match", tag)));
+        self.send_blob_write(Method::PUT, url, Some(bytes), &headers)
+            .await
+    }
+
+    /// `DELETE /graphs/{id}/blob`: sets a nullable cell to null on `branch`, bound by `if_match`
+    /// as [`Self::blob_put`] is. A cell that was already null publishes nothing: its receipt has
+    /// no commit.
+    pub async fn blob_clear(
+        &self,
+        graph: &str,
+        branch: &str,
+        cell: &BlobCell,
+        if_match: Option<&str>,
+    ) -> WriteOutcome<BlobWriteOutput> {
+        let url = self.blob_url(graph, cell, BlobAt::Branch(branch));
+        let headers: Vec<(&str, &str)> =
+            if_match.map(|tag| ("if-match", tag)).into_iter().collect();
+        self.send_blob_write(Method::DELETE, url, None, &headers)
+            .await
+    }
+
+    async fn send_blob_write(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<Vec<u8>>,
+        headers: &[(&str, &str)],
+    ) -> WriteOutcome<BlobWriteOutput> {
+        match self.send(method, url, body, headers, WRITE_TIMEOUT).await {
+            Ok(raw) => classify_write(raw),
+            Err(reason) => WriteOutcome::Unknown { reason },
         }
     }
 
@@ -2013,6 +2069,149 @@ mod tests {
         assert!(matches!(
             block_on(client.blob_bytes("g", &cell("gone"), at, 40..44)),
             Err(ReadError::Refused(e)) if e.message == "no Note with id gone at this commit"
+        ));
+    }
+
+    /// One Blob write as the server saw it: method, query, every `content-type`, the
+    /// `If-Match`, and the body.
+    type BlobWriteSeen = (String, String, Vec<String>, Option<String>, Vec<u8>);
+
+    /// A server for Blob writes: answers each with `status` and `body`, contract header and
+    /// all, and records what it was sent.
+    fn blob_write_server(
+        status: u16,
+        body: &'static str,
+    ) -> (
+        Arc<dyn HttpClient>,
+        Arc<std::sync::Mutex<Vec<BlobWriteSeen>>>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let log = log.clone();
+            async move {
+                let method = request.method().to_string();
+                let query = request.uri().query().unwrap_or_default().to_owned();
+                let types = request
+                    .headers()
+                    .get_all("content-type")
+                    .iter()
+                    .filter_map(|value| value.to_str().ok().map(str::to_owned))
+                    .collect();
+                let if_match = request
+                    .headers()
+                    .get("if-match")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let mut bytes = Vec::new();
+                request.into_body().read_to_end(&mut bytes).await.unwrap();
+                log.lock()
+                    .unwrap()
+                    .push((method, query, types, if_match, bytes));
+                Ok(Response::builder()
+                    .status(status)
+                    .header(CONTRACT_HEADER, "0.13")
+                    .body(AsyncBody::from(body))
+                    .unwrap())
+            }
+        });
+        (http, seen)
+    }
+
+    const BLOB_PUT: &str = r#"{"selector":{"entity":"node","type":"Note","id":"n1","property":"attachment"},"branch":"main","kind":"managed","size":3,"etag":"\"e2\"","commit":{"graph_commit_id":"c2","graph_manifest_version":2,"created_at":0,"parent_commit_id":"c1","kind":"published"}}"#;
+
+    /// A put sends the bytes once, as raw bytes on the branch, bound to the ETag it was given;
+    /// its receipt names the commit and the new value.
+    #[test]
+    fn a_blob_put_sends_raw_bytes_bound_to_the_etag_read() {
+        let (http, seen) = blob_write_server(200, BLOB_PUT);
+        let client = client(http);
+        let outcome =
+            block_on(client.blob_put("g", "feature/x", &cell("n1"), Some("\"e1\""), vec![1, 2, 3]));
+        let WriteOutcome::Committed(receipt) = outcome else {
+            panic!("committed: {outcome:?}");
+        };
+        assert_eq!(receipt.commit.unwrap().graph_commit_id, "c2");
+        assert_eq!(
+            (receipt.kind, receipt.size, receipt.etag.as_deref()),
+            (crate::api::BlobWriteState::Managed, Some(3), Some("\"e2\""))
+        );
+        let (method, query, types, if_match, body) = seen.lock().unwrap().remove(0);
+        assert_eq!(method, "PUT");
+        assert_eq!(
+            query,
+            "entity=node&type=Note&id=n1&property=attachment&branch=feature%2Fx"
+        );
+        assert_eq!(types, ["application/octet-stream"], "one type, not JSON");
+        assert_eq!(if_match.as_deref(), Some("\"e1\""));
+        assert_eq!(body, [1, 2, 3]);
+    }
+
+    /// A clear goes unbound when given no ETag, and a cell already null publishes nothing.
+    #[test]
+    fn a_blob_clear_of_a_null_cell_commits_nothing() {
+        let receipt = r#"{"selector":{"entity":"edge","type":"Cites","id":"e9","property":"scan"},"branch":"main","kind":"null","commit":null}"#;
+        let (http, seen) = blob_write_server(200, receipt);
+        let client = client(http);
+        let mut edge = cell("e9");
+        edge.edge = true;
+        let outcome = block_on(client.blob_clear("g", "main", &edge, None));
+        assert!(
+            matches!(&outcome, WriteOutcome::Committed(receipt) if receipt.commit.is_none()),
+            "{outcome:?}"
+        );
+        let (method, query, types, if_match, body) = seen.lock().unwrap().remove(0);
+        assert_eq!(method, "DELETE");
+        assert!(query.starts_with("entity=edge&"), "{query}");
+        assert!(types.is_empty() && if_match.is_none() && body.is_empty());
+    }
+
+    /// A value changed since it was read refuses the write with 412, and the refusal names
+    /// the cell's current ETag; nothing is sent again.
+    #[test]
+    fn a_changed_blob_refuses_the_write_with_its_current_etag() {
+        let changed = r#"{"error":"If-Match did not hold for Note.attachment","blob_precondition_failure":{"current_etag":"\"e3\""}}"#;
+        let (http, seen) = blob_write_server(412, changed);
+        let outcome = block_on(client(http).blob_put(
+            "g",
+            "main",
+            &cell("n1"),
+            Some("\"e1\""),
+            b"new".to_vec(),
+        ));
+        match outcome {
+            WriteOutcome::Refused(error) => {
+                assert_eq!(error.status, 412);
+                let failure = error.body.blob_precondition_failure.unwrap();
+                assert_eq!(failure.current_etag.as_deref(), Some("\"e3\""));
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(seen.lock().unwrap().len(), 1, "sent once");
+    }
+
+    /// A put whose answer is lost, or comes back without the server's contract header or as a
+    /// gateway's error, is unknown: it may have been stored.
+    #[test]
+    fn a_blob_put_without_the_servers_answer_is_unknown() {
+        let lost: Arc<dyn HttpClient> =
+            FakeHttpClient::create(|_| async { Err(anyhow::anyhow!("connection reset")) });
+        let put = |http: Arc<dyn HttpClient>| {
+            block_on(client(http).blob_put("g", "main", &cell("n1"), None, vec![0; 4]))
+        };
+        assert!(matches!(put(lost), WriteOutcome::Unknown { .. }));
+        assert!(matches!(
+            put(respond(200, None, BLOB_PUT)),
+            WriteOutcome::Unknown { .. }
+        ));
+        assert!(matches!(
+            put(respond(502, None, "bad gateway")),
+            WriteOutcome::Unknown { .. }
+        ));
+        // Too large for the server is its refusal: nothing was stored.
+        assert!(matches!(
+            put(respond(413, Some("0.13"), r#"{"error":"Blob put exceeds 1048576 bytes"}"#)),
+            WriteOutcome::Refused(error) if error.status == 413
         ));
     }
 
