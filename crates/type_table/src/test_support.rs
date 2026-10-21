@@ -371,6 +371,8 @@ pub(crate) struct Blobs {
     /// How many commits Blob writes published.
     published: Mutex<u64>,
     tags: std::sync::atomic::AtomicU64,
+    /// A gate the next Blob write waits at before it is answered, once one is set.
+    pub(crate) hold: Mutex<Option<futures::channel::oneshot::Receiver<()>>>,
 }
 
 impl Blobs {
@@ -555,6 +557,10 @@ fn serve_blobs(
                 let mut body = Vec::new();
                 request.into_body().read_to_end(&mut body).await.ok();
                 let write = !matches!(method.as_str(), "HEAD" | "GET");
+                let gate = write.then(|| blobs.hold.lock().unwrap().take()).flatten();
+                if let Some(gate) = gate {
+                    gate.await.ok();
+                }
                 let (status, headers, body) =
                     blobs.answer(&method, &query, range.as_deref(), if_match.as_deref(), body);
                 let lost = write && blobs.lose_answers.load(std::sync::atomic::Ordering::SeqCst);

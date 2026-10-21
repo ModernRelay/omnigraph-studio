@@ -712,6 +712,9 @@ impl TypeTable {
                 self.branch = self.session.read(cx).branch.clone();
                 // A Refresh asked for on the branch left reads nothing here.
                 self._refresh = None;
+                // A file still being stored goes on to the branch left, and its toast tells how
+                // it ended; the new branch's cells show none of it.
+                self.blob_edits.clear();
                 // The branch's own drafts show; the other's wait in the session.
                 self.cells.clear();
                 self.draft_notices.clear();
@@ -9411,6 +9414,60 @@ mod tests {
                     etag: Some(stored.1.clone())
                 })
             );
+        });
+    }
+
+    /// A file still being stored when the table moves to another branch goes on to the branch
+    /// left: the new branch's cell does not show it as going and takes a file of its own, and
+    /// the write's landing changes nothing there.
+    #[gpui::test]
+    async fn a_blob_write_out_stays_with_the_branch_left(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        let schema = PEOPLE.replace("  name: String\n", "  name: String\n  doc: Blob?\n");
+        let (session, blobs) = crate::test_support::session_with_blobs(&schema, cx);
+        blobs.set("Person/p1/doc", b"old");
+        let (table, cx) = cx.add_window_view({
+            let session = session.clone();
+            |window, cx| {
+                TypeTable::new(
+                    WeakEntity::new_invalid(),
+                    session,
+                    "Person".into(),
+                    None,
+                    window,
+                    cx,
+                )
+            }
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(BLOB_READ_AFTER);
+        cx.run_until_parked();
+        let (open, gate) = futures::channel::oneshot::channel();
+        *blobs.hold.lock().unwrap() = Some(gate);
+        let key = ("p1".to_owned(), "doc".to_owned());
+        let file = crate::test_support::upload_file("scan.txt", b"a new scan", None);
+        table.update(cx, |table, cx| table.upload_blob("p1", "doc", file, cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| assert!(table.blob_edits[&key].is_saving()));
+
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.branch, "fix");
+            assert!(table.blob_edits.is_empty(), "not shown on fix");
+            assert!(table.takes_blob_drop("p1", "doc"));
+        });
+        open.send(()).ok();
+        cx.run_until_parked();
+        let writes = blobs.writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].branch, "main", "it went to the branch left");
+        table.read_with(cx, |table, _| {
+            assert!(table.blob_edits.is_empty());
+            assert_eq!(table.saves_in_flight, 0);
         });
     }
 

@@ -368,8 +368,18 @@ async fn bind(
             ),
         ))
     };
+    let unbound = || {
+        BlobWritten::Refused(Notice::new(
+            Tone::Refused,
+            format!(
+                "Nothing was written: the server named no version of what {} holds, so the \
+                 write could not be bound to it.",
+                cell.property
+            ),
+        ))
+    };
     let read = match (shown, read_at) {
-        (BlobMeta::Managed { .. }, None) => return Ok(Some(validator(shown))),
+        (BlobMeta::Managed { .. }, None) => return validator(shown).map(Some).ok_or_else(unbound),
         (BlobMeta::Managed { .. }, Some(commit)) => session.update(cx, |session, cx| {
             session.blob_meta(cell.clone(), Some(commit.to_owned()), cx)
         }),
@@ -379,10 +389,10 @@ async fn bind(
     };
     let found = read.await.map_err(unread)?;
     if same_value(&found, shown) {
-        return Ok(match &found {
-            BlobMeta::Null => None,
-            _ => Some(validator(&found)),
-        });
+        return match &found {
+            BlobMeta::Null => Ok(None),
+            _ => validator(&found).map(Some).ok_or_else(unbound),
+        };
     }
     // Read at the view's commit, the value is not the one shown there: what the head holds is
     // what a change would replace.
@@ -393,13 +403,13 @@ async fn bind(
     Err(BlobWritten::Changed { now })
 }
 
-/// What binds a write to a value that is not null: its ETag, or `*` (any value) without one.
-fn validator(meta: &BlobMeta) -> String {
+/// What binds a write to a value that is not null: a managed value's ETag, or `*` (any value)
+/// for a reference, which has none. `None` for a managed value the server named no ETag for:
+/// bound to `*`, the write would replace whatever value is there.
+fn validator(meta: &BlobMeta) -> Option<String> {
     match meta {
-        BlobMeta::Managed {
-            etag: Some(etag), ..
-        } => etag.clone(),
-        _ => "*".into(),
+        BlobMeta::Managed { etag, .. } => etag.clone(),
+        _ => Some("*".into()),
     }
 }
 
@@ -598,6 +608,31 @@ mod tests {
         assert!(read_upload(&dir).err().unwrap().ends_with("is a folder."));
         assert!(read_upload(&dir.join("gone")).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A managed value the server named no ETag for is not written over: bound to `*`, the write
+    /// would replace whatever value is there.
+    #[gpui::test]
+    async fn a_value_without_its_etag_is_not_written_over(cx: &mut gpui::TestAppContext) {
+        let (session, blobs) = crate::test_support::session_with_blobs(NOTES, cx);
+        let shown = BlobMeta::Managed {
+            size: 3,
+            etag: None,
+        };
+        let write = cx.update(|cx| clear(&session, "main", cell(false), shown, None, cx));
+        cx.run_until_parked();
+        let written = futures::executor::block_on(write);
+        let BlobWritten::Refused(notice) = written else {
+            panic!("refused");
+        };
+        assert!(
+            notice
+                .message
+                .starts_with("Nothing was written: the server named no version"),
+            "{}",
+            notice.message
+        );
+        assert!(blobs.writes.lock().unwrap().is_empty(), "nothing was sent");
     }
 
     /// A conflict offers the change again over what the cell holds now; a clear of a value

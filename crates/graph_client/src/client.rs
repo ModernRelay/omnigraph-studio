@@ -552,7 +552,8 @@ impl GraphClient {
 
     /// `HEAD /graphs/{id}/blob`: what a cell holds, without its bytes. The server answers a null
     /// cell and a missing row alike with 404; callers ask about rows they have read, so a 404
-    /// is null.
+    /// is null. Every answer must carry the contract header: a 404 or a redirect from something
+    /// between Studio and the server says nothing about the cell, and a write is bound by it.
     pub async fn blob_head(
         &self,
         graph: &str,
@@ -578,11 +579,17 @@ impl GraphClient {
                     etag: header("etag"),
                 })
             }
-            301 | 302 | 303 | 307 | 308 => match header("location") {
-                Some(uri) => Ok(BlobMeta::External { uri }),
-                None => Err(ReadError::Decode("a redirect without a location".into())),
-            },
-            404 => Ok(BlobMeta::Null),
+            301 | 302 | 303 | 307 | 308 => {
+                check_contract(&raw)?;
+                match header("location") {
+                    Some(uri) => Ok(BlobMeta::External { uri }),
+                    None => Err(ReadError::Decode("a redirect without a location".into())),
+                }
+            }
+            404 => {
+                check_contract(&raw)?;
+                Ok(BlobMeta::Null)
+            }
             _ => Err(ReadError::Refused(summary(raw.status, &raw.body))),
         }
     }
@@ -1706,6 +1713,41 @@ mod tests {
         assert!(matches!(outcome, WriteOutcome::Unknown { .. }));
     }
 
+    /// A Blob cell is null, or a reference, only by the server's word: a 404 or a redirect
+    /// without the contract header comes from something in between.
+    #[test]
+    fn a_blob_cell_is_null_only_by_the_servers_answer() {
+        let cell = BlobCell {
+            edge: false,
+            type_name: "Doc".into(),
+            id: "d1".into(),
+            property: "file".into(),
+        };
+        let head = |contract| {
+            block_on(client(respond(404, contract, "")).blob_head(
+                "g",
+                &cell,
+                BlobAt::Branch("main"),
+            ))
+        };
+        assert_eq!(head(Some(CONTRACT)).unwrap(), BlobMeta::Null);
+        assert!(matches!(
+            head(None),
+            Err(ReadError::ContractMismatch { served: None })
+        ));
+        let redirect = FakeHttpClient::create(|_| async {
+            Ok(Response::builder()
+                .status(302)
+                .header("location", "s3://bucket/doc.pdf")
+                .body(AsyncBody::empty())
+                .unwrap())
+        });
+        assert!(matches!(
+            block_on(client(redirect).blob_head("g", &cell, BlobAt::Branch("main"))),
+            Err(ReadError::ContractMismatch { served: None })
+        ));
+    }
+
     #[test]
     fn a_read_checks_the_contract() {
         let result =
@@ -1911,8 +1953,7 @@ mod tests {
                             .body(AsyncBody::from(vec![2u8, 3, 4]))
                     }
                 } else if url.contains("id=external") {
-                    Response::builder()
-                        .status(302)
+                    ok().status(302)
                         .header("location", "s3://bucket/report.pdf")
                         .body(AsyncBody::empty())
                 } else if url.contains("id=gone") {
@@ -1920,7 +1961,7 @@ mod tests {
                         r#"{"error":"no Note with id gone at this commit"}"#,
                     ))
                 } else {
-                    Response::builder().status(404).body(AsyncBody::empty())
+                    ok().status(404).body(AsyncBody::empty())
                 };
                 Ok(response.unwrap())
             }

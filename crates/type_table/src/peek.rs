@@ -460,6 +460,13 @@ impl NodePeek {
                 && session.read(cx).branch != this.branch
             {
                 this.branch = session.read(cx).branch.clone();
+                // A file still being stored goes on to the branch left, and its toast tells how
+                // it ended: the new branch's values show none of it, and its head moves are
+                // compared again.
+                this.saving.clear();
+                for slot in &mut this.blobs {
+                    slot.edit = None;
+                }
                 this.edits.clear();
                 this.adding = None;
                 this.removing = None;
@@ -6326,6 +6333,35 @@ mod tests {
         });
         cx.run_until_parked();
         (view, session, blobs, cx)
+    }
+
+    /// A file still being stored when the view moves to another branch goes on to the branch
+    /// left: the new branch's slot does not show it as going, the view compares the new
+    /// branch's head moves again, and the write's landing changes nothing there.
+    #[gpui::test]
+    async fn a_blob_write_out_stays_with_the_branch_left(cx: &mut TestAppContext) {
+        let (view, session, blobs, cx) = page_with_doc(Some(b"old"), None, cx);
+        let (open, gate) = futures::channel::oneshot::channel();
+        *blobs.hold.lock().unwrap() = Some(gate);
+        let file = crate::test_support::upload_file("notes.txt", b"new notes", None);
+        view.update(cx, |view, cx| view.upload_blob("doc", file, cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.saving.contains("doc")));
+
+        session.update(cx, |session, cx| session.set_branch("fix".into(), cx));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.branch, "fix");
+            assert!(view.saving.is_empty(), "nothing of fix is being saved");
+            assert_eq!(view.blobs[0].edit, None);
+        });
+        open.send(()).ok();
+        cx.run_until_parked();
+        assert_eq!(blobs.writes.lock().unwrap()[0].branch, "main");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.blobs[0].edit, None);
+            assert!(view.saving.is_empty());
+        });
     }
 
     /// A file stored in a slot is bound to the ETag the slot read, sent once to the view's
