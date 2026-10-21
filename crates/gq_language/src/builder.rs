@@ -1528,42 +1528,9 @@ fn traversal_clause(group: &RelationshipGroup, edge_var: Option<&str>) -> String
     oriented(group.direction, "$n", &edge, "$m")
 }
 
-/// How many neighbours a node has through one relationship group (spec 005).
-pub fn degree(
-    schema: &SchemaModel,
-    node_type: &str,
-    group: &RelationshipGroup,
-    id: &str,
-) -> Result<BuiltQuery, BuildError> {
-    let node = node(schema, node_type)?;
-    schema
-        .edge(&group.edge)
-        .ok_or_else(|| BuildError::UnknownEdge(group.edge.clone()))?;
-    let depends = Depends::EdgesAt {
-        edge: group.edge.clone(),
-        nodes: vec![id.to_owned()],
-        listed: None,
-    };
-    let mut params = Params::new();
-    let id = params.add("id", "String", Value::String(id.to_owned()));
-    let text = format!(
-        "query studio_degree({sig}) {{\n  match {{\n    $n: {ty}\n    $n.@id = {id}\n    {traversal}\n  }}\n  return {{ count($m) as n }}\n}}\n",
-        sig = params.signature(),
-        ty = node.name,
-        traversal = traversal_clause(group, None),
-    );
-    Ok(BuiltQuery {
-        name: "studio_degree".into(),
-        text,
-        params: params.values,
-        depends,
-        seeds: None,
-    })
-}
-
-/// How many edges a node has through one relationship group: more than [`degree`]'s
-/// neighbours when two edges reach one of them (a person rehired by one company). The peek
-/// lists every edge, so each can be removed, and counts them so. Column: `n`.
+/// How many edges a node has through one relationship group: more than its neighbours when
+/// two edges reach one of them (a person rehired by one company). The peek lists every edge,
+/// so each can be removed, and counts them so. Column: `n`.
 pub fn edge_degree(
     schema: &SchemaModel,
     node_type: &str,
@@ -2798,7 +2765,7 @@ mod tests {
             let queries = [
                 node_page(&schema, "Person", &[has_any(&key)], None, &start, 10).unwrap(),
                 neighbour_counts(&schema, "Person", &[], &key, 10).unwrap(),
-                degree(&schema, "Person", &out, "p1").unwrap(),
+                edge_degree(&schema, "Person", &out, "p1").unwrap(),
                 edge_page(&schema, edge, &[], None, &start, 10).unwrap(),
             ];
             for query in &queries {
@@ -3602,7 +3569,6 @@ mod tests {
     fn relationship_queries_compile_in_both_directions() {
         let schema = dev();
         for group in schema.relationships_of("Person") {
-            assert_compiles(&degree(&schema, "Person", group, "person-000000").unwrap());
             let page = neighbours(
                 &schema,
                 "Person",
