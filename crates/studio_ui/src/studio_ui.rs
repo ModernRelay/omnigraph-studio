@@ -167,6 +167,29 @@ pub fn format_value(value: &Value) -> String {
     }
 }
 
+/// The icon a header cell shows for a JSON value's kind, as the type table picks a property's
+/// by what it holds: text, a number, a truth value, a time (a string that starts as an ISO
+/// date), a list by its first item.
+pub fn value_icon(value: &Value) -> IconName {
+    match value {
+        Value::Number(_) => IconName::Hash,
+        Value::Bool(_) => IconName::Check,
+        Value::String(text) if is_iso_date(text) => IconName::Clock,
+        Value::Array(items) => items.first().map_or(IconName::CaseSensitive, value_icon),
+        _ => IconName::CaseSensitive,
+    }
+}
+
+/// Whether `text` starts with a `YYYY-MM-DD` date.
+fn is_iso_date(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() >= 10
+        && bytes[..10].iter().enumerate().all(|(at, byte)| match at {
+            4 | 7 => *byte == b'-',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
 /// Whether a value is a number, for right alignment.
 pub fn is_numeric(value: &Value) -> bool {
     matches!(value, Value::Number(_))
@@ -332,5 +355,19 @@ mod tests {
             "person-1"
         );
         assert_eq!(format_value(&json!(42)), "42");
+    }
+
+    /// A header cell's icon follows what a value holds, as the type table's does by kind.
+    #[test]
+    fn values_pick_their_kind_icon() {
+        let icon = |value: Value| value_icon(&value);
+        assert!(icon(json!(3)) == IconName::Hash);
+        assert!(icon(json!(true)) == IconName::Check);
+        assert!(icon(json!("1985-01-11")) == IconName::Clock);
+        assert!(icon(json!("2026-10-21T08:00:00Z")) == IconName::Clock);
+        assert!(icon(json!("Radia Knuth")) == IconName::CaseSensitive);
+        assert!(icon(json!("1985-1-11")) == IconName::CaseSensitive);
+        assert!(icon(json!([1, 2])) == IconName::Hash);
+        assert!(icon(json!(null)) == IconName::CaseSensitive);
     }
 }

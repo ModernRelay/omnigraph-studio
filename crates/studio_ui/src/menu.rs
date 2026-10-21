@@ -1515,8 +1515,8 @@ pub fn menu_header(title: SharedString) -> Div {
 type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 type HoverHandler = Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>;
 
-/// One row of a menu or a picker (the command palette): [`size::MENU_ROW`] high unless set,
-/// inset [`space::MD`], rounded within the card's corner. A hovered row and the
+/// One row of a menu or a picker (the command palette): [`size::MENU_ROW`] high and inset
+/// [`space::MD`] unless set, rounded within the card's corner. A hovered row and the
 /// keyboard-highlighted one take the highlight fill, a pressed one the pressed fill; a
 /// disabled row neither. It reports its role, label, shortcut and state to assistive
 /// technology as Zed's list item does.
@@ -1525,6 +1525,7 @@ pub struct MenuRow {
     id: ElementId,
     height: f32,
     radius: Option<f32>,
+    inset: f32,
     disabled: bool,
     selected: bool,
     role: Option<Role>,
@@ -1545,6 +1546,7 @@ impl MenuRow {
             id: id.into(),
             height: size::MENU_ROW,
             radius: None,
+            inset: space::MD,
             disabled: false,
             selected: false,
             role: None,
@@ -1569,6 +1571,14 @@ impl MenuRow {
     /// The corner, for a row in a card other than a menu's: the card's radius less its inset.
     pub fn radius(mut self, radius: f32) -> Self {
         self.radius = Some(radius);
+        self
+    }
+
+    /// The space between the row's fill and its content either side, for a row led by an
+    /// icon tile: half the row's height less the tile's, so the tile sits as far in from the
+    /// fill's side as from its top.
+    pub fn inset(mut self, inset: f32) -> Self {
+        self.inset = inset;
         self
     }
 
@@ -1647,7 +1657,7 @@ impl RenderOnce for MenuRow {
             .relative()
             .w_full()
             .min_h(px(self.height))
-            .px(px(space::MD))
+            .px(px(self.inset))
             .gap(px(space::MD))
             .rounded(px(self.radius.unwrap_or_else(|| radii(cx).menu_item())))
             .when_some(self.role, |this, role| {

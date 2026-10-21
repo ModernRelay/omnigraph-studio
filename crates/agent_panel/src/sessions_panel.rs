@@ -19,7 +19,7 @@ use gpui::{
     IntoElement, ListAlignment, ListState, ParentElement, Render, SharedString, Styled,
     Subscription, WeakEntity, Window, div, list,
 };
-use studio_actions::agent::{NewConversation, OpenConversation};
+use studio_actions::agent::{NewConversation, OpenAgent, OpenConversation};
 use studio_settings::StudioSettings;
 use studio_ui::ds;
 use studio_ui::ds::Prose as _;
@@ -656,19 +656,13 @@ impl SessionsPanel {
                     this.toggle_search(window, cx);
                 }))
                 .into_any_element(),
-            // Its words are made as it draws: the shortcut they name follows the keymap.
             ListRow::Note(Note::NoMatch) => {
                 ds::sidebar_note("No conversation matches.").into_any_element()
             }
-            ListRow::Note(Note::NoConversations) => ds::sidebar_note(
-                match studio_ui::shortcut_text(&studio_actions::agent::OpenAgent, cx) {
-                    Some(keys) => {
-                        format!("No conversations yet. Ask the agent from the Agent tab ({keys}).")
-                    }
-                    None => "No conversations yet. Ask the agent from the Agent tab.".to_owned(),
-                },
-            )
-            .into_any_element(),
+            // The panel's foot asks the agent, with its keys.
+            ListRow::Note(Note::NoConversations) => {
+                ds::sidebar_note("No conversations yet.").into_any_element()
+            }
             // By its path only, which holds no conversation.
             ListRow::Note(Note::NotSaved) => {
                 let file = self
@@ -714,18 +708,41 @@ impl Render for SessionsPanel {
             studio_ui::rows::sync(&self.list_state, &mut self.rows, rows);
             self.rows_stale = false;
         }
-        list(
-            self.list_state.clone(),
-            // A row's root takes the list's width, so a note wraps at it.
-            cx.processor(|this, ix, _window, cx| {
+        // The conversations, then at the panel's foot the way to ask the agent, as the
+        // reference sidebar ends with its "Ask" launcher: an outlined pill with its keys.
+        v_flex()
+            .size_full()
+            .child(
+                list(
+                    self.list_state.clone(),
+                    // A row's root takes the list's width, so a note wraps at it.
+                    cx.processor(|this, ix, _window, cx| {
+                        div()
+                            .w_full()
+                            .child(this.render_list_row(ix, cx))
+                            .into_any_element()
+                    }),
+                )
+                .flex_1()
+                .min_h_0(),
+            )
+            .child(
                 div()
-                    .w_full()
-                    .child(this.render_list_row(ix, cx))
-                    .into_any_element()
-            }),
-        )
-        .size_full()
-        .into_any_element()
+                    .flex_none()
+                    .px(px(ds::space::SM))
+                    .pb(px(ds::space::SM))
+                    .child(
+                        ds::button("ask-agent", "Ask the agent")
+                            .style(ButtonStyle::Outlined)
+                            .full_width()
+                            .start_icon(Icon::new(IconName::ZedAssistant))
+                            .key_caps(ds::KeyCaps::for_action(&OpenAgent))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(OpenAgent), cx)
+                            }),
+                    ),
+            )
+            .into_any_element()
     }
 }
 

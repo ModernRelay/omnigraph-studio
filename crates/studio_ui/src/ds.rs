@@ -135,14 +135,15 @@ impl Radii {
         radius::within(self.menu(), space::XS + size::HAIRLINE)
     }
 
-    /// The command palette's results: a solid card inside its frame's hairline and padding.
-    pub fn palette_list(&self) -> f32 {
+    /// An inset panel ([`super::inset_panel`]): a white panel inside a tray's hairline and
+    /// [`space::XS`] of padding, as the command palette holds its search and its results.
+    pub fn inset_panel(&self) -> f32 {
         radius::within(self.modal, space::XS + size::HAIRLINE)
     }
 
-    /// A palette row, inside the results card's hairline and padding.
-    pub fn palette_row(&self) -> f32 {
-        radius::within(self.palette_list(), space::XS + size::HAIRLINE)
+    /// A row's fill inside an inset panel, inside the panel's hairline and padding.
+    pub fn inset_row(&self) -> f32 {
+        radius::within(self.inset_panel(), space::XS + size::HAIRLINE)
     }
 
     /// A [`float_bar`]: concentric around the `sm` controls set 3 px inside its edge.
@@ -227,6 +228,12 @@ pub mod size {
     /// A tag, a count badge, a write target: the small chips inside rows and headers. Also a
     /// switch's height.
     pub const TAG: f32 = 18.;
+    /// A key cap ([`super::KeyCaps`]): a tag's height, and as wide at least, so a one-glyph
+    /// key is a square and a word ("Esc") widens it.
+    pub const KEY_CAP: f32 = TAG;
+    /// A neutral icon tile ([`super::icon_tile`]) leading a pick-list row or a card's title: a
+    /// palette row holds it 6 px in from its fill on every side.
+    pub const ICON_TILE: f32 = 20.;
     /// A switch's width, and its knob, inside a [`TAG`]-high track.
     pub const SWITCH_WIDTH: f32 = 32.;
     pub const SWITCH_KNOB: f32 = 14.;
@@ -431,9 +438,28 @@ pub mod surface {
             .blend(gpui::black().opacity(0.02))
     }
 
-    /// A tag's fill: a faint ink, borderless, so a row of tags reads as one quiet band.
+    /// A tag's fill: a faint ink, borderless, so a row of tags reads as one quiet band. Also a
+    /// key cap's on a white panel or a document.
     pub fn tag(cx: &App) -> Hsla {
         cx.theme().colors().ghost_element_hover.opacity(0.7)
+    }
+
+    /// A tray: the grey sheet that holds white inset panels and raised controls (the command
+    /// palette's frame, a notice strip on the composer's card). In a light theme the
+    /// document's white less 4 %, as the reference palette's `#f4f5f5` frame; in a dark one
+    /// the elevated surface, lighter than the document panels it holds.
+    pub fn tray(cx: &App) -> Hsla {
+        if cx.theme().appearance.is_light() {
+            document(cx).blend(gpui::black().opacity(11. / 255.))
+        } else {
+            floating(cx)
+        }
+    }
+
+    /// A neutral icon tile's fill (`super::icon_tile`): 7 % of the ink, so a grey tile with a
+    /// dark glyph reads on a white row and on a dark one alike.
+    pub fn tile(cx: &App) -> Hsla {
+        cx.theme().colors().text.opacity(0.07)
     }
 
     /// A selected row on chrome (the sidebar): a pressed pill, 5% ink, in both styles.
@@ -891,8 +917,8 @@ pub mod elevation {
     // Tower's values, light and dark (`styles/glass.css`, `styles/theme.css`, `button.tsx`).
 
     /// [`custom`]'s drops alone, for an element that draws its own hairline as its border (a
-    /// document page with its rule, the palette's results card): the box includes that line,
-    /// so each drop's spread is one less than CSS's.
+    /// document page with its rule, a selected sidebar row on glass): the box includes that
+    /// line, so each drop's spread is one less than CSS's.
     pub fn raised(cx: &App) -> Vec<BoxShadow> {
         layers(Lift::Rest, cx)
             .into_iter()
@@ -2097,13 +2123,18 @@ impl RenderOnce for Callout {
     }
 }
 
-/// A choice of two to four, as Tower's tabs: no track, quiet labels, the selected one on the
-/// pressed pill. Over content, put it in a [`float_bar`].
+/// Text filter tabs, or any choice of two to six: no track, quiet labels, the selected one a
+/// raised segment (the reference palette's tabs; Tower's). The palette's scope tabs, a
+/// setting's choice and a floating bar's modes are all this. Over content, put it in a
+/// [`float_bar`].
 pub fn segmented(_cx: &App) -> Div {
     h_flex().flex_none().gap(px(space::XXS))
 }
 
 /// One option of a [`segmented`] control: a bar button's height, so a floating bar holds it.
+/// The selected one is raised, as interfaces.dev's chips: the solid fill and `shadow-custom`
+/// ([`elevation::custom`]), its label in ink; the others are their muted label until hovered.
+/// Every segment keeps a clear hairline, so choosing one moves no label.
 pub fn segment(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
@@ -2114,11 +2145,16 @@ pub fn segment(
     h_flex()
         .id(id.into())
         .h(px(size::BAR_BUTTON))
-        .px(px(space::MD + space::XXS))
+        // The border is part of the inset.
+        .px(px(space::MD + space::XXS - size::HAIRLINE))
         .items_center()
         .rounded(px(radii(cx).sm))
+        .border_1()
+        .border_color(gpui::transparent_black())
         .cursor_pointer()
-        .when(selected, |segment| segment.bg(surface::pressed(cx)))
+        .when(selected, |segment| {
+            segment.bg(surface::solid(cx)).shadow(elevation::custom(cx))
+        })
         .when(!selected, |segment| {
             segment.hover(move |style| style.bg(hover))
         })
@@ -2174,19 +2210,221 @@ pub fn setting_row(
         .child(div().flex_none().child(control))
 }
 
-/// A key cap and a one-word label, as Zed's hints show keys.
+/// What one key cap shows: a glyph Zed draws (⌘, ⇧, ↵, an arrow) or a word ("Esc", "Ctrl").
+#[derive(Debug, Clone, PartialEq)]
+enum KeyFace {
+    Icon(IconName),
+    Text(SharedString),
+}
+
+/// The caps of one keystroke, modifiers first in the order Zed's key hints draw them. On
+/// macOS a modifier, an arrow, ↵, ⌫ and ⇥ are Zed's glyphs; elsewhere words, as the platform
+/// writes them ("Ctrl", "Shift"). Escape is "Esc" everywhere: its glyph reads as a stray mark
+/// at a cap's size.
+fn key_faces(modifiers: &gpui::Modifiers, key: &str, style: ui::PlatformStyle) -> Vec<KeyFace> {
+    let mac = style == ui::PlatformStyle::Mac;
+    let platform = match style {
+        ui::PlatformStyle::Mac => "⌘",
+        ui::PlatformStyle::Linux => "Super",
+        ui::PlatformStyle::Windows => "Win",
+    };
+    let held = [
+        (modifiers.function, None, "Fn"),
+        (modifiers.control, Some(IconName::Control), "Ctrl"),
+        (modifiers.alt, Some(IconName::Option), "Alt"),
+        (modifiers.platform, Some(IconName::Command), platform),
+        (modifiers.shift, Some(IconName::Shift), "Shift"),
+    ];
+    let mut faces: Vec<KeyFace> = held
+        .into_iter()
+        .filter(|(on, _, _)| *on)
+        .map(|(_, glyph, word)| match glyph.filter(|_| mac) {
+            Some(glyph) => KeyFace::Icon(glyph),
+            None => KeyFace::Text(word.into()),
+        })
+        .collect();
+    let glyph = match key {
+        "up" => Some(IconName::ArrowUp),
+        "down" => Some(IconName::ArrowDown),
+        "left" => Some(IconName::ArrowLeft),
+        "right" => Some(IconName::ArrowRight),
+        "enter" | "return" if mac => Some(IconName::Return),
+        "backspace" | "delete" if mac => Some(IconName::Backspace),
+        "tab" if mac => Some(IconName::Tab),
+        _ => None,
+    };
+    faces.push(match glyph {
+        Some(glyph) => KeyFace::Icon(glyph),
+        None => KeyFace::Text(
+            match key {
+                "escape" => "Esc".to_owned(),
+                "enter" | "return" => "Enter".to_owned(),
+                "pageup" => "PageUp".to_owned(),
+                "pagedown" => "PageDown".to_owned(),
+                key => {
+                    let mut chars = key.chars();
+                    chars.next().map_or(String::new(), |first| {
+                        first.to_uppercase().chain(chars).collect()
+                    })
+                }
+            }
+            .into(),
+        ),
+    });
+    faces
+}
+
+/// One key cap: a [`size::KEY_CAP`] box at the scale's extra-small corner holding a glyph or
+/// a word at the metadata size, muted. Inset, on a white panel or a document, it is a faint
+/// ink ([`surface::tag`]); raised, on a [`surface::tray`], the solid fill with
+/// `shadow-custom` ([`lifted`]), as the reference palette's footer draws its keys.
+fn key_cap(face: KeyFace, raised: bool, cx: &App) -> Div {
+    let cap = div()
+        .flex_none()
+        .h(px(size::KEY_CAP))
+        .min_w(px(size::KEY_CAP))
+        .px(px(space::XS))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(radii(cx).xs));
+    let cap = if raised {
+        lifted(cap.bg(surface::solid(cx)), cx)
+    } else {
+        cap.bg(surface::tag(cx))
+    };
+    cap.child(match face {
+        KeyFace::Icon(glyph) => icon::meta(glyph).into_any_element(),
+        KeyFace::Text(word) => text::meta(word).single_line().into_any_element(),
+    })
+}
+
+/// The keys bound to an action as key caps, one box per key (⌘ and N apart), as the binding
+/// that wins where the person is (Zed's `KeyBinding` finds the same one): read in a focus's
+/// context, else the focused element's, else the window's. A chord's strokes sit a step apart.
+/// Nothing when no key is bound. [`KeyCaps::raised`] for caps on a tray.
+#[derive(IntoElement)]
+pub struct KeyCaps {
+    action: Box<dyn gpui::Action>,
+    focus: Option<gpui::FocusHandle>,
+    raised: bool,
+}
+
+impl KeyCaps {
+    /// The caps of `action`'s binding, in the focused element's context.
+    pub fn for_action(action: &dyn gpui::Action) -> Self {
+        Self {
+            action: action.boxed_clone(),
+            focus: None,
+            raised: false,
+        }
+    }
+
+    /// The caps of `action`'s binding in `focus`'s context.
+    pub fn for_action_in(action: &dyn gpui::Action, focus: &gpui::FocusHandle) -> Self {
+        Self {
+            action: action.boxed_clone(),
+            focus: Some(focus.clone()),
+            raised: false,
+        }
+    }
+
+    /// Raised caps, for a tray's grey (the palette's footer) where an inset cap would sink.
+    pub fn raised(mut self) -> Self {
+        self.raised = true;
+        self
+    }
+}
+
+impl RenderOnce for KeyCaps {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let binding = self
+            .focus
+            .or_else(|| window.focused(cx))
+            .and_then(|focus| {
+                window.highest_precedence_binding_for_action_in(self.action.as_ref(), &focus)
+            })
+            .or_else(|| window.highest_precedence_binding_for_action(self.action.as_ref()));
+        let Some(binding) = binding else {
+            return gpui::Empty.into_any_element();
+        };
+        let style = ui::PlatformStyle::platform();
+        let raised = self.raised;
+        h_flex()
+            .flex_none()
+            .gap(px(space::XS))
+            .items_center()
+            .children(binding.keystrokes().iter().map(|stroke| {
+                h_flex().gap(px(space::XXS)).children(
+                    key_faces(stroke.modifiers(), stroke.key(), style)
+                        .into_iter()
+                        .map(|face| key_cap(face, raised, cx)),
+                )
+            }))
+            .into_any_element()
+    }
+}
+
+/// A key hint: the caps of one or more actions, then a word for what they do ("↑ ↓ Navigate",
+/// "Esc Close"), as a footer lists its keys. Made by [`key_hint`]; a row of them is
+/// [`key_hints`].
+#[derive(IntoElement)]
+pub struct KeyHint {
+    caps: Vec<KeyCaps>,
+    label: SharedString,
+    raised: bool,
+}
+
+/// A [`KeyHint`] for `action`, read in `focus`'s context.
 pub fn key_hint(
     action: &dyn gpui::Action,
     label: impl Into<SharedString>,
     focus: &gpui::FocusHandle,
-    cx: &App,
-) -> Div {
-    h_flex()
-        .gap(px(space::XS))
-        .items_center()
-        .flex_none()
-        .child(ui::KeyBinding::for_action_in(action, focus, cx).size(rems_from_px(text::KEY_HINT)))
-        .child(text::meta(label))
+    _cx: &App,
+) -> KeyHint {
+    KeyHint {
+        caps: vec![KeyCaps::for_action_in(action, focus)],
+        label: label.into(),
+        raised: false,
+    }
+}
+
+impl KeyHint {
+    /// Another action's caps before the word: ↓ after ↑ for "Navigate".
+    pub fn and(mut self, action: &dyn gpui::Action, focus: &gpui::FocusHandle) -> Self {
+        self.caps.push(KeyCaps::for_action_in(action, focus));
+        self
+    }
+
+    /// Raised caps, for a hint on a tray.
+    pub fn raised(mut self) -> Self {
+        self.raised = true;
+        self
+    }
+}
+
+impl RenderOnce for KeyHint {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        h_flex()
+            .flex_none()
+            .gap(px(space::SM))
+            .items_center()
+            .child(
+                h_flex().gap(px(space::XXS)).children(
+                    self.caps.into_iter().map(
+                        |caps| {
+                            if self.raised { caps.raised() } else { caps }
+                        },
+                    ),
+                ),
+            )
+            .child(text::meta(self.label).single_line())
+    }
+}
+
+/// A row of [`key_hint`]s, a step apart, as a footer lists its keys.
+pub fn key_hints() -> Div {
+    h_flex().flex_none().gap(px(space::LG)).items_center()
 }
 
 /// A bordered block of code or a command, as Delta draws edits and commands in a thread.
@@ -2610,6 +2848,328 @@ pub fn composer_button(
         })
 }
 
+// ---- trays, inset panels, tiles, grids and composers ----
+//
+// After the reference command palette (a grey tray of white inset panels, rows led by tiles,
+// keys as caps), the reference table (a rounded card of hairline cells) and the reference
+// agent chat (record cards in the table's cells, a notice strip on the composer's card).
+
+/// A neutral icon tile: a [`size::ICON_TILE`] square of the extra-small corner on the
+/// [`surface::tile`] grey, holding a dark glyph, as the reference palette's "Quick actions"
+/// lead their rows. Neutral on purpose: a row's tile says what kind of row it is, and colour is
+/// kept for what is data (a type's dot, [`tile`]).
+pub fn icon_tile(glyph: IconName, cx: &App) -> Div {
+    tile(cx).child(
+        Icon::new(glyph)
+            .size(IconSize::XSmall)
+            .color(text::icon_ink(cx)),
+    )
+}
+
+/// An empty [`icon_tile`] for another mark: a type's dot ([`type_dot`]'s), centred.
+pub fn tile(cx: &App) -> Div {
+    div()
+        .size(px(size::ICON_TILE))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(radii(cx).xs))
+        .bg(surface::tile(cx))
+}
+
+/// A white inset panel on a [`surface::tray`]: the document's fill inside the panel's hairline
+/// (`surface::outline`), [`space::XS`] of padding, the corner concentric within the tray
+/// (`Radii::inset_panel`). It sits in its tray rather than over it, so it carries the ring
+/// and no drops. The command palette's search and result groups are inset panels.
+pub fn inset_panel(cx: &App) -> Div {
+    v_flex()
+        .p(px(space::XS))
+        .rounded(px(radii(cx).inset_panel()))
+        .bg(surface::document(cx))
+        .border_1()
+        .border_color(surface::outline(cx))
+}
+
+/// Where a row sits in its inset panel, for a list that draws a panel row by row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsetEdge {
+    First,
+    Middle,
+    Last,
+    /// The panel's one row.
+    Only,
+}
+
+impl InsetEdge {
+    pub fn of(first: bool, last: bool) -> Self {
+        match (first, last) {
+            (true, true) => Self::Only,
+            (true, false) => Self::First,
+            (false, true) => Self::Last,
+            (false, false) => Self::Middle,
+        }
+    }
+}
+
+/// One row-high slice of an [`inset_panel`], for a virtualized list, which lays out rows of
+/// one height and so cannot nest them in a panel: the panel's fill and side hairlines, and at
+/// its first and last row the panel's padding and rounded end, drawn just outside the slice
+/// (into the list's padding or an [`inset_label`]), so every slice keeps the list's height.
+/// A row's content goes inside, the panel's padding in from its sides.
+pub fn inset_slice(edge: InsetEdge, height: f32, cx: &App) -> Div {
+    let (fill, outline) = (surface::document(cx), surface::outline(cx));
+    let radius = radii(cx).inset_panel();
+    // A rounded end is as tall as its corner (GPUI clamps a corner to half its box), from the
+    // panel's padding outside the slice into the slice itself; the straight sides start
+    // where it stops. The fill and hairlines are children drawn first, so the row's content
+    // paints over them, and not the slice's own border: a child placed absolutely measures
+    // from inside its parent's border.
+    let end = radius.max(space::XS);
+    let into = end - space::XS;
+    let part = move || {
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .bg(fill)
+            .border_l_1()
+            .border_r_1()
+            .border_color(outline)
+    };
+    let slice = div()
+        .relative()
+        .w_full()
+        .h(px(height))
+        .px(px(space::XS + size::HAIRLINE))
+        .flex()
+        .items_center();
+    match edge {
+        InsetEdge::Only => slice.child(
+            part()
+                .top(px(-space::XS))
+                .bottom(px(-space::XS))
+                .border_1()
+                .rounded(px(radius)),
+        ),
+        InsetEdge::Middle => slice.child(part().top_0().bottom_0()),
+        InsetEdge::First => slice.child(part().top(px(into)).bottom_0()).child(
+            part()
+                .top(px(-space::XS))
+                .h(px(end))
+                .border_t_1()
+                .rounded_t(px(radius)),
+        ),
+        InsetEdge::Last => slice.child(part().top_0().bottom(px(into))).child(
+            part()
+                .bottom(px(-space::XS))
+                .h(px(end))
+                .border_b_1()
+                .rounded_b(px(radius)),
+        ),
+    }
+}
+
+/// A group's label above its inset panel ("Recent", "Commands"), muted at the metadata size on
+/// the tray, on the edge its rows' tiles start at: a row high in a virtualized list, the
+/// panel's padding left clear at its top and bottom for the panels either side.
+pub fn inset_label(label: impl Into<SharedString>, height: f32) -> Div {
+    h_flex()
+        .w_full()
+        .h(px(height))
+        .items_end()
+        // The panel's hairline and padding, then a row's own inset.
+        .pl(px(size::HAIRLINE + space::XS + space::SM))
+        // The next panel's padding and a gap.
+        .pb(px(space::XS + space::XS))
+        .child(text::meta(label).single_line())
+}
+
+/// A rule between a grid's cells, on the cell's right ([`header_cell`], [`data_cell`]). Give
+/// it to every cell but a card's last column, whose edge is the card's.
+pub fn cell_rule<E: Styled>(cell: E, cx: &App) -> E {
+    cell.border_r_1().border_color(surface::rule(cx))
+}
+
+/// A grid's header cell, after the reference table: the property's kind icon, then its name,
+/// muted, or in ink while it is `active` (the column the rows are ordered by), [`size::HEADER`]
+/// high and as inset as a [`data_cell`]. It sits in a [`header_row`], whose fill it shows. A
+/// trailing action ([`cell_action`]) goes at its end. Shared by the type table and an agent's
+/// record cards.
+pub fn header_cell(icon: Option<IconName>, label: impl Into<SharedString>, active: bool) -> Div {
+    h_flex()
+        .h(px(size::HEADER))
+        .px(px(space::LG))
+        .gap(px(space::SM))
+        .items_center()
+        .overflow_hidden()
+        .children(icon.map(icon::meta))
+        .child(
+            div().min_w_0().child(
+                text::body(label)
+                    .color(if active { Color::Default } else { Color::Muted })
+                    .single_line()
+                    .truncate(),
+            ),
+        )
+}
+
+/// A grid header's fill: the reference table's `#fafafa` over white, a faint ink
+/// ([`surface::well`]) that darkens a light document and lightens a dark one, where a darker
+/// fill would not show.
+pub fn header_fill(cx: &App) -> Hsla {
+    surface::well(cx)
+}
+
+/// A grid's header row, on the header's fill ([`header_fill`]) under a hairline: its
+/// [`header_cell`]s side by side.
+pub fn header_row(cx: &App) -> Div {
+    grid_row(cx).bg(header_fill(cx))
+}
+
+/// A grid's data cell: [`size::ROW`] high, its value [`space::LG`] in from both sides.
+pub fn data_cell() -> Div {
+    h_flex()
+        .h(px(size::ROW))
+        .px(px(space::LG))
+        .gap(px(space::SM))
+        .items_center()
+        .overflow_hidden()
+}
+
+/// An icon action at a cell's end, as the reference table's header and cells end in one: a
+/// row's icon button, muted. In a wide cell it keeps its place, shown on hover
+/// (`.visible_on_hover`); over a header's text it is a [`hover_slot`].
+pub fn cell_action(id: impl Into<ElementId>, glyph: IconName) -> IconButton {
+    row_icon_button(id, glyph).icon_color(Color::Muted)
+}
+
+/// A [`cell_action`] over the end of a header cell, shown while `group` (the header) is
+/// hovered, on the header's own opaque fill there (`fill`, [`header_fill_opaque`]), so a
+/// narrow column's name and type keep their room while the pointer is elsewhere. The button
+/// keeps its place in the layout: a hover that changed layout would change it between a
+/// frame's prepaint and its paint.
+pub fn hover_slot(group: impl Into<SharedString>, fill: Hsla, action: impl IntoElement) -> Div {
+    div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right_0()
+        .pl(px(space::XS))
+        .pr(px(space::SM))
+        .flex()
+        .items_center()
+        .bg(fill)
+        .visible_on_hover(group)
+        .child(action)
+}
+
+/// A header cell's fill made opaque over the document, `hovered` or not, for what is drawn over
+/// its text ([`hover_slot`]): the document's fill under the header's ink, and the hover's when
+/// the cell takes it under the pointer.
+pub fn header_fill_opaque(hovered: bool, cx: &App) -> Hsla {
+    let fill = surface::document(cx).blend(header_fill(cx));
+    if hovered {
+        fill.blend(surface::hover(cx))
+    } else {
+        fill
+    }
+}
+
+/// A row of a grid card ([`card`]): its cells side by side, under a hairline.
+pub fn grid_row(cx: &App) -> Div {
+    h_flex()
+        .w_full()
+        .border_t_1()
+        .border_color(surface::rule(cx))
+}
+
+/// A record card's title line, after the reference chat's: a tile, the record's name, and
+/// what else to know about it after a middle dot, muted ("12 rows · main").
+pub fn card_title(
+    tile: impl IntoElement,
+    title: impl Into<SharedString>,
+    meta: Option<SharedString>,
+) -> Div {
+    h_flex()
+        .w_full()
+        .min_h(px(size::SIDEBAR_ROW + space::MD))
+        .px(px(space::LG))
+        .gap(px(space::SM))
+        .items_center()
+        .child(tile)
+        .child(meta_row(
+            std::iter::once(
+                text::body(title)
+                    .weight(text::weight::HEADING)
+                    .single_line()
+                    .into_any_element(),
+            )
+            .chain(meta.map(|meta| text::muted(meta).single_line().into_any_element())),
+        ))
+}
+
+/// A slim notice attached to the top of a card (the composer's): what holds the card's work up
+/// or follows from it, one [`notice_line`] each, on the tray's grey under the card's corner
+/// and hairline, its foot tucked under the card ([`attach_notice`]).
+pub fn notice_strip(cx: &App) -> Div {
+    let radius = radii(cx).md;
+    v_flex()
+        .w_full()
+        .px(px(space::LG))
+        // The card covers this much.
+        .pb(px(radius))
+        .rounded_t(px(radius))
+        .bg(surface::tray(cx))
+        .border_t_1()
+        .border_l_1()
+        .border_r_1()
+        .border_color(surface::outline(cx))
+}
+
+/// One line of a [`notice_strip`]: an icon or a gauge, what it says, and an action at its end.
+pub fn notice_line() -> Div {
+    h_flex().h(px(size::ROW)).gap(px(space::SM)).items_center()
+}
+
+/// A card with its [`notice_strip`] on top: the card is drawn over the strip's foot, so the
+/// strip reads as a tab of the card.
+pub fn attach_notice(strip: Div, card: Div, cx: &App) -> Div {
+    v_flex()
+        .w_full()
+        // The card's ring is drawn outside its box, the strip's hairline inside: the strip
+        // reaches a hairline further either side, so the two edges run on.
+        .child(strip.mx(px(-size::HAIRLINE)).w_auto())
+        .child(card.mt(px(-radii(cx).md)))
+}
+
+/// The composer, after the reference chat's: a card (the card's corner, fill and
+/// `shadow-custom`) holding the message being written, then its controls on one line under the
+/// text, at its end ([`composer_controls`]).
+pub fn composer_card(cx: &App) -> Div {
+    lifted(
+        v_flex()
+            .w_full()
+            .rounded(px(radii(cx).md))
+            .bg(surface::document(cx))
+            .pl(px(space::LG))
+            .pr(px(space::SM))
+            .pt(px(space::MD))
+            .pb(px(space::SM))
+            .gap(px(space::SM)),
+        cx,
+    )
+}
+
+/// A composer's controls under its text: close together, at its end.
+pub fn composer_controls() -> Div {
+    h_flex()
+        .w_full()
+        .justify_end()
+        .items_center()
+        .gap(px(space::XS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2656,6 +3216,59 @@ mod tests {
         );
     }
 
+    /// A binding is one cap per key, modifiers first in Zed's order: glyphs on macOS, the
+    /// platform's words elsewhere, and "Esc" for Escape on both.
+    #[test]
+    fn key_caps_are_one_box_per_key() {
+        let held = |control, alt, platform, shift| gpui::Modifiers {
+            control,
+            alt,
+            platform,
+            shift,
+            function: false,
+        };
+        let word = |text: &str| KeyFace::Text(text.into());
+        let mac = ui::PlatformStyle::Mac;
+        assert_eq!(
+            key_faces(&held(false, false, true, true), "a", mac),
+            [
+                KeyFace::Icon(IconName::Command),
+                KeyFace::Icon(IconName::Shift),
+                word("A")
+            ]
+        );
+        assert_eq!(
+            key_faces(&held(false, false, false, false), "escape", mac),
+            [word("Esc")]
+        );
+        assert_eq!(
+            key_faces(&held(false, false, false, false), "enter", mac),
+            [KeyFace::Icon(IconName::Return)]
+        );
+        assert_eq!(
+            key_faces(&held(false, false, false, false), "/", mac),
+            [word("/")]
+        );
+        let linux = ui::PlatformStyle::Linux;
+        assert_eq!(
+            key_faces(&held(true, false, false, true), "enter", linux),
+            [word("Ctrl"), word("Shift"), word("Enter")]
+        );
+        assert_eq!(
+            key_faces(&held(false, false, false, false), "up", linux),
+            [KeyFace::Icon(IconName::ArrowUp)]
+        );
+    }
+
+    /// A row's place in its inset panel: the first and last rows draw the panel's ends.
+    #[test]
+    fn a_row_knows_its_place_in_its_panel() {
+        assert_eq!(InsetEdge::of(true, true), InsetEdge::Only);
+        assert_eq!(InsetEdge::of(true, false), InsetEdge::First);
+        assert_eq!(InsetEdge::of(false, true), InsetEdge::Last);
+        assert_eq!(InsetEdge::of(false, false), InsetEdge::Middle);
+    }
+
     /// The nested pairs the design system draws stay concentric (`radius::around`/`within`),
     /// at every base the corner radius setting allows.
     #[test]
@@ -2673,7 +3286,7 @@ mod tests {
             (4., 6., 10., 14., 16.)
         );
         assert_eq!(default.menu_item(), 5.);
-        assert_eq!((default.palette_list(), default.palette_row()), (11., 6.));
+        assert_eq!((default.inset_panel(), default.inset_row()), (11., 6.));
         assert_eq!(default.row_list(), 9.);
         for base in 1..=20 {
             let r = Radii::new(base as f32);
@@ -2682,12 +3295,12 @@ mod tests {
             assert_eq!(radius::within(r.lg, space::XS), r.md, "base {base}");
             assert_eq!(radius::within(r.md, space::SM), r.xs, "base {base}");
             assert_eq!(radius::within(r.modal, space::SM), r.md, "base {base}");
-            // A menu's rows, the palette's results and their rows: each inside a hairline
-            // and `space::XS` of padding; a row list around its rows.
+            // A menu's rows, an inset panel and its rows: each inside a hairline and
+            // `space::XS` of padding; a row list around its rows.
             let inset = space::XS + size::HAIRLINE;
             assert_eq!(r.menu_item(), radius::within(r.menu(), inset));
-            assert_eq!(r.palette_list(), radius::within(r.modal, inset));
-            assert_eq!(r.palette_row(), radius::within(r.palette_list(), inset));
+            assert_eq!(r.inset_panel(), radius::within(r.modal, inset));
+            assert_eq!(r.inset_row(), radius::within(r.inset_panel(), inset));
             assert_eq!(r.row_list(), radius::around(r.xs, inset));
         }
         // 0 squares everything.

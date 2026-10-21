@@ -215,7 +215,7 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   action runs.
 - Scope tabs: All ⌘1, Types ⌘2, Nodes ⌘3, Queries ⌘4, Branches ⌘5, Commands ⌘6. Tab hands the
   text to the agent ("Ask") once spec 011 lands.
-  Built: a segmented control under the search field; ⌘1–⌘6 (Alt elsewhere) inside the
+  Built: text tabs under the search field (`ds::segmented`); ⌘1–⌘6 (Alt elsewhere) inside the
   palette. ⌘K opens All, ⌘P Nodes, ⌘⇧B Branches; the key sheet (`?`) has no tabs. Queries
   lists the open query tabs with their first line, then the graph's saved query files that no
   tab has open, and the stored queries the graph serves, each followed by the CLI config's
@@ -259,6 +259,21 @@ what was last saved at most every 250 ms rather than serializing every tab on ev
   of results rounded within it (`radius::PALETTE_LIST`), and the description and count under
   it. Its rows are menu rows (`ds::MenuRow`, 32 px). It sits a tenth of the window down over a
   light veil (`ModalPlacement::Palette`), not a dialog's dim.
+- Since 2026-10-21 it follows the reference palette on the design system's tokens: a grey tray
+  (`surface::tray`, `radius::MODAL`, 4 px inset) holding white inset panels (`ds::inset_panel`),
+  the search in one and the results in others; the scope tabs between them as text tabs, the
+  chosen one a raised segment. With nothing typed, the rows fall in groups as `rank` orders
+  them, each its own panel under its name ("Recent", "Commands", "Types", "Queries", "Nodes",
+  "Branches", "Other commands"), named only when there are two groups or more; with text typed
+  they are one ranked panel under their count ("12 results", left out while nodes are still to
+  come, as the footer's count was). The list is virtualized, so each row draws its slice of its
+  panel and the first and last draw the panel's ends (`ds::inset_slice`, `ds::inset_label`, a
+  row high). A row is led by a neutral tile (`ds::icon_tile`: a command by its area's icon, a
+  branch, a query, a stored query, an alias; a node type or a node by the type's dot in the
+  tile, since the row names the type) and ends in its keys as caps (`ds::KeyCaps`, one box per
+  key) or what it is, muted. The footer keeps the highlighted row's description and adds the
+  keys that work as raised caps: ↑ ↓ Navigate, ↵ Select, Esc Close, and Tab Ask once text is
+  typed. The reference's `?` key in the search field is left out: `?` types itself there.
 
 ### Tooltips and disabled states
 
@@ -575,8 +590,8 @@ than styling one-off elements.
   write target, a row list's rows) less 6; `lg` (glass sheets) plus 4; `modal` (modals, the
   palette) plus 6. 0 squares every corner. Nested radii follow by `radius::within`/`around`,
   and the gap counts a hairline border (`size::HAIRLINE`), which GPUI draws inside the box: a
-  menu row is the menu's radius less its hairline and 4 px padding, the palette's results card
-  and rows likewise, a floating bar is `sm` around its controls 3 px in (`Radii::bar`). A fill
+  menu row is the menu's radius less its hairline and 4 px padding, an inset panel and its
+  rows likewise, a floating bar is `sm` around its controls 3 px in (`Radii::bar`). A fill
   flush with a bordered edge (a card's header, a modal's footer) rounds its own corners at the
   container's radius less the hairline (`radius::flush`): GPUI clips children to a rectangle,
   not to rounded corners. The `ds` test `nested_radii_are_concentric` holds every pair at every
@@ -585,7 +600,48 @@ than styling one-off elements.
   select, the composer's agent picker) and a filter chip are pills (`Shape::Pill`); everything
   else takes the scale's corner: icon buttons (`Shape::Rounded`), fields, segments and tabs,
   the status bar's pickers and panel buttons, floating bars and the buttons set into them
-  (`ds::bar_button`), chips, drag previews. Dots and count badges stay round.
+  (`ds::bar_button`), chips, key caps and icon tiles (`xs`), inset panels
+  (`Radii::inset_panel`, concentric in their tray) and their rows (`Radii::inset_row`), cards
+  and grid cards (`md`), drag previews. Dots and count badges stay round.
+- **Trays, inset panels, tiles and key caps** (since 2026-10-21, after the reference command
+  palette). A tray (`surface::tray`: white less 4 % in a light theme, the elevated surface in a
+  dark one) holds white inset panels (`ds::inset_panel`: the document's fill inside the ring's
+  hairline and 4 px of padding; they sit in the tray, so the ring and no drops). A group's name
+  sits above its panel, muted at the metadata size on its rows' tile edge (`ds::inset_label`). A
+  virtualized list draws its panels row by row (`ds::inset_slice` with `ds::InsetEdge`): the
+  first and last rows draw the panel's rounded ends just outside themselves, so every row keeps
+  the list's height. A pick-list row is led by a neutral icon tile (`ds::icon_tile`, 20 px,
+  `surface::tile` grey with a dark glyph, 6 px in from a 32 px row's fill on every side,
+  `MenuRow::inset`); colour stays for what is data, as a type's dot in the tile
+  (`ds::tile`). Keys show as caps, one box per key (`ds::KeyCaps`, `size::KEY_CAP`): the
+  binding that wins in a focus's context, Zed's glyphs on macOS (⌘ ⇧ ⌥ ⌃ ↵ ⇥ ⌫, arrows), words
+  elsewhere, "Esc" on both; a faint ink on a white panel or a document, raised (the solid fill
+  and `shadow-custom`) on a tray. A key hint is caps and a word (`ds::key_hint`, `.and` for a
+  second action, `.raised`), a row of them `ds::key_hints`; a full-width button with caps
+  (`Button::key_caps`) reads as a launcher, its label at the start and its keys at the end.
+- **Text tabs and segments.** A choice (the palette's scope tabs, a setting's options, a
+  floating bar's modes) is `ds::segmented` of `ds::segment`s: no track, muted labels, the
+  chosen one raised (the solid fill and `shadow-custom`), every segment keeping a clear
+  hairline so choosing one moves no label.
+- **Grids** (since 2026-10-21, after the reference table). A grid's header row
+  (`ds::header_row`, the `ds::header_fill` faint ink, `#fafafa` on white, which lightens a dark
+  document) holds header cells (`ds::header_cell`: the property kind's icon, then its name,
+  muted, in ink while it orders the rows, 30 px); data cells (`ds::data_cell`) are 28 px; both
+  are 12 px in from either side and ruled on their right (`ds::cell_rule`), a card's last column
+  but; rows are `ds::grid_row`s under a hairline. A cell's trailing action (`ds::cell_action`,
+  a row's icon button) shows while its header or row is hovered: in a wide cell in its own
+  place, over a header's end on the header's opaque fill (`ds::hover_slot`,
+  `ds::header_fill_opaque`), so a narrow column's name and type keep their room. It never
+  takes room on hover only: GPUI lays a frame out before it paints the hover, and an element
+  shown by hover alone panics ("must call prepaint before paint"). A record card is a
+  `ds::card` with a title line (`ds::card_title`: a tile, the record's name, then muted facts
+  after a middle dot) over a grid. The type table and the agent's record cards share these.
+- **Composers and notice strips** (since 2026-10-21, after the reference agent chat). A
+  composer is a card (`ds::composer_card`: the card's corner, fill and `shadow-custom`) holding
+  the message, then its controls on one line at its end (`ds::composer_controls`). A notice
+  strip (`ds::notice_strip`, a `ds::notice_line` each) is a tab of the card it is attached to
+  (`ds::attach_notice`): the tray's grey under the card's corner and ring, its foot under the
+  card, which is drawn over it.
 - **Control sizes, in code.** `size::CONTROL` (28 px: a medium button, a field, a floating
   bar, a tile), `size::PILL` (26 px: a filter, a composer's picker, a dock's title tab),
   `size::BAR_BUTTON` (22 px: a segment, a bar's button, the status bar's items), `size::TAG`
@@ -713,7 +769,7 @@ than styling one-off elements.
   (`ds::lifted`). GPUI keeps the element's corner for every layer where CSS grows it with the
   spread, so a ring is a little heavier at a corner; the canvas, which paints its own chips,
   gives each layer CSS's corner (`elevation::paint_layers`). `raised` is the drops alone, for
-  an element that draws its own hairline (a document page, the palette's results).
+  an element that draws its own hairline (a document page, a selected sidebar row on glass).
   `surface::outline` is the ring's colour, the one hairline of a floating surface
   (`floating_border`, `card_border`). Menus, popovers, modals and glass sheets keep Tower's
   `sheet` (`floating`) and `float` shadows (an inner white rim at 70 %, 6 % dark; 4 % at
@@ -723,18 +779,26 @@ than styling one-off elements.
   through `SidebarRow::icon`, at 14 px, or a type mark) sits in one 16 px slot
   (`size::ROW_ICON`), so every list's labels start on one edge, 36 px in.
 - **Context once.** The branch appears once, in the document footer's branch menu.
-- **Tables.** Like Linear: a 48 px toolbar, a one-line header (name, then the type muted, 30
-  px), 28 px rows split by hairlines, no column rules, the cursor as a ring and the selected row
-  as a pill. Dense enough to scan a page at a glance; an 18 px borderless tag or chip still sits
-  inside a row. Sidebar rows are 26 px, feed rows 36 px; every list takes its height from
-  `ds::size`, never its own constant.
+- **Tables.** A 48 px toolbar, then the grid as a rounded card inset from the document's edges
+  (16 px either side, 12 above and below), as the reference table (since 2026-10-21; until then
+  the grid ran to the document's edges with no column rules): a one-line header row of header
+  cells (the kind's icon, the name, the type muted, 30 px), drawn by Studio rather than Zed's
+  table, whose header padded it to 42 px; the key's header and the others scroll sideways with
+  the rows. Each header ends in its column menu (⋯, the right-click menu) while hovered; the key
+  cell ends in the row's Peek while the row is hovered. 28 px rows split by hairlines, every
+  cell ruled on its right, cells 12 px in either side, the cursor as a ring and the selected row
+  on its fill. Dense enough to scan a page at a glance; an 18 px borderless tag or chip still
+  sits inside a row. Sidebar rows are 26 px, feed rows 36 px; every list takes its height from
+  `ds::size`, never its own constant. Query results keep the grid header of
+  `studio_ui::resizable_grid_header` for now.
 - **Layout, not sentences.** Information sits in structure, as in Delta's thread and Zed's
   panels: metadata as an icon and a short value (`ds::meta`, `meta_code`: a count, a commit, a
-  branch); keys as key caps (`ds::key_hint`, `KeyBinding` on buttons), never "↵ edit · …"
-  strings; activity as one-line rows with a gutter icon and a verb; approvals and outcomes in
-  cards with a header and a footer of icon buttons (✓ allow, ✓✓ always, ✗ reject) or an outcome
-  chip; code and commands in bordered blocks. The agent's prompt sits under its thread as the
-  next message's gutter row. Explanations go in tooltips. Sentences appear only in errors
+  branch); keys as key caps (`ds::KeyCaps`, `ds::key_hint`; `KeyBinding` on buttons), never
+  "↵ edit · …" strings; activity as one-line rows with a gutter icon and a verb; approvals and
+  outcomes in cards with a header and a footer of icon buttons (✓ allow, ✓✓ always, ✗ reject)
+  or an outcome chip; code and commands in bordered blocks; a query's rows in a record card.
+  The agent's prompt is a composer card under its thread (spec 011). Explanations go in
+  tooltips. Sentences appear only in errors
   (`Callout`) and in what an agent writes.
 - **Empty states.** An icon, a title of two or three words, and the actions that fill the
   space as outlined buttons with their key bindings (`ds::empty_state`, `ds::state_action`); an
@@ -853,6 +917,7 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 | 2026-10-13 | A busy modal stays open until it agrees | `studio_workspace` GPUI test `a_busy_modal_stays_open_until_it_agrees` (a real `Workspace` in a test window, Zed's base theme) | `hide_modal` and the same command again leave it open while busy; it closes once not. Before the change, every close went straight through |
 | 2026-10-14 | Review findings on the footer, settings fields and controls | `studio` `typing_not_yet_written_outlives_the_values_drawn_again` (fails on the earlier show logic); `studio_workspace` `leaving_the_window_pauses_the_cpu_reading` (fails without the mark on leaving); `studio_ui` `a_pill_button_keeps_the_focus_and_the_click` (fails without it: the click reached the surface around it) and `controls_draw_at_their_sizes` (a float bar's buttons 22 px, inside its border) | All pass. The settings test runs on `studio_settings::init_test`, settings in memory that refuse every write, so no test reaches `settings.json` |
 | 2026-10-13 | A panic message loses quoted text | `studio` test `a_panic_message_loses_the_text_it_quotes` | ``'é'`` and `` `Ada Lovelace's notes` `` become `'…'` and `` `…` ``; messages over 300 characters are cut |
+| 2026-10-21 | The palette, the agent's composer and the type table follow the three reference frames on the design system | Offscreen snapshots (1440×900 at 2×) against a scratch dev server, light, dark and glass, before and after, cropped at 2× beside the references; `studio_ui` `key_caps_are_one_box_per_key`, `a_row_knows_its_place_in_its_panel`, `controls_draw_at_their_sizes` (a tile, a segment and the grid's cells at their tokens), `values_pick_their_kind_icon`; `command_palette` `rows_are_grouped_by_kind_until_text_is_typed`; `agent_panel` `a_querys_rows_are_read_from_what_its_call_returned`, `a_tool_call_keeps_the_result_its_agent_reported`, `a_turn_ends_at_its_last_reply` | The palette is a tray of inset panels, its groups named while nothing is typed and counted once text is, rows led by tiles with their keys as caps; the inset panels' corners stayed square until each end was drawn as tall as its corner (GPUI clamps a corner to half its box). The type table's header was 42 px under Zed's padding; Studio's own header row is 30. In a dark theme a darker header fill did not show, so the header takes the well's ink |
 
 ## Corrections
 

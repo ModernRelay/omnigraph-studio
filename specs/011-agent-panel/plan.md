@@ -62,7 +62,7 @@ change the agent makes must be visible and approved before it lands, and must ar
 | ACP host | `crates/agent_panel/src/host.rs` | Spawns the agent, speaks ACP v1, turns traffic into thread events |
 | Tool server | `crates/agent_panel/src/tools.rs`, `mcp.rs` | MCP over a Unix socket; executes tools on the person's `GraphSession` |
 | Proxy | `omnigraph-studio mcp-proxy <socket>` in `crates/studio/src/main.rs` (`agent_panel::proxy`) | The stdio MCP server the agent starts; copies bytes between its stdio and Studio's socket |
-| Test agent | `crates/agent_panel/examples/test_agent.rs` | A scripted ACP agent for end-to-end checks without a model or network |
+| Test agent | `crates/agent_panel/examples/test_agent.rs` | A scripted ACP agent for end-to-end checks without a model or network; it reports its tool calls in the Claude adapter's wire format (`…/claude-agent-acp`, the MCP tool in `_meta.claudeCode.toolName`, the result as the call's content), and "list" in a prompt reads three people, rows Studio shows as a record card |
 
 The proxy holds no token and no logic. The agent never learns the server URL or token.
 
@@ -152,15 +152,33 @@ the error colour, and each thought's text. A query the agent runs is not folded:
 shows an edit, a line "Query people" (the declared name in the code font, "Running" while it
 runs, "· failed" when it failed) stands over the query in a code card with the query editor's
 colours (`TokenKind::syntax_name`, shared with spec 007's editor), with its parameters on one
-muted line under it, taken from the call's `rawInput`; the line folds the card; the plan as a list with each entry's status. Steps
+muted line under it, taken from the call's `rawInput`; the line folds the card. When the call's
+result, as the agent reported it (its content's text, else its raw output; Claude's adapter
+sends an MCP tool's result so), holds the CLI's JSON rows (`omnigraph_run`'s "exit 0", the
+output, then `[stderr]`, or the CLI's output alone), a record card under the query shows them,
+after the reference chat's: a title line (a neutral tile, "3 rows" or "5 of 200 rows", and
+where they were read, "main"), then the rows in the type table's cells, a header cell per
+column (the icon of what its first value holds and the column's name) over the values, at most
+5 rows and 4 columns and a reading column wide. A finished turn ends in its actions under its
+last reply: Copy (the turn's reply text) and how many tools it called, muted; the agent offers
+no retry or rating, so there is none. The plan as a list with each entry's status. Steps
 of a turn sit 12 px apart and a new question opens 16 px more. Other updates are ignored. The
 thread is a list that lays out only the blocks in view, as Zed's agent thread is: a block is
 measured again only when what it shows changes (or its markdown finishes parsing), so a long
 conversation costs what its visible part costs. It follows the newest reply while it is scrolled
 to its end; a person reading further up stays where they are, and sending a message returns to
-the end. A
-banner above the composer shows "`agent/<stamp>` · N changes · **Review**" after the first
-committed change; Review switches the session to the agent branch and opens spec 008's review.
+the end.
+
+The composer, after the reference chat's (since 2026-10-21): a card (`ds::composer_card`)
+holding the message and, on one line at its end, the controls that send it, under the thread's
+text column with the card's inset outside it; under it, centred and muted, what the agent
+reaches ("Reads knowledge at main · writes only to a branch of its own", which was the
+composer's tooltip). A notice strip attached to the card's top (`ds::notice_strip`) holds what
+the conversation's state asks of the person, a line each, and is not drawn otherwise: the
+context window at 85 % or more (the gauge, "88% of the context window used", the token counts),
+and after the first committed change the agent's branch ("`agent/<stamp>` · ✎ N · **Review**");
+Review switches the session to the agent branch and opens spec 008's review. The composer's
+gutter mark and the banner across the panel are gone. Queued messages sit above the card.
 
 ### Actions
 
@@ -222,6 +240,9 @@ and Delta's sidebar.
   is never saved over: the list lasts until Studio quits, and the Conversations panel says so
   above its rows, naming the file. (The first format, one session per graph and agent,
   predates v0.1.0 and is not read.)
+- **The launcher.** The Conversations panel ends with "Ask the agent", an outlined pill with
+  its icon and `studio_agent::OpenAgent`'s keys as caps (⌘⇧A), as the reference sidebar ends with
+  its "Ask" launcher; an empty list says only "No conversations yet."
 - **Titles.** The agent's `session_info_update` title wins; until it sends one, the first line
   of the first message (cut at 80 characters); "New conversation" before that.
 - **One tab per conversation.** Each conversation is its own Agent tab, titled after it, and
@@ -340,6 +361,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A query's rows show as a record card, a finished turn ends in its actions, and the composer is a card with its notices on a strip | Offscreen snapshots with the test agent (now in the Claude adapter's wire format) in a scratch data folder against a scratch dev server: "list people, summarize as markdown" and "list people, then make a change", light and dark; `agent_panel` `a_querys_rows_are_read_from_what_its_call_returned`, `a_tool_call_keeps_the_result_its_agent_reported`, `a_turn_ends_at_its_last_reply` | "3 rows · main" over p.name and p.title for three people, and "1 row" for the count; Copy and "5 tool calls" under the last reply; after the change the strip read "agent/20261021-122659 · ✎ 1 · Review". Before, the test agent's calls read as "Used 1 tool" (its adapter was not recognised) and its count as -1 (it parsed Studio's answer with the CLI's stderr in it) |
 | 2026-10-21 | Conversations filed under a server's name are not moved (decided: no conversion code) | `AgentSessions::move_named_graphs` and its test `conversations_filed_by_server_name_move_to_the_graphs_key` deleted with `graph_store::named_keys`; `AgentSessions::global` loads the index as it is | Supersedes the 2026-10-20 row on conversations following the graph's key: a record under `<server name>/<graph id>` keeps that graph field, so no graph's Conversations list shows it; one under the key resumes in its own `cwd` as before |
 | 2026-10-12 | 0.13's MCP endpoint cannot write | Read `crates/omnigraph-server/src/mcp.rs` at `v0.13.0` | One tool, `query`, for stored reads; instructions say mutations are unavailable |
 | 2026-10-12 | Branch names may contain `/` | `POST /graphs/knowledge/branches {"name":"agent/probe-1"}`, list, `DELETE …/agent%2Fprobe-1` on the dev server | All three succeeded |

@@ -5,11 +5,10 @@
 use gpui::{
     App, Context, EventEmitter, FocusHandle, Focusable, Hsla, Render, SharedString, Window,
 };
-use studio_actions::agent::{Allow, AllowAlways, Reject};
+use studio_actions::agent::{Allow, AllowAlways, OpenAgent, Reject};
 use studio_ui::ds::{
     self, ActivityRow, Dotted as _, SidebarRow, radii, size, space, surface, text,
 };
-use studio_ui::{GridColumn, grid_header};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::Severity;
 use ui::prelude::*;
@@ -241,45 +240,151 @@ impl Render for DesignGallery {
                     .child(studio_ui::ds::icon::meta(IconName::ChevronUpDown)),
             );
         let columns = [
-            GridColumn::new("slug", "slug")
-                .detail("String · key")
-                .width(px(180.)),
-            GridColumn::new("name", "name")
-                .detail("String")
-                .width(px(200.)),
-            GridColumn::new("title", "title")
-                .detail("String?")
-                .width(px(200.)),
+            (IconName::CaseSensitive, "slug", "String · key"),
+            (IconName::CaseSensitive, "name", "String"),
+            (IconName::CaseSensitive, "title", "String?"),
         ];
         let rows = [
             ("person-000000", "Radia Knuth", "Chief Scientist"),
             ("person-000001", "Donald Dijkstra", "Researcher"),
             ("person-000002", "Grace Allen", "—"),
         ];
+        // A grid card, as the type table and an agent's record cards draw one: header cells
+        // of the kind's icon and a muted name (the first ordering the rows, in ink, its menu
+        // shown as under the pointer), then data cells, every cell's rule on its right but the
+        // last's; the selected row on its fill and its Peek shown.
+        let last = columns.len() - 1;
+        let ruled = |cell: Div, at: usize| {
+            let cell = cell.flex_1().min_w_0();
+            if at < last {
+                ds::cell_rule(cell, cx)
+            } else {
+                cell
+            }
+        };
         let table = ds::card(cx)
+            .child(ds::card_title(
+                ds::icon_tile(IconName::Table, cx),
+                "3 rows",
+                Some("main".into()),
+            ))
             .child(
-                ds::toolbar(cx)
-                    .child(studio_ui::type_swatch("Person", cx))
-                    .child(text::title("Person"))
-                    .child(text::muted("200 rows"))
-                    .child(div().flex_1())
+                ds::header_row(cx).children(columns.iter().enumerate().map(
+                    |(at, (icon, name, detail))| {
+                        ruled(
+                            ds::header_cell(Some(*icon), *name, at == 0)
+                                .child(text::meta(*detail).color(Color::Disabled))
+                                .when(at == 0, |cell| {
+                                    cell.child(div().flex_1()).child(ds::row_icon_button(
+                                        "g-column-menu",
+                                        IconName::Ellipsis,
+                                    ))
+                                }),
+                            at,
+                        )
+                    },
+                )),
+            )
+            .children(rows.iter().enumerate().map(|(index, values)| {
+                let values = [values.0, values.1, values.2];
+                ds::grid_row(cx)
+                    .when(index == 0, |row| row.bg(surface::selected_document(cx)))
+                    .children(values.iter().enumerate().map(|(at, value)| {
+                        ruled(
+                            ds::data_cell().child(text::body(*value)).when(
+                                index == 0 && at == 0,
+                                |cell| {
+                                    cell.child(div().flex_1())
+                                        .child(ds::row_icon_button("g-peek", IconName::Eye))
+                                },
+                            ),
+                            at,
+                        )
+                    }))
+            }));
+
+        // The command palette's parts: a tray of inset panels, a group's label above its own,
+        // rows led by neutral tiles (a type's colour as its dot) with their keys as caps, the
+        // highlighted row, and the footer's raised key hints.
+        let palette_row = |id: &'static str, tile: Div, label: &'static str, end: AnyElement| {
+            ds::MenuRow::new(id)
+                .height(size::PALETTE_ROW)
+                .radius(radii(cx).inset_row())
+                .inset((size::PALETTE_ROW - size::ICON_TILE) / 2.)
+                .start_slot(tile)
+                .child(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .child(text::plain(label))
+                        .child(end),
+                )
+        };
+        let palette = v_flex()
+            .w(px(size::MODAL_WIDTH))
+            .p(px(space::XS))
+            .gap(px(space::XS))
+            .rounded(px(radii(cx).modal))
+            .bg(surface::tray(cx))
+            .border_1()
+            .border_color(surface::floating_border(cx))
+            .child(
+                ds::inset_panel(cx).child(
+                    h_flex()
+                        .h(px(size::CONTROL))
+                        .px(px(space::SM))
+                        .gap(px(space::MD))
+                        .child(ds::icon::lead(IconName::MagnifyingGlass))
+                        .child(text::muted(
+                            "Search commands, types, nodes, queries and branches…",
+                        )),
+                ),
+            )
+            .child(
+                ds::segmented(cx)
+                    .child(ds::segment("g-tab-all", "All", true, cx))
+                    .child(ds::segment("g-tab-types", "Types", false, cx))
+                    .child(ds::segment("g-tab-commands", "Commands", false, cx)),
+            )
+            .child(ds::inset_label("Recent", size::PALETTE_ROW))
+            .child(
+                ds::inset_panel(cx)
+                    .child(palette_row(
+                        "g-palette-agent",
+                        ds::icon_tile(IconName::ZedAssistant, cx),
+                        "Agent: open agent",
+                        ds::KeyCaps::for_action_in(&OpenAgent, &focus).into_any_element(),
+                    ))
                     .child(
-                        studio_ui::ds::button("g-filter", "Filter")
-                            .start_icon(Icon::new(IconName::Filter)),
+                        palette_row(
+                            "g-palette-person",
+                            ds::tile(cx).child(ds::type_dot("Person")),
+                            "Person",
+                            text::muted("node · 200 rows").into_any_element(),
+                        )
+                        .toggle_state(true),
                     ),
             )
-            .child(grid_header(&columns, px(0.), cx))
-            .children(rows.iter().enumerate().map(|(index, (slug, name, title))| {
-                ds::row_rule(
-                    h_flex()
-                        .h(px(size::ROW))
-                        .when(index == 0, |row| row.bg(surface::selected_document(cx)))
-                        .child(studio_ui::grid_cell(px(180.), false).child(text::body(*slug)))
-                        .child(studio_ui::grid_cell(px(200.), false).child(text::body(*name)))
-                        .child(studio_ui::grid_cell(px(200.), false).child(text::body(*title))),
-                    cx,
-                )
-            }));
+            .child(
+                h_flex()
+                    .px(px(space::SM))
+                    .py(px(space::SM))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(text::meta("Open this node type's table.")),
+                    )
+                    .child(
+                        ds::key_hints()
+                            .child(
+                                ds::key_hint(&menu::SelectPrevious, "Navigate", &focus, cx)
+                                    .and(&menu::SelectNext, &focus)
+                                    .raised(),
+                            )
+                            .child(ds::key_hint(&menu::Confirm, "Select", &focus, cx).raised())
+                            .child(ds::key_hint(&menu::Cancel, "Close", &focus, cx).raised()),
+                    ),
+            );
 
         let card = ds::card(cx)
             .child(
@@ -401,41 +506,53 @@ impl Render for DesignGallery {
                 ),
             );
 
-        // The agent's prompt, after Delta: the next message's gutter row under the thread, and
-        // the agent and send in the row under it.
-        let composer = ds::card(cx)
+        // The agent's composer, after the reference chat's: a notice strip attached to the top
+        // of a composer card, the message then its controls, and what the agent reaches under
+        // it; the reply's actions above, and the Conversations panel's launcher.
+        let composer = v_flex()
+            .gap(px(space::SM))
             .child(
                 h_flex()
-                    .px(px(space::MD))
-                    .pt(px(space::MD))
-                    .pb(px(space::LG))
-                    .gap(px(space::SM))
-                    .items_start()
-                    .child(
-                        div()
-                            .w(px(size::GUTTER))
-                            .flex()
-                            .justify_center()
-                            .pt(px(space::XS))
-                            .child(studio_ui::ds::icon::lead(IconName::Person)),
-                    )
-                    .child(text::muted("Ask about the graph, or ask for a change…")),
-            )
-            .child(
-                h_flex()
-                    .px(px(space::MD))
-                    .pb(px(space::MD))
                     .gap(px(space::SM))
                     .items_center()
-                    .child(div().flex_1())
-                    .child(studio_ui::ds::icon_button("g-restart", IconName::RotateCw))
+                    .child(ds::row_icon_button("g-copy-reply", IconName::Copy))
+                    .child(text::meta("3 tool calls")),
+            )
+            .child(ds::attach_notice(
+                ds::notice_strip(cx).child(
+                    ds::notice_line()
+                        .child(ds::meta(IconName::GitBranch, "agent/20261021-122659"))
+                        .child(ds::meta(IconName::Pencil, "1"))
+                        .child(div().flex_1())
+                        .child(
+                            ds::toolbar_button("g-review", "Review")
+                                .start_icon(Icon::new(IconName::Eye)),
+                        ),
+                ),
+                ds::composer_card(cx)
+                    .child(text::muted("Ask about the graph, or ask for a change…"))
                     .child(
-                        ds::pill("g-agent", cx)
-                            .child(ui::Indicator::dot().color(Color::Success))
-                            .child(text::body("Claude Agent"))
-                            .child(studio_ui::ds::icon::meta(IconName::ChevronDown)),
-                    )
-                    .child(ds::composer_button("g-send", IconName::ArrowUp, true, cx)),
+                        ds::composer_controls()
+                            .child(
+                                ds::pill("g-agent", cx)
+                                    .child(ui::Indicator::dot().color(Color::Success))
+                                    .child(text::body("Claude Agent"))
+                                    .child(studio_ui::ds::icon::meta(IconName::ChevronDown)),
+                            )
+                            .child(ds::composer_button("g-send", IconName::ArrowUp, true, cx)),
+                    ),
+                cx,
+            ))
+            .child(div().w_full().flex().justify_center().child(ds::meta_row([
+                text::meta("Reads knowledge at main").into_any_element(),
+                text::meta("writes only to a branch of its own").into_any_element(),
+            ])))
+            .child(
+                ds::button("g-ask", "Ask the agent")
+                    .style(ButtonStyle::Outlined)
+                    .full_width()
+                    .start_icon(Icon::new(IconName::ZedAssistant))
+                    .key_caps(ds::KeyCaps::for_action_in(&OpenAgent, &focus)),
             );
 
         let settings_rows = ds::card(cx)
@@ -618,7 +735,7 @@ impl Render for DesignGallery {
                     .items_start()
                     .child(section("Left dock", sidebar))
                     .child(section(
-                        "Table",
+                        "Grid card · header and data cells",
                         div().w(px(size::READING_WIDTH)).child(table),
                     )),
             )
@@ -632,6 +749,10 @@ impl Render for DesignGallery {
                         div().w(px(size::STATE_DETAIL_WIDTH)).child(empty),
                     )),
             )
+            .child(section(
+                "Command palette · tray, inset groups, tiles, key caps",
+                palette,
+            ))
             .child(section("Buttons", buttons))
             .child(
                 h_flex()
@@ -646,7 +767,7 @@ impl Render for DesignGallery {
                 div().w(px(size::READING_WIDTH)).child(settings_rows),
             ))
             .child(section(
-                "Agent prompt",
+                "Agent composer · notice strip, reply actions, launcher",
                 div().w(px(size::MODAL_WIDTH)).child(composer),
             ))
             .child(section(

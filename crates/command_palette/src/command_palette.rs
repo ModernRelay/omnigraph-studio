@@ -32,7 +32,7 @@ use studio_actions::agent::Ask;
 use studio_actions::graph::{OpenNode, OpenQueryFile, OpenStoredQuery, OpenType};
 use studio_actions::palette::{AskAgent, ShowScope};
 use studio_actions::workspace::{GoTo, ShowKeyBindings, SwitchBranch, ToggleCommandPalette};
-use studio_ui::ds::{MenuRow, elevation, radii, size, space, surface};
+use studio_ui::ds::{InsetEdge, KeyCaps, MenuRow, elevation, radii, size, space, surface};
 use studio_workspace::{ToastKind, Workspace};
 use ui::HighlightedLabel;
 use ui::prelude::*;
@@ -307,10 +307,56 @@ impl Row {
 }
 
 const ROW_HEIGHT: f32 = studio_ui::ds::size::PALETTE_ROW;
-/// Space above the first row and below the last. The list's height includes it, so the rows
+/// Space above the first row and below the last: an inset panel's padding, which its first
+/// and last rows draw there (`ds::inset_slice`). The list's height includes it, so the rows
 /// fit without scrolling and a selected row is never clipped by the edge.
 const LIST_PAD: f32 = studio_ui::ds::space::XS;
+/// Items shown before the list scrolls: rows, and the labels of their groups.
 const VISIBLE_ROWS: usize = 11;
+
+/// One item of the results list, each a row high: a group's label above its inset panel, or
+/// a match in its group's panel.
+#[derive(Clone, Debug, PartialEq)]
+enum Shown {
+    /// A group's name, or with text typed how many rows matched (`count`).
+    Label { text: SharedString, count: bool },
+    /// The match at `at` in `matches`, and where it sits in its panel.
+    Row { at: usize, edge: InsetEdge },
+}
+
+/// The group a row is listed under while nothing is typed: the rows run most recently, then
+/// each kind in the order `rank` lists them.
+fn heading(group: Group) -> &'static str {
+    match group {
+        Group::Studio => "Commands",
+        Group::Type => "Types",
+        Group::Query => "Queries",
+        Group::Node => "Nodes",
+        Group::Branch => "Branches",
+        Group::Other => "Other commands",
+    }
+}
+
+/// A row's tile: what kind of row it is, in a neutral tile. A command takes its area's icon
+/// (the icon of the surface it acts on), by its action's namespace.
+fn command_icon(name: &str) -> IconName {
+    let namespace = name
+        .rsplit_once("::")
+        .map_or("", |(namespace, _)| namespace);
+    match namespace {
+        "studio_table" | "studio_blob" | "studio_node" => IconName::Table,
+        "studio_query" | "studio_queries" => IconName::Code,
+        "studio_history" => IconName::HistoryRerun,
+        "studio_review" => IconName::GitBranch,
+        "studio_canvas" => IconName::Crosshair,
+        "studio_ontology" => IconName::GitGraph,
+        "studio_agent" => IconName::ZedAssistant,
+        "studio_tree" => IconName::ListTree,
+        "studio_graph" => IconName::Blocks,
+        name if name.starts_with("studio") => IconName::BoltOutlined,
+        _ => IconName::CaseSensitive,
+    }
+}
 
 pub(crate) struct CommandPalette {
     mode: Mode,
@@ -324,6 +370,8 @@ pub(crate) struct CommandPalette {
     fixed: usize,
     matches: Vec<Ranked>,
     selected: usize,
+    /// The list's items as last drawn: labels, and the matches in their groups' panels.
+    shown: Vec<Shown>,
     scroll: UniformListScrollHandle,
     /// The pause in typing before the node reads go out.
     node_search: Option<Task<()>>,
@@ -435,6 +483,7 @@ impl CommandPalette {
             fixed,
             matches: Vec::new(),
             selected: 0,
+            shown: Vec::new(),
             scroll: UniformListScrollHandle::new(),
             node_search: None,
             nodes_for: String::new(),
@@ -762,8 +811,7 @@ impl CommandPalette {
                     && matches!(self.rows[ranked.index], Row::Branch { current: true, .. })
             })
             .unwrap_or(0);
-        self.scroll
-            .scroll_to_item(self.selected, ScrollStrategy::Nearest);
+        self.scroll_to_selected(cx);
         cx.notify();
     }
 
@@ -772,9 +820,88 @@ impl CommandPalette {
             return;
         }
         self.selected = index.min(self.matches.len() - 1);
-        self.scroll
-            .scroll_to_item(self.selected, ScrollStrategy::Nearest);
+        self.scroll_to_selected(cx);
         cx.notify();
+    }
+
+    /// Brings the highlighted row into view, by its place among the list's items, with its
+    /// group's label when it is the group's first row.
+    fn scroll_to_selected(&mut self, cx: &App) {
+        let layout = self.layout(cx);
+        let item = layout
+            .iter()
+            .position(|shown| matches!(shown, Shown::Row { at, .. } if *at == self.selected))
+            .unwrap_or(self.selected);
+        let labelled = item
+            .checked_sub(1)
+            .is_some_and(|above| matches!(layout.get(above), Some(Shown::Label { .. })));
+        self.scroll
+            .scroll_to_item_with_offset(item, ScrollStrategy::Nearest, labelled as usize);
+    }
+
+    /// Whether node rows are still to come for the text, in a scope that shows them.
+    fn searching_shown(&self) -> bool {
+        self.searching && self.mode.scope().is_some_and(Scope::searches_nodes)
+    }
+
+    /// The matches that are results; "Search more types" is a way on, not one.
+    fn result_count(&self) -> usize {
+        self.matches
+            .iter()
+            .filter(|ranked| !matches!(self.rows[ranked.index], Row::MoreTypes { .. }))
+            .count()
+    }
+
+    /// The list's items. With nothing typed the rows fall in groups, as `rank` orders them: the
+    /// rows run most recently, then each kind; each group is an inset panel under its name,
+    /// named only when there are two groups or more (one alone is the scope the tab names).
+    /// With text typed the matches are one panel, ranked, under their count; no count of none
+    /// while nodes are still to come.
+    fn layout(&self, cx: &App) -> Vec<Shown> {
+        let typed = !self.query.read(cx).is_empty(cx);
+        let mut runs: Vec<(&'static str, std::ops::Range<usize>)> = Vec::new();
+        if typed {
+            if !self.matches.is_empty() {
+                runs.push(("", 0..self.matches.len()));
+            }
+        } else {
+            let recent = recent::keys(cx);
+            for (at, ranked) in self.matches.iter().enumerate() {
+                let candidate = &self.candidates[ranked.index];
+                let title = if recent.contains(&candidate.key) {
+                    "Recent"
+                } else {
+                    heading(candidate.group)
+                };
+                match runs.last_mut() {
+                    Some((last, range)) if *last == title => range.end = at + 1,
+                    _ => runs.push((title, at..at + 1)),
+                }
+            }
+        }
+        let mut shown = Vec::new();
+        let results = self.result_count();
+        if typed && !(self.searching_shown() && results == 0) && !self.matches.is_empty() {
+            shown.push(Shown::Label {
+                text: format!("{results} {}", self.mode.noun(results)).into(),
+                count: true,
+            });
+        }
+        let named = !typed && runs.len() > 1;
+        for (title, range) in runs {
+            if named {
+                shown.push(Shown::Label {
+                    text: title.into(),
+                    count: false,
+                });
+            }
+            let last = range.end - 1;
+            shown.extend(range.clone().map(|at| Shown::Row {
+                at,
+                edge: InsetEdge::of(at == range.start, at == last),
+            }));
+        }
+        shown
     }
 
     fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
@@ -862,104 +989,111 @@ impl CommandPalette {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         range
-            .filter_map(|ix| {
-                let ranked = self.matches.get(ix)?;
-                let candidate = &self.candidates[ranked.index];
-                let row = &self.rows[ranked.index];
-                // A click runs the row clicked, by its key: rows that came in since this frame
-                // was drawn (nodes found, saved queries) can have moved it.
-                let key = candidate.key.clone();
-                let label =
-                    HighlightedLabel::new(candidate.label.clone(), ranked.positions.clone())
-                        .truncate();
-                let muted = |text: String| studio_ui::ds::text::muted(text).into_any_element();
-                let end: AnyElement = match row {
-                    Row::Action { action, .. } => match &self.previous_focus {
-                        Some(focus) => ui::KeyBinding::for_action_in(action.as_ref(), focus, cx)
-                            .into_any_element(),
-                        None => ui::KeyBinding::for_action(action.as_ref(), cx).into_any_element(),
-                    },
-                    Row::Type { kind, count, .. } => muted(match count {
-                        Some(count) => format!("{kind} · {count} rows"),
-                        None => (*kind).to_owned(),
-                    }),
-                    Row::Node { type_name, .. } => muted(type_name.clone()),
-                    Row::Branch { current, .. } => muted(if *current {
-                        "current".into()
-                    } else {
-                        String::new()
-                    }),
-                    Row::Tab { .. } => muted("open tab".into()),
-                    Row::Saved { .. } => muted("saved".into()),
-                    Row::Stored { mutation, .. } => muted(if *mutation {
-                        "stored · writes".into()
-                    } else {
-                        "stored".into()
-                    }),
-                    Row::Alias { query, .. } => muted(format!("alias · {query}")),
-                    Row::MoreTypes { count } => {
-                        muted(format!("next {}", (*count).min(TYPES_PER_SEARCH)))
-                    }
-                };
-                let start: Option<gpui::Div> = match row {
-                    Row::Type { kind, .. } => Some(studio_ui::kind_swatch(
-                        &candidate.label,
-                        *kind == "edge",
-                        cx,
-                    )),
-                    Row::Node { type_name, .. } => Some(studio_ui::type_swatch(type_name, cx)),
-                    Row::Branch { current, .. } => {
-                        Some(div().child(studio_ui::ds::icon::lead(if *current {
-                            IconName::Check
-                        } else {
-                            IconName::GitBranch
-                        })))
-                    }
-                    Row::Tab { .. } | Row::Saved { .. } => {
-                        Some(div().child(studio_ui::ds::icon::lead(IconName::Code)))
-                    }
-                    Row::Stored { .. } => {
-                        Some(div().child(studio_ui::ds::icon::lead(IconName::Server)))
-                    }
-                    Row::Alias { .. } => {
-                        Some(div().child(studio_ui::ds::icon::lead(IconName::Link)))
-                    }
-                    Row::MoreTypes { .. } => {
-                        Some(div().child(studio_ui::ds::icon::lead(IconName::MagnifyingGlass)))
-                    }
-                    Row::Action { .. } => None,
-                };
-                Some(
-                    div()
-                        .h(px(ROW_HEIGHT))
-                        .child(
-                            MenuRow::new(ix)
-                                .height(ROW_HEIGHT)
-                                .radius(radii(cx).palette_row())
-                                .toggle_state(ix == self.selected)
-                                .when_some(start, |row, start| row.start_slot(start))
-                                .child(
-                                    h_flex()
-                                        .w_full()
-                                        .gap(px(space::MD))
-                                        .justify_between()
-                                        .child(label)
-                                        .child(div().flex_none().child(end)),
-                                )
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    let at = this.matches.iter().position(|ranked| {
-                                        this.candidates[ranked.index].key == key
-                                    });
-                                    if let Some(at) = at {
-                                        this.selected = at;
-                                        this.run_selected(window, cx);
-                                    }
-                                })),
-                        )
+            .filter_map(|item| match self.shown.get(item)?.clone() {
+                Shown::Label { text, count } => Some(
+                    studio_ui::ds::inset_label(text, ROW_HEIGHT)
+                        .when(count, |label| {
+                            label.debug_selector(|| "palette-count".into())
+                        })
                         .into_any_element(),
-                )
+                ),
+                Shown::Row { at, edge } => self.render_row(at, edge, cx),
             })
             .collect()
+    }
+
+    /// The match at `ix` as a row of its group's inset panel: its tile, its label with the
+    /// letters that matched, and at its end its keys as caps or what it is, muted.
+    fn render_row(
+        &mut self,
+        ix: usize,
+        edge: InsetEdge,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let ranked = self.matches.get(ix)?;
+        let candidate = &self.candidates[ranked.index];
+        let row = &self.rows[ranked.index];
+        // A click runs the row clicked, by its key: rows that came in since this frame was
+        // drawn (nodes found, saved queries) can have moved it.
+        let key = candidate.key.clone();
+        let label =
+            HighlightedLabel::new(candidate.label.clone(), ranked.positions.clone()).truncate();
+        let muted = |text: String| studio_ui::ds::text::muted(text).into_any_element();
+        let end: AnyElement = match row {
+            Row::Action { action, .. } => match &self.previous_focus {
+                Some(focus) => KeyCaps::for_action_in(action.as_ref(), focus).into_any_element(),
+                None => KeyCaps::for_action(action.as_ref()).into_any_element(),
+            },
+            Row::Type { kind, count, .. } => muted(match count {
+                Some(count) => format!("{kind} · {count} rows"),
+                None => (*kind).to_owned(),
+            }),
+            Row::Node { type_name, .. } => muted(type_name.clone()),
+            Row::Branch { current, .. } => muted(if *current {
+                "current".into()
+            } else {
+                String::new()
+            }),
+            Row::Tab { .. } => muted("open tab".into()),
+            Row::Saved { .. } => muted("saved".into()),
+            Row::Stored { mutation, .. } => muted(if *mutation {
+                "stored · writes".into()
+            } else {
+                "stored".into()
+            }),
+            Row::Alias { query, .. } => muted(format!("alias · {query}")),
+            Row::MoreTypes { count } => muted(format!("next {}", (*count).min(TYPES_PER_SEARCH))),
+        };
+        let icon_tile = |glyph| studio_ui::ds::icon_tile(glyph, cx);
+        // A type's colour is data, so it stays, as its dot in the tile: the row names the type
+        // already, where a lettered mark would name it again.
+        let type_tile =
+            |type_name: &str| studio_ui::ds::tile(cx).child(studio_ui::ds::type_dot(type_name));
+        let start = match row {
+            Row::Type { kind, .. } if *kind == "edge" => icon_tile(IconName::ArrowRight),
+            Row::Type { .. } => type_tile(&candidate.label),
+            Row::Node { type_name, .. } => type_tile(type_name),
+            Row::Branch { current, .. } => icon_tile(if *current {
+                IconName::Check
+            } else {
+                IconName::GitBranch
+            }),
+            Row::Tab { .. } | Row::Saved { .. } => icon_tile(IconName::Code),
+            Row::Stored { .. } => icon_tile(IconName::Server),
+            Row::Alias { .. } => icon_tile(IconName::Link),
+            Row::MoreTypes { .. } => icon_tile(IconName::MagnifyingGlass),
+            Row::Action { .. } => icon_tile(command_icon(&candidate.key)),
+        };
+        Some(
+            studio_ui::ds::inset_slice(edge, ROW_HEIGHT, cx)
+                .child(
+                    MenuRow::new(ix)
+                        .height(ROW_HEIGHT)
+                        .radius(radii(cx).inset_row())
+                        .inset((ROW_HEIGHT - size::ICON_TILE) / 2.)
+                        .toggle_state(ix == self.selected)
+                        .start_slot(start)
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .gap(px(space::MD))
+                                .justify_between()
+                                .child(label)
+                                .child(div().flex_none().child(end)),
+                        )
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let at = this
+                                .matches
+                                .iter()
+                                .position(|ranked| this.candidates[ranked.index].key == key);
+                            if let Some(at) = at {
+                                this.selected = at;
+                                this.run_selected(window, cx);
+                            }
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     fn selected_description(&self) -> Option<SharedString> {
@@ -1221,11 +1355,12 @@ impl Render for CommandPalette {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let count = self.matches.len();
         // Only a scope that shows nodes waits on them.
-        let searching = self.searching && self.mode.scope().is_some_and(Scope::searches_nodes);
+        let searching = self.searching_shown();
+        self.shown = self.layout(cx);
+        let items = self.shown.len();
         let list = if count == 0 {
-            div()
+            studio_ui::ds::inset_panel(cx)
                 .h(px(ROW_HEIGHT * 2.))
-                .flex()
                 .items_center()
                 .justify_center()
                 .child(studio_ui::ds::text::muted(
@@ -1234,28 +1369,29 @@ impl Render for CommandPalette {
                 ))
                 .into_any_element()
         } else {
+            // The first row of a panel draws its padding above itself: into the list's own
+            // padding when no label leads the list.
+            let top = match self.shown.first() {
+                Some(Shown::Row { .. }) => LIST_PAD,
+                _ => 0.,
+            };
             uniform_list(
                 "command-palette-rows",
-                count,
+                items,
                 cx.processor(|this, range, _window, cx| this.render_rows(range, cx)),
             )
             .track_scroll(&self.scroll)
-            .h(px(
-                ROW_HEIGHT * count.min(VISIBLE_ROWS) as f32 + 2. * LIST_PAD
-            ))
-            .p(px(LIST_PAD))
+            .h(px(ROW_HEIGHT * items.min(VISIBLE_ROWS) as f32
+                + top
+                + LIST_PAD))
+            .pt(px(top))
+            .pb(px(LIST_PAD))
             .into_any_element()
         };
         let description = self.selected_description();
-        // "Search more types" is a way on, not a result.
-        let results = self
-            .matches
-            .iter()
-            .filter(|ranked| !matches!(self.rows[ranked.index], Row::MoreTypes { .. }))
-            .count();
         let typed = !self.query.read(cx).is_empty(cx);
         let focus = self.query.focus_handle(cx);
-        // The scope tabs, as a segmented control; each carries its ⌘ number in the tooltip.
+        // The scope tabs, as text tabs; each carries its ⌘ number in the tooltip.
         let tabs = self.mode.scope().map(|current| {
             let mut tabs = studio_ui::ds::segmented(cx);
             for (index, scope) in Scope::TABS.into_iter().enumerate() {
@@ -1275,8 +1411,20 @@ impl Render for CommandPalette {
                     ),
                 );
             }
-            h_flex().px(px(space::SM)).pb(px(space::XS)).child(tabs)
+            h_flex().child(tabs)
         });
+        // The keys that work here, as caps on the tray: the list's, then Tab once there is
+        // text to hand the agent.
+        let hint = |action: &dyn Action, label: &'static str| {
+            studio_ui::ds::key_hint(action, label, &focus, cx).raised()
+        };
+        let hints = studio_ui::ds::key_hints()
+            .child(hint(&menu::SelectPrevious, "Navigate").and(&menu::SelectNext, &focus))
+            .child(hint(&menu::Confirm, "Select"))
+            .child(hint(&menu::Cancel, "Close"))
+            .when(typed && self.mode != Mode::Keys, |hints| {
+                hints.child(hint(&AskAgent, "Ask"))
+            });
         v_flex()
             .key_context("CommandPalette Picker")
             .on_action(cx.listener(Self::select_next))
@@ -1287,49 +1435,42 @@ impl Render for CommandPalette {
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::show_scope))
             .on_action(cx.listener(Self::ask_agent))
-            // Tower's palette: a glass frame holding one solid card, the results, inset by a
-            // small gap and rounded concentrically; the search above it on the glass, the
-            // description and the keys below.
+            // The reference palette, on Tower's corners: a grey tray holding white inset
+            // panels, the search in one and each group of results in its own under its name,
+            // the scope tabs between them, and the keys along the foot.
             .w(px(size::PALETTE_WIDTH))
             .max_w_full()
             .p(px(space::XS))
             .gap(px(space::XS))
             .rounded(px(radii(cx).modal))
-            .bg(surface::floating(cx))
+            .bg(surface::tray(cx))
             .border_1()
             .border_color(surface::floating_border(cx))
             .shadow(elevation::floating(cx))
             .child(
-                h_flex()
-                    .px(px(space::CONTROL_INSET))
-                    .py(px(space::SM))
-                    .gap(px(space::MD))
-                    .child(studio_ui::ds::icon::lead(IconName::MagnifyingGlass))
-                    .child(div().flex_1().child(self.query.clone()))
-                    .when(searching, |row| {
-                        row.child(
-                            div()
-                                .id("palette-searching")
-                                .debug_selector(|| "palette-searching".into())
-                                .child(studio_ui::ds::spinner())
-                                .tooltip(ui::Tooltip::text("Searching nodes on the server")),
-                        )
-                    }),
+                studio_ui::ds::inset_panel(cx).child(
+                    h_flex()
+                        .h(px(size::CONTROL))
+                        .px(px(space::SM))
+                        .gap(px(space::MD))
+                        .child(studio_ui::ds::icon::lead(IconName::MagnifyingGlass))
+                        .child(div().flex_1().child(self.query.clone()))
+                        .when(searching, |row| {
+                            row.child(
+                                div()
+                                    .id("palette-searching")
+                                    .debug_selector(|| "palette-searching".into())
+                                    .child(studio_ui::ds::spinner())
+                                    .tooltip(ui::Tooltip::text("Searching nodes on the server")),
+                            )
+                        }),
+                ),
             )
             .children(tabs)
-            .child(
-                div()
-                    .rounded(px(radii(cx).palette_list()))
-                    .bg(surface::document(cx))
-                    .border_1()
-                    .border_color(surface::floating_border(cx))
-                    .shadow(elevation::raised(cx))
-                    .overflow_hidden()
-                    .child(list),
-            )
+            .child(list)
             .child(
                 h_flex()
-                    .px(px(space::CONTROL_INSET))
+                    .px(px(space::SM))
                     .py(px(space::SM))
                     .gap(px(space::LG))
                     .child(
@@ -1338,18 +1479,7 @@ impl Render for CommandPalette {
                             .min_w_0()
                             .children(description.map(|d| studio_ui::ds::text::meta(d).truncate())),
                     )
-                    // No "0 nodes" while the nodes are still to come.
-                    .when(!(searching && results == 0), |footer| {
-                        footer.child(div().debug_selector(|| "palette-count".into()).child(
-                            studio_ui::ds::text::meta(format!(
-                                "{results} {}",
-                                self.mode.noun(results)
-                            )),
-                        ))
-                    })
-                    .when(typed && self.mode != Mode::Keys, |footer| {
-                        footer.child(studio_ui::ds::key_hint(&AskAgent, "Ask", &focus, cx))
-                    }),
+                    .child(hints),
             )
     }
 }
@@ -1375,12 +1505,13 @@ mod tests {
 
     impl Render for Host {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            // Where the person was: opening a stored query is available there, as in the
-            // workspace.
+            // Where the person was: opening a stored query and a type are available there, as
+            // in the workspace.
             div()
                 .size_full()
                 .track_focus(&self.focus)
                 .on_action(|_: &OpenStoredQuery, _, _| {})
+                .on_action(|_: &OpenType, _, _| {})
                 .children(self.palette.clone())
         }
     }
@@ -1751,6 +1882,69 @@ mod tests {
                 Some("People with a title")
             );
         });
+    }
+
+    /// With nothing typed the rows fall in groups, each its own inset panel under its name: the
+    /// rows run most recently, then each kind, as `rank` orders them, and a group's first and
+    /// last rows close its panel. With text typed the matches are one panel under their count.
+    #[gpui::test]
+    async fn rows_are_grouped_by_kind_until_text_is_typed(cx: &mut TestAppContext) {
+        let session = session(cx);
+        let (palette, cx) = palette(Scope::All, session, cx);
+        cx.update(|_, cx| recent::record("type:Person", cx));
+        palette.update(cx, |palette, cx| palette.update_matches(cx));
+        let layout =
+            |cx: &mut VisualTestContext| palette.update(cx, |palette, cx| palette.layout(cx));
+        let shown = layout(cx);
+        let labels: Vec<&str> = shown
+            .iter()
+            .filter_map(|shown| match shown {
+                Shown::Label { text, count: false } => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, ["Recent", "Branches"], "{shown:?}");
+        // Each label is followed by its group's panel: a first row, then its last.
+        for (at, item) in shown.iter().enumerate() {
+            if let Shown::Label { .. } = item {
+                assert!(matches!(
+                    shown.get(at + 1),
+                    Some(Shown::Row {
+                        edge: InsetEdge::First | InsetEdge::Only,
+                        ..
+                    })
+                ));
+                if at > 0 {
+                    assert!(matches!(
+                        shown[at - 1],
+                        Shown::Row {
+                            edge: InsetEdge::Last | InsetEdge::Only,
+                            ..
+                        }
+                    ));
+                }
+            }
+        }
+        let rows = shown
+            .iter()
+            .filter(|shown| matches!(shown, Shown::Row { .. }))
+            .count();
+        assert_eq!(
+            rows,
+            palette.read_with(cx, |palette, _| palette.matches.len())
+        );
+
+        type_text(&palette, "mai", cx);
+        let shown = layout(cx);
+        assert!(
+            matches!(shown.first(), Some(Shown::Label { count: true, .. })),
+            "{shown:?}"
+        );
+        assert!(
+            shown[1..]
+                .iter()
+                .all(|shown| matches!(shown, Shown::Row { .. }))
+        );
     }
 
     #[test]

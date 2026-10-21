@@ -297,6 +297,7 @@ pub struct Button {
     start_icon: Option<Icon>,
     end_icon: Option<Icon>,
     key_binding: Option<KeyBinding>,
+    key_caps: Option<ds::KeyCaps>,
 }
 
 impl Button {
@@ -312,6 +313,7 @@ impl Button {
             start_icon: None,
             end_icon: None,
             key_binding: None,
+            key_caps: None,
         }
     }
 
@@ -350,6 +352,13 @@ impl Button {
     /// The keys that do what the button does, after its label.
     pub fn key_binding(mut self, key_binding: impl Into<Option<KeyBinding>>) -> Self {
         self.key_binding = key_binding.into();
+        self
+    }
+
+    /// The keys as key caps, one box per key, after the label: for a launcher whose keys are
+    /// part of what it says (the Conversations panel's "Ask the agent ⌘⇧A").
+    pub fn key_caps(mut self, key_caps: ds::KeyCaps) -> Self {
+        self.key_caps = Some(key_caps);
         self
     }
 }
@@ -458,8 +467,13 @@ impl RenderOnce for Button {
             _ => None,
         };
         let pad = inset(size);
+        // A full-width button with keys reads as a launcher: its label at the start, its keys
+        // at the end. Without keys its content stays centred.
+        let spread =
+            self.base.width.is_some() && (self.key_binding.is_some() || self.key_caps.is_some());
         self.base.frame(paint, cx).child(
             h_flex()
+                .when(spread, |content| content.w_full())
                 .px(px(pad - 1.))
                 .gap(px(match size {
                     ButtonSize::Large | ButtonSize::Medium => ds::space::SM,
@@ -469,6 +483,7 @@ impl RenderOnce for Button {
                 .child(
                     h_flex()
                         .debug_selector(|| "button-label".into())
+                        .when(spread, |label| label.flex_1())
                         .gap(px(ds::space::SM))
                         .justify_between()
                         .child(
@@ -480,7 +495,8 @@ impl RenderOnce for Button {
                         .children(self.key_binding.map(|key| match key_ink {
                             Some(ink) => key.color(ink),
                             None => key,
-                        })),
+                        }))
+                        .children(self.key_caps),
                 )
                 .children(self.end_icon.map(end_icon)),
         )
@@ -729,6 +745,26 @@ mod tests {
                         .debug_selector(|| "pill-button".into())
                         .child(ds::pill_button("p", ui::IconName::Close, Color::Muted, cx)),
                 )
+                .child(
+                    div()
+                        .debug_selector(|| "icon-tile".into())
+                        .child(ds::icon_tile(ui::IconName::Table, cx)),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "segment".into())
+                        .child(ds::segment("s", "All", true, cx)),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "header-cell".into())
+                        .child(ds::header_cell(Some(ui::IconName::Hash), "count", false)),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "data-cell".into())
+                        .child(ds::data_cell().child(ds::text::body("12"))),
+                )
         }
     }
 
@@ -851,6 +887,22 @@ mod tests {
             ("toolbar-icon-button", ds::size::BAR_BUTTON),
             ("row-button", ds::size::ROW_BUTTON),
             ("row-icon-button", ds::size::ROW_BUTTON),
+        ] {
+            assert_eq!(
+                f32::from(bounds(cx, selector).size.height),
+                side,
+                "{selector}"
+            );
+        }
+        // A tile is a square; a segment a bar button's height, raised or not; a grid's cells
+        // a header's and a row's.
+        let tile = bounds(cx, "icon-tile");
+        assert_eq!(f32::from(tile.size.height), ds::size::ICON_TILE);
+        assert_eq!(tile.size.width, tile.size.height, "a square");
+        for (selector, side) in [
+            ("segment", ds::size::BAR_BUTTON),
+            ("header-cell", ds::size::HEADER),
+            ("data-cell", ds::size::ROW),
         ] {
             assert_eq!(
                 f32::from(bounds(cx, selector).size.height),

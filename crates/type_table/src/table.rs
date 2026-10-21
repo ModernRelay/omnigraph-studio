@@ -203,6 +203,9 @@ struct BulkDraft {
     saving: bool,
 }
 
+/// The hover group of a grid row, for the actions its cells show under the pointer.
+const ROW_GROUP: &str = "table-row";
+
 /// A property's icon, by what it holds: text, a number, a time, a choice, a file.
 fn property_icon(property: &Property) -> IconName {
     if property.enum_values.is_some() {
@@ -6219,9 +6222,12 @@ impl TypeTable {
             return state.into_any_element();
         }
         let grid = self.render_grid(window, cx);
-        // A column's edge dragged anywhere over the grid resizes it until released.
+        // A column's edge dragged anywhere over the grid resizes it until released. The grid
+        // is a card inset from the document's edges, as the reference table's.
         div()
             .size_full()
+            .px(px(space::EDGE))
+            .py(px(space::LG))
             .on_drag_move(
                 cx.listener(|this, event: &DragMoveEvent<ColumnDrag>, _, cx| {
                     this.drag_column(event, cx)
@@ -6233,7 +6239,7 @@ impl TypeTable {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.end_resize(cx)),
             )
-            .child(grid)
+            .child(studio_ui::ds::card(cx).size_full().child(grid))
             .into_any_element()
     }
 
@@ -6265,36 +6271,27 @@ impl TypeTable {
                     .as_ref()
                     .filter(|sort| sortable.is_some_and(|p| p.name == sort.property));
                 let key = column.key.clone();
+                let menu_key = column.key.clone();
                 let resize = self.render_resize_handle(index, column, cx);
-                let header = h_flex()
-                    .id(("column-header", index))
-                    .relative()
-                    .child(resize)
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            this.open_header_menu(key.clone(), event.position, window, cx)
-                        }),
-                    )
-                    .h(px(studio_ui::HEADER_HEIGHT))
-                    // Zed's table pads a header cell by `space::XS` (its `px_1`) and leaves the
-                    // body's cells to draw their own, so the header's text starts that much
-                    // closer to sit on the cells' edge.
-                    .px(px(space::XL - space::XS))
-                    .gap(px(space::SM))
-                    .w_full()
-                    .overflow_hidden()
-                    .when(column.align_right, |d| d.justify_end())
-                    .child(
-                        studio_ui::ds::text::body(column.title.clone())
-                            .color(if sorted.is_some() {
-                                Color::Default
-                            } else {
-                                Color::Muted
-                            })
-                            .single_line(),
-                    )
-                    .child(
+                let group = SharedString::from(format!("column-header-{index}"));
+                let kind = Some(self.column_icon(column));
+                let header = studio_ui::ds::cell_rule(
+                    studio_ui::ds::header_cell(kind, column.title.clone(), sorted.is_some()),
+                    cx,
+                )
+                .id(("column-header", index))
+                .group(group.clone())
+                .relative()
+                .w_full()
+                .child(resize)
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        this.open_header_menu(key.clone(), event.position, window, cx)
+                    }),
+                )
+                .child(
+                    div().min_w_0().flex_shrink(1000.).child(
                         studio_ui::ds::text::meta(match self.absent.get(&column.key) {
                             Some(then) => crate::peek::absence_text(then, false),
                             None => column.detail.clone(),
@@ -6302,15 +6299,27 @@ impl TypeTable {
                         .color(Color::Disabled)
                         .single_line()
                         .truncate(),
-                    )
-                    .children(sorted.map(|sort| {
-                        studio_ui::ds::icon::meta(if sort.descending {
-                            IconName::ArrowDown
-                        } else {
-                            IconName::ArrowUp
-                        })
-                        .color(Color::Accent)
-                    }));
+                    ),
+                )
+                .children(sorted.map(|sort| {
+                    studio_ui::ds::icon::meta(if sort.descending {
+                        IconName::ArrowDown
+                    } else {
+                        IconName::ArrowUp
+                    })
+                    .color(Color::Accent)
+                }))
+                // A number's header sits at the cells' end, as its values do.
+                .when(column.align_right, |header| header.justify_end())
+                .child(studio_ui::ds::hover_slot(
+                    group,
+                    studio_ui::ds::header_fill_opaque(sortable.is_some(), cx),
+                    studio_ui::ds::cell_action(("column-menu", index), IconName::Ellipsis)
+                        .tooltip(Tooltip::text("Column menu"))
+                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                            this.open_header_menu(menu_key.clone(), event.position(), window, cx)
+                        })),
+                ));
                 // An unpinned header drags onto another to move its column there.
                 let header = if index == 0 {
                     header
@@ -6387,16 +6396,17 @@ impl TypeTable {
                 GridPlace::Gap(width) => width,
             })
             .collect();
-        Table::new(places.len())
+        let header = self.render_header_row(headers, &widths, cx);
+        let table = Table::new(places.len())
             .interactable(&self.table_state)
             .width_config(ColumnWidthConfig::explicit(widths))
-            .header(headers)
             .disable_base_style()
             .hide_row_borders()
             .pin_cols(1)
             .map_row(move |(ix, row), _window, cx| {
                 let look = looks.borrow().get(&ix).copied().unwrap_or_default();
                 studio_ui::ds::dotted(row.border_b_1(), cx)
+                    .group(ROW_GROUP)
                     .when(look.header, |row| row.bg(header_bg))
                     .when(look.picked, |row| row.bg(picked_bg))
                     .when(look.cursor, |row| row.bg(selected_bg))
@@ -6486,8 +6496,81 @@ impl TypeTable {
                         })
                         .collect()
                 }),
-            )
+            );
+        v_flex()
+            .size_full()
+            .child(header)
+            .child(div().flex_1().min_h_0().child(table))
             .into_any_element()
+    }
+
+    /// The grid's header row, drawn here rather than by Zed's table, which pads its header row
+    /// and cells beyond [`size::HEADER`]: the header's fill under a hairline, its top corners the
+    /// card's, the pinned key column's header, then the others in a strip that scrolls sideways
+    /// with the rows (the table's horizontal scroll handle), each place as wide as its cells.
+    fn render_header_row(
+        &self,
+        headers: Vec<AnyElement>,
+        widths: &[Pixels],
+        cx: &App,
+    ) -> AnyElement {
+        let handle = self.table_state.read(cx).horizontal_scroll_handle.clone();
+        let mut places = headers.into_iter().zip(widths).map(|(header, width)| {
+            div()
+                .w(*width)
+                .h_full()
+                .flex_none()
+                .overflow_hidden()
+                .child(header)
+        });
+        let pinned: Vec<Div> = places.by_ref().take(1).collect();
+        let scrolled: Vec<Div> = places.collect();
+        let corner = studio_ui::ds::radius::flush(studio_ui::ds::radii(cx).md);
+        h_flex()
+            .w_full()
+            .h(px(studio_ui::HEADER_HEIGHT))
+            .flex_none()
+            .rounded_t(px(corner))
+            .bg(studio_ui::ds::header_fill(cx))
+            .border_b_1()
+            .border_color(studio_ui::ds::surface::rule(cx))
+            .child(h_flex().h_full().flex_shrink_0().children(pinned))
+            .when(!scrolled.is_empty(), |row| {
+                row.child(
+                    div()
+                        .id("table-header-scrollable")
+                        .h_full()
+                        .flex_grow(1.)
+                        .overflow_x_scroll()
+                        .restrict_scroll_to_axis()
+                        .track_scroll(&handle)
+                        .child(h_flex().h_full().children(scrolled)),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// What a column's header shows it holds: its property's kind, the key property's (text
+    /// for an `@id`), or for an edge's end and a relationship the arrow the sidebar draws them
+    /// with.
+    fn column_icon(&self, column: &ColumnSpec) -> IconName {
+        match &column.role {
+            ColumnRole::Property(property) => property_icon(property),
+            ColumnRole::Key => self
+                .schema
+                .as_ref()
+                .and_then(|schema| schema.node(&self.type_name))
+                .and_then(|node| node.property(&column.key))
+                .map_or(IconName::CaseSensitive, property_icon),
+            ColumnRole::Endpoint { .. } | ColumnRole::Relationship(_) => IconName::ArrowRight,
+        }
+    }
+
+    /// Peeks at row `ix`, as Space does with the cursor on it: the cursor moves to its key, and
+    /// a second press closes the peek.
+    fn peek_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.cursor = Some(Cursor { row: ix, col: 0 });
+        self.on_peek(&PeekRow, window, cx);
     }
 
     /// A grouped grid's header line: the value, how many rows hold it, and the disclosure.
@@ -6634,7 +6717,7 @@ impl TypeTable {
             h_flex()
                 .h(px(ROW_HEIGHT))
                 .w_full()
-                .px(px(space::XL))
+                .px(px(space::LG))
                 .items_center()
                 .child(content)
                 .into_any_element(),
@@ -7385,12 +7468,13 @@ impl TypeTable {
             .relative()
             .h(px(ROW_HEIGHT))
             .w_full()
-            .px(px(space::XL))
+            .px(px(space::LG))
             .flex()
             .items_center()
             .gap(px(space::XS))
             .overflow_hidden()
-            .when(col == 0, |d| d.border_r_1().border_color(divider))
+            .border_r_1()
+            .border_color(divider)
             .when(column.align_right, |d| d.justify_end());
         // The cursor and the editor are drawn as a ring over the cell, so no cell changes size.
         let ring = || {
@@ -7433,8 +7517,8 @@ impl TypeTable {
         };
         let numeric = column.align_right;
         if column.relationship().is_some() {
-            // The cell's padding (`px_4`) on both sides.
-            let available = self.layout.width(column) - 32.;
+            // The cell's padding on both sides.
+            let available = self.layout.width(column) - 2. * space::LG;
             return cell
                 .child(self.render_relation_cell(place, col, row, available, cx))
                 .when(is_cursor, |cell| cell.child(ring()))
@@ -7565,8 +7649,22 @@ impl TypeTable {
         } else if let Some(tooltip) = tooltip {
             cell = cell.tooltip(Tooltip::text(tooltip));
         }
+        // The key's cell ends in the row's Peek while the row is hovered, as the reference
+        // table's cells end in their action.
+        let peek = (col == 0).then(|| {
+            div().ml_auto().flex_none().child(
+                studio_ui::ds::cell_action(("peek-row", ix), IconName::Eye)
+                    .visible_on_hover(ROW_GROUP)
+                    .tooltip({
+                        let focus = self.focus_handle.clone();
+                        move |_, cx| Tooltip::for_action_in("Peek", &PeekRow, &focus, cx)
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| this.peek_at(ix, window, cx))),
+            )
+        });
         cell.children(dot.map(|color| Indicator::dot().color(color)))
             .child(content)
+            .children(peek)
             .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                 this.click_cell(ix, col, event.modifiers(), event.click_count(), window, cx)
             }))

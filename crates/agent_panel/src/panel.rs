@@ -10,7 +10,7 @@ use agent_client_protocol::schema::v1::{
     ContentBlock, PermissionOption, PermissionOptionKind, PlanEntryStatus,
     RequestPermissionOutcome, SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption,
     SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOptions,
-    SessionUpdate, StopReason, ToolCallStatus,
+    SessionUpdate, StopReason, ToolCallContent, ToolCallStatus,
 };
 use editor::{Editor, EditorEvent};
 use futures::channel::{mpsc, oneshot};
@@ -257,6 +257,9 @@ enum Entry {
         input: Option<Value>,
         /// Which of Studio's tools it is, by what the agent's adapter said when it was called.
         studio: Option<StudioTool>,
+        /// What the call returned, as the agent reported it (its content's text, else its raw
+        /// output): a query's rows show from it as a record card.
+        output: Option<String>,
     },
     Plan(Vec<(String, PlanEntryStatus)>),
     Permission(PermissionCard),
@@ -279,12 +282,14 @@ impl Entry {
 }
 
 /// One item of the thread's list: an entry, a query the agent ran, a run of steps folded to
-/// one line, or the callout of an agent that stopped. `lead` carries the agent's mark.
+/// one line, or the callout of an agent that stopped. `lead` carries the agent's mark; `ends`
+/// marks the last reply of a finished turn, which carries the turn's actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Block {
     Entry {
         index: usize,
         lead: bool,
+        ends: bool,
     },
     Query {
         index: usize,
@@ -298,9 +303,10 @@ enum Block {
     Exited,
 }
 
-/// What a thread was brought up to: its entries' version, its folds' count, and how the agent
-/// stopped ([`AgentPanel::thread_key`]).
-type ThreadKey = (u64, u64, Option<u64>);
+/// What a thread was brought up to: its entries' version, its folds' count, how the agent
+/// stopped, and whether it is working on a turn, which holds back the turn's actions
+/// ([`AgentPanel::thread_key`]).
+type ThreadKey = (u64, u64, Option<u64>, bool);
 
 /// The thread's entries, and what each shows folded to a number, kept as they change: a
 /// streamed token rehashes the entry it lands in, not the whole conversation (a tool's input
@@ -411,11 +417,13 @@ fn hash_entry(entry: &Entry, hasher: &mut impl std::hash::Hasher) {
             title,
             status,
             input,
+            output,
             ..
         } => {
             title.hash(hasher);
             format!("{status:?}").hash(hasher);
             input.as_ref().map(Value::to_string).hash(hasher);
+            output.hash(hasher);
         }
         Entry::Plan(items) => {
             for (content, status) in items {
@@ -1478,12 +1486,14 @@ impl AgentPanel {
             SessionUpdate::ToolCall(call) => {
                 let studio =
                     StudioTool::of(self.adapter, call.meta.as_ref(), call.raw_input.as_ref());
+                let output = tool_output(&call.content, call.raw_output.as_ref());
                 self.entries.push(Entry::Tool {
                     id: call.tool_call_id.to_string(),
                     title: call.title,
                     status: call.status,
                     input: call.raw_input,
                     studio,
+                    output,
                 });
             }
             SessionUpdate::ToolCallUpdate(update) => {
@@ -1497,9 +1507,17 @@ impl AgentPanel {
                     status,
                     input,
                     studio,
+                    output,
                     ..
                 }) = at.and_then(|at| self.entries.get_mut(at))
                 {
+                    let reported = tool_output(
+                        update.fields.content.as_deref().unwrap_or_default(),
+                        update.fields.raw_output.as_ref(),
+                    );
+                    if reported.is_some() {
+                        *output = reported;
+                    }
                     if let Some(new_title) = update.fields.title.clone() {
                         *title = new_title;
                     }
@@ -2344,6 +2362,154 @@ struct QueryCard {
     text: SharedString,
     highlights: Vec<(std::ops::Range<usize>, &'static str)>,
     params: String,
+    /// The rows it returned, when its result holds the CLI's rows.
+    rows: Option<QueryRows>,
+}
+
+/// The rows a query returned, as the CLI prints them with `--json` (`columns`, `rows`,
+/// `row_count`, `target`), for its record card: the first columns, each with the icon of what
+/// its first value holds, the first rows' values as text, how many rows and columns came back,
+/// and where they were read.
+#[derive(Debug, Clone, PartialEq)]
+struct QueryRows {
+    columns: Vec<(String, IconName)>,
+    rows: Vec<Vec<String>>,
+    total_rows: usize,
+    total_columns: usize,
+    read_at: Option<String>,
+}
+
+/// The most rows and columns a record card shows; its title says how many came back.
+const RECORD_ROWS: usize = 5;
+const RECORD_COLUMNS: usize = 4;
+
+/// A query's rows from what its tool call returned: `omnigraph_run`'s answer ("exit 0", the
+/// output, then `[stderr]` and what the CLI wrote there) or the CLI's output alone, when it is
+/// the CLI's JSON result with rows. `None` for a failed run, other output or no rows.
+fn query_rows(output: &str) -> Option<QueryRows> {
+    let body = match output.split_once('\n') {
+        Some((first, rest)) if first.starts_with("exit ") => {
+            if first.trim_end() != "exit 0" {
+                return None;
+            }
+            rest
+        }
+        _ => output,
+    };
+    let body = body.split("\n[stderr]\n").next().unwrap_or(body).trim();
+    let value: Value = serde_json::from_str(body).ok()?;
+    let rows = value.get("rows")?.as_array()?;
+    let first = rows.first()?.as_object()?;
+    let columns: Vec<String> = value
+        .get("columns")
+        .and_then(Value::as_array)
+        .map(|columns| {
+            columns
+                .iter()
+                .filter_map(|column| column.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_else(|| first.keys().cloned().collect());
+    if columns.is_empty() {
+        return None;
+    }
+    let total_columns = columns.len();
+    let shown: Vec<String> = columns.into_iter().take(RECORD_COLUMNS).collect();
+    let icon = |column: &str| {
+        rows.iter()
+            .filter_map(|row| row.get(column))
+            .find(|value| !value.is_null())
+            .map_or(IconName::CaseSensitive, studio_ui::value_icon)
+    };
+    let target = value.get("target");
+    let read_at = target
+        .and_then(|target| target.get("snapshot"))
+        .and_then(Value::as_str)
+        .map(|commit| studio_ui::short_commit_id(commit).to_string())
+        .or_else(|| {
+            target
+                .and_then(|target| target.get("branch"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    Some(QueryRows {
+        columns: shown
+            .iter()
+            .map(|column| (column.clone(), icon(column)))
+            .collect(),
+        rows: rows
+            .iter()
+            .take(RECORD_ROWS)
+            .map(|row| {
+                shown
+                    .iter()
+                    .map(|column| studio_ui::format_value(row.get(column).unwrap_or(&Value::Null)))
+                    .collect()
+            })
+            .collect(),
+        total_rows: value
+            .get("row_count")
+            .and_then(Value::as_u64)
+            .map_or(rows.len(), |count| count as usize),
+        total_columns,
+        read_at,
+    })
+}
+
+/// A record card, after the reference chat's: a title line (a tile, how many rows, where they
+/// were read), then the rows in the type table's cells, a header cell per column (the kind's
+/// icon and the column's name) over the values.
+fn record_card(rows: &QueryRows, cx: &App) -> Div {
+    let shown = rows.rows.len();
+    let noun = |count: usize| if count == 1 { "row" } else { "rows" };
+    let title = if shown < rows.total_rows {
+        format!("{shown} of {} {}", rows.total_rows, noun(rows.total_rows))
+    } else {
+        format!("{shown} {}", noun(shown))
+    };
+    let mut meta: Vec<String> = rows.read_at.iter().cloned().collect();
+    if rows.columns.len() < rows.total_columns {
+        meta.push(format!(
+            "{} of {} columns",
+            rows.columns.len(),
+            rows.total_columns
+        ));
+    }
+    let last = rows.columns.len().saturating_sub(1);
+    let ruled = |cell: Div, at: usize| {
+        let cell = cell.flex_1().min_w_0();
+        if at < last {
+            ds::cell_rule(cell, cx)
+        } else {
+            cell
+        }
+    };
+    // A reading column wide at most: a few columns stretched across a wide thread scan
+    // badly.
+    ds::card(cx)
+        .max_w(px(ds::size::READING_WIDTH))
+        .child(ds::card_title(
+            ds::icon_tile(IconName::Table, cx),
+            title,
+            (!meta.is_empty()).then(|| meta.join(" · ").into()),
+        ))
+        .child(
+            ds::header_row(cx).children(rows.columns.iter().enumerate().map(
+                |(at, (name, icon))| ruled(ds::header_cell(Some(*icon), name.clone(), false), at),
+            )),
+        )
+        .children(rows.rows.iter().map(|values| {
+            ds::grid_row(cx).children(values.iter().enumerate().map(|(at, value)| {
+                ruled(
+                    ds::data_cell().child(
+                        div()
+                            .min_w_0()
+                            .child(ds::text::body(value.clone()).single_line().truncate()),
+                    ),
+                    at,
+                )
+            }))
+        }))
 }
 
 /// One of the agent's session options as the composer shows it, with a value chosen but not yet
@@ -2620,6 +2786,9 @@ fn select_values(
 
 /// The longest value name a composer picker shows before it is cut.
 const OPTION_NAME_CHARS: usize = 32;
+/// How full the context window is when the composer's ring turns to the warning colour and its
+/// notice strip says so.
+const CONTEXT_NEARLY_FULL: f32 = 0.85;
 /// The longest conversation title a tab shows.
 const TAB_TITLE_CHARS: usize = 28;
 
@@ -2658,6 +2827,49 @@ fn replays(update: &SessionUpdate) -> bool {
             | SessionUpdate::ToolCallUpdate(_)
             | SessionUpdate::Plan(_)
     )
+}
+
+/// The last reply of each finished turn in `entries`: a turn runs from a message of the
+/// person's to the next, and the last one has finished unless the agent is still `working` on
+/// it. A turn without a reply has none.
+fn turn_ends(entries: &[Entry], working: bool) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let mut last_reply = None;
+    for (index, entry) in entries.iter().enumerate() {
+        match entry {
+            Entry::User(_) => ends.extend(last_reply.take()),
+            Entry::Agent(_) => last_reply = Some(index),
+            _ => {}
+        }
+    }
+    if !working {
+        ends.extend(last_reply);
+    }
+    ends
+}
+
+/// What a tool call returned, as its agent reports it: the text of its content blocks (Claude's
+/// adapter sends an MCP tool's result so), else its raw output, a string as it is and other JSON
+/// as its text. `None` when it reported neither.
+fn tool_output(content: &[ToolCallContent], raw: Option<&Value>) -> Option<String> {
+    let text: Vec<&str> = content
+        .iter()
+        .filter_map(|content| match content {
+            ToolCallContent::Content(content) => match &content.content {
+                ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    if !text.is_empty() {
+        return Some(text.join("\n"));
+    }
+    match raw? {
+        Value::Null => None,
+        Value::String(text) => Some(text.clone()),
+        other => Some(other.to_string()),
+    }
 }
 
 fn content_text(content: &ContentBlock) -> String {
@@ -2822,32 +3034,41 @@ impl Render for AgentPanel {
                 self.render_thread(window, cx).into_any_element()
             }
         };
-        let banner = self.render_branch_banner(cx);
         let (graph, branch) = {
             let session = self.session.read(cx);
             (session.graph_id.clone(), session.branch.clone())
         };
-        // The prompt, inline under the thread as Delta writes it: the next message's gutter and
-        // the editor, then the controls that send it.
-        let composer = div()
+        // The composer, after the reference chat's: a card holding the message and the
+        // controls that send it, under the thread's text column with the card's inset outside
+        // it; what holds the conversation up or follows from it on a strip attached to its top;
+        // and under it, what the agent reaches.
+        let card = ds::composer_card(cx)
+            .child(div().prose().child(self.composer.clone()))
+            .child(self.render_composer_controls(cx));
+        let notices = self.render_notices(cx);
+        let reach = div().w_full().flex().justify_center().child(ds::meta_row([
+            ds::text::meta(format!("Reads {graph} at {branch}"))
+                .single_line()
+                .into_any_element(),
+            ds::text::meta("writes only to a branch of its own")
+                .single_line()
+                .into_any_element(),
+        ]));
+        let composer = v_flex()
             .id("composer")
             .key_context("AgentComposer")
             .flex_none()
-            .pl(px(ds::space::MD))
+            .pl(px(ds::space::MD + GUTTER + ds::space::XS - ds::space::LG))
             .pr(px(ds::space::XL))
-            .pt(px(ds::space::MD))
-            .pb(px(ds::space::LG))
-            .border_t_1()
-            .border_color(ds::surface::rule(cx))
-            .tooltip(Tooltip::text(format!(
-                "The agent reads {graph} at {branch}; its changes go to a branch of its own"
-            )))
+            .pt(px(ds::space::SM))
+            .pb(px(ds::space::SM))
+            .gap(px(ds::space::SM))
             .children(self.render_queue(cx))
-            .child(gutter_row(
-                Some(studio_ui::ds::icon::lead(IconName::Person)),
-                div().prose().child(self.composer.clone()),
-            ))
-            .child(self.render_composer_controls(cx));
+            .child(match notices {
+                Some(strip) => ds::attach_notice(strip, card, cx),
+                None => card,
+            })
+            .child(reach);
 
         v_flex()
             .key_context("AgentPanel")
@@ -2863,7 +3084,6 @@ impl Render for AgentPanel {
             .size_full()
             .bg(editor_bg)
             .child(body)
-            .children(banner)
             .child(composer)
     }
 }
@@ -2914,12 +3134,7 @@ impl AgentPanel {
             );
         }
         end.push(send_or_stop.into_any_element());
-        h_flex()
-            .justify_end()
-            .items_center()
-            .gap(px(ds::space::XS))
-            .pt(px(ds::space::SM))
-            .children(end)
+        ds::composer_controls().children(end)
     }
 
     /// The agent's name, a dot for its state and what the state means.
@@ -3044,7 +3259,8 @@ impl AgentPanel {
             }
             _ => None,
         };
-        (self.entries.version, self.folds, exited)
+        let working = matches!(self.state, State::Prompting { .. });
+        (self.entries.version, self.folds, exited, working)
     }
 
     /// Brings each agent reply's markdown up to its text: new replies get an entity, a growing
@@ -3082,6 +3298,7 @@ impl AgentPanel {
     /// The thread's blocks in order. As in Delta: the agent's mark once per turn, and each run
     /// of tool calls and thoughts as one line that opens to its steps.
     fn blocks(&self) -> Vec<Block> {
+        let ends = turn_ends(&self.entries, matches!(self.state, State::Prompting { .. }));
         let mut blocks = Vec::new();
         let mut marked = false;
         let mut index = 0;
@@ -3117,13 +3334,71 @@ impl AgentPanel {
             if matches!(entry, Entry::Agent(_)) {
                 marked = true;
             }
-            blocks.push(Block::Entry { index, lead });
+            blocks.push(Block::Entry {
+                index,
+                lead,
+                ends: ends.contains(&index),
+            });
             index += 1;
         }
         if matches!(self.state, State::Exited { .. }) {
             blocks.push(Block::Exited);
         }
         blocks
+    }
+
+    /// The turn entry `index` is in: from the person's message before it to the next one.
+    fn turn_of(&self, index: usize) -> std::ops::Range<usize> {
+        let is_user = |entry: &Entry| matches!(entry, Entry::User(_));
+        let start = self.entries[..index]
+            .iter()
+            .rposition(is_user)
+            .map_or(0, |at| at + 1);
+        let end = self.entries[index..]
+            .iter()
+            .position(is_user)
+            .map_or(self.entries.len(), |at| index + at);
+        start..end
+    }
+
+    /// A finished turn's actions under its last reply, after the reference chat's: copy the
+    /// turn's reply, and how many tools the agent called for it, muted. There is no retry or
+    /// rating: the agent offers neither.
+    fn render_turn_actions(&self, index: usize) -> AnyElement {
+        let turn = self.turn_of(index);
+        let entries = &self.entries[turn];
+        let reply: String = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Agent(text) => Some(text.trim()),
+                _ => None,
+            })
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let tools = entries
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Tool { .. }))
+            .count();
+        h_flex()
+            .gap(px(ds::space::SM))
+            .items_center()
+            .child(
+                ds::row_icon_button(("copy-reply", index), IconName::Copy)
+                    .icon_color(Color::Muted)
+                    .tooltip(Tooltip::text("Copy the reply"))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(reply.clone()))
+                    }),
+            )
+            .when(tools > 0, |row| {
+                row.child(ds::text::meta(if tools == 1 {
+                    "1 tool call".to_owned()
+                } else {
+                    format!("{tools} tool calls")
+                }))
+            })
+            .into_any_element()
     }
 
     /// What a block shows, folded to a number: a block whose number is unchanged keeps its
@@ -3218,7 +3493,13 @@ impl AgentPanel {
             return div().into_any_element();
         };
         let body = match block {
-            Block::Entry { index, lead } => match self.entries.get(index) {
+            Block::Entry { index, lead, ends } => match self.entries.get(index) {
+                // The actions sit a step under the reply, apart from its text.
+                Some(entry) if ends => v_flex()
+                    .gap(px(ds::space::SM))
+                    .child(self.render_entry(index, entry, lead, window, cx))
+                    .child(gutter_row(None, self.render_turn_actions(index)))
+                    .into_any_element(),
                 Some(entry) => self.render_entry(index, entry, lead, window, cx),
                 None => div().into_any_element(),
             },
@@ -3359,6 +3640,7 @@ impl AgentPanel {
             text,
             highlights,
             params,
+            rows,
         } = &*card;
         let running = matches!(status, ToolCallStatus::Pending | ToolCallStatus::InProgress);
         let failed = matches!(status, ToolCallStatus::Failed);
@@ -3412,9 +3694,12 @@ impl AgentPanel {
                 .gap(px(ds::space::SM))
                 .child(header)
                 .when(!folded, |column| {
-                    column.child(card).when(!params.is_empty(), |column| {
-                        column.child(ds::text::meta(params))
-                    })
+                    column
+                        .child(card)
+                        .when(!params.is_empty(), |column| {
+                            column.child(ds::text::meta(params))
+                        })
+                        .children(rows.as_ref().map(|rows| record_card(rows, cx)))
                 }),
         )
         .into_any_element()
@@ -3440,12 +3725,20 @@ impl AgentPanel {
             .filter(|token| token.range.end <= shown.len())
             .filter_map(|token| token.kind.syntax_name().map(|name| (token.range, name)))
             .collect();
+        let rows = match entry {
+            Entry::Tool {
+                output: Some(output),
+                ..
+            } => query_rows(output),
+            _ => None,
+        };
         let card = Rc::new(QueryCard {
             command,
             name,
             text: shown.to_owned().into(),
             highlights,
             params,
+            rows,
         });
         self.query_cards
             .borrow_mut()
@@ -3892,14 +4185,13 @@ impl AgentPanel {
     fn render_usage(&self, cx: &App) -> Option<AnyElement> {
         let usage = self.usage.as_ref().filter(|usage| usage.size > 0)?;
         let ratio = (usage.used as f32 / usage.size as f32).clamp(0., 1.);
-        let nearly_full = ratio >= 0.85;
+        let nearly_full = ratio >= CONTEXT_NEARLY_FULL;
         let color = if nearly_full {
             Color::Warning.color(cx)
         } else {
             Color::Muted.color(cx)
         };
-        let percent = format!("{}%", (ratio * 100.).round() as u32);
-        let title = format!("{percent} of the context window");
+        let title = format!("{}% of the context window", (ratio * 100.).round() as u32);
         let mut meta = format!(
             "{} of {} tokens",
             humanize_tokens(usage.used),
@@ -3926,10 +4218,6 @@ impl AgentPanel {
                     .bg_color(ds::surface::control_border(cx))
                     .progress_color(color),
                 )
-                // The number only when it matters.
-                .when(nearly_full, |row| {
-                    row.child(ds::text::meta(percent).color(Color::Warning))
-                })
                 .tooltip(move |_, cx| Tooltip::with_meta(title.clone(), None, meta.clone(), cx))
                 .into_any_element(),
         )
@@ -4045,11 +4333,10 @@ impl AgentPanel {
                     .into_any_element()
             })
             .collect();
+        // Above the composer's card, on its edges and its corner.
         Some(
             v_flex()
-                .mb(px(ds::space::MD))
-                .ml(px(ds::space::SM))
-                .rounded(px(ds::radii(cx).sm))
+                .rounded(px(ds::radii(cx).md))
                 .border_1()
                 .border_color(border)
                 .bg(ds::surface::sunken(cx))
@@ -4060,40 +4347,59 @@ impl AgentPanel {
         )
     }
 
-    fn render_branch_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let branch = self
-            .branch
-            .as_ref()
-            .filter(|b| b.created && b.changes > 0)?;
-        Some(
-            h_flex()
-                .flex_none()
-                .h(px(studio_ui::ds::size::STRIP))
-                .px(px(ds::space::LG))
-                .gap(px(ds::space::LG))
-                .border_t_1()
-                .border_color(studio_ui::ds::surface::rule(cx))
-                .child(studio_ui::ds::meta(
-                    IconName::GitBranch,
-                    branch.name.clone(),
-                ))
-                .child(
-                    div()
-                        .id("agent-changes")
-                        .tooltip(Tooltip::text("Changes committed on the agent's branch"))
-                        .child(studio_ui::ds::meta(
-                            IconName::Pencil,
-                            branch.changes.to_string(),
-                        )),
-                )
-                .child(div().flex_1())
-                .child(
-                    studio_ui::ds::button("review", "Review")
-                        .start_icon(Icon::new(IconName::Eye))
-                        .on_click(cx.listener(|this, _, window, cx| this.review(window, cx))),
-                )
-                .into_any_element(),
-        )
+    /// The notice strip on the composer's card (spec 011), one line for each state that holds
+    /// the conversation up or follows from it, or none: the context window nearly full (the
+    /// gauge, how full and how many tokens), then the agent's branch once it holds changes
+    /// (its name, how many, and Review).
+    fn render_notices(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let mut lines = Vec::new();
+        if let Some(usage) = self.usage.as_ref().filter(|usage| usage.size > 0) {
+            let ratio = (usage.used as f32 / usage.size as f32).clamp(0., 1.);
+            if ratio >= CONTEXT_NEARLY_FULL {
+                lines.push(
+                    ds::notice_line()
+                        .child(
+                            CircularProgress::new(
+                                usage.used as f32,
+                                usage.size as f32,
+                                px(ds::size::GAUGE),
+                                cx,
+                            )
+                            .stroke_width(px(ds::size::GAUGE_STROKE))
+                            .bg_color(ds::surface::control_border(cx))
+                            .progress_color(Color::Warning.color(cx)),
+                        )
+                        .child(ds::text::body(format!(
+                            "{}% of the context window used",
+                            (ratio * 100.).round() as u32
+                        )))
+                        .child(ds::text::muted(format!(
+                            "{} of {} tokens",
+                            humanize_tokens(usage.used),
+                            humanize_tokens(usage.size)
+                        ))),
+                );
+            }
+        }
+        if let Some(branch) = self.branch.as_ref().filter(|b| b.created && b.changes > 0) {
+            lines.push(
+                ds::notice_line()
+                    .child(ds::meta(IconName::GitBranch, branch.name.clone()))
+                    .child(
+                        div()
+                            .id("agent-changes")
+                            .tooltip(Tooltip::text("Changes committed on the agent's branch"))
+                            .child(ds::meta(IconName::Pencil, branch.changes.to_string())),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        ds::toolbar_button("review", "Review")
+                            .start_icon(Icon::new(IconName::Eye))
+                            .on_click(cx.listener(|this, _, window, cx| this.review(window, cx))),
+                    ),
+            );
+        }
+        (!lines.is_empty()).then(|| ds::notice_strip(cx).children(lines))
     }
 }
 
@@ -4110,6 +4416,7 @@ mod tests {
             status: ToolCallStatus::Completed,
             input: Some(input),
             studio,
+            output: None,
         };
         let run = Some(StudioTool::Run);
         for (entry, shown) in [
@@ -4149,6 +4456,100 @@ mod tests {
             )),
             Some(("query".into(), "q".into(), "--json".into()))
         );
+    }
+
+    /// A query's rows come from its result as `omnigraph_run` answers it or as the CLI prints
+    /// it: the columns in the CLI's order, the first rows, how many came back and where they
+    /// were read. A failed run, other output and no rows give no card.
+    #[test]
+    fn a_querys_rows_are_read_from_what_its_call_returned() {
+        let json = r#"{"query_name":"people","target":{"branch":"main","snapshot":null},
+            "row_count":3,"columns":["p.name","p.born"],
+            "rows":[{"p.name":"Radia Knuth","p.born":"1978-03-20"},
+                    {"p.name":"Donald Dijkstra","p.born":null},
+                    {"p.name":"Grace Allen","p.born":"1985-01-11"}]}"#;
+        let run = format!("exit 0\n{json}\n[stderr]\nwhat the CLI wrote there");
+        let rows = query_rows(&run).expect("rows from omnigraph_run's answer");
+        assert_eq!(
+            rows.columns,
+            [
+                ("p.name".to_owned(), IconName::CaseSensitive),
+                ("p.born".to_owned(), IconName::Clock)
+            ]
+        );
+        assert_eq!(rows.rows[1], ["Donald Dijkstra", "—"]);
+        assert_eq!((rows.total_rows, rows.total_columns), (3, 2));
+        assert_eq!(rows.read_at.as_deref(), Some("main"));
+        assert_eq!(query_rows(json), Some(rows), "the CLI's output alone");
+
+        let many: Vec<Value> = (0..12)
+            .map(|n| serde_json::json!({"a": n, "b": n, "c": n, "d": n, "e": n}))
+            .collect();
+        let wide = serde_json::json!({"rows": many, "row_count": 12}).to_string();
+        let rows = query_rows(&wide).expect("rows");
+        assert_eq!(
+            (rows.rows.len(), rows.columns.len()),
+            (RECORD_ROWS, RECORD_COLUMNS),
+            "a card shows the first rows and columns"
+        );
+        assert_eq!((rows.total_rows, rows.total_columns), (12, 5));
+
+        assert_eq!(query_rows(&format!("exit 1\n{json}")), None, "a failed run");
+        assert_eq!(query_rows("exit 0\nnode Person {}"), None, "not rows");
+        assert_eq!(
+            query_rows(r#"{"rows":[],"columns":["n"]}"#),
+            None,
+            "no rows"
+        );
+    }
+
+    /// A turn's actions go under its last reply once it has finished: not under a turn the
+    /// agent still works on, nor in a turn with no reply.
+    #[test]
+    fn a_turn_ends_at_its_last_reply() {
+        let user = || Entry::User("q".into());
+        let agent = || Entry::Agent("a".into());
+        let thought = || Entry::Thought("t".into());
+        let entries = [
+            user(),
+            agent(),
+            thought(),
+            agent(),
+            user(),
+            thought(),
+            user(),
+            agent(),
+        ];
+        assert_eq!(turn_ends(&entries, false), [3, 7]);
+        assert_eq!(
+            turn_ends(&entries, true),
+            [3],
+            "the last turn is still going"
+        );
+        assert!(turn_ends(&[], false).is_empty());
+    }
+
+    /// A tool's result is the text of the content its agent reported, else its raw output.
+    #[test]
+    fn a_tool_call_keeps_the_result_its_agent_reported() {
+        use agent_client_protocol::schema::v1::TextContent;
+        let text =
+            |text: &str| -> ToolCallContent { ContentBlock::Text(TextContent::new(text)).into() };
+        assert_eq!(
+            tool_output(&[text("exit 0"), text("{}")], None).as_deref(),
+            Some("exit 0\n{}")
+        );
+        let raw = serde_json::json!({"rows": []});
+        assert_eq!(
+            tool_output(&[], Some(&raw)).as_deref(),
+            Some(r#"{"rows":[]}"#)
+        );
+        assert_eq!(
+            tool_output(&[], Some(&Value::String("ok".into()))).as_deref(),
+            Some("ok")
+        );
+        assert_eq!(tool_output(&[], Some(&Value::Null)), None);
+        assert_eq!(tool_output(&[], None), None);
     }
 
     #[test]

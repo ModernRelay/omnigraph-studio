@@ -5,7 +5,13 @@
 //! conversation's omnigraph CLI through Studio's `omnigraph_run` tool, as an agent whose shell has
 //! no network does (spec 013). When the prompt contains "change", it also creates its branch and
 //! retitles a person there. When it contains "cli", it runs the CLI in its own shell by the path
-//! `omnigraph_cli` gives.
+//! `omnigraph_cli` gives. When it contains "list", it reads three people's names and titles,
+//! rows Studio shows as a record card.
+//!
+//! It reports its tool calls in the Claude ACP agent's wire format, which Studio reads to tell
+//! its own tools apart (`tools::StudioTool::of`): it names itself `…/claude-agent-acp`, names
+//! the MCP tool a call runs in `_meta.claudeCode.toolName`, and sends the tool's result as the
+//! call's content when it ends.
 //!
 //! One process serves every session Studio opens with it. It keeps each session's transcript in
 //! the session's working directory and supports `session/load` (replaying the messages),
@@ -36,7 +42,7 @@ use agent_client_protocol::schema::v1::{
     SessionConfigSelectGroup, SessionConfigSelectOption, SessionDeleteCapabilities, SessionId,
     SessionInfo, SessionListCapabilities, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
-    ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
+    ToolCall, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Stdio};
 use serde_json::{Map, Value, json};
@@ -45,6 +51,8 @@ use smol::process::{Command, Stdio as ProcessStdio};
 use smol::stream::StreamExt as _;
 
 const COUNT: &str = "query people() {\n  match { $p: Person }\n  return { count($p) as n }\n}";
+const PEOPLE: &str =
+    "query people() {\n  match { $p: Person }\n  return { $p.name, $p.title }\n  limit 3\n}";
 const RETITLE: &str = "query retitle() {\n  update Person set { title: \"Retitled by the test agent\" } where @id = \"person-000000\"\n}";
 
 /// What the agent keeps about one open session. One process serves every session Studio opens
@@ -282,7 +290,10 @@ fn main() -> agent_client_protocol::Result<()> {
                     BOOLEANS.store(booleans, Ordering::SeqCst);
                     responder.respond(
                         InitializeResponse::new(request.protocol_version)
-                            .agent_info(Implementation::new("Studio test agent", "0.1.0"))
+                            .agent_info(
+                                Implementation::new("studio-test-agent/claude-agent-acp", "0.1.0")
+                                    .title("Studio test agent"),
+                            )
                             .agent_capabilities(
                                 AgentCapabilities::new()
                                     .load_session(true)
@@ -509,6 +520,7 @@ async fn run_cli(
         "omnigraph_run",
         ToolCallStatus::InProgress,
         Some(input.clone()),
+        None,
     );
     let (text, error) = mcp.call("omnigraph_run", input).await?;
     tool_status(
@@ -522,14 +534,18 @@ async fn run_cli(
             ToolCallStatus::Completed
         },
         None,
+        Some(&text),
     );
+    // Studio's answer: "exit N", the output, then what the CLI wrote to stderr.
     let output = text
         .split_once('\n')
-        .map(|(_, rest)| rest.to_owned())
+        .map(|(_, rest)| rest.split("\n[stderr]\n").next().unwrap_or(rest).to_owned())
         .unwrap_or_default();
     Ok((if error { text } else { output }, error))
 }
 
+/// Reports a tool call as Claude's ACP agent does: its start names the MCP tool it runs, and
+/// its end carries the tool's result as its content.
 fn tool_status(
     connection: &ConnectionTo<Client>,
     session: &SessionId,
@@ -537,17 +553,29 @@ fn tool_status(
     title: &str,
     status: ToolCallStatus,
     input: Option<Value>,
+    result: Option<&str>,
 ) {
     let update = if status == ToolCallStatus::InProgress {
+        let meta: Map<String, Value> = [(
+            "claudeCode".to_owned(),
+            json!({ "toolName": format!("mcp__omnigraph__{title}") }),
+        )]
+        .into_iter()
+        .collect();
         SessionUpdate::ToolCall(
             ToolCall::new(id.to_owned(), title)
                 .status(status)
-                .raw_input(input),
+                .raw_input(input)
+                .meta(meta),
         )
     } else {
+        let content: Vec<ToolCallContent> = result
+            .map(|text| ContentBlock::Text(TextContent::new(text)).into())
+            .into_iter()
+            .collect();
         SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
             id.to_owned(),
-            ToolCallUpdateFields::new().status(status),
+            ToolCallUpdateFields::new().status(status).content(content),
         ))
     };
     connection
@@ -612,6 +640,29 @@ async fn turn(
         session,
         &format!("It holds {} people.", n.unwrap_or(-1)),
     );
+    // A read whose rows Studio shows as a record card.
+    if prompt.contains("list") {
+        let (rows, _) = run_cli(
+            &mut mcp,
+            connection,
+            session,
+            "list",
+            json!(["query", "-e", PEOPLE, "--json"]),
+        )
+        .await?;
+        let names: Vec<String> = serde_json::from_str::<Value>(&rows)
+            .ok()
+            .and_then(|value| value["rows"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|row| row["p.name"].as_str().map(str::to_owned))
+            .collect();
+        say(
+            connection,
+            session,
+            &format!("\n\nThe first three are {}.", names.join(", ")),
+        );
+    }
     // A reply with markdown, to see it rendered.
     if prompt.contains("markdown") {
         say(
@@ -631,7 +682,8 @@ async fn turn(
             Some(rest.split(end).next()?.trim().to_owned())
         };
         let branch = after("Write only to your branch, ", &[':']).ok_or("no branch")?;
-        let base = after("--from ", &[' ']).ok_or("no base")?;
+        // The instructions quote the command: the base ends at its closing backtick.
+        let base = after("--from ", &['`', ' ']).ok_or("no base")?;
         let (created, _) = run_cli(
             &mut mcp,
             connection,
