@@ -202,6 +202,52 @@ mod tests {
         std::fs::remove_dir_all(&cwd).ok();
     }
 
+    /// A link to a folder elsewhere left inside the skill's folder (a symbolic link, or on
+    /// Windows a junction, which any user may make) is removed as a stale entry, and what it
+    /// points at is not touched: later writes of the skill go on.
+    #[test]
+    fn a_link_left_in_the_skill_folder_is_removed_and_not_followed() {
+        let cwd = std::env::temp_dir().join(format!("studio-skill-inner-{}", std::process::id()));
+        let elsewhere =
+            std::env::temp_dir().join(format!("studio-skill-target-{}", std::process::id()));
+        for dir in [&cwd, &elsewhere] {
+            std::fs::remove_dir_all(dir).ok();
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(elsewhere.join("diary.md"), "mine").unwrap();
+        write(&cwd).unwrap();
+        let linked = cwd
+            .join(".agents/skills")
+            .join(NAME)
+            .join("references")
+            .join("linked");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&elsewhere, &linked).unwrap();
+        #[cfg(windows)]
+        {
+            let made = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(&linked)
+                .arg(&elsewhere)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+        }
+
+        write(&cwd).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&linked).is_err(),
+            "the link stays"
+        );
+        assert_eq!(
+            std::fs::read_to_string(elsewhere.join("diary.md")).unwrap(),
+            "mine"
+        );
+        write(&cwd).unwrap();
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::remove_dir_all(&elsewhere).ok();
+    }
+
     /// An agent can turn the skill's folder into a link to anywhere, its home included:
     /// Studio refuses to write through it, and removes nothing there.
     #[cfg(unix)]

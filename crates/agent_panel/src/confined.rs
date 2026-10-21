@@ -396,9 +396,20 @@ mod pinned {
             Ok(out)
         }
 
-        /// Removes the file or link `name`; a link's target is never touched.
+        /// Removes the file or link `name`; a link's target is never touched. A link to a
+        /// folder, a junction included, is a directory to Windows, which removing a file
+        /// refuses: it is removed as one, which removes the link itself, whatever it points at.
         pub fn remove(&self, name: &std::ffi::OsStr) -> io::Result<()> {
-            std::fs::remove_file(self.path.join(name))
+            use std::os::windows::fs::FileTypeExt as _;
+            let path = self.path.join(name);
+            if std::fs::symlink_metadata(&path)?
+                .file_type()
+                .is_symlink_dir()
+            {
+                std::fs::remove_dir(&path)
+            } else {
+                std::fs::remove_file(&path)
+            }
         }
 
         /// Windows has no mode bits: a folder takes the access its parent gives, which under the
@@ -500,9 +511,13 @@ mod tests {
         );
         assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(), b"mine");
 
+        // A junction is removed as the link it is, and what it points at stays.
+        cwd.remove("linked".as_ref()).unwrap();
+        cwd.dir("inner").unwrap().remove("deeper".as_ref()).unwrap();
         for link in [root.join("linked"), root.join("inner").join("deeper")] {
-            std::fs::remove_dir(link).unwrap();
+            assert!(std::fs::symlink_metadata(&link).is_err(), "{link:?}");
         }
+        assert_eq!(std::fs::read(outside.join("keep.txt")).unwrap(), b"mine");
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&outside).ok();
     }

@@ -39,10 +39,14 @@ rustix = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 uds_windows = { workspace = true }
 # The agent's launcher holds the agent in a job that ends with it; `confined` holds the agent's
-# folders open while Studio writes in them.
+# folders open while Studio writes in them; `requester` finds the processes a gateway client
+# was started under.
 windows-sys = { workspace = true, features = [
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }

@@ -67,6 +67,9 @@ pub enum Live {
 pub struct AgentSessions {
     path: PathBuf,
     records: Vec<SessionRecord>,
+    /// Whether changes are written to the file: not when it held what Studio could not read
+    /// and could not be set aside, since a save would replace it. They are kept for this run.
+    saving: bool,
     live: HashMap<String, Live>,
     /// Conversations whose turn ended while their tab was not the one shown.
     unread: HashSet<String>,
@@ -93,19 +96,29 @@ impl AgentSessions {
     }
 
     fn load(path: PathBuf) -> Self {
-        let records = read_records(&path);
+        let Stored { value, saving } = read_records(&path);
         Self {
             path,
-            records,
+            records: value,
+            saving,
             live: HashMap::new(),
             unread: HashSet::new(),
             deleted: HashSet::new(),
         }
     }
 
+    /// The file, when Studio could neither read it nor set it aside: the list then lasts only
+    /// until Studio quits, and the Conversations panel says so.
+    pub fn not_saved(&self) -> Option<&Path> {
+        (!self.saving).then_some(self.path.as_path())
+    }
+
     /// Writes the list on Studio's writer thread, in order with its other writes: a write
     /// waits for the disk to sync it, too long for the main thread at every prompt.
     fn save(&self) {
+        if !self.saving {
+            return;
+        }
         let value = serde_json::json!({ "version": VERSION, "sessions": self.records });
         if let Ok(text) = serde_json::to_string_pretty(&value) {
             studio_settings::write_atomic_in_turn(
@@ -328,10 +341,35 @@ pub fn graph_cwd(graph: &str) -> PathBuf {
     let hash = graph.bytes().fold(0x811c_9dc5_u32, |hash, byte| {
         (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193)
     });
-    studio_settings::data_dir()
+    let data = studio_settings::data_dir();
+    let local = if cfg!(windows) {
+        let folder = |name: &str| std::env::var_os(name).map(PathBuf::from);
+        local_counterpart(
+            &data,
+            folder("APPDATA").as_deref(),
+            folder("LOCALAPPDATA").as_deref(),
+        )
+    } else {
+        None
+    };
+    local
+        .unwrap_or(data)
         .join("agent")
         .join("graphs")
         .join(format!("{slug}-{hash:08x}"))
+}
+
+/// Where agents work on Windows. Studio's data folder there is the roaming one (`%APPDATA%`),
+/// which folder redirection can make a network path (`\\server\share\…`), and cmd cannot work
+/// in a network folder: it starts in the Windows folder instead, so every batch file the agent
+/// runs from its working directory, its `omnigraph.cmd` and npm's shims alike, would read
+/// relative paths from there. The local application folder (`%LOCALAPPDATA%`) is never
+/// redirected, and an agent keeps its own sessions on this machine anyway. So `data`'s
+/// counterpart in `local`, when `data` is a folder of `roaming`; a data folder set elsewhere
+/// (`OMNIGRAPH_STUDIO_DATA`) keeps its agents.
+fn local_counterpart(data: &Path, roaming: Option<&Path>, local: Option<&Path>) -> Option<PathBuf> {
+    let (roaming, local, name) = (roaming?, local?, data.file_name()?);
+    (data.parent() == Some(roaming)).then(|| local.join(name))
 }
 
 /// Where each conversation's private CLI home is made: outside every working directory, so
@@ -358,13 +396,51 @@ fn provisional_title(message: &str) -> Option<String> {
 /// older form that no longer reads sets its file aside on its own.
 const VERSION: u64 = 2;
 
+/// What Studio read of one of its state files, and whether it may write the file again.
+struct Stored<T> {
+    value: T,
+    /// False when the file held what Studio could not read and could not be set aside: a save
+    /// would replace it, so what changes is kept in memory for this run instead.
+    saving: bool,
+}
+
+/// The text of one of Studio's state files: `Ok(None)` when there is none, `Err` when it is
+/// there but cannot be read (not UTF-8, or held by another program), which is as unusable as a
+/// file that does not parse.
+fn read_text(path: &Path) -> Result<Option<String>, ()> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+/// Moves a state file Studio could not use out of the way of the next save, renamed beside
+/// itself: whether it may be saved over now. Not when the rename fails (on Windows, another
+/// program holds it open without letting it be renamed): the file then stays as it is.
+fn set_aside(path: &Path) -> bool {
+    studio_settings::set_aside(path).is_some()
+}
+
 /// The records on disk, each read on its own: one Studio cannot read (damaged, or written by an
 /// older build without a field this one requires) leaves the others. A file with any it cannot
-/// read, or of another [`VERSION`], is set aside first, renamed beside itself, so the next
-/// save, which writes only the ones read, loses nothing.
-fn read_records(path: &Path) -> Vec<SessionRecord> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
+/// read, of another [`VERSION`], or that cannot be read at all, is set aside first, renamed
+/// beside itself, so the next save, which writes only the ones read, loses nothing. One that
+/// cannot be set aside is never saved over.
+fn read_records(path: &Path) -> Stored<Vec<SessionRecord>> {
+    let unusable = || Stored {
+        value: Vec::new(),
+        saving: set_aside(path),
+    };
+    let text = match read_text(path) {
+        Ok(Some(text)) => text,
+        Ok(None) => {
+            return Stored {
+                value: Vec::new(),
+                saving: true,
+            };
+        }
+        Err(()) => return unusable(),
     };
     let records = serde_json::from_str::<Value>(&text)
         .ok()
@@ -374,31 +450,40 @@ fn read_records(path: &Path) -> Vec<SessionRecord> {
             _ => None,
         });
     let Some(records) = records else {
-        studio_settings::set_aside(path);
-        return Vec::new();
+        return unusable();
     };
     let read: Vec<SessionRecord> = records
         .iter()
         .filter_map(|record| serde_json::from_value(record.clone()).ok())
         .collect();
-    if read.len() < records.len() {
-        studio_settings::set_aside(path);
+    let saving = read.len() == records.len() || set_aside(path);
+    Stored {
+        value: read,
+        saving,
     }
-    read
 }
 
-/// The preferences file's object. A file that exists but is not a JSON object is set aside, so
-/// the next write does not replace every agent's choices it holds.
-fn read(path: &Path) -> Map<String, Value> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Map::new();
+/// The preferences file's object. A file that exists but cannot be read or is not a JSON
+/// object is set aside, so the next write does not replace every agent's choices it holds; one
+/// that cannot be set aside is never written over.
+fn read(path: &Path) -> Stored<Map<String, Value>> {
+    let object = match read_text(path) {
+        Ok(None) => Some(Map::new()),
+        Ok(Some(text)) => match serde_json::from_str::<Value>(&text) {
+            Ok(Value::Object(object)) => Some(object),
+            _ => None,
+        },
+        Err(()) => None,
     };
-    match serde_json::from_str::<Value>(&text) {
-        Ok(Value::Object(object)) => object,
-        _ => {
-            studio_settings::set_aside(path);
-            Map::new()
-        }
+    match object {
+        Some(value) => Stored {
+            value,
+            saving: true,
+        },
+        None => Stored {
+            value: Map::new(),
+            saving: set_aside(path),
+        },
     }
 }
 
@@ -411,20 +496,21 @@ fn preferences_path() -> PathBuf {
 }
 
 /// The preferences, read from their file once and then kept; each change is written in turn,
-/// off the main thread.
+/// off the main thread, unless the file could not be read and stays where it was.
 struct Preferences {
     path: PathBuf,
-    records: Option<Map<String, Value>>,
+    records: Option<Stored<Map<String, Value>>>,
 }
 
 impl Preferences {
-    fn records(&mut self) -> &mut Map<String, Value> {
+    fn records(&mut self) -> &mut Stored<Map<String, Value>> {
         let path = &self.path;
         self.records.get_or_insert_with(|| read(path))
     }
 
     fn of(&mut self, command: &[String]) -> Map<String, Value> {
         self.records()
+            .value
             .get(&command.join(" "))
             .and_then(Value::as_object)
             .cloned()
@@ -432,12 +518,18 @@ impl Preferences {
     }
 
     fn prefer(&mut self, command: &[String], option: &str, value: Value) {
-        let records = self.records();
+        let Stored {
+            value: records,
+            saving,
+        } = self.records();
         let agent = records
             .entry(command.join(" "))
             .or_insert_with(|| Value::Object(Map::new()));
         if let Some(agent) = agent.as_object_mut() {
             agent.insert(option.to_owned(), value);
+        }
+        if !*saving {
+            return;
         }
         if let Ok(text) = serde_json::to_vec_pretty(records) {
             studio_settings::write_atomic_in_turn(
@@ -497,6 +589,47 @@ mod tests {
         assert_eq!(a, graph_cwd("server/crm"));
         assert_ne!(a, graph_cwd("server-crm"));
         assert!(a.to_string_lossy().contains("server-crm-"));
+    }
+
+    /// On Windows agents work in the local application folder, never the roaming one, which
+    /// folder redirection can put on a network share where cmd cannot work. A data folder set
+    /// elsewhere keeps its agents.
+    #[test]
+    fn agents_work_in_the_local_folder_of_studios_roaming_data() {
+        let profile = std::env::temp_dir().join("profile");
+        let (roaming, local) = (
+            profile.join("AppData").join("Roaming"),
+            profile.join("AppData").join("Local"),
+        );
+        let redirected = PathBuf::from(r"\\server\share\ada\AppData\Roaming");
+        for roaming in [roaming, redirected] {
+            for name in ["OmniGraph Studio", "OmniGraph Studio Dev"] {
+                assert_eq!(
+                    local_counterpart(
+                        &roaming.join(name),
+                        Some(roaming.as_path()),
+                        Some(local.as_path())
+                    ),
+                    Some(local.join(name))
+                );
+            }
+            assert_eq!(
+                local_counterpart(
+                    &profile.join("elsewhere"),
+                    Some(roaming.as_path()),
+                    Some(local.as_path())
+                ),
+                None
+            );
+            assert_eq!(
+                local_counterpart(
+                    &roaming.join("OmniGraph Studio"),
+                    Some(roaming.as_path()),
+                    None
+                ),
+                None
+            );
+        }
     }
 
     #[gpui::test]
@@ -643,7 +776,11 @@ mod tests {
             "sessions": [record, { "session": 3 }, older, oldest],
         });
         std::fs::write(&path, file.to_string()).unwrap();
-        let records = read_records(&path);
+        let Stored {
+            value: records,
+            saving,
+        } = read_records(&path);
+        assert!(saving, "set aside, so saved again");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].session, "s-1");
         assert!(!path.exists(), "set aside before it is written again");
@@ -667,10 +804,142 @@ mod tests {
         for version in [json!(VERSION + 1), json!(1), Value::Null] {
             let file = json!({ "version": version, "sessions": [record] });
             std::fs::write(&path, file.to_string()).unwrap();
-            assert!(read_records(&path).is_empty(), "version {version}");
+            assert!(read_records(&path).value.is_empty(), "version {version}");
             assert!(!path.exists(), "version {version}");
             std::fs::remove_dir_all(&dir).ok();
             std::fs::create_dir_all(&dir).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Keeps `path` from being set aside, as another program holding it open without letting
+    /// it be renamed does on Windows: a folder stands where each name it would take for the
+    /// next while (`<name>.unreadable-<seconds>`), and a file cannot be renamed over a folder.
+    fn block_set_aside(path: &Path) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        for seconds in now - 2..now + 60 {
+            let blocker = path.with_file_name(format!("{name}.unreadable-{seconds}"));
+            std::fs::create_dir_all(blocker.join("taken")).unwrap();
+        }
+    }
+
+    /// A file Studio could not read is never written over. One that does not read as text is
+    /// set aside as one that does not parse is, and the next save writes beside it. One that
+    /// cannot be set aside stays as it was: the list is kept in memory and not saved, and says
+    /// so.
+    #[gpui::test]
+    fn a_file_that_could_not_be_read_is_never_written_over(cx: &mut gpui::TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("studio-agent-unread-{}", std::process::id()));
+        let fresh = || {
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir_all(&dir).unwrap();
+        };
+        let path = dir.join("sessions.json");
+        let not_text: &[u8] = b"{\"version\": 2, \"sessions\": [\xff\xfe]}";
+        let others = || -> Vec<PathBuf> {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|other| *other != path)
+                .collect()
+        };
+
+        fresh();
+        std::fs::write(&path, not_text).unwrap();
+        let store = cx.new(|_| AgentSessions::load(path.clone()));
+        assert!(!path.exists(), "set aside before it is written again");
+        store.update(cx, |store, cx| {
+            assert_eq!(store.not_saved(), None);
+            store.upsert(record("a", "server/crm", "claude", 0), cx);
+        });
+        studio_settings::writes_done();
+        assert_eq!(std::fs::read(&others()[0]).unwrap(), not_text);
+        assert_eq!(AgentSessions::load(path.clone()).records.len(), 1);
+
+        // Neither one that does not read as text nor one that does not parse is written over
+        // when it cannot be set aside.
+        let other_version = serde_json::to_vec(&json!({ "version": VERSION + 1, "sessions": [] }));
+        for held in [not_text.to_vec(), other_version.unwrap()] {
+            fresh();
+            std::fs::write(&path, &held).unwrap();
+            block_set_aside(&path);
+            let store = cx.new(|_| AgentSessions::load(path.clone()));
+            store.update(cx, |store, cx| {
+                store.upsert(record("a", "server/crm", "claude", 0), cx);
+                store.set_pinned("a", true, cx);
+            });
+            studio_settings::writes_done();
+            assert_eq!(std::fs::read(&path).unwrap(), held, "written over");
+            store.read_with(cx, |store, _| {
+                assert!(
+                    store.get("a").is_some_and(|record| record.pinned),
+                    "kept in memory"
+                );
+                assert_eq!(store.not_saved(), Some(path.as_path()));
+            });
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The person's option choices are kept the same way: a preferences file that could not be
+    /// read and cannot be set aside is not written over.
+    #[test]
+    fn a_preferences_file_that_could_not_be_read_is_never_written_over() {
+        let dir = std::env::temp_dir().join(format!("studio-agent-prefs-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("preferences.json");
+        let claude = vec!["claude-code-acp".to_owned()];
+        for held in [&b"{\"a\": \xff}"[..], b"[1, 2]"] {
+            std::fs::write(&path, held).unwrap();
+            block_set_aside(&path);
+            let mut preferences = Preferences {
+                path: path.clone(),
+                records: None,
+            };
+            preferences.prefer(&claude, "model", json!("opus"));
+            studio_settings::writes_done();
+            assert_eq!(std::fs::read(&path).unwrap(), held, "written over");
+            assert_eq!(preferences.of(&claude).get("model"), Some(&json!("opus")));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// On Windows another program can hold the file open without letting it be renamed, or
+    /// read at all. Studio can then neither set it aside nor read it, and does not save over
+    /// it, even once the other program lets it go.
+    #[cfg(windows)]
+    #[gpui::test]
+    fn a_file_another_program_holds_is_never_written_over(cx: &mut gpui::TestAppContext) {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+        let dir = std::env::temp_dir().join(format!("studio-agent-held-{}", std::process::id()));
+        let path = dir.join("sessions.json");
+        let held = serde_json::to_vec(&json!({ "version": VERSION + 1, "sessions": [] })).unwrap();
+        // Readable but not to be renamed, then not even readable.
+        for share in [FILE_SHARE_READ, 0] {
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, &held).unwrap();
+            let holder = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(share)
+                .open(&path)
+                .unwrap();
+            let store = cx.new(|_| AgentSessions::load(path.clone()));
+            drop(holder);
+            store.update(cx, |store, cx| {
+                store.upsert(record("a", "server/crm", "claude", 0), cx);
+            });
+            studio_settings::writes_done();
+            assert_eq!(std::fs::read(&path).unwrap(), held, "share {share}");
+            store.read_with(cx, |store, _| {
+                assert_eq!(store.not_saved(), Some(path.as_path()));
+            });
         }
         std::fs::remove_dir_all(&dir).ok();
     }

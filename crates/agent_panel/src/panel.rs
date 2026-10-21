@@ -2077,7 +2077,8 @@ impl AgentPanel {
     }
 
     /// Studio found (or did not find) a CLI that speaks the graph's API for this conversation.
-    /// A configured CLI it passed over, and every CLI it found when none fits, are named.
+    /// A configured CLI it passed over, every CLI it found when none fits, and one the agent's
+    /// shell cannot run through the wrapper, are named.
     fn cli_chosen(
         &mut self,
         choice: cli_home::CliChoice,
@@ -2090,7 +2091,11 @@ impl AgentPanel {
             waiting.send(()).ok();
         }
         match choice {
-            cli_home::CliChoice::Chosen { cli, version } => {
+            cli_home::CliChoice::Chosen {
+                cli,
+                version,
+                wrapper,
+            } => {
                 let configured = configured
                     .filter(|path| !path.is_empty())
                     .map(|path| cli_home::expand_home(&path));
@@ -2104,6 +2109,18 @@ impl AgentPanel {
                             configured.display(),
                             cli.display(),
                             version.map(|v| format!(" ({v})")).unwrap_or_default()
+                        ),
+                        false,
+                    );
+                }
+                if !wrapper {
+                    self.say(
+                        format!(
+                            "The agent's shell cannot run {}: its path is not plain ASCII, \
+                             which a batch file cannot hold. The agent runs it with \
+                             omnigraph_run instead; set `agent.omnigraph_cli` to a CLI at a \
+                             plain ASCII path to give its shell the CLI too.",
+                            cli.display()
                         ),
                         false,
                     );

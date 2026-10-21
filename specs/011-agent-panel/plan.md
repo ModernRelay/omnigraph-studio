@@ -213,9 +213,12 @@ and Delta's sidebar.
   archived. Ids and titles only; the conversation stays with the agent. The agent's own
   `session/list` is not the source: every graph's agent works in the same directory, so it
   cannot tell graphs apart. Each record is read on its own: one Studio cannot read is skipped
-  and the file set aside first, so the next save loses nothing. A file in another shape is set
-  aside whole. (The first format, one session per graph and agent, predates v0.1.0 and is not
-  read.)
+  and the file set aside first, so the next save loses nothing. A file in another shape, or one
+  Studio cannot read at all (not text, or held by another program), is set aside whole. One it
+  cannot set aside (on Windows, another program holds it open without letting it be renamed)
+  is never saved over: the list lasts until Studio quits, and the Conversations panel says so
+  above its rows, naming the file. (The first format, one session per graph and agent,
+  predates v0.1.0 and is not read.)
 - **Titles.** The agent's `session_info_update` title wins; until it sends one, the first line
   of the first message (cut at 80 characters); "New conversation" before that.
 - **One tab per conversation.** Each conversation is its own Agent tab, titled after it, and
@@ -235,8 +238,13 @@ and Delta's sidebar.
   can resume (`session/resume`) comes back without its messages, with a note.
 - **Each graph's own directory.** A new conversation runs in `agent/graphs/<graph>-<hash>` in the
   data directory (the key made safe plus a stable FNV-1a hash), so an agent's `session/list` in
-  it is the graph's conversations. A conversation keeps the directory it started in (recorded
-  with it); earlier ones ran in the shared `agent/workspace`.
+  it is the graph's conversations. On Windows it is under the local application folder
+  instead (`%LOCALAPPDATA%\OmniGraph Studio\agent\graphs\…`): the data directory is the roaming
+  one, which folder redirection can put on a network share, and cmd cannot work in a network
+  folder (spec 013). A conversation keeps the directory it started in (recorded with it;
+  `sessions::working_dir`), so one started under a graph's older key still resumes where the
+  agent keeps it; only a new one gets the directory of the key it has now. Import lists the
+  key's directory alone. Earlier conversations ran in the shared `agent/workspace`.
 - **The Conversations panel** is a tab of the left sidebar (the agent mark;
   `studio_agent::ShowConversations`), after Delta's threads list, every title on one edge. Its
   title line holds Filter, More (Import from the agent) and New conversation, before the
@@ -305,7 +313,8 @@ As in Zed's agent panel (checked in `agent_ui` at `v1.23.2`), and only through s
 - **Remembered choices.** Studio remembers the last value chosen for each option, per agent
   command (`agent/preferences.json`, owner-only, value ids and booleans only), and sets them on
   the agent's next new session where it offers that value and starts on another. A resumed
-  session keeps its own.
+  session keeps its own. A file Studio cannot read is set aside as the conversations' is, and
+  one it cannot set aside is never written over.
 - **Context.** Each `usage_update` replaces the usage: a 14 px ring on a visible track, so it
   reads as a gauge rather than a spinner, muted until 85 % and then the warning colour with the
   percentage beside it. Hover
@@ -352,6 +361,9 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 | 2026-10-20 | The agent panel and the Conversations panel run agents on Windows | Both refusals removed (`panel.rs` `start`, `sessions_panel.rs` `agent`); spec 013's Windows rows | Not run on Windows here: the Windows-only tests run in CI on `windows-2025` |
 | 2026-10-20 | An overdue close is not cancelled, and does not free a later conversation's close | `agent_panel` `an_overdue_close_frees_the_session_and_still_runs_to_its_answer` | Past the bound the waiting conversation was woken and the close still ran to its answer; its late answer left a later conversation's close of the session in place. Dropping the unanswered request had sent `$/cancel_request` (`SentRequestCancellation::drop`, agent-client-protocol 2.2.0); the bound is now `FREED_WITHIN` (60 s), not 15 s |
 | 2026-10-20 | Sessions files of another build are set aside, not lost | `agent_panel` `a_record_that_cannot_be_read_leaves_the_others` | A record without `cwd`, with `cwd: null`, or without its marks sets the file aside (renamed beside itself, byte for byte); a file of version 3, 1 or none is set aside with nothing read |
+| 2026-10-20 | A conversation that asked for the session before the close was sent is freed by the close, not told to try again | `agent_panel` `a_conversation_waiting_before_the_close_is_sent_is_freed_by_the_close` (new), `a_conversation_waits_for_a_start_given_up_only_so_long` (its close step now waits); run on macOS | Before the fix the new test failed with `Err(Late { closing: true })`: the waiter's own bound, started at its claim and shorter than the close's, ran out while the close was under way. After it the waiter waited past its own bound (1 s) and was routed once the close was overdue (2 s after sending, no sooner); a waiter for an open still hears "try again" at its bound |
+| 2026-10-20 | A sessions or preferences file Studio could not read is never written over | `agent_panel` `a_file_that_could_not_be_read_is_never_written_over`, `a_preferences_file_that_could_not_be_read_is_never_written_over` (run on macOS; a folder at each name the file would be set aside as stands in for a program holding it); `a_file_another_program_holds_is_never_written_over` (Windows only: a handle without delete sharing, then without any; runs in CI on `windows-2025`, not run here) | Before the fix: a sessions file that was not UTF-8 was not set aside, and both files were written over when the rename failed. After it: a file that is not text is set aside like one that does not parse; one that cannot be set aside stays byte for byte through a save, the changes kept in memory, and `not_saved` names it for the Conversations panel's note |
+| 2026-10-20 | On Windows agents work in the local application folder | `agent_panel` `agents_work_in_the_local_folder_of_studios_roaming_data` (run on macOS) | A data folder under `%APPDATA%`, local or on a `\\server\share`, maps to the same name under `%LOCALAPPDATA%`; a data folder set elsewhere keeps its agents |
 
 ## Corrections
 
@@ -366,3 +378,10 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 - Stop was planned as ⌘.; Zed's editor binding takes it inside the composer, so it is ⌘⇧.
 - 2026-10-12 · Approval said Allow was ⌘↩ and Reject ⎋. ⌘↩ is Send in the composer and ⎋
   belongs to the editor, so the card uses the bound ⌘Y, ⌘⌥Y and ⌘⌥N, as in Actions.
+- 2026-10-20 · Raising a close's bound to 60 s made a conversation that asked for its session
+  before the close was sent (a restart, or one during a long load) time out on its own 60 s
+  bound first, counted from its claim, and hear "try again". A waiter's own bound now covers
+  only the agent's open; a close frees it within the close's bound, counted from sending.
+- 2026-10-20 · Setting the sessions file aside was not checked: when the rename failed, or when
+  the file could not be read at all (not UTF-8, or held by another program), the next save
+  wrote over the file Studio promised to keep. Such a file is now never saved over.

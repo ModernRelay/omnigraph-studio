@@ -48,6 +48,10 @@ pub struct CliHome {
     /// The CLI chosen for the conversation, which `omnigraph_run` starts itself, or why there
     /// is none.
     cli: std::sync::Mutex<Result<PathBuf, String>>,
+    /// Whether the wrapper runs the chosen CLI. On Windows the batch file names it only by a
+    /// path it can hold ([`cmd_program`]); otherwise the wrapper refuses, and the agent is told
+    /// to use `omnigraph_run`, which starts the CLI by its path.
+    wrapper_runs: std::sync::atomic::AtomicBool,
 }
 
 /// The target protocol of the home Studio writes (`target_config_version: 1`). A CLI is chosen
@@ -125,6 +129,7 @@ impl CliHome {
             credentials,
             private: private_root.join(folder),
             cli: std::sync::Mutex::new(Err("Studio has not chosen an omnigraph CLI yet.".into())),
+            wrapper_runs: std::sync::atomic::AtomicBool::new(true),
         })
     }
 
@@ -170,16 +175,26 @@ impl CliHome {
         Confined::open(&self.cwd)?.dirs(&self.folder)
     }
 
-    /// Points the wrapper at `cli`.
-    pub fn use_cli(&self, cli: &Path) -> std::io::Result<()> {
+    /// Points the wrapper and `omnigraph_run` at `cli`: whether the wrapper runs it. On Windows
+    /// a batch file that cannot name the CLI refuses and points at `omnigraph_run`, which still
+    /// runs it.
+    pub fn use_cli(&self, cli: &Path) -> std::io::Result<bool> {
+        self.use_cli_on(cli, cfg!(windows))
+    }
+
+    /// [`CliHome::use_cli`] with the batch file when `windows`.
+    fn use_cli_on(&self, cli: &Path, windows: bool) -> std::io::Result<bool> {
         let wrapper = Wrapper::Run {
             home: &self.dir,
             cli,
         };
         self.home()?
-            .write(WRAPPER_NAME, wrapper.script().as_bytes(), 0o700)?;
+            .write(WRAPPER_NAME, wrapper.script_on(windows).as_bytes(), 0o700)?;
+        let runs = !windows || cmd_program(&self.dir, cli).is_some();
+        self.wrapper_runs
+            .store(runs, std::sync::atomic::Ordering::Relaxed);
         self.set_cli(Ok(cli));
-        Ok(())
+        Ok(runs)
     }
 
     /// Makes the wrapper run nothing and say `why`: the conversation has no CLI that speaks the
@@ -201,16 +216,27 @@ impl CliHome {
     }
 
     /// [`CliHome::instructions`] on Windows when `windows`, where the wrapper is a batch file
-    /// and the agent is told what that means for its arguments ([`cmd_script`]).
+    /// and the agent is told what that means for its arguments ([`cmd_script`]), and that cmd
+    /// cannot work in a network folder, should its working directory be one.
     fn instructions_on(&self, cli_ready: Option<bool>, windows: bool) -> String {
         let command = self.command.to_string_lossy();
-        let batch = if windows {
-            " It is a batch file, so cmd reads its arguments first: pass a query or parameters \
-             holding \" with %, &, |, <, > or ^ in a file (--query, --params-file), or use \
-             omnigraph_run."
-        } else {
-            ""
+        let batch = match (windows, on_network(&self.cwd)) {
+            (false, _) => "",
+            (true, false) => {
+                " It is a batch file, so cmd reads its arguments first: pass a query or \
+                 parameters holding \" with %, &, |, <, > or ^ in a file (--query, \
+                 --params-file), or use omnigraph_run."
+            }
+            // cmd starts in the Windows folder instead, and the CLI reads relative paths from
+            // there.
+            (true, true) => {
+                " It is a batch file, so cmd reads its arguments first: pass a query or \
+                 parameters holding \" with %, &, |, <, > or ^ in a file (--query, \
+                 --params-file), or use omnigraph_run. Your working directory is a network \
+                 folder, which cmd cannot work in: give it every file by its absolute path."
+            }
         };
+        let wrapper_runs = self.wrapper_runs.load(std::sync::atomic::Ordering::Relaxed);
         match cli_ready {
             Some(false) => format!(
                 "Studio found no omnigraph CLI that speaks this graph's HTTP API, so the graph is \
@@ -218,6 +244,19 @@ impl CliHome {
                  matching omnigraph CLI or set `agent.omnigraph_cli`. Your branch would be \
                  {branch}.",
                 branch = self.branch
+            ),
+            _ if !wrapper_runs => format!(
+                "Your shell cannot run this conversation's omnigraph CLI: its path is not plain \
+                 ASCII, which a batch file cannot hold. Run omnigraph commands with \
+                 the omnigraph_run tool: pass the arguments after `omnigraph` as a list, and \
+                 Studio adds the gateway and the graph {graph}. Read any branch. Write only to \
+                 your branch, {branch}: create it first with [\"branch\", \"create\", \
+                 \"{branch}\", \"--from\", \"{base}\"], then pass --branch {branch} to mutate \
+                 and load. Prefer one load of NDJSON to many mutations. Studio refuses other \
+                 writes before sending them (\"Nothing was sent\"). See AGENTS.md for the rules.",
+                graph = self.graph,
+                branch = self.branch,
+                base = self.base,
             ),
             _ => format!(
                 "This conversation's omnigraph CLI is {command} (run it by that path; another \
@@ -386,6 +425,9 @@ pub enum CliChoice {
     Chosen {
         cli: PathBuf,
         version: Option<String>,
+        /// Whether the agent's shell can run it through the wrapper, which on Windows names
+        /// the CLI only by a path a batch file can hold; `omnigraph_run` runs it either way.
+        wrapper: bool,
     },
     /// No candidate speaks the graph's contract: each one found, with what it said.
     NoMatch { found: Vec<(PathBuf, CliFacts)> },
@@ -411,11 +453,12 @@ pub async fn choose_cli(home: &CliHome, candidates: Vec<PathBuf>, contract: &str
         };
         if facts.contract.as_deref() == Some(contract)
             && facts.target_protocol == Some(TARGET_PROTOCOL)
-            && home.use_cli(&cli).is_ok()
+            && let Ok(wrapper) = home.use_cli(&cli)
         {
             return CliChoice::Chosen {
                 cli,
                 version: facts.version,
+                wrapper,
             };
         }
         found.push((cli, facts));
@@ -1001,7 +1044,12 @@ enum Wrapper<'a> {
 impl Wrapper<'_> {
     /// The wrapper as this platform runs it.
     fn script(&self) -> String {
-        if cfg!(windows) {
+        self.script_on(cfg!(windows))
+    }
+
+    /// The batch file when `windows`, else the shell script.
+    fn script_on(&self, windows: bool) -> String {
+        if windows {
             cmd_script(self)
         } else {
             posix_script(self)
@@ -1156,10 +1204,20 @@ fn cmd_program(home: &Path, cli: &Path) -> Option<String> {
     ascii(&relative).then(|| format!("\"%~dp0{}\"", relative.replace('%', "%%")))
 }
 
+/// Whether `path`, read as a Windows path whatever platform reads it, is a network path
+/// (`\\server\share\…`, or `\\?\UNC\…`). cmd cannot work in one: started there, it works in the
+/// Windows folder instead, so a program it runs reads relative paths from there.
+fn on_network(path: &Path) -> bool {
+    let text = path.to_string_lossy().replace('/', "\\");
+    text.starts_with(r"\\?\UNC\")
+        || (text.starts_with(r"\\") && !text.starts_with(r"\\?\") && !text.starts_with(r"\\.\"))
+}
+
 /// A batch file that runs nothing and writes `why` to standard error, as plain ASCII: a
 /// character outside it shows as `?`, a double quote as `'`, and every character cmd would
-/// read (`%`, `^`, `&`, `|`, `<`, `>`, `(`, `)`) is escaped. A long text is split over lines
-/// short of cmd's limit.
+/// read (`%`, `^`, `&`, `|`, `<`, `>`, `(`, `)`) is escaped. Delayed expansion is off, as in
+/// the wrapper that runs the CLI, so a `!` stays (a person's registry can turn it on for every
+/// batch file). A long text is split over lines short of cmd's limit.
 fn cmd_refusal(why: &str) -> String {
     let plain: String = why
         .chars()
@@ -1172,6 +1230,7 @@ fn cmd_refusal(why: &str) -> String {
     let mut lines = vec![
         "@echo off".to_owned(),
         "rem Written by OmniGraph Studio for one agent conversation (spec 013).".to_owned(),
+        "setlocal EnableExtensions DisableDelayedExpansion".to_owned(),
     ];
     for chunk in plain.as_bytes().chunks(1000) {
         let mut escaped = String::new();
@@ -1251,9 +1310,14 @@ mod tests {
         };
 
         match choose(vec![old.clone(), untargeted.clone(), current.clone()]) {
-            CliChoice::Chosen { cli, version } => {
+            CliChoice::Chosen {
+                cli,
+                version,
+                wrapper,
+            } => {
                 assert_eq!(cli, current);
                 assert_eq!(version.as_deref(), Some("0.14.0-edge+7fd9cc9"));
+                assert!(wrapper, "a shell script names any path");
             }
             other => panic!("{other:?}"),
         }
@@ -1698,30 +1762,51 @@ mod tests {
 
         // Claude Code keeps the first 2,048 characters of a server's instructions, so the
         // server's and the conversation's fit, with a long data directory in the command path.
-        // Windows's batch file adds a note on its arguments, and its name is longer.
+        // Windows's batch file adds a note on its arguments, and its name is longer; a working
+        // directory in a network folder adds another, and a CLI the batch file cannot name
+        // turns the agent to omnigraph_run.
         let long = cwd
             .join("d".repeat(120))
             .join(".studio/agent-20261013-101500");
-        for (windows, wrapper) in [(false, "omnigraph"), (true, "omnigraph.cmd")] {
+        let network =
+            PathBuf::from(r"\\server\share\ada\AppData\Roaming\OmniGraph Studio\agent\graphs\g");
+        for (windows, wrapper, at, runs) in [
+            (false, "omnigraph", &cwd, true),
+            (true, "omnigraph.cmd", &cwd, true),
+            (true, "omnigraph.cmd", &network, true),
+            (true, "omnigraph.cmd", &cwd, false),
+        ] {
             let longest = CliHome {
                 command: long.join(wrapper),
                 dir: long.clone(),
                 graph: "g".repeat(64),
                 branch: "agent/20261013-101500".into(),
                 base: "b".repeat(64),
-                cwd: cwd.clone(),
+                cwd: at.clone(),
                 folder: ".studio/agent-20261013-101500".into(),
                 credentials: String::new(),
                 private: cwd.join("private/longest"),
                 cli: std::sync::Mutex::new(Err(String::new())),
+                wrapper_runs: std::sync::atomic::AtomicBool::new(runs),
             };
             for ready in [None, Some(true), Some(false)] {
                 let instructions = longest.instructions_on(ready, windows);
                 let length = crate::mcp::INSTRUCTIONS.len() + 2 + instructions.len();
                 assert!(length <= 2048, "{length} characters (Windows: {windows})");
+                let told = ready != Some(false);
                 assert_eq!(
                     instructions.contains("batch file"),
-                    windows && ready != Some(false),
+                    windows && told,
+                    "{instructions}"
+                );
+                assert_eq!(
+                    instructions.contains("network folder"),
+                    *at == network && runs && told,
+                    "{instructions}"
+                );
+                assert_eq!(
+                    instructions.contains(&*long.join(wrapper).to_string_lossy()),
+                    runs && told,
                     "{instructions}"
                 );
             }
@@ -1830,6 +1915,7 @@ mod tests {
             refusal,
             "@echo off\r\n\
              rem Written by OmniGraph Studio for one agent conversation (spec 013).\r\n\
+             setlocal EnableExtensions DisableDelayedExpansion\r\n\
              1>&2 echo(No CLI: 'C:\\J?rgen\\x' 100%% ^& ^<a^|b^> ^^c ^(d^)\r\n\
              exit /b 1\r\n"
         );
@@ -1839,6 +1925,105 @@ mod tests {
         for script in [refusal, long] {
             assert!(script.lines().all(|line| line.len() < 8191));
         }
+    }
+
+    /// A CLI the batch file cannot name leaves the wrapper refusing, so the agent is not told
+    /// to run it from its shell: it is told why it cannot and to use `omnigraph_run`, which
+    /// starts the CLI by its path and still runs it. A shell script names any path.
+    #[test]
+    fn a_cli_the_batch_file_cannot_name_is_not_offered_to_the_shell() {
+        let cwd = std::env::temp_dir().join(format!("studio-cli-unnamed-{}", std::process::id()));
+        std::fs::remove_dir_all(&cwd).ok();
+        std::fs::create_dir_all(&cwd).unwrap();
+        let home = CliHome::write(
+            &cwd,
+            &cwd.join("private"),
+            1,
+            "t",
+            "knowledge",
+            "agent/x",
+            "main",
+        )
+        .unwrap();
+        let unnamed = Path::new(r"D:\Jürgen\omnigraph.exe");
+        assert!(!home.use_cli_on(unnamed, true).unwrap());
+        let wrapper = std::fs::read_to_string(&home.command).unwrap();
+        assert!(
+            wrapper.contains("omnigraph_run") && !wrapper.contains("%*"),
+            "{wrapper}"
+        );
+        assert_eq!(home.cli().unwrap(), unnamed, "omnigraph_run still runs it");
+        let command = home.command.to_string_lossy().into_owned();
+        let told = home.instructions_on(Some(true), true);
+        assert!(
+            told.starts_with("Your shell cannot run") && told.contains("omnigraph_run"),
+            "{told}"
+        );
+        assert!(!told.contains(&command), "{told}");
+
+        // A CLI it can name runs from the shell again, and a shell script names any.
+        assert!(
+            home.use_cli_on(Path::new(r"C:\Tools\omnigraph.exe"), true)
+                .unwrap()
+        );
+        assert!(home.instructions_on(Some(true), true).contains(&command));
+        assert!(home.use_cli_on(unnamed, false).unwrap());
+        assert!(home.instructions_on(Some(true), false).contains(&command));
+        drop(home);
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// cmd cannot work in a network folder, so a working directory there is told apart.
+    #[test]
+    fn network_folders_are_told_apart() {
+        for network in [
+            r"\\server\share\ada\AppData\Roaming",
+            r"\\?\UNC\server\share\ada",
+            "//server/share/ada",
+        ] {
+            assert!(on_network(Path::new(network)), "{network}");
+        }
+        for local in [
+            r"C:\Users\ada\AppData\Local",
+            r"\\?\C:\Users\ada",
+            r"\\.\pipe\x",
+            "/Users/ada",
+        ] {
+            assert!(!on_network(Path::new(local)), "{local}");
+        }
+    }
+
+    /// A person's registry can turn delayed expansion on for every batch file, as `cmd /V:ON`
+    /// does: the refusal turns it off, so a `!` and a `^` in its text stay as written.
+    #[cfg(windows)]
+    #[test]
+    fn a_refusal_keeps_its_text_with_delayed_expansion_on() {
+        let root = std::env::temp_dir().join(format!("studio-cmd-refusal-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        let home = CliHome::write(
+            &root,
+            &root.join("private"),
+            1,
+            "t",
+            "knowledge",
+            "agent/x",
+            "main",
+        )
+        .unwrap();
+        home.refuse("No CLI: !y! ^c 100%").unwrap();
+        let output = std::process::Command::new("cmd")
+            .args(["/D", "/V:ON", "/C"])
+            .arg(&home.command)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr).trim_end(),
+            "No CLI: !y! ^c 100%"
+        );
+        drop(home);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Set for this test binary when it runs as the CLI.
@@ -1901,7 +2086,7 @@ mod tests {
         .unwrap();
         assert!(home.command.ends_with("omnigraph.cmd"));
         let cli = std::env::current_exe().unwrap();
-        home.use_cli(&cli).unwrap();
+        assert!(home.use_cli(&cli).unwrap(), "the batch file names {cli:?}");
         let script = std::fs::read_to_string(&home.command).unwrap();
         assert!(script.is_ascii(), "{script}");
 

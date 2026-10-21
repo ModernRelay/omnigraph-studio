@@ -77,11 +77,14 @@ enum ListRow {
     End,
 }
 
-/// The note a list with no conversation row shows.
+/// The note a list with no conversation row shows, or one above every row.
 #[derive(Clone, Copy, PartialEq)]
 enum Note {
     NoMatch,
     NoConversations,
+    /// Studio could neither read the list's file nor set it aside, so it does not save the
+    /// list over it.
+    NotSaved,
 }
 
 /// What a row shows at its end.
@@ -599,6 +602,9 @@ impl SessionsPanel {
             .collect();
         let id = |record: &&SessionRecord| ListRow::Conversation(Rc::new((*record).clone()));
         let mut rows = Vec::new();
+        if sessions.not_saved().is_some() {
+            rows.push(ListRow::Note(Note::NotSaved));
+        }
         if self.search_open || searching {
             rows.push(ListRow::Search);
         }
@@ -663,6 +669,21 @@ impl SessionsPanel {
                 },
             )
             .into_any_element(),
+            // By its path only, which holds no conversation.
+            ListRow::Note(Note::NotSaved) => {
+                let file = self
+                    .sessions
+                    .read(cx)
+                    .not_saved()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                ds::sidebar_note(format!(
+                    "Studio could not read {file} or move it aside, so this list is not saved: \
+                     changes last until Studio quits. Close any program that has the file \
+                     open, then restart Studio."
+                ))
+                .into_any_element()
+            }
             ListRow::Label { title, first } => ds::section_label(title)
                 .when(first, |label| label.pt(px(ds::space::XS)))
                 .into_any_element(),

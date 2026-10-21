@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use smol::net::{TcpListener, TcpStream};
 
 use crate::gateway_rules::{self, Incoming, Sandbox, Verdict, WriteSummary};
+use crate::requester::Starters;
 
 /// The most a request's line and headers may take.
 const MAX_HEAD: usize = 64 * 1024;
@@ -289,6 +290,9 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
             stream_back(&mut stream, &request.method, response).await;
         }
         Verdict::Write(write) => {
+            // Whoever ran the command, as they are now (`requester`): on Windows the CLI can
+            // outlive a command stopped by its process id, its connection open.
+            let starters = Starters::of(stream.peer_addr().ok(), stream.local_addr().ok()).await;
             let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
             let (decide, decision) = oneshot::channel();
             if shared
@@ -307,7 +311,8 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
             }
             // The person may decide after the CLI has given up (its shell's two-minute timeout):
             // a write approved then would land with the agent told it failed. A closed
-            // connection while waiting ends the write unsent.
+            // connection while waiting ends the write unsent, and so does the end of a process
+            // the CLI was started under, since whoever ran it no longer waits.
             let gone = {
                 let mut watch = stream.clone();
                 async move {
@@ -318,28 +323,45 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
                     ) {}
                 }
             };
-            let (decision, gone) = (
+            let (decision, gone, stopped) = (
                 futures::FutureExt::fuse(decision),
                 futures::FutureExt::fuse(gone),
+                futures::FutureExt::fuse(starters.ended()),
             );
-            futures::pin_mut!(decision, gone);
+            futures::pin_mut!(decision, gone, stopped);
             let decided = futures::select! {
-                decided = decision => Some(decided),
-                () = gone => None,
+                decided = decision => Ok(decided),
+                () = gone => Err(Undecided::Gone),
+                () = stopped => Err(Undecided::Stopped),
             };
-            let Some(decided) = decided else {
-                // An approval that came as the CLI gave up is not sent: it says so, rather
-                // than being dropped and taken for a write whose outcome is unknown.
-                if let Some(Ok(Some(on_outcome))) =
-                    futures::FutureExt::now_or_never(decision.as_mut())
-                {
-                    on_outcome(&Seen::Refused(NOT_SENT.into()));
+            let decided = match decided {
+                Ok(decided) => decided,
+                Err(undecided) => {
+                    // An approval that came as the CLI gave up is not sent: it says so, rather
+                    // than being dropped and taken for a write whose outcome is unknown.
+                    if let Some(Ok(Some(on_outcome))) =
+                        futures::FutureExt::now_or_never(decision.as_mut())
+                    {
+                        on_outcome(&Seen::Refused(NOT_SENT.into()));
+                    }
+                    shared
+                        .events
+                        .unbounded_send(GatewayEvent::Abandoned { id })
+                        .ok();
+                    // A CLI whose command was stopped still listens: it hears that nothing
+                    // was sent, and ends.
+                    if let Undecided::Stopped = undecided {
+                        answer(
+                            &mut stream,
+                            403,
+                            "forbidden",
+                            "Studio: the command that sent this write was stopped before the \
+                             person decided. Nothing was sent.",
+                        )
+                        .await;
+                    }
+                    return;
                 }
-                shared
-                    .events
-                    .unbounded_send(GatewayEvent::Abandoned { id })
-                    .ok();
-                return;
             };
             let Ok(Some(on_outcome)) = decided else {
                 answer(
@@ -374,6 +396,14 @@ async fn handle(mut stream: TcpStream, request: Request, shared: &Shared) {
             }
         }
     }
+}
+
+/// Why a write stopped waiting for the person's decision, unsent.
+enum Undecided {
+    /// The CLI closed its connection.
+    Gone,
+    /// A process the CLI was started under ended; the CLI still listens.
+    Stopped,
 }
 
 fn forward_request(request: &Request, body: Option<Vec<u8>>) -> ForwardRequest {
@@ -1041,6 +1071,56 @@ mod tests {
                     branch_created: false,
                 }
             );
+        });
+    }
+
+    /// On Windows the agent's wrapper is a batch file and the CLI runs under `cmd`: the agent
+    /// stopping the command by the wrapper's process id ends `cmd` and leaves the CLI waiting,
+    /// its connection open. The write it sent is given up unsent all the same, as when the CLI
+    /// goes, so a person allowing it later sends nothing.
+    #[cfg(windows)]
+    #[test]
+    fn a_write_whose_command_was_stopped_is_not_sent() {
+        async fn next_within(
+            events: &mut mpsc::UnboundedReceiver<GatewayEvent>,
+        ) -> Option<GatewayEvent> {
+            smol::future::or(events.next(), async {
+                smol::Timer::after(std::time::Duration::from_secs(60)).await;
+                None
+            })
+            .await
+        }
+        smol::block_on(async {
+            let (client, seen) = upstream();
+            let mut gateway = Gateway::bind().unwrap();
+            let (port, token) = (gateway.port, gateway.token.clone());
+            let (events_tx, mut events) = mpsc::unbounded();
+            let _serve = smol::spawn(gateway.serve(client, sandbox(), events_tx));
+            let write =
+                r#"{"query":"query m() { … }","name":"m","branch":"agent/20261013-101500"}"#;
+            let request = post("/graphs/knowledge/mutate", &token, Some(CONTRACT), write);
+            let root =
+                std::env::temp_dir().join(format!("studio-gateway-stopped-{}", std::process::id()));
+            let (home, mut wrapper) =
+                crate::requester::stand_in::start(&root, port, Some(request.as_bytes()));
+            let Some(GatewayEvent::Write { decide, id, .. }) = next_within(&mut events).await
+            else {
+                panic!("no write event")
+            };
+            wrapper.kill().unwrap();
+            wrapper.wait().unwrap();
+            let Some(GatewayEvent::Abandoned { id: abandoned }) = next_within(&mut events).await
+            else {
+                panic!("the gateway did not see the command stopped")
+            };
+            assert_eq!(abandoned, id);
+            assert!(
+                decide.send(Some(Box::new(|_: &super::Seen| {}))).is_err(),
+                "nobody waits for the decision"
+            );
+            assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
+            drop(home);
+            std::fs::remove_dir_all(&root).ok();
         });
     }
 

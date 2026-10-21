@@ -117,7 +117,7 @@ Agents (claude-agent-acp 0.89.1 with Claude Agent SDK 0.3.293; codex-acp 2.2.2 w
 |---|---|---|
 | Forwarding | `GraphClient::forward` (`crates/graph_client/src/client.rs`) | Sends a request on as it came, with the person's token and the contract header. Bodies stream both ways, no total timeout, never retried, and a path that would leave the server root is refused. The one client crate keeps every request (I) |
 | Rules | `crates/agent_panel/src/gateway_rules.rs` | `classify(request, sandbox) -> Verdict`: health, read, read with a rewritten body, a write for the agent's branch, or a refusal |
-| Gateway | `crates/agent_panel/src/gateway.rs` | A loopback HTTP/1.1 server per conversation (`127.0.0.1:0`, one request per connection). Checks the session token and contract header, applies the rules, forwards, and reports writes to the panel |
+| Gateway | `crates/agent_panel/src/gateway.rs`, `requester.rs` | A loopback HTTP/1.1 server per conversation (`127.0.0.1:0`, one request per connection). Checks the session token and contract header, applies the rules, forwards, and reports writes to the panel. On Windows it holds the processes a write's CLI was started under while the write waits |
 | CLI home | `crates/agent_panel/src/cli_home.rs` | The conversation's directory, config, credentials and wrapper; the shared `AGENTS.md`; finding a CLI that answers |
 | Panel | `crates/agent_panel/src/panel.rs` | Starts the gateway and home with the conversation, shows each write as a card, and records outcomes in the session's write log (`GraphSession::note_write`) |
 | Agent launch | `crates/agent_panel/src/host.rs`, `launch.rs`; `omnigraph-studio launch-agent` in `crates/studio/src/main.rs` | Starts the agent without OmniGraph credentials in its environment: through `env -u` on Unix, always through Studio's own launcher on Windows |
@@ -125,9 +125,9 @@ Agents (claude-agent-acp 0.89.1 with Claude Agent SDK 0.3.293; codex-acp 2.2.2 w
 ### One directory per conversation
 
 A graph's conversations share one agent process and one working directory
-(`<data dir>/agent/graphs/<graph>/`), so nothing per conversation can travel in the agent's
-environment or in one instructions file. Each conversation gets
-`<cwd>/.studio/<agent branch with / as ->/` (mode `0700`):
+(`<data dir>/agent/graphs/<graph>/`; on Windows under `%LOCALAPPDATA%`, below), so nothing per
+conversation can travel in the agent's environment or in one instructions file. Each
+conversation gets `<cwd>/.studio/<agent branch with / as ->/` (mode `0700`):
 
 ```yaml
 # config.yaml (0600)
@@ -174,7 +174,24 @@ nothing more itself: `%*` is expanded once, delayed expansion is off, each path 
 double quotes with `%` doubled, and its lines end with CRLF. cmd reads a batch file in the
 console's code page, so the file is ASCII only: its home is `%~dp0`; the CLI is named by its
 path when that is ASCII, else from `%~dp0` when that way is (both under a profile whose name is
-not); otherwise the wrapper says so and points at `omnigraph_run`.
+not); otherwise the wrapper says so and points at `omnigraph_run`. The agent is then told that
+its shell cannot run the CLI and to use `omnigraph_run`, which starts the CLI by its path and
+still runs it, and the thread says why; it is not told the wrapper is ready. A refusal turns
+delayed expansion off too, so a `!` in its text stays even where a person's registry turns it
+on for every batch file.
+
+cmd cannot work in a network folder: started in one, it says so and works in the Windows
+folder instead, so every relative path a batch file passes on (`--query`, `--data`, `--out`)
+would be read from there. Studio's data folder on Windows is the roaming one (`%APPDATA%`),
+which folder redirection can put on a `\\server\share`, so the agent's working directories go
+under the local application folder (`%LOCALAPPDATA%\OmniGraph Studio\agent\graphs\…`), which is
+never redirected; the agent keeps its own sessions on the machine anyway. A `pushd` of the
+working directory in the wrapper was rejected: cmd has lost the caller's folder before the batch
+file runs, so it could only guess the working directory's root, and a drive letter it maps can
+be left mapped when the command is stopped before its `popd`. Known limit: a working directory that is
+still a network path (a profile on a share, or `OMNIGRAPH_STUDIO_DATA` set to one) keeps cmd's
+behaviour, and the conversation's instructions then tell the agent to give the CLI every file by
+its absolute path, or use `omnigraph_run`, which reads relative paths itself.
 
 The agent learns the path two ways: the conversation's MCP server adds it to its `initialize`
 instructions, and a new `omnigraph_cli` tool returns it with the branch, its base and the rules.
@@ -205,15 +222,21 @@ it is.
   the launcher puts itself in a job that ends every process in it when the launcher ends; the
   agent and what it starts join that job. On Windows the ACP crate ends only the process it
   started (its process group is Unix's), which for `npx` is `cmd`, not the agent under it, so
-  every agent goes through the job. A program named without a folder or an extension is found
-  as a shell finds it, by PATHEXT in PATH's order and never in the working directory: the
-  standard library looks only for `NAME.exe`, and npm installs `npx` as `npx.cmd`. Windows reads
-  a variable by its name in any case, so there names are matched in any ASCII case.
+  every agent goes through the job. A program named without a folder is found as a shell finds
+  it, on PATH in its order (by PATHEXT when it has no extension), and never in the working
+  directory: the standard library looks only for `NAME.exe`, and npm installs `npx` as
+  `npx.cmd`. An empty or relative PATH entry (`a;;b`, a trailing `;`, `bin`) names a folder
+  under the working directory and is passed over; the standard library's own search reads such
+  entries too, so a name on no absolute entry does not start ("could not find … on PATH").
+  Windows reads a variable by its name in any case, so there names are matched in any ASCII
+  case.
 - Studio's files in the agent's working directory are written by handle on both
   (`agent_panel::confined`): Unix opens each name relative to its folder's descriptor; Windows
   holds each folder open without sharing deletion, so it cannot be renamed, removed or swapped
   for a junction while Studio works in it, and opens each part with
-  `FILE_FLAG_OPEN_REPARSE_POINT`, so a link or a junction is refused, never followed.
+  `FILE_FLAG_OPEN_REPARSE_POINT`, so a link or a junction is refused, never followed. A link to
+  a folder, a junction included, is a directory to Windows, so Studio removes a stale one as a
+  directory, which removes the link itself and never its target.
 
 ### Choosing the CLI
 
@@ -282,6 +305,20 @@ session (the workspace's "Agent CLI: … committed" notice) and the agent branch
 - **Ask before writes** (Settings → Agent, `agent.ask_before_writes`): each write waits on its
   card with Allow (⌘Y), Always on this branch (⌘⌥Y) and Reject (⌘⌥N). The CLI waits, since it has
   no timeout. Reject answers 403 and nothing is sent.
+
+A write still waiting is given up unsent, and its card says so, once nobody waits for it: when
+the CLI closes its connection (its command timed out or was stopped), since the person could
+otherwise allow a write the agent was told had failed. On Unix the wrapper `exec`s the CLI, so
+stopping the command by its process id stops the CLI. On Windows the CLI runs under the batch
+file's `cmd`, and an agent that stops the command by that process id, not by its process tree,
+ends `cmd` and leaves the CLI waiting with its connection open. The agent's job does not cover
+this: it ends what the agent started only when the launcher, and with it the agent, ends. So on
+Windows the gateway, when a write arrives, finds the process holding the connection's other end
+(`GetExtendedTcpTable`) and holds open each process it was started under, from its parent up to
+Studio (a parent that is already gone, or whose number a later process took, ends the walk; a
+CLI Studio started itself has none). When one of them ends while the write waits, the write is
+given up as if the CLI had gone, and the CLI, still listening, hears a 403 that nothing was
+sent (`requester`).
 
 ### An agent whose shell has no network
 
@@ -467,8 +504,32 @@ CLI is the one they trust).
 | 2026-10-20 | The Windows wrapper is written from the shell script's account, and names only what cmd reads as written | `agent_panel` `both_wrappers_are_written_from_one_account`, `the_batch_file_names_hostile_paths_and_refuses_what_it_cannot_name` (pure, run on macOS) | The shell script byte for byte as before; the batch file in CRLF and ASCII only, with the same names removed; `%` doubled inside quotes and `&`, `^`, `(`, `)`, `!`, `'`, `;`, `=` left plain there; a CLI under a profile named `Jürgen` (in another case too) named from `%~dp0`; one on another drive or under another non-ASCII folder refused, pointing at `omnigraph_run`; a refusal's `"`, `%`, `&|<>^()` and `ü` escaped or replaced |
 | 2026-10-20 | On Windows the batch file passes every argument as given, Studio's folders cannot be swapped, and an agent named `npx` starts | `the_batch_file_runs_the_cli_with_every_argument_as_given`, `a_held_folder_cannot_be_swapped_and_a_junction_is_not_followed` (Windows only); `a_bare_program_name_is_found_by_its_extensions_in_path_order` (run on macOS); `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings` on macOS over a scratch crate that includes the real `cli_home`, `confined`, `host`, `launch`, `mcp`, `socket` and `tools` files | Clippy clean once an unused `mut` in `cli_home::Stage::new`, which fails Windows's `-D warnings`, was fixed. `cargo check --workspace --target x86_64-pc-windows-msvc` cannot run on macOS: `zstd-sys`'s build script needs an MSVC C compiler. The Windows-only tests have not run yet; CI runs them on `windows-2025` |
 | 2026-10-20 | The gateway refuses a mutation held off the branch, reads a merge's dry run anywhere, and reads a write's answer as Studio does | `gateway_rules` `mutations_need_the_agent_branch_in_their_branch_field`, `branches_merges_and_blobs_stay_on_the_agent_branch`, `loads_name_their_branch_and_base_in_the_query_string`; `gateway` `a_writes_success_answer_says_what_it_did` | `as commit` and `as unattached branch [on …]` refused, after an annotation, with a comment between the words and after a settings line; the words in a string, a comment or a declaration not run let through; a dry run on another graph read, with `as_commit` refused; a load's `branch_created` read from its answer; `kind` `unpublished` or `unattached`, or `published: false`, read as not on the branch; an empty or unreadable success body unknown |
+| 2026-10-20 | The launcher never finds a program through an empty or relative PATH entry | `agent_panel` `a_relative_path_entry_is_never_searched` (new), `a_bare_program_name_is_found_by_its_extensions_in_path_order` (run on macOS; the search is the same code on every platform) | Before the fix the new test failed: with PATH `;bin;<abs>\npm` it returned the relative `npx.cmd`, which resolves against the working directory. After it only absolute entries are looked in; `npx.cmd` and `agent.js` are found there as named; a name on no absolute entry is `None`, which the launcher reports as not on PATH |
+| 2026-10-20 | A CLI the batch file cannot name is not offered to the agent's shell, and a refusal keeps its `!` | `agent_panel` `a_cli_the_batch_file_cannot_name_is_not_offered_to_the_shell`, `network_folders_are_told_apart`, `the_batch_file_names_hostile_paths_and_refuses_what_it_cannot_name`, `a_conversation_home_holds_its_config_token_and_wrapper` (run on macOS); `a_refusal_keeps_its_text_with_delayed_expansion_on` (Windows only, `cmd /V:ON`; not run here) | Before the fix the refusal had no `setlocal` line (the exact-text test failed), and `use_cli` returned `Ok(())` for a refusing wrapper, so `choose_cli` reported it chosen and ready (read in the code). After it `use_cli` returns whether the wrapper runs the CLI, the instructions say the shell cannot run it and point at `omnigraph_run` (which still has the CLI) without the wrapper's path, a network working directory adds its note, and every variant stays within 2,048 characters |
+| 2026-10-20 | A junction in the skill folder is removed as a link, and later skill writes go on | `agent_panel` `a_link_left_in_the_skill_folder_is_removed_and_not_followed` (a symbolic link on macOS, run here; a junction on Windows, not run here), `a_held_folder_cannot_be_swapped_and_a_junction_is_not_followed` (Windows only, now removing its junctions through `Confined::remove`) | On macOS the link is removed and its target kept. On Windows `std::fs::remove_file` fails on a junction (`DeleteFileW`, then a reopen without backup semantics, in the 1.98 standard library's `sys/fs/windows.rs` `unlink`), which failed every later skill write; `remove` now takes a link to a folder away with `remove_dir` (`RemoveDirectoryW` removes the junction, not its target) |
+| 2026-10-20 | On Windows a write whose command was stopped by the wrapper's process id is not sent | `agent_panel` `the_client_is_the_owner_of_the_connections_client_end` (the TCP table read as Windows writes it; run on macOS); `a_command_stopped_by_its_id_is_seen_though_the_cli_waits_on` and `gateway` `a_write_whose_command_was_stopped_is_not_sent` (Windows only: this test binary as the CLI under the real `omnigraph.cmd`, the wrapper killed by its id; not run here) | The launcher's job ends the CLI only when the agent ends, so it does not cover this. Expected on Windows: the CLI keeps its connection after `cmd` ends, the held `cmd` is seen to end within a poll, and the gateway sends `Abandoned` and nothing upstream |
+| 2026-10-20 | The Windows code builds | `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -A dead_code -D warnings` on macOS over a scratch crate that includes the real `cli_home`, `confined`, `host`, `launch`, `mcp`, `requester`, `skill`, `socket` and `tools` files (`dead_code` allowed only because the panel and gateway that use them are not in it) | Clean, once a Windows-only test's missing `mut` and a `chunks_exact` lint were fixed. `gateway.rs` and `sessions.rs` need `graph_client` and `gpui` and were checked by reading; CI builds them on `windows-2025` |
 
 ## Corrections
+
+- 2026-10-20 · The launcher's search for a program read every PATH entry, and an empty or
+  relative one (`a;;b`, a trailing `;`) resolved against its working directory, which the doc
+  said was never searched. It now reads only absolute entries, and a name found on none does
+  not start.
+- 2026-10-20 · A stale junction in the skill folder could not be removed (`remove_file` refuses
+  a directory link on Windows), so every later skill write failed. It is now removed as a
+  directory, which removes the link and not its target.
+- 2026-10-20 · When the batch file could not name the CLI, the wrapper refused but the agent was
+  told its CLI was ready, and the refusal left delayed expansion as the registry set it. The
+  agent is now told its shell cannot run the CLI and to use `omnigraph_run`, and the refusal
+  turns delayed expansion off.
+- 2026-10-20 · A command stopped by the wrapper's process id left the CLI under `cmd` waiting, so
+  the person could still allow its write after the agent was told it failed; the gateway relied
+  on the CLI's connection closing. It now also gives the write up when a process the CLI was
+  started under ends.
+- 2026-10-20 · The agent's working directory on Windows was under `%APPDATA%`, which folder
+  redirection can make a network path cmd cannot work in, so relative file arguments through
+  `omnigraph.cmd` were read from the Windows folder. It is now under `%LOCALAPPDATA%`.
 
 - 2026-10-18 · The agent started through `/usr/bin/env -u …`, which Windows does not have, so on
   Windows any OmniGraph variable in Studio's environment kept the agent from starting. Windows

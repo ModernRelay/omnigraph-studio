@@ -13,9 +13,9 @@
 //! the launcher keeps the agent in a job that ends with it. For that reason Windows starts every
 //! agent through it, with no names to remove as well.
 //!
-//! A program named without a folder is found as a shell finds it ([`find_program`]): the
-//! standard library looks only for `NAME.exe`, and the agents Studio offers start with `npx`,
-//! which npm installs on Windows as `npx.cmd`.
+//! A program named without a folder is found as a shell finds it, on PATH, and never in the
+//! working directory ([`find_program`]): the standard library looks only for `NAME.exe`, and the
+//! agents Studio offers start with `npx`, which npm installs on Windows as `npx.cmd`.
 
 use std::ffi::{OsStr, OsString};
 #[cfg(any(windows, test))]
@@ -36,12 +36,24 @@ pub(crate) fn arguments(removed: &[String], program: &str, args: &[String]) -> V
 /// Runs the launcher with the arguments after its name, `NAME… -- PROGRAM ARGS…`, and returns
 /// the exit code: PROGRAM's, 2 when no program is named, or 1 when it cannot start.
 pub fn launch_agent(args: impl IntoIterator<Item = OsString>) -> i32 {
-    let Some(mut command) = command(args) else {
-        eprintln!(
-            "usage: omnigraph-studio {} NAME… -- PROGRAM [ARGS…]",
-            crate::LAUNCH_COMMAND
-        );
-        return 2;
+    let mut command = match command(args) {
+        Ok(command) => command,
+        Err(NoCommand::Usage) => {
+            eprintln!(
+                "usage: omnigraph-studio {} NAME… -- PROGRAM [ARGS…]",
+                crate::LAUNCH_COMMAND
+            );
+            return 2;
+        }
+        #[cfg(windows)]
+        Err(NoCommand::NotFound(program)) => {
+            eprintln!(
+                "omnigraph-studio {}: could not find {} on PATH",
+                crate::LAUNCH_COMMAND,
+                program.to_string_lossy()
+            );
+            return 1;
+        }
     };
     #[cfg(windows)]
     if let Err(error) = job::end_with_this_process() {
@@ -63,15 +75,24 @@ pub fn launch_agent(args: impl IntoIterator<Item = OsString>) -> i32 {
     }
 }
 
+/// Why the launcher has no command to run.
+enum NoCommand {
+    /// No program follows the `--`.
+    Usage,
+    /// A program named without a folder is on no absolute PATH entry.
+    #[cfg(windows)]
+    NotFound(OsString),
+}
+
 /// The agent's command: the program after the first `--`, its arguments, and every name before
-/// that `--` removed from its environment. `None` when no program follows.
-fn command(args: impl IntoIterator<Item = OsString>) -> Option<Command> {
+/// that `--` removed from its environment.
+fn command(args: impl IntoIterator<Item = OsString>) -> Result<Command, NoCommand> {
     let mut args = args.into_iter();
     let removed: Vec<OsString> = args
         .by_ref()
         .take_while(|arg| arg.as_os_str() != OsStr::new("--"))
         .collect();
-    let program = args.next()?;
+    let program = args.next().ok_or(NoCommand::Usage)?;
     #[cfg(windows)]
     let program = {
         let dirs = std::env::var_os("PATH")
@@ -79,6 +100,7 @@ fn command(args: impl IntoIterator<Item = OsString>) -> Option<Command> {
             .unwrap_or_default();
         let extensions = std::env::var("PATHEXT").unwrap_or_default();
         find_program(&program, &dirs, &extensions, Path::is_file)
+            .ok_or(NoCommand::NotFound(program))?
     };
     let mut command = Command::new(program);
     command
@@ -96,7 +118,7 @@ fn command(args: impl IntoIterator<Item = OsString>) -> Option<Command> {
         // console program would open a window of its own.
         command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
-    Some(command)
+    Ok(command)
 }
 
 /// The extensions of a program the standard library can start on Windows: a `.bat` or `.cmd`
@@ -104,45 +126,46 @@ fn command(args: impl IntoIterator<Item = OsString>) -> Option<Command> {
 #[cfg(any(windows, test))]
 const STARTABLE: &[&str] = &[".com", ".exe", ".bat", ".cmd"];
 
-/// The program `name` stands for, found as a shell finds a command: a name with no folder and
-/// no extension is looked for in each of `dirs` (PATH, in its order) with each extension of
-/// `pathext` (PATHEXT, `.COM;.EXE;.BAT;.CMD` when unset) the standard library can start. The
-/// working directory is never searched, as the standard library does not search it either: the
-/// agent writes there, and the launcher runs outside the agent's sandbox. A name with a folder
-/// or an extension, or one found nowhere, is the standard library's to find, as given.
+/// The program `name` stands for, found as a shell finds a command but never in the working
+/// directory. A name with no folder is looked for in each absolute folder of `dirs` (PATH, in
+/// its order): as it is when it has an extension, else with each extension of `pathext`
+/// (PATHEXT, `.COM;.EXE;.BAT;.CMD` when unset) the standard library can start. An empty or
+/// relative entry (`a;;b`, a trailing `;`, `bin`) names a folder under the working directory and
+/// is passed over: the agent writes there, and the launcher runs outside the agent's sandbox.
+/// The standard library's own search reads such entries too, so a name in no absolute folder is
+/// `None`, not left to it. A name with a folder is the standard library's, as given.
 #[cfg(any(windows, test))]
 fn find_program(
     name: &OsStr,
     dirs: &[PathBuf],
     pathext: &str,
     is_file: impl Fn(&Path) -> bool,
-) -> PathBuf {
+) -> Option<PathBuf> {
     let as_given = PathBuf::from(name);
-    let bare = name
-        .to_str()
-        .is_some_and(|text| !text.is_empty() && !text.contains(['/', '\\', ':']))
-        && as_given.extension().is_none();
-    if !bare {
-        return as_given;
+    let bytes = name.as_encoded_bytes();
+    if bytes.is_empty() || bytes.iter().any(|byte| matches!(byte, b'/' | b'\\' | b':')) {
+        return Some(as_given);
     }
-    let mut extensions: Vec<&str> = pathext
-        .split(';')
-        .filter(|extension| STARTABLE.contains(&extension.to_ascii_lowercase().as_str()))
-        .collect();
-    if pathext.trim().is_empty() {
-        extensions = STARTABLE.to_vec();
-    }
-    for dir in dirs {
-        for extension in &extensions {
-            let mut file = name.to_owned();
-            file.push(extension);
-            let candidate = dir.join(file);
-            if is_file(&candidate) {
-                return candidate;
-            }
-        }
-    }
-    as_given
+    let extensions: Vec<&str> = if as_given.extension().is_some() {
+        vec![""]
+    } else if pathext.trim().is_empty() {
+        STARTABLE.to_vec()
+    } else {
+        pathext
+            .split(';')
+            .filter(|extension| STARTABLE.contains(&extension.to_ascii_lowercase().as_str()))
+            .collect()
+    };
+    dirs.iter().filter(|dir| dir.is_absolute()).find_map(|dir| {
+        extensions
+            .iter()
+            .map(|extension| {
+                let mut file = name.to_owned();
+                file.push(extension);
+                dir.join(file)
+            })
+            .find(|candidate| is_file(candidate))
+    })
 }
 
 #[cfg(windows)]
@@ -188,11 +211,42 @@ mod job {
 mod tests {
     use super::*;
 
+    /// An empty or relative entry of PATH (`a;;b`, a trailing `;`, `bin`) names a folder under
+    /// the working directory, which is never searched: the agent writes there. A name found on
+    /// no absolute entry is found nowhere, though the working directory holds it.
+    #[test]
+    fn a_relative_path_entry_is_never_searched() {
+        let npm = std::env::temp_dir().join("npm");
+        let looked = std::cell::RefCell::new(Vec::new());
+        let present = [
+            PathBuf::from("npx.cmd"),
+            PathBuf::from("bin").join("npx.cmd"),
+            PathBuf::from("agent.exe"),
+            npm.join("npx.cmd"),
+        ];
+        let is_file = |path: &Path| {
+            looked.borrow_mut().push(path.to_owned());
+            present.iter().any(|file| file == path)
+        };
+        let dirs = [PathBuf::new(), PathBuf::from("bin"), npm.clone()];
+        let find = |name: &str| find_program(OsStr::new(name), &dirs, ".cmd;.exe", is_file);
+        assert_eq!(find("npx"), Some(npm.join("npx.cmd")));
+        assert_eq!(find("npx.cmd"), Some(npm.join("npx.cmd")));
+        assert_eq!(find("agent"), None);
+        assert_eq!(find("agent.exe"), None);
+        assert!(
+            looked.borrow().iter().all(|path| path.is_absolute()),
+            "{:?}",
+            looked.borrow()
+        );
+    }
+
     /// `npx` is `npx.cmd` on Windows: the launcher finds it by PATHEXT in PATH's order, as a
-    /// shell would. A path, or a name with an extension, is left as given.
+    /// shell would, and a name with an extension as it is. A path is left as given.
     #[test]
     fn a_bare_program_name_is_found_by_its_extensions_in_path_order() {
-        let (npm, tools) = (PathBuf::from("npm"), PathBuf::from("tools"));
+        let root = std::env::temp_dir();
+        let (npm, tools) = (root.join("npm"), root.join("tools"));
         let present = [
             npm.join("npx.cmd"),
             tools.join("npx.cmd"),
@@ -210,21 +264,21 @@ mod tests {
         let find =
             |name: &str, pathext: &str| find_program(OsStr::new(name), &dirs, pathext, is_file);
         let pathext = ".COM;.EXE;.BAT;.CMD;.VBS;.JS";
-        assert_eq!(find("npx", pathext), npm.join("npx.CMD"));
-        assert_eq!(find("uvx", pathext), tools.join("uvx.EXE"));
+        assert_eq!(find("npx", pathext), Some(npm.join("npx.CMD")));
+        assert_eq!(find("uvx", pathext), Some(tools.join("uvx.EXE")));
         // PATHEXT unset: the four extensions Windows starts.
-        assert_eq!(find("uvx", ""), tools.join("uvx.exe"));
-        // A script the standard library cannot start is not chosen.
-        assert_eq!(find("agent", pathext), PathBuf::from("agent"));
-        for given in [
-            "npx.cmd",
-            "C:\\npm\\npx",
-            "bin/npx",
-            ".\\npx",
-            "missing",
-            "",
-        ] {
-            assert_eq!(find(given, pathext), PathBuf::from(given), "{given:?}");
+        assert_eq!(find("uvx", ""), Some(tools.join("uvx.exe")));
+        // A script the standard library cannot start is not chosen by its bare name.
+        assert_eq!(find("agent", pathext), None);
+        assert_eq!(find("agent.js", pathext), Some(tools.join("agent.js")));
+        assert_eq!(find("npx.cmd", pathext), Some(npm.join("npx.cmd")));
+        assert_eq!(find("missing", pathext), None);
+        for given in ["C:\\npm\\npx", "bin/npx", ".\\npx", ""] {
+            assert_eq!(
+                find(given, pathext),
+                Some(PathBuf::from(given)),
+                "{given:?}"
+            );
         }
     }
 }
