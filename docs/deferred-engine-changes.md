@@ -38,7 +38,7 @@ Every server Studio supports serves these (checked at `7fd9cc9`, 2026-10-20):
 | E8 | Merge preview: `dry_run` on `POST /branches/merge` | `cluster_mergeBranches` with `dry_run` | 008 | A review asks it whether the branch merges cleanly |
 | E10 | Paged commit list: `limit`, `page_token`; `head_commit_id`, `next_page_token` (#1013) | `GET /commits` | 009 | History reads a page at a time, the query editor's snapshot picker one page, and Review down to the fork |
 | E15 | What the caller's credential may do on a graph and its branches (#1073) | `cluster_getAccess` | 002 | Not used yet: every action is shown, and a 403 is a denial that keeps the draft |
-| E21 | A branch from a commit: `from_commit`, `from_commit_id`, `branch_start_refusal` (#1016) | `POST /branches` | 008, 009 | Not used yet: a branch starts from a branch head; the agent's gateway refuses one started at a commit |
+| E21 | A branch from a commit: `from_commit`, `from_commit_id`, `branch_start_refusal` (#1016) | `POST /branches` | 008, 009 | History's "New branch here…" opens the new-branch dialog at a published commit; a refusal reads its reason in words; the agent's gateway refuses one started at a commit |
 | E22 | The CLI reports a write refused at authentication, policy or the contract as not started (#981) | CLI | 013 | `AGENTS.md` says a Studio refusal wrote nothing |
 | E23 | `omnigraph version --json` with the HTTP contract (#987) | CLI | 013 | The agent's CLI is chosen by it |
 | E24 | Unix-socket transport (#988) | CLI | 013 | Not used |

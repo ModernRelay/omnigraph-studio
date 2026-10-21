@@ -346,7 +346,14 @@
     "context": "History && !searching",
     "bindings": {
       "j": "menu::SelectNext",
-      "k": "menu::SelectPrevious"
+      "k": "menu::SelectPrevious",
+      "b": "studio_history::NewBranchHere"
+    }
+  },
+  {
+    "context": "CommitView",
+    "bindings": {
+      "b": "studio_history::NewBranchHere"
     }
   },
   {

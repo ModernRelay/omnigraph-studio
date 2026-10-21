@@ -12,8 +12,11 @@ use gpui::{
     Subscription, Task, WeakEntity, Window,
 };
 use graph_client::WriteOutcome;
-use graph_store::{GraphSession, SessionEvent};
-use studio_actions::graph::{CreateBranch, DeleteBranch, MergeBranch, ReviewBranch};
+use graph_client::api::{BranchStartRefusalOutput, BranchStartRefusalReason, CommitOutput};
+use graph_store::{BranchStart, GraphSession, SessionEvent};
+use studio_actions::graph::{
+    CreateBranch, CreateBranchAt, DeleteBranch, MergeBranch, ReviewBranch,
+};
 use studio_ui::menu::{ContextMenu, ContextMenuEntry};
 use studio_ui::{ds, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Workspace, WorkspaceEvent};
@@ -309,14 +312,36 @@ fn field(editor: &Entity<Editor>, cx: &App) -> Div {
     studio_ui::ds::field_frame(false, cx).child(studio_ui::ds::field_input(editor.clone()))
 }
 
-/// "New branch": a name, created from the current branch, then switched to.
+/// Where the new branch starts, as the dialog shows it.
+enum Start {
+    /// The current branch's head.
+    Head(String),
+    /// A published commit, read as the dialog opens to say who made it and when.
+    Commit { id: String, read: CommitRead },
+}
+
+enum CommitRead {
+    Reading,
+    Read(CommitOutput),
+    /// Not read (a token whose read grant names branches is refused commits by id): the commit
+    /// is named by its id alone, and the server still decides.
+    Failed,
+}
+
+/// "New branch": a name, then the branch is created where it starts and switched to: the
+/// current branch's head, or a published commit (History's "New branch here").
 pub struct CreateBranchModal {
     session: Entity<GraphSession>,
-    from: String,
+    start: Start,
     name: Entity<Editor>,
     error: Option<SharedString>,
+    /// Why the server would not start a branch at the commit. It is the commit's, not the
+    /// name's, so it stays while the name changes, and Create with it: another name would be
+    /// refused the same.
+    refused_start: Option<SharedString>,
     running: bool,
     focus_handle: FocusHandle,
+    _read: Option<Task<()>>,
     _task: Option<Task<()>>,
     _subscription: Subscription,
 }
@@ -337,8 +362,44 @@ impl Focusable for CreateBranchModal {
 }
 
 impl CreateBranchModal {
+    /// At the current branch's head.
     pub fn new(session: Entity<GraphSession>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let from = session.read(cx).branch.clone();
+        Self::starting(session, Start::Head(from), window, cx)
+    }
+
+    /// At a published commit, which is read for who made it and when.
+    pub fn at_commit(
+        session: Entity<GraphSession>,
+        commit_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let read = session.update(cx, |session, cx| session.commit(&commit_id, cx));
+        let start = Start::Commit {
+            id: commit_id,
+            read: CommitRead::Reading,
+        };
+        let mut this = Self::starting(session, start, window, cx);
+        this._read = Some(cx.spawn(async move |this, cx| {
+            let read = read.await;
+            this.update(cx, |this, cx| {
+                if let Start::Commit { read: shown, .. } = &mut this.start {
+                    *shown = read.map_or(CommitRead::Failed, CommitRead::Read);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        this
+    }
+
+    fn starting(
+        session: Entity<GraphSession>,
+        start: Start,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let name = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Branch name, for example fix-titles", window, cx);
@@ -352,18 +413,27 @@ impl CreateBranchModal {
         });
         Self {
             session,
-            from,
+            start,
             name,
             error: None,
+            refused_start: None,
             running: false,
             focus_handle: cx.focus_handle(),
+            _read: None,
             _task: None,
             _subscription: subscription,
         }
     }
 
+    fn branch_start(&self) -> BranchStart {
+        match &self.start {
+            Start::Head(branch) => BranchStart::Head(branch.clone()),
+            Start::Commit { id, .. } => BranchStart::Commit(id.clone()),
+        }
+    }
+
     fn create(&mut self, cx: &mut Context<Self>) {
-        if self.running {
+        if self.running || self.refused_start.is_some() {
             return;
         }
         let name = self.name.read(cx).text(cx).trim().to_owned();
@@ -373,10 +443,10 @@ impl CreateBranchModal {
             return;
         }
         self.running = true;
-        let from = self.from.clone();
+        let start = self.branch_start();
         let task = self
             .session
-            .update(cx, |s, cx| s.create_branch(name.clone(), Some(from), cx));
+            .update(cx, |s, cx| s.create_branch(name.clone(), start, cx));
         self._task = Some(cx.spawn(async move |this, cx| {
             let outcome = task.await;
             this.update(cx, |this, cx| {
@@ -386,9 +456,15 @@ impl CreateBranchModal {
                         this.session.update(cx, |s, cx| s.set_branch(name, cx));
                         cx.emit(DismissEvent);
                     }
-                    WriteOutcome::Refused(error) => {
-                        this.error = Some(format!("Not created: {}", error.body.error).into());
-                    }
+                    WriteOutcome::Refused(error) => match &error.body.branch_start_refusal {
+                        Some(refusal) => {
+                            this.refused_start =
+                                Some(start_refusal_notice(refusal, &error.body.error).into())
+                        }
+                        None => {
+                            this.error = Some(format!("Not created: {}", error.body.error).into())
+                        }
+                    },
                     WriteOutcome::Unknown { .. } => {
                         this.error = Some(
                             "The outcome is unknown. Check the branch list before trying again."
@@ -404,32 +480,96 @@ impl CreateBranchModal {
     }
 }
 
+/// Why the server would not start a branch at a commit, in plain words, with what to do
+/// instead; nothing was created. A reason this build does not know reads as the server's own
+/// message, as any other refusal does.
+fn start_refusal_notice(refusal: &BranchStartRefusalOutput, message: &str) -> String {
+    let commit = short_commit_id(&refusal.graph_commit_id);
+    match refusal.reason {
+        BranchStartRefusalReason::NotRetained => format!(
+            "Not created: cleanup no longer keeps {} as it was at {commit}. Start the branch at \
+             a newer commit.",
+            refusal.type_name.as_deref().unwrap_or("the graph")
+        ),
+        BranchStartRefusalReason::SchemaChanged => format!(
+            "Not created: {commit} was written under an earlier schema. Start the branch at a \
+             commit made since the schema last changed."
+        ),
+        BranchStartRefusalReason::EarlierStorageFormat => format!(
+            "Not created: {commit} was written before the graph's storage was upgraded. Start \
+             the branch at a commit made since the upgrade."
+        ),
+        BranchStartRefusalReason::BranchDeleted => format!(
+            "Not created: {}, the branch that wrote {commit}, was deleted. Start the branch at a \
+             commit of a branch that still exists.",
+            refusal.branch.as_deref().unwrap_or("the branch")
+        ),
+        BranchStartRefusalReason::UnpublishedCommit => format!(
+            "Not created: {commit} is not published yet. A branch can start at it once it is \
+             published."
+        ),
+        BranchStartRefusalReason::UnattachedSnapshot => format!(
+            "Not created: {commit} is an unattached snapshot, which never joins a branch's \
+             history."
+        ),
+        BranchStartRefusalReason::Unknown | BranchStartRefusalReason::Other => {
+            format!("Not created: {message}")
+        }
+    }
+}
+
 impl Render for CreateBranchModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self.name.read(cx).text(cx);
-        let cli = format!(
-            "omnigraph branch create {} --from {}",
-            if name.trim().is_empty() {
-                "<name>"
-            } else {
-                name.trim()
-            },
-            self.from
-        );
+        let name = if name.trim().is_empty() {
+            "<name>"
+        } else {
+            name.trim()
+        };
+        // A commit start is headed by its short id, then who made it and when, as History
+        // shows a commit; the line keeps its place while the commit is read.
+        let (title, about, cli) = match &self.start {
+            Start::Head(from) => (
+                format!("New branch from {from}"),
+                None,
+                format!("omnigraph branch create {name} --from {from}"),
+            ),
+            Start::Commit { id, read } => {
+                let about = match read {
+                    CommitRead::Reading => "Reading the commit…".to_owned(),
+                    CommitRead::Read(commit) => format!(
+                        "{} · {}",
+                        commit.actor_id.as_deref().unwrap_or("—"),
+                        relative_time(commit.created_at, now_micros())
+                    ),
+                    CommitRead::Failed => {
+                        "Who made the commit, and when, could not be read.".to_owned()
+                    }
+                };
+                (
+                    format!("New branch at {}", short_commit_id(id)),
+                    Some(SharedString::from(about)),
+                    format!("omnigraph branch create {name} --from-commit {id}"),
+                )
+            }
+        };
+        let refused = self.refused_start.is_some();
         ds::modal(cx)
             .key_context("CreateBranchModal")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|_, _: &menu::Cancel, _, cx| cx.emit(DismissEvent)))
             .on_action(cx.listener(|this, _: &menu::Confirm, _, cx| this.create(cx)))
             .child(
-                ds::ModalHeader::new(format!("New branch from {}", self.from))
+                ds::ModalHeader::new(title)
+                    .description(about)
                     .on_close(cx.listener(|_, _, _, cx| cx.emit(DismissEvent))),
             )
             .child(
                 ds::modal_body()
                     .child(field(&self.name, cx))
                     .child(studio_ui::ds::text::meta(cli).buffer_font(cx))
-                    .children(self.error.clone().map(studio_ui::ds::text::error)),
+                    .children(self.error.clone().map(studio_ui::ds::text::error))
+                    .children(self.refused_start.clone().map(studio_ui::ds::text::error)),
             )
             .child(
                 ds::modal_footer(cx)
@@ -446,7 +586,10 @@ impl Render for CreateBranchModal {
                                 "Create"
                             },
                         )
-                        .disabled(self.running)
+                        .disabled(self.running || refused)
+                        .when(refused, |button| {
+                            button.tooltip(Tooltip::text("A branch cannot start at this commit"))
+                        })
                         .on_click(cx.listener(|this, _, _, cx| this.create(cx))),
                     ),
             )
@@ -733,6 +876,16 @@ pub fn register(workspace: &mut Workspace) {
             CreateBranchModal::new(session, window, cx)
         });
     });
+    // A start at a commit replaces whatever dialog is open, rather than closing one.
+    workspace.register_action(|workspace, action: &CreateBranchAt, window, cx| {
+        let Some(session) = workspace.session().cloned() else {
+            return;
+        };
+        let commit = action.commit_id.clone();
+        workspace.show_modal(window, cx, |window, cx| {
+            CreateBranchModal::at_commit(session, commit, window, cx)
+        });
+    });
     workspace.register_action(|workspace, _: &DeleteBranch, window, cx| {
         let Some(session) = workspace.session().cloned() else {
             return;
@@ -854,6 +1007,155 @@ mod tests {
         late.read_with(cx, |modal, _| {
             assert_eq!(modal.holds, Holds::Unmerged);
             assert!(modal.error.is_some());
+        });
+    }
+
+    /// A branch at a commit is asked for with the commit alone, never a branch too, and the
+    /// dialog names who made the commit and when. Each refusal to start there says why in
+    /// words, naming the type or the branch it is about, and nothing is sent again: not by
+    /// itself, and not by Create, which stays off while the name changes. A reason this build
+    /// does not know reads as the server's message.
+    #[gpui::test]
+    async fn a_branch_at_a_commit_says_why_it_was_refused_and_is_not_sent_again(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            editor::init(cx);
+        });
+        // What each commit's start is refused with: the reason, its detail and its status.
+        let refusals = [
+            ("c1", "not_retained", json!({ "type_name": "Person" }), 410),
+            ("c2", "schema_changed", json!({}), 409),
+            ("c3", "earlier_storage_format", json!({}), 409),
+            ("c4", "branch_deleted", json!({ "branch": "spike" }), 409),
+            ("c5", "unpublished_commit", json!({}), 409),
+            ("c6", "unattached_snapshot", json!({}), 409),
+            ("c7", "unknown", json!({}), 409),
+            ("c8", "a_later_reason", json!({}), 409),
+        ];
+        let notices = [
+            "Not created: cleanup no longer keeps Person as it was at c1. Start the branch at a \
+             newer commit.",
+            "Not created: c2 was written under an earlier schema. Start the branch at a commit \
+             made since the schema last changed.",
+            "Not created: c3 was written before the graph's storage was upgraded. Start the \
+             branch at a commit made since the upgrade.",
+            "Not created: spike, the branch that wrote c4, was deleted. Start the branch at a \
+             commit of a branch that still exists.",
+            "Not created: c5 is not published yet. A branch can start at it once it is \
+             published.",
+            "Not created: c6 is an unattached snapshot, which never joins a branch's history.",
+            "Not created: cannot start a branch at commit 'c7'",
+            "Not created: cannot start a branch at commit 'c8'",
+        ];
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let creates = sent.clone();
+        let served = refusals.clone();
+        // The branches the server lists: those it made, once it makes them.
+        let made = std::sync::Arc::new(std::sync::Mutex::new(vec![
+            "main".to_owned(),
+            "feature".to_owned(),
+        ]));
+        let (session, _) = fake_server(
+            move |path, _, body| {
+                if let Some(id) = path.rsplit_once("/commits/").map(|(_, id)| id) {
+                    let commit = json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": "published", "created_at": 0, "actor_id": "act-alice" });
+                    return (200, commit);
+                }
+                if !path.ends_with("/branches") || body.is_empty() {
+                    return (200, json!({ "branches": *made.lock().unwrap() }));
+                }
+                let asked: serde_json::Value = serde_json::from_str(body).unwrap();
+                creates.lock().unwrap().push(asked.clone());
+                let at = asked["from_commit"].as_str().unwrap_or_default().to_owned();
+                match served.iter().find(|(commit, ..)| *commit == at) {
+                    Some((commit, reason, detail, status)) => {
+                        let mut refusal = json!({ "reason": reason, "graph_commit_id": commit });
+                        for (key, value) in detail.as_object().unwrap() {
+                            refusal[key] = value.clone();
+                        }
+                        let error = format!("cannot start a branch at commit '{commit}'");
+                        (
+                            *status,
+                            json!({ "error": error, "code": "conflict", "branch_start_refusal": refusal }),
+                        )
+                    }
+                    None => {
+                        let name = asked["name"].as_str().unwrap_or_default().to_owned();
+                        made.lock().unwrap().push(name.clone());
+                        (
+                            200,
+                            json!({ "uri": "u", "from": "main", "name": name, "from_commit_id": at }),
+                        )
+                    }
+                }
+            },
+            cx,
+        );
+        for ((commit, ..), notice) in refusals.iter().zip(notices) {
+            let (modal, cx) = cx.add_window_view(|window, cx| {
+                CreateBranchModal::at_commit(session.clone(), (*commit).to_owned(), window, cx)
+            });
+            cx.run_until_parked();
+            modal.update_in(cx, |modal, window, cx| {
+                assert!(matches!(
+                    &modal.start,
+                    Start::Commit { read: CommitRead::Read(read), .. }
+                        if read.actor_id.as_deref() == Some("act-alice")
+                ));
+                modal
+                    .name
+                    .update(cx, |editor, cx| editor.set_text("then", window, cx));
+                modal.create(cx);
+            });
+            cx.run_until_parked();
+            modal.update_in(cx, |modal, window, cx| {
+                assert_eq!(modal.refused_start.as_deref(), Some(notice), "{commit}");
+                assert_eq!(modal.error, None);
+                // The refusal is the commit's: another name keeps it, and sends nothing.
+                modal
+                    .name
+                    .update(cx, |editor, cx| editor.set_text("again", window, cx));
+                modal.create(cx);
+            });
+            cx.run_until_parked();
+            modal.read_with(cx, |modal, _| {
+                assert_eq!(modal.refused_start.as_deref(), Some(notice));
+                assert!(!modal.running);
+            });
+        }
+        assert_eq!(
+            sent.lock().unwrap().len(),
+            refusals.len(),
+            "each start was sent once"
+        );
+
+        // A start the server takes: the commit alone is sent, and the session moves there.
+        let (modal, cx) = cx.add_window_view(|window, cx| {
+            CreateBranchModal::at_commit(session.clone(), "c9".into(), window, cx)
+        });
+        cx.run_until_parked();
+        modal.update_in(cx, |modal, window, cx| {
+            modal
+                .name
+                .update(cx, |editor, cx| editor.set_text("then", window, cx));
+            modal.create(cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .all(|asked| asked.get("from").is_none())
+        );
+        assert_eq!(
+            sent.lock().unwrap().last(),
+            Some(&json!({ "name": "then", "from_commit": "c9" }))
+        );
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.branch, "then");
+            assert_eq!(session.head("then"), Some("c9"));
         });
     }
 }

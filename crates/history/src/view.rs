@@ -17,14 +17,14 @@ use graph_client::ReadError;
 use graph_client::api::{CommitListOutput, CommitOutput};
 use graph_store::{GraphSession, HeadWatch, SessionEvent};
 use studio_actions::graph::OpenCommit;
-use studio_actions::history::{NextMatch, PreviousMatch};
+use studio_actions::history::{NewBranchHere, NextMatch, PreviousMatch};
 use studio_ui::menu::ContextMenu;
 use studio_ui::{change_counts, now_micros, relative_time, short_commit_id};
 use studio_workspace::{Item, ItemEvent, SavedItem};
 use ui::prelude::*;
 use ui::{Tooltip, right_click_menu};
 
-use crate::commit_view::{CommitCounts, CommitView};
+use crate::commit_view::{CommitCounts, CommitView, branch_start, new_branch_at};
 use crate::lanes::{Graph, GraphCommit, assign_lanes};
 use crate::merged::{Drawn, HistoryRead, branch_heads};
 
@@ -1177,6 +1177,17 @@ impl HistoryView {
         }
     }
 
+    /// The commit "New branch here" starts a branch at: the selected one, when it is published.
+    fn branch_here(&self) -> Option<&str> {
+        branch_start(self.commits.get(self.selected?)?)
+    }
+
+    fn new_branch_here(&mut self, _: &NewBranchHere, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(commit) = self.branch_here() {
+            new_branch_at(commit, window, cx);
+        }
+    }
+
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(commit) = self.selected.and_then(|ix| self.commits.get(ix)) {
             window.dispatch_action(
@@ -1373,7 +1384,8 @@ impl HistoryView {
                 let selected = self.selected == Some(ix);
                 let actor = commit.actor_id.clone();
                 let open_id = id.clone();
-                let copy_id = id.clone();
+                let menu_commit = commit.clone();
+                let menu_focus = self.focus_handle.clone();
                 let merge = commit.merged_parent_commit_id.is_some();
                 // A row reads: lane, id, where it heads, what it changed, then who and when.
                 let row_element = h_flex()
@@ -1475,26 +1487,9 @@ impl HistoryView {
                     right_click_menu(("commit-menu", ix))
                         .trigger(move |_, _, _| row_element)
                         .menu(move |window, cx| {
-                            let copy_id = copy_id.clone();
+                            let (commit, focus) = (menu_commit.clone(), menu_focus.clone());
                             ContextMenu::build(window, cx, move |menu, _, _| {
-                                let open_id = copy_id.clone();
-                                menu.entry("Copy commit id", None, move |_, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        copy_id.clone(),
-                                    ))
-                                })
-                                .entry(
-                                    "Open in a tab",
-                                    None,
-                                    move |window, cx| {
-                                        window.dispatch_action(
-                                            Box::new(OpenCommit {
-                                                commit_id: open_id.clone(),
-                                            }),
-                                            cx,
-                                        )
-                                    },
-                                )
+                                commit_menu(menu.context(focus), &commit)
                             })
                         })
                         .into_any_element(),
@@ -1562,6 +1557,32 @@ impl HistoryView {
             )
             .into_any_element()
     }
+}
+
+/// A commit row's menu. "New branch here" shows the key that starts a branch at the selected
+/// commit, and starts one at this row's; it is offered only at a published commit.
+fn commit_menu(menu: ContextMenu, commit: &CommitOutput) -> ContextMenu {
+    let copy_id = commit.graph_commit_id.clone();
+    let open_id = copy_id.clone();
+    let branch_at = branch_start(commit).map(str::to_owned);
+    menu.entry("Copy commit id", None, move |_, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(copy_id.clone()))
+    })
+    .entry("Open in a tab", None, move |window, cx| {
+        window.dispatch_action(
+            Box::new(OpenCommit {
+                commit_id: open_id.clone(),
+            }),
+            cx,
+        )
+    })
+    .when_some(branch_at, |menu, commit| {
+        menu.separator().entry(
+            "New branch here…",
+            Some(Box::new(NewBranchHere)),
+            move |window, cx| new_branch_at(&commit, window, cx),
+        )
+    })
 }
 
 /// What the search finds a commit by, lowercase, made once with the list rather than at each
@@ -1809,6 +1830,9 @@ impl Render for HistoryView {
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(|this, _: &NextMatch, _, cx| this.step_match(true, cx)))
             .on_action(cx.listener(|this, _: &PreviousMatch, _, cx| this.step_match(false, cx)))
+            .when(self.branch_here().is_some(), |view| {
+                view.on_action(cx.listener(Self::new_branch_here))
+            })
             .child(header)
             .child(body)
     }
@@ -2703,6 +2727,59 @@ mod tests {
             assert_eq!(view.match_at, None);
             assert_eq!(view.match_query, "nothing");
         });
+    }
+
+    /// "New branch here" is offered at a published commit only. At one, the key starts a
+    /// branch at the selected commit and the row's menu offers it; at a proposal or a snapshot
+    /// the key is not available and the menu leaves it out.
+    #[gpui::test]
+    async fn new_branch_here_is_offered_only_at_a_published_commit(cx: &mut TestAppContext) {
+        use studio_actions::graph::CreateBranchAt;
+
+        let mut main = chain("m", 3);
+        main[1]["kind"] = json!("unpublished");
+        main[2]["kind"] = json!("unattached");
+        let (session, _) = serve(
+            Served {
+                branches: vec![("main".into(), main)],
+                ..Default::default()
+            },
+            cx,
+        );
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let heard = started.clone();
+        cx.update(|cx| {
+            cx.on_action(move |action: &CreateBranchAt, _| {
+                heard.lock().unwrap().push(action.commit_id.clone())
+            });
+        });
+        let (view, cx) = open(&session, cx);
+        cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+        let commits = view.read_with(cx, |view, _| view.commits.clone());
+        assert_eq!(commits.len(), 3);
+        for (ix, offered) in [(0, true), (1, false), (2, false)] {
+            view.update(cx, |view, cx| view.select(ix, cx));
+            cx.run_until_parked();
+            let available = cx.update(|window, cx| window.is_action_available(&NewBranchHere, cx));
+            assert_eq!(available, offered, "{}", commits[ix].graph_commit_id);
+            cx.dispatch_action(NewBranchHere);
+            cx.run_until_parked();
+        }
+        assert_eq!(*started.lock().unwrap(), ["m2"]);
+
+        for (commit, offered) in commits.iter().zip([true, false, false]) {
+            let (_, cx) = cx.add_window_view(|window, cx| {
+                ContextMenu::new(window, cx, |menu, _, _| commit_menu(menu, commit))
+            });
+            cx.run_until_parked();
+            assert_eq!(
+                cx.debug_bounds("MENU_ITEM-New branch here…").is_some(),
+                offered,
+                "{}",
+                commit.graph_commit_id
+            );
+            assert!(cx.debug_bounds("MENU_ITEM-Open in a tab").is_some());
+        }
     }
 
     #[test]

@@ -12,12 +12,13 @@ use gpui::{
 };
 use gq_language::SchemaModel;
 use graph_client::ReadError;
-use graph_client::api::{ChangeCauseOutput, CommitOutput};
+use graph_client::api::{ChangeCauseOutput, CommitKind, CommitOutput};
 use graph_store::{
     ChangeFold, EntityGroups, FoldedChanges, GraphSession, GroupRun, GroupSection, NodeNames,
     SessionEvent, TypeCounts,
 };
-use studio_actions::graph::{OpenCommit, OpenQueryAt, OpenType};
+use studio_actions::graph::{CreateBranchAt, OpenCommit, OpenQueryAt, OpenType};
+use studio_actions::history::NewBranchHere;
 use studio_ui::menu::ContextMenu;
 use studio_ui::{now_micros, relative_time, short_commit_id, utc_date_time};
 use studio_workspace::{Item, ItemEvent, SavedItem};
@@ -50,7 +51,9 @@ enum State {
 pub struct CommitView {
     session: Entity<GraphSession>,
     commit_id: String,
+    /// The commit as listed; read by its id when the view opens without it (its own tab).
     commit: Option<CommitOutput>,
+    _commit_task: Option<Task<()>>,
     cause: Option<ChangeCauseOutput>,
     state: State,
     fold: ChangeFold,
@@ -127,6 +130,7 @@ impl CommitView {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self::unread(session, commit_id, commit, cx);
+        view.read_commit(cx);
         view.load_more(cx);
         view
     }
@@ -144,7 +148,11 @@ impl CommitView {
         let mut view = Self::unread(session, commit_id, commit, cx);
         view._pause = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(pause).await;
-            this.update(cx, |this, cx| this.load_more(cx)).ok();
+            this.update(cx, |this, cx| {
+                this.read_commit(cx);
+                this.load_more(cx);
+            })
+            .ok();
         }));
         view
     }
@@ -164,6 +172,7 @@ impl CommitView {
             session,
             commit_id,
             commit,
+            _commit_task: None,
             cause: None,
             state: State::Loading,
             fold: ChangeFold::new(),
@@ -190,6 +199,33 @@ impl CommitView {
 
     pub fn commit_id(&self) -> &str {
         &self.commit_id
+    }
+
+    /// Reads the commit itself when the view came without it: its kind says whether a branch
+    /// can start at it, and it names the branch that wrote it. One that cannot be read leaves
+    /// the header to the changes' cause, and offers no branch.
+    fn read_commit(&mut self, cx: &mut Context<Self>) {
+        if self.commit.is_some() || self._commit_task.is_some() {
+            return;
+        }
+        let id = self.commit_id.clone();
+        let read = self
+            .session
+            .update(cx, |session, cx| session.commit(&id, cx));
+        self._commit_task = Some(cx.spawn(async move |this, cx| {
+            if let Ok(commit) = read.await {
+                this.update(cx, |this, cx| {
+                    this.commit = Some(commit);
+                    cx.notify();
+                })
+                .ok();
+            }
+        }));
+    }
+
+    /// The commit a new branch can start at: this one, when it is published.
+    fn branch_here(&self) -> Option<&str> {
+        branch_start(self.commit.as_ref()?)
     }
 
     /// Reads the next pages of changes, up to [`CAP`] more.
@@ -522,8 +558,10 @@ impl CommitView {
     }
 
     /// Opens the graph as it was at this commit, read-only: a type's table, or a query (spec
-    /// 009).
+    /// 009); and starts a branch at it, when it is published (spec 008).
     fn render_open_at(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let branch_at = self.branch_here().map(str::to_owned);
+        let focus = self.focus_handle.clone();
         let commit = self.commit_id.clone();
         let changed: Vec<String> = self.counts.iter().map(|c| c.type_name.clone()).collect();
         let session = self.session.clone();
@@ -589,6 +627,24 @@ impl CommitView {
                         )
                     }),
             )
+            .when_some(branch_at, |row, commit| {
+                let cli = branch_here_cli(&commit);
+                row.child(
+                    studio_ui::ds::toolbar_button("branch-here", "Branch")
+                        .style(ButtonStyle::Subtle)
+                        .start_icon(Icon::new(IconName::GitBranch))
+                        .tooltip(move |_, cx| {
+                            Tooltip::with_meta_in(
+                                "Start a new branch at this commit",
+                                Some(&NewBranchHere),
+                                cli.clone(),
+                                &focus,
+                                cx,
+                            )
+                        })
+                        .on_click(move |_, window, cx| new_branch_at(&commit, window, cx)),
+                )
+            })
     }
 
     fn render_row(
@@ -694,6 +750,27 @@ impl CommitView {
     }
 }
 
+/// The commit a branch can start at: a published one. A proposal or an unattached snapshot is
+/// in no branch's history, and the server refuses a branch there.
+pub(crate) fn branch_start(commit: &CommitOutput) -> Option<&str> {
+    (commit.kind == CommitKind::Published).then_some(commit.graph_commit_id.as_str())
+}
+
+/// Opens the new-branch dialog, started at `commit_id`.
+pub(crate) fn new_branch_at(commit_id: &str, window: &mut Window, cx: &mut App) {
+    window.dispatch_action(
+        Box::new(CreateBranchAt {
+            commit_id: commit_id.to_owned(),
+        }),
+        cx,
+    );
+}
+
+/// The CLI command that starts a branch at `commit_id`.
+pub(crate) fn branch_here_cli(commit_id: &str) -> String {
+    format!("omnigraph branch create <name> --from-commit {commit_id}")
+}
+
 fn describe(error: &ReadError) -> String {
     match error {
         ReadError::Refused(summary) if summary.status == 409 => format!(
@@ -741,6 +818,13 @@ impl Render for CommitView {
             .key_context("CommitView")
             .track_focus(&self.focus_handle)
             .size_full()
+            .when(self.branch_here().is_some(), |view| {
+                view.on_action(cx.listener(|this, _: &NewBranchHere, window, cx| {
+                    if let Some(commit) = this.branch_here() {
+                        new_branch_at(commit, window, cx)
+                    }
+                }))
+            })
             .child(header)
             .child(body)
     }
@@ -912,6 +996,81 @@ mod tests {
             assert!(view._regroup_task.is_none());
         });
         assert_eq!(reads.load(Ordering::SeqCst), 1, "the commit was read again");
+    }
+
+    /// A commit opened in its own tab reads itself for its kind, and offers a branch at it
+    /// only when it is published: its Branch button and its key start one there, and a
+    /// proposal offers neither. A commit shown beside History comes listed and is not read.
+    #[gpui::test]
+    async fn a_branch_starts_here_only_at_a_published_commit(cx: &mut TestAppContext) {
+        cx.update(studio_theme::init_test);
+        let asked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = asked.clone();
+        let commit = |id: &str, kind: &str| json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": kind, "created_at": 0, "parent_commit_id": "c0" });
+        let http = FakeHttpClient::create(move |request| {
+            let path = request.uri().path().to_owned();
+            seen.lock().unwrap().push(path.clone());
+            async move {
+                let cause = |id: &str| json!({ "graph_commit_id": id, "parent_commit_id": "c0", "authored_branch": "main", "authored_at": 0 });
+                let (status, body) = match path.rsplit_once("/commits/") {
+                    Some((_, rest)) if rest.ends_with("/changes") => {
+                        let id = rest.trim_end_matches("/changes");
+                        (200, json!({ "cause": cause(id), "changes": [] }))
+                    }
+                    Some((_, "c9")) => (200, commit("c9", "published")),
+                    Some((_, "c8")) => (200, commit("c8", "unpublished")),
+                    _ => (404, json!({ "error": "not here" })),
+                };
+                Ok(Response::builder()
+                    .status(status)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let heard = started.clone();
+        cx.update(|cx| {
+            cx.on_action(move |action: &CreateBranchAt, _| {
+                heard.lock().unwrap().push(action.commit_id.clone())
+            });
+        });
+        for (id, offered) in [("c9", true), ("c8", false)] {
+            let (view, cx) =
+                cx.add_window_view(|_, cx| CommitView::new(session.clone(), id.into(), None, cx));
+            cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.branch_here(), offered.then_some(id), "{id}")
+            });
+            let available = cx.update(|window, cx| window.is_action_available(&NewBranchHere, cx));
+            assert_eq!(available, offered, "{id}");
+            cx.dispatch_action(NewBranchHere);
+            cx.run_until_parked();
+        }
+        assert_eq!(*started.lock().unwrap(), ["c9"]);
+
+        let listed: CommitOutput = serde_json::from_value(commit("c7", "published")).unwrap();
+        let beside = cx.new(|cx| CommitView::new(session.clone(), "c7".into(), Some(listed), cx));
+        cx.run_until_parked();
+        beside.read_with(cx, |view, _| assert_eq!(view.branch_here(), Some("c7")));
+        assert!(
+            !asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.ends_with("/commits/c7")),
+            "a listed commit was read again"
+        );
     }
 
     /// A commit stepped past reads nothing; the one the steps stop on reads once they pause.

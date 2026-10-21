@@ -60,6 +60,14 @@ from Zed with notices).
   them as the detail does ("+ more" when there are more); answers are kept, since a commit's
   changes never change, and the detail's full count replaces a first-page one. A commit
   without a first parent shows none.
+- Built (a branch at a commit, E21, 2026-10-20): a published commit's row menu offers "New
+  branch here…", and its detail a Branch button beside Table and Query; `b`
+  (`NewBranchHere`) does the same for the selected commit in the list, the panel and a
+  commit's tab. Each dispatches `CreateBranchAt`, which opens spec 008's new-branch dialog
+  started at that commit. A proposal or an unattached snapshot (`kind` other than
+  `published`) offers none of them, and the key is not available there. A commit opened in
+  its own tab reads itself by id once (`GET /commits/{id}`) for its kind and branch; one
+  listed beside History is not read again.
 
 Other branches' tags come from each branch's newest commit, read alone (a page of one) and
 kept by the session until a commit lands on that branch (spec 003), for up to 20 branches; a
@@ -87,9 +95,7 @@ away are dropped.
     the plan here before: a commit landing reads the first page again and keeps the pages it
     reaches, rather than showing "N newer commits · Refresh"; and merged-in commits are read by
     id rather than from other branches' paged lists, which start at those branches' heads now.
-  - E21 a branch from a commit: landed (OmniGraph #1016), adopted with the same bump. A commit's
-    menu and its detail offer "New branch here…", which starts a branch at that commit
-    (spec 008).
+  - E21 a branch from a commit (OmniGraph #1016): built 2026-10-20 (Design).
   - E9 branch details: branch chips derived from per-branch commit lists until then.
 
 ## Validation log
@@ -105,6 +111,7 @@ away are dropped.
 | 2026-10-12 | Search matches by id prefix or actor | `history` test `search_finds_commits_by_id_prefix_or_actor` | An id matches only by prefix; actors match anywhere, case-blind |
 | 2026-10-20 | History reads a page at a time, merged-in commits by id | `history` tests `history_reads_its_branch_a_page_at_a_time`, `an_old_server_answers_the_whole_history_as_one_page`, `a_commit_landing_on_the_branch_keeps_the_pages_read`, `try_again_after_a_refused_page_starts_from_the_first`, `merged_in_commits_are_read_by_their_ids`, `a_merged_branch_is_read_as_far_as_the_pages_read`, `a_long_merged_branch_is_read_as_its_rows_are_drawn`, `merged_reads_go_to_the_rows_drawn_first`, `a_failed_merged_read_is_asked_again_after_a_while`, `a_token_refused_commits_by_id_reads_merges_from_the_listings`, `tags_sit_at_each_branchs_newest_commit`, `a_commit_to_another_branch_moves_its_tag_alone`, `a_search_finds_matches_a_later_page_brings`, against a fake server that pages as #1013 does | Pass; no listing is read whole but a 0.14 server's that pages none, and the other branches' after a 403 by id |
 | 2026-10-20 | A deleted branch's commits by id | OmniGraph `GraphCoordinator::resolve_commit` at `0a62bb7` (source read) | `GET /commits/{id}` serves them once they have moved into the graph's `__history`; its latest commits, still buffered in the branch's retired `__manifest`, answer 404 and draw as stubs |
+| 2026-10-20 | "New branch here" is offered only at a published commit | `history` tests `new_branch_here_is_offered_only_at_a_published_commit` (the selected row's key and the row menu, over published, unpublished and unattached commits) and `a_branch_starts_here_only_at_a_published_commit` (a commit's own tab reads its kind; a listed one is not read), against the `Served` fake and a fake sending the contract header | Pass: only the published commit makes the key available, shows the menu entry and starts `CreateBranchAt` |
 
 ## Corrections
 

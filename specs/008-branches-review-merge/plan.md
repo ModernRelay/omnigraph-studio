@@ -38,6 +38,19 @@ place), X (designed on 0.13; the better routes are deferred).
 
 - Sidebar list with current branch marked; ⌘⇧B switch; create from the current branch or a
   commit. Fork point and last commit derived from `GET /commits?branch=`.
+- Built (start at a commit, E21, 2026-10-20): History's "New branch here…" (spec 009)
+  dispatches `CreateBranchAt`, which opens the same new-branch dialog started at that commit:
+  "New branch at <short id>", then who made it and when, read by its id as the dialog opens
+  (`GET /commits/{id}`; a token refused that read sees the id alone), and the CLI line
+  `omnigraph branch create <name> --from-commit <id>`. The session sends `from_commit` and
+  no `from` (`graph_store::BranchStart`); the receipt's `from_commit_id` is the new branch's
+  head, which the session records, and a commit start's outcome names it ("Create branch
+  <name> at <short id>"). Success switches to the branch, as a start at a head does. A
+  `branch_start_refusal` reads in words, nothing created: cleanup no longer keeps <type> as
+  it was at the commit (410); written under an earlier schema; written before the storage
+  upgrade; <branch>, which wrote it, was deleted; not published yet; an unattached snapshot
+  (409); a reason this build does not know reads as the server's message. The notice is the
+  commit's, so it stays while the name changes and Create stays off; nothing is sent again.
 - Delete asks once, saying what goes with the branch, read from its merge base with `main` as
   the dialog opens: a branch whose head is in `main` loses nothing and is deleted with ↵; one
   with commits only it holds, or one the check could not read, is deleted by typing its name
@@ -148,12 +161,8 @@ place), X (designed on 0.13; the better routes are deferred).
     response reads the target's history a page at a time from its head.
   - E8 merge preview with no effects: merge on request and show the 409 conflicts until then.
   - E9 branch details: derived from `GET /commits?branch=` until then.
-  - E21 a branch from a commit: landed as `from_commit` (OmniGraph #1016), adopted with the next
-    minimum-server bump. The new-branch dialog then also starts at a commit (History's "New
-    branch here…", spec 009), the outcome names the receipt's `from_commit_id`, and a refusal
-    reads its `branch_start_refusal` reason: a commit cleanup no longer keeps (410), or one
-    under an earlier schema, from before the storage upgrade, of a deleted branch, unpublished,
-    or an unattached snapshot (409). Until then a branch starts from a branch head.
+  - E21 a branch from a commit (`from_commit`, OmniGraph #1016): built 2026-10-20 (Design,
+    Branches). The agent's gateway still refuses a create started at a commit.
   - R2 unpublished commits: `as_commit` merge proposals. The minimum server (0.14) serves
     them; Studio does not use them yet.
   - E28 a merge bound to the reviewed source head: until then a commit landing between the
@@ -180,6 +189,7 @@ place), X (designed on 0.13; the better routes are deferred).
 | 2026-10-12 | Merge refuses a moved branch | offscreen snapshot: a second writer committed on `feature-v` after the review was read | "feature-v moved to …"; no merge request sent; main unchanged |
 | 2026-10-18 | Relationships are reviewed with the entity they came with | `graph_store` `entity_groups` tests (home rule, mirrors, self relationships, a type the schema lacks, edge types in words); `review` test `a_search_keeps_the_cards_whose_changes_match_and_headers_count_what_shows` | Each change on exactly one card; mirrors name their card; headers count what shows |
 | 2026-10-18 | Entity cards render | offscreen snapshot against a scratch dev server on edge `0a62bb7`: branch `review-demo` adds Person `person-900000` with `WorksAt` and `Knows`, retitles `person-000001` and adds its `Contributes`, removes `WorksAt person-000000 → company-00002`, adds `Knows person-000155 → person-000005` | Donald Dijkstra's card carries his new `contributes`; Theo Brandt's carries `works at` and `knows`, mirrored on `person-000000`'s card with the removed `works at` struck through; the scratch server and its data were deleted after |
+| 2026-10-20 | A branch starts at a commit with the commit alone, and each refusal reads in words | `graph_store` test `a_branch_starts_at_a_head_or_at_a_commit_never_both`; `review` test `a_branch_at_a_commit_says_why_it_was_refused_and_is_not_sent_again`, against fakes answering with the contract header as OmniGraph `edge-20261020-7fd9cc9` does (`BranchCreateRequest`, `BranchCreateOutput`, `BranchStartRefusalOutput` in `crates/graph_client/openapi/omnigraph-0.14.0-edge.json`) | Pass: the body names `from_commit` and no `from`; the receipt's commit is the head; every reason's notice shows, an unknown one as the server's message, and each start is sent once |
 
 ## Corrections
 

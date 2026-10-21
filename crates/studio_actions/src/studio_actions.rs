@@ -336,6 +336,14 @@ pub mod graph {
     pub struct OpenCommit {
         pub commit_id: String,
     }
+
+    /// Create a branch that starts at a published commit, with that commit's data and history
+    /// (specs 008, 009).
+    #[derive(Clone, Debug, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = studio_graph)]
+    pub struct CreateBranchAt {
+        pub commit_id: String,
+    }
 }
 
 pub mod table {
@@ -495,6 +503,8 @@ pub mod history {
             NextMatch,
             /// Go to the previous commit matching the search.
             PreviousMatch,
+            /// Start a new branch at the selected commit.
+            NewBranchHere,
         ]
     );
 }

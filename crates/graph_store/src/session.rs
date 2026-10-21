@@ -191,6 +191,29 @@ pub struct HeadWatch {
 /// A branch's commits, newest first, shared by the views that show them.
 pub type CommitList = Arc<Vec<CommitOutput>>;
 
+/// Where a new branch starts ([`GraphSession::create_branch`]): a branch's head as the branch
+/// is created, or a published commit, with that commit's data and history. The server takes
+/// one or the other, never both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchStart {
+    Head(String),
+    Commit(String),
+}
+
+impl BranchStart {
+    fn request(&self, name: String) -> BranchCreateRequest {
+        let (from, from_commit) = match self {
+            BranchStart::Head(branch) => (Some(branch.clone()), None),
+            BranchStart::Commit(commit) => (None, Some(commit.clone())),
+        };
+        BranchCreateRequest {
+            name,
+            from,
+            from_commit,
+        }
+    }
+}
+
 /// The server as the storage inspector shows it ([`GraphSession::server_state`]): each read's
 /// own answer, so one failing leaves the others.
 pub struct ServerState {
@@ -3176,36 +3199,50 @@ impl GraphSession {
         self.saw_head(branch, commit, true, parent.as_deref(), cx);
     }
 
+    /// Creates branch `name` where `start` says. It publishes no commit: the receipt names the
+    /// commit the branch starts at, which is its head.
     pub fn create_branch(
         &mut self,
         name: String,
-        from: Option<String>,
+        start: BranchStart,
         cx: &mut Context<Self>,
     ) -> Task<WriteOutcome<BranchCreateOutput>> {
         let client = self.client(cx);
         let graph = self.graph_id.clone();
-        let description = format!("Create branch {name}");
-        let branch = name.clone();
+        let request = start.request(name.clone());
+        let branch = name;
         self.writes_in_flight += 1;
         cx.emit(SessionEvent::ActivityChanged);
         let work = cx.spawn(async move |this, cx| {
-            let outcome = client
-                .create_branch(
-                    &graph,
-                    &BranchCreateRequest {
-                        name,
-                        from,
-                        from_commit: None,
-                    },
-                )
-                .await;
+            let outcome = client.create_branch(&graph, &request).await;
             let kind = outcome_kind(&outcome, |_| None);
+            let description = match (&start, &outcome) {
+                (BranchStart::Head(_), _) => format!("Create branch {branch}"),
+                (BranchStart::Commit(_), WriteOutcome::Committed(created)) => format!(
+                    "Create branch {branch} at {}",
+                    studio_ui::short_commit_id(&created.from_commit_id)
+                ),
+                (BranchStart::Commit(commit), _) => format!(
+                    "Create branch {branch} at {}",
+                    studio_ui::short_commit_id(commit)
+                ),
+            };
             this.update(cx, |this, cx| {
                 // A branch made again under a deleted one's name takes drafts again.
                 if matches!(outcome, WriteOutcome::Committed(_)) {
                     this.gone_branches.remove(&branch);
                 }
                 this.finish_write(branch.clone(), description, kind, None, None, cx);
+                // The receipt names the new branch's head: the commit it starts at.
+                if let WriteOutcome::Committed(created) = &outcome {
+                    this.saw_head(
+                        branch.clone(),
+                        created.from_commit_id.clone(),
+                        false,
+                        None,
+                        cx,
+                    );
+                }
                 this.reload_branches_after(branch, cx);
             })
             .ok();
@@ -5102,6 +5139,79 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(drafts("elsewhere", cx), 0);
         assert_eq!(drafts("kept", cx), 1);
+    }
+
+    /// A branch starts at a branch's head or at a commit, and its request names the one, never
+    /// both. The receipt's commit is the new branch's head; a commit start's outcome names it.
+    #[gpui::test]
+    async fn a_branch_starts_at_a_head_or_at_a_commit_never_both(cx: &mut TestAppContext) {
+        use futures::AsyncReadExt as _;
+        use serde_json::json;
+
+        let sent = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let seen = sent.clone();
+        let http = FakeHttpClient::create(move |request| {
+            let create =
+                request.method().as_str() == "POST" && request.uri().path().ends_with("/branches");
+            let seen = seen.clone();
+            async move {
+                let mut bytes = Vec::new();
+                request.into_body().read_to_end(&mut bytes).await.ok();
+                let body = if create {
+                    let asked: Value = serde_json::from_slice(&bytes).unwrap();
+                    seen.lock().unwrap().push(asked.clone());
+                    // A head start begins at main's head, a commit start at its commit.
+                    let at = asked.get("from_commit").cloned().unwrap_or(json!("m9"));
+                    json!({ "uri": "u", "from": "main", "name": asked["name"], "from_commit_id": at })
+                } else {
+                    json!({ "branches": ["main"] })
+                };
+                Ok(Response::builder()
+                    .status(200)
+                    .header(graph_client::CONTRACT_HEADER, graph_client::CONTRACT)
+                    .body(AsyncBody::from(body.to_string()))
+                    .unwrap())
+            }
+        });
+        let server = ServerEntry {
+            name: "dev".into(),
+            url: "http://127.0.0.1:8787".into(),
+            source: ServerSource::Environment,
+            known_graphs: Vec::new(),
+        };
+        let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
+        let session =
+            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        cx.run_until_parked();
+        let head = session.update(cx, |session, cx| {
+            session.create_branch("fix".into(), BranchStart::Head("main".into()), cx)
+        });
+        assert!(matches!(head.await, WriteOutcome::Committed(_)));
+        let at = session.update(cx, |session, cx| {
+            session.create_branch("then".into(), BranchStart::Commit("c7".into()), cx)
+        });
+        assert!(matches!(
+            at.await,
+            WriteOutcome::Committed(created) if created.from_commit_id == "c7"
+        ));
+        cx.run_until_parked();
+        assert_eq!(
+            *sent.lock().unwrap(),
+            [
+                json!({ "name": "fix", "from": "main" }),
+                json!({ "name": "then", "from_commit": "c7" }),
+            ]
+        );
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.head("fix"), Some("m9"));
+            assert_eq!(session.head("then"), Some("c7"));
+            let described: Vec<&str> = session
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.description.as_str())
+                .collect();
+            assert_eq!(described, ["Create branch fix", "Create branch then at c7"]);
+        });
     }
 
     #[gpui::test]
