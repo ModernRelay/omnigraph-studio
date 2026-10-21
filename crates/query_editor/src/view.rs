@@ -659,14 +659,11 @@ impl QueryEditor {
             let Ok(page) = read.await else {
                 return;
             };
-            // A server that pages no history answers it whole; the newest are kept.
-            let mut commits: Vec<(String, i64, Option<String>)> = page
+            let commits: Vec<(String, i64, Option<String>)> = page
                 .commits
                 .iter()
                 .map(|c| (c.graph_commit_id.clone(), c.created_at, c.actor_id.clone()))
                 .collect();
-            commits.sort_by_key(|commit| std::cmp::Reverse(commit.1));
-            commits.truncate(PICKER_COMMITS);
             this.update(cx, |this, cx| {
                 this.commits = commits;
                 cx.notify();

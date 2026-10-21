@@ -97,17 +97,14 @@ struct Listing {
 
 impl Listing {
     fn of(page: &CommitListOutput) -> Self {
-        // A server that pages no history answers it whole, with no token. A page with no commits
-        // ends the listing too: a token after nothing would only ask for nothing again.
+        // A page with no commits ends the listing: a token after nothing would only ask for
+        // nothing again.
         let next = page
             .next_page_token
             .clone()
             .filter(|_| !page.commits.is_empty());
         Self {
-            head: page
-                .head_commit_id
-                .clone()
-                .or_else(|| page.commits.first().map(|c| c.graph_commit_id.clone())),
+            head: page.head_commit_id.clone(),
             complete: next.is_none(),
             next,
         }
@@ -593,10 +590,7 @@ impl HistoryView {
         // A page answering for another head is of another listing than the pages read, and is
         // not added to them. Reading the first page again here could go on for as long as the
         // server answers so; Try again reads it once, from a listing later pages answer for.
-        if page.head_commit_id.is_some()
-            && asked_head.is_some()
-            && page.head_commit_id != asked_head
-        {
+        if asked_head.is_some() && page.head_commit_id != asked_head {
             this.update(cx, |this, cx| {
                 this.more = More::Failed {
                     error: "the server answered for another head".into(),
@@ -1833,17 +1827,15 @@ mod tests {
 
     /// A server for History's tests. It holds each branch's first-parent chain, newest first,
     /// and pages a listing as OmniGraph does (`limit`, `page_token`, `head_commit_id`; a later
-    /// page answers for the head the first resolved), or answers it whole as a 0.14 build
-    /// before paging did. It answers a commit by its id, the head probe with the branch's
-    /// newest commit, and every commit's changes with none, and notes every request.
+    /// page answers for the head the first resolved). It answers a commit by its id, the head
+    /// probe with the branch's newest commit, and every commit's changes with none, and notes
+    /// every request.
     #[derive(Default)]
     struct Served {
         /// Each branch's chain, newest first, in the branch list's order.
         branches: Vec<(String, Vec<Value>)>,
         /// Commits only their id reaches: those of a branch not listed.
         loose: Vec<Value>,
-        /// `limit` and `page_token` are ignored, and a listing is answered whole.
-        unpaged: bool,
         /// A read of a commit by id is refused (403), as for a token whose read grant names
         /// branches; and how many such reads fail (500) before one is answered.
         refuse_by_id: bool,
@@ -1963,7 +1955,7 @@ mod tests {
         /// far below it the listing has come, so later pages answer for that head's chain.
         fn listing(&self, branch: &str, limit: Option<usize>, token: Option<&str>) -> Value {
             let chain = self.chain(branch);
-            if self.unpaged || (limit.is_none() && token.is_none()) {
+            if limit.is_none() && token.is_none() {
                 return json!({ "commits": chain });
             }
             let limit = limit.unwrap_or(100);
@@ -2127,30 +2119,6 @@ mod tests {
                 "branch=main&limit=200&page_token=m449_400",
             ]
         );
-    }
-
-    /// A server that pages no history answers the first page's read with the whole listing and
-    /// no token: History lays it out as the one page there is, and reads no more.
-    #[gpui::test]
-    async fn an_old_server_answers_the_whole_history_as_one_page(cx: &mut TestAppContext) {
-        let (session, served) = serve(
-            Served {
-                branches: vec![("main".into(), chain("m", 450))],
-                unpaged: true,
-                ..Default::default()
-            },
-            cx,
-        );
-        let (view, cx) = open(&session, cx);
-        view.read_with(cx, |view, _| {
-            assert_eq!(view.commits.len(), 450);
-            assert!(view.read.complete);
-            assert_eq!(view.next_page, None);
-            assert!(!view.has_more());
-        });
-        view.update(cx, |view, cx| view.want_more(&(430..450), cx));
-        cx.run_until_parked();
-        assert_eq!(served.lock().unwrap().listings(), ["branch=main&limit=200"]);
     }
 
     /// A commit landing on the branch reads its first page again: the commits above the head

@@ -914,9 +914,7 @@ impl GraphClient {
     }
 
     /// A page of `branch`'s history, newest first: its newest `limit` commits, or from
-    /// `page_token` the next ones. The page names the head it resolved and where it goes on; a
-    /// server that pages no history (a 0.14 build before `edge-20261018-0a62bb7`) ignores both
-    /// and answers the whole list, with no token.
+    /// `page_token` the next ones. The page names the head it resolved and where it goes on.
     pub async fn commit_page(
         &self,
         graph: &str,
