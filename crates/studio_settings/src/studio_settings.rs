@@ -631,7 +631,10 @@ impl StudioSettings {
         document::read(text)
     }
 
-    /// The settings of a file that has no problem at all.
+    /// The settings of a file that has no problem at all. Studio reads its file with
+    /// [`Self::read`]; this is left for `crates/studio/tests/settings_apply.rs`, the one test
+    /// outside this crate that still calls it.
+    #[cfg(feature = "test-support")]
     pub fn parse(text: &str) -> Result<Self, String> {
         let reading = Self::read(text)?;
         if reading.problems.is_empty() {
@@ -1008,6 +1011,13 @@ fn watch(cx: &mut App) {
 mod tests {
     use super::*;
 
+    /// The settings of `text`, read as Studio reads its file, which must have no problem.
+    fn read_clean(text: &str) -> StudioSettings {
+        let reading = StudioSettings::read(text).unwrap();
+        assert!(reading.problems.is_empty(), "{:?}", reading.problems);
+        reading.settings
+    }
+
     /// A change is edited into the file as it is now, an edit made elsewhere kept.
     #[test]
     fn a_change_is_written_into_the_file_as_it_is_now() {
@@ -1133,10 +1143,7 @@ mod tests {
     #[test]
     fn the_documented_defaults_are_the_defaults() {
         let text = include_str!("../../../assets/settings/default.json");
-        assert_eq!(
-            StudioSettings::parse(text).unwrap(),
-            StudioSettings::default()
-        );
+        assert_eq!(read_clean(text), StudioSettings::default());
         let documented: serde_json::Value = serde_json::from_str(text).unwrap();
         let actual = serde_json::to_value(StudioSettings::default()).unwrap();
         assert_eq!(documented, actual, "default.json names every setting");
@@ -1177,13 +1184,12 @@ mod tests {
 
     #[test]
     fn a_graph_takes_its_own_limits_then_the_shared_ones() {
-        let settings = StudioSettings::parse(
+        let settings = read_clean(
             r#"{
                 "studio": {"canvas_max_nodes": 3000},
                 "graphs": {"http://127.0.0.1:8787/knowledge": {"tree_page_size": 10}}
             }"#,
-        )
-        .unwrap();
+        );
         let dev = settings.for_graph("http://127.0.0.1:8787", "knowledge");
         assert_eq!(dev.tree_page_size, 10, "the graph's own value");
         assert_eq!(dev.canvas_max_nodes, 3000, "else the shared value");
@@ -1225,7 +1231,7 @@ mod tests {
         let text = serde_json::to_string(&settings).unwrap();
         assert!(text.contains(r#""hidden":["email"]"#), "{text}");
         assert!(!text.contains("order"), "schema order is left out: {text}");
-        assert_eq!(StudioSettings::parse(&text).unwrap(), settings);
+        assert_eq!(read_clean(&text), settings);
         settings.delete_view("dev/knowledge", "Person", "Founders");
         assert!(settings.graphs.is_empty(), "an empty entry is dropped");
         // A type's node name is kept per graph, and choosing the default drops it.
@@ -1234,7 +1240,7 @@ mod tests {
         assert!(settings.labels_for("prod/knowledge").is_empty());
         let text = serde_json::to_string(&settings).unwrap();
         assert!(text.contains(r#""labels":{"Person":"title"}"#), "{text}");
-        assert_eq!(StudioSettings::parse(&text).unwrap(), settings);
+        assert_eq!(read_clean(&text), settings);
         settings.set_label("dev/knowledge", "Person", None);
         assert!(settings.graphs.is_empty(), "the default is no entry");
     }

@@ -1171,9 +1171,14 @@ impl Workspace {
         }
     }
 
-    /// Toasts the outcomes `session` logged since the last asked: each refusal and each
-    /// outcome nobody knows, and a commit once no write of its graph is out, so a run of fixes
-    /// toasts its last. A graph not shown names itself.
+    /// Toasts the outcomes `session` logged since the last asked, each once, by its place in
+    /// the log ([`GraphSession::outcomes_logged`]), never by its text: two deletes described
+    /// alike are two toasts, each with its own Undo. Every refusal, every outcome nobody knows
+    /// and every commit is toasted. None waits for the graph's other writes, which may be
+    /// another view's or the agent's, so a delete's Undo, which only its toast offers, is never
+    /// passed over. Nothing is folded: the session logs each write's outcome in an update of
+    /// its own, which the window hears before the next is logged, and an outcome names no run
+    /// of writes it belongs to. A graph not shown names itself.
     fn toast_outcomes(&mut self, session: &Entity<GraphSession>, cx: &mut Context<Self>) {
         let id = session.entity_id();
         let (server_url, _) = graph_key_of(session, cx);
@@ -1181,16 +1186,10 @@ impl Workspace {
         let logged = read.outcomes_logged;
         let seen = self.outcomes_toasted.insert(id, logged).unwrap_or(logged);
         let new = (logged.saturating_sub(seen) as usize).min(read.outcomes.len());
-        let writing = read.writes_in_flight > 0;
         let fresh = read.outcomes[read.outcomes.len() - new..].to_vec();
         let shown = self.session.as_ref() == Some(session);
         let graph = read.graph_id.clone();
-        for (ix, entry) in fresh.iter().enumerate() {
-            if matches!(entry.outcome, OutcomeKind::Committed { .. })
-                && (writing || ix + 1 < fresh.len())
-            {
-                continue;
-            }
+        for entry in &fresh {
             let written_to = WrittenTo {
                 server_url: server_url.clone(),
                 graph: graph.clone(),
@@ -1214,9 +1213,6 @@ impl Workspace {
         } else {
             toast_text(latest)
         };
-        if self.toasts.iter().any(|t| t.message.as_ref() == text) {
-            return;
-        }
         let (kind, label, action): (_, SharedString, Box<dyn Action>) = match &latest.outcome {
             // No publish, no toast (constitution VII); the surface that wrote explains it, and
             // the activity log says where a held commit is.
@@ -1394,12 +1390,13 @@ impl Workspace {
                     }
                     cx.notify()
                 }
-                // The item asked to close; it has already decided.
-                ItemEvent::Close => {
-                    if let Some((pane, index)) = this.find_item(item.entity_id()) {
-                        this.force_close(pane, index, window, cx);
-                    }
-                }
+                // The item asked to close; it has already decided. A tab of a parked graph
+                // (a conversation deleted in another window) goes from that graph's panes, so
+                // the graph shows without it when shown again.
+                ItemEvent::Close => match this.find_item(item.entity_id()) {
+                    Some((pane, index)) => this.force_close(pane, index, window, cx),
+                    None => this.close_parked(item.entity_id()),
+                },
             },
         );
         self._item_subscriptions
@@ -1596,27 +1593,48 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Closes the tab `id` of a parked graph without asking, as [`Self::force_close`] does a
+    /// shown one's. A pane left empty closes too, unless it is the graph's only one.
+    fn close_parked(&mut self, id: EntityId) {
+        let Some(parked) = self
+            .parked
+            .iter_mut()
+            .find(|parked| parked.panes.iter().any(|pane| pane.position(id).is_some()))
+        else {
+            return;
+        };
+        let Some(pane) = parked
+            .panes
+            .iter_mut()
+            .find(|pane| pane.position(id).is_some())
+        else {
+            return;
+        };
+        let pane_id = pane.id;
+        if let Some(index) = pane.position(id) {
+            pane.remove(index);
+        }
+        if pane.items.is_empty() && parked.panes.len() > 1 {
+            take_pane(
+                &mut parked.center,
+                &mut parked.panes,
+                &mut parked.active_pane,
+                pane_id,
+            );
+        }
+        self._item_subscriptions.retain(|(item, _)| *item != id);
+    }
+
     /// Takes a pane out of the split tree; its neighbour in reading order becomes active.
     fn remove_pane(&mut self, id: PaneId) {
-        let order = self.center.panes();
-        if !self.center.remove(id) {
+        if !take_pane(&mut self.center, &mut self.panes, &mut self.active_pane, id) {
             return;
         }
         if self.zoomed == Some(Zoomed::Pane(id)) {
             self.zoomed = None;
         }
-        self.panes.retain(|pane| pane.id != id);
         self.tab_scrolls.borrow_mut().remove(&id);
         self.tabs_scrolled_to.borrow_mut().remove(&id);
-        if self.active_pane == id {
-            let position = order.iter().position(|p| *p == id).unwrap_or_default();
-            self.active_pane = order
-                .get(position.wrapping_sub(1))
-                .or_else(|| order.get(position + 1))
-                .copied()
-                .filter(|p| *p != id)
-                .unwrap_or_else(|| self.center.top_left());
-        }
     }
 
     /// Splits the active pane; the new pane opens a copy of the active tab, when the tab can
@@ -2153,21 +2171,11 @@ impl Workspace {
         }
     }
 
-    /// Names each new error from the CLI's files, and each server that could not be added at
-    /// start, in a toast that stays until dismissed.
+    /// Names each new error from the CLI's files, and each problem with the servers at start,
+    /// in a toast that stays until dismissed.
     fn show_cli_errors(&mut self, registry: &Entity<ConnectionRegistry>, cx: &mut Context<Self>) {
         let registry = registry.read(cx);
-        let errors: Vec<String> = registry
-            .cli_errors()
-            .iter()
-            .map(|error| format!("OmniGraph CLI config: {error}"))
-            .chain(
-                registry
-                    .start_errors()
-                    .iter()
-                    .map(|error| format!("A server could not be added: {error}")),
-            )
-            .collect();
+        let errors = server_notices(registry.cli_errors(), registry.start_errors());
         for error in &errors {
             if !self.cli_errors.contains(error) {
                 self.show_toast(ToastKind::Error, error.clone(), cx);
@@ -3948,6 +3956,48 @@ impl Workspace {
     }
 }
 
+/// The toasts' texts for what the CLI's files could not give and for the servers' problems at
+/// start. A start problem is a server named with why it was not added or not connected, or
+/// Studio's saved list that could not be read: a prefix saying a server was not added would be
+/// untrue of the list, so it names only when.
+fn server_notices(cli_errors: &[String], start_errors: &[String]) -> Vec<String> {
+    cli_errors
+        .iter()
+        .map(|error| format!("OmniGraph CLI config: {error}"))
+        .chain(
+            start_errors
+                .iter()
+                .map(|error| format!("Servers at start: {error}")),
+        )
+        .collect()
+}
+
+/// Takes pane `id` out of a graph's split tree and panes, shown or parked; when it was
+/// `active`, its neighbour in reading order becomes active. False for the graph's last pane,
+/// which stays.
+fn take_pane(
+    center: &mut Member,
+    panes: &mut Vec<Pane<Box<dyn ItemHandle>>>,
+    active: &mut PaneId,
+    id: PaneId,
+) -> bool {
+    let order = center.panes();
+    if !center.remove(id) {
+        return false;
+    }
+    panes.retain(|pane| pane.id != id);
+    if *active == id {
+        let position = order.iter().position(|p| *p == id).unwrap_or_default();
+        *active = order
+            .get(position.wrapping_sub(1))
+            .or_else(|| order.get(position + 1))
+            .copied()
+            .filter(|p| *p != id)
+            .unwrap_or_else(|| center.top_left());
+    }
+    true
+}
+
 /// The server and graph a session's saved state is kept under.
 fn graph_key_of(session: &Entity<GraphSession>, cx: &App) -> (String, String) {
     let session = session.read(cx);
@@ -4012,9 +4062,10 @@ fn toast_text(entry: &graph_store::OutcomeEntry) -> String {
             "{} · refused: {message}. Nothing was written.",
             entry.description
         ),
+        // Its history is the branch's, which Open history shows.
         OutcomeKind::Unknown { .. } => format!(
-            "{} · outcome unknown. Check History before trying again.",
-            entry.description
+            "{} · outcome unknown on {}. Check its history before trying again.",
+            entry.description, entry.branch
         ),
     }
 }
@@ -6293,6 +6344,217 @@ mod tests {
             message.contains("people is no longer open in this window"),
             "{message}"
         );
+    }
+
+    /// Logs `outcome` on `session`'s branch as the session logs a write's, and lets the window
+    /// hear of it.
+    fn log_outcome(
+        session: &Entity<GraphSession>,
+        description: &str,
+        outcome: OutcomeKind,
+        follow_up: Option<graph_store::FollowUp>,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        session.update(cx, |session, cx| {
+            session.outcomes.push(graph_store::OutcomeEntry {
+                at: std::time::SystemTime::now(),
+                branch: session.branch.clone(),
+                description: description.into(),
+                outcome,
+                follow_up,
+            });
+            session.outcomes_logged += 1;
+            cx.emit(SessionEvent::ActivityChanged);
+        });
+        cx.run_until_parked();
+    }
+
+    /// A delete's Undo, which only its toast offers, is offered though another write of the
+    /// graph (a cell's save, the agent's) is still out; so is every other commit.
+    #[gpui::test]
+    fn a_commit_is_toasted_while_another_write_of_its_graph_is_out(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let people = idle_session("http://b.test", "people", cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update(cx, |workspace, cx| {
+            workspace.graph_order.push(people.entity_id());
+            workspace.subscribe_session(people.clone(), cx);
+        });
+        // The agent's write, out the whole time.
+        people.update(cx, |session, _| session.writes_in_flight = 1);
+        let commit = |id: &str| OutcomeKind::Committed {
+            commit: Some(id.into()),
+        };
+        log_outcome(
+            &people,
+            "Delete Person ada",
+            commit("c2"),
+            Some(graph_store::FollowUp::UndoDelete),
+            cx,
+        );
+        log_outcome(&people, "Set name of p1", commit("c3"), None, cx);
+        let toasts = workspace.read_with(cx, |workspace, _| {
+            workspace
+                .toasts
+                .iter()
+                .map(|toast| {
+                    let label = toast
+                        .action
+                        .as_ref()
+                        .map(|follow_up| follow_up.label.clone());
+                    (toast.message.clone(), label)
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            toasts,
+            [
+                (
+                    "Delete Person ada · committed to main".into(),
+                    Some("Undo".into())
+                ),
+                (
+                    "Set name of p1 · committed to main".into(),
+                    Some("View commit".into())
+                ),
+            ]
+        );
+    }
+
+    /// Toasts are told apart by the outcome, never by their text: two deletes described alike
+    /// are two toasts, each undoing its own commit, and two outcomes nobody knows, alike but on
+    /// two branches, each name their branch and open its history.
+    #[gpui::test]
+    fn outcomes_described_alike_are_toasted_each_with_its_own_follow_up(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let people = idle_session("http://b.test", "people", cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        workspace.update(cx, |workspace, cx| {
+            workspace.graph_order.push(people.entity_id());
+            workspace.subscribe_session(people.clone(), cx);
+        });
+        for commit in ["c2", "c3"] {
+            log_outcome(
+                &people,
+                "Delete Person ada",
+                OutcomeKind::Committed {
+                    commit: Some(commit.into()),
+                },
+                Some(graph_store::FollowUp::UndoDelete),
+                cx,
+            );
+        }
+        for branch in ["fix", "main"] {
+            people.update(cx, |session, cx| session.set_branch(branch.into(), cx));
+            log_outcome(
+                &people,
+                "Edit Person ada",
+                OutcomeKind::Unknown {
+                    reason: "the connection closed".into(),
+                },
+                None,
+                cx,
+            );
+        }
+        workspace.read_with(cx, |workspace, _| {
+            let toasts = &workspace.toasts;
+            assert_eq!(toasts.len(), 4, "one toast per outcome");
+            for (toast, commit) in toasts[..2].iter().zip(["c2", "c3"]) {
+                let follow_up = toast.action.as_ref().unwrap();
+                assert!(
+                    follow_up
+                        .action
+                        .partial_eq(&studio_actions::graph::UndoDelete {
+                            commit: commit.into(),
+                            branch: "main".into(),
+                            what: "Delete Person ada".into(),
+                        }),
+                    "Undo puts back {commit}"
+                );
+            }
+            for (toast, branch) in toasts[2..].iter().zip(["fix", "main"]) {
+                assert_eq!(
+                    toast.message.as_ref(),
+                    format!(
+                        "Edit Person ada · outcome unknown on {branch}. Check its history before \
+                         trying again."
+                    )
+                );
+                let follow_up = toast.action.as_ref().unwrap();
+                assert_eq!(follow_up.label.as_ref(), "Open history");
+                let on = follow_up.on.as_ref().unwrap();
+                assert_eq!((on.graph.as_str(), on.branch.as_str()), ("people", branch));
+            }
+        });
+    }
+
+    /// A saved list that could not be read is not called a server that could not be added.
+    #[test]
+    fn a_start_notice_says_only_what_happened() {
+        let notices = server_notices(
+            &["config.yaml: could not parse".into()],
+            &[
+                "Studio's saved servers could not be read (bad), so it starts without them".into(),
+                "dev: the address is not valid".into(),
+            ],
+        );
+        assert_eq!(
+            notices,
+            [
+                "OmniGraph CLI config: config.yaml: could not parse",
+                "Servers at start: Studio's saved servers could not be read (bad), so it starts \
+                 without them",
+                "Servers at start: dev: the address is not valid",
+            ]
+        );
+    }
+
+    /// A tab of a parked graph that asks to close (a conversation deleted in another window)
+    /// closes there, and the pane it leaves empty with it: the graph shows without it when
+    /// shown again.
+    #[gpui::test]
+    fn a_parked_graphs_tab_closes_when_it_asks(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            studio_theme::init_test(cx);
+            studio_settings::init_test(cx);
+        });
+        let notes = idle_session("http://a.test", "notes", cx);
+        let people = idle_session("http://b.test", "people", cx);
+        let (workspace, cx) = cx.add_window_view(Workspace::new);
+        let split = |cx: &mut Context<Split>| Split {
+            field: cx.new(|_| Field),
+            part: cx.new(|_| Part { renders: 0 }),
+            caches: false,
+            focus_handle: cx.focus_handle(),
+        };
+        let (kept, closing) = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.graph_order.push(notes.entity_id());
+            workspace.subscribe_session(notes.clone(), cx);
+            let kept = workspace.add_item(window, cx, |_, cx| split(cx));
+            workspace.split(SplitDirection::Right, window, cx);
+            let closing = workspace.add_item(window, cx, |_, cx| split(cx));
+            assert_eq!(workspace.panes.len(), 2);
+            workspace.add_behind(people.clone(), None, cx);
+            workspace.show_graph(people.entity_id(), window, cx);
+            (kept, closing)
+        });
+        closing.update(cx, |_, cx| cx.emit(ItemEvent::Close));
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.show_graph(notes.entity_id(), window, cx);
+            let tabs: Vec<EntityId> = workspace.all_items().map(|item| item.item_id()).collect();
+            assert_eq!(tabs, [kept.entity_id()], "the tab that asked is gone");
+            assert_eq!(workspace.panes.len(), 1, "and its pane with it");
+            assert_eq!(workspace.center, Member::Pane(workspace.active_pane));
+        });
     }
 
     #[gpui::test]

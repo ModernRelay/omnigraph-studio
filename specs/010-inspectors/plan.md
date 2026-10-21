@@ -40,6 +40,12 @@ labelled, never blank).
   the old token's answers meanwhile (`SessionEvent::CredentialChanged`; a parked graph's when
   it is shown again), since the new one may see less (since 2026-10-21). Row counts are
   grouped, "12,480".
+- The snapshot's tables are a virtualized list (`uniform_list`, constitution IX): only the
+  rows in view are built, each value with its copy button, nodes first and each kind by type
+  name as before. The list fills what the server's and the graphs' facts leave, the snapshot's
+  part keeping at least twelve rows' height; on a short window those facts scroll above it
+  (since 2026-10-21; before, every table's row and its five copy buttons were built at every
+  redraw, about 3,000 buttons on a graph of 653 tables).
 
 ## Deferred
 
@@ -51,6 +57,7 @@ labelled, never blank).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | The snapshot's tables build only the rows in view | `crates/inspectors/src/storage.rs` `render_snapshot` (a `uniform_list` over `snapshot.datasets`, its rows built by `dataset_rows` for the range shown, each one line tall) and `tables_in_order` unchanged; the `inspectors` tests; workspace clippy | Builds and the inspector's tests pass. Not checked by drawing: a drawing test needs `studio_theme`, which `inspectors` does not depend on, and adding it would change `Cargo.lock`; not yet seen in the running app on a large graph |
 | 2026-10-21 | A new token reads the storage again | `inspectors` `a_new_token_reads_the_storage_again` (the connection's token replaced) | Right after the change the graphs and the snapshot read as loading, then a second snapshot read lands under the new token. Before, the tab heard only branch changes and head moves, and kept the old token's graphs and tables until a Refresh |
 | 2026-10-21 | Row counts are grouped | `inspectors` `row_counts_are_grouped` | "12,480"; before, "12480" |
 | 2026-10-20 | The snapshot shown stays when the branch moves | `inspectors` test `a_head_move_offers_the_newer_snapshot_and_reads_it_only_on_refresh` on `graph_store::test_server` (another writer's commit seen by the head watch, then Refresh, the same head again, then another branch); the same test against the earlier subscription | One snapshot read and the chip and stale dot after the commit; a second read only on Refresh, none for the head it was read at, a third on the branch switch. The earlier code read again at the commit (2 reads, no chip) |

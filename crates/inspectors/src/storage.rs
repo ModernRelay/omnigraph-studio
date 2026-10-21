@@ -4,13 +4,16 @@
 //! the tab offers the newer one (constitution II, V), and reads again on Refresh or on another
 //! branch.
 
+use std::ops::Range;
+
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString,
-    Subscription, Task, Window,
+    Subscription, Task, Window, uniform_list,
 };
 use graph_client::ServerHealth;
 use graph_client::api::{
-    EntityKind, GraphInfo, GraphListResponse, ReadinessOutput, SnapshotOutput,
+    EntityKind, GraphInfo, GraphListResponse, ReadinessOutput, SnapshotDatasetOutput,
+    SnapshotOutput,
 };
 use graph_store::{GraphSession, Loadable, SessionEvent};
 use studio_actions::workspace::Refresh;
@@ -35,6 +38,11 @@ mod col {
     pub const VERSION: f32 = 80.;
     pub const NATIVE: f32 = 130.;
 }
+
+/// The least height of the snapshot's part, in rows (its title, its three facts, the tables'
+/// header and some tables), when the server's and the graphs' facts above it would take more:
+/// those then scroll in what is left.
+const SNAPSHOT_MIN_ROWS: f32 = 12.;
 
 pub struct StorageInspector {
     session: Entity<GraphSession>,
@@ -339,9 +347,12 @@ impl StorageInspector {
         section("Graphs", error_of(&[&self.graphs.failed()]), all, cx)
     }
 
+    /// The snapshot's facts over its tables. A graph can hold hundreds of tables (653 on one
+    /// seen), so only the rows in view are built, each with its copy buttons, as every long
+    /// list is drawn (constitution IX); the list scrolls in the room the facts above leave.
     fn render_snapshot(&self, cx: &mut Context<Self>) -> AnyElement {
         let snapshot = self.snapshot.loaded();
-        let mut rows = vec![
+        let facts = [
             kv(
                 "Branch",
                 CopyableValue::new("snapshot-branch", snapshot.map(|s| s.graph_branch.clone())),
@@ -361,90 +372,122 @@ impl StorageInspector {
                 ),
             ),
         ];
-        if let Some(snapshot) = snapshot {
-            rows.push(
-                h_flex()
-                    .gap(px(space::MD))
-                    .pt(px(space::MD))
-                    .child(column("Kind", col::KIND))
-                    .child(column("Type", col::TYPE))
-                    .child(column("Rows", col::ROWS))
-                    .child(column("Version", col::VERSION))
-                    .child(column("Native branch", col::NATIVE))
-                    .child(div().flex_1().child(heading("Dataset path")))
-                    .into_any_element(),
-            );
-            for (ix, dataset) in snapshot.datasets.iter().enumerate() {
-                rows.push(
+        let tables = snapshot.map(|snapshot| {
+            v_flex()
+                .flex_1()
+                .min_h_0()
+                .child(
                     h_flex()
                         .gap(px(space::MD))
-                        .min_h(px(studio_ui::ds::size::SIDEBAR_ROW))
-                        .child(div().w(px(col::KIND)).flex_none().child(
-                            studio_ui::ds::text::muted(match dataset.entity_kind {
-                                EntityKind::Node => "node",
-                                EntityKind::Edge => "edge",
-                            }),
-                        ))
-                        .child(
-                            h_flex()
-                                .w(px(col::TYPE))
-                                .flex_none()
-                                .gap(px(space::SM))
-                                .child(studio_ui::kind_swatch(
-                                    &dataset.type_name,
-                                    dataset.entity_kind == graph_client::api::EntityKind::Edge,
-                                    cx,
-                                ))
-                                .child(
-                                    CopyableValue::new(
-                                        ("type", ix),
-                                        Some(dataset.type_name.clone()),
-                                    )
-                                    .plain(),
-                                ),
-                        )
-                        .child(div().w(px(col::ROWS)).flex_none().child(CopyableValue::new(
-                            ("rows", ix),
-                            Some(rows_text(dataset.entity_count)),
-                        )))
-                        .child(
-                            div()
-                                .w(px(col::VERSION))
-                                .flex_none()
-                                .child(CopyableValue::new(
-                                    ("version", ix),
-                                    Some(dataset.published_dataset_version.to_string()),
-                                )),
-                        )
-                        .child(
-                            div()
-                                .w(px(col::NATIVE))
-                                .flex_none()
-                                .child(CopyableValue::new(
-                                    ("native", ix),
-                                    Some(
-                                        dataset
-                                            .native_dataset_branch
-                                            .clone()
-                                            .unwrap_or_else(|| "none".into()),
-                                    ),
-                                )),
-                        )
-                        .child(div().flex_1().min_w_0().child(CopyableValue::new(
-                            ("path", ix),
-                            Some(dataset.dataset_path.clone()),
-                        )))
-                        .into_any_element(),
-                );
-            }
-        }
-        section(
-            &format!("Snapshot of {}", self.branch),
-            error_of(&[&self.snapshot.failed()]),
-            rows,
-            cx,
-        )
+                        .pt(px(space::MD))
+                        .child(column("Kind", col::KIND))
+                        .child(column("Type", col::TYPE))
+                        .child(column("Rows", col::ROWS))
+                        .child(column("Version", col::VERSION))
+                        .child(column("Native branch", col::NATIVE))
+                        .child(div().flex_1().child(heading("Dataset path"))),
+                )
+                .child(
+                    uniform_list(
+                        "storage-tables",
+                        snapshot.datasets.len(),
+                        cx.processor(|this, range: Range<usize>, _window, cx| {
+                            this.dataset_rows(range, cx)
+                        }),
+                    )
+                    .flex_1()
+                    .min_h_0(),
+                )
+        });
+        let error = error_of(&[&self.snapshot.failed()]);
+        v_flex()
+            .w_full()
+            .flex_1()
+            .min_h(px(studio_ui::ds::size::SIDEBAR_ROW * SNAPSHOT_MIN_ROWS))
+            .gap(px(space::XS))
+            .py(px(space::LG))
+            .border_b_1()
+            .dotted(cx)
+            .child(studio_ui::ds::text::muted(format!(
+                "Snapshot of {}",
+                self.branch
+            )))
+            .children(error.map(|e| studio_ui::ds::text::error(format!("Could not read: {e}"))))
+            .children(facts)
+            .children(tables)
+            .into_any_element()
     }
+
+    /// The rows of the snapshot's tables in `range`, as the list shows them.
+    fn dataset_rows(&self, range: Range<usize>, cx: &App) -> Vec<AnyElement> {
+        let Some(snapshot) = self.snapshot.loaded() else {
+            return Vec::new();
+        };
+        range
+            .filter_map(|ix| Some(dataset_row(ix, snapshot.datasets.get(ix)?, cx)))
+            .collect()
+    }
+}
+
+/// One table of the snapshot: its kind, type, rows, version, native branch and path, each
+/// copyable. One line tall whatever it holds, as the list it is drawn in requires.
+fn dataset_row(ix: usize, dataset: &SnapshotDatasetOutput, cx: &App) -> AnyElement {
+    h_flex()
+        .gap(px(space::MD))
+        .h(px(studio_ui::ds::size::SIDEBAR_ROW))
+        .child(
+            div()
+                .w(px(col::KIND))
+                .flex_none()
+                .child(studio_ui::ds::text::muted(match dataset.entity_kind {
+                    EntityKind::Node => "node",
+                    EntityKind::Edge => "edge",
+                })),
+        )
+        .child(
+            h_flex()
+                .w(px(col::TYPE))
+                .flex_none()
+                .gap(px(space::SM))
+                .child(studio_ui::kind_swatch(
+                    &dataset.type_name,
+                    dataset.entity_kind == EntityKind::Edge,
+                    cx,
+                ))
+                .child(CopyableValue::new(("type", ix), Some(dataset.type_name.clone())).plain()),
+        )
+        .child(div().w(px(col::ROWS)).flex_none().child(CopyableValue::new(
+            ("rows", ix),
+            Some(rows_text(dataset.entity_count)),
+        )))
+        .child(
+            div()
+                .w(px(col::VERSION))
+                .flex_none()
+                .child(CopyableValue::new(
+                    ("version", ix),
+                    Some(dataset.published_dataset_version.to_string()),
+                )),
+        )
+        .child(
+            div()
+                .w(px(col::NATIVE))
+                .flex_none()
+                .child(CopyableValue::new(
+                    ("native", ix),
+                    Some(
+                        dataset
+                            .native_dataset_branch
+                            .clone()
+                            .unwrap_or_else(|| "none".into()),
+                    ),
+                )),
+        )
+        .child(div().flex_1().min_w_0().child(CopyableValue::new(
+            ("path", ix),
+            Some(dataset.dataset_path.clone()),
+        )))
+        .into_any_element()
 }
 
 trait FailedMessage {
@@ -632,15 +675,22 @@ impl Render for StorageInspector {
             )
             .child(
                 v_flex()
-                    .id("storage-body")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
                     .px(px(space::XXL))
                     .py(px(space::XL))
                     .gap(px(space::XL))
-                    .child(server)
-                    .child(graphs)
+                    // The facts give way to the snapshot's tables, and scroll when they do.
+                    .child(
+                        v_flex()
+                            .id("storage-facts")
+                            .flex_shrink_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .gap(px(space::XL))
+                            .child(server)
+                            .child(graphs),
+                    )
                     .child(snapshot)
                     .child(
                         div()

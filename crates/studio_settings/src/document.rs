@@ -1,7 +1,8 @@
 //! `settings.json` as text the person owns (spec 002). Reading accepts comments and trailing
 //! commas, applies every value that fits, and reports each one that does not and each key that
 //! does nothing. Writing edits the text in place: only the settings that changed are rewritten,
-//! a setting put back to its default is removed, and comments, order and every other key stay.
+//! a list entry by entry, a setting put back to its default is removed, and comments, order,
+//! every other key and every value set aside stay.
 
 use serde_json::{Map, Value};
 
@@ -30,9 +31,16 @@ const MOST_PROBLEMS: usize = 100;
 /// default; the problem is reported with every other one. An error means the text is not a JSON
 /// object at all (its syntax), so nothing in it can be used.
 pub fn read(text: &str) -> Result<Reading, String> {
+    read_setting_aside(text).map(|(reading, _)| reading)
+}
+
+/// As [`read`], with where each value set aside is in the text: its keys, and its position
+/// when it is a list element set aside alone.
+fn read_setting_aside(text: &str) -> Result<(Reading, Vec<Vec<Step>>), String> {
     let mut document = parse(text)?;
     // (line, problem), so they read top to bottom.
     let mut problems: Vec<(usize, String)> = Vec::new();
+    let mut aside: Vec<Vec<Step>> = Vec::new();
     for _ in 0..MOST_PROBLEMS {
         let mut ignored = Vec::new();
         let attempt = serde_path_to_error::deserialize::<_, StudioSettings>(
@@ -48,7 +56,7 @@ pub fn read(text: &str) -> Result<Reading, String> {
                 }));
                 problems.sort_by_key(|(line, _)| *line);
                 let problems = problems.into_iter().map(|(_, problem)| problem).collect();
-                return Ok(Reading { settings, problems });
+                return Ok((Reading { settings, problems }, aside));
             }
             Err(error) => {
                 let failed = error_steps(error.path());
@@ -56,7 +64,8 @@ pub fn read(text: &str) -> Result<Reading, String> {
                     return Err(error.into_inner().to_string());
                 };
                 let reason = plain(&error.into_inner().to_string());
-                let (line, at) = locate(text, &dropped);
+                let in_text = in_text(&aside, &dropped);
+                let (line, at) = locate(text, &in_text);
                 problems.push((
                     line,
                     if dropped == failed {
@@ -69,10 +78,39 @@ pub fn read(text: &str) -> Result<Reading, String> {
                 if !remove(&mut document, &dropped) {
                     return Err(reason);
                 }
+                aside.push(in_text);
             }
         }
     }
     Err(format!("more than {MOST_PROBLEMS} values do not fit"))
+}
+
+/// Where `path`, in the document as read so far, is in the text. A list element set aside
+/// alone leaves the document, so a later element's position counts it back in. Only the last
+/// step of a path set aside is a position ([`drop_target`]), so the keys before it are the
+/// text's.
+fn in_text(aside: &[Vec<Step>], path: &[Step]) -> Vec<Step> {
+    let Some((Step::Index(at), list)) = path.split_last() else {
+        return path.to_vec();
+    };
+    let gone: Vec<usize> = aside
+        .iter()
+        .filter_map(|set_aside| match set_aside.split_last() {
+            Some((Step::Index(index), of)) if of == list => Some(*index),
+            _ => None,
+        })
+        .collect();
+    let mut left = *at;
+    let mut index = 0;
+    while gone.contains(&index) || left > 0 {
+        if !gone.contains(&index) {
+            left -= 1;
+        }
+        index += 1;
+    }
+    let mut path = list.to_vec();
+    path.push(Step::Index(index));
+    path
 }
 
 /// The document as JSON with comments and trailing commas allowed. Empty text is an empty
@@ -252,12 +290,12 @@ fn locate(text: &str, path: &[Step]) -> (usize, String) {
 
 /// The text with every setting that differs between `old` and `new` written in place. A
 /// setting put back to its default is removed, and so is an object the removal left empty.
-/// Everything else in the text (comments, order, unknown keys, values that did not fit) stays.
-/// An error means the text is not a settings document, so it is left alone.
+/// Everything else in the text (comments, order, unknown keys, values that did not fit) stays:
+/// a list is edited entry by entry, so its comments and the entries set aside stay, and an
+/// object removed keeps what was set aside inside it. An error means the text is not a
+/// settings document, so it is left alone.
 pub fn edit(text: &str, old: &StudioSettings, new: &StudioSettings) -> Result<String, String> {
-    parse(text)?;
-    // Serializing the settings types to a `Value` cannot fail: every map key is a string.
-    let as_value = |settings: &StudioSettings| serde_json::to_value(settings).unwrap_or_default();
+    let (reading, aside) = read_setting_aside(text)?;
     let mut changes = Vec::new();
     diff(
         &as_value(old),
@@ -272,27 +310,36 @@ pub fn edit(text: &str, old: &StudioSettings, new: &StudioSettings) -> Result<St
         text.to_owned()
     };
     let tab = settings::infer_json_indent_size(&text);
+    let held = Held {
+        read: as_value(&reading.settings),
+        aside,
+        tab,
+    };
     for (path, value) in &changes {
-        match value.clone() {
-            None => remove_in_text(&mut text, path),
-            Some(value) => {
-                let present = settings::find_value_range_in_json_text(&text, path).is_some();
-                if present || !add_in_text(&mut text, path, &value, tab) {
-                    let (range, replacement) =
-                        settings::replace_value_in_json_text(&text, path, tab, Some(&value), None);
-                    text.replace_range(range, &replacement);
-                }
-            }
-        }
+        held.write(&mut text, path, value.as_ref());
     }
     // The edit must leave a document that still reads; otherwise the file stays as it was.
-    let edited =
-        parse(&text).map_err(|error| format!("the change would break the file ({error})"))?;
+    let edited = read(&text)
+        .map_err(|error| format!("the change would break the file ({error})"))?
+        .settings;
     // And one that reads as changed: a key the file sets twice is edited where it first
     // appears, while the last one applies, so the change would be lost without a word.
+    let (edited, default) = (as_value(&edited), as_value(&StudioSettings::default()));
     for (path, value) in &changes {
-        let read = path.iter().try_fold(&edited, |at, key| at.get(key));
-        if read != value.as_ref() {
+        let read = value_at(&edited, path);
+        let changed = match value {
+            Some(value) => read == Some(value),
+            // Gone, or holding only what was set aside, which reads as nothing.
+            None => {
+                read.is_none()
+                    || read == value_at(&default, path)
+                    || read.is_some_and(|read| {
+                        read.as_object().is_some_and(Map::is_empty)
+                            || read.as_array().is_some_and(Vec::is_empty)
+                    })
+            }
+        };
+        if !changed {
             let at = display(&path.iter().cloned().map(Step::Key).collect::<Vec<_>>());
             return Err(format!(
                 "{at} is set more than once, and only the last one applies; remove the others"
@@ -300,6 +347,207 @@ pub fn edit(text: &str, old: &StudioSettings, new: &StudioSettings) -> Result<St
         }
     }
     Ok(text)
+}
+
+/// The settings as a `Value`. Serializing them cannot fail: every map key is a string.
+fn as_value(settings: &StudioSettings) -> Value {
+    serde_json::to_value(settings).unwrap_or_default()
+}
+
+/// The value at `path` of keys.
+fn value_at<'a>(value: &'a Value, path: &[String]) -> Option<&'a Value> {
+    path.iter().try_fold(value, |at, key| at.get(key))
+}
+
+/// What the text held before the edit: the settings it read as, and where the values it set
+/// aside are.
+struct Held {
+    read: Value,
+    aside: Vec<Vec<Step>>,
+    tab: usize,
+}
+
+impl Held {
+    /// Whether the value at `path` is itself set aside.
+    fn set_aside(&self, path: &[String]) -> bool {
+        self.aside
+            .iter()
+            .any(|aside| aside.len() == path.len() && under(aside, path))
+    }
+
+    /// Whether something set aside is inside the value at `path`.
+    fn holds_aside(&self, path: &[String]) -> bool {
+        self.aside
+            .iter()
+            .any(|aside| aside.len() > path.len() && under(aside, path))
+    }
+
+    /// The positions of the elements set aside in the list at `path`.
+    fn aside_in(&self, path: &[String]) -> Vec<usize> {
+        self.aside
+            .iter()
+            .filter_map(|aside| match aside.split_last() {
+                Some((Step::Index(index), list))
+                    if list.len() == path.len() && under(list, path) =>
+                {
+                    Some(*index)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Writes `value` at `path`, or removes the setting there when `None`. A list the text has
+    /// is edited entry by entry. Any other value is written whole, unless it holds something set
+    /// aside, around which it is written part by part. A value set aside is the person's until
+    /// its own setting changes, which replaces it: a removal around it leaves it.
+    fn write(&self, text: &mut String, path: &[String], value: Option<&Value>) {
+        let range = settings::find_value_range_in_json_text(text, path);
+        let written: Option<Value> = range
+            .clone()
+            .and_then(|range| settings::parse_json_with_comments(&text[range]).ok());
+        let around = self.holds_aside(path);
+        match (value, written) {
+            (Some(value), _) if self.set_aside(path) => {
+                replace_in_text(text, path, Some(value), self.tab)
+            }
+            (None, _) if self.set_aside(path) => {}
+            (Some(Value::Array(items)), Some(Value::Array(written))) => {
+                self.edit_list(text, path, items, written.len())
+            }
+            (Some(Value::Object(object)), Some(Value::Object(written))) if around => {
+                let mut path = path.to_vec();
+                for (key, value) in object {
+                    path.push(key.clone());
+                    if value_at(&self.read, &path) != Some(value) {
+                        self.write(text, &path, Some(value));
+                    }
+                    path.pop();
+                }
+                for key in written.keys().filter(|key| !object.contains_key(*key)) {
+                    path.push(key.clone());
+                    self.write(text, &path, None);
+                    path.pop();
+                }
+            }
+            (None, Some(Value::Array(written))) if around => {
+                let aside = self.aside_in(path);
+                for index in (0..written.len()).rev().filter(|i| !aside.contains(i)) {
+                    replace_in_text(text, &element(path, index), None, 0);
+                }
+            }
+            (None, Some(Value::Object(written))) if around => {
+                let mut path = path.to_vec();
+                for key in written.keys() {
+                    path.push(key.clone());
+                    self.write(text, &path, None);
+                    path.pop();
+                }
+            }
+            (None, _) => remove_in_text(text, path),
+            (Some(value), _) => {
+                if range.is_some() || !add_in_text(text, path, value, self.tab) {
+                    replace_in_text(text, path, Some(value), self.tab);
+                }
+            }
+        }
+    }
+
+    /// Edits the list at `path`, `written` entries long in the text, to read as `items`: each
+    /// entry that changed is written in its place, each one gone is removed, and new ones go at
+    /// the end, so the entries set aside and the comments between entries stay. Zed's editor
+    /// inserts only at a list's end: entries added before unchanged ones write those again,
+    /// each in its place.
+    fn edit_list(&self, text: &mut String, path: &[String], items: &[Value], written: usize) {
+        let aside = self.aside_in(path);
+        let slots: Vec<usize> = (0..written).filter(|i| !aside.contains(i)).collect();
+        let held: &[Value] = value_at(&self.read, path)
+            .and_then(Value::as_array)
+            .map_or(&[], Vec::as_slice);
+        // The entries the text holds, unchanged at the start and the end. Without the text's
+        // own reading of each entry, every one is written again in its place.
+        let (start, mut end) = if held.len() == slots.len() {
+            let start = held.iter().zip(items).take_while(|(a, b)| a == b).count();
+            let most = held.len().min(items.len()) - start;
+            let end = held[start..]
+                .iter()
+                .rev()
+                .zip(items[start..].iter().rev())
+                .take(most)
+                .take_while(|(a, b)| a == b)
+                .count();
+            (start, end)
+        } else {
+            (0, 0)
+        };
+        if items.len() > slots.len() {
+            end = 0;
+        }
+        let old = &slots[start..slots.len() - end];
+        let new = &items[start..items.len() - end];
+        for (slot, item) in old.iter().zip(new) {
+            replace_in_text(text, &element(path, *slot), Some(item), self.tab);
+        }
+        for slot in old.iter().skip(new.len()).rev() {
+            replace_in_text(text, &element(path, *slot), None, 0);
+        }
+        for item in new.iter().skip(old.len()) {
+            append_in_text(text, path, item, self.tab);
+        }
+    }
+}
+
+/// Appends `value` to the list at `path`. Zed's editor is given the list's own text, whose
+/// entries keep their columns: reached through the document's keys, it indents a nested
+/// list's new entry twice, by the last entry's column and again by the list's key's. It
+/// writes the closing bracket as a top-level list's, at the line's start, so the bracket's
+/// own indent is put back. A list with no entry is written whole.
+fn append_in_text(text: &mut String, path: &[String], value: &Value, tab: usize) {
+    let Some(range) = settings::find_value_range_in_json_text(text, path) else {
+        return;
+    };
+    let list = &text[range.clone()];
+    let empty = settings::parse_json_with_comments::<Value>(list)
+        .ok()
+        .and_then(|list| list.as_array().map(Vec::is_empty))
+        .unwrap_or(true);
+    if empty {
+        replace_in_text(text, path, Some(&Value::Array(vec![value.clone()])), tab);
+        return;
+    }
+    let before_bracket = &list[..list.len().saturating_sub(1)];
+    let bracket_indent = before_bracket
+        .rfind('\n')
+        .map(|at| &before_bracket[at + 1..])
+        .filter(|gap| gap.trim().is_empty())
+        .unwrap_or_default();
+    let (at, mut entry) = settings::append_top_level_array_value_in_json_text(list, value, tab);
+    if entry.ends_with('\n') {
+        entry.push_str(bracket_indent);
+    }
+    text.replace_range(range.start + at.start..range.start + at.end, &entry);
+}
+
+/// Whether `steps` start with the keys of `path`.
+fn under(steps: &[Step], path: &[String]) -> bool {
+    steps.len() >= path.len()
+        && steps
+            .iter()
+            .zip(path)
+            .all(|(step, key)| matches!(step, Step::Key(own) if own == key))
+}
+
+/// The path of the list entry at `index`, as Zed's editor names one (`#index`).
+fn element(path: &[String], index: usize) -> Vec<String> {
+    let mut path = path.to_vec();
+    path.push(format!("#{index}"));
+    path
+}
+
+/// Writes `value` at `path` with Zed's editor, or removes what is there when `None`.
+fn replace_in_text(text: &mut String, path: &[String], value: Option<&Value>, tab: usize) {
+    let (range, replacement) = settings::replace_value_in_json_text(text, path, tab, value, None);
+    text.replace_range(range, &replacement);
 }
 
 /// Each setting whose value differs, with its new value, or `None` to remove it: a setting
@@ -673,6 +921,148 @@ mod tests {
         assert!(out.starts_with("{\n  // per graph\n"), "{out}");
         assert!(read(&out).unwrap().settings.graphs.is_empty(), "{out}");
         assert!(!out.contains("dev/knowledge"), "{out}");
+    }
+
+    /// A list is edited entry by entry: saving, changing and deleting views leaves the view set
+    /// aside and the comments between entries where they were, and a graph's entry whose
+    /// views all go stays while it holds the one set aside.
+    #[test]
+    fn a_list_keeps_its_comments_and_the_entries_set_aside() {
+        let text = r#"{
+  "graphs": {
+    "dev/knowledge": {
+      "views": [
+        // Broken by hand
+        {"name": "Broken", "type": "Person", "filters": [{"property": "a", "op": 3}]},
+        // The one I use
+        {"name": "Kept", "type": "Person"}
+      ]
+    }
+  }
+}
+"#;
+        let view = |name: &str, group_by: Option<&str>| SavedView {
+            name: name.into(),
+            type_name: "Person".into(),
+            group_by: group_by.map(Into::into),
+            ..Default::default()
+        };
+        let names = |text: &str| -> Vec<(String, Option<String>)> {
+            read(text).unwrap().settings.graphs["dev/knowledge"]
+                .views
+                .iter()
+                .map(|v| (v.name.clone(), v.group_by.clone()))
+                .collect()
+        };
+        let broken =
+            r#"{"name": "Broken", "type": "Person", "filters": [{"property": "a", "op": 3}]}"#;
+
+        let out = edited(text, |s| s.save_view("dev/knowledge", view("New", None)));
+        for kept in [
+            "// Broken by hand",
+            broken,
+            "// The one I use",
+            r#"{"name": "Kept", "type": "Person"}"#,
+        ] {
+            assert!(out.contains(kept), "{kept} in\n{out}");
+        }
+        assert_eq!(
+            names(&out),
+            [("Kept".into(), None), ("New".into(), None)],
+            "{out}"
+        );
+        assert!(
+            out.contains("\n        {\n          \"name\": \"New\",")
+                && out.contains("\n      ]\n"),
+            "the new view at the list's indent: {out}"
+        );
+
+        let out = edited(&out, |s| {
+            s.save_view("dev/knowledge", view("Kept", Some("title")))
+        });
+        assert!(
+            out.contains(broken) && out.contains("// The one I use"),
+            "{out}"
+        );
+        assert_eq!(
+            names(&out),
+            [("Kept".into(), Some("title".into())), ("New".into(), None)],
+            "{out}"
+        );
+
+        let out = edited(&out, |s| {
+            s.delete_view("dev/knowledge", "Person", "Kept");
+            s.delete_view("dev/knowledge", "Person", "New");
+        });
+        assert!(out.contains(broken), "{out}");
+        assert!(
+            !out.contains("\"Kept\"") && !out.contains("\"New\""),
+            "{out}"
+        );
+        let reading = read(&out).unwrap();
+        assert!(reading.settings.graphs["dev/knowledge"].views.is_empty());
+        assert_eq!(reading.problems.len(), 1, "the view set aside, still named");
+    }
+
+    /// Any list is edited entry by entry: a comment between its entries stays when an entry is
+    /// added, changed or removed.
+    #[test]
+    fn a_list_edit_keeps_the_comments_between_its_entries() {
+        let text = "{\n  \"agent\": {\n    \"command\": [\n      \"claude\", // the program\n      \"--acp\"\n    ]\n  }\n}\n";
+        let command = |text: &str| read(text).unwrap().settings.agent.command;
+        let out = edited(text, |s| s.agent.command.push("--verbose".into()));
+        assert!(out.contains("\"claude\", // the program"), "{out}");
+        assert!(
+            out.contains("      \"--acp\",\n      \"--verbose\"\n    ]\n"),
+            "an entry added at the list's own indent: {out}"
+        );
+        assert_eq!(command(&out), ["claude", "--acp", "--verbose"], "{out}");
+        let out = edited(&out, |s| s.agent.command[1] = "--stdio".into());
+        assert!(out.contains("\"claude\", // the program"), "{out}");
+        assert_eq!(command(&out), ["claude", "--stdio", "--verbose"], "{out}");
+        let out = edited(&out, |s| {
+            s.agent.command.pop();
+        });
+        assert!(out.contains("\"claude\", // the program"), "{out}");
+        assert_eq!(command(&out), ["claude", "--stdio"], "{out}");
+    }
+
+    /// Entries set aside before one that fits are counted where the text has them: each is
+    /// named by its own place, and a change keeps them both.
+    #[test]
+    fn entries_set_aside_are_named_by_their_place_in_the_text() {
+        let text = r#"{"graphs": {"g": {"views": [
+            {"name": "A", "type": "Person", "filters": [{"op": 1}]},
+            {"name": "B", "type": "Person", "filters": [{"op": 2}]},
+            {"name": "C", "type": "Person"}
+        ]}}}"#;
+        let problems = read(text).unwrap().problems;
+        assert!(
+            problems[0].starts_with("`graphs.g.views[0]`"),
+            "{problems:?}"
+        );
+        assert!(
+            problems[1].starts_with("`graphs.g.views[1]`"),
+            "{problems:?}"
+        );
+        let out = edited(text, |s| {
+            s.save_view(
+                "g",
+                SavedView {
+                    name: "C".into(),
+                    type_name: "Person".into(),
+                    hidden: vec!["email".into()],
+                    ..Default::default()
+                },
+            )
+        });
+        assert!(
+            out.contains("\"op\": 1") && out.contains("\"op\": 2"),
+            "{out}"
+        );
+        let views = read(&out).unwrap().settings.graphs["g"].views.clone();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].hidden, ["email"]);
     }
 
     #[test]

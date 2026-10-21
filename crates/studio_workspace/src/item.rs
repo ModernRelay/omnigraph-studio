@@ -114,7 +114,6 @@ pub trait ItemHandle: 'static {
     fn is_dirty(&self, cx: &App) -> bool;
     fn is_stale(&self, cx: &App) -> bool;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
-    fn boxed_clone(&self) -> Box<dyn ItemHandle>;
     fn serialize(&self, cx: &App) -> Option<SavedItem>;
     fn status(&self, window: &mut Window, cx: &mut App) -> Option<ItemStatus>;
     fn caches_its_parts(&self, cx: &App) -> bool;
@@ -155,10 +154,6 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         Focusable::focus_handle(self.read(cx), cx)
-    }
-
-    fn boxed_clone(&self) -> Box<dyn ItemHandle> {
-        Box::new(self.clone())
     }
 
     fn serialize(&self, cx: &App) -> Option<SavedItem> {
