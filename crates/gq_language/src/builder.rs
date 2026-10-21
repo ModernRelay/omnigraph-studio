@@ -4,6 +4,8 @@
 //! never spliced into the text. The tests type-check every builder's output with
 //! `omnigraph-compiler` against the dev schema.
 
+use std::collections::HashMap;
+
 use serde_json::{Map, Value};
 
 use crate::schema::{
@@ -2137,7 +2139,8 @@ pub fn node_labels(
 
 /// Nodes of one type whose id starts with `text`, or whose label contains it (spec 002, ⌘P go
 /// to a node); with no text, the type's first nodes. Columns: `id`, then `label` when the type
-/// has a label other than its key.
+/// has a label other than its key. It reads the type's rows alone, so a commit to no node of
+/// the type leaves its answer as it was.
 pub fn node_search(
     schema: &SchemaModel,
     type_name: &str,
@@ -2169,7 +2172,10 @@ pub fn node_search(
         name: "studio_find".into(),
         text,
         params: params.values,
-        depends: Depends::Unknown,
+        depends: Depends::Types {
+            nodes: vec![node.name.clone()],
+            edges: Vec::new(),
+        },
         seeds: None,
     })
 }
@@ -2366,8 +2372,11 @@ pub fn update_rows(
 }
 
 /// Sets one property on several rows in one mutation, so they publish as one commit (spec 004,
-/// bulk set). Each row's statement is bound to the value the row showed, as a cell edit is: a
-/// row changed elsewhere is left alone, and `affected_nodes` comes back short by it.
+/// bulk set). Rows that showed the same value share one statement, `@id in` their ids, bound to
+/// that value as a cell edit is: a row changed elsewhere is left alone, and `affected_nodes`
+/// comes back short by it. The engine scans the type once per statement, so a set over many
+/// rows costs a scan per value they showed rather than one per row. A list is not bound, so a
+/// list property's rows are one statement.
 pub fn update_cells(
     schema: &SchemaModel,
     type_name: &str,
@@ -2382,14 +2391,25 @@ pub fn update_cells(
     }
     let mut params = Params::new();
     let new = params.add("new", &property.param_type(true), new.clone());
-    let statements = rows
-        .iter()
+    // The rows by the value they showed, in the order each value first appears.
+    let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+    let mut group_of: HashMap<String, usize> = HashMap::new();
+    for (id, old) in rows {
+        let old = if property.list { &Value::Null } else { old };
+        let group = *group_of.entry(old.to_string()).or_insert_with(|| {
+            groups.push((old.clone(), Vec::new()));
+            groups.len() - 1
+        });
+        groups[group].1.push(Value::String(id.clone()));
+    }
+    let statements = groups
+        .into_iter()
         .enumerate()
-        .map(|(index, (id, old))| {
-            let id = params.add(&format!("id{index}"), "String", Value::String(id.clone()));
-            let bound = bound_to(property, old, &format!("old{index}"), &mut params)?;
+        .map(|(index, (old, ids))| {
+            let ids = params.add(&format!("ids{index}"), "[String]", Value::Array(ids));
+            let bound = bound_to(property, &old, &format!("old{index}"), &mut params)?;
             Ok(format!(
-                "update {ty} set {{ {prop}: {new} }} where @id = {id}{bound}",
+                "update {ty} set {{ {prop}: {new} }} where @id in {ids}{bound}",
                 ty = node.name,
                 prop = property.name,
             ))
@@ -2842,14 +2862,25 @@ mod tests {
             query.text
         );
         assert_compiles(&query);
+        // Only Person's rows answer it: a commit to other types leaves it as it was.
+        assert_eq!(
+            query.depends,
+            Depends::Types {
+                nodes: vec!["Person".into()],
+                edges: Vec::new()
+            }
+        );
     }
 
+    /// A bulk set is one mutation with a statement per value the rows showed, each bound to it:
+    /// rows that showed the same value share a statement.
     #[test]
-    fn a_bulk_set_is_one_mutation_bound_row_by_row() {
+    fn a_bulk_set_is_one_mutation_bound_value_by_value() {
         let schema = dev();
         let rows = vec![
             ("person-000001".to_owned(), Value::String("Engineer".into())),
             ("person-000006".to_owned(), Value::Null),
+            ("person-000007".to_owned(), Value::String("Engineer".into())),
         ];
         let query = update_cells(
             &schema,
@@ -2862,11 +2893,17 @@ mod tests {
         assert!(
             query
                 .text
-                .contains("update Person set { title: $new } where @id = $id0 and title = $old0"),
+                .contains("update Person set { title: $new } where @id in $ids0 and title = $old0"),
             "{}",
             query.text
         );
-        assert!(query.text.contains("where @id = $id1 and title is null"));
+        assert!(query.text.contains("where @id in $ids1 and title is null"));
+        assert_eq!(query.text.matches("update Person").count(), 2);
+        assert_eq!(
+            query.params["ids0"],
+            json!(["person-000001", "person-000007"])
+        );
+        assert_eq!(query.params["ids1"], json!(["person-000006"]));
         assert_eq!(query.params["old0"], "Engineer");
         assert_compiles(&query);
         assert!(matches!(
