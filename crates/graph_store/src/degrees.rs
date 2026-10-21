@@ -15,8 +15,9 @@ use serde_json::Value;
 /// Nodes per `page_degrees` read, as the table reads a page's relationship columns.
 pub const DEGREE_BATCH: usize = 100;
 
-/// Where one count goes: the asker, until it stops waiting.
-pub(crate) type Waiter = oneshot::Sender<Result<u64, String>>;
+/// Where one count goes, with the commit its read answered at: the asker, until it stops
+/// waiting.
+pub(crate) type Waiter = oneshot::Sender<Result<(u64, Option<String>), String>>;
 
 /// The counts read together: one node type, one relationship, one commit (`None`, the head of
 /// `branch`, the session's branch when they were asked for).

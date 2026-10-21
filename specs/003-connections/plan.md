@@ -56,8 +56,10 @@ dialog by keyboard), X (capabilities from the served document).
    window open on it keeps its connection), one at a new address is a new connection, a
    target's graph is added, and a token changed there (`omnigraph login`) replaces the
    connection's, which a connection in use checks at once. Every session on the connection
-   then reads what the new token may do at once, and forgets every answer it kept with the old
-   one, which may have seen more (spec 002, "What the credential may do"). A token typed into
+   then reads what the new token may do at once, forgets every answer its read memo kept with
+   the old one, which may have seen more, and reads its type counts, stored-query catalog and
+   branch list again, showing none of the old token's meanwhile (spec 002, "What the credential
+   may do"; `docs/architecture.md` says what is kept and why). A token typed into
    Studio for a CLI server lasts until the files change that server's token. Files that cannot be read
    keep every server as it was and are named in a toast that stays until dismissed, as a
    settings file's are. A token from `OMNIGRAPH_TOKEN_<OWNER>` is the one Studio started with,
@@ -176,7 +178,10 @@ it does.
   cells, least recently used out first) and an identical read under way is shared, since a
   commit never changes. Failures are not kept, and reads at the branch head always go out. A
   new token forgets every answer kept, and a read still out when it changed keeps nothing: the
-  new token may see less, and its refusals are shown (constitution IV).
+  new token may see less, and its refusals are shown (constitution IV). The type counts, the
+  stored-query catalog and the branch list are read again under it; the schema, the heads and
+  the change logs stay (the schema is answered alike to every credential that may read the
+  graph; heads and logs describe commits, and carry forward only answers read since).
 - A session watches branch heads for the views pinned to them: its own branch always, and any
   branch a view holds a `HeadWatch` for (a review's). Every `HEAD_POLL` (30 s) while a Studio
   window is active, and when a window becomes active after a poll came while none was, it reads
@@ -224,6 +229,7 @@ it does.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A new token reads the counts, the stored-query catalog and the branch list again | `graph_store` `a_new_token_reads_access_and_every_answer_again`, extended: the fake answers `/snapshot` (Person: 7), `/queries` and `/branches`, and lists what is asked; `GraphSession::read_again_for_credential` from `sync_access`; at `7fd9cc9` `server_branch_list`, `server_schema_get` (a read with no branch) and `server_list_queries` (a read on main) in `omnigraph-server/src/handlers.rs` | Before, `forget_reads` cleared the read memo only: the old token's counts, catalog and branch list stayed shown. Now, right after the token changes, `count_of(Person)` is none and the branch list and catalog are loading; then each of `/snapshot`, `/queries` and `/branches` is asked once under the new token, and Person shows 7 again. The schema, the heads and the change logs stay, as `docs/architecture.md` says |
 | 2026-10-21 | A new token reads what it may do at once and forgets what the old one read | `graph_store` test `a_new_token_reads_access_and_every_answer_again` (a server answering `/access` by the bearer token; the session opened with a read-only token whose access read is held); `graph_client` `a_replaced_token_reaches_every_clone` (only a token that differs counts as a credential change); `access` `a_forgotten_answer_is_read_again`. The same session test against the earlier code, by reading: `Connection::set_token` moved the client's count and nothing subscribed to it, and `Access::landed` compared only its own generation | The write-capable token's access read went at once, with no write, and allowed changing main; the read-only answer released after it landed nowhere; a read at commit c1 kept under the old token was asked again under the new; the narrower token's own answer refused change. A 403 on a write read access again (one read) and kept the answers. Before: the table kept "Your credential may not change main" until a branch move or a write, the held answer landed, and the memo answered without asking |
 | 2026-10-21 | Only a 403 on a graph says its policy may have changed | `graph_client` test `a_refusal_on_a_graph_is_counted_and_one_on_the_server_is_not` (a 403 from `GET /graphs`, `/graphs/discovery`, and one without the contract header; then a read, a write and a forwarded request on a graph, one named `discovery` among them) | The server's own routes counted nothing, the graph's three; neither moved the credential count. Before, the connect probe's `/graphs` refusal, which a static token always gets, forgot every access answer at each connect |
 | 2026-10-21 | An address is one connection | `graph_store` tests `targets_on_one_endpoint_are_one_server` (a file as `omnigraph target import` writes it, with `defaults.target: default`, an anonymous target on the same endpoint, and two targets on another endpoint, the anonymous one first in the file), `cli_servers_follow_the_cli_files` (a server added in Studio at an address two CLI targets then name, one of them moved there) | Three servers: the imported one (named like its owner, both default graphs, its token), the other endpoint's as its first target with its default graph, and the plain one; the anonymous target beside `default` and the keyed one after the first were named in the toast with the target Studio connects as and why, their aliases on no server. The Studio server stayed the address's one connection, both CLI targets named, the moved one's old connection gone. Before, the anonymous target was a second connection to the same address |

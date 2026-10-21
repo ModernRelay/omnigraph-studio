@@ -130,7 +130,9 @@ pub struct SystemColumnsOutput {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SnapshotOutput {
     pub graph_branch: String,
-    pub graph_manifest_version: i64,
+    /// A Lance version, `u64` on the server: the contract's `int64` is narrower than what it
+    /// sends (`docs/deferred-engine-changes.md`).
+    pub graph_manifest_version: u64,
     pub internal_schema_version: i32,
     pub datasets: Vec<SnapshotDatasetOutput>,
 }
@@ -140,7 +142,8 @@ pub struct SnapshotDatasetOutput {
     pub entity_kind: EntityKind,
     pub type_name: String,
     pub dataset_path: String,
-    pub published_dataset_version: i64,
+    /// A Lance version, `u64` on the server, as the manifest's is.
+    pub published_dataset_version: u64,
     pub entity_count: i64,
     #[serde(default)]
     pub native_dataset_branch: Option<String>,
@@ -492,9 +495,16 @@ pub struct CommitListOutput {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CommitOutput {
     pub graph_commit_id: String,
-    pub graph_manifest_version: i64,
+    /// The `__manifest` version holding the commit, `u64` on the server. An unpublished commit
+    /// or an unattached snapshot is held in a detached version, which Lance numbers with the
+    /// high bit set: past `i64::MAX`.
+    pub graph_manifest_version: u64,
     /// Unix microseconds.
     pub created_at: i64,
+    /// The branch the commit was published on, `None` for main, as the server records it: a
+    /// commit keeps the branch that wrote it, so a branch's first-parent chain lists its own
+    /// commits, then those of the branch it forked from. A held commit names the branch it was
+    /// written on, which it is not on.
     #[serde(default)]
     pub graph_branch: Option<String>,
     #[serde(default)]
@@ -1175,6 +1185,37 @@ mod contract_tests {
         assert_eq!(state, GraphAvailability::Other);
         let op: super::ChangeOp = serde_json::from_str(r#""upsert""#).unwrap();
         assert_eq!(op, super::ChangeOp::Other);
+    }
+
+    /// A commit held in a detached `__manifest` version decodes: Lance sets the high bit of a
+    /// detached version, so it is past `i64::MAX`, as the server answers a write `as commit`.
+    /// A snapshot's versions are as wide.
+    #[test]
+    fn a_detached_manifest_version_decodes() {
+        use super::{CommitKind, CommitOutput, SnapshotOutput};
+        let detached: u64 = 10_415_222_161_995_537_841;
+        assert!(detached > i64::MAX as u64);
+        let commit: CommitOutput = serde_json::from_value(serde_json::json!({
+            "graph_commit_id": "01JPROPOSAL", "graph_branch": null,
+            "graph_manifest_version": detached, "parent_commit_id": "c1",
+            "merged_parent_commit_id": null, "actor_id": "act-dev", "created_at": 0,
+            "published": false, "kind": "unpublished", "root_commit_id": null
+        }))
+        .unwrap();
+        assert_eq!(commit.graph_manifest_version, detached);
+        assert_eq!(commit.kind, CommitKind::Unpublished);
+        let snapshot: SnapshotOutput = serde_json::from_value(serde_json::json!({
+            "graph_branch": "main", "graph_manifest_version": u64::MAX,
+            "internal_schema_version": 16,
+            "datasets": [{
+                "entity_kind": "node", "type_name": "Person", "dataset_path": "nodes/1",
+                "published_dataset_version": detached, "native_dataset_branch": null,
+                "entity_count": 3
+            }]
+        }))
+        .unwrap();
+        assert_eq!(snapshot.graph_manifest_version, u64::MAX);
+        assert_eq!(snapshot.datasets[0].published_dataset_version, detached);
     }
 
     /// A `branch diff` answer says where its page stands, as `branch_diff_read_output` writes

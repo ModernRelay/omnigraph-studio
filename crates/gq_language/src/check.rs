@@ -109,6 +109,58 @@ pub struct QueryInfo {
     pub columns: Vec<ResultColumn>,
     /// What running it destroys: the rows a `delete` removes from its branch.
     pub destroys: Option<Destroys>,
+    /// Where a write's result goes: the branch it is sent to, or held off every branch.
+    pub publication: Publication,
+}
+
+/// Where a write's result goes, by how it is declared (`as commit`, `as unattached branch`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Publication {
+    /// It publishes on the branch it is sent to.
+    #[default]
+    Branch,
+    /// `as commit`: held as an unpublished commit, made on the branch's head, which moves only
+    /// when the commit is published; it can be dropped instead.
+    Held,
+    /// `as unattached branch`: an unattached snapshot, read by its id, which never publishes.
+    Unattached,
+}
+
+impl Publication {
+    fn of(mode: &MutationWriteMode) -> Self {
+        match mode {
+            MutationWriteMode::Publish => Self::Branch,
+            MutationWriteMode::AsCommit => Self::Held,
+            MutationWriteMode::Unattached { .. } => Self::Unattached,
+        }
+    }
+}
+
+/// Where the statement `source` puts what it writes, read from its parse alone: a `branch
+/// merge … as commit` holds the merge as an unpublished commit; every other statement, and text
+/// that does not parse, is [`Publication::Branch`].
+pub fn statement_publication(source: &str) -> Publication {
+    match parse_query_diagnostic(source).map(|file| file.body) {
+        Ok(FileBody::Branch(BranchStmt::Write(BranchWrite::Merge {
+            as_commit: true, ..
+        }))) => Publication::Held,
+        _ => Publication::Branch,
+    }
+}
+
+/// Where the declaration `name` in `source` puts what it writes, read from its parse alone, for
+/// a source checked against no schema yet; [`QueryInfo::publication`] says the same once it is.
+/// [`Publication::Branch`] for text that does not parse or holds no such declaration.
+pub fn declared_publication(source: &str, name: &str) -> Publication {
+    match parse_query_diagnostic(source).map(|file| file.body) {
+        Ok(FileBody::Queries(decls)) => decls
+            .iter()
+            .find(|decl| decl.name == name)
+            .map_or(Publication::Branch, |decl| {
+                Publication::of(&decl.write_mode)
+            }),
+        _ => Publication::Branch,
+    }
 }
 
 /// What a write destroys that Studio cannot put back (constitution IV), so it is confirmed by
@@ -242,6 +294,7 @@ pub fn check(schema: &SchemaModel, source: &str) -> QueryCheck {
                 .collect(),
             columns: Vec::new(),
             destroys: deletes(decl),
+            publication: Publication::of(&decl.write_mode),
         };
         match typecheck_query_decl(&schema.catalog, decl) {
             Ok(checked) => {
@@ -346,7 +399,6 @@ mod tests {
         assert_eq!(columns, ["who", "n"]);
     }
 
-    /// What a write destroys that Studio cannot put back: a deleted branch, a dropped commit,
     /// A statement's branch is the one the server writes: the branch made or deleted, a
     /// merge's target or main, and main for a load sent without a branch. A commit statement's
     /// target is only in the server's answer, and a read or a declaration writes no branch.
@@ -376,6 +428,47 @@ mod tests {
             ("branch delete", None),
         ] {
             assert_eq!(statement_branch(source).as_deref(), branch, "{source}");
+        }
+    }
+
+    /// A write says where its result goes: a declaration `as commit` is held, one `as
+    /// unattached branch` is a snapshot, any other publishes on its branch; of the statements,
+    /// only a merge `as commit` is held.
+    #[test]
+    fn a_write_says_where_its_result_goes() {
+        for (source, publication) in [
+            (
+                "query q() { insert Person { slug: \"a\" } }",
+                Publication::Branch,
+            ),
+            (
+                "query q() as commit { insert Person { slug: \"a\" } }",
+                Publication::Held,
+            ),
+            (
+                "query q() as unattached branch { insert Person { slug: \"a\" } }",
+                Publication::Unattached,
+            ),
+        ] {
+            let checked = check(&dev(), source);
+            assert_eq!(checked.queries[0].publication, publication, "{source}");
+            assert_eq!(declared_publication(source, "q"), publication, "{source}");
+        }
+        assert_eq!(
+            declared_publication("query q() as commit { insert Person { slug: \"a\" } }", "r"),
+            Publication::Branch,
+            "no such declaration"
+        );
+        for (source, publication) in [
+            (
+                "branch merge feature into release as commit",
+                Publication::Held,
+            ),
+            ("branch merge feature into release", Publication::Branch),
+            ("branch delete feature", Publication::Branch),
+            ("branch merge", Publication::Branch),
+        ] {
+            assert_eq!(statement_publication(source), publication, "{source}");
         }
     }
 

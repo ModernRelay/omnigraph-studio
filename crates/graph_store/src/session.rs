@@ -152,9 +152,6 @@ pub enum SessionEvent {
     },
     /// What the credential may do was read, or is to be read again ([`GraphSession::allows`]).
     AccessChanged,
-    /// The graph's saved queries moved into its folder from where a build before 2026-10-20
-    /// filed them, under its server's name: a view listing the folder lists it again.
-    SavedQueriesMoved,
 }
 
 /// How many answers to reads pinned to a commit, and Blob cells at a commit, a session keeps. A
@@ -741,19 +738,6 @@ impl GraphSession {
             },
         ));
         session._connection_watch = Some(session.connection.update(cx, |c, cx| c.watch(cx)));
-        // What builds before 2026-10-20 filed under the server's name; delete after the next
-        // release. The folder moves off the main thread, and the panel listing it lists it
-        // again once it has.
-        let server = session.connection.read(cx).server.clone();
-        if let Some(moving) = crate::named_keys::move_named(&server, &session.graph_id, cx) {
-            cx.spawn(async move |this, cx| {
-                if moving.await {
-                    this.update(cx, |_, cx| cx.emit(SessionEvent::SavedQueriesMoved))
-                        .ok();
-                }
-            })
-            .detach();
-        }
         session.labels = session.chosen_labels(cx);
         session._settings = Some(
             cx.observe_global::<studio_settings::StudioSettings>(|this, cx| {
@@ -837,18 +821,25 @@ impl GraphSession {
     }
 
     /// Catches up with the client's counts: after a new token every answer kept is forgotten
-    /// ([`Self::forget_reads`]), and after a new token or a 403 on the graph what the
-    /// credential may do is too, and the session's branch is read again; views that show what
-    /// it allows hear [`SessionEvent::AccessChanged`] and ask for theirs. Whether anything was
-    /// forgotten.
+    /// ([`Self::forget_reads`]) and what the session shows of the graph is read again
+    /// ([`Self::read_again_for_credential`]); after a new token or a 403 on the graph what the
+    /// credential may do is forgotten too, and the session's branch is read again; views that
+    /// show what it allows hear [`SessionEvent::AccessChanged`] and ask for theirs. Whether
+    /// anything was forgotten.
     fn sync_access(&mut self, cx: &mut Context<Self>) -> bool {
         let client = self.client(cx);
         let credential = client.credential_changes();
         if credential != self.credential {
             self.credential = credential;
             self.forget_reads();
+            self.read_again_for_credential(cx);
         }
-        if !self.access.sync((credential, client.refusals())) {
+        // This graph's refusals alone: a 403 on another graph of the server says nothing of
+        // what the credential may do here, and an answer for this graph in flight stands.
+        if !self
+            .access
+            .sync((credential, client.refusals(&self.graph_id)))
+        {
             return false;
         }
         cx.emit(SessionEvent::AccessChanged);
@@ -859,9 +850,15 @@ impl GraphSession {
     }
 
     /// Forgets every answer kept, and the reads under way with them, which then keep nothing
-    /// when they land: answers read at a commit, Blob cells, counts, branches' newest commits
-    /// and commits' changes. Each was read with a credential that may see more than the one
-    /// sent now, and a kept answer is shown again without asking the server.
+    /// when they land: answers read at a commit, Blob cells, relationship counts, branches'
+    /// newest commits and commits' changes. Each was read with a credential that may see more
+    /// than the one sent now, and a kept answer is shown again without asking the server.
+    ///
+    /// What it keeps, and why: the schema, which the server answers alike to every credential
+    /// that may read the graph and every read is made under (Refresh, or another writer's
+    /// schema seen at a head, reads it again); and the heads it watches with each branch's
+    /// change log, which describe commits, never the rows a view shows: a commit never changes,
+    /// and a log only carries an answer forward, from those read since with the new token.
     fn forget_reads(&mut self) {
         self.pinned_reads.clear();
         self.pinned_blobs.clear();
@@ -871,6 +868,25 @@ impl GraphSession {
         self.head_commits.clear();
         self.commit_change_pages.clear();
         self.whole_commit_pages.clear();
+    }
+
+    /// Reads again, under a new token, what the session shows of the graph as the old one was
+    /// answered it: the type counts, the stored-query catalog and the branch list. The new
+    /// token's policy may refuse it what the old one read, so none of it shows meanwhile: each
+    /// is being read, and views hear it. A branch the new token's list does not hold is left,
+    /// as any branch the list no longer holds is; drafts on it stay.
+    fn read_again_for_credential(&mut self, cx: &mut Context<Self>) {
+        self.counts_reading = false;
+        self.counts_again = false;
+        self.reload_counts(cx);
+        self.reload_stored_queries(cx);
+        // Not kept while it is read: it is the old token's.
+        self.branches = Loadable::Loading;
+        self.read_branches(None, cx);
+        cx.emit(SessionEvent::CountsChanged);
+        cx.emit(SessionEvent::StoredQueriesChanged);
+        cx.emit(SessionEvent::BranchesChanged);
+        cx.notify();
     }
 
     /// The client every read and write of this session goes through. Views never hold one
@@ -1692,7 +1708,7 @@ impl GraphSession {
         }
     }
 
-    /// [`GraphSession::degree`] for what a view shows: the count depends on the edges of the
+    /// [`GraphSession::degree_at`] for what a view shows: the count depends on the edges of the
     /// group's type at the node.
     pub(crate) fn degree_in(
         &mut self,
@@ -1702,7 +1718,7 @@ impl GraphSession {
         id: &str,
         snapshot: Option<String>,
         cx: &mut Context<Self>,
-    ) -> Task<Result<u64, String>> {
+    ) -> Task<Result<(u64, Option<String>), String>> {
         // A count lists no nodes: nothing it says waits for its answer.
         if let Some(scope) = self.scopes.get_mut(&scope.id) {
             let _ = scope.add(Depends::EdgesAt {
@@ -1711,7 +1727,7 @@ impl GraphSession {
                 listed: None,
             });
         }
-        self.degree(type_name, group, id, snapshot, cx)
+        self.degree_at(type_name, group, id, snapshot, cx)
     }
 
     /// [`GraphSession::blob_meta`] for what a view shows: the cell depends on its node or edge.
@@ -2949,6 +2965,21 @@ impl GraphSession {
         snapshot: Option<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<u64, String>> {
+        let read = self.degree_at(type_name, group, id, snapshot, cx);
+        cx.background_spawn(async move { read.await.map(|(n, _)| n) })
+    }
+
+    /// [`Self::degree`], with the commit the count holds at: the one asked for, or the one the
+    /// read answered at, for a count asked for at the head. A view pinned by its first answer
+    /// compares it with its pin, as it does every other answer.
+    pub(crate) fn degree_at(
+        &mut self,
+        type_name: &str,
+        group: &RelationshipGroup,
+        id: &str,
+        snapshot: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<(u64, Option<String>), String>> {
         if let Some(commit) = &snapshot {
             let at = DegreeAt {
                 type_name: type_name.to_owned(),
@@ -2958,7 +2989,7 @@ impl GraphSession {
                 schema: self.schema_epoch,
             };
             if let Some(n) = self.degree_kept(&at) {
-                return Task::ready(Ok(n));
+                return Task::ready(Ok((n, Some(commit.clone()))));
             }
         }
         let (tx, rx) = oneshot::channel();
@@ -3038,16 +3069,21 @@ impl GraphSession {
                         Either::Right(_) => return,
                     }
                 };
+                // Each count with the commit the read answered at: the one asked for, or the
+                // head it read.
                 let answer = result
                     .map_err(|error| error.to_string())
                     .and_then(|output| {
-                        page_counts(&output.rows)
-                            .ok_or_else(|| "The server's counts could not be read.".to_owned())
+                        let counts = page_counts(&output.rows)
+                            .ok_or_else(|| "The server's counts could not be read.".to_owned())?;
+                        Ok((counts, output.graph_commit_id.clone()))
                     });
                 for (id, waiters) in nodes {
                     let count = answer
                         .as_ref()
-                        .map(|counts| counts.get(&id).copied().unwrap_or(0))
+                        .map(|(counts, commit)| {
+                            (counts.get(&id).copied().unwrap_or(0), commit.clone())
+                        })
                         .map_err(Clone::clone);
                     for waiter in waiters {
                         waiter.send(count.clone()).ok();
@@ -4801,8 +4837,8 @@ mod tests {
             known_graphs: Vec::new(),
         };
         let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
-        let session =
-            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        let session = cx
+            .new(|cx| GraphSession::new(connection.clone(), "knowledge".into(), "main".into(), cx));
         let events: Rc<std::cell::RefCell<Vec<SessionEvent>>> = Rc::default();
         let seen = events.clone();
         let _events = cx.update(|cx| {
@@ -4908,8 +4944,12 @@ mod tests {
         assert_eq!(events.take(), vec![landed("main"), moved("main", "c9")]);
 
         // Parked (its window shows another graph), the session asks nothing at the polls, nor
-        // when the window becomes active; shown again, it asks at once.
+        // when the window becomes active, and lets go of its watch on the server, whose health
+        // is then checked for no one; shown again, it asks at once, and watches again.
+        let watched = |cx: &mut TestAppContext| connection.read_with(cx, |c, _| c.watched());
+        assert!(watched(cx), "a shown graph watches its server");
         session.update(cx, |session, cx| session.set_shown(false, cx));
+        assert!(!watched(cx), "parked, it holds no watch");
         heads.lock().unwrap().insert("main".into(), "c10".into());
         for _ in 0..2 {
             cx.executor().advance_clock(HEAD_POLL);
@@ -4923,6 +4963,7 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(*probes.lock().unwrap(), vec!["main"]);
         assert_eq!(head_of(cx, "main").as_deref(), Some("c10"));
+        assert!(watched(cx), "shown again, it watches again");
     }
 
     /// The stored-query catalog is read with the graph, and a server without one has an empty
@@ -5609,19 +5650,25 @@ mod tests {
     }
 
     /// What the credential may do is read for the session's branch when it opens and moves
-    /// there, once per branch, and again after the server refuses a write with 403.
+    /// there, once per branch, and again after the server refuses a write with 403. A 403 on
+    /// one graph says nothing of another on the server: a session of the other keeps its
+    /// answer, and asks nothing again.
     #[gpui::test]
     async fn access_is_read_per_branch_and_again_after_a_refusal(cx: &mut TestAppContext) {
         use crate::access::{AccessScope, Allowed};
         use graph_client::api::AccessAction;
         use serde_json::json;
+        use std::sync::atomic::AtomicUsize;
 
         let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
-        let seen = asked.clone();
+        let notes_asked = Arc::new(AtomicUsize::new(0));
+        let (seen, notes_seen) = (asked.clone(), notes_asked.clone());
         let http = FakeHttpClient::create(move |request| {
             let path = request.uri().path().to_owned();
             let query = request.uri().query().unwrap_or_default().to_owned();
-            if path.ends_with("/access") {
+            if path.ends_with("/graphs/notes/access") {
+                notes_seen.fetch_add(1, Ordering::SeqCst);
+            } else if path.ends_with("/access") {
                 seen.lock().unwrap().push(query.clone());
             }
             let create = request.method().as_str() == "POST" && path.ends_with("/branches");
@@ -5660,11 +5707,14 @@ mod tests {
             known_graphs: Vec::new(),
         };
         let connection = cx.new(|_| Connection::new(server, Some("t".into()), http).unwrap());
-        let session =
-            cx.new(|cx| GraphSession::new(connection, "knowledge".into(), "main".into(), cx));
+        let session = cx
+            .new(|cx| GraphSession::new(connection.clone(), "knowledge".into(), "main".into(), cx));
+        // Another graph of the server, on the same connection, in another window.
+        let notes = cx.new(|cx| GraphSession::new(connection, "notes".into(), "main".into(), cx));
         cx.run_until_parked();
         let taken = || std::mem::take(&mut *asked.lock().unwrap());
         assert_eq!(taken(), ["branch=main"]);
+        assert_eq!(notes_asked.load(Ordering::SeqCst), 1);
         session.read_with(cx, |session, _| {
             assert_eq!(session.allows_here(AccessAction::Change), Allowed::No);
             assert_eq!(session.allows_here(AccessAction::Read), Allowed::Yes);
@@ -5695,12 +5745,23 @@ mod tests {
                 "fix's answer was forgotten"
             );
         });
+        // notes' answer stands: asked for again, it is the one held.
+        notes.update(cx, |notes, cx| {
+            notes.read_access(AccessScope::branch("main"), cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(notes_asked.load(Ordering::SeqCst), 1, "notes asked nothing");
+        notes.read_with(cx, |notes, _| {
+            assert_eq!(notes.allows_here(AccessAction::Read), Allowed::Yes);
+        });
     }
 
     /// A new token is a new credential: what the old one was allowed is read again at once,
     /// with no write to bring it about, an access answer still out from before lands nowhere,
-    /// and no answer kept from the old token is given again, since the new one may see less. A
-    /// 403 alone reads what the credential may do again and keeps the answers.
+    /// and no answer kept from the old token is given again, since the new one may see less:
+    /// the type counts, the stored-query catalog and the branch list are read again, and none
+    /// of the old token's shows meanwhile. A 403 alone reads what the credential may do again
+    /// and keeps the answers.
     #[gpui::test]
     async fn a_new_token_reads_access_and_every_answer_again(cx: &mut TestAppContext) {
         use futures::AsyncReadExt as _;
@@ -5711,13 +5772,21 @@ mod tests {
         use graph_client::api::AccessAction;
 
         // The next access read waits here, once a gate is set; reads other than the head probe
-        // are counted.
+        // are counted, and the graph's counts, catalog and branch list asked for are listed.
         let gate: Arc<std::sync::Mutex<Option<oneshot::Receiver<()>>>> = Arc::default();
         let reads = Arc::new(AtomicUsize::new(0));
         let accesses = Arc::new(AtomicUsize::new(0));
-        let (held, counted, asked) = (gate.clone(), reads.clone(), accesses.clone());
+        let shown: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let (held, counted, asked, listed) =
+            (gate.clone(), reads.clone(), accesses.clone(), shown.clone());
         let http = FakeHttpClient::create(move |request| {
             let path = request.uri().path().to_owned();
+            if let Some(read) = ["/snapshot", "/queries", "/branches"]
+                .iter()
+                .find(|read| path.ends_with(*read))
+            {
+                listed.lock().unwrap().push((*read).to_owned());
+            }
             let token = request
                 .headers()
                 .get("authorization")
@@ -5766,6 +5835,14 @@ mod tests {
                         403,
                         json!({ "error": "policy denied", "code": "forbidden" }),
                     )
+                } else if path.ends_with("/snapshot") {
+                    let body = json!({ "graph_branch": "main", "graph_manifest_version": 3,
+                        "internal_schema_version": 16, "datasets": [{ "entity_kind": "node",
+                        "type_name": "Person", "dataset_path": "nodes/1",
+                        "published_dataset_version": 2, "entity_count": 7 }] });
+                    (200, body)
+                } else if path.ends_with("/queries") {
+                    (200, json!({ "queries": [] }))
                 } else {
                     (200, json!({ "branches": ["main"] }))
                 };
@@ -5825,10 +5902,29 @@ mod tests {
         };
         assert_eq!(read_at_c1(cx), 1);
         assert_eq!(read_at_c1(cx), 0, "kept");
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.count_of(EntityKind::Node, "Person"), Some(7));
+            assert!(matches!(session.branches, Loadable::Loaded(_)));
+            assert!(matches!(session.stored_queries, Loadable::Loaded(_)));
+        });
+        shown.lock().unwrap().clear();
         connection.update(cx, |connection, cx| {
             connection.set_token(Some("ro".into()), cx)
         });
+        // Until the new token's answers land, none of the old token's shows.
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.count_of(EntityKind::Node, "Person"), None);
+            assert!(session.branches.is_loading());
+            assert!(session.stored_queries.is_loading());
+        });
         cx.run_until_parked();
+        let mut asked_again = shown.lock().unwrap().clone();
+        asked_again.sort();
+        assert_eq!(asked_again, ["/branches", "/queries", "/snapshot"]);
+        session.read_with(cx, |session, _| {
+            assert_eq!(session.count_of(EntityKind::Node, "Person"), Some(7));
+            assert!(matches!(session.branches, Loadable::Loaded(_)));
+        });
         assert_eq!(change(cx), Allowed::No, "the narrower token's own answer");
         assert_eq!(read_at_c1(cx), 1, "asked again with the new token");
 

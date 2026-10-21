@@ -3,6 +3,7 @@
 //! Reads return `Result<T, ReadError>`. Writes return a [`WriteOutcome`] and are never retried
 //! here (constitution III).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -285,6 +286,33 @@ fn check_root(url: &Url) -> Result<(), String> {
     Ok(())
 }
 
+/// A path segment with its `%XX` escapes read, as the server reads a graph id from it: the
+/// client escapes each segment it sends, and a forwarded request names its graph as its sender
+/// wrote it, escaped or not. A `%` not followed by two hex digits stays as it is.
+fn decode_segment(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let escaped = bytes
+            .get(at + 1..at + 3)
+            .filter(|hex| bytes[at] == b'%' && hex.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escaped {
+            Some(byte) => {
+                decoded.push(byte);
+                at += 3;
+            }
+            None => {
+                decoded.push(bytes[at]);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
 /// Where a change-feed read starts: `now`, `beginning` or `after:<commit_id>`; a cursor a
 /// terminal page returned; or a page token, to continue one read.
 #[derive(Debug, Clone, Copy)]
@@ -305,10 +333,10 @@ pub struct GraphClient {
     /// Shared by every clone, so the bound holds for the whole connection.
     read_slots: Arc<smol::lock::Semaphore>,
     /// How often the token was replaced by another ([`Self::credential_changes`]), and how often
-    /// the server refused a request on one of its graphs with 403 ([`Self::refusals`]). Shared
-    /// by every clone.
+    /// the server refused a request on each of its graphs with 403, by graph id
+    /// ([`Self::refusals`]). Shared by every clone.
     credential_changes: Arc<std::sync::atomic::AtomicU64>,
-    refusals: Arc<std::sync::atomic::AtomicU64>,
+    refusals: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
 impl std::fmt::Debug for GraphClient {
@@ -367,27 +395,41 @@ impl GraphClient {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// A count that moves whenever the server refuses a request on one of its graphs with 403:
-    /// the graph's policy may have changed, so what the credential may do there is to be read
-    /// again. A 403 from the server's own routes is not counted: listing or discovering its
+    /// A count that moves whenever the server refuses a request on graph `graph` with 403: the
+    /// graph's policy may have changed, so what the credential may do there is to be read
+    /// again. A refusal on another graph of the server says nothing of this one, whose answers
+    /// stand. A 403 from the server's own routes is not counted: listing or discovering its
     /// graphs is a server action most tokens may not take, and says nothing about a graph.
-    pub fn refusals(&self) -> u64 {
-        self.refusals.load(std::sync::atomic::Ordering::SeqCst)
+    pub fn refusals(&self, graph: &str) -> u64 {
+        self.refusals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(graph)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Counts a response's 403 to a request on a graph (`graphs/{id}/…` under the root) when
-    /// the server sent it (it carries the contract header).
+    /// the server sent it (it carries the contract header), against the graph its path names.
     fn note_refusal(&self, url: &Url, status: StatusCode, headers: &HeaderMap) {
         if status != StatusCode::FORBIDDEN || !headers.contains_key(CONTRACT_HEADER) {
             return;
         }
         let below = url.path().strip_prefix(self.base.path()).unwrap_or("");
         let mut segments = below.split('/');
-        let on_graph = segments.next() == Some("graphs") && segments.nth(1).is_some();
-        if on_graph {
-            self.refusals
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if segments.next() != Some("graphs") {
+            return;
         }
+        // The id, then at least one segment of a graph's route under it.
+        let (Some(id), Some(_)) = (segments.next(), segments.next()) else {
+            return;
+        };
+        *self
+            .refusals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(decode_segment(id))
+            .or_default() += 1;
     }
 
     /// Replaces the token for this client and every clone of it; requests sent after this use
@@ -1513,12 +1555,13 @@ mod tests {
     const CHANGE: &str =
         r#"{"branch":"main","query_name":"u","affected_nodes":1,"affected_edges":0,"commit":null}"#;
 
-    /// A 403 on a graph's route counts as a refusal on every clone, read or write, from the
-    /// gateway too; one on the server's own routes (listing and discovering graphs, which most
-    /// tokens may not), or one without the contract header, does not. Neither moves the
-    /// credential count.
+    /// A 403 on a graph's route counts as a refusal of that graph on every clone, read or
+    /// write, from the gateway too, by the id its path names, escaped or not; one on another
+    /// graph does not count for it. One on the server's own routes (listing and discovering
+    /// graphs, which most tokens may not), or one without the contract header, does not count.
+    /// Neither moves the credential count.
     #[test]
-    fn a_refusal_on_a_graph_is_counted_and_one_on_the_server_is_not() {
+    fn a_refusal_on_a_graph_is_counted_for_that_graph_alone() {
         let held = GraphClient::new(
             "http://127.0.0.1:8787/og",
             Some("t".into()),
@@ -1540,12 +1583,19 @@ mod tests {
         block_on(held.graphs()).ok();
         block_on(held.discover_graphs()).ok();
         block_on(held.schema("plain")).ok();
-        assert_eq!(
-            held.refusals(),
-            0,
-            "the server's own routes, and a 403 from elsewhere"
-        );
+        for graph in ["plain", "discovery", "knowledge"] {
+            assert_eq!(
+                held.refusals(graph),
+                0,
+                "the server's own routes, and a 403 from elsewhere"
+            );
+        }
         block_on(held.schema("discovery")).ok();
+        assert_eq!(
+            held.refusals("discovery"),
+            1,
+            "a graph named like a route counts"
+        );
         let change = ChangeRequest {
             query: "query q() {}".into(),
             name: None,
@@ -1560,12 +1610,30 @@ mod tests {
             body: AsyncBody::empty(),
         }))
         .unwrap();
-        assert_eq!(
-            gateway.refusals(),
-            3,
-            "a graph named like a route counts too"
-        );
+        assert_eq!(gateway.refusals("knowledge"), 2, "a write and a forward");
+        assert_eq!(held.refusals("discovery"), 1, "another graph's refusals");
+        // An id the client escapes, and one a forwarded request escaped otherwise: one graph.
+        block_on(held.schema("a b")).ok();
+        block_on(gateway.forward(ForwardRequest {
+            method: Method::GET,
+            path_and_query: "graphs/a%20b/branches".into(),
+            headers: Vec::new(),
+            body: AsyncBody::empty(),
+        }))
+        .unwrap();
+        assert_eq!(held.refusals("a b"), 2);
+        assert_eq!(held.refusals("knowledge"), 2);
         assert_eq!(held.credential_changes(), 0);
+    }
+
+    /// A path segment reads as the server reads it: each escape decoded, anything else kept.
+    #[test]
+    fn a_path_segment_reads_its_escapes() {
+        assert_eq!(decode_segment("knowledge"), "knowledge");
+        assert_eq!(decode_segment("a%20b"), "a b");
+        assert_eq!(decode_segment("caf%C3%A9"), "café");
+        assert_eq!(decode_segment("100%"), "100%");
+        assert_eq!(decode_segment("%zz%4"), "%zz%4");
     }
 
     /// Every route the client calls is one the contract serves, with that method: each public

@@ -1265,13 +1265,15 @@ impl HistoryView {
 
     /// Reads change counts for drawn commits that have none yet: one page each, netted as the
     /// detail nets them. A commit with more changes than the page shows "N+". A commit's
-    /// changes never change, so an answer is kept for the life of the view.
+    /// changes never change, so an answer is kept for the life of the view. The graph's first
+    /// commit has no parent to compare with, so its changes are not asked for.
     fn load_row_counts(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
         let ids: Vec<String> = self
             .commits
             .get(range.start..range.end.min(self.commits.len()))
             .unwrap_or_default()
             .iter()
+            .filter(|commit| !crate::commit_view::is_first_commit(commit))
             .map(|commit| commit.graph_commit_id.clone())
             .filter(|id| !self.counts.contains_key(id) && !self.asked_counts.contains(id))
             .collect();
@@ -1390,6 +1392,7 @@ impl HistoryView {
                 let id = commit.graph_commit_id.clone();
                 let counts = self.counts.get(&id).copied();
                 let partial = self.partial_counts.contains(&id);
+                let first = crate::commit_view::is_first_commit(commit);
                 let heads = self.heads.get(&id).cloned().unwrap_or_default();
                 let selected = self.selected == Some(ix);
                 let actor = commit.actor_id.clone();
@@ -1429,6 +1432,14 @@ impl HistoryView {
                             .w(px(CHANGES_WIDTH))
                             .flex_none()
                             .overflow_hidden()
+                            // The first commit has nothing before it to count against.
+                            .when(first, |d| {
+                                d.child(
+                                    studio_ui::ds::text::meta("first commit")
+                                        .single_line()
+                                        .truncate(),
+                                )
+                            })
                             .children(counts.map(|(added, changed, removed)| {
                                 if added + changed + removed == 0 {
                                     studio_ui::ds::text::meta("no changes").into_any_element()
@@ -2201,6 +2212,45 @@ mod tests {
                 "branch=main&limit=200&page_token=m449_400",
             ]
         );
+    }
+
+    /// A drawn row's count is read from its commit's changes, except the graph's first commit:
+    /// it has no parent, the server cannot compare it with anything (a 409), and its row names
+    /// it instead of asking.
+    #[gpui::test]
+    async fn the_first_commits_changes_are_never_asked_for(cx: &mut TestAppContext) {
+        let (session, served) = serve(
+            Served {
+                branches: vec![("main".into(), chain("m", 3))],
+                ..Default::default()
+            },
+            cx,
+        );
+        let (view, cx) = open(&session, cx);
+        view.update(cx, |view, cx| view.load_row_counts(0..3, cx));
+        cx.run_until_parked();
+        let changes = |id: &str| {
+            let path = format!("/graphs/knowledge/commits/{id}/changes?");
+            served
+                .lock()
+                .unwrap()
+                .asked
+                .iter()
+                .filter(|asked| asked.starts_with(&path))
+                .count()
+        };
+        assert_eq!(
+            changes("m0"),
+            0,
+            "the first commit's changes were asked for"
+        );
+        assert!(changes("m1") > 0 && changes("m2") > 0);
+        view.read_with(cx, |view, _| {
+            assert!(view.counts.contains_key("m1") && view.counts.contains_key("m2"));
+            assert!(!view.counts.contains_key("m0"));
+            assert!(crate::commit_view::is_first_commit(&view.commits[2]));
+            assert!(!crate::commit_view::is_first_commit(&view.commits[1]));
+        });
     }
 
     /// A commit landing on the branch reads its first page again: the commits above the head

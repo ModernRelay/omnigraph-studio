@@ -150,6 +150,31 @@ pub struct KnownRelation {
     pub first: Option<Vec<Neighbour>>,
 }
 
+/// The Blob values a table shows of the row a peek is opened from: the commit where they hold
+/// ([`BlobsAt`], which the table's own Blob write may have moved past its pin), and each value
+/// its cell shows, by property. The peek shows the same, and binds its Blob writes the same way.
+#[derive(Debug, Clone, Default)]
+pub struct TableBlobs {
+    pub at: BlobsAt,
+    pub shown: HashMap<String, BlobMeta>,
+}
+
+/// One of the table's own writes, as the peek of one of its rows hears it
+/// ([`NodePeek::table_wrote`]).
+#[derive(Debug, Clone)]
+pub(crate) struct TableWrote {
+    /// The commit it landed at, and the one it was made on.
+    pub commit: String,
+    pub parent: Option<String>,
+    /// What it wrote to the peek's row: property values, and a Blob value with its metadata.
+    pub values: Vec<(String, Value)>,
+    pub blob: Option<(String, BlobMeta)>,
+    /// The other rows of `type_name` whose values it changed, which the peek may show among a
+    /// group's neighbours by their old name.
+    pub type_name: String,
+    pub touched: HashSet<String>,
+}
+
 struct Group {
     group: RelationshipGroup,
     count: Loadable<i64>,
@@ -378,8 +403,36 @@ impl NodePeek {
         debounce: bool,
         cx: &mut Context<Self>,
     ) -> Self {
+        let blobs = TableBlobs::default();
         Self::build(
-            session, subject, values, snapshot, known, debounce, false, cx,
+            session, subject, values, snapshot, known, blobs, debounce, false, cx,
+        )
+    }
+
+    /// [`Self::new`] for a row a table shows: its Blob values are where the table's hold
+    /// (`blobs`), which may be past `snapshot` after the table's own Blob write, and each one
+    /// the table read is shown as its cell shows it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_table(
+        session: Entity<GraphSession>,
+        subject: PeekSubject,
+        values: Map<String, Value>,
+        snapshot: Option<String>,
+        known: HashMap<String, KnownRelation>,
+        blobs: TableBlobs,
+        debounce: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(
+            session,
+            subject,
+            Some(values),
+            snapshot,
+            known,
+            blobs,
+            debounce,
+            false,
+            cx,
         )
     }
 
@@ -399,6 +452,7 @@ impl NodePeek {
             None,
             at_commit,
             HashMap::new(),
+            TableBlobs::default(),
             false,
             true,
             cx,
@@ -416,6 +470,7 @@ impl NodePeek {
         values: Option<Map<String, Value>>,
         snapshot: Option<String>,
         known: HashMap<String, KnownRelation>,
+        blobs: TableBlobs,
         debounce: bool,
         page: bool,
         cx: &mut Context<Self>,
@@ -530,7 +585,7 @@ impl NodePeek {
             edits: HashMap::new(),
             saving: HashSet::new(),
             saving_elsewhere: HashSet::new(),
-            blobs_at: BlobsAt::Pin,
+            blobs_at: blobs.at,
             adding: None,
             removing: None,
             edge_writes: HashSet::new(),
@@ -569,7 +624,7 @@ impl NodePeek {
                 this.note_shown(depends, None, cx);
                 this.values = Loadable::Loaded(values);
                 this.load_groups(cx);
-                this.load_blobs(debounce, cx);
+                this.load_blobs(debounce, blobs.shown, cx);
             }
             None => this.load_node(cx),
         }
@@ -809,7 +864,7 @@ impl NodePeek {
                     Some(values) => {
                         self.values = Loadable::Loaded(values);
                         self.load_groups(cx);
-                        self.load_blobs(false, cx);
+                        self.load_blobs(false, HashMap::new(), cx);
                     }
                     None => {
                         self.values =
@@ -965,25 +1020,58 @@ impl NodePeek {
         cx.notify();
     }
 
-    /// A save of the table this peek was opened from landed at `commit`, made on `parent`,
-    /// writing `values` to the node: the view follows it as it follows its own writes, showing
-    /// the values at that commit, or is behind when another writer's commit came between.
-    pub(crate) fn table_saved(
-        &mut self,
-        values: Vec<(String, Value)>,
-        commit: &str,
-        parent: Option<&str>,
-        cx: &mut Context<Self>,
-    ) {
+    /// A write of the table this peek was opened from landed ([`TableWrote`]): the view follows
+    /// it as it follows its own writes, showing what it wrote to the node at that commit, or is
+    /// behind when another writer's commit came between. It is behind too when it shows one of
+    /// the other rows the write changed among a group's neighbours, whose name it would show as
+    /// it was.
+    pub(crate) fn table_wrote(&mut self, wrote: TableWrote, cx: &mut Context<Self>) {
         if self.holds_commit || self.values.loaded().is_none() {
             return;
         }
-        if self.follow_own_commit(parent, commit) {
-            for (name, value) in values {
+        if self.shows_neighbour(&wrote.type_name, &wrote.touched) {
+            self.newer = true;
+            cx.notify();
+            return;
+        }
+        // A head compared as it landed may have moved the view there already, nothing it reads
+        // having changed.
+        let followed = self.snapshot.as_deref() == Some(wrote.commit.as_str())
+            || self.follow_own_commit(wrote.parent.as_deref(), &wrote.commit);
+        if followed {
+            for (name, value) in wrote.values {
                 self.restore(&name, value);
+            }
+            if let Some((property, meta)) = wrote.blob
+                && let Some(index) = self.blobs.iter().position(|slot| slot.property == property)
+            {
+                if let Loadable::Loaded(Preview::Image(image)) = &self.blobs[index].preview {
+                    image.release(cx);
+                }
+                self.blobs[index].preview = Loadable::NotLoaded;
+                self.blobs[index].head.clear();
+                self.read_blob(index, false, Some(meta), cx);
+            }
+            // The head the session saw land may be this commit, compared before it was told
+            // of; with nothing else out, it is compared again now.
+            if !self.writes_out() {
+                self.compare_head(cx);
             }
         }
         cx.notify();
+    }
+
+    /// Whether a relationship group shows one of `ids`, nodes of `type_name`, among the
+    /// neighbours it read.
+    fn shows_neighbour(&self, type_name: &str, ids: &HashSet<String>) -> bool {
+        !ids.is_empty()
+            && self.groups.iter().any(|group| {
+                group.group.other_type == type_name
+                    && group
+                        .neighbours
+                        .loaded()
+                        .is_some_and(|shown| shown.iter().any(|n| ids.contains(&n.id)))
+            })
     }
 
     /// Frees the images this peek decoded; GPUI would keep them otherwise.
@@ -996,8 +1084,15 @@ impl NodePeek {
     }
 
     /// Reads each Blob property's metadata, then enough of a managed value to preview it: its
-    /// first bytes, or the whole of an image that fits. Pinned to the peek's commit.
-    fn load_blobs(&mut self, debounce: bool, cx: &mut Context<Self>) {
+    /// first bytes, or the whole of an image that fits. Pinned to the peek's commit, or where
+    /// its values hold ([`Self::read_blob`]); a property's value in `shown` (what the table it
+    /// was opened from shows) is taken as it is.
+    fn load_blobs(
+        &mut self,
+        debounce: bool,
+        mut shown: HashMap<String, BlobMeta>,
+        cx: &mut Context<Self>,
+    ) {
         self.release_images(cx);
         // A value being saved to a file goes on, shown on its property's new slot; one whose
         // property the view no longer lists still lands in its file. A file being stored in it
@@ -1034,7 +1129,8 @@ impl NodePeek {
             }
         }
         for index in 0..self.blobs.len() {
-            self.read_blob(index, debounce, None, cx);
+            let known = shown.remove(&self.blobs[index].property);
+            self.read_blob(index, debounce, known, cx);
         }
     }
 
@@ -1048,9 +1144,12 @@ impl NodePeek {
         }
     }
 
-    /// Reads what slot `index` holds at the peek's commit, then enough of a managed value to
-    /// preview it; `known` is what it holds there already (a write's own receipt), which is not
-    /// read again.
+    /// Reads what slot `index` holds where the values the view shows hold ([`BlobsAt`]: its
+    /// commit, or its own past it), then enough of a managed value to preview it; `known` is
+    /// what it holds there already (a write's receipt, or what the table it was opened from
+    /// shows), which is not read again. Where they hold at no commit the view knows, a value is
+    /// read at the view's commit, as a table reads a cell, and a known one is shown without a
+    /// preview, since no commit is known to hold its bytes.
     fn read_blob(
         &mut self,
         index: usize,
@@ -1063,7 +1162,21 @@ impl NodePeek {
         };
         let cell = self.blob_cell(&slot.property);
         let session = self.session.downgrade();
-        let snapshot = self.snapshot.clone();
+        let held_at = self
+            .blobs_at
+            .commit(self.snapshot.as_deref())
+            .map(str::to_owned);
+        let unknown = self.blobs_at == BlobsAt::Unknown;
+        let snapshot = if unknown {
+            self.snapshot.clone()
+        } else {
+            held_at.clone()
+        };
+        let preview_at = match (&known, unknown) {
+            (Some(_), true) => None,
+            (Some(_), false) => Some(held_at),
+            (None, _) => Some(snapshot.clone()),
+        };
         let scope = self.scope.clone();
         self.blobs[index]._task = Some(cx.spawn(async move |this, cx| {
             if debounce {
@@ -1083,10 +1196,11 @@ impl NodePeek {
                     read.await
                 }
             };
-            let size = match &meta {
-                Ok(BlobMeta::Managed { size, .. }) => Some(*size),
+            let size = match (&meta, &preview_at) {
+                (Ok(BlobMeta::Managed { size, .. }), Some(_)) => Some(*size),
                 _ => None,
             };
+            let snapshot = preview_at.flatten();
             this.update(cx, |this, cx| {
                 this.blobs[index].meta = match meta {
                     Ok(meta) => Loadable::Loaded(meta),
@@ -1618,17 +1732,22 @@ impl NodePeek {
             .into_any_element()
     }
 
-    /// Opening slot `property`'s value in a tab of its own: read at the view's commit, so it
-    /// shows what the slot shows, and held there, read-only, only when the view holds that
-    /// commit; a view at the branch head opens one that writes on its branch, bound to the
-    /// value read at that commit.
+    /// Opening slot `property`'s value in a tab of its own: read where the values the slots
+    /// show hold ([`BlobsAt`]: the view's commit, or past it the view's own commit after its own
+    /// Blob write over another writer's), so it shows what the slot shows, and held there,
+    /// read-only, only when the view holds its commit; a view at the branch head opens one that
+    /// writes on its branch, bound to the value read at that commit. Where they hold at no
+    /// commit the view knows, the tab reads the branch head, and binds to what it shows.
     fn open_blob_action(&self, property: &str) -> OpenBlob {
         OpenBlob {
             type_name: self.subject.type_name().to_owned(),
             id: self.subject.id().to_owned(),
             property: property.to_owned(),
             edge: matches!(self.subject, PeekSubject::Edge { .. }),
-            at_commit: self.snapshot.clone(),
+            at_commit: self
+                .blobs_at
+                .commit(self.snapshot.as_deref())
+                .map(str::to_owned),
             held: self.holds_commit,
         }
     }
@@ -4816,6 +4935,20 @@ impl NodePeek {
     pub(crate) fn reads_at(&self) -> Option<&str> {
         self.snapshot.as_deref()
     }
+
+    /// The size of the managed value slot `property` shows, once its value is in.
+    pub(crate) fn blob_size(&self, property: &str) -> Option<u64> {
+        let slot = self.blobs.iter().find(|slot| slot.property == property)?;
+        match slot.meta.loaded()? {
+            BlobMeta::Managed { size, .. } => Some(*size),
+            _ => None,
+        }
+    }
+
+    /// The commit the Blob values the view shows hold at ([`BlobsAt`]).
+    pub(crate) fn blobs_held_at(&self) -> Option<&str> {
+        self.blobs_at.commit(self.snapshot.as_deref())
+    }
 }
 
 #[cfg(test)]
@@ -5024,6 +5157,18 @@ mod tests {
         let file = crate::test_support::upload_file("doc.txt", b"new doc", None);
         view.update(cx, |view, cx| view.upload_blob("doc", file, cx));
         cx.run_until_parked();
+        // The slots hold at the write's commit now, not at the view's: a tab opened from one
+        // reads there, so it shows the value written and binds to it.
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.blobs_at, BlobsAt::Own("c2".into()));
+            let open = view.open_blob_action("doc");
+            assert_eq!(
+                open.at_commit.as_deref(),
+                Some("c2"),
+                "not the replaced value"
+            );
+            assert!(!open.held);
+        });
         let scan_now = blobs.get("Person/p1/scan").unwrap().1;
         let file = crate::test_support::upload_file("scan.txt", b"new scan", None);
         view.update(cx, |view, cx| view.upload_blob("scan", file, cx));
@@ -5170,6 +5315,27 @@ mod tests {
             1,
             "a count only past the page: {asked:?}"
         );
+
+        // A write of its table to other rows: one it shows among its neighbours would show by
+        // its old name at the new commit, so the view stays behind; one it does not show moves
+        // it on.
+        let pin = view.read_with(cx, |view, _| view.reads_at().map(str::to_owned));
+        let wrote = |touched: &str, commit: &str| TableWrote {
+            commit: commit.to_owned(),
+            parent: pin.clone(),
+            values: Vec::new(),
+            blob: None,
+            type_name: "Person".into(),
+            touched: HashSet::from([touched.to_owned()]),
+        };
+        view.update(cx, |view, cx| view.table_wrote(wrote("p010", "c2"), cx));
+        view.read_with(cx, |view, _| {
+            assert!(view.is_newer(), "a neighbour shown was written");
+            assert_eq!(view.reads_at(), pin.as_deref());
+        });
+        view.update(cx, |view, _| view.newer = false);
+        view.update(cx, |view, cx| view.table_wrote(wrote("p999", "c2"), cx));
+        view.read_with(cx, |view, _| assert_eq!(view.reads_at(), Some("c2")));
     }
 
     /// A type with many relationships reads only the groups whose rows are drawn, and a few

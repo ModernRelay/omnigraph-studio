@@ -14,7 +14,6 @@ mod entity_groups;
 mod exploration;
 pub mod fixes;
 mod memo;
-pub mod named_keys;
 mod refusal;
 mod registry;
 pub mod scope;

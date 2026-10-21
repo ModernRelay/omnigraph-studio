@@ -264,6 +264,16 @@ impl NeighbourList {
     }
 }
 
+/// What the commit an answer names does to it ([`Exploration::pinned_at`]).
+enum Pinned {
+    /// At the pin, or the first answer, which pins the exploration: it is taken.
+    Taken,
+    /// Read at the head before the pin and answered elsewhere: it is read again at the pin.
+    Again,
+    /// Read at the pin and answered at another commit: a failure, which says so.
+    Elsewhere(String),
+}
+
 /// Something the exploration reads.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LoadTarget {
@@ -1643,11 +1653,11 @@ impl Exploration {
                         &key.node.type_name,
                         &key.group,
                         &key.node.id,
-                        snapshot,
+                        snapshot.clone(),
                         cx,
                     )
                 });
-                self.spawn_count(target.clone(), count, cx);
+                self.spawn_count(target.clone(), count, snapshot, cx);
                 return;
             }
             LoadTarget::Page(key) => {
@@ -1801,11 +1811,16 @@ impl Exploration {
         self.tasks.insert(target, task);
     }
 
-    /// Waits for a count the session reads together with the others asked for this turn.
+    /// Waits for a count the session reads together with the others asked for this turn, read
+    /// at `sent_at` (the head when `None`). Its commit is checked as every answer's is
+    /// ([`Self::pinned_at`]): the first answer pins the exploration, one read at the head
+    /// before the pin and answered at another commit is read again at the pin, and one read at
+    /// the pin that names another commit is a failure.
     fn spawn_count(
         &mut self,
         target: LoadTarget,
-        count: Task<Result<u64, String>>,
+        count: Task<Result<(u64, Option<String>), String>>,
+        sent_at: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let generation = self.generation;
@@ -1816,18 +1831,57 @@ impl Exploration {
                 if this.generation != generation {
                     return;
                 }
+                let unpinned = this.pin.is_none();
                 match (&key, count) {
-                    (LoadTarget::Count(group), Ok(count)) => {
-                        this.state.apply_count(group.clone(), count)
+                    (LoadTarget::Count(group), Ok((count, commit))) => {
+                        match this.pinned_at(&key, commit.as_deref(), sent_at.as_deref(), cx) {
+                            Pinned::Taken => this.state.apply_count(group.clone(), count),
+                            Pinned::Again => return,
+                            Pinned::Elsewhere(message) => this.apply_failure(&key, message),
+                        }
                     }
                     (_, Ok(_)) => {}
                     (_, Err(message)) => this.apply_failure(&key, message),
                 }
                 this.loaded(&key, cx);
+                // A count that pinned the exploration: a head seen move meanwhile is compared
+                // now, as after the first read.
+                if unpinned && this.pin.is_some() {
+                    this.compare_head(cx);
+                }
             })
             .ok();
         });
         self.tasks.insert(target, task);
+    }
+
+    /// Takes the commit an answer to `target` names, read at `sent_at` (the head when `None`):
+    /// the first answer pins the exploration, and every later one must be at the pin.
+    fn pinned_at(
+        &mut self,
+        target: &LoadTarget,
+        commit: Option<&str>,
+        sent_at: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Pinned {
+        match (&self.pin, commit) {
+            (None, commit) => {
+                self.pin = commit.map(str::to_owned);
+                Pinned::Taken
+            }
+            (Some(pin), Some(commit)) if pin != commit => {
+                if sent_at.is_none() {
+                    self.start(target.clone(), cx);
+                    return Pinned::Again;
+                }
+                Pinned::Elsewhere(format!(
+                    "The server answered at commit {}, not at {}, which the exploration shows.",
+                    studio_ui::short_commit_id(commit),
+                    studio_ui::short_commit_id(pin)
+                ))
+            }
+            _ => Pinned::Taken,
+        }
     }
 
     /// After an answer: reads what it made visible, and redraws when it shows.
@@ -1871,24 +1925,13 @@ impl Exploration {
                 return true;
             }
         };
-        match (&self.pin, &output.graph_commit_id) {
-            (None, commit) => self.pin = commit.clone(),
-            (Some(pin), Some(commit)) if pin != commit => {
-                if sent_at.is_none() {
-                    self.start(target.clone(), cx);
-                    return false;
-                }
-                self.apply_failure(
-                    target,
-                    format!(
-                        "The server answered at commit {}, not at {}, which the exploration shows.",
-                        studio_ui::short_commit_id(commit),
-                        studio_ui::short_commit_id(pin)
-                    ),
-                );
+        match self.pinned_at(target, output.graph_commit_id.as_deref(), sent_at, cx) {
+            Pinned::Taken => {}
+            Pinned::Again => return false,
+            Pinned::Elsewhere(message) => {
+                self.apply_failure(target, message);
                 return true;
             }
-            _ => {}
         }
         match target {
             LoadTarget::Root => self.state.apply_root(&output),
@@ -2634,6 +2677,42 @@ mod tests {
         });
         assert!(taken_now);
         assert!(matches!(list(cx), (PageStatus::Failed(_), 0)));
+
+        // A count is held to the pin as every other answer is: read at the head before the pin
+        // and answered at another commit, it is read again at the pin; read at the pin and
+        // naming another commit, it fails. Neither shows the other commit's count.
+        let count = LoadTarget::Count(key.clone());
+        let counted = |cx: &mut gpui::TestAppContext| {
+            exploration.read_with(cx, |exploration, _| {
+                exploration.state().counts.get(&key).cloned()
+            })
+        };
+        let at_c3 = || Task::ready(Ok((9, Some("c3".to_owned()))));
+        exploration.update(cx, |exploration, cx| {
+            exploration.spawn_count(count.clone(), at_c3(), None, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            counted(cx),
+            Some(Loadable::Loaded(0)),
+            "read again at the pin"
+        );
+        assert!(taken().iter().all(|(_, at)| at.as_deref() == Some("c2")));
+        exploration.update(cx, |exploration, cx| {
+            exploration.spawn_count(count.clone(), at_c3(), Some("c2".into()), cx)
+        });
+        cx.run_until_parked();
+        assert!(matches!(counted(cx), Some(Loadable::Failed(_))));
+        // Unpinned (the root's read failed), the first count's commit is the pin, which every
+        // read after it is held to.
+        exploration.update(cx, |exploration, cx| {
+            exploration.pin = None;
+            exploration.spawn_count(count.clone(), at_c3(), None, cx)
+        });
+        cx.run_until_parked();
+        let pin = exploration.read_with(cx, |exploration, _| exploration.pin().map(str::to_owned));
+        assert_eq!(pin.as_deref(), Some("c3"));
+        assert_eq!(counted(cx), Some(Loadable::Loaded(9)));
     }
 
     /// Paths opened or closed together are one change: views draw them once, not once a path.

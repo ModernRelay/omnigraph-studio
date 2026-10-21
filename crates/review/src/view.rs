@@ -190,9 +190,10 @@ struct ReviewData {
     /// The target was merged into the branch since it forked: `fork` is that merge's base, and
     /// the changes are the net ones since it, without the target's own.
     merged_in: bool,
-    /// The fork lies past the commits read, [`FORK_BOUND`] of a history: `commits` are those
-    /// read, so their count and authors are not all known.
-    commits_capped: bool,
+    /// The fork lies past the commits read, [`FORK_BOUND`] of a history, and which history
+    /// stopped the read: `commits` are the branch's own read, so their count and authors are
+    /// not all known.
+    commits_capped: Option<Capped>,
 }
 
 /// A fix asked for on a card: sent once the fixes before it are back.
@@ -1417,7 +1418,7 @@ impl ReviewView {
         actors.dedup();
         // The commits read short of the fork are not all of them: their count and authors are
         // not said. One commit chosen is that one.
-        let commits = (self.scope.is_some() || !data.commits_capped)
+        let commits = (self.scope.is_some() || data.commits_capped.is_none())
             .then(|| in_scope.len().max(usize::from(self.scope.is_some())));
         summary_sentence(
             data.folded.entity_count(),
@@ -1823,7 +1824,11 @@ impl ReviewView {
                     .into_any_element(),
             );
         }
-        if let Some(note) = self.data.as_ref().and_then(capped_commits_note) {
+        if let Some(note) = self
+            .data
+            .as_ref()
+            .and_then(|data| capped_commits_note(data, &self.branch, &self.target))
+        {
             banners.push(
                 studio_ui::ds::banner(Severity::Info)
                     .child(studio_ui::ds::text::body(note))
@@ -2510,15 +2515,44 @@ fn unknown_merge_words(reason: &str, landed: Check, target: &str) -> String {
     }
 }
 
-/// What a review says when the fork lies past the history it read: that it read no further,
-/// and that the scope menu's One commit lists only the commits read.
-fn capped_commits_note(data: &ReviewData) -> Option<String> {
-    data.commits_capped.then(|| {
+/// What a review of `branch` into `target` says when the fork lies past the history it read:
+/// which history stopped it, that it read no further, and what the scope menu's One commit
+/// lists. Counts are of commits at or below the reviewed head, never of the commits the branch
+/// made after it, which the pages read too.
+fn capped_commits_note(data: &ReviewData, branch: &str, target: &str) -> Option<String> {
+    let commits = |n: usize| {
         format!(
-            "More than {} commits since the fork: Studio read no further, and One commit lists \
-             only those it read.",
-            group_digits(FORK_BOUND)
+            "{} commit{}",
+            group_digits(n),
+            if n == 1 { "" } else { "s" }
         )
+    };
+    Some(match data.commits_capped.as_ref()? {
+        Capped::Own { read: 0 } => format!(
+            "{branch} has more than {} commits since this review was read: Studio read no \
+             further. Refresh to review its head.",
+            group_digits(FORK_BOUND)
+        ),
+        Capped::Own { read } => format!(
+            "More than {} since the fork: Studio read no further, and One commit lists only \
+             those it read.",
+            commits(*read)
+        ),
+        Capped::Fork { made, target: true } => format!(
+            "The fork is past the newest {} of {target}'s history: Studio read no further, and \
+             One commit lists the {} made on {branch}.",
+            commits(FORK_BOUND),
+            commits(*made)
+        ),
+        Capped::Fork {
+            made,
+            target: false,
+        } => format!(
+            "The fork is more than {} down {branch}'s history: Studio read no further, and One \
+             commit lists the {} made on {branch}.",
+            commits(FORK_BOUND),
+            commits(*made)
+        ),
     })
 }
 
@@ -2623,7 +2657,7 @@ async fn read_review(
                 partial: false,
                 moved_while_reading: false,
                 merged_in: false,
-                commits_capped: false,
+                commits_capped: None,
             });
         }
         let start = format!("after:{fork}");
@@ -2710,7 +2744,7 @@ impl Fed {
             partial: self.partial,
             moved_while_reading: self.moved_while_reading,
             merged_in: false,
-            commits_capped: false,
+            commits_capped: None,
         }
     }
 }
@@ -2913,9 +2947,29 @@ struct Since {
     /// The target was merged into the branch since it forked: the merge base is off the
     /// branch's own chain.
     merged_in: bool,
-    /// The fork lies past the commits read: `commits` are those read, and `fork` the merge
-    /// base.
-    capped: bool,
+    /// The fork lies past the commits read: `commits` are the branch's own read, `fork` the
+    /// merge base, and this says which history stopped the read.
+    capped: Option<Capped>,
+}
+
+/// Which history a review stopped reading before it reached the fork, for the note that says
+/// so ([`capped_commits_note`]).
+#[derive(Debug, Clone, PartialEq)]
+enum Capped {
+    /// The branch's own pages ran out while its own commits went on: `read` of them were read at
+    /// or below the reviewed head (none when every page read was of commits made after it).
+    Own { read: usize },
+    /// Every commit the branch made since the reviewed head was read, `made` of them, and the
+    /// fork lies past what was read of a history: the target's (`target`), or the branch's own
+    /// below them.
+    Fork { made: usize, target: bool },
+}
+
+/// Whether `commit` is one the branch published: the server records each commit with the branch
+/// that wrote it (`None` for main), so a branch's chain holds its own commits, then those of the
+/// branch it forked from, which it shares with that branch.
+fn made_on(commit: &CommitOutput, branch: &str) -> bool {
+    commit.graph_branch.as_deref().unwrap_or("main") == branch
 }
 
 /// The branch's commits since it forked from `target`, newest first, with the fork, read a page
@@ -2926,8 +2980,10 @@ struct Since {
 /// chain naming `base` as its merged parent) has its merge base off its chain: its fork is the
 /// newest commit of its chain that the target's history holds, so the target's history is read
 /// too, a page after each of the branch's. So is it for a chain that ends without reaching
-/// `base`. A fork not reached within [`FORK_PAGES`] pages of each history leaves the commits
-/// read, `capped`, with `base` for the fork: the review says so rather than reading on.
+/// `base`. A fork not reached within [`FORK_PAGES`] pages of each history leaves `capped`, with
+/// `base` for the fork: the review says so rather than reading on, and its commits are the
+/// branch's own read, down to the first commit another branch published (the history it shares
+/// with the branch it forked from, which the pages go on into).
 async fn commits_since_fork(
     session: &Entity<GraphSession>,
     branch: &str,
@@ -2943,6 +2999,10 @@ async fn commits_since_fork(
     // The listing starts at the branch's head now: commits made after the reviewed head are
     // not the review's.
     let mut above_head = true;
+    // The chain's commits read, at or below the reviewed head, and how many of them the branch
+    // made before the first commit another branch published: known once that commit is read.
+    let mut chained = 0;
+    let mut made = None;
     while search.fork().is_none() {
         let mut read = false;
         if own.more() {
@@ -2957,6 +3017,10 @@ async fn commits_since_fork(
                     above_head = false;
                 }
                 merged_in |= commit.merged_parent_commit_id.as_deref() == Some(base);
+                if made.is_none() && !made_on(&commit, branch) {
+                    made = Some(chained);
+                }
+                chained += 1;
                 chain.push(commit);
             }
             search.branch_page(chain);
@@ -2974,16 +3038,30 @@ async fn commits_since_fork(
     }
     // Both histories read to their ends and sharing nothing is an answer; anything less is
     // the bound.
-    let capped = search.fork().is_none() && !(own.done && theirs.done);
+    let capped = (search.fork().is_none() && !(own.done && theirs.done)).then(|| match made {
+        // The branch's own commits went on past its pages.
+        None if !own.done => Capped::Own { read: chained },
+        made => Capped::Fork {
+            made: made.unwrap_or(chained),
+            target: theirs.read > 0 && !theirs.done,
+        },
+    });
     let fork = match search.fork() {
         Some(fork) => Some(fork.graph_commit_id.clone()),
-        None if capped => Some(base.to_owned()),
+        None if capped.is_some() => Some(base.to_owned()),
         None => None,
+    };
+    let since = search.since();
+    // Short of the fork, the pages go on into history shared with another branch: those
+    // commits are not the branch's.
+    let since = match (&capped, made) {
+        (Some(_), Some(made)) => &since[..made.min(since.len())],
+        _ => since,
     };
     Ok(Since {
         fork,
         head: head.to_owned(),
-        commits: search.since().iter().map(ReviewCommit::from).collect(),
+        commits: since.iter().map(ReviewCommit::from).collect(),
         merged_in,
         capped,
     })
@@ -3328,7 +3406,7 @@ pub(crate) mod tests {
             partial: false,
             moved_while_reading: false,
             merged_in: false,
-            commits_capped: false,
+            commits_capped: None,
         };
         let shown = |query: &str| {
             let matched = search_matches(&data.search, query);
@@ -4299,12 +4377,19 @@ pub(crate) mod tests {
         assert_eq!(lists.len(), 2, "a page of each: {asked:?}");
         assert!(lists[0].contains("branch=feature&limit=500"), "{asked:?}");
         assert!(lists[1].contains("branch=main&limit=500"), "{asked:?}");
-        assert!(!data.commits_capped);
+        assert_eq!(data.commits_capped, None);
     }
 
-    /// A commit as a listing has it: `id`, its parent and merged parent.
+    /// A commit as a listing has it: `id`, its parent and merged parent, and the branch that
+    /// published it as the server records it: `feature` for an `f…` id, `dev` for a `d…` one,
+    /// main (none) otherwise.
     fn listed(id: &str, parent: Option<&str>, merged: Option<&str>) -> Value {
-        json!({ "graph_commit_id": id, "graph_manifest_version": 1, "kind": "published", "created_at": 0, "parent_commit_id": parent, "merged_parent_commit_id": merged, "actor_id": "act-dev" })
+        let branch = match id.chars().next() {
+            Some('f') => Some("feature"),
+            Some('d') => Some("dev"),
+            _ => None,
+        };
+        json!({ "graph_commit_id": id, "graph_branch": branch, "graph_manifest_version": 1, "kind": "published", "created_at": 0, "parent_commit_id": parent, "merged_parent_commit_id": merged, "actor_id": "act-dev" })
     }
 
     /// A chain of `n` commits, newest first, `{prefix}{n-1}` down to `{prefix}0`, whose oldest
@@ -4359,7 +4444,23 @@ pub(crate) mod tests {
         Entity<GraphSession>,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
-        let head = feature[0]["graph_commit_id"].clone();
+        let head = feature[0]["graph_commit_id"].as_str().unwrap().to_owned();
+        paged_server_at(feature, main, base, &head, merged_in, cx)
+    }
+
+    /// [`paged_server`] whose merge base names `head` as `feature`'s head: the branch moved on
+    /// past it before its listing was read, which starts at the commits made since.
+    fn paged_server_at(
+        feature: Vec<Value>,
+        main: Vec<Value>,
+        base: &str,
+        head: &str,
+        merged_in: bool,
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<GraphSession>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         let merge_base = json!({ "merge_base": listed(base, None, None), "source": "feature", "source_commit_id": head, "target": "main", "target_commit_id": main[0]["graph_commit_id"] });
         let person = json!({ "kind": "node", "type": { "id": "Person", "name": "Person" }, "id": "p1", "op": "insert", "before": null, "after": { "properties": { "slug": "p1" } } });
         let refused = format!("start=after%3A{base}");
@@ -4415,10 +4516,13 @@ pub(crate) mod tests {
     }
 
     /// A fork past the history a review reads is not looked for in the whole lists: the review
-    /// shows the commits it read, says the fork is further back than it read, and names no
-    /// commit count. Past the branch's own pages (a review of one commit on a long branch), the
-    /// merge base the server names is the fork; past main's (a branch main was merged into,
-    /// whose fork is deep in main), the branch's commits read are all shown.
+    /// shows the branch's own commits it read, says which history it stopped reading, and
+    /// names no commit count. Past the branch's own pages (a review of one commit on a long
+    /// branch), the merge base the server names is the fork, and the count is of the commits at
+    /// or below the reviewed head, not of those the branch made after it; past main's (a branch
+    /// main was merged into, whose fork is deep in main), and past the branch's pages below its
+    /// own commits (a branch forked from another), the branch's own commits are shown, and
+    /// none of the history it shares with another branch.
     #[gpui::test]
     async fn a_fork_past_the_history_read_is_said_and_no_history_is_read_whole(
         cx: &mut gpui::TestAppContext,
@@ -4443,13 +4547,80 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(data.commits.len(), FORK_BOUND, "the commits read");
         assert_eq!(data.commits[0].id, "f10499", "newest first");
-        assert!(data.commits_capped && !data.merged_in);
+        assert_eq!(data.commits_capped, Some(Capped::Own { read: FORK_BOUND }));
+        assert!(!data.merged_in);
         assert_eq!(data.fork.as_deref(), Some("m0"), "the merge base");
         assert_eq!(
-            capped_commits_note(&data).as_deref(),
+            capped_commits_note(&data, "feature", "main").as_deref(),
             Some(
                 "More than 10,000 commits since the fork: Studio read no further, and One \
                  commit lists only those it read."
+            )
+        );
+        assert_eq!(listings(&asked, "feature"), FORK_PAGES);
+        assert_eq!(listings(&asked, "main"), 0);
+
+        // feature moved 300 commits past the reviewed head, f9899, before its listing was read:
+        // those 300 are read and skipped, so 9,700 of the pages' commits are the review's, and
+        // the branch has 9,900 since the fork, not more than 10,000.
+        let feature = chain_of("f", FORK_BOUND + 200, Some("m0"));
+        let (session, _) =
+            paged_server_at(feature, chain_of("m", 1, None), "m0", "f9899", false, cx);
+        let mut async_cx = cx.to_async();
+        let data = read_review(
+            session,
+            "feature".into(),
+            "main".into(),
+            Some("f9899".into()),
+            WeakEntity::new_invalid(),
+            &mut async_cx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(data.commits.len(), 9_700);
+        assert_eq!(data.commits[0].id, "f9899", "nothing made after the head");
+        assert_eq!(
+            capped_commits_note(&data, "feature", "main").as_deref(),
+            Some(
+                "More than 9,700 commits since the fork: Studio read no further, and One \
+                 commit lists only those it read."
+            )
+        );
+
+        // feature forked from dev, which has more commits than a review reads above main's m0:
+        // feature's two are listed, not dev's, and the note says feature's history stopped the
+        // read below them.
+        let mut feature = vec![
+            listed("f1", Some("f0"), None),
+            listed("f0", Some("d9999"), None),
+        ];
+        feature.extend(chain_of("d", FORK_BOUND, Some("m0")));
+        let (session, asked) = paged_server(feature, chain_of("m", 1, None), "m0", false, cx);
+        let mut async_cx = cx.to_async();
+        let data = read_review(
+            session,
+            "feature".into(),
+            "main".into(),
+            Some("f1".into()),
+            WeakEntity::new_invalid(),
+            &mut async_cx,
+        )
+        .await
+        .unwrap();
+        let commits: Vec<&str> = data.commits.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(commits, ["f1", "f0"], "dev's commits are not feature's");
+        assert_eq!(
+            data.commits_capped,
+            Some(Capped::Fork {
+                made: 2,
+                target: false
+            })
+        );
+        assert_eq!(
+            capped_commits_note(&data, "feature", "main").as_deref(),
+            Some(
+                "The fork is more than 10,000 commits down feature's history: Studio read no \
+                 further, and One commit lists the 2 commits made on feature."
             )
         );
         assert_eq!(listings(&asked, "feature"), FORK_PAGES);
@@ -4470,11 +4641,24 @@ pub(crate) mod tests {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             let data = view.data.as_ref().expect("read");
-            assert!(data.merged_in && data.commits_capped);
+            assert!(data.merged_in);
+            assert_eq!(
+                data.commits_capped,
+                Some(Capped::Fork {
+                    made: 3,
+                    target: true
+                })
+            );
             assert_eq!(data.fork.as_deref(), Some("m10500"));
             let commits: Vec<&str> = data.commits.iter().map(|c| c.id.as_str()).collect();
-            assert_eq!(commits, ["f2", "fm", "f1", "m0"], "every commit read");
-            assert!(capped_commits_note(data).is_some());
+            assert_eq!(commits, ["f2", "fm", "f1"], "main's m0 is not feature's");
+            assert_eq!(
+                capped_commits_note(data, "feature", "main").as_deref(),
+                Some(
+                    "The fork is past the newest 10,000 commits of main's history: Studio read \
+                     no further, and One commit lists the 3 commits made on feature."
+                )
+            );
             assert_eq!(view.summary, "1 entity changed", "no count, nobody");
         });
         assert_eq!(listings(&asked, "feature"), 1);

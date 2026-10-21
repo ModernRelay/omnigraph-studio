@@ -164,10 +164,17 @@ place), X (designed on 0.13; the better routes are deferred).
     chain, finds its commits since the fork from pages of both histories, read in turn: its
     first-parent chain down to its newest commit the target's pages hold, listed there or as a
     merged parent (`graph_store::ForkSearch`). No history is read whole: each is read at most
-    20 pages of 500. A fork past them shows the commits read, "More than 10,000 commits since
-    the fork: Studio read no further, and One commit lists only those it read.", and a
-    summary that names no commit count or author ("17 entities changed"). A lost merge
-    response reads the target's history a page at a time from its head, as far.
+    20 pages of 500. A fork past them shows the branch's own commits read, down to the first
+    one another branch published (`CommitOutput.graph_branch`, the branch that wrote it; the
+    pages go on into history it shares with the branch it forked from), and a note that says
+    which history stopped the read, counting only commits at or below the reviewed head (the
+    pages also hold those the branch made after it): "More than 9,700 commits since the fork:
+    …" when the branch's own commits go on past its pages; "The fork is past the newest 10,000
+    commits of main's history: Studio read no further, and One commit lists the 3 commits made
+    on feature." when the target's pages stopped it; "The fork is more than 10,000 commits down
+    feature's history: …" when the branch's pages, below its own commits, did (since
+    2026-10-21). The summary names no commit count or author ("17 entities changed"). A lost
+    merge response reads the target's history a page at a time from its head, as far.
   - E8 merge preview with no effects: merge on request and show the 409 conflicts until then.
   - E9 branch details: derived from `GET /commits?branch=` until then.
   - E21 a branch from a commit (`from_commit`, OmniGraph #1016): built 2026-10-20 (Design,
@@ -182,6 +189,7 @@ place), X (designed on 0.13; the better routes are deferred).
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A review short of the fork lists the branch's own commits and names the history that stopped it | `review` `a_fork_past_the_history_read_is_said_and_no_history_is_read_whole`, extended: fixtures name `graph_branch` as the server records it (`feature`, `dev`, none for main); a branch that moved 300 commits past the reviewed head; a branch forked from `dev`, whose 10,000 commits are past its pages; `graph_branch` at `7fd9cc9`: `GraphNamespacePublisher` and `GraphHeadExpectation` normalize main to `None`, `LineageIntent.branch` is the writing branch, `GET /commits?branch=` lists the first-parent chain (`commit_list_page`, `first_parent_page`) | Before, a branch main was merged into listed `["f2","fm","f1","m0"]`, main's m0 as the branch's, and every capped review said "More than 10,000 commits since the fork". Now `["f2","fm","f1"]` with "The fork is past the newest 10,000 commits of main's history: … the 3 commits made on feature."; the moved branch says "More than 9,700 commits" (9,900 since its fork, not 10,000); the `dev` fork lists `["f1","f0"]` and "The fork is more than 10,000 commits down feature's history: …". A fork reached is unchanged: its commits since it still include a parent branch's |
 | 2026-10-21 | A merge whose deletion was refused is logged as such | `graph_store` `a_merge_whose_deletion_was_refused_says_the_branch_stays` (a merge with deletion answered `branch_deleted: false` and `branch_delete_error_details`, then one answered `true`) | "Merge feature into main; feature was not deleted: feature is protected", the session still on feature; then "Merge feature into main and delete feature", the session on main. Before, both read "…and delete feature", the activity log and the toast saying a branch that stayed was deleted |
 | 2026-10-21 | Every write runs through one runner | `graph_store` `GraphSession::run_write` (count, send once, run to the outcome, log, follow-up) in place of six copies in `send_write`, `invoke_stored_write`, `send_blob_write`, `create_branch`, `delete_branch` and `merge`; the session, review, history, type table and query editor tests | All pass unchanged |
 | 2026-10-11 | Merge outcomes and conflict kinds in 0.13.0 | parsed `openapi.json` at `v0.13.0` | As listed |

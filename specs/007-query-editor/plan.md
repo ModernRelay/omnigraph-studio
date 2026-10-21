@@ -49,8 +49,8 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   Built: ⌘S saves a query tab to its file; a new query goes to the graph's queries folder
   (`<data dir>/queries/<graph key>/`, the graph's one key `<server url>/<graph id>` made safe,
   `http_~~127.0.0.1_8787~knowledge`; since 2026-10-20, before which the folder was the server's
-  name, `<server>~<graph>`, and opening the graph moves it once: renamed when the key has no
-  folder, else each file the key's folder lacks, never over one), named after its first declaration
+  name, `<server>~<graph>`, which Studio no longer reads: its files stay there, and ⌘O opens
+  one), named after its first declaration
   (`list_company.gq`, then `-2`, …). ⌘⇧S picks any path in the system dialog; ⌘O opens a file
   (or `studio_graph::OpenQueryFile { path }`). A file tab is titled by the file, keyed by its
   path so it opens once, and shows the changed dot while its text differs from the file; its
@@ -151,7 +151,11 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
   nothing of itself and says "The answer is over 32 MB, the most Studio reads at once. Add a
   `limit` to the query, or return fewer properties". F6 moves the keyboard to the result grid
   and back; ↑↓←→ move its cell, ⌘C copies the cell and ⌘⇧C the row.
-- A mutation never runs on ⌘↵: a bar names the branch ("Run on main", ↵) and Esc cancels. A
+- A mutation never runs on ⌘↵: a bar names the branch ("Run on main", ↵) and Esc cancels. One
+  that moves no branch says so (since 2026-10-21): a declaration `as commit` is held as a
+  commit to publish or drop later ("Hold for main"), one `as unattached branch` writes a
+  snapshot that never publishes ("Write snapshot"), and a merge `as commit` holds the merge
+  ("Hold as commit"). A
   write Studio cannot put back says what goes and waits for its name typed (constitution IV):
   `branch delete x` the branch and its commits no other branch holds (type `x`), `commit drop`
   the proposal (its short id), `load … mode overwrite` every row of the type (the type), and a
@@ -222,6 +226,9 @@ a commit), VII (mutations never run by accident), XII (spike S4 decides the edit
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A write `as commit` lands as held, not unknown | Found in the running app against the edge server (`7fd9cc9`): the commit's `graph_manifest_version` was `10415222161995537841`, a detached `__manifest` version past `i64::MAX`; `omnigraph-api-types` holds it as `u64` (spec 012, E30); `graph_client` `a_detached_manifest_version_decodes`; `query_editor` `a_write_says_what_it_did_from_the_commits_kind_and_the_outcome` with that version | Before, `CommitOutput.graph_manifest_version: i64` refused the answer and the write read "The outcome is unknown" though it landed; as `u64` it decodes, and the tab says "Held as commit …". Not yet seen in the running app |
+| 2026-10-21 | The confirm bar says where a write goes | `gq_language` `a_write_says_where_its_result_goes` (`QueryInfo::publication`, `statement_publication`, `declared_publication` for text checked against no schema yet); `query_editor` `the_confirm_bar_says_where_a_write_goes`, and the as-commit test above | A declaration `as commit`: "add is held as a commit to publish or drop later; main does not change.", button "Hold for main"; `as unattached branch`: a snapshot that never publishes, "Write snapshot"; a merge `as commit`: "Hold as commit"; any other write as before. Before, the bar said "add_held changes data on main." with "Run on main". A stored query's text is the server's, so its bar says it changes data. Not yet seen in the running app |
+| 2026-10-21 | Saved queries under a server's name are not read (decided: no conversion code) | `graph_store::named_keys`, `SessionEvent::SavedQueriesMoved` and the Queries panel's arm for it deleted, with `saved_queries_move_to_the_graphs_key_without_writing_over_one` and `a_graph_opening_takes_its_saved_queries_along` | Supersedes the 2026-10-20 row on saved queries following the graph's key: a `<server>~<graph>` folder stays as it is; its files open with ⌘O |
 | 2026-10-21 | A statement's outcome names the branch it writes | `gq_language` `a_statement_names_the_branch_it_writes`; `graph_store` `a_statement_is_recorded_on_the_branch_it_changed` (on fix: a merge into release committed, a merge into main refused, a delete of feature unknown, a commit publish refused) | Logged on release (the answer's), main (the merge's target), feature (the deleted branch) and fix (a commit statement's target is only in the server's answer). Before, the refused merge into main was logged on fix, and its toast's Open history opened fix's |
 | 2026-10-12 | The schema grammar parses OmniGraph's schemas and the Schema tab uses it | `tree-sitter parse --stat` over the 269 schemas at v0.13.0 (the `.pg` files and the `.gqt` corpus's `--- schema` sections): all parse with no error node; `tree-sitter-pg` tests (every construct, recovery after a broken declaration, queries compile, outline names every declaration); `query_editor` `both_languages_build_with_every_query` and `a_type_is_found_at_its_declaration_and_not_in_a_comment_or_a_longer_name`; offscreen snapshot of `OpenSchema {"type_name":"Person"}` on the development graph | The tab reads "Schema", the sidebar row is selected, `Person` is selected in `node Person`; keywords, types, properties, annotations, enum values and numbers are coloured from the tree, declarations fold, and the footer reads "3 types · 4 relationships" and "Read-only" |
 | 2026-10-12 | The GQ grammar parses OmniGraph's queries and the editor uses it | `tree-sitter parse --stat` over the 1,390 `--- query`/`--- mutate` steps of the v0.13.0 `.gqt` corpus that expect no error, and the two `.gq` files: all parse with no error node; `tree-sitter-gq` tests (every clause kind, recovery around a broken clause, queries compile, outline names both declarations); `query_editor` `the_language_builds_with_every_query`; offscreen snapshot of a new query tab | Traversals (edge binding, `<a \| b>`, `(a \| b)`, hop bounds), filters, subquery predicates and negations come out as their own nodes; the editor colours keywords, names, types, properties, strings, numbers and edges from the tree and highlights the matching bracket |

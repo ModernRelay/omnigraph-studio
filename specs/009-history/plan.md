@@ -37,7 +37,14 @@ from Zed with notices).
 - Selecting a commit opens its changes (spec 008's entity cards) in a detail split, headed like
   the inspector: a small "Commit" label, the short id as the title (click copies the full id),
   then one meta row (actor, time, branch, parent and merged parent as links, change count).
-  The per-type breakdown is the group headers over the cards, not a second summary.
+  The per-type breakdown is the group headers over the cards, not a second summary. A commit
+  held off every branch names what it is in the branch's place ("Unpublished, on no branch
+  until published to main", "Unattached snapshot, on no branch"), and a commit still being read
+  names no branch until its kind is known (since 2026-10-21). The graph's first commit has no
+  parent, so the server cannot compare it (a 409, `parentless_commit`): its changes are never
+  asked for, its row reads "first commit" in the changes column, and its detail says it is the
+  graph's first commit; a commit opened in its own tab waits for its own read before asking
+  for changes, since it may be that one.
 - Search by id prefix or actor with an i/N counter; ↵ and ⇧↵ step through the matches, and
   typing in the field never moves the selection.
 - Any commit can open a type table or query editor pinned to it (read-only chip): the commit
@@ -118,6 +125,8 @@ away are dropped.
 | 2026-10-20 | A token refused commits by id reads one page of each other branch, and a stub says why it is one | `history` tests `a_token_refused_commits_by_id_reads_merges_from_the_listings` (a third branch of 1,102 commits whose `z1`, merged into main, lies below its newest 1,000), `merged_in_commits_are_read_by_their_ids` (a merged parent the server answers 404 for); `history::merged` tests `listed_commits_answer_a_merged_chain_at_once`, `a_merge_from_a_commit_the_server_does_not_have_stays_a_stub` (`Absent::NotListed`, `Absent::NotHad`); against the `Served` fake paging as `edge-20261020-7fd9cc9` does and sending the contract header | Pass: each other branch is read as `branch=<name>&limit=1000`, once per load and again after Refresh; every listing names a `limit`; `z1` draws as a stub whose tooltip reads "The merged commit is not among the newest 1,000 commits of any branch read, and this credential may not read a commit by its id."; the 404 one "The server does not serve the merged commit, as for a deleted branch's latest commits and history cleaned up." |
 | 2026-10-20 | A deleted branch's commits by id | OmniGraph `GraphCoordinator::resolve_commit` at `0a62bb7` (source read) | `GET /commits/{id}` serves them once they have moved into the graph's `__history`; its latest commits, still buffered in the branch's retired `__manifest`, answer 404 and draw as stubs |
 | 2026-10-20 | "New branch here" is offered only at a published commit | `history` tests `new_branch_here_is_offered_only_at_a_published_commit` (the selected row's key and the row menu, over published, unpublished and unattached commits) and `a_branch_starts_here_only_at_a_published_commit` (a commit's own tab reads its kind; a listed one is not read), against the `Served` fake and a fake sending the contract header | Pass: only the published commit makes the key available, shows the menu entry and starts `CreateBranchAt` |
+| 2026-10-21 | A held commit's view names what it is, not main | `history` `a_branch_starts_here_only_at_a_published_commit`, extended: own tabs of a published, an unpublished and an unattached commit, each read by id, and `branch_fact` for a commit still being read and for one that could not be read | Before (found in the running app on the edge server, after a write `as commit`), the meta line showed "main", the cause's `authored_branch`. Now: published, "main"; unpublished, "Unpublished, on no branch until published to main"; unattached, "Unattached snapshot, on no branch"; still being read, no branch; unreadable, the cause's branch. Not yet seen in the running app |
+| 2026-10-21 | The graph's first commit is named, and its changes never asked for | `history` `the_first_commits_changes_are_never_asked_for` (a three-commit chain, row counts read for every row) and `a_branch_starts_here_only_at_a_published_commit` (the first commit listed and in its own tab) | Before (found in the running app on the edge server), each History open sent `/commits/{root}/changes` and the server answered 409; the row showed nothing and the detail an error. Now no `/commits/m0/changes` is sent, the row reads "first commit", and both views are in their `First` state: "The graph's first commit", with no read. Not yet seen in the running app |
 
 ## Corrections
 

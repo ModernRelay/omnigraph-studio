@@ -182,11 +182,10 @@ impl QueriesPanel {
 
     fn watch_session(&mut self, session: Option<Entity<GraphSession>>, cx: &mut Context<Self>) {
         self._session_subscription = session.as_ref().map(|session| {
-            cx.subscribe(session, |this, _, event: &SessionEvent, cx| match event {
-                SessionEvent::StoredQueriesChanged => cx.notify(),
-                // Moved in from where an older build filed them after the folder was listed.
-                SessionEvent::SavedQueriesMoved => this.read_folder(cx),
-                _ => {}
+            cx.subscribe(session, |_, _, event: &SessionEvent, cx| {
+                if let SessionEvent::StoredQueriesChanged = event {
+                    cx.notify()
+                }
             })
         });
         // Another graph's queries: the keyboard starts again from the first.

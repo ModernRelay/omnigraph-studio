@@ -60,7 +60,9 @@ use crate::model::{
     relation_sample, row_matches,
 };
 use crate::offers::Offers;
-use crate::peek::{KnownRelation, NEIGHBOUR_LIMIT, Neighbour, NodePeek, PeekSubject};
+use crate::peek::{
+    KnownRelation, NEIGHBOUR_LIMIT, Neighbour, NodePeek, PeekSubject, TableBlobs, TableWrote,
+};
 use crate::suggest;
 use crate::write::{self, Bound};
 
@@ -1417,6 +1419,12 @@ impl TypeTable {
                         ) {
                             self.newer = true;
                         }
+                        let written = rows
+                            .iter()
+                            .map(|(id, _)| (id.clone(), column.clone(), new.clone()))
+                            .collect();
+                        let parent = commit.parent_commit_id.as_deref();
+                        self.tell_peek_wrote(written, None, &commit.graph_commit_id, parent, cx);
                         self.clear_selection(cx);
                     }
                     _ => {
@@ -3278,6 +3286,8 @@ impl TypeTable {
             self.newer = true;
             cx.emit(ItemEvent::UpdateTab);
         }
+        // A row added, with no relationship: nothing the peek shows changed.
+        self.tell_peek_wrote(Vec::new(), None, commit, parent, cx);
         let filters = self.resolved_filters();
         let matching = i64::from(row_matches(&filters, &values));
         match key {
@@ -3721,15 +3731,12 @@ impl TypeTable {
                 .collect(),
             None => HashMap::new(),
         };
+        // Its Blob values as the cells show them, where they hold: past the pin after the
+        // table's own Blob write over another writer's commit.
+        let blobs = self.shown_blobs(&id);
         let peek = cx.new(|cx| {
-            let mut peek = NodePeek::new(
-                session,
-                subject,
-                Some(values),
-                snapshot,
-                known,
-                debounce,
-                cx,
+            let mut peek = NodePeek::from_table(
+                session, subject, values, snapshot, known, blobs, debounce, cx,
             );
             if holds_commit {
                 peek.hold_commit();
@@ -3783,21 +3790,49 @@ impl TypeTable {
         peek.update(cx, |peek, cx| peek.table_saves(saving, cx));
     }
 
-    /// Tells the peek of the row with `row_id` that a save of it landed at `commit`, made on
-    /// `parent`, writing `values`: the peek follows it as it follows its own writes.
-    fn tell_peek_saved(
+    /// Tells the peek that one of the table's own writes landed at `commit`, made on `parent`:
+    /// every write, so the peek follows it as it follows its own writes rather than offering
+    /// Refresh for it. `written` is what it wrote, by row and property, and `blob` the Blob
+    /// value it stored or cleared in one cell, by row; the peek takes those of its own row, and
+    /// the other rows only by id, since it may show one of them among its neighbours. A write
+    /// that only added rows (an insert) changed no row the peek shows.
+    fn tell_peek_wrote(
         &self,
-        row_id: &str,
-        values: Vec<(String, Value)>,
+        written: Vec<(String, String, Value)>,
+        blob: Option<(String, String, BlobMeta)>,
         commit: &str,
         parent: Option<&str>,
         cx: &mut Context<Self>,
     ) {
-        if let Some((id, peek)) = &self.peek
-            && id == row_id
-        {
-            peek.update(cx, |peek, cx| peek.table_saved(values, commit, parent, cx));
+        let Some((id, peek)) = &self.peek else {
+            return;
+        };
+        let mut touched = HashSet::new();
+        let mut values = Vec::new();
+        for (row, column, value) in written {
+            if row == *id {
+                values.push((column, value));
+            } else {
+                touched.insert(row);
+            }
         }
+        let blob = blob.and_then(|(row, property, meta)| {
+            if row == *id {
+                Some((property, meta))
+            } else {
+                touched.insert(row);
+                None
+            }
+        });
+        let wrote = TableWrote {
+            commit: commit.to_owned(),
+            parent: parent.map(str::to_owned),
+            values,
+            blob,
+            type_name: self.type_name.clone(),
+            touched,
+        };
+        peek.update(cx, |peek, cx| peek.table_wrote(wrote, cx));
     }
 
     /// Opens a node row's page, at the commit the table holds or the branch head.
@@ -4165,8 +4200,8 @@ impl TypeTable {
                 {
                     self.newer = true;
                 }
-                let written = vec![(cell.column.clone(), cell.new.clone())];
-                self.tell_peek_saved(&cell.row_id, written, &commit, parent.as_deref(), cx);
+                let written = vec![(cell.row_id.clone(), cell.column.clone(), cell.new.clone())];
+                self.tell_peek_wrote(written, None, &commit, parent.as_deref(), cx);
                 // Shown again: the rows may have been read again, at the commit before, while
                 // the write was out.
                 if let Some(ix) = self.row_index(&cell.row_id) {
@@ -4675,18 +4710,13 @@ impl TypeTable {
                     self.newer = true;
                 }
                 let changed = output.affected_nodes as usize;
-                if let Some(commit) = output.commit.as_ref().filter(|_| changed == row_count)
-                    && let Some((id, _)) = &self.peek
-                {
-                    let written: Vec<(String, Value)> = edits
+                if let Some(commit) = output.commit.as_ref().filter(|_| changed == row_count) {
+                    let written = edits
                         .iter()
-                        .filter(|edit| edit.row_id == *id)
-                        .map(|edit| (edit.column.clone(), edit.new.clone()))
+                        .map(|edit| (edit.row_id.clone(), edit.column.clone(), edit.new.clone()))
                         .collect();
-                    if !written.is_empty() {
-                        let (id, parent) = (id.clone(), commit.parent_commit_id.as_deref());
-                        self.tell_peek_saved(&id, written, &commit.graph_commit_id, parent, cx);
-                    }
+                    let parent = commit.parent_commit_id.as_deref();
+                    self.tell_peek_wrote(written, None, &commit.graph_commit_id, parent, cx);
                 }
                 if output.commit.is_some() && changed == row_count {
                     // Shown again, as one saved cell is: the rows may have been read again.
@@ -6708,6 +6738,25 @@ impl TypeTable {
         }));
     }
 
+    /// The Blob values the row `row_id` shows, each cell read so far, and where they hold, for a
+    /// peek opened from the row to show and bind to the same.
+    fn shown_blobs(&self, row_id: &str) -> TableBlobs {
+        let shown = self
+            .columns
+            .iter()
+            .filter_map(|c| c.property())
+            .filter(|p| p.kind == ScalarKind::Blob)
+            .filter_map(|p| {
+                let meta = self.blobs.get(row_id, &p.name)?.loaded()?;
+                Some((p.name.clone(), meta.clone()))
+            })
+            .collect();
+        TableBlobs {
+            at: self.paging.blobs.clone(),
+            shown,
+        }
+    }
+
     fn has_blob_columns(&self) -> bool {
         self.columns
             .iter()
@@ -7026,6 +7075,8 @@ impl TypeTable {
                             .after_bound_write(at, before.as_deref(), commit);
                     }
                 }
+                let blob = Some((key.0.clone(), key.1.clone(), meta.clone()));
+                self.tell_peek_wrote(Vec::new(), blob, commit, parent.as_deref(), cx);
             }
             // A read of the cell still out would land the value replaced.
             self.blob_tasks.remove(&key);
@@ -10563,6 +10614,128 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// Every write the table makes reaches its peek, which follows it as it follows its own: a
+    /// bulk set its row is in shows the value set at the set's commit, and a row inserted moves
+    /// it on to the insert's commit, neither offering Refresh. A cell's save and a drafts' save
+    /// did before; these did not.
+    #[gpui::test]
+    async fn a_peek_follows_every_write_of_its_table(cx: &mut TestAppContext) {
+        let mut both = crate::test_support::committed("c2", "c1");
+        both["affected_nodes"] = 2.into();
+        let inserted = crate::test_support::committed("c3", "c2");
+        let session =
+            crate::test_support::session_writing(PEOPLE, vec![(200, both), (200, inserted)], cx);
+        let (table, cx) = people_table(&session, cx);
+        let peek = table.update(cx, |table, cx| table.peek_row(0, cx));
+        cx.run_until_parked();
+        table.update_in(cx, |table, window, cx| {
+            table.selection.extend(["p1".to_owned(), "p2".to_owned()]);
+            table.bulk.property = Some("name".into());
+            table
+                .bulk_editor
+                .update(cx, |editor, cx| editor.set_text("Ida", window, cx));
+            table.submit_bulk(window, cx);
+        });
+        cx.run_until_parked();
+        peek.read_with(cx, |peek, _| {
+            assert_eq!(peek.shown("name"), ("Ida".into(), false));
+            assert_eq!(peek.reads_at(), Some("c2"), "the set's commit");
+            assert!(!peek.is_newer());
+        });
+
+        // An insert, sent as the dialog sends it, then landed in the table.
+        let values = vec![
+            ("slug".to_owned(), serde_json::json!("p3")),
+            ("name".to_owned(), serde_json::json!("Lin")),
+        ];
+        let write = session.update(cx, |session, cx| {
+            let schema = session.schema_model().unwrap();
+            let query = gq_language::builder::insert_node(&schema, "Person", &values).unwrap();
+            session.write_on("main", &query, None, "Insert p3".into(), None, cx)
+        });
+        cx.run_until_parked();
+        assert!(matches!(
+            write.await,
+            graph_client::WriteOutcome::Committed(_)
+        ));
+        table.update(cx, |table, cx| {
+            let row = values.into_iter().collect();
+            table.row_inserted("main", Some("p3".into()), row, "c3", Some("c2"), cx)
+        });
+        cx.run_until_parked();
+        peek.read_with(cx, |peek, _| {
+            assert_eq!(peek.reads_at(), Some("c3"), "the insert's commit");
+            assert!(!peek.is_newer());
+            assert_eq!(peek.shown("name"), ("Ida".into(), false));
+        });
+    }
+
+    const DOCS: &str = "node Person {\n  slug: String @key\n  name: String\n  doc: Blob?\n}\n";
+
+    /// A Blob the table stores in its peek's row reaches the peek: the slot shows the value
+    /// stored, at the write's commit, rather than offering Refresh.
+    #[gpui::test]
+    async fn a_peek_shows_the_blobs_its_table_stores(cx: &mut TestAppContext) {
+        let (session, blobs) = crate::test_support::session_with_blobs(DOCS, cx);
+        blobs.set("Person/p1/doc", b"old");
+        let (table, cx) = people_table(&session, cx);
+        table.update(cx, |table, cx| table.load_blob_metas(0..2, cx));
+        cx.run_until_parked();
+        let peek = table.update(cx, |table, cx| table.peek_row(0, cx));
+        cx.run_until_parked();
+        peek.read_with(cx, |peek, _| assert_eq!(peek.blob_size("doc"), Some(3)));
+        let file = crate::test_support::upload_file("new.txt", b"newer", None);
+        table.update(cx, |table, cx| table.upload_blob("p1", "doc", file, cx));
+        cx.run_until_parked();
+        peek.read_with(cx, |peek, _| {
+            assert_eq!(peek.reads_at(), Some("c2"), "the write's commit");
+            assert!(!peek.is_newer());
+            assert_eq!(peek.blob_size("doc"), Some(5), "the value stored");
+        });
+    }
+
+    /// A table behind its branch (another writer committed after its read) that stores a Blob
+    /// holds its cells at its own commit, past its pin: a peek opened from it then shows the
+    /// value stored, and its slots hold there, so its own Blob write binds to that value and a
+    /// tab it opens reads there. Given only the table's pin, it read the value replaced.
+    #[gpui::test]
+    async fn a_peek_opened_after_its_tables_blob_write_shows_it_where_it_holds(
+        cx: &mut TestAppContext,
+    ) {
+        let (session, blobs) = crate::test_support::session_with_blobs(DOCS, cx);
+        blobs.set("Person/p1/doc", b"old");
+        blobs.set("Person/p2/doc", b"two");
+        let (table, cx) = people_table(&session, cx);
+        table.update(cx, |table, cx| table.load_blob_metas(0..2, cx));
+        cx.run_until_parked();
+        // Another writer's commit, c2, on the table's c1.
+        let cell = BlobCell {
+            edge: false,
+            type_name: "Person".into(),
+            id: "p2".into(),
+            property: "doc".into(),
+        };
+        let theirs = session.update(cx, |session, cx| {
+            session.blob_put_on("main", cell, None, b"theirs".to_vec(), "theirs".into(), cx)
+        });
+        cx.run_until_parked();
+        theirs.await;
+        let file = crate::test_support::upload_file("newest.txt", b"newest", None);
+        table.update(cx, |table, cx| table.upload_blob("p1", "doc", file, cx));
+        cx.run_until_parked();
+        table.read_with(cx, |table, _| {
+            assert_eq!(table.paging.pinned.as_deref(), Some("c1"), "behind");
+            assert_eq!(table.paging.blobs, crate::model::BlobsAt::Own("c3".into()));
+        });
+        let peek = table.update(cx, |table, cx| table.peek_row(0, cx));
+        cx.run_until_parked();
+        peek.read_with(cx, |peek, _| {
+            assert_eq!(peek.reads_at(), Some("c1"), "the table's pin");
+            assert_eq!(peek.blob_size("doc"), Some(6), "not the value replaced");
+            assert_eq!(peek.blobs_held_at(), Some("c3"));
+        });
     }
 
     /// A date or a time reads relative to now: what its cell shows is made once a minute, kept

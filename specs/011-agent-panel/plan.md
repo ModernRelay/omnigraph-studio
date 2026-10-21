@@ -209,8 +209,8 @@ and Delta's sidebar.
 - **Studio's own index.** Like Zed's metadata store, Studio keeps the list itself
   (`agent/sessions.json` in the data directory, owner-only, format 2): per conversation, the
   agent's session id, the graph (its one key, `<server url>/<graph id>`, since 2026-10-20; a
-  record filed under its server's name is filed under the key when the index loads, once, if
-  the name is a server Studio knows, and keeps its working directory), the agent command, its
+  record a build before then filed under its server's name stays under it, and no graph's
+  list shows it), the agent command, its
   title, when it started, the last
   message the person sent, the agent branch its changes go to, and whether it is pinned or
   archived. Ids and titles only; the conversation stays with the agent. The agent's own
@@ -340,6 +340,7 @@ Effort, Fast mode and Agent; the test agent offers the same five.
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | Conversations filed under a server's name are not moved (decided: no conversion code) | `AgentSessions::move_named_graphs` and its test `conversations_filed_by_server_name_move_to_the_graphs_key` deleted with `graph_store::named_keys`; `AgentSessions::global` loads the index as it is | Supersedes the 2026-10-20 row on conversations following the graph's key: a record under `<server name>/<graph id>` keeps that graph field, so no graph's Conversations list shows it; one under the key resumes in its own `cwd` as before |
 | 2026-10-12 | 0.13's MCP endpoint cannot write | Read `crates/omnigraph-server/src/mcp.rs` at `v0.13.0` | One tool, `query`, for stored reads; instructions say mutations are unavailable |
 | 2026-10-12 | Branch names may contain `/` | `POST /graphs/knowledge/branches {"name":"agent/probe-1"}`, list, `DELETE …/agent%2Fprobe-1` on the dev server | All three succeeded |
 | 2026-10-12 | Handlers block the ACP dispatch loop | Read `src/concepts/ordering.rs` in `agent-client-protocol` 2.2.0 | "the dispatch loop waits for each handler to complete" |

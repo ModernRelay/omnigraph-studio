@@ -20,7 +20,7 @@ use gpui::{
     ScrollHandle, ScrollStrategy, SharedString, StyleRefinement, Subscription, Task,
     UnderlineStyle, UniformListScrollHandle, WeakEntity, Window, uniform_list,
 };
-use gq_language::check::Destroys;
+use gq_language::check::{Destroys, Publication};
 use gq_language::{QueryInfo, ResultColumn, SchemaModel};
 use graph_client::api::ErrorCode;
 use graph_client::api::{
@@ -83,6 +83,10 @@ struct Prepared {
     stored: Option<String>,
     /// What the write destroys that Studio cannot put back: it is confirmed by typing.
     destroys: Option<Destroys>,
+    /// Where the write's result goes: the branch, or held off it (`as commit`, `as unattached
+    /// branch`), which the confirm bar says. A stored query's text is the server's, so it is
+    /// taken to publish.
+    publication: Publication,
     /// Which page of a paged read (`branch diff`) this asks for, from 1; 0 for any other run.
     page: usize,
 }
@@ -1523,8 +1527,10 @@ impl QueryEditor {
             map: SourceMap::default(),
             sent: None,
             stored: Some(name.clone()),
-            // The server keeps its text: what it deletes is not known here.
+            // The server keeps its text: what it deletes, or whether it is held, is not known
+            // here.
             destroys: None,
+            publication: Publication::Branch,
             page: 0,
         })
     }
@@ -1697,6 +1703,7 @@ impl QueryEditor {
                 destroys: write
                     .then(|| gq_language::check::statement_destroys(&source))
                     .flatten(),
+                publication: gq_language::check::statement_publication(&source),
                 // A diff answers a page at a time; this asks for its first.
                 page: usize::from(is_branch_diff(&source)),
                 text: source.clone(),
@@ -1759,9 +1766,14 @@ impl QueryEditor {
         } else {
             declaration.name.clone()
         };
-        let (columns, destroys) = match info {
-            Some(info) => (Some(info.columns), info.destroys),
-            None => (None, None),
+        let (columns, destroys, publication) = match info {
+            Some(info) => (Some(info.columns), info.destroys, info.publication),
+            // Unchecked (no schema yet): where it publishes is in its parse alone.
+            None => (
+                None,
+                None,
+                gq_language::check::declared_publication(&text, &declaration.name),
+            ),
         };
         Ok(Prepared {
             text,
@@ -1779,6 +1791,7 @@ impl QueryEditor {
             sent: Some(self.snapshot(cx)),
             stored: None,
             destroys,
+            publication,
             page: 0,
         })
     }
@@ -2943,20 +2956,10 @@ impl QueryEditor {
         use studio_ui::ds::{self, size, space};
         let pending = self.pending_write.as_ref()?;
         let (background, border) = (ds::surface::warning(cx), ds::surface::warning_border(cx));
+        let (said, button) = confirm_words(&pending.prepared, &pending.branch);
         let what = match &pending.typed {
             Some(typed) => typed.what.clone(),
-            None if pending.prepared.statement => {
-                format!("`{}` changes branches.", pending.prepared.label)
-            }
-            None => format!(
-                "{} changes data on {}.",
-                pending.prepared.label, pending.branch
-            ),
-        };
-        let button = if pending.prepared.statement {
-            "Run statement".to_owned()
-        } else {
-            format!("Run on {}", pending.branch)
+            None => said,
         };
         // A write Studio cannot put back takes its name typed, in a field before the buttons.
         let typed = pending.typed.as_ref().map(|typed| {
@@ -3912,6 +3915,41 @@ fn one_line_label(statement: &str) -> String {
     format!("{}…", kept.trim_end())
 }
 
+/// What the confirm bar says a write does, and its button: by where its result goes. A write
+/// `as commit` is held as a commit made on `branch`'s head and moves nothing until it is
+/// published; one `as unattached branch` never publishes; any other changes what it names.
+fn confirm_words(prepared: &Prepared, branch: &str) -> (String, String) {
+    let label = &prepared.label;
+    match (prepared.publication, prepared.statement) {
+        (Publication::Held, true) => (
+            format!(
+                "`{label}` holds the merge as a commit to publish or drop later; no branch changes."
+            ),
+            "Hold as commit".into(),
+        ),
+        (Publication::Held, false) => (
+            format!(
+                "{label} is held as a commit to publish or drop later; {branch} does not change."
+            ),
+            format!("Hold for {branch}"),
+        ),
+        (Publication::Unattached, _) => (
+            format!(
+                "{label} writes an unattached snapshot, which never publishes; {branch} does not change."
+            ),
+            "Write snapshot".into(),
+        ),
+        (Publication::Branch, true) => (
+            format!("`{label}` changes branches."),
+            "Run statement".into(),
+        ),
+        (Publication::Branch, false) => (
+            format!("{label} changes data on {branch}."),
+            format!("Run on {branch}"),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -4003,6 +4041,58 @@ mod tests {
         assert_eq!(
             sent(&list, &value_text(&json!(["a", "b"]))),
             Ok(Some(json!(["a", "b"])))
+        );
+    }
+
+    /// The confirm bar says where a write's result goes: a declaration `as commit` is held and
+    /// one `as unattached branch` is a snapshot, neither moving the branch; a merge `as commit`
+    /// is held too; any other changes what it names.
+    #[test]
+    fn the_confirm_bar_says_where_a_write_goes() {
+        let words = |label: &str, statement: bool, publication: Publication| {
+            let prepared = Prepared {
+                label: label.into(),
+                write: true,
+                statement,
+                publication,
+                ..Default::default()
+            };
+            confirm_words(&prepared, "main")
+        };
+        let said = |text: &str, button: &str| (text.to_owned(), button.to_owned());
+        assert_eq!(
+            words("add", false, Publication::Held),
+            said(
+                "add is held as a commit to publish or drop later; main does not change.",
+                "Hold for main"
+            )
+        );
+        assert_eq!(
+            words("snap", false, Publication::Unattached),
+            said(
+                "snap writes an unattached snapshot, which never publishes; main does not change.",
+                "Write snapshot"
+            )
+        );
+        assert_eq!(
+            words(
+                "branch merge f into main as commit",
+                true,
+                Publication::Held
+            ),
+            said(
+                "`branch merge f into main as commit` holds the merge as a commit to publish or \
+                 drop later; no branch changes.",
+                "Hold as commit"
+            )
+        );
+        assert_eq!(
+            words("add", false, Publication::Branch),
+            said("add changes data on main.", "Run on main")
+        );
+        assert_eq!(
+            words("branch delete f", true, Publication::Branch),
+            said("`branch delete f` changes branches.", "Run statement")
         );
     }
 
@@ -4460,8 +4550,9 @@ mod tests {
         }
 
         /// What the server says a committed write did is what the tab says: a mutation `as
-        /// commit` is held as a proposal and moved no branch; a `branch delete` says what went,
-        /// with no counts.
+        /// commit` is held as a proposal and moved no branch, which its confirm bar says before
+        /// it goes, and its commit is in a detached `__manifest` version, past `i64::MAX`, as the
+        /// server numbers it; a `branch delete` says what went, with no counts.
         #[gpui::test]
         async fn a_write_says_what_it_did_from_the_commits_kind_and_the_outcome(
             cx: &mut TestAppContext,
@@ -4469,7 +4560,9 @@ mod tests {
             init(cx);
             let proposal = json!({
                 "branch": "main", "query_name": "add", "affected_nodes": 1, "affected_edges": 0,
-                "commit": {"graph_commit_id": "01JPROPOSALAA", "graph_manifest_version": 4,
+                "commit": {"graph_commit_id": "01JPROPOSALAA",
+                           "graph_manifest_version": 10_415_222_161_995_537_841_u64,
+                           "graph_branch": null, "parent_commit_id": "c1", "published": false,
                            "created_at": 0, "kind": "unpublished"},
             });
             let (session, asked) = served(
@@ -4484,7 +4577,16 @@ mod tests {
                 editor.set_text(text, window, cx);
                 editor.cursor = 0;
                 editor.run(&Run, window, cx);
-                assert!(editor.pending_write.is_some(), "a write asks first");
+                let pending = editor.pending_write.as_ref().expect("a write asks first");
+                // Nothing moves main: the bar says the commit is held, not that main changes.
+                assert_eq!(
+                    confirm_words(&pending.prepared, &pending.branch),
+                    (
+                        "add is held as a commit to publish or drop later; main does not change."
+                            .to_owned(),
+                        "Hold for main".to_owned()
+                    )
+                );
                 editor.confirm_write(&menu::Confirm, window, cx);
             });
             cx.run_until_parked();

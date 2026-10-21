@@ -276,9 +276,13 @@ opens, and a review for its branch and target (`AccessScope::branch_into`) as it
 read once until the credential may have changed, and views draw again when an answer lands
 (`SessionEvent::AccessChanged`). A new token (typed in, or `omnigraph login` changing the CLI's
 files) reads it at once, with no write to bring it about, and forgets every answer the session
-kept with the old token; a 403 reads it again and keeps them. An answer that lands after
-either was read for the credential before, and lands nowhere. A 403 from the server's own
-routes (listing its graphs, which most tokens may not) is not counted. Studio offers every action not known to be refused
+kept with the old token (spec 003 says which, and what is read again); a 403 on the session's
+graph reads it again and keeps them. An answer that lands after either was read for the
+credential before, and lands nowhere. The client counts 403s per graph, by the id in the
+request's path (since 2026-10-21): one connection serves every window on an address, and a 403
+on one graph says nothing of another's policy, so a session of another graph keeps its answers,
+and one in flight still lands. A 403 from the server's own routes (listing its graphs, which
+most tokens may not) is not counted. Studio offers every action not known to be refused
 (`Allowed::offered`): before an answer lands, or when none can be read, everything is offered.
 The server stays the authority: a 403 still shows as a denial, and the draft stays.
 
@@ -346,8 +350,9 @@ Its action is not registered, so the palette and the keyboard button's list leav
     search spans every section; the search box has focus when the tab opens.
   - Per-graph overrides: `graphs."<server url>/<graph id>"`, the graph's one key, which also
     files its saved queries (spec 007) and agent conversations (spec 011) (since 2026-10-20;
-    before, the server's name, which a rename in the CLI's config lost; `graph_store::named_keys`
-    moves what was under a known server's name once, as the graph opens) holds a graph's own values for
+    before, the server's name, which a rename in the CLI's config lost; what builds before
+    2026-10-20 filed under a server's name is not read, and no conversion moves it, decided
+    2026-10-21) holds a graph's own values for
     the settings marked `x-per-graph` (table and relationship page sizes, canvas node limit).
     With a graph open, the tab's scope switch ("All graphs" | the graph) shows only those,
     writes the graph's own value, and Reset removes it; an own value's description names the
@@ -781,6 +786,9 @@ one is refused with the reason. `studio::OpenLink { url }` opens a link from ins
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | A 403 on one graph leaves another graph's access as read | `graph_client` `a_refusal_on_a_graph_is_counted_for_that_graph_alone` (`GraphClient::refusals(graph)`, by the id in `graphs/{id}/…`, escaped or not: `a_path_segment_reads_its_escapes`); `graph_store` `access_is_read_per_branch_and_again_after_a_refusal`, extended with a `notes` session on the same connection | Before, the client counted 403s for the whole server, so a refusal on `knowledge` made the `notes` session forget its answer and read `/access` again, and an answer in flight landed nowhere. Now `knowledge` reads its access again after its 403, and `notes`, asked again, asks nothing and still allows reading |
+| 2026-10-21 | Parking a graph lets go of its server's watch | `graph_store` `the_head_watch_sees_other_writers_commits_while_a_window_is_active`, extended (`Connection::watched`) | Watched while shown; parked, no watch; shown again, watched again |
+| 2026-10-21 | What builds before 2026-10-20 filed under a server's name is not read (decided: no conversion code) | `graph_store::named_keys` deleted with its callers (`GraphSession::new`'s move, `agent_panel` `AgentSessions::global`'s `move_named_graphs`) and `SessionEvent::SavedQueriesMoved` with the Queries panel's arm for it; their tests `a_name_resolves_only_to_a_known_server`, `settings_kept_under_a_servers_name_move_to_its_address_once`, `saved_queries_move_to_the_graphs_key_without_writing_over_one`, `a_graph_opening_takes_its_saved_queries_along` and `conversations_filed_by_server_name_move_to_the_graphs_key` deleted; no source names `named_keys`, `move_named` or `SavedQueriesMoved` | Supersedes the 2026-10-20 row on one key per graph: settings under `graphs."<server name>/<graph id>"`, query folders `<server>~<graph>` and conversations filed by a server's name stay where they are, unread; Studio writes only under `<server url>/<graph id>` |
 | 2026-10-21 | A panic prints only its redacted line | `studio` `a_panic_reports_one_line_without_the_text_it_quotes` (a panic quoting 'Ada Lovelace' and `secret notes` on a named thread, through `panic_line`, which the hook prints); `logging::init` no longer chains to `std::panic::take_hook()` | "panic on thread quoting-panic at crates/studio/src/logging.rs:…: no row for '…' in `…`", nothing else. Before, the line was logged and then Rust's own hook printed the panic whole to standard error, with a backtrace under `RUST_BACKTRACE`. Not yet seen in the running app |
 | 2026-10-21 | The activity log draws for outcomes, not for reads | `studio` `the_log_draws_for_outcomes_not_for_reads` (renders counted: `ActivityChanged` and `CountsChanged` with no outcome logged, then an external write refused), failing with the subscription that drew on every event | No draw for the read-like events; one for the outcome. Its times are drawn again once a minute (`TIMES_EVERY`) while it lists writes |
 | 2026-10-21 | A link checks no more and no less than "Open a graph" before it opens a session | A read of `studio::open_link`, `open_graph::OpenGraphModal::open` and `show_graph_in` (both open through `show_graph_in`, on any known connection, whatever its state) and of `graph_client`'s contract check on every response | Not changed: "Open a graph" opens a remembered or typed id on a server in any state, as a link does, so a link skips no check it applies. A server speaking another contract still serves nothing: every response without the contract header is refused (constitution I, X), and a refused token answers 401 to every read |

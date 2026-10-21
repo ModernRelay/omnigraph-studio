@@ -277,6 +277,15 @@ precondition on the source head would refuse such a merge instead. *Waits:* 008.
 merge commit's merged parent (or a fast-forward's commit) is compared with the reviewed head,
 and the outcome says when the merge took a commit made after the review was read.
 
+**E30. Version fields as wide as the server sends them.** `omnigraph-api-types` holds every
+`graph_manifest_version` and `published_dataset_version` as `u64`, and the OpenAPI document
+declares them `integer`, `format: int64`, `minimum: 0`. A commit held in a detached
+`__manifest` version (a write `as commit` or `as unattached branch`) has a version with the
+high bit set, which is no `int64`: the edge server answered one with
+`graph_manifest_version: 10415222161995537841`. The document should say `uint64` (or drop the
+format), so a client generated from it decodes every answer the server sends. *Waits:* 004,
+007. *Today:* Studio decodes them as `u64`; its contract tests compare field names only.
+
 ### In 0.14, not in 0.13.0
 
 Studio's minimum server serves these, so it uses them without asking the server's OpenAPI
@@ -319,6 +328,7 @@ Then engine changes still open:
 
 | Date | Claim | Check | Result |
 |---|---|---|---|
+| 2026-10-21 | The server's version fields are wider than its contract says (E30) | `omnigraph-api-types/src/lib.rs` at `7fd9cc9` (`CommitOutput`, `SnapshotOutput`, `SnapshotDatasetOutput`, `SchemaApplyOutput`, `PublishedDatasetVersionConflictOutput`: `u64`; its own test decodes `9_223_372_036_854_775_809u64`); `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` (`int64`, `minimum: 0`); what the running app was answered by the edge server; `graph_client` `a_detached_manifest_version_decodes` | A write `as commit` was answered with `graph_manifest_version: 10415222161995537841`, which Studio's `i64` refused to decode, so the write read as unknown; as `u64` it decodes, and the query editor says it is held |
 | 2026-10-20 | What OmniGraph main serves that Studio's minimum server does not | `openapi.json` at main `4ba904d3` diffed with `crates/graph_client/openapi/omnigraph-0.14.0-edge.json` by operation, parameter and schema property; the `changelog.d` notes added since `d883c49e`; the CLI reference and targets guide at `4ba904d3` | New: `GET /graphs/{id}/access`; `limit`, `page_token`, `head_commit_id`, `next_page_token` on commits; `from_commit` and `from_commit_id` on branch creation; `ChangeOutput.executed`; error details `branch_start_refusal` and `full_text_index_required`. Contract header still `0.13`. The CLI drops `--server` and profiles for targets (#1090) |
 | 2026-10-15 | What OmniGraph main serves that 0.13.0 does not | `openapi.json` at `v0.13.0` and at main `fe69c039`, diffed by operation id, schema properties and parameters; issues #976–#980 | New: `cluster_getDiff`, `cluster_getBranchDiff`, `cluster_getMergeBase`, `cluster_putBlob`, `cluster_clearBlob`, `cluster_publishCommit`, `cluster_dropCommit`, OAuth resource metadata; `dry_run` and `as_commit` on merge; commit kinds and filters; `ReadOutput.page`. Contract header still `0.13`. #977 and #979 closed by #987 and #988; #976, #978 and #980 open |
 | 2026-10-11 | Route list at 0.13.0 and main | parsed `openapi.json` at `v0.13.0` and main | 0.13.0 lacks Blob PUT/DELETE and commit publish/drop |

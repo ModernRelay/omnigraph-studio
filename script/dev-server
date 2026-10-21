@@ -55,6 +55,13 @@ if [[ -f "$DATA/__cluster/lock.json" ]]; then
   fi
 fi
 
+# Something already answering at the address would be asked in this server's place, and this
+# server would exit, unable to bind it.
+if curl -s -o /dev/null --max-time 2 "http://$BIND/healthz"; then
+  echo "dev-server: something already answers at http://$BIND; stop it, or set STUDIO_DEV_BIND to another address" >&2
+  exit 1
+fi
+
 OMNIGRAPH_SERVER_BEARER_TOKENS_JSON="{\"act-dev\":\"$TOKEN\"}" \
   "$SERVER" --cluster "$DATA" --bind "$BIND" &
 server=$!
@@ -64,10 +71,24 @@ home=$(mktemp -d)
 printf 'target_config_version: 1\ntargets:\n  dev: { kind: server, endpoint: "http://%s", credential: dev }\n' "$BIND" > "$home/config.yaml"
 trap 'kill $server 2>/dev/null; rm -rf "$home"' EXIT INT TERM
 
+# Asked only while the server runs: one that exited (the address taken meanwhile, a cluster it
+# cannot open) is reported as having exited, not as a server that answers no contract.
+ready=0
 for _ in $(seq 1 60); do
-  if curl -fsS "http://$BIND/readyz" > /dev/null 2>&1; then break; fi
+  if ! kill -0 "$server" 2>/dev/null; then break; fi
+  if curl -fsS "http://$BIND/readyz" > /dev/null 2>&1; then ready=1; break; fi
   sleep 0.5
 done
+if ! kill -0 "$server" 2>/dev/null; then
+  status=0
+  wait "$server" || status=$?
+  echo "dev-server: $SERVER exited (status $status) before it served http://$BIND; its output is above (is the address in use?)" >&2
+  exit 1
+fi
+if [[ $ready == 0 ]]; then
+  echo "dev-server: $SERVER did not answer http://$BIND/readyz within 30 s" >&2
+  exit 1
+fi
 
 # The CLI's contract says nothing of the server's: a stale OMNIGRAPH_SERVER_BIN starts, and Studio
 # would refuse it only once it connects. Ask the server itself, as Studio does, by the contract

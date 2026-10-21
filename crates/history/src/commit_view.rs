@@ -46,6 +46,9 @@ enum State {
     Loading,
     Ready,
     Failed(SharedString),
+    /// The graph's first commit: it has no parent to compare with, so its changes are not
+    /// asked for (the server refuses them, `parentless_commit`).
+    First,
 }
 
 pub struct CommitView {
@@ -53,6 +56,9 @@ pub struct CommitView {
     commit_id: String,
     /// The commit as listed; read by its id when the view opens without it (its own tab).
     commit: Option<CommitOutput>,
+    /// The commit is being read: until it is in, the header names no branch, since a commit
+    /// held off every branch names the branch it was written on.
+    commit_pending: bool,
     _commit_task: Option<Task<()>>,
     cause: Option<ChangeCauseOutput>,
     state: State,
@@ -172,6 +178,7 @@ impl CommitView {
             session,
             commit_id,
             commit,
+            commit_pending: false,
             _commit_task: None,
             cause: None,
             state: State::Loading,
@@ -202,8 +209,9 @@ impl CommitView {
     }
 
     /// Reads the commit itself when the view came without it: its kind says whether a branch
-    /// can start at it, and it names the branch that wrote it. One that cannot be read leaves
-    /// the header to the changes' cause, and offers no branch.
+    /// can start at it and where it is, and its parent whether it has changes to read, which
+    /// wait for it. One that cannot be read leaves the header to the changes' cause, and
+    /// offers no branch.
     fn read_commit(&mut self, cx: &mut Context<Self>) {
         if self.commit.is_some() || self._commit_task.is_some() {
             return;
@@ -212,15 +220,41 @@ impl CommitView {
         let read = self
             .session
             .update(cx, |session, cx| session.commit(&id, cx));
+        self.commit_pending = true;
         self._commit_task = Some(cx.spawn(async move |this, cx| {
-            if let Ok(commit) = read.await {
-                this.update(cx, |this, cx| {
+            let read = read.await;
+            this.update(cx, |this, cx| {
+                this.commit_pending = false;
+                if let Ok(commit) = read {
                     this.commit = Some(commit);
-                    cx.notify();
-                })
-                .ok();
-            }
+                }
+                // Its changes waited for it: the first commit has none to ask for.
+                if !this.settle_if_first() {
+                    this.load_more(cx);
+                }
+                cx.notify();
+            })
+            .ok();
         }));
+    }
+
+    /// Whether the commit is the graph's first, as far as it is known: one with no parent,
+    /// which the server cannot compare with anything.
+    fn is_first(&self) -> bool {
+        self.commit.as_ref().is_some_and(is_first_commit)
+    }
+
+    /// Shows the graph's first commit as such, and drops a read of its changes still out, which
+    /// the server would refuse. Whether it is the first.
+    fn settle_if_first(&mut self) -> bool {
+        if !self.is_first() {
+            return false;
+        }
+        self._task = None;
+        self.more_error = None;
+        self.next_page_token = None;
+        self.state = State::First;
+        true
     }
 
     /// The commit a new branch can start at: this one, when it is published.
@@ -228,8 +262,12 @@ impl CommitView {
         branch_start(self.commit.as_ref()?)
     }
 
-    /// Reads the next pages of changes, up to [`CAP`] more.
+    /// Reads the next pages of changes, up to [`CAP`] more. The graph's first commit has none
+    /// to read, and a commit still being read is waited for, since it may be that one.
     fn load_more(&mut self, cx: &mut Context<Self>) {
+        if self.settle_if_first() || self.commit_pending {
+            return;
+        }
         // One read at a time: the one under way holds the fold.
         if matches!(self.state, State::Loading) && self._task.is_some() {
             return;
@@ -427,16 +465,11 @@ impl CommitView {
             .as_ref()
             .map(|c| c.created_at)
             .or_else(|| self.cause.as_ref().map(|c| c.authored_at));
-        // A listed commit without an authored branch was written on main.
-        let branch = self
-            .cause
-            .as_ref()
-            .map(|c| c.authored_branch.clone())
-            .or_else(|| {
-                self.commit
-                    .as_ref()
-                    .map(|c| c.graph_branch.clone().unwrap_or_else(|| "main".into()))
-            });
+        let branch = branch_fact(
+            self.commit.as_ref(),
+            self.cause.as_ref(),
+            self.commit_pending,
+        );
         let parent = self
             .commit
             .as_ref()
@@ -465,7 +498,7 @@ impl CommitView {
                 Some(text)
             }
             State::Loading => Some("Reading changes…".into()),
-            State::Failed(_) => None,
+            State::Failed(_) | State::First => None,
         };
         // A parent is a link to its own commit.
         let parent_link = |id: String, icon: IconName, name: &'static str, tooltip: String| {
@@ -501,8 +534,8 @@ impl CommitView {
                     .into_any_element(),
             );
         }
-        if let Some(branch) = branch {
-            facts.push(studio_ui::ds::meta(IconName::GitBranch, branch).into_any_element());
+        if let Some((icon, branch)) = branch {
+            facts.push(studio_ui::ds::meta(icon, branch).into_any_element());
         }
         if let Some(parent) = parent {
             facts.push(parent_link(
@@ -750,6 +783,45 @@ impl CommitView {
     }
 }
 
+/// Where the commit is, for its header: the branch that published it, or, for a commit held
+/// off every branch, what it is; it names the branch it was written on, which it is not on. A
+/// commit still being read (`pending`) says nothing yet, since its kind decides; one that could
+/// not be read is placed by its changes' cause, which names its authored branch.
+fn branch_fact(
+    commit: Option<&CommitOutput>,
+    cause: Option<&ChangeCauseOutput>,
+    pending: bool,
+) -> Option<(IconName, String)> {
+    let Some(commit) = commit else {
+        return cause
+            .filter(|_| !pending)
+            .map(|cause| (IconName::GitBranch, cause.authored_branch.clone()));
+    };
+    let on = || commit.graph_branch.clone().unwrap_or_else(|| "main".into());
+    Some(match commit.kind {
+        CommitKind::Published => (IconName::GitBranch, on()),
+        CommitKind::Unpublished => (
+            IconName::GitCommit,
+            format!("Unpublished, on no branch until published to {}", on()),
+        ),
+        CommitKind::Unattached => (
+            IconName::GitCommit,
+            "Unattached snapshot, on no branch".to_owned(),
+        ),
+        // A kind a later server sends: where it is, Studio cannot say.
+        CommitKind::Other => return None,
+    })
+}
+
+/// What the graph's first commit is called where its changes would show.
+pub(crate) const FIRST_COMMIT: &str = "The graph's first commit";
+
+/// Whether `commit` is the graph's first: it has no parent, so it has no changes the server can
+/// tell (it refuses them with a 409, `parentless_commit`), and none are asked for.
+pub(crate) fn is_first_commit(commit: &CommitOutput) -> bool {
+    commit.parent_commit_id.is_none() && commit.merged_parent_commit_id.is_none()
+}
+
 /// The commit a branch can start at: a published one. A proposal or an unattached snapshot is
 /// in no branch's history, and the server refuses a branch there.
 pub(crate) fn branch_start(commit: &CommitOutput) -> Option<&str> {
@@ -797,6 +869,11 @@ impl Render for CommitView {
             State::Ready if self.rows.is_empty() => {
                 studio_ui::ds::empty_state(IconName::Check, "No entity changes").into_any_element()
             }
+            State::First => studio_ui::ds::empty_state(IconName::GitCommit, FIRST_COMMIT)
+                .child(studio_ui::ds::text::muted(
+                    "It has no parent, so it has no changes to compare.",
+                ))
+                .into_any_element(),
             State::Loading if self.rows.is_empty() => {
                 studio_ui::ds::loading_state("Reading changes…").into_any_element()
             }
@@ -1019,6 +1096,12 @@ mod tests {
                     }
                     Some((_, "c9")) => (200, commit("c9", "published")),
                     Some((_, "c8")) => (200, commit("c8", "unpublished")),
+                    Some((_, "c6")) => (200, commit("c6", "unattached")),
+                    // The graph's first commit: no parent.
+                    Some((_, "c0")) => (
+                        200,
+                        json!({ "graph_commit_id": "c0", "graph_manifest_version": 1, "kind": "published", "created_at": 0 }),
+                    ),
                     _ => (404, json!({ "error": "not here" })),
                 };
                 Ok(Response::builder()
@@ -1044,13 +1127,33 @@ mod tests {
                 heard.lock().unwrap().push(action.commit_id.clone())
             });
         });
-        for (id, offered) in [("c9", true), ("c8", false)] {
+        // A held commit names the branch it was written on, which it is not on: the header says
+        // what it is instead.
+        let held = |text: &str| Some((IconName::GitCommit, text.to_owned()));
+        for (id, offered, place) in [
+            ("c9", true, Some((IconName::GitBranch, "main".to_owned()))),
+            (
+                "c8",
+                false,
+                held("Unpublished, on no branch until published to main"),
+            ),
+            ("c6", false, held("Unattached snapshot, on no branch")),
+        ] {
             let (view, cx) =
                 cx.add_window_view(|_, cx| CommitView::new(session.clone(), id.into(), None, cx));
             cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
             cx.run_until_parked();
             view.read_with(cx, |view, _| {
-                assert_eq!(view.branch_here(), offered.then_some(id), "{id}")
+                assert_eq!(view.branch_here(), offered.then_some(id), "{id}");
+                assert_eq!(
+                    branch_fact(
+                        view.commit.as_ref(),
+                        view.cause.as_ref(),
+                        view.commit_pending
+                    ),
+                    place,
+                    "{id}"
+                );
             });
             let available = cx.update(|window, cx| window.is_action_available(&NewBranchHere, cx));
             assert_eq!(available, offered, "{id}");
@@ -1058,6 +1161,18 @@ mod tests {
             cx.run_until_parked();
         }
         assert_eq!(*started.lock().unwrap(), ["c9"]);
+        // A commit still being read names no branch, though its changes' cause names the one
+        // it was written on: a held commit is not on it. One that could not be read is placed
+        // by the cause.
+        let cause: ChangeCauseOutput = serde_json::from_value(
+            json!({ "graph_commit_id": "c8", "parent_commit_id": "c0", "authored_branch": "main", "authored_at": 0 }),
+        )
+        .unwrap();
+        assert_eq!(branch_fact(None, Some(&cause), true), None);
+        assert_eq!(
+            branch_fact(None, Some(&cause), false),
+            Some((IconName::GitBranch, "main".to_owned()))
+        );
 
         let listed: CommitOutput = serde_json::from_value(commit("c7", "published")).unwrap();
         let beside = cx.new(|cx| CommitView::new(session.clone(), "c7".into(), Some(listed), cx));
@@ -1070,6 +1185,30 @@ mod tests {
                 .iter()
                 .any(|path| path.ends_with("/commits/c7")),
             "a listed commit was read again"
+        );
+
+        // The graph's first commit, listed or in its own tab: the server cannot compare it with
+        // a parent, so its changes are never asked for, and it says what it is.
+        let first: CommitOutput = serde_json::from_value(
+            json!({ "graph_commit_id": "c0", "graph_manifest_version": 1, "kind": "published", "created_at": 0 }),
+        )
+        .unwrap();
+        let listed = cx.new(|cx| CommitView::new(session.clone(), "c0".into(), Some(first), cx));
+        let own = cx.new(|cx| CommitView::new(session.clone(), "c0".into(), None, cx));
+        cx.run_until_parked();
+        for view in [listed, own] {
+            view.read_with(cx, |view, _| {
+                assert!(matches!(view.state, State::First));
+                assert_eq!(view.branch_here(), Some("c0"), "a branch can start there");
+            });
+        }
+        assert!(
+            !asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.ends_with("/commits/c0/changes")),
+            "the first commit's changes were asked for"
         );
     }
 
